@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from typing import Callable, Optional, Sequence, TYPE_CHECKING, cast
 
 from common import Context, PathPair
+from scan_fs import stream_root_fingerprint
 from common.performance_diagnostics import (
     CANDIDATE_LIFECYCLE_FALLBACK_REASON_EXCEPTION,
     CANDIDATE_PAIR_FALLBACK_REASON_AUTHORIZATION_REJECTED,
@@ -278,6 +279,10 @@ class _ProgressiveScanAccumulator:
         # separate from the file map so a later empty full snapshot can be
         # proven unchanged without confusing it with a fresh accumulator.
         self.__committed_pairs: set[Optional[str]] = set()
+        # These are derived from the sole committed tree authority, never a
+        # remote cache.  A new scanner session deliberately starts without
+        # them so restart/first-run behavior remains a full-tree baseline.
+        self.__committed_root_fingerprints: dict[Optional[str], dict[str, str]] = {}
         self.__working: dict[int, dict[Optional[str], dict[str, SystemFile]]] = {}
         self.__manifests: dict[int, dict[Optional[str], Optional[set[str]]]] = {}
         self.__active_generation: dict[Optional[str], int] = {}
@@ -303,6 +308,7 @@ class _ProgressiveScanAccumulator:
         self.__incomplete_pairs.clear()
         self.__authoritative_by_pair.clear()
         self.__completed_pairs.clear()
+        self.__committed_root_fingerprints.clear()
         self.__session_has_progressive_evidence = False
         self.__last_touched_keys.clear()
         self.__last_final_comparison_proven_pairs.clear()
@@ -380,8 +386,15 @@ class _ProgressiveScanAccumulator:
             return None
         latest = accepted[-1]
         if not any(getattr(event, "is_progress", False) for event in accepted):
-            selected_ids = set(latest.scanned_path_pair_ids)
+            selected_ids = set(latest.scanned_path_pair_ids) | set(latest.unknown_path_pair_ids)
             if not selected_ids:
+                if latest.failed:
+                    # A transport/protocol failure before the first manifest
+                    # carries no reliable pair identity. Keep every committed
+                    # tree, but force all subsequent remote scans in this
+                    # session to establish fresh full-root transport hints.
+                    self.__committed_root_fingerprints.clear()
+                    return latest
                 if bool(getattr(latest, "is_targeted_scan", False)):
                     return None
                 selected_ids = {None}
@@ -392,6 +405,8 @@ class _ProgressiveScanAccumulator:
             ):
                 return None
             if latest.failed:
+                for pair_id in selected_ids:
+                    self.__committed_root_fingerprints.pop(pair_id, None)
                 return latest
             if latest.files:
                 self.__session_has_progressive_evidence = True
@@ -462,6 +477,12 @@ class _ProgressiveScanAccumulator:
                     self.__authoritative_by_pair.pop(pair_id, None)
                 touched.add(pair_id)
                 if event.failed:
+                    # Any recoverable failed generation may have been caused
+                    # by a malformed/unsupported hinted stream before marker
+                    # evidence reached this accumulator. Preserve committed
+                    # tree authority, but force the next scan to send full
+                    # roots by dropping only this pair's derived hints.
+                    self.__committed_root_fingerprints.pop(pair_id, None)
                     self.__failed_pairs.add((generation, pair_id))
                     self.__authoritative_by_pair.pop(pair_id, None)
                     failed = True
@@ -473,6 +494,8 @@ class _ProgressiveScanAccumulator:
                 full_snapshot = bool(getattr(event, "is_full_snapshot", False)) \
                     and pair_id in full_snapshot_ids
                 previous_committed = self.__committed_by_pair.get(pair_id, {})
+                previous_fingerprints = self.__committed_root_fingerprints.get(pair_id, {})
+                retained_fingerprints: dict[str, str] = {}
                 comparison_proven = pair_id in self.__committed_pairs
                 if full_snapshot:
                     # The final aggregate is lossless even when intermediate
@@ -493,6 +516,33 @@ class _ProgressiveScanAccumulator:
                                 authoritative_pair[name] = None
                             else:
                                 authoritative_pair.pop(name, None)
+                unchanged_by_pair = getattr(event, "unchanged_root_fingerprints_by_pair", {})
+                unchanged_fingerprints = (
+                    unchanged_by_pair.get(pair_id, {}) if isinstance(unchanged_by_pair, dict)
+                    else getattr(event, "unchanged_root_fingerprints", {})
+                )
+                if full_snapshot and isinstance(unchanged_fingerprints, dict):
+                    invalid_marker = False
+                    for name, fingerprint in unchanged_fingerprints.items():
+                        if not isinstance(name, str) or not isinstance(fingerprint, str) or \
+                                previous_fingerprints.get(name) != fingerprint or name not in previous_committed:
+                            invalid_marker = True
+                            continue
+                        working[name] = previous_committed[name]
+                        retained_fingerprints[name] = fingerprint
+                        self.__authoritative_by_pair.setdefault(pair_id, {})[name] = previous_committed[name]
+                    if invalid_marker:
+                        # A marker without model-owned matching authority is
+                        # never evidence of presence. Keep the last committed
+                        # model and clear only this pair's derived transport
+                        # hints so the next scan must return full roots. A
+                        # successful full snapshot derives fresh hints again.
+                        self.__committed_root_fingerprints.pop(pair_id, None)
+                        self.__failed_pairs.add((generation, pair_id))
+                        self.__incomplete_pairs.add(pair_id)
+                        failed = True
+                        error_message = "Remote unchanged-root fingerprint did not match committed authority"
+                        continue
                 for file in event.files:
                     file_pair = self.__pair_for_file(file, event)
                     if file_pair != pair_id and len(ids) > 1:
@@ -532,6 +582,14 @@ class _ProgressiveScanAccumulator:
                     for name in [name for name in self.__committed_by_pair.get(pair_id, {}) if name not in working]:
                         self.__committed_by_pair[pair_id].pop(name, None)
                         self.__authoritative_by_pair.get(pair_id, {}).pop(name, None)
+                    self.__committed_root_fingerprints[pair_id] = {
+                        name: (
+                            retained_fingerprints[name]
+                            if name in retained_fingerprints and file is previous_committed.get(name)
+                            else stream_root_fingerprint(file)
+                        )
+                        for name, file in working.items()
+                    }
                     if comparison_proven:
                         self.__last_final_comparison_proven_pairs.add(pair_id)
                     self.__committed_pairs.add(pair_id)
@@ -625,6 +683,14 @@ class _ProgressiveScanAccumulator:
     def touched_keys(self) -> set[tuple[Optional[str], str]]:
         """Return only root identities changed by the most recent drain."""
         return set(self.__last_touched_keys)
+
+    def accepted_root_fingerprints(self) -> dict[Optional[str], dict[str, str]]:
+        """Return only digests derived from accepted full-snapshot roots."""
+        return {
+            pair_id: dict(fingerprints)
+            for pair_id, fingerprints in self.__committed_root_fingerprints.items()
+            if pair_id in self.__committed_pairs
+        }
 
 
 class _JointProgressiveReconciler:
@@ -1495,6 +1561,19 @@ class ModelUpdater(_ControllerCoreAccess):
         controller._Controller__progressive_remote_scan_session_changed = False
 
         stage_timer.switch(DURATION_MODEL_UPDATE_SCAN_INTAKE)
+        # The accumulator is the sole authority for these hints.  They are
+        # sent only to a future scan; a fresh ScannerProcess session has an
+        # empty accumulator fingerprint map and therefore performs a full
+        # streamed baseline.
+        remote_accumulator = getattr(controller, "_Controller__progressive_remote_scan_state", None)
+        remote_fingerprint_setter = getattr(controller._Controller__remote_scan_process,
+                                            "set_accepted_root_fingerprints", None)
+        if isinstance(remote_accumulator, _ProgressiveScanAccumulator) and callable(remote_fingerprint_setter):
+            process_session = getattr(controller._Controller__remote_scan_process, "session_token", None)
+            remote_fingerprint_setter(
+                remote_accumulator.accepted_root_fingerprints()
+                if remote_accumulator.session_token == process_session else {}
+            )
         # Grab the latest scan results.
         latest_remote_scan = _pop_scan_updates(controller, "remote", controller._Controller__remote_scan_process)
         latest_local_scan = _pop_scan_updates(controller, "local", controller._Controller__local_scan_process)

@@ -71,9 +71,13 @@ class IScanner(ABC):
         # Optional for legacy scanners.  Concrete scanners override this hook.
         return None
 
+    def set_accepted_root_fingerprints(self, fingerprints: dict[str | None, dict[str, str]]) -> None:
+        """Optional remote-only hint; absence must retain full-stream behavior."""
+        return None
+
 
 ScanProgressCallback = Callable[
-    [List[SystemFile], Optional[str], Optional[str], Optional[set[str]], bool],
+    [List[SystemFile], Optional[str], Optional[str], Optional[set[str]], bool, Optional[dict[str, str]]],
     None,
 ]
 
@@ -100,6 +104,8 @@ class ScannerResult:
                  is_full_snapshot: bool = False,
                  full_snapshot_path_pair_ids: Optional[set[str | None]] = None,
                  is_targeted_scan: bool = False,
+                 unchanged_root_fingerprints: Optional[dict[str, str]] = None,
+                 unchanged_root_fingerprints_by_pair: Optional[dict[str | None, dict[str, str]]] = None,
                  duration_aggregates: Optional[dict[str, dict[str, float | int]]] = None,
                  duration_aggregate_token: Optional[tuple[str, int, int]] = None):
         self.timestamp = timestamp
@@ -119,6 +125,9 @@ class ScannerResult:
         self.is_full_snapshot = is_full_snapshot
         self.full_snapshot_path_pair_ids = set() if full_snapshot_path_pair_ids is None else full_snapshot_path_pair_ids
         self.is_targeted_scan = is_targeted_scan
+        self.unchanged_root_fingerprints = {} if unchanged_root_fingerprints is None else unchanged_root_fingerprints
+        self.unchanged_root_fingerprints_by_pair = {} if unchanged_root_fingerprints_by_pair is None \
+            else unchanged_root_fingerprints_by_pair
         self.duration_aggregates = duration_aggregates
         self.duration_aggregate_token = duration_aggregate_token
 
@@ -311,6 +320,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
         diagnostics_setter(duration_recorder)
     progress_emitted = False
     progress_files_by_pair: dict[Optional[str], list[SystemFile]] = {}
+    unchanged_root_fingerprints_by_pair: dict[Optional[str], dict[str, str]] = {}
     control_send_lock = threading.Lock()
 
     def send_control_message(message: object) -> None:
@@ -322,13 +332,16 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
             control_connection.send(message)
 
     def publish_progress(files: List[SystemFile], path_pair_id: Optional[str], path_pair_name: Optional[str],
-                         root_names: Optional[set[str]], complete: bool) -> None:
+                         root_names: Optional[set[str]], complete: bool,
+                         unchanged_root_fingerprints: Optional[dict[str, str]] = None) -> None:
         nonlocal progress_emitted
         progress_emitted = True
         for system_file in files:
             system_file.path_pair_id = path_pair_id
             system_file.path_pair_name = path_pair_name
         progress_files_by_pair.setdefault(path_pair_id, []).extend(files)
+        if unchanged_root_fingerprints:
+            unchanged_root_fingerprints_by_pair.setdefault(path_pair_id, {}).update(unchanged_root_fingerprints)
         progress_result = ScannerResult(
             datetime.now(),
             files,
@@ -339,6 +352,9 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
             completed_path_pair_ids={path_pair_id} if complete else set(),
             is_scan_final=False,
             session_token=session_token,
+            unchanged_root_fingerprints=unchanged_root_fingerprints,
+            unchanged_root_fingerprints_by_pair=({path_pair_id: unchanged_root_fingerprints}
+                                                 if unchanged_root_fingerprints else None),
         )
         if result_via_control:
             send_control_message(("result", progress_result))
@@ -355,6 +371,8 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                 is_full_snapshot=True,
                 full_snapshot_path_pair_ids={path_pair_id},
                 session_token=session_token,
+                unchanged_root_fingerprints=unchanged_root_fingerprints_by_pair.get(path_pair_id),
+                unchanged_root_fingerprints_by_pair=unchanged_root_fingerprints_by_pair,
             )
             if result_via_control:
                 send_control_message(("result", pair_snapshot))
@@ -386,6 +404,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                 full_snapshot_path_pair_ids=scanned_ids if progress_emitted else set(),
                 is_targeted_scan=scan_target_path_pair_ids is not None,
                 session_token=session_token,
+                unchanged_root_fingerprints_by_pair=unchanged_root_fingerprints_by_pair,
                 duration_aggregates=duration_recorder.snapshot(),
                 duration_aggregate_token=(session_token, generation, performance_diagnostics_generation),
             )
@@ -684,15 +703,19 @@ class ScannerProcess:
         self.__scan_generation += 1
         progress_emitted = False
         progress_files_by_pair: dict[Optional[str], list[SystemFile]] = {}
+        unchanged_root_fingerprints_by_pair: dict[Optional[str], dict[str, str]] = {}
 
         def publish_progress(files: List[SystemFile], path_pair_id: Optional[str], path_pair_name: Optional[str],
-                             root_names: Optional[set[str]], complete: bool) -> None:
+                             root_names: Optional[set[str]], complete: bool,
+                             unchanged_root_fingerprints: Optional[dict[str, str]] = None) -> None:
             nonlocal progress_emitted
             progress_emitted = True
             for system_file in files:
                 system_file.path_pair_id = path_pair_id
                 system_file.path_pair_name = path_pair_name
             progress_files_by_pair.setdefault(path_pair_id, []).extend(files)
+            if unchanged_root_fingerprints:
+                unchanged_root_fingerprints_by_pair.setdefault(path_pair_id, {}).update(unchanged_root_fingerprints)
             assert self.__queue is not None
             self.__publish_result(ScannerResult(
                 datetime.now(), files,
@@ -703,6 +726,9 @@ class ScannerProcess:
                 completed_path_pair_ids={path_pair_id} if complete else set(),
                 is_scan_final=False,
                 session_token=self.__session_token,
+                unchanged_root_fingerprints=unchanged_root_fingerprints,
+                unchanged_root_fingerprints_by_pair=({path_pair_id: unchanged_root_fingerprints}
+                                                     if unchanged_root_fingerprints else None),
             ))
             if complete:
                 self.__publish_result(ScannerResult(
@@ -714,6 +740,8 @@ class ScannerProcess:
                     is_full_snapshot=True,
                     full_snapshot_path_pair_ids={path_pair_id},
                     session_token=self.__session_token,
+                    unchanged_root_fingerprints=unchanged_root_fingerprints_by_pair.get(path_pair_id),
+                    unchanged_root_fingerprints_by_pair=unchanged_root_fingerprints_by_pair,
                 ))
         self.__scanner.set_progress_callback(publish_progress)
         self.__inline_scan_target_path_pair_ids = scan_target_path_pair_ids
@@ -732,7 +760,8 @@ class ScannerProcess:
                                     full_snapshot_path_pair_ids=self.__scanner.scanned_path_pair_ids()
                                     if progress_emitted else set(),
                                     is_targeted_scan=scan_target_path_pair_ids is not None,
-                                    session_token=self.__session_token)
+                                    session_token=self.__session_token,
+                                    unchanged_root_fingerprints_by_pair=unchanged_root_fingerprints_by_pair)
             self.__record_breadcrumb("scan_completed", {"scanner": self.__scanner.__class__.__name__,
                                                           "file_count": len(files),
                                                           "malformed_status_only_file_count": len(malformed),
@@ -1070,6 +1099,12 @@ class ScannerProcess:
                 target_queue.not_empty.notify()
         assert self.__wake_event is not None
         self.__wake_event.set()
+
+    def set_accepted_root_fingerprints(self, fingerprints: object) -> None:
+        """Pass model-owned accepted root digests to the next remote scan."""
+        setter = getattr(self.__scanner, "set_accepted_root_fingerprints", None)
+        if callable(setter):
+            setter(fingerprints)
 
     def prioritize_scan(self, path_pair_id: str) -> None:
         """Move one selected pair ahead of ordinary full-scan work."""

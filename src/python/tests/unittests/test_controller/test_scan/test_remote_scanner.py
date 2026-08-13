@@ -2252,3 +2252,89 @@ class TestRemoteScanner(unittest.TestCase):
             str(ctx.exception)
         )
         self.assertFalse(ctx.exception.recoverable)
+
+    def test_progressive_v2_retains_compact_unchanged_root_marker(self):
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        fingerprint = "a" * 64
+        root_name = "root ' with space"
+        scanner.set_accepted_root_fingerprints({root_name: fingerprint})
+        records = [
+            {"type": "manifest_begin", "count": 1},
+            {"type": "manifest_names", "names": [root_name]},
+            {"type": "manifest_end"},
+            {"type": "root_unchanged", "name": root_name, "fingerprint": fingerprint},
+            {"type": "complete"},
+        ]
+        payload = b"".join(
+            "SEEDSYNC_SCAN_V2\t{}\n".format(json.dumps(record, separators=(",", ":"))).encode()
+            for record in records
+        )
+        commands = []
+        self.mock_ssh.shell_stream = MagicMock(side_effect=lambda command, on_chunk: (
+            commands.append(command), on_chunk(payload), b""
+        )[-1])
+        events = []
+        scanner.set_progress_callback(lambda *args: events.append(args))
+
+        self.assertEqual([], scanner.scan())
+        self.assertIn("--stream-known-root-fingerprints", commands[0])
+        arguments = shlex.split(commands[0])
+        encoded_index = arguments.index("--stream-known-root-fingerprints") + 1
+        self.assertEqual({root_name: fingerprint}, json.loads(arguments[encoded_index]))
+        self.assertIn({root_name: fingerprint}, [event[-1] for event in events if event[-1]])
+
+    def test_legacy_five_argument_progress_callback_falls_back_to_full_roots(self):
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        scanner.set_accepted_root_fingerprints({"root": "a" * 64})
+        commands = []
+        payload = self._framed_stream(["root"])
+        self.mock_ssh.shell_stream = MagicMock(side_effect=lambda command, on_chunk: (
+            commands.append(command), on_chunk(payload), b""
+        )[-1])
+        events = []
+
+        def legacy_callback(files, path_pair_id, path_pair_name, root_names, complete):
+            events.append((files, path_pair_id, path_pair_name, root_names, complete))
+
+        scanner.set_progress_callback(legacy_callback)
+
+        self.assertEqual(["root"], [file.name for file in scanner.scan()])
+        self.assertNotIn("--stream-known-root-fingerprints", commands[0])
+        self.assertTrue(events)
+
+    def test_oversized_root_fingerprint_map_falls_back_to_full_stream(self):
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        scanner.set_accepted_root_fingerprints({
+            "root-{:04d}".format(index): "a" * 64 for index in range(600)
+        })
+        commands = []
+        payload = b"".join(
+            "SEEDSYNC_SCAN_V2\t{}\n".format(json.dumps(record, separators=(",", ":"))).encode()
+            for record in (
+                {"type": "manifest_begin", "count": 0},
+                {"type": "manifest_end"},
+                {"type": "complete"},
+            )
+        )
+        self.mock_ssh.shell_stream = MagicMock(side_effect=lambda command, on_chunk: (
+            commands.append(command), on_chunk(payload), b""
+        )[-1])
+        scanner.set_progress_callback(lambda *args: None)
+
+        self.assertEqual([], scanner.scan())
+        self.assertNotIn("--stream-known-root-fingerprints", commands[0])

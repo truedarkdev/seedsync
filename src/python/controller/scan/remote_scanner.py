@@ -150,6 +150,7 @@ class RemoteScanner(IScanner):
     # stream parsing and active transfer status independent.
     _ROOT_PROGRESS_BATCH_SIZE = 8
     _ROOT_PROGRESS_MAX_AGE_SECONDS = 0.1
+    _MAX_KNOWN_ROOT_FINGERPRINT_BYTES = 32 * 1024
 
     @classmethod
     def _validate_v2_stream_record_bytes(cls, record: bytes) -> None:
@@ -293,6 +294,8 @@ class RemoteScanner(IScanner):
         self.__path_pair_id = path_pair_id
         self.__path_pair_name = path_pair_name
         self.__progress_callback: Optional[ScanProgressCallback] = None
+        self.__progress_callback_supports_fingerprints = False
+        self.__accepted_root_fingerprints: dict[str, str] = {}
 
         # Append scan script name to remote path if not there already
         if self.__is_valid_local_script_path(self.__local_path_to_scan_script) and \
@@ -374,9 +377,42 @@ class RemoteScanner(IScanner):
         state["pending_roots_started_at"] = None
         self.__publish_progress(batch, self.__path_pair_id, self.__path_pair_name, None, False)
 
+    def __flush_pending_unchanged_progress(self, state: dict[str, object]) -> None:
+        """Publish compact retained-root evidence without materializing trees."""
+        pending = cast(dict[str, str], state["pending_unchanged_root_fingerprints"])
+        if not pending:
+            return
+        fingerprints = dict(pending)
+        pending.clear()
+        self.__publish_progress([], self.__path_pair_id, self.__path_pair_name, None, False, fingerprints)
+
+    def set_accepted_root_fingerprints(self, fingerprints: object) -> None:
+        """Set model-owned accepted hints for one future stream generation."""
+        if isinstance(fingerprints, dict) and isinstance(fingerprints.get(self.__path_pair_id), dict):
+            fingerprints = fingerprints[self.__path_pair_id]
+        if not isinstance(fingerprints, dict):
+            self.__accepted_root_fingerprints = {}
+            return
+        self.__accepted_root_fingerprints = {
+            name: fingerprint for name, fingerprint in fingerprints.items()
+            if isinstance(name, str) and isinstance(fingerprint, str) and
+            re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+        }
+
     @overrides(IScanner)
     def set_progress_callback(self, callback: Optional[ScanProgressCallback]) -> None:
         self.__progress_callback = callback
+        self.__progress_callback_supports_fingerprints = False
+        if callback is None:
+            return
+        try:
+            inspect.signature(callback).bind([], None, None, None, False, {})
+            self.__progress_callback_supports_fingerprints = True
+        except (TypeError, ValueError):
+            # A legacy five-argument callback remains supported by using the
+            # established full-tree stream instead of emitting markers it
+            # cannot carry to the accumulator.
+            pass
 
     @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
@@ -410,6 +446,17 @@ class RemoteScanner(IScanner):
             # Run packaged binaries or non-Python shebang helpers directly; Python shebang
             # helpers keep the configured interpreter path.
             stream_args = " --stream --stream-batch-size 64" if self.__progress_callback is not None else ""
+            if stream_args and self.__progress_callback_supports_fingerprints and \
+                    self.__accepted_root_fingerprints:
+                encoded_fingerprints = json.dumps(
+                    self.__accepted_root_fingerprints, sort_keys=True, separators=(",", ":")
+                )
+                # A hint must never make a valid scan exceed shell argument
+                # bounds.  Omit it as a safe full-tree fallback instead.
+                if len(encoded_fingerprints.encode("utf-8")) <= self._MAX_KNOWN_ROOT_FINGERPRINT_BYTES:
+                    stream_args += " --stream-known-root-fingerprints {}".format(
+                        shlex.quote(encoded_fingerprints)
+                    )
             if self.__should_execute_scanfs_directly(self.__local_path_to_scan_script):
                 command = "{}{} {}".format(remote_scanfs_path, stream_args, remote_scan_path)
                 legacy_command = "{} {}".format(remote_scanfs_path, remote_scan_path)
@@ -441,6 +488,7 @@ class RemoteScanner(IScanner):
                     "emitted_root_names": set(),
                     "pending_roots": [],
                     "pending_roots_started_at": None,
+                    "pending_unchanged_root_fingerprints": {},
                     "dialect": None,
                 }
 
@@ -677,6 +725,7 @@ class RemoteScanner(IScanner):
                     # Protocol completion is provisional until the transport
                     # has returned successfully and validated its exit status.
                     self.__flush_pending_root_progress(stream_state)
+                    self.__flush_pending_unchanged_progress(stream_state)
                     self.__publish_progress(
                         [], self.__path_pair_id, self.__path_pair_name,
                         None, True
@@ -876,12 +925,25 @@ class RemoteScanner(IScanner):
             cast(set[str], state["emitted_root_names"]).add(root.name)
             state["next_root_id"] = cast(int, state["next_root_id"]) + 1
             state["current_root"] = None
+        elif record_type == "root_unchanged":
+            name = record.get("name")
+            fingerprint = record.get("fingerprint")
+            if state["dialect"] != "framed" or not state["manifest"] or state["manifest_collecting"] or \
+                    state["current_root"] is not None or not isinstance(name, str) or \
+                    not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint) or \
+                    name not in cast(set[str], state["manifest_names"]) or \
+                    name in cast(set[str], state["emitted_root_names"]):
+                raise TypeError("invalid unchanged scan root")
+            cast(set[str], state["emitted_root_names"]).add(name)
+            pending = cast(dict[str, str], state["pending_unchanged_root_fingerprints"])
+            pending[name] = fingerprint
         elif record_type == "complete":
             if not state["manifest"] or state["manifest_collecting"] or state["current_root"] is not None:
                 raise TypeError("incomplete scan stream")
             state["complete"] = True
             if not state.get("defer_complete", False):
                 self.__flush_pending_root_progress(state)
+                self.__flush_pending_unchanged_progress(state)
                 self.__publish_progress([], self.__path_pair_id, self.__path_pair_name, None, True)
         else:
             raise TypeError("unknown scan stream record")
@@ -937,6 +999,7 @@ class RemoteScanner(IScanner):
             "emitted_root_names": set(),
             "pending_roots": [],
             "pending_roots_started_at": None,
+            "pending_unchanged_root_fingerprints": {},
             "dialect": None,
         }
         for raw_line in output.splitlines(keepends=True):
@@ -950,6 +1013,7 @@ class RemoteScanner(IScanner):
         if not state["manifest"] or not state["complete"]:
             raise TypeError("incomplete scan stream")
         self.__flush_pending_root_progress(state)
+        self.__flush_pending_unchanged_progress(state)
         self.__publish_progress([], self.__path_pair_id, self.__path_pair_name, None, True)
         return remote_files
 

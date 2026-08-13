@@ -957,6 +957,151 @@ class TestModelUpdater(unittest.TestCase):
         ])
         self.assertEqual({("pair", "unchanged.bin")}, accumulator.touched_keys())
 
+    def test_progressive_accumulator_retains_only_matching_unchanged_root_marker(self):
+        accumulator = _ProgressiveScanAccumulator()
+        original = SystemFile("root", 3)
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [original], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        accepted = accumulator.accepted_root_fingerprints()["pair"]["root"]
+
+        with patch("controller.model_updater.stream_root_fingerprint") as fingerprint:
+            retained = accumulator.apply([
+                ScannerResult(
+                    datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=2,
+                    is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                    is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+                    unchanged_root_fingerprints_by_pair={"pair": {"root": accepted}},
+                ),
+            ])
+            fingerprint.assert_not_called()
+        self.assertFalse(retained.failed)
+        self.assertEqual({("pair", "root")}, set(accumulator.snapshot()))
+        self.assertEqual(set(), accumulator.touched_keys())
+
+        rejected = accumulator.apply([
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=3,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+                unchanged_root_fingerprints_by_pair={"pair": {"root": "0" * 64}},
+            ),
+        ])
+        self.assertTrue(rejected.failed)
+        self.assertEqual({("pair", "root")}, set(accumulator.snapshot()))
+        self.assertEqual({"pair"}, accumulator.incomplete_pairs())
+        self.assertNotIn("pair", accumulator.accepted_root_fingerprints())
+
+        recovered = accumulator.apply([
+            ScannerResult(
+                datetime.now(), [SystemFile("root", 3)], scanned_path_pair_ids={"pair"}, generation=4,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        self.assertFalse(recovered.failed)
+        self.assertNotIn("pair", accumulator.incomplete_pairs())
+        self.assertIn("pair", accumulator.accepted_root_fingerprints())
+
+    def test_progressive_accumulator_clears_root_fingerprints_on_new_session(self):
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [SystemFile("root", 3)], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="first",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        self.assertTrue(accumulator.accepted_root_fingerprints())
+        accumulator.set_session_token("restarted")
+        self.assertEqual({}, accumulator.accepted_root_fingerprints())
+
+    def test_progressive_accumulator_failed_hinted_generation_forces_full_retry(self):
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [SystemFile("root", 3)], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        self.assertIn("pair", accumulator.accepted_root_fingerprints())
+
+        failed = accumulator.apply([
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=2,
+                is_progress=True, failed=True, error_message="invalid hinted stream",
+                unknown_path_pair_ids={"pair"}, session_token="session",
+            ),
+        ])
+        self.assertTrue(failed.failed)
+        self.assertNotIn("pair", accumulator.accepted_root_fingerprints())
+        self.assertEqual({("pair", "root")}, set(accumulator.snapshot()))
+
+        recovered = accumulator.apply([
+            ScannerResult(
+                datetime.now(), [SystemFile("root", 3)], scanned_path_pair_ids={"pair"}, generation=3,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        self.assertFalse(recovered.failed)
+        self.assertIn("pair", accumulator.accepted_root_fingerprints())
+
+    def test_progressive_accumulator_pre_manifest_failure_clears_all_hints(self):
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [SystemFile("root-a", 1)], scanned_path_pair_ids={"pair-a"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair-a"}, session_token="session",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+            ),
+            ScannerResult(
+                datetime.now(), [SystemFile("root-b", 1)], scanned_path_pair_ids={"pair-b"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair-b"}, session_token="session",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-b"},
+            ),
+        ])
+        self.assertEqual({"pair-a", "pair-b"}, set(accumulator.accepted_root_fingerprints()))
+
+        failed = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids=set(), generation=2,
+            failed=True, error_message="failure before manifest", session_token="session",
+        )
+        result = accumulator.apply([failed])
+
+        self.assertIs(failed, result)
+        self.assertEqual({}, accumulator.accepted_root_fingerprints())
+        self.assertEqual({("pair-a", "root-a"), ("pair-b", "root-b")}, set(accumulator.snapshot()))
+
+    def test_progressive_accumulator_ignores_stale_unchanged_root_marker(self):
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [SystemFile("root", 3)], scanned_path_pair_ids={"pair"}, generation=2,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        accepted = accumulator.accepted_root_fingerprints()["pair"]["root"]
+
+        result = accumulator.apply([
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+                unchanged_root_fingerprints_by_pair={"pair": {"root": accepted}},
+            ),
+        ])
+
+        self.assertFalse(result.failed)
+        self.assertEqual(set(), result.scanned_path_pair_ids)
+        self.assertEqual({("pair", "root")}, set(accumulator.snapshot()))
+
     def test_progressive_full_snapshot_touches_only_actual_pair_changes(self):
         accumulator = _ProgressiveScanAccumulator()
         original = [

@@ -285,6 +285,12 @@ class MultiPathRemoteScanner(IScanner):
     def set_scan_target_path_pair_ids(self, path_pair_ids: Optional[set[str]]) -> None:
         self.__scan_target_path_pair_ids = None if path_pair_ids is None else set(path_pair_ids)
 
+    def set_accepted_root_fingerprints(self, fingerprints: object) -> None:
+        """Route model-owned accepted root hints to their matching remote pair."""
+        mapping = fingerprints if isinstance(fingerprints, dict) else {}
+        for scanner in self.__scanners:
+            scanner.set_accepted_root_fingerprints(mapping.get(scanner.path_pair_id, {}))
+
     def __getstate__(self) -> dict[str, object]:
         state = self.__dict__.copy()
         state["_MultiPathRemoteScanner__performance_diagnostics"] = None

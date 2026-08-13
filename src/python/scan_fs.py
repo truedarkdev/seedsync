@@ -5,6 +5,7 @@
 # so it must not depend on the local SeedSync package layout.
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -535,6 +536,34 @@ def _stream_shallow_file_data(file: SystemFile) -> SystemFileData:
     return data
 
 
+def stream_root_fingerprint(root: SystemFile) -> str:
+    """Return a deterministic digest of every V2-visible root field.
+
+    This deliberately follows the streamed tree representation rather than
+    directory metadata.  A matching digest therefore means the complete
+    ordered, exclusion-filtered root would decode to the same model input.
+    """
+    digest = hashlib.sha256()
+    next_node_id = 0
+    pending_nodes: List[Tuple[SystemFile, Optional[int]]] = [(root, None)]
+    while pending_nodes:
+        node, parent_id = pending_nodes.pop()
+        node_id = next_node_id
+        next_node_id += 1
+        data = dict(_stream_shallow_file_data(node))
+        # Pair identity is attached by the local receiver after decoding; it
+        # is not part of one remote root's wire/content equality.
+        data.pop("path_pair_id", None)
+        data.pop("path_pair_name", None)
+        record = {"id": node_id, "parent": parent_id, "file": data}
+        digest.update(json.dumps(
+            record, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8"))
+        digest.update(b"\n")
+        pending_nodes.extend((child, node_id) for child in reversed(node.children))
+    return digest.hexdigest()
+
+
 def _encode_stream_record(record: dict) -> str:
     line = _STREAM_PREFIX + json.dumps(record, separators=(",", ":")) + "\n"
     if len(line.encode("utf-8")) > _MAX_STREAM_RECORD_BYTES:
@@ -630,6 +659,8 @@ if __name__ == "__main__":
                         help="Emit bounded SeedSync scan protocol records")
     parser.add_argument("--stream-batch-size", type=int, default=_MAX_STREAM_NODE_BATCH_SIZE,
                         help="Maximum V2 nodes per bounded record")
+    parser.add_argument("--stream-known-root-fingerprints", default=None,
+                        help="Compact JSON map of previously accepted V2 root digests")
     args = parser.parse_args()
 
     scanner = SystemScanner(args.path)
@@ -639,6 +670,18 @@ if __name__ == "__main__":
         if args.stream:
             if args.stream_batch_size < 1 or args.stream_batch_size > _MAX_STREAM_NODE_BATCH_SIZE:
                 parser.error("--stream-batch-size must be between 1 and {}".format(_MAX_STREAM_NODE_BATCH_SIZE))
+            known_fingerprints: dict[str, str] = {}
+            if args.stream_known_root_fingerprints is not None:
+                try:
+                    candidate = json.loads(args.stream_known_root_fingerprints)
+                except json.JSONDecodeError:
+                    parser.error("--stream-known-root-fingerprints must be a JSON object")
+                if not isinstance(candidate, dict) or not all(
+                        isinstance(name, str) and isinstance(fingerprint, str) and
+                        re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+                        for name, fingerprint in candidate.items()):
+                    parser.error("--stream-known-root-fingerprints contains invalid values")
+                known_fingerprints = candidate
             root_names = scanner.root_names()
             _write_stream_manifest(root_names)
             emitted_root_id = 0
@@ -646,8 +689,12 @@ if __name__ == "__main__":
                 root_file = scanner.scan_single_if_present(root_name)
                 if root_file is None:
                     continue
-                _write_stream_root(emitted_root_id, root_file, args.stream_batch_size)
-                emitted_root_id += 1
+                fingerprint = stream_root_fingerprint(root_file)
+                if known_fingerprints.get(root_name) == fingerprint:
+                    _write_stream_record({"type": "root_unchanged", "name": root_name, "fingerprint": fingerprint})
+                else:
+                    _write_stream_root(emitted_root_id, root_file, args.stream_batch_size)
+                    emitted_root_id += 1
             if scanner.scan_had_errors:
                 raise SystemScannerError(
                     "Permission denied while scanning: {}".format(args.path)

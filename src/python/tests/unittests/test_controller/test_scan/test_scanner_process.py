@@ -66,6 +66,23 @@ class ProgressiveScanner(DummyScanner):
         return [SystemFile("a", 1), SystemFile("b", 2)]
 
 
+class FingerprintProgressiveScanner(ProgressiveScanner):
+    def __init__(self):
+        super().__init__()
+        self.accepted = {}
+
+    def set_accepted_root_fingerprints(self, fingerprints):
+        self.accepted = fingerprints
+
+    def scan(self):
+        assert self.callback is not None
+        fingerprints = self.accepted.get(self.path_pair_id, {})
+        self.callback([], self.path_pair_id, self.path_pair_name, {"a"}, False)
+        self.callback([], self.path_pair_id, self.path_pair_name, None, False, fingerprints)
+        self.callback([], self.path_pair_id, self.path_pair_name, None, True)
+        return []
+
+
 class BurstProgressiveScanner(ProgressiveScanner):
     def scan(self):
         assert self.callback is not None
@@ -581,7 +598,12 @@ class TestScannerProcess(unittest.TestCase):
 
         self.process.run_loop()
         self._wait_for_recycled_worker()
-        self.assertTrue(collector.sample_if_due())
+        deadline = time.monotonic() + 2
+        sampled = collector.sample_if_due()
+        while not sampled and time.monotonic() < deadline:
+            time.sleep(0.01)
+            sampled = collector.sample_if_due()
+        self.assertTrue(sampled)
         metrics = collector.snapshot()["samples"][-1]["stage_window"]["metrics"]
         self.assertEqual(1, metrics[DURATION_REMOTE_SCAN_STREAM_PARSING]["count"])
 
@@ -975,6 +997,41 @@ class TestScannerProcess(unittest.TestCase):
         self.assertEqual({"pair"}, results[-1].completed_path_pair_ids)
         self.assertTrue(all(result.generation == 1 for result in results))
         self.assertIsNone(process._ScannerProcess__scan_worker)
+
+    def test_progressive_scan_carries_model_owned_unchanged_root_hint_to_full_snapshot(self):
+        scanner = FingerprintProgressiveScanner()
+        process = ScannerProcess(scanner=scanner, interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+        fingerprint = "a" * 64
+
+        process.set_accepted_root_fingerprints({"pair": {"a": fingerprint}})
+        process.run_loop()
+        results = process.pop_results()
+
+        self.assertEqual({"pair": {"a": fingerprint}}, scanner.accepted)
+        marker_events = [result for result in results if result.unchanged_root_fingerprints]
+        self.assertTrue(marker_events)
+        self.assertTrue(all(result.unchanged_root_fingerprints == {"a": fingerprint}
+                            for result in marker_events))
+        final = next(result for result in results if result.is_full_snapshot)
+        self.assertEqual({"pair": {"a": fingerprint}}, final.unchanged_root_fingerprints_by_pair)
+
+    def test_multi_path_scanner_routes_root_fingerprints_only_to_matching_pair(self):
+        first = MagicMock()
+        first.path_pair_id = "pair-a"
+        second = MagicMock()
+        second.path_pair_id = "pair-b"
+        scanner = MultiPathRemoteScanner([first, second])
+        fingerprints = {
+            "pair-a": {"root-a": "a" * 64},
+            "pair-b": {"root-b": "b" * 64},
+            "unrelated": {"root-c": "c" * 64},
+        }
+
+        scanner.set_accepted_root_fingerprints(fingerprints)
+
+        first.set_accepted_root_fingerprints.assert_called_once_with(fingerprints["pair-a"])
+        second.set_accepted_root_fingerprints.assert_called_once_with(fingerprints["pair-b"])
 
     def test_burst_progressive_queue_preserves_lossless_final_snapshot(self):
         process = ScannerProcess(scanner=BurstProgressiveScanner(), interval_in_ms=0, verbose=False)
