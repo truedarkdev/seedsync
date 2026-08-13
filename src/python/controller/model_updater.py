@@ -155,6 +155,31 @@ class _MoveRetryRebuildGate:
         return recovery_ids
 
 
+class _CandidateLifecycleFallback:
+    """Make staged pair authority durable if its shared lifecycle raises."""
+
+    def __init__(self, model_builder: ModelBuilder, pair_build: object, committer: object):
+        self._model_builder = model_builder
+        self._pair_build = pair_build
+        self._committer = committer
+
+    def __enter__(self) -> "_CandidateLifecycleFallback":
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        if exc_type is None or self._pair_build is None:
+            return False
+        try:
+            if callable(self._committer):
+                self._committer(self._pair_build)
+            else:
+                self._model_builder.request_rebuild()
+        except Exception:
+            # Preserve the original lifecycle exception and its traceback.
+            pass
+        return False
+
+
 def _request_model_rebuild(model_builder: ModelBuilder, diagnostics: object, reason: str) -> None:
     """Invalidate the builder and increment one fixed, bounded reason counter."""
     model_builder.request_rebuild()
@@ -228,12 +253,12 @@ class _ProgressiveScanAccumulator:
 
     def __init__(self) -> None:
         self.__session_token: Optional[str] = None
-        self.__committed: dict[tuple[Optional[str], str], SystemFile] = {}
+        self.__committed_by_pair: dict[Optional[str], dict[str, SystemFile]] = {}
         self.__working: dict[int, dict[Optional[str], dict[str, SystemFile]]] = {}
         self.__manifests: dict[int, dict[Optional[str], Optional[set[str]]]] = {}
         self.__active_generation: dict[Optional[str], int] = {}
         self.__failed_pairs: set[tuple[int, Optional[str]]] = set()
-        self.__authoritative: dict[tuple[Optional[str], str], Optional[SystemFile]] = {}
+        self.__authoritative_by_pair: dict[Optional[str], dict[str, Optional[SystemFile]]] = {}
         self.__incomplete_pairs: set[Optional[str]] = set()
         self.__completed_pairs: set[Optional[str]] = set()
         self.__session_has_progressive_evidence = False
@@ -251,7 +276,7 @@ class _ProgressiveScanAccumulator:
         self.__active_generation.clear()
         self.__failed_pairs.clear()
         self.__incomplete_pairs.clear()
-        self.__authoritative.clear()
+        self.__authoritative_by_pair.clear()
         self.__completed_pairs.clear()
         self.__session_has_progressive_evidence = False
         self.__last_touched_keys.clear()
@@ -347,16 +372,16 @@ class _ProgressiveScanAccumulator:
                 self.__active_generation[pair_id] = latest_generation
                 self.__completed_pairs.add(pair_id)
                 self.__incomplete_pairs.discard(pair_id)
-                for key in [key for key in self.__committed if key[0] == pair_id]:
-                    self.__last_touched_keys.add(key)
-                    self.__committed.pop(key, None)
-                    self.__authoritative.pop(key, None)
+                for name in self.__committed_by_pair.get(pair_id, {}):
+                    self.__last_touched_keys.add((pair_id, name))
+                self.__committed_by_pair.pop(pair_id, None)
+                self.__authoritative_by_pair.pop(pair_id, None)
             for file in latest.files:
                 pair_id = file.path_pair_id if file.path_pair_id in selected_ids else (
                     next(iter(selected_ids)) if len(selected_ids) == 1 else file.path_pair_id
                 )
-                self.__committed[(pair_id, file.name)] = file
-                self.__authoritative[(pair_id, file.name)] = file
+                self.__committed_by_pair.setdefault(pair_id, {})[file.name] = file
+                self.__authoritative_by_pair.setdefault(pair_id, {})[file.name] = file
                 self.__last_touched_keys.add((pair_id, file.name))
             return latest
         accepted = [
@@ -402,20 +427,15 @@ class _ProgressiveScanAccumulator:
                                 self.__working.pop(old_generation, None)
                             if not self.__manifests.get(old_generation):
                                 self.__manifests.pop(old_generation, None)
-                    previous = {
-                        name: file for (stored_pair, name), file in self.__committed.items()
-                        if stored_pair == pair_id
-                    }
+                    previous = dict(self.__committed_by_pair.get(pair_id, {}))
                     self.__working.setdefault(generation, {})[pair_id] = previous
                     self.__manifests.setdefault(generation, {})[pair_id] = None
                     self.__failed_pairs.discard((generation, pair_id))
-                    for key in [key for key in self.__authoritative if key[0] == pair_id]:
-                        self.__authoritative.pop(key, None)
+                    self.__authoritative_by_pair.pop(pair_id, None)
                 touched.add(pair_id)
                 if event.failed:
                     self.__failed_pairs.add((generation, pair_id))
-                    for key in [key for key in self.__authoritative if key[0] == pair_id]:
-                        self.__authoritative.pop(key, None)
+                    self.__authoritative_by_pair.pop(pair_id, None)
                     failed = True
                     error_message = event.error_message
                     self.__incomplete_pairs.add(pair_id)
@@ -437,17 +457,18 @@ class _ProgressiveScanAccumulator:
                     # establish that a previously committed root is absent.
                     # Only the lossless aggregate below may replace a pair.
                     if full_snapshot:
-                        for key in [key for key in self.__committed if key[0] == pair_id]:
-                            if key[1] not in manifest:
-                                self.__authoritative[key] = None
+                        authoritative_pair = self.__authoritative_by_pair.setdefault(pair_id, {})
+                        for name in self.__committed_by_pair.get(pair_id, {}):
+                            if name not in manifest:
+                                authoritative_pair[name] = None
                             else:
-                                self.__authoritative.pop(key, None)
+                                authoritative_pair.pop(name, None)
                 for file in event.files:
                     file_pair = self.__pair_for_file(file, event)
                     if file_pair != pair_id and len(ids) > 1:
                         continue
                     working[file.name] = file
-                    self.__authoritative[(pair_id, file.name)] = file
+                    self.__authoritative_by_pair.setdefault(pair_id, {})[file.name] = file
                     self.__last_touched_keys.add((pair_id, file.name))
                 if full_snapshot:
                     self.__manifests.setdefault(generation, {})[pair_id] = set(working)
@@ -457,7 +478,7 @@ class _ProgressiveScanAccumulator:
                 # lossless full snapshot is the authority boundary.
                 if full_snapshot and pair_id in event.completed_path_pair_ids:
                     self.__last_touched_keys.update(
-                        key for key in self.__committed if key[0] == pair_id
+                        (pair_id, name) for name in self.__committed_by_pair.get(pair_id, {})
                     )
                     self.__last_touched_keys.update(
                         (pair_id, name) for name in working
@@ -468,17 +489,21 @@ class _ProgressiveScanAccumulator:
                             if name not in manifest_names:
                                 working.pop(name, None)
                         for name in manifest_names:
-                            self.__authoritative.setdefault((pair_id, name), None)
+                            self.__authoritative_by_pair.setdefault(pair_id, {}).setdefault(name, None)
                     for name, file in working.items():
-                        self.__committed[(pair_id, name)] = file
-                    for key in [key for key in self.__committed if key[0] == pair_id and key[1] not in working]:
-                        self.__committed.pop(key, None)
-                        self.__authoritative.pop(key, None)
+                        self.__committed_by_pair.setdefault(pair_id, {})[name] = file
+                    for name in [name for name in self.__committed_by_pair.get(pair_id, {}) if name not in working]:
+                        self.__committed_by_pair[pair_id].pop(name, None)
+                        self.__authoritative_by_pair.get(pair_id, {}).pop(name, None)
                     completed.add(pair_id)
                     self.__incomplete_pairs.discard(pair_id)
                     self.__completed_pairs.add(pair_id)
 
-        visible: dict[tuple[Optional[str], str], SystemFile] = dict(self.__committed)
+        visible: dict[tuple[Optional[str], str], SystemFile] = {
+            (pair_id, name): file
+            for pair_id, files in self.__committed_by_pair.items()
+            for name, file in files.items()
+        }
         for generation, pair_maps in self.__working.items():
             for pair_id, files in pair_maps.items():
                 if self.__active_generation.get(pair_id) != generation:
@@ -507,9 +532,21 @@ class _ProgressiveScanAccumulator:
         )
 
     def snapshot(self) -> dict[tuple[Optional[str], str], SystemFile]:
-        visible: dict[tuple[Optional[str], str], SystemFile] = dict(self.__committed)
+        return self.snapshot_for_pairs(None)
+
+    def snapshot_for_pairs(
+            self, pair_ids: Optional[set[Optional[str]]],
+    ) -> dict[tuple[Optional[str], str], SystemFile]:
+        visible: dict[tuple[Optional[str], str], SystemFile] = {
+            (pair_id, name): file
+            for pair_id, files in self.__committed_by_pair.items()
+            if pair_ids is None or pair_id in pair_ids
+            for name, file in files.items()
+        }
         for generation, pair_maps in self.__working.items():
             for pair_id, files in pair_maps.items():
+                if pair_ids is not None and pair_id not in pair_ids:
+                    continue
                 if self.__active_generation.get(pair_id) != generation:
                     continue
                 if (generation, pair_id) in self.__failed_pairs:
@@ -519,7 +556,17 @@ class _ProgressiveScanAccumulator:
         return visible
 
     def authority(self) -> dict[tuple[Optional[str], str], Optional[SystemFile]]:
-        return dict(self.__authoritative)
+        return self.authority_for_pairs(None)
+
+    def authority_for_pairs(
+            self, pair_ids: Optional[set[Optional[str]]],
+    ) -> dict[tuple[Optional[str], str], Optional[SystemFile]]:
+        return {
+            (pair_id, name): file
+            for pair_id, files in self.__authoritative_by_pair.items()
+            if pair_ids is None or pair_id in pair_ids
+            for name, file in files.items()
+        }
 
     def incomplete_pairs(self) -> set[Optional[str]]:
         return set(self.__incomplete_pairs)
@@ -540,8 +587,11 @@ class _JointProgressiveReconciler:
     """Gate new roots until local and remote evidence agree for that root."""
 
     def __init__(self) -> None:
-        self.__published: dict[
-            tuple[Optional[str], str], tuple[Optional[SystemFile], Optional[SystemFile]]
+        # This is the reconciler's sole published scan authority.  Keep it by
+        # pair so a completed pair can replace its own roots without walking
+        # every unrelated completed pair.
+        self.__published_by_pair: dict[
+            Optional[str], dict[str, tuple[Optional[SystemFile], Optional[SystemFile]]]
         ] = {}
 
     def __reconcile(
@@ -560,7 +610,11 @@ class _JointProgressiveReconciler:
     ) -> tuple[list[SystemFile], list[SystemFile], set[Optional[str]]]:
         remote_excluded_keys = remote_excluded_keys or set()
         if candidate_keys is None:
-            keys = set(self.__published)
+            keys = {
+                (pair_id, name)
+                for pair_id, files in self.__published_by_pair.items()
+                for name in files
+            }
             keys.update(local_snapshot)
             keys.update(remote_snapshot)
             keys.update(local_authority)
@@ -573,9 +627,9 @@ class _JointProgressiveReconciler:
             if (pair_id, name) in remote_excluded_keys:
                 local_file = local_authority.get((pair_id, name), local_snapshot.get((pair_id, name)))
                 if local_file is None:
-                    self.__published.pop((pair_id, name), None)
+                    self.__published_by_pair.get(pair_id, {}).pop(name, None)
                 else:
-                    self.__published[(pair_id, name)] = (local_file, None)
+                    self.__published_by_pair.setdefault(pair_id, {})[name] = (local_file, None)
                 continue
             local_known = (pair_id, name) in local_authority or pair_id in local_completed
             remote_known = (pair_id, name) in remote_authority or pair_id in remote_completed
@@ -584,17 +638,17 @@ class _JointProgressiveReconciler:
             local_file = local_authority.get((pair_id, name))
             remote_file = remote_authority.get((pair_id, name))
             if local_file is None and remote_file is None:
-                self.__published.pop((pair_id, name), None)
+                self.__published_by_pair.get(pair_id, {}).pop(name, None)
             else:
-                self.__published[(pair_id, name)] = (local_file, remote_file)
+                self.__published_by_pair.setdefault(pair_id, {})[name] = (local_file, remote_file)
 
         local_files: list[SystemFile] = []
         remote_files: list[SystemFile] = []
-        output_keys = set(self.__published) if candidate_keys is None else set(candidate_keys)
+        output_keys = keys if candidate_keys is None else set(candidate_keys)
         for pair_id, name in output_keys:
             if pair_id not in enabled_pair_ids:
                 continue
-            published = self.__published.get((pair_id, name))
+            published = self.__published_by_pair.get(pair_id, {}).get(name)
             if published is None:
                 continue
             local_file, remote_file = published
@@ -645,6 +699,36 @@ class _JointProgressiveReconciler:
             local_snapshot, local_authority, local_incomplete, local_completed,
             remote_snapshot, remote_authority, remote_incomplete, remote_completed,
             enabled_pair_ids, remote_excluded_keys, candidate_keys,
+        )
+
+    def reconcile_pairs(
+        self,
+        local_snapshot: dict[tuple[Optional[str], str], SystemFile],
+        local_authority: dict[tuple[Optional[str], str], Optional[SystemFile]],
+        local_incomplete: set[Optional[str]],
+        local_completed: set[Optional[str]],
+        remote_snapshot: dict[tuple[Optional[str], str], SystemFile],
+        remote_authority: dict[tuple[Optional[str], str], Optional[SystemFile]],
+        remote_incomplete: set[Optional[str]],
+        remote_completed: set[Optional[str]],
+        enabled_pair_ids: set[Optional[str]],
+        pair_ids: set[Optional[str]],
+        remote_excluded_keys: Optional[set[tuple[Optional[str], str]]] = None,
+    ) -> tuple[list[SystemFile], list[SystemFile], set[Optional[str]]]:
+        """Reconcile selected authoritative pair buckets without global lookup."""
+        candidate_keys = {
+            (pair_id, name)
+            for pair_id in pair_ids
+            for name in self.__published_by_pair.get(pair_id, {})
+        }
+        candidate_keys.update(local_snapshot)
+        candidate_keys.update(local_authority)
+        candidate_keys.update(remote_snapshot)
+        candidate_keys.update(remote_authority)
+        return self.reconcile_delta(
+            local_snapshot, local_authority, local_incomplete, local_completed,
+            remote_snapshot, remote_authority, remote_incomplete, remote_completed,
+            enabled_pair_ids, candidate_keys, remote_excluded_keys,
         )
 
 
@@ -1385,10 +1469,35 @@ class ModelUpdater(_ControllerCoreAccess):
             joint_reconciler = _JointProgressiveReconciler()
             controller._Controller__progressive_joint_reconciler = joint_reconciler
 
-        def side_state(side: str, result: Optional[ScannerResult]):
+        final_event_pair_ids: set[Optional[str]] = set()
+        for result in (latest_local_scan, latest_remote_scan):
+            if result is not None and bool(getattr(result, "is_scan_final", True)) and \
+                    not bool(getattr(result, "failed", False)) and \
+                    not bool(getattr(result, "unknown_path_pair_ids", set())):
+                final_event_pair_ids.update(getattr(result, "completed_path_pair_ids", set()))
+        scoped_final_pair_ids: Optional[set[Optional[str]]] = (
+            final_event_pair_ids
+            if bool(getattr(controller, "_Controller__progressive_joint_authoritative", False))
+            and len(final_event_pair_ids) == 1 and callable(getattr(
+                type(model_builder), "build_authoritative_pair_roots", None
+            )) else None
+        )
+        # A compatibility builder or multi-pair final without the declared
+        # single-pair transaction never
+        # enters pair-scoped reconciliation.  Its established whole-source
+        # setters below therefore receive the reconciler's full authority,
+        # including retained unrelated pairs.
+
+        def side_state(
+                side: str, result: Optional[ScannerResult],
+                pair_ids: Optional[set[Optional[str]]] = None,
+        ):
             accumulator = getattr(controller, "_Controller__progressive_{}_scan_state".format(side), None)
             if isinstance(accumulator, _ProgressiveScanAccumulator):
-                return accumulator.snapshot(), accumulator.authority(), accumulator.incomplete_pairs(), accumulator.completed_pairs()
+                return (
+                    accumulator.snapshot_for_pairs(pair_ids), accumulator.authority_for_pairs(pair_ids),
+                    accumulator.incomplete_pairs(), accumulator.completed_pairs(),
+                )
             if result is None or bool(getattr(result, "failed", False)):
                 return {}, {}, set(getattr(result, "scanned_path_pair_ids", {None})) if result is not None else set(), set()
             snapshot = {(file.path_pair_id, file.name): file for file in result.files}
@@ -1428,10 +1537,10 @@ class ModelUpdater(_ControllerCoreAccess):
             if progressive_scan_event_arrived or not bool(
                     getattr(controller, "_Controller__progressive_joint_authoritative", False)):
                 local_snapshot, local_authority, local_incomplete, local_completed = side_state(
-                    "local", latest_local_scan
+                    "local", latest_local_scan, scoped_final_pair_ids
                 )
                 remote_snapshot, remote_authority, remote_incomplete, remote_completed = side_state(
-                    "remote", latest_remote_scan
+                    "remote", latest_remote_scan, scoped_final_pair_ids
                 )
                 remote_snapshot, remote_authority, joint_remote_excluded_keys = _filter_progressive_remote_state(
                     remote_snapshot,
@@ -1472,14 +1581,24 @@ class ModelUpdater(_ControllerCoreAccess):
         remote_scan_final_relevant = scan_final_relevant("remote", latest_remote_scan)
         local_scan_final_relevant = scan_final_relevant("local", latest_local_scan)
         joint_reconciliation_final = remote_scan_final_relevant and local_scan_final_relevant \
-            and not joint_unknown_local_ids \
+            and (not joint_unknown_local_ids or (
+                scoped_final_pair_ids is not None and
+                not joint_unknown_local_ids.intersection(scoped_final_pair_ids)
+            )) \
             and (not progressive_mode or progressive_scan_event_arrived)
         if progressive_mode and joint_reconciler is not None and joint_reconciliation_final:
-            joint_local_files, joint_remote_files, joint_unknown_local_ids = joint_reconciler.reconcile(
-                local_snapshot, local_authority, local_incomplete, local_completed,
-                remote_snapshot, remote_authority, remote_incomplete, remote_completed,
-                enabled_pair_ids, joint_remote_excluded_keys,
-            )
+            if scoped_final_pair_ids:
+                joint_local_files, joint_remote_files, joint_unknown_local_ids = joint_reconciler.reconcile_pairs(
+                    local_snapshot, local_authority, local_incomplete, local_completed,
+                    remote_snapshot, remote_authority, remote_incomplete, remote_completed,
+                    enabled_pair_ids, scoped_final_pair_ids, joint_remote_excluded_keys,
+                )
+            else:
+                joint_local_files, joint_remote_files, joint_unknown_local_ids = joint_reconciler.reconcile(
+                    local_snapshot, local_authority, local_incomplete, local_completed,
+                    remote_snapshot, remote_authority, remote_incomplete, remote_completed,
+                    enabled_pair_ids, joint_remote_excluded_keys,
+                )
         progressive_joint_first_partial_publication = (
             progressive_mode
             and not joint_reconciliation_final
@@ -1768,6 +1887,8 @@ class ModelUpdater(_ControllerCoreAccess):
 
         stage_timer.switch(DURATION_MODEL_UPDATE_BUILDER_SYNC)
         # Update model builder state.
+        authoritative_pair_delta_builds: list[object] = []
+        authoritative_pair_fallback_required = False
         remote_files: list[SystemFile] = []
         if latest_remote_scan is not None:
             record_scan_result_attribution("remote", latest_remote_scan)
@@ -1871,10 +1992,57 @@ class ModelUpdater(_ControllerCoreAccess):
         if progressive_mode and joint_reconciler is not None:
             if progressive_joint_publication_allowed:
                 if joint_reconciliation_final:
-                    model_builder.set_local_files(joint_local_files)
-                    model_builder.set_remote_files(joint_remote_files)
+                    # A later completed progressive scan can replace exactly
+                    # one pair.  Stage that source replacement here; actual
+                    # mutation/adoption occurs beside model publication below.
+                    # Any uncertain shape retains the existing whole-source
+                    # setters and global rebuild path.
+                    pair_delta_builder = getattr(model_builder, "build_authoritative_pair_roots", None)
+                    # ``MagicMock`` fabricates arbitrary callable attributes;
+                    # require a declared class capability so tests and legacy
+                    # adapters retain the conservative whole-source path.
+                    pair_delta_capable = callable(getattr(
+                        type(model_builder), "build_authoritative_pair_roots", None
+                    ))
+                    if scoped_final_pair_ids and pair_delta_capable and callable(pair_delta_builder):
+                        for pair_id in scoped_final_pair_ids:
+                            try:
+                                pair_build = pair_delta_builder(
+                                    pair_id,
+                                    [file for file in joint_local_files if file.path_pair_id == pair_id],
+                                    [file for file in joint_remote_files if file.path_pair_id == pair_id],
+                                    joint_unknown_local_ids,
+                                )
+                            except Exception:
+                                pair_build = None
+                            if pair_build is None:
+                                authoritative_pair_delta_builds = []
+                                authoritative_pair_fallback_required = True
+                                break
+                            authoritative_pair_delta_builds.append(pair_build)
+                    if authoritative_pair_fallback_required:
+                        pair_fallback_replacer = getattr(
+                            model_builder, "replace_completed_pair_sources_for_full_rebuild", None
+                        )
+                        if callable(pair_fallback_replacer):
+                            for pair_id in scoped_final_pair_ids or set():
+                                pair_fallback_replacer(
+                                    pair_id,
+                                    [file for file in joint_local_files if file.path_pair_id == pair_id],
+                                    [file for file in joint_remote_files if file.path_pair_id == pair_id],
+                                    joint_unknown_local_ids,
+                                )
+                        else:
+                            # A legacy builder cannot preserve pair buckets;
+                            # retain its established whole-source adapter.
+                            model_builder.set_local_files(joint_local_files)
+                            model_builder.set_remote_files(joint_remote_files)
+                    elif not authoritative_pair_delta_builds:
+                        model_builder.set_local_files(joint_local_files)
+                        model_builder.set_remote_files(joint_remote_files)
                     setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
-                    if callable(setter_unknown_local):
+                    if (not authoritative_pair_delta_builds or authoritative_pair_fallback_required) and \
+                            callable(setter_unknown_local):
                         setter_unknown_local(joint_unknown_local_ids)
                 if progressive_joint_first_partial_publication:
                     controller._Controller__progressive_joint_first_publication = True
@@ -2235,13 +2403,6 @@ class ModelUpdater(_ControllerCoreAccess):
             and progressive_joint_partial_publication
             and progressive_joint_publication_allowed
             and not lftp_statuses
-            and not controller._Controller__active_downloading_file_names
-            and not controller._Controller__active_extracting_file_names
-            and not controller._Controller__pending_completion_file_names
-            and latest_extract_statuses is None
-            and latest_validation_statuses is None
-            and not latest_extracted_results
-            and not latest_failed_results
             and not model_builder.has_changes()
         )
         if progressive_delta_eligible:
@@ -2295,6 +2456,70 @@ class ModelUpdater(_ControllerCoreAccess):
                 except Exception:
                     pass
 
+        # A completed progressive pair may replace roots, so render it in
+        # isolation and compose a temporary complete candidate from the live
+        # unrelated root objects.  The established full lifecycle below then
+        # owns every publication side effect; this path only changes how its
+        # candidate is rendered.
+        authoritative_pair_delta_applied = False
+        authoritative_pair_candidate = None
+        authoritative_pair_build = None
+        pair_fallback_committer = getattr(
+            model_builder, "commit_authoritative_pair_sources_for_full_rebuild", None
+        )
+        pair_authorizer = getattr(model_builder, "authorize_authoritative_pair_delta", None)
+        pair_adopter = getattr(model_builder, "adopt_authoritative_pair_delta", None)
+        if authoritative_pair_delta_builds:
+            # The staged transaction is intentionally one non-legacy pair.
+            # Startup recovery consumes global remote authority, so it retains
+            # the ordinary full build until that lifecycle is complete.
+            pair_build = authoritative_pair_delta_builds[0] \
+                if len(authoritative_pair_delta_builds) == 1 else None
+            pair_safe = pair_build is not None and pair_build.path_pair_id is not None and \
+                bool(getattr(controller, "_Controller__startup_recovery_done", False)) and \
+                callable(pair_authorizer) and callable(pair_adopter)
+
+            def tree_file_count(file: ModelFile) -> int:
+                return 1 + sum(tree_file_count(child) for child in file.get_children())
+
+            if pair_safe:
+                try:
+                    with controller._Controller__model_lock:
+                        def root_exists(file_id: str) -> bool:
+                            try:
+                                model.get_file(file_id)
+                                return True
+                            except ModelError:
+                                return False
+
+                        if not pair_authorizer(root_exists, pair_build) or pair_build.model is None:
+                            pair_safe = False
+                        else:
+                            previous_root_ids = set(pair_build.previous_local_files).union(
+                                pair_build.previous_remote_files
+                            )
+                            selected_roots = tuple(pair_build.model.iter_files())
+                            next_tree_count = getattr(model, "tree_file_count", 0)
+                            next_tree_count = next_tree_count if type(next_tree_count) is int else 0
+                            for file_id in previous_root_ids:
+                                next_tree_count -= tree_file_count(model.get_file(file_id))
+                            next_tree_count += sum(tree_file_count(file) for file in selected_roots)
+                            authoritative_pair_candidate = Model.compose_candidate(
+                                model, previous_root_ids, selected_roots, max(0, next_tree_count),
+                            )
+                            authoritative_pair_build = pair_build
+                except Exception:
+                    pair_safe = False
+                    authoritative_pair_candidate = None
+                    authoritative_pair_build = None
+            if not pair_safe:
+                if callable(pair_fallback_committer):
+                    for staged_pair_build in authoritative_pair_delta_builds:
+                        pair_fallback_committer(staged_pair_build)
+                else:
+                    model_builder.request_rebuild()
+                authoritative_pair_delta_builds = []
+
         # A live transfer status is the only input that can safely repaint an
         # already-visible root without walking the rest of the model.  The
         # builder owns the invalidation contract; any scan, marker, lifecycle,
@@ -2307,7 +2532,7 @@ class ModelUpdater(_ControllerCoreAccess):
         active_delta_authorizer = getattr(model_builder, "authorize_active_transfer_delta", None)
         active_delta_adopter = getattr(model_builder, "adopt_active_transfer_delta", None)
         active_delta_file_ids: Optional[set[str]] = None
-        if callable(active_delta_pending) and bool(active_delta_pending()) and \
+        if authoritative_pair_candidate is None and callable(active_delta_pending) and bool(active_delta_pending()) and \
                 callable(active_delta_selector) and callable(active_delta_builder) and \
                 callable(active_delta_authorizer) and callable(active_delta_adopter):
             try:
@@ -2388,21 +2613,29 @@ class ModelUpdater(_ControllerCoreAccess):
                 except Exception:
                     pass
 
-        full_build_triggered = model_builder.has_changes() and not progressive_delta_eligible
+        candidate_lifecycle_triggered = authoritative_pair_candidate is not None
+        full_build_triggered = candidate_lifecycle_triggered or (
+            model_builder.has_changes() and not progressive_delta_eligible and \
+            not authoritative_pair_delta_applied
+        )
+        global_full_build_triggered = full_build_triggered and not candidate_lifecycle_triggered
         if full_build_triggered:
             diagnostics = getattr(getattr(controller, "_Controller__context", None), "performance_diagnostics", None)
-            try:
-                started_at = diagnostics.begin_duration(DURATION_MODEL_BUILD) if diagnostics is not None else None
-            except Exception:
-                started_at = None
-            try:
-                new_model = model_builder.build_model()
-            finally:
-                if diagnostics is not None:
-                    try:
-                        diagnostics.finish_duration(DURATION_MODEL_BUILD, started_at)
-                    except Exception:
-                        pass
+            if candidate_lifecycle_triggered:
+                new_model = authoritative_pair_candidate
+            else:
+                try:
+                    started_at = diagnostics.begin_duration(DURATION_MODEL_BUILD) if diagnostics is not None else None
+                except Exception:
+                    started_at = None
+                try:
+                    new_model = model_builder.build_model()
+                finally:
+                    if diagnostics is not None:
+                        try:
+                            diagnostics.finish_duration(DURATION_MODEL_BUILD, started_at)
+                        except Exception:
+                            pass
             # A small set of completion side effects is applied directly to
             # the model objects from this build.  If those setters invalidate
             # the builder cache, retain their exact event tokens for adoption;
@@ -2412,7 +2645,47 @@ class ModelUpdater(_ControllerCoreAccess):
                 model_builder, "invalidation_token_matches_file", None
             )
 
-            with controller._Controller__model_lock:
+            def candidate_pair_id(file_id: str) -> Optional[str]:
+                try:
+                    value = json.loads(file_id)
+                except (TypeError, ValueError):
+                    return None
+                return value[0] if isinstance(value, list) and len(value) == 2 and \
+                    isinstance(value[0], str) and isinstance(value[1], str) else None
+
+            def candidate_complete_local_coverage(file_id: str) -> bool:
+                if authoritative_pair_build is not None and \
+                        candidate_pair_id(file_id) == authoritative_pair_build.path_pair_id:
+                    return file_id in authoritative_pair_build.complete_local_coverage_file_ids
+                return model_builder.has_complete_local_coverage(file_id)
+
+            def candidate_terminalizable_collision_file_ids() -> set[str]:
+                cached = model_builder.get_terminalizable_staging_collision_file_ids()
+                if authoritative_pair_build is None:
+                    return cached
+                selected_pair_id = authoritative_pair_build.path_pair_id
+                return {
+                    file_id for file_id in cached if candidate_pair_id(file_id) != selected_pair_id
+                }.union(authoritative_pair_build.terminalizable_staging_collision_file_ids)
+
+            def candidate_lifecycle_allows(file_id: str) -> bool:
+                return authoritative_pair_build is None or \
+                    candidate_pair_id(file_id) == authoritative_pair_build.path_pair_id
+
+            unrelated_candidate_lifecycle_work_deferred = False
+
+            def defer_unrelated_candidate_lifecycle_work() -> None:
+                nonlocal unrelated_candidate_lifecycle_work_deferred
+                if authoritative_pair_build is None or unrelated_candidate_lifecycle_work_deferred:
+                    return
+                # Reused unrelated roots must not receive unversioned in-place
+                # lifecycle mutations. Keep their established global path
+                # dirty after this selected pair publishes.
+                unrelated_candidate_lifecycle_work_deferred = True
+
+            with _CandidateLifecycleFallback(
+                    model_builder, authoritative_pair_build, pair_fallback_committer,
+            ), controller._Controller__model_lock:
                 def pending_completion_file_ids():
                     return {
                         ModelFile.build_file_id(file_name, path_pair_id)
@@ -2536,15 +2809,22 @@ class ModelUpdater(_ControllerCoreAccess):
                     controller._Controller__pending_completion_progress_floors.pop(file.file_id, None)
 
                 def run_reserved_automatic_move(file: ModelFile):
-                    if not controller._reserve_move_attempt(file.file_id):
+                    reserve_move = getattr(controller, "_reserve_move_attempt", None)
+                    release_move = getattr(controller, "_release_move_attempt", None)
+                    move_from_staging = getattr(controller, "_Controller__move_from_staging", None)
+                    # Lightweight legacy controller adapters can render the
+                    # candidate but do not implement the real move boundary.
+                    # Production Controllers always expose all three methods.
+                    if not callable(reserve_move) or not callable(release_move) or \
+                            not callable(move_from_staging) or not reserve_move(file.file_id):
                         return None
                     try:
-                        return controller._Controller__move_from_staging(
+                        return move_from_staging(
                             file.name,
                             file.path_pair_id,
                         )
                     finally:
-                        controller._release_move_attempt(file.file_id)
+                        release_move(file.file_id)
 
                 terminalized_collision_file_ids: set[str] = set()
 
@@ -2587,11 +2867,20 @@ class ModelUpdater(_ControllerCoreAccess):
                 # effective-local tree per candidate, before diffing so the
                 # MOVE_FAILED mutation itself becomes visible to listeners.
                 pending_file_ids = pending_completion_file_ids()
-                terminalizable_collision_file_ids = \
-                    model_builder.get_terminalizable_staging_collision_file_ids()
-                terminal_collision_candidate_ids = pending_file_ids.union(
-                    terminalizable_collision_file_ids
-                )
+                all_terminalizable_collision_file_ids = candidate_terminalizable_collision_file_ids()
+                terminalizable_collision_file_ids = {
+                    file_id for file_id in all_terminalizable_collision_file_ids
+                    if candidate_lifecycle_allows(file_id)
+                }
+                terminal_collision_candidate_ids = {
+                    file_id for file_id in pending_file_ids.union(
+                        terminalizable_collision_file_ids
+                    ) if candidate_lifecycle_allows(file_id)
+                }
+                if all_terminalizable_collision_file_ids.difference(
+                        terminalizable_collision_file_ids
+                ):
+                    defer_unrelated_candidate_lifecycle_work()
                 live_lftp_file_ids = {
                     status.file_id for status in (lftp_statuses or [])
                 }
@@ -2621,6 +2910,10 @@ class ModelUpdater(_ControllerCoreAccess):
                 attempted_move_file_ids: set[str] = set()
 
                 for file_id, count in persist.move_failure_counts.items():
+                    if not candidate_lifecycle_allows(file_id):
+                        if 0 < count < controller._Controller__MAX_MOVE_FAILURES:
+                            defer_unrelated_candidate_lifecycle_work()
+                        continue
                     if count <= 0 or count >= controller._Controller__MAX_MOVE_FAILURES:
                         continue
                     try:
@@ -2707,7 +3000,7 @@ class ModelUpdater(_ControllerCoreAccess):
                             old_file.remote_size is not None
                             and new_file.local_size is not None
                             and new_file.local_size >= old_file.remote_size
-                            and model_builder.has_complete_local_coverage(new_file.file_id)
+                            and candidate_complete_local_coverage(new_file.file_id)
                         ):
                             completion_proved = True
 
@@ -2795,6 +3088,11 @@ class ModelUpdater(_ControllerCoreAccess):
                 # relying on incidental scan changes.
                 for file_name, path_pair_id, _ in list(controller._Controller__pending_completion_file_names):
                     file_id = ModelFile.build_file_id(file_name, path_pair_id)
+                    if not candidate_lifecycle_allows(file_id):
+                        failure_count = persist.move_failure_counts.get(file_id, 0)
+                        if failure_count > 0 or file_id in controller._Controller__deferred_move_file_ids:
+                            defer_unrelated_candidate_lifecycle_work()
+                        continue
                     if file_id in attempted_move_file_ids:
                         continue
                     failure_count = persist.move_failure_counts.get(file_id, 0)
@@ -2815,7 +3113,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     # active-only branch or collision since the last attempt.
                     # Leave pending/retry state intact until coverage is
                     # proven again.
-                    if not model_builder.has_complete_local_coverage(file_id):
+                    if not candidate_complete_local_coverage(file_id):
                         continue
                     move_result = run_reserved_automatic_move(pending_file)
                     if move_result is None:
@@ -2855,11 +3153,15 @@ class ModelUpdater(_ControllerCoreAccess):
                 # Prune the extracted files list of any files that were deleted locally.
                 # This prevents these files from going to EXTRACTED state if they are re-downloaded.
                 remove_extracted_file_names: set[str] = set()
-                existing_file_ids = model.get_file_ids()
+                # Marker cleanup is a property of the candidate that was
+                # just reconciled, not of the root collection captured when
+                # this tick began.  This is material for a pair candidate
+                # whose selected root was removed.
+                existing_file_ids = new_model.get_file_ids()
                 if reconciliation_healthy:
                     for extracted_file_name in persist.extracted_file_names:
                         if extracted_file_name in existing_file_ids:
-                            file = model.get_file(extracted_file_name)
+                            file = new_model.get_file(extracted_file_name)
                             if file.state == ModelFile.State.DELETED:
                                 remove_extracted_file_names.add(extracted_file_name)
                 if remove_extracted_file_names:
@@ -2877,8 +3179,8 @@ class ModelUpdater(_ControllerCoreAccess):
                                 })
                     model_builder.set_extracted_files(persist.extracted_file_names)
 
-                active_model_names = set(model.get_file_names())
-                active_model_ids = set(model.get_file_ids())
+                active_model_names = set(new_model.get_file_names())
+                active_model_ids = set(new_model.get_file_ids())
                 if reconciliation_healthy:
                     enabled_path_pair_ids = set(
                         getattr(controller, "_Controller__path_pairs_by_id", {}).keys()
@@ -2997,6 +3299,32 @@ class ModelUpdater(_ControllerCoreAccess):
                         )
                         controller._sync_final_move_succeeded_files_to_model()
 
+            # The shared lifecycle has now applied its selected-root diff.
+            # Commit candidate authority before later external queues/status
+            # work, so an unrelated post-lifecycle failure cannot strand the
+            # only authoritative final scan in a temporary candidate.
+            if authoritative_pair_build is not None:
+                with _CandidateLifecycleFallback(
+                        model_builder, authoritative_pair_build, pair_fallback_committer,
+                ), controller._Controller__model_lock:
+                    controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
+                    pair_adopter(
+                        controller._Controller__model,
+                        authoritative_pair_build,
+                        applied_builder_invalidation_tokens,
+                    )
+                    authoritative_pair_delta_applied = True
+                    refresh_identities = getattr(
+                        controller, "_refresh_model_file_command_identities_locked", None
+                    )
+                    if callable(refresh_identities):
+                        refresh_identities()
+                if unrelated_candidate_lifecycle_work_deferred:
+                    # This is deliberately after scoped adoption: otherwise
+                    # the staged-token cleanup would consume the deferred
+                    # unrelated-work rebuild together with the selected pair.
+                    model_builder.request_rebuild()
+
         if remote_auto_purge_reconciliation_healthy and controller._Controller__pending_auto_purge_file_ids:
             pending_auto_purge_candidates: set[str] = set()
             for file_id in list(controller._Controller__pending_auto_purge_file_ids):
@@ -3029,7 +3357,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 controller._Controller__recover_interrupted_downloads(remote_files)
         if latest_local_scan is not None:
             controller._Controller__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp
-        if full_build_triggered:
+        if global_full_build_triggered:
             with controller._Controller__model_lock:
                 controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
                 model_builder.adopt_applied_model(
@@ -3042,6 +3370,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 )
                 if callable(refresh_identities):
                     refresh_identities()
+        if full_build_triggered:
             try:
                 model_version = getattr(controller._Controller__model, "version", None)
                 if isinstance(model_version, int):
@@ -3069,9 +3398,9 @@ class ModelUpdater(_ControllerCoreAccess):
                 diagnostics_enabled = False
         if diagnostics_enabled:
             try:
-                if full_build_triggered:
+                if global_full_build_triggered:
                     choice = "full"
-                elif progressive_delta_applied:
+                elif candidate_lifecycle_triggered or progressive_delta_applied or authoritative_pair_delta_applied:
                     choice = "progressive"
                 elif active_transfer_delta_applied:
                     choice = "active"
@@ -3092,4 +3421,5 @@ class ModelUpdater(_ControllerCoreAccess):
                 })
             except Exception:
                 pass
-        return full_build_triggered or progressive_delta_applied or active_transfer_delta_applied
+        return full_build_triggered or progressive_delta_applied or authoritative_pair_delta_applied or \
+            active_transfer_delta_applied

@@ -2,6 +2,7 @@
 
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 
 from model import Model, ModelFile, ModelDiff, ModelDiffUtil
 
@@ -33,6 +34,16 @@ class TestModelDiff(unittest.TestCase):
 
 
 class TestModelDiffUtil(unittest.TestCase):
+    def test_shared_root_identity_skips_recursive_equality(self):
+        model_before = Model()
+        shared = ModelFile("shared", True)
+        shared.add_child(ModelFile("child", False))
+        model_before.add_file(shared)
+        model_after = Model.compose_candidate(model_before, set(), (), 2)
+
+        with patch.object(ModelFile, "__eq__", side_effect=AssertionError("must not compare shared root")):
+            self.assertEqual([], ModelDiffUtil.diff_models(model_before, model_after))
+
     def test_added(self):
         model_before = Model()
         model_after = Model()

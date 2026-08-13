@@ -91,6 +91,30 @@ class TestLftpModel(unittest.TestCase):
         self.model.add_file(file_a)
         self.assertEqual({file_a.file_id}, self.model.get_file_ids())
 
+    def test_compose_candidate_reuses_roots_without_notifying_live_listeners(self):
+        retained = ModelFile("retained", False)
+        retained.path_pair_id = "pair-b"
+        replaced = ModelFile("replaced", False)
+        replaced.path_pair_id = "pair-a"
+        self.model.add_file(retained)
+        self.model.add_file(replaced)
+        listener = MagicMock(spec=DummyModelListener)
+        self.model.add_listener(listener)
+        replacement = ModelFile("replacement", False)
+        replacement.path_pair_id = "pair-a"
+
+        candidate = Model.compose_candidate(
+            self.model, {replaced.file_id}, (replacement,), 2,
+        )
+
+        self.assertEqual({retained.file_id, replacement.file_id}, candidate.get_file_ids())
+        self.assertIs(retained, candidate.get_file(retained.file_id))
+        self.assertEqual(2, candidate.tree_file_count)
+        self.assertEqual(0, candidate.listener_count)
+        listener.file_added.assert_not_called()
+        listener.file_removed.assert_not_called()
+        listener.file_updated.assert_not_called()
+
     def test_duplicate_names_can_coexist_by_file_id(self):
         file_a_movies = ModelFile("a", False)
         file_a_movies.path_pair_id = "movies"

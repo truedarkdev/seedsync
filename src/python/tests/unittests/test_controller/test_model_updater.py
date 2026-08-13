@@ -1492,6 +1492,558 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(1, model_builder.set_local_files.call_args.args[0][0].size)
         self.assertEqual(2, model_builder.set_remote_files.call_args.args[0][0].size)
 
+    def test_completed_pair_final_replaces_only_that_pair_without_global_build(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        idle = SystemFile("idle.bin", 20, False)
+        idle.path_pair_id = "pair-b"
+        builder = ModelBuilder()
+        builder.set_local_files([old, idle])
+        builder.set_remote_files([old, idle])
+        # Pair-b remains unavailable throughout this selected pair-a final;
+        # retaining the same overlay makes candidate reuse provable.
+        builder.set_unknown_local_path_pair_ids({"pair-b"})
+        live_model = builder.build_model()
+        idle_before = live_model.get_file(ModelFile.build_file_id("idle.bin", "pair-b"))
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        builder.build_authoritative_pair_roots = MagicMock(wraps=builder.build_authoritative_pair_roots)
+        next_local = SystemFile("new.bin", 30, False)
+        next_local.path_pair_id = "pair-a"
+        next_remote = SystemFile("new.bin", 30, False)
+        next_remote.path_pair_id = "pair-a"
+        final_local = ScannerResult(
+            datetime.now(), [next_local], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [next_remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        controller._refresh_model_file_command_identities_locked = MagicMock()
+        controller._Controller__context.performance_diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+
+        ModelUpdater(controller).update()
+
+        builder.build_authoritative_pair_roots.assert_called_once()
+
+        self.assertEqual(
+            {ModelFile.build_file_id("new.bin", "pair-a"), ModelFile.build_file_id("idle.bin", "pair-b")},
+            live_model.get_file_ids(),
+        )
+        self.assertIs(idle_before, live_model.get_file(ModelFile.build_file_id("idle.bin", "pair-b")))
+        builder.build_model.assert_not_called()
+        self.assertFalse(builder.has_changes())
+        counters = controller._Controller__context.performance_diagnostics.snapshot()["counters"]
+        self.assertEqual(1, counters["model_update_choice_progressive"])
+        self.assertEqual(0, counters["model_update_choice_active"])
+        self.assertEqual(0, counters["model_update_choice_full"])
+
+    def test_completed_pair_with_unrelated_unknown_delta_uses_global_build(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        untouched = SystemFile("idle.bin", 20, False)
+        untouched.path_pair_id = "pair-b"
+        builder = ModelBuilder()
+        builder.set_local_files([old, untouched])
+        builder.set_remote_files([old, untouched])
+        builder.set_unknown_local_path_pair_ids({"pair-a"})
+        live_model = builder.build_model()
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        replacement_local = SystemFile("new.bin", 30, False)
+        replacement_local.path_pair_id = "pair-a"
+        replacement_remote = SystemFile("new.bin", 30, False)
+        replacement_remote.path_pair_id = "pair-a"
+        final_local = ScannerResult(
+            datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        controller._refresh_model_file_command_identities_locked = MagicMock()
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(
+            {ModelFile.build_file_id("new.bin", "pair-a"), ModelFile.build_file_id("idle.bin", "pair-b")},
+            live_model.get_file_ids(),
+        )
+        self.assertEqual({"pair-b"}, builder._ModelBuilder__unknown_local_path_pair_ids)
+        builder.build_model.assert_called_once()
+
+    def test_candidate_lifecycle_exception_commits_pair_sources_for_global_recovery(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        builder = ModelBuilder()
+        builder.set_local_files([old])
+        builder.set_remote_files([old])
+        live_model = builder.build_model()
+        next_local = SystemFile("new.bin", 30, False)
+        next_local.path_pair_id = "pair-a"
+        next_remote = SystemFile("new.bin", 30, False)
+        next_remote.path_pair_id = "pair-a"
+        final_local = ScannerResult(
+            datetime.now(), [next_local], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [next_remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock()}
+        live_model.add_file = MagicMock(side_effect=RuntimeError("candidate lifecycle failure"))
+
+        with self.assertRaisesRegex(RuntimeError, "candidate lifecycle failure"):
+            ModelUpdater(controller).update()
+
+        new_id = ModelFile.build_file_id("new.bin", "pair-a")
+        self.assertIn(new_id, builder._ModelBuilder__local_files_by_pair["pair-a"])
+        self.assertIn(new_id, builder._ModelBuilder__remote_files_by_pair["pair-a"])
+        self.assertTrue(builder.has_changes())
+
+    def test_pair_candidate_waits_for_startup_recovery(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        builder = ModelBuilder()
+        builder.set_local_files([old])
+        builder.set_remote_files([old])
+        live_model = builder.build_model()
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        replacement = SystemFile("new.bin", 30, False)
+        replacement.path_pair_id = "pair-a"
+        result = ScannerResult(
+            datetime.now(), [replacement], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            result, local_scan=result, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock()}
+        controller._Controller__startup_recovery_done = False
+        controller._reserve_move_attempt = MagicMock(return_value=False)
+        controller._Controller__recover_interrupted_downloads = MagicMock()
+
+        ModelUpdater(controller).update()
+
+        self.assertIn(ModelFile.build_file_id("new.bin", "pair-a"), live_model.get_file_ids())
+        builder.build_model.assert_called_once()
+
+    def test_pair_final_with_pending_completion_uses_candidate_lifecycle(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        builder = ModelBuilder()
+        builder.set_local_files([old])
+        builder.set_remote_files([old])
+        live_model = builder.build_model()
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        replacement_local = SystemFile("new.bin", 30, False)
+        replacement_local.path_pair_id = "pair-a"
+        replacement_remote = SystemFile("new.bin", 30, False)
+        replacement_remote.path_pair_id = "pair-a"
+        final_local = ScannerResult(
+            datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock()}
+        controller._Controller__pending_completion_file_names = {("old.bin", "pair-a", None)}
+        controller._reserve_move_attempt = MagicMock(return_value=False)
+
+        ModelUpdater(controller).update()
+
+        self.assertIn(ModelFile.build_file_id("new.bin", "pair-a"), live_model.get_file_ids())
+        builder.build_model.assert_not_called()
+
+    def test_pair_final_with_stale_markers_uses_candidate_and_prunes_them(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        builder = ModelBuilder()
+        builder.set_local_files([old])
+        builder.set_remote_files([old])
+        live_model = builder.build_model()
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        replacement_local = SystemFile("new.bin", 30, False)
+        replacement_local.path_pair_id = "pair-a"
+        replacement_remote = SystemFile("new.bin", 30, False)
+        replacement_remote.path_pair_id = "pair-a"
+        final_local = ScannerResult(
+            datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock()}
+        controller._reserve_move_attempt = MagicMock(return_value=False)
+        stale_id = ModelFile.build_file_id("stale.bin", "pair-a")
+        persist = controller._Controller__persist
+        persist.downloaded_file_names = {stale_id}
+        persist.downloaded_timestamps = {stale_id: 1.0}
+        persist.extracted_file_names = {stale_id}
+        persist.final_move_succeeded_file_names = {stale_id}
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(set(), persist.downloaded_file_names)
+        self.assertEqual({}, persist.downloaded_timestamps)
+        self.assertEqual(set(), persist.extracted_file_names)
+        self.assertEqual(set(), persist.final_move_succeeded_file_names)
+        builder.build_model.assert_not_called()
+
+    def test_pair_candidate_removal_prunes_its_canonical_persisted_markers(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        builder = ModelBuilder()
+        builder.set_local_files([old])
+        builder.set_remote_files([old])
+        old_id = ModelFile.build_file_id("old.bin", "pair-a")
+        # These persisted values are already reflected in the cached live
+        # model. The final scan alone must therefore be enough to remove them.
+        builder.set_downloaded_files({old_id})
+        builder.set_downloaded_timestamps({old_id: 1.0})
+        builder.set_extracted_files({old_id})
+        builder.set_final_move_succeeded_files({old_id})
+        builder.set_move_failed_files({old_id})
+        live_model = builder.build_model()
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        empty_final = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            empty_final, local_scan=empty_final, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock()}
+        persist = controller._Controller__persist
+        persist.downloaded_file_names = {old_id}
+        persist.downloaded_timestamps = {old_id: 1.0}
+        persist.extracted_file_names = {old_id}
+        persist.final_move_succeeded_file_names = {old_id}
+        persist.move_failure_counts = {old_id: controller._Controller__MAX_MOVE_FAILURES}
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(set(), live_model.get_file_ids())
+        self.assertEqual(set(), persist.downloaded_file_names)
+        self.assertEqual({}, persist.downloaded_timestamps)
+        self.assertEqual(set(), persist.extracted_file_names)
+        self.assertEqual(set(), persist.final_move_succeeded_file_names)
+        self.assertEqual({}, persist.move_failure_counts)
+        builder.build_model.assert_not_called()
+
+    def test_pair_candidate_runs_existing_auto_purge_lifecycle_for_new_local_only_root(self):
+        builder = ModelBuilder()
+        live_model = builder.build_model()
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        local_only = SystemFile("orphan.bin", 0, False)
+        local_only.path_pair_id = "pair-a"
+        final_local = ScannerResult(
+            datetime.now(), [local_only], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock()}
+        controller._Controller__should_auto_purge_local_file = MagicMock(return_value=True)
+        controller._Controller__queue_delete_local_process = MagicMock()
+
+        ModelUpdater(controller).update()
+
+        local_id = ModelFile.build_file_id("orphan.bin", "pair-a")
+        self.assertIn(local_id, live_model.get_file_ids())
+        controller._Controller__queue_delete_local_process.assert_called_once()
+        self.assertIs(
+            live_model.get_file(local_id),
+            controller._Controller__queue_delete_local_process.call_args.args[0],
+        )
+        builder.build_model.assert_not_called()
+
+    def test_pair_candidate_defers_unrelated_collision_and_retry_lifecycle(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        idle_remote = SystemFile("idle.bin", 20, False)
+        idle_remote.path_pair_id = "pair-b"
+        idle_local = SystemFile("idle.bin", 20, False)
+        idle_local.path_pair_id = "pair-b"
+        builder = ModelBuilder()
+        builder.set_local_files([old, idle_local])
+        builder.set_remote_files([old, idle_remote])
+        builder.set_downloaded_files(set())
+        builder.set_downloaded_timestamps({})
+        builder.set_extracted_files(set())
+        builder.set_stopped_files(set())
+        builder.set_move_failed_files(set())
+        builder.set_final_move_succeeded_files(set())
+        builder.set_unknown_local_path_pair_ids({"pair-b"})
+        live_model = builder.build_model()
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        builder.build_authoritative_pair_roots = MagicMock(
+            wraps=builder.build_authoritative_pair_roots,
+        )
+        idle_id = ModelFile.build_file_id("idle.bin", "pair-b")
+        idle_before = live_model.get_file(idle_id)
+        idle_state = idle_before.state
+        idle_scope_version = live_model.scope_version("pair-b")
+        # Model cached terminal collision work from pair-b without
+        # making pair-a's final scan own or mutate that shared root.
+        builder.get_terminalizable_staging_collision_file_ids = MagicMock(
+            side_effect=[set(), {idle_id}],
+        )
+        builder.request_rebuild = MagicMock(wraps=builder.request_rebuild)
+        replacement_local = SystemFile("new.bin", 10, False)
+        replacement_local.path_pair_id = "pair-a"
+        replacement_remote = SystemFile("new.bin", 30, False)
+        replacement_remote.path_pair_id = "pair-a"
+        final_local = ScannerResult(
+            datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        controller._Controller__is_explicitly_stopped = MagicMock(return_value=False)
+        controller._has_active_collision_comparison = MagicMock(return_value=False)
+        controller._reserve_move_attempt = MagicMock(return_value=True)
+        controller._release_move_attempt = MagicMock()
+        controller._Controller__move_from_staging = MagicMock()
+
+        ModelUpdater(controller).update()
+
+        self.assertIn(ModelFile.build_file_id("new.bin", "pair-a"), live_model.get_file_ids())
+        builder.build_authoritative_pair_roots.assert_called_once()
+        builder.build_model.assert_not_called()
+        self.assertIs(idle_before, live_model.get_file(idle_id))
+        self.assertEqual(idle_state, idle_before.state)
+        self.assertEqual(idle_scope_version, live_model.scope_version("pair-b"))
+        controller._reserve_move_attempt.assert_not_called()
+        controller._Controller__move_from_staging.assert_not_called()
+        builder.request_rebuild.assert_called_once()
+        self.assertTrue(builder.has_changes())
+
+    def test_multi_pair_final_with_new_duplicate_basenames_uses_global_build(self):
+        old_a = SystemFile("old-a.bin", 10, False)
+        old_a.path_pair_id = "pair-a"
+        old_b = SystemFile("old-b.bin", 20, False)
+        old_b.path_pair_id = "pair-b"
+        builder = ModelBuilder()
+        builder.set_local_files([old_a, old_b])
+        builder.set_remote_files([old_a, old_b])
+        live_model = builder.build_model()
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        duplicate_a = SystemFile("shared.bin", 30, False)
+        duplicate_a.path_pair_id = "pair-a"
+        duplicate_b = SystemFile("shared.bin", 40, False)
+        duplicate_b.path_pair_id = "pair-b"
+        final_local = ScannerResult(
+            datetime.now(), [duplicate_a, duplicate_b], scanned_path_pair_ids={"pair-a", "pair-b"},
+            is_progress=True, completed_path_pair_ids={"pair-a", "pair-b"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a", "pair-b"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [duplicate_a, duplicate_b], scanned_path_pair_ids={"pair-a", "pair-b"},
+            is_progress=True, completed_path_pair_ids={"pair-a", "pair-b"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a", "pair-b"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        controller._reserve_move_attempt = MagicMock(return_value=False)
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(
+            {ModelFile.build_file_id("shared.bin", "pair-a"), ModelFile.build_file_id("shared.bin", "pair-b")},
+            live_model.get_file_ids(),
+        )
+        builder.build_model.assert_called_once()
+
+    def test_pair_final_with_staged_collision_uses_candidate_lifecycle(self):
+        old = SystemFile("old.bin", 1, False)
+        old.path_pair_id = "pair-a"
+        builder = ModelBuilder()
+        builder.set_local_files([old])
+        builder.set_remote_files([old])
+        live_model = builder.build_model()
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        remote = SystemFile("release", 10, True)
+        remote.path_pair_id = "pair-a"
+        remote.add_child(SystemFile("entry.bin", 10, False))
+        local = SystemFile("release", 10, True)
+        local.path_pair_id = "pair-a"
+        collision = SystemFile("entry.bin", 10, False, is_staging=True)
+        collision.has_staging_collision = True
+        local.add_child(collision)
+        final_local = ScannerResult(
+            datetime.now(), [local], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock()}
+        controller._Controller__is_explicitly_stopped = MagicMock(return_value=False)
+        controller._has_active_collision_comparison = MagicMock(return_value=False)
+
+        ModelUpdater(controller).update()
+
+        builder.build_model.assert_not_called()
+        release_id = ModelFile.build_file_id("release", "pair-a")
+        self.assertEqual(ModelFile.State.MOVE_FAILED, live_model.get_file(release_id).state)
+        self.assertEqual(
+            controller._Controller__MAX_MOVE_FAILURES,
+            controller._Controller__persist.move_failure_counts[release_id],
+        )
+
+    def test_unsafe_completed_pair_fallback_preserves_unrelated_source_bucket(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        untouched = SystemFile("shared.bin", 20, False)
+        untouched.path_pair_id = "pair-b"
+        builder = ModelBuilder()
+        builder.set_local_files([old, untouched])
+        builder.set_remote_files([old, untouched])
+        live_model = builder.build_model()
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        replacement_local = SystemFile("shared.bin", 30, False)
+        replacement_local.path_pair_id = "pair-a"
+        replacement_remote = SystemFile("shared.bin", 30, False)
+        replacement_remote.path_pair_id = "pair-a"
+        final_local = ScannerResult(
+            datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        controller._reserve_move_attempt = MagicMock(return_value=False)
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(
+            {ModelFile.build_file_id("shared.bin", "pair-a"), ModelFile.build_file_id("shared.bin", "pair-b")},
+            live_model.get_file_ids(),
+        )
+        self.assertEqual(
+            {ModelFile.build_file_id("shared.bin", "pair-b")},
+            set(builder._ModelBuilder__remote_files_by_pair["pair-b"]),
+        )
+        self.assertEqual(
+            {ModelFile.build_file_id("shared.bin", "pair-a")},
+            set(builder._ModelBuilder__remote_files_by_pair["pair-a"]),
+        )
+        builder.build_model.assert_called_once()
+
+    def test_legacy_builder_final_refresh_receives_full_reconciled_authority(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        untouched = SystemFile("idle.bin", 20, False)
+        untouched.path_pair_id = "pair-b"
+        reconciler = _JointProgressiveReconciler()
+        snapshot = {
+            ("pair-a", "old.bin"): old,
+            ("pair-b", "idle.bin"): untouched,
+        }
+        reconciler.reconcile(
+            snapshot, dict(snapshot), set(), {"pair-a", "pair-b"},
+            snapshot, dict(snapshot), set(), {"pair-a", "pair-b"},
+            {"pair-a", "pair-b"},
+        )
+        replacement_local = SystemFile("new.bin", 30, False)
+        replacement_local.path_pair_id = "pair-a"
+        replacement_remote = SystemFile("new.bin", 30, False)
+        replacement_remote.path_pair_id = "pair-a"
+        final_local = ScannerResult(
+            datetime.now(), [replacement_local, untouched], scanned_path_pair_ids={"pair-a", "pair-b"},
+            is_progress=True, completed_path_pair_ids={"pair-a", "pair-b"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [replacement_remote, untouched], scanned_path_pair_ids={"pair-a", "pair-b"},
+            is_progress=True, completed_path_pair_ids={"pair-a", "pair-b"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, builder = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local,
+        )
+        # MagicMock has no declared ModelBuilder pair API. It must retain the
+        # compatibility whole-source path and receive both pair buckets.
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        controller._Controller__progressive_joint_reconciler = reconciler
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(
+            {("pair-a", "new.bin"), ("pair-b", "idle.bin")},
+            {(file.path_pair_id, file.name) for file in builder.set_local_files.call_args.args[0]},
+        )
+        self.assertEqual(
+            {("pair-a", "new.bin"), ("pair-b", "idle.bin")},
+            {(file.path_pair_id, file.name) for file in builder.set_remote_files.call_args.args[0]},
+        )
+        builder.build_authoritative_pair_roots.assert_not_called()
+
     def test_authoritative_progressive_no_event_tick_keeps_active_lftp_status_updates(self):
         remote_token = "remote-lftp-cadence"
         local_token = "local-lftp-cadence"

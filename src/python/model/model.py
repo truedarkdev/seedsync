@@ -3,7 +3,7 @@
 import logging
 from abc import ABC, abstractmethod
 from bisect import insort
-from typing import Dict, Iterator, Optional, Set
+from typing import Dict, Iterable, Iterator, Optional, Set
 from threading import Lock
 
 # my libs
@@ -102,6 +102,37 @@ class Model:
     def iter_files_by_id(self) -> Iterator[ModelFile]:
         """Stable canonical root order without allocating/sorting a snapshot."""
         return (self.__files_by_id[file_id] for file_id in self.__ordered_file_ids)
+
+    @classmethod
+    def compose_candidate(
+            cls, live_model: "Model", removed_file_ids: Set[str], replacement_files: Iterable[ModelFile],
+            tree_file_count: int,
+    ) -> "Model":
+        """Build an unobserved candidate reusing untouched live root objects.
+
+        The updater holds its model lock while composing this short-lived
+        transaction input.  Deliberately bypassing ``add_file`` preserves the
+        live model's listeners and versions until the normal diff/lifecycle
+        path decides which selected roots to publish.
+        """
+        candidate = cls()
+        candidate.logger = live_model.logger
+        for file in live_model.iter_files():
+            if file.file_id not in removed_file_ids:
+                candidate.__insert_candidate_file(file)
+        for file in replacement_files:
+            candidate.__insert_candidate_file(file)
+        candidate.set_tree_file_count(tree_file_count)
+        return candidate
+
+    def __insert_candidate_file(self, file: ModelFile) -> None:
+        """Insert a root reference without notifications/version mutation."""
+        file_id = file.file_id
+        if file_id in self.__files_by_id:
+            raise ModelError("Duplicate root while composing model candidate")
+        self.__files_by_id[file_id] = file
+        insort(self.__ordered_file_ids, file_id)
+        self.__file_ids_by_name.setdefault(file.name, set()).add(file_id)
 
     def __notify_versioned_change(self, file: ModelFile) -> None:
         """Notify optional lightweight listeners after a model mutation.

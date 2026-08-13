@@ -71,9 +71,27 @@ class _BuiltRootFile:
 @dataclass
 class _ActiveTransferRootBuild:
     """Isolated render and runtime state for an active-transfer root delta."""
-    model: Model
+    model: Optional[Model]
     recent_live_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot]
     retained_stopped_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot]
+
+
+@dataclass
+class _AuthoritativePairBuild:
+    """Staged replacement for one fully-covered scan pair."""
+    path_pair_id: Optional[str]
+    previous_local_files: dict[str, SystemFile]
+    previous_remote_files: dict[str, SystemFile]
+    local_files: dict[str, SystemFile]
+    remote_files: dict[str, SystemFile]
+    model: Optional[Model]
+    unknown_local_path_pair_ids: set[Optional[str]]
+    unresolved_staging_collision_file_ids: set[str]
+    terminalizable_staging_collision_file_ids: set[str]
+    recent_live_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot]
+    retained_stopped_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot]
+    complete_local_coverage_file_ids: set[str]
+    invalidation_tokens: frozenset[int]
 
 
 class ModelBuilder:
@@ -96,9 +114,14 @@ class ModelBuilder:
         self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
         if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
             self.__target_archive_trace_file_id = None
-        self.__local_files: dict[str, SystemFile] = {}
+        # Scan authority is partitioned by path pair.  The previous flat maps
+        # made an authoritative final scan of one pair walk every unrelated
+        # pair merely to discover removals.  These are the only local/remote
+        # source maps; full reconciliation deliberately flattens them at its
+        # existing global-build boundary.
+        self.__local_files_by_pair: dict[Optional[str], dict[str, SystemFile]] = {}
         self.__active_files: dict[str, SystemFile] = {}
-        self.__remote_files: dict[str, SystemFile] = {}
+        self.__remote_files_by_pair: dict[Optional[str], dict[str, SystemFile]] = {}
         self.__active_file_ids: set[str] = set()
         self.__lftp_statuses: dict[str, LftpJobStatus] = {}
         self.__recent_live_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot] = {}
@@ -130,6 +153,11 @@ class ModelBuilder:
         self.__active_touched_root_file_ids: set[str] = set()
         self.__lftp_regressed_root_file_ids: set[str] = set()
         self.__source_name_counts: dict[str, int] = {}
+        # Global rendering hides local roots that collide by configured local
+        # root path and basename.  Keep the small derived index alongside the
+        # source buckets so a pair-final safety check never walks unrelated
+        # roots just to prove that arbitration is independent.
+        self.__local_root_name_counts: dict[tuple[str, str], int] = {}
         self.__status_only_file_names: dict[str, str] = {}
         self.__status_only_name_counts: dict[str, int] = {}
         self.__active_only_file_names: dict[str, str] = {}
@@ -161,6 +189,60 @@ class ModelBuilder:
         except Exception:
             pass
 
+    @staticmethod
+    def __file_id_path_pair_id(file_id: str) -> Optional[str]:
+        """Recover the canonical root's pair without inspecting other roots."""
+        try:
+            value = json.loads(file_id)
+        except (TypeError, ValueError):
+            return None
+        return value[0] if isinstance(value, list) and len(value) == 2 and \
+            isinstance(value[0], str) and isinstance(value[1], str) else None
+
+    @staticmethod
+    def __bucket_files(files: List[SystemFile]) -> dict[Optional[str], dict[str, SystemFile]]:
+        buckets: dict[Optional[str], dict[str, SystemFile]] = {}
+        for file in files:
+            pair_id = file.path_pair_id
+            buckets.setdefault(pair_id, {})[ModelBuilder.__root_file_id(file.name, pair_id)] = file
+        return buckets
+
+    @staticmethod
+    def __flatten_buckets(
+            buckets: dict[Optional[str], dict[str, SystemFile]],
+    ) -> dict[str, SystemFile]:
+        return {
+            file_id: file
+            for files in buckets.values()
+            for file_id, file in files.items()
+        }
+
+    def __local_file(self, file_id: str) -> Optional[SystemFile]:
+        return self.__local_files_by_pair.get(self.__file_id_path_pair_id(file_id), {}).get(file_id)
+
+    def __remote_file(self, file_id: str) -> Optional[SystemFile]:
+        return self.__remote_files_by_pair.get(self.__file_id_path_pair_id(file_id), {}).get(file_id)
+
+    def __local_files(self) -> dict[str, SystemFile]:
+        """Flatten only callers that already need global authority."""
+        return self.__flatten_buckets(self.__local_files_by_pair)
+
+    def __remote_files(self) -> dict[str, SystemFile]:
+        """Flatten only callers that already need global authority."""
+        return self.__flatten_buckets(self.__remote_files_by_pair)
+
+    def local_source_roots_snapshot(self) -> tuple[SystemFile, ...]:
+        """Return an on-demand ownership-census snapshot of local roots."""
+        return tuple(
+            file for files in self.__local_files_by_pair.values() for file in files.values()
+        )
+
+    def remote_source_roots_snapshot(self) -> tuple[SystemFile, ...]:
+        """Return an on-demand ownership-census snapshot of remote roots."""
+        return tuple(
+            file for files in self.__remote_files_by_pair.values() for file in files.values()
+        )
+
     def __invalidate_cache(
             self,
             counter: str,
@@ -190,13 +272,15 @@ class ModelBuilder:
 
     def __refresh_source_name_counts(self) -> None:
         counts: dict[str, int] = {}
-        for file_id in set(self.__local_files).union(self.__remote_files):
-            source = self.__local_files.get(file_id) or self.__remote_files[file_id]
+        local_files = self.__local_files()
+        remote_files = self.__remote_files()
+        for file_id in set(local_files).union(remote_files):
+            source = local_files.get(file_id) or remote_files[file_id]
             counts[source.name] = counts.get(source.name, 0) + 1
         self.__source_name_counts = counts
         self.__status_only_file_names = {
             file_id: status.name for file_id, status in self.__lftp_statuses.items()
-            if file_id not in self.__local_files and file_id not in self.__remote_files
+            if self.__local_file(file_id) is None and self.__remote_file(file_id) is None
         }
         status_counts: dict[str, int] = {}
         for name in self.__status_only_file_names.values():
@@ -204,12 +288,43 @@ class ModelBuilder:
         self.__status_only_name_counts = status_counts
         self.__active_only_file_names = {
             file_id: file.name for file_id, file in self.__active_files.items()
-            if file_id not in self.__local_files and file_id not in self.__remote_files
+            if self.__local_file(file_id) is None and self.__remote_file(file_id) is None
         }
         active_counts: dict[str, int] = {}
         for name in self.__active_only_file_names.values():
             active_counts[name] = active_counts.get(name, 0) + 1
         self.__active_only_name_counts = active_counts
+
+    def __local_root_name_key(
+            self, local_file: SystemFile, path_pair_id: Optional[str],
+    ) -> Optional[tuple[str, str]]:
+        normalized_root = self.__resolve_normalized_local_root_path(
+            local_file, path_pair_id,
+        )
+        if normalized_root is None:
+            return None
+        return normalized_root, local_file.name
+
+    def __refresh_local_root_name_counts(self) -> None:
+        counts: dict[tuple[str, str], int] = {}
+        for path_pair_id, files in self.__local_files_by_pair.items():
+            for local_file in files.values():
+                key = self.__local_root_name_key(local_file, path_pair_id)
+                if key is not None:
+                    counts[key] = counts.get(key, 0) + 1
+        self.__local_root_name_counts = counts
+
+    def __adjust_local_root_name_count(
+            self, local_file: SystemFile, path_pair_id: Optional[str], delta: int,
+    ) -> None:
+        key = self.__local_root_name_key(local_file, path_pair_id)
+        if key is None:
+            return
+        count = self.__local_root_name_counts.get(key, 0) + delta
+        if count > 0:
+            self.__local_root_name_counts[key] = count
+        else:
+            self.__local_root_name_counts.pop(key, None)
 
     def __update_status_only_name_count(self, file_id: str) -> None:
         previous_name = self.__status_only_file_names.pop(file_id, None)
@@ -220,7 +335,7 @@ class ModelBuilder:
             else:
                 self.__status_only_name_counts.pop(previous_name, None)
         status = self.__lftp_statuses.get(file_id)
-        if status is None or file_id in self.__local_files or file_id in self.__remote_files:
+        if status is None or self.__local_file(file_id) is not None or self.__remote_file(file_id) is not None:
             return
         self.__status_only_file_names[file_id] = status.name
         self.__status_only_name_counts[status.name] = self.__status_only_name_counts.get(status.name, 0) + 1
@@ -234,7 +349,7 @@ class ModelBuilder:
             else:
                 self.__active_only_name_counts.pop(previous_name, None)
         active_file = self.__active_files.get(file_id)
-        if active_file is None or file_id in self.__local_files or file_id in self.__remote_files:
+        if active_file is None or self.__local_file(file_id) is not None or self.__remote_file(file_id) is not None:
             return
         self.__active_only_file_names[file_id] = active_file.name
         self.__active_only_name_counts[active_file.name] = self.__active_only_name_counts.get(active_file.name, 0) + 1
@@ -525,9 +640,9 @@ class ModelBuilder:
                self.__candidate_stopped_file_ids(file_id, remote, local, status)):
             return True
         if remote is None:
-            remote = self.__remote_files.get(file_id)
+            remote = self.__remote_file(file_id)
         if local is None:
-            local = self.__local_files.get(file_id)
+            local = self.__local_file(file_id)
         if remote is None and local is None and status is None:
             status = self.__lftp_statuses.get(file_id)
         if status is not None and status.name in self.__stopped_files:
@@ -636,6 +751,7 @@ class ModelBuilder:
             self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LOCAL_ROOT_PATHS)
         self.__local_root_paths = next_local_root_paths
         self.__local_staging_paths = next_local_staging_paths
+        self.__refresh_local_root_name_counts()
 
     def __resolve_local_disk_path(self,
                                   model_file: ModelFile,
@@ -996,8 +1112,8 @@ class ModelBuilder:
         returned.  This is intentionally location-based and does not infer a
         completed final leaf from an equal apparent size in staging.
         """
-        remote_root = self.__remote_files.get(file_id)
-        local_root = self.__local_files.get(file_id)
+        remote_root = self.__remote_file(file_id)
+        local_root = self.__local_file(file_id)
         if remote_root is None or local_root is None or not remote_root.is_dir or not local_root.is_dir:
             return ()
 
@@ -1040,7 +1156,7 @@ class ModelBuilder:
         disappeared, while still rejecting collisions, partial leaves, and
         active-only paths that only inflate aggregate directory size.
         """
-        remote_file = self.__remote_files.get(file_id)
+        remote_file = self.__remote_file(file_id)
         local_file = self.__build_effective_local_files().get(file_id)
         return self.__effective_local_tree_proves_completion(remote_file, local_file)
 
@@ -1078,7 +1194,7 @@ class ModelBuilder:
         """
         if self.__cached_model is None or file_id not in self.__cached_terminalizable_staging_collision_file_ids:
             return False
-        remote_root = self.__remote_files.get(file_id)
+        remote_root = self.__remote_file(file_id)
         effective_root = self.__build_effective_local_files().get(file_id)
         active_root = self.__active_files.get(file_id)
         if remote_root is None or effective_root is None or remote_root.is_dir != effective_root.is_dir:
@@ -1142,7 +1258,7 @@ class ModelBuilder:
 
     def is_remote_leaf_path(self, file_id: str, relative_path: str) -> bool:
         """Whether a source-root-relative leaf is currently remote-listed."""
-        remote_file = self.__remote_files.get(file_id)
+        remote_file = self.__remote_file(file_id)
         if remote_file is None or not relative_path:
             return False
         current = remote_file
@@ -1890,12 +2006,12 @@ class ModelBuilder:
 
     def __build_effective_local_files(self) -> Dict[str, SystemFile]:
         if not self.__active_files:
-            return dict(self.__local_files)
+            return self.__local_files()
 
-        effective_local_files = dict(self.__local_files)
+        effective_local_files = self.__local_files()
         for file_id, active_file in self.__active_files.items():
             existing_file = effective_local_files.get(file_id)
-            remote_file = self.__remote_files.get(file_id)
+            remote_file = self.__remote_file(file_id)
             if existing_file is not None and remote_file is not None and \
                     (self.__has_staging_descendant(existing_file) or
                      self.__has_staging_collision_descendant(existing_file)) and \
@@ -1919,14 +2035,12 @@ class ModelBuilder:
     def set_local_files(self, local_files: List[SystemFile]) -> None:
         started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_LOCAL_FILES)
         try:
-            prev_local_files = self.__local_files
-            next_local_files = {
-                self.__root_file_id(file.name, file.path_pair_id): file for file in local_files
-            }
+            next_local_files = self.__bucket_files(local_files)
             # Invalidate the cache
-            if next_local_files != prev_local_files:
-                self.__local_files = next_local_files
+            if next_local_files != self.__local_files_by_pair:
+                self.__local_files_by_pair = next_local_files
                 self.__refresh_source_name_counts()
+                self.__refresh_local_root_name_counts()
                 self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LOCAL_FILES)
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_LOCAL_FILES, started_at)
@@ -1934,13 +2048,10 @@ class ModelBuilder:
     def set_remote_files(self, remote_files: List[SystemFile]) -> None:
         started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_REMOTE_FILES)
         try:
-            prev_remote_files = self.__remote_files
-            next_remote_files = {
-                self.__root_file_id(file.name, file.path_pair_id): file for file in remote_files
-            }
+            next_remote_files = self.__bucket_files(remote_files)
             # Invalidate the cache
-            if next_remote_files != prev_remote_files:
-                self.__remote_files = next_remote_files
+            if next_remote_files != self.__remote_files_by_pair:
+                self.__remote_files_by_pair = next_remote_files
                 self.__refresh_source_name_counts()
                 self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_REMOTE_FILES)
         finally:
@@ -1970,12 +2081,8 @@ class ModelBuilder:
             for file in local_files + remote_files
         }
 
-        partial.__local_files = {
-            self.__root_file_id(file.name, file.path_pair_id): file for file in local_files
-        }
-        partial.__remote_files = {
-            self.__root_file_id(file.name, file.path_pair_id): file for file in remote_files
-        }
+        partial.__local_files_by_pair = partial.__bucket_files(local_files)
+        partial.__remote_files_by_pair = partial.__bucket_files(remote_files)
         partial.__active_files = {
             file_id: file for file_id, file in self.__active_files.items()
             if file_id in selected_file_ids or file.path_pair_id in selected_pair_ids
@@ -2011,6 +2118,327 @@ class ModelBuilder:
         partial.__local_root_paths = dict(self.__local_root_paths)
         partial.__local_staging_paths = dict(self.__local_staging_paths)
         return partial.build_model()
+
+    def __pair_delta_is_globally_safe(
+            self, path_pair_id: Optional[str], local_files: dict[str, SystemFile],
+            remote_files: dict[str, SystemFile], unknown_local_path_pair_ids: set[Optional[str]],
+    ) -> bool:
+        """Fail closed when a pair render would rely on global root identity.
+
+        The final-pair path may replace or remove roots, so it is deliberately
+        stricter than the presence-only progressive path.  Legacy marker names,
+        duplicate basenames across pairs, orphan status roots, incomplete local
+        coverage, and unrelated dirty inputs retain the normal full build.
+        """
+        if path_pair_id is None or path_pair_id in unknown_local_path_pair_ids or \
+                self.__unknown_local_path_pair_ids.symmetric_difference(
+                    unknown_local_path_pair_ids
+                ).difference({path_pair_id}):
+            return False
+        current_local = self.__local_files_by_pair.get(path_pair_id, {})
+        current_remote = self.__remote_files_by_pair.get(path_pair_id, {})
+        old_sources = {
+            file_id: current_local.get(file_id) or current_remote.get(file_id)
+            for file_id in set(current_local).union(current_remote)
+        }
+        next_sources = {
+            file_id: local_files.get(file_id) or remote_files.get(file_id)
+            for file_id in set(local_files).union(remote_files)
+        }
+        old_names: dict[str, int] = {}
+        next_names: dict[str, int] = {}
+        for source in old_sources.values():
+            if source is not None:
+                old_names[source.name] = old_names.get(source.name, 0) + 1
+        for source in next_sources.values():
+            if source is not None:
+                next_names[source.name] = next_names.get(source.name, 0) + 1
+        for name in set(old_names).union(next_names):
+            # A bare marker cannot safely be assigned to this pair.  Pairless
+            # root ids are also bare, so preserving the global fallback is the
+            # only sound interpretation there.
+            if name in self.__extracted_files:
+                return False
+            # Any remaining global count belongs to another pair.  We never
+            # assign a duplicate basename to a pair-local publication.
+            if self.__source_name_counts.get(name, 0) - old_names.get(name, 0) > 0 or \
+                    self.__status_only_name_counts.get(name, 0) > 0 or \
+                    self.__active_only_name_counts.get(name, 0) > 0:
+                return False
+        # ``build_model`` applies a second, path-aware visibility arbitration:
+        # a local-only root is hidden if a managed root shares its configured
+        # local root path and basename, and local-only peers choose one winner.
+        # Reusing untouched live root objects would bypass that global pass, so
+        # reject whenever either the old or staged selected local bucket shares
+        # an arbitration key with another pair.  The maintained count keeps
+        # this proof bounded even with a large unrelated source set.
+        selected_local_keys = {
+            key for local_file in list(current_local.values()) + list(local_files.values())
+            if (key := self.__local_root_name_key(local_file, path_pair_id)) is not None
+        }
+        for key in selected_local_keys:
+            selected_old_count = sum(
+                1 for local_file in current_local.values()
+                if self.__local_root_name_key(local_file, path_pair_id) == key
+            )
+            if self.__local_root_name_counts.get(key, 0) > selected_old_count:
+                return False
+        source_ids = set(next_sources)
+        if any(
+                status.path_pair_id == path_pair_id and status.file_id not in source_ids
+                for status in self.__lftp_statuses.values()
+        ):
+            return False
+        if any(
+                file.path_pair_id == path_pair_id and file_id not in source_ids
+                for file_id, file in self.__active_files.items()
+        ):
+            return False
+        allowed_reasons = {
+            MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
+            MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
+            MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS,
+        }
+        if not self.__invalidation_reasons.issubset(allowed_reasons):
+            return False
+        touched_ids = self.__lftp_touched_root_file_ids | self.__active_touched_root_file_ids
+        return all(self.__file_id_path_pair_id(file_id) == path_pair_id for file_id in touched_ids)
+
+    def build_authoritative_pair_roots(
+            self, path_pair_id: Optional[str], local_files: List[SystemFile],
+            remote_files: List[SystemFile], unknown_local_path_pair_ids: Set[Optional[str]],
+    ) -> Optional[_AuthoritativePairBuild]:
+        """Stage a complete pair replacement without mutating authoritative maps."""
+        next_local = {
+            self.__root_file_id(file.name, path_pair_id): file
+            for file in local_files if file.path_pair_id == path_pair_id
+        }
+        next_remote = {
+            self.__root_file_id(file.name, path_pair_id): file
+            for file in remote_files if file.path_pair_id == path_pair_id
+        }
+        current_unknown_ids = set(unknown_local_path_pair_ids)
+        if not self.__pair_delta_is_globally_safe(
+                path_pair_id, next_local, next_remote, current_unknown_ids,
+        ):
+            return None
+        partial = ModelBuilder()
+        partial.logger = self.logger
+        partial.__target_archive_trace_logger = self.__target_archive_trace_logger
+        partial.__stop_resume_trace_cycle_id = self.__stop_resume_trace_cycle_id
+        partial.__stop_resume_trace_cycle_context = dict(self.__stop_resume_trace_cycle_context)
+        partial.__stop_resume_trace_breadcrumb = self.__stop_resume_trace_breadcrumb
+        partial.__stop_resume_trace_last_signatures = OrderedDict(self.__stop_resume_trace_last_signatures)
+        partial.__stop_resume_trace_last_enabled = self.__stop_resume_trace_last_enabled
+        partial.__target_archive_trace_last_signature = self.__target_archive_trace_last_signature
+        partial.__performance_diagnostics = self.__performance_diagnostics
+        partial.__local_files_by_pair = {path_pair_id: dict(next_local)}
+        partial.__remote_files_by_pair = {path_pair_id: dict(next_remote)}
+        partial.__active_files = {
+            file_id: file for file_id, file in self.__active_files.items()
+            if file.path_pair_id == path_pair_id
+        }
+        partial.__active_file_ids = set(self.__active_file_ids).intersection(
+            set(next_local).union(next_remote)
+        )
+        partial.__lftp_statuses = {
+            file_id: status for file_id, status in self.__lftp_statuses.items()
+            if status.path_pair_id == path_pair_id
+        }
+        selected_root_ids = set(next_local).union(next_remote)
+        partial.__recent_live_transfer_snapshots = {
+            file_id: snapshot for file_id, snapshot in self.__recent_live_transfer_snapshots.items()
+            if file_id in selected_root_ids or snapshot.root_file_id in selected_root_ids
+        }
+        partial.__retained_stopped_transfer_snapshots = {
+            file_id: snapshot for file_id, snapshot in self.__retained_stopped_transfer_snapshots.items()
+            if file_id in selected_root_ids or snapshot.root_file_id in selected_root_ids
+        }
+        partial.__downloaded_files = None if self.__downloaded_files is None else set(self.__downloaded_files)
+        partial.__downloaded_timestamps = dict(self.__downloaded_timestamps)
+        partial.__extract_statuses = dict(self.__extract_statuses)
+        partial.__extracted_files = set(self.__extracted_files)
+        partial.__stopped_files = set(self.__stopped_files)
+        partial.__validation_statuses = dict(self.__validation_statuses)
+        partial.__move_failed_files = set(self.__move_failed_files)
+        partial.__final_move_succeeded_files = set(self.__final_move_succeeded_files)
+        partial.__unknown_local_path_pair_ids = set(current_unknown_ids)
+        partial.__local_root_paths = dict(self.__local_root_paths)
+        partial.__local_staging_paths = dict(self.__local_staging_paths)
+        return _AuthoritativePairBuild(
+            path_pair_id,
+            dict(self.__local_files_by_pair.get(path_pair_id, {})),
+            dict(self.__remote_files_by_pair.get(path_pair_id, {})),
+            next_local,
+            next_remote,
+            partial.build_model(),
+            current_unknown_ids,
+            partial.get_unresolved_staging_collision_file_ids(),
+            partial.get_terminalizable_staging_collision_file_ids(),
+            dict(partial.__recent_live_transfer_snapshots),
+            dict(partial.__retained_stopped_transfer_snapshots),
+            {
+                file_id for file_id in selected_root_ids
+                if partial.has_complete_local_coverage(file_id)
+            },
+            frozenset(self.__pending_invalidation_tokens),
+        )
+
+    def authorize_authoritative_pair_delta(
+            self, root_exists: Callable[[str], bool], pair_build: _AuthoritativePairBuild,
+    ) -> bool:
+        """Recheck staged source identity and live roots immediately before publication."""
+        pair_id = pair_build.path_pair_id
+        if self.__local_files_by_pair.get(pair_id, {}) != pair_build.previous_local_files or \
+                self.__remote_files_by_pair.get(pair_id, {}) != pair_build.previous_remote_files:
+            return False
+        if frozenset(self.__pending_invalidation_tokens) != pair_build.invalidation_tokens:
+            return False
+        if not self.__pair_delta_is_globally_safe(
+                pair_id, pair_build.local_files, pair_build.remote_files,
+                pair_build.unknown_local_path_pair_ids,
+        ):
+            return False
+        previous_root_ids = set(pair_build.previous_local_files).union(pair_build.previous_remote_files)
+        try:
+            return all(root_exists(file_id) for file_id in previous_root_ids)
+        except Exception:
+            return False
+
+    def adopt_authoritative_pair_delta(
+            self, applied_model: Model, pair_build: _AuthoritativePairBuild,
+            applied_invalidation_tokens: Optional[Set[int]] = None,
+    ) -> None:
+        """Commit staged pair authority only after the live model accepted it."""
+        self.__replace_authoritative_pair_sources(pair_build)
+        selected_pair_ids = {pair_build.path_pair_id}
+        selected_root_ids = set(pair_build.previous_local_files).union(pair_build.previous_remote_files)
+        selected_root_ids.update(pair_build.local_files)
+        selected_root_ids.update(pair_build.remote_files)
+        def replace_snapshots(
+                target: dict[str, _RecentLiveTransferSnapshot],
+                staged: dict[str, _RecentLiveTransferSnapshot],
+        ) -> None:
+            relevant = lambda key, snapshot: key in selected_root_ids or snapshot.root_file_id in selected_root_ids
+            for key, snapshot in list(target.items()):
+                if relevant(key, snapshot):
+                    target.pop(key, None)
+            target.update({key: snapshot for key, snapshot in staged.items() if relevant(key, snapshot)})
+        replace_snapshots(self.__recent_live_transfer_snapshots, pair_build.recent_live_transfer_snapshots)
+        replace_snapshots(self.__retained_stopped_transfer_snapshots, pair_build.retained_stopped_transfer_snapshots)
+        self.__cached_unresolved_staging_collision_file_ids = {
+            file_id for file_id in self.__cached_unresolved_staging_collision_file_ids
+            if self.__file_id_path_pair_id(file_id) not in selected_pair_ids
+        }.union(pair_build.unresolved_staging_collision_file_ids)
+        self.__cached_terminalizable_staging_collision_file_ids = {
+            file_id for file_id in self.__cached_terminalizable_staging_collision_file_ids
+            if self.__file_id_path_pair_id(file_id) not in selected_pair_ids
+        }.union(pair_build.terminalizable_staging_collision_file_ids)
+        self.__unknown_local_path_pair_ids = set(pair_build.unknown_local_path_pair_ids)
+        consumed_tokens = set(pair_build.invalidation_tokens)
+        consumed_tokens.update(applied_invalidation_tokens or set())
+        for token in consumed_tokens:
+            self.__pending_invalidation_tokens.pop(token, None)
+        self.__invalidation_reasons = {
+            reason for reason, _ in self.__pending_invalidation_tokens.values()
+        }
+        self.__lftp_touched_root_file_ids = set().union(*(
+            file_ids or set()
+            for reason, file_ids in self.__pending_invalidation_tokens.values()
+            if reason == MODEL_BUILDER_INVALIDATION_LFTP_STATUSES
+        )) if self.__pending_invalidation_tokens else set()
+        self.__active_touched_root_file_ids = set().union(*(
+            file_ids or set()
+            for reason, file_ids in self.__pending_invalidation_tokens.values()
+            if reason == MODEL_BUILDER_INVALIDATION_ACTIVE_FILES
+        )) if self.__pending_invalidation_tokens else set()
+        self.__lftp_regressed_root_file_ids.intersection_update(self.__lftp_touched_root_file_ids)
+        self.__cached_model = applied_model if not self.__pending_invalidation_tokens else None
+
+    def commit_authoritative_pair_sources_for_full_rebuild(
+            self, pair_build: _AuthoritativePairBuild,
+    ) -> None:
+        """Keep a final scan authoritative when its live delta is rejected."""
+        self.__replace_authoritative_pair_sources(pair_build)
+        self.__unknown_local_path_pair_ids = set(pair_build.unknown_local_path_pair_ids)
+        self.request_rebuild()
+
+    def replace_completed_pair_sources_for_full_rebuild(
+            self, path_pair_id: Optional[str], local_files: List[SystemFile],
+            remote_files: List[SystemFile], unknown_local_path_pair_ids: Set[Optional[str]],
+    ) -> None:
+        """Commit final pair scan authority when bounded rendering is unsafe.
+
+        This intentionally performs no delta-safety classification: the caller
+        has already selected the established global-build fallback.  It still
+        replaces only this pair's bucket, preserving every unrelated source
+        bucket for that global reconciliation.
+        """
+        next_local = {
+            self.__root_file_id(file.name, path_pair_id): file
+            for file in local_files if file.path_pair_id == path_pair_id
+        }
+        next_remote = {
+            self.__root_file_id(file.name, path_pair_id): file
+            for file in remote_files if file.path_pair_id == path_pair_id
+        }
+        self.__replace_authoritative_pair_sources(_AuthoritativePairBuild(
+            path_pair_id,
+            dict(self.__local_files_by_pair.get(path_pair_id, {})),
+            dict(self.__remote_files_by_pair.get(path_pair_id, {})),
+            next_local,
+            next_remote,
+            None,
+            set(unknown_local_path_pair_ids),
+            set(),
+            set(),
+            {},
+            {},
+            set(),
+            frozenset(),
+        ))
+        self.__unknown_local_path_pair_ids = set(unknown_local_path_pair_ids)
+        self.request_rebuild()
+
+    def __replace_authoritative_pair_sources(self, pair_build: _AuthoritativePairBuild) -> None:
+        """Replace one source bucket and maintain bounded global name counts."""
+        pair_id = pair_build.path_pair_id
+        previous_local = self.__local_files_by_pair.get(pair_id, {})
+        previous_remote = self.__remote_files_by_pair.get(pair_id, {})
+        old_sources = {
+            file_id: previous_local.get(file_id) or previous_remote.get(file_id)
+            for file_id in set(previous_local).union(previous_remote)
+        }
+        next_sources = {
+            file_id: pair_build.local_files.get(file_id) or pair_build.remote_files.get(file_id)
+            for file_id in set(pair_build.local_files).union(pair_build.remote_files)
+        }
+        for source in old_sources.values():
+            if source is not None:
+                remaining = self.__source_name_counts.get(source.name, 0) - 1
+                if remaining > 0:
+                    self.__source_name_counts[source.name] = remaining
+                else:
+                    self.__source_name_counts.pop(source.name, None)
+        for source in next_sources.values():
+            if source is not None:
+                self.__source_name_counts[source.name] = self.__source_name_counts.get(source.name, 0) + 1
+        for local_file in previous_local.values():
+            self.__adjust_local_root_name_count(local_file, pair_id, -1)
+        for local_file in pair_build.local_files.values():
+            self.__adjust_local_root_name_count(local_file, pair_id, 1)
+        if pair_build.local_files:
+            self.__local_files_by_pair[pair_id] = dict(pair_build.local_files)
+        else:
+            self.__local_files_by_pair.pop(pair_id, None)
+        if pair_build.remote_files:
+            self.__remote_files_by_pair[pair_id] = dict(pair_build.remote_files)
+        else:
+            self.__remote_files_by_pair.pop(pair_id, None)
+        affected_ids = set(old_sources).union(next_sources)
+        for file_id in affected_ids:
+            self.__update_status_only_name_count(file_id)
+            self.__update_active_only_name_count(file_id)
 
     def has_pending_active_transfer_delta(self) -> bool:
         """Cheap hot-path gate; does not inspect model roots or source maps."""
@@ -2063,9 +2491,9 @@ class ModelBuilder:
         authoritative after full builds; this delta never updates them.
         """
         selected_names = {
-            (self.__remote_files.get(file_id) or self.__local_files.get(file_id)).name
+            (self.__remote_file(file_id) or self.__local_file(file_id)).name
             for file_id in root_file_ids
-            if self.__remote_files.get(file_id) is not None or self.__local_files.get(file_id) is not None
+            if self.__remote_file(file_id) is not None or self.__local_file(file_id) is not None
         }
         if not selected_names.intersection(self.__extracted_files):
             return True
@@ -2086,13 +2514,26 @@ class ModelBuilder:
         partial = ModelBuilder()
         partial.logger = self.logger
         partial.__target_archive_trace_logger = self.__target_archive_trace_logger
-        partial.__local_files = {
-            file_id: file for file_id, file in self.__local_files.items()
-            if file_id in root_file_ids
+        selected_pair_ids = {
+            self.__file_id_path_pair_id(file_id) for file_id in root_file_ids
         }
-        partial.__remote_files = {
-            file_id: file for file_id, file in self.__remote_files.items()
-            if file_id in root_file_ids
+        partial.__local_files_by_pair = {
+            pair_id: {
+                file_id: file for file_id, file in files.items()
+                if file_id in root_file_ids
+            }
+            for pair_id in selected_pair_ids
+            for files in (self.__local_files_by_pair.get(pair_id, {}),)
+            if files
+        }
+        partial.__remote_files_by_pair = {
+            pair_id: {
+                file_id: file for file_id, file in files.items()
+                if file_id in root_file_ids
+            }
+            for pair_id in selected_pair_ids
+            for files in (self.__remote_files_by_pair.get(pair_id, {}),)
+            if files
         }
         partial.__active_files = {
             file_id: file for file_id, file in self.__active_files.items()
@@ -2253,10 +2694,11 @@ class ModelBuilder:
             self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_VALIDATION_STATUSES)
 
     def clear(self) -> None:
-        self.__local_files.clear()
+        self.__local_files_by_pair.clear()
         self.__active_files.clear()
-        self.__remote_files.clear()
+        self.__remote_files_by_pair.clear()
         self.__source_name_counts.clear()
+        self.__local_root_name_counts.clear()
         self.__status_only_file_names.clear()
         self.__status_only_name_counts.clear()
         self.__active_only_file_names.clear()
@@ -2384,12 +2826,13 @@ class ModelBuilder:
             file_id
             for file_id in self.__cached_unresolved_staging_collision_file_ids
             if self.__effective_local_tree_covers_remote_leaves_allowing_collision(
-                self.__remote_files.get(file_id),
+                self.__remote_file(file_id),
                 effective_local_files.get(file_id),
             )
         }
-        all_file_ids: set[str] = set(effective_local_files).union(self.__remote_files)
-        source_file_ids: set[str] = set(effective_local_files).union(self.__remote_files)
+        remote_files = self.__remote_files()
+        all_file_ids: set[str] = set(effective_local_files).union(remote_files)
+        source_file_ids: set[str] = set(effective_local_files).union(remote_files)
         for status_file_id in self.__lftp_statuses.keys():
             if status_file_id not in source_file_ids:
                 all_file_ids.add(status_file_id)
@@ -2400,7 +2843,7 @@ class ModelBuilder:
         # while the ambiguity still exists.
         source_name_counts: Dict[str, int] = {}
         for file_id in all_file_ids:
-            source = effective_local_files.get(file_id) or self.__remote_files.get(file_id)
+            source = effective_local_files.get(file_id) or remote_files.get(file_id)
             if source is None:
                 status = self.__lftp_statuses.get(file_id)
                 source_name = status.name if status is not None else file_id
@@ -2415,7 +2858,7 @@ class ModelBuilder:
 
         built_root_files: List[_BuiltRootFile] = []
         for file_id in all_file_ids:
-            remote = self.__remote_files.get(file_id, None)
+            remote = remote_files.get(file_id, None)
             local = effective_local_files.get(file_id, None)
             status = self.__lftp_statuses.get(file_id, None)
             is_stopped = self.__is_stopped_file(file_id, remote, local)

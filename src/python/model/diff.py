@@ -83,6 +83,11 @@ class ModelDiffUtil:
         for file_id in file_ids_updated:
             file_before = model_before.get_file(file_id)
             file_after = model_after.get_file(file_id)
+            # Pair-final candidate composition intentionally shares every
+            # unrelated live root object.  Equality is recursive, so object
+            # identity is the authoritative O(1) no-change proof here.
+            if file_before is file_after:
+                continue
             if file_before != file_after:
                 diffs.append(ModelDiff(ModelDiff.Change.UPDATED, file_before, file_after))
 

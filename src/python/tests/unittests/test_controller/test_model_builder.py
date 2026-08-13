@@ -110,6 +110,214 @@ class TestModelBuilder(unittest.TestCase):
             retained_model.get_file_ids(),
         )
 
+    def test_authoritative_pair_build_replaces_only_completed_pair_and_adopts_after_publication(self):
+        first = SystemFile("old.bin", 10, False)
+        first.path_pair_id = "pair-a"
+        untouched = SystemFile("idle.bin", 20, False)
+        untouched.path_pair_id = "pair-b"
+        self.model_builder.set_remote_files([first, untouched])
+        live_model = self.model_builder.build_model()
+        untouched_before = live_model.get_file(ModelFile.build_file_id("idle.bin", "pair-b"))
+
+        replacement = SystemFile("new.bin", 30, False)
+        replacement.path_pair_id = "pair-a"
+        pair_build = self.model_builder.build_authoritative_pair_roots(
+            "pair-a", [], [replacement], set(),
+        )
+
+        self.assertIsNotNone(pair_build)
+        assert pair_build is not None
+        self.assertTrue(self.model_builder.authorize_authoritative_pair_delta(
+            lambda file_id: file_id in live_model.get_file_ids(), pair_build,
+        ))
+        live_model.remove_file(ModelFile.build_file_id("old.bin", "pair-a"))
+        live_model.add_file(pair_build.model.get_file(ModelFile.build_file_id("new.bin", "pair-a")))
+        self.model_builder.adopt_authoritative_pair_delta(live_model, pair_build)
+
+        self.assertEqual(
+            {ModelFile.build_file_id("new.bin", "pair-a"), ModelFile.build_file_id("idle.bin", "pair-b")},
+            live_model.get_file_ids(),
+        )
+        self.assertIs(untouched_before, live_model.get_file(ModelFile.build_file_id("idle.bin", "pair-b")))
+        self.assertEqual(
+            {ModelFile.build_file_id("new.bin", "pair-a")},
+            set(self.model_builder._ModelBuilder__remote_files_by_pair["pair-a"]),
+        )
+        self.assertEqual(
+            {ModelFile.build_file_id("idle.bin", "pair-b")},
+            set(self.model_builder._ModelBuilder__remote_files_by_pair["pair-b"]),
+        )
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_authoritative_pair_build_falls_back_for_cross_pair_duplicate_basename(self):
+        first = SystemFile("shared.bin", 10, False)
+        first.path_pair_id = "pair-a"
+        second = SystemFile("shared.bin", 20, False)
+        second.path_pair_id = "pair-b"
+        self.model_builder.set_remote_files([first, second])
+        self.model_builder.build_model()
+
+        replacement = SystemFile("shared.bin", 30, False)
+        replacement.path_pair_id = "pair-a"
+
+        self.assertIsNone(self.model_builder.build_authoritative_pair_roots(
+            "pair-a", [], [replacement], set(),
+        ))
+
+    def test_authoritative_pair_build_falls_back_for_cross_pair_local_root_arbitration(self):
+        for other_is_managed in (True, False):
+            with self.subTest(other_is_managed=other_is_managed):
+                builder = ModelBuilder()
+                builder.set_local_root_paths({
+                    "pair-a": "/shared-local-root",
+                    "pair-b": "/shared-local-root/.",
+                })
+                selected = SystemFile("shared.bin", 10, False)
+                selected.path_pair_id = "pair-a"
+                other_local = SystemFile("shared.bin", 20, False)
+                other_local.path_pair_id = "pair-b"
+                builder.set_local_files([selected, other_local])
+                other_remote = SystemFile("shared.bin", 20, False)
+                other_remote.path_pair_id = "pair-b"
+                builder.set_remote_files([other_remote] if other_is_managed else [])
+
+                before = builder.build_model()
+                other_id = ModelFile.build_file_id("shared.bin", "pair-b")
+                self.assertEqual({other_id}, before.get_file_ids())
+                replacement = SystemFile("shared.bin", 11, False)
+                replacement.path_pair_id = "pair-a"
+
+                # A pair candidate would reuse pair-b's live root and skip
+                # the global local-root winner/visibility arbitration.
+                self.assertIsNone(builder.build_authoritative_pair_roots(
+                    "pair-a", [replacement], [], set(),
+                ))
+
+                # The normal global rebuild preserves the one visible winner.
+                builder.set_local_files([replacement, other_local])
+                self.assertEqual({other_id}, builder.build_model().get_file_ids())
+
+    def test_authoritative_pair_build_rejects_cross_pair_status_only_duplicate_basename(self):
+        selected = SystemFile("release.bin", 10, False)
+        selected.path_pair_id = "pair-a"
+        self.model_builder.set_remote_files([selected])
+        self.model_builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "release.bin", "",
+        )
+        status.path_pair_id = "pair-b"
+        self.model_builder.set_lftp_statuses([status])
+
+        self.assertIsNone(self.model_builder.build_authoritative_pair_roots(
+            "pair-a", [], [selected], set(),
+        ))
+
+    def test_authoritative_pair_build_rejects_cross_pair_active_only_duplicate_basename(self):
+        selected = SystemFile("release.bin", 10, False)
+        selected.path_pair_id = "pair-a"
+        self.model_builder.set_remote_files([selected])
+        self.model_builder.build_model()
+        active = SystemFile("release.bin", 5, False)
+        active.path_pair_id = "pair-b"
+        self.model_builder.set_active_files([active])
+
+        self.assertIsNone(self.model_builder.build_authoritative_pair_roots(
+            "pair-a", [], [selected], set(),
+        ))
+
+    def test_authoritative_pair_build_retains_selected_recent_transfer_snapshot(self):
+        remote = SystemFile("active.bin", 1000, False)
+        remote.path_pair_id = "pair-a"
+        local = SystemFile("active.bin", 950, False)
+        local.path_pair_id = "pair-a"
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+        self.model_builder.build_model()
+        file_id = ModelFile.build_file_id("active.bin", "pair-a")
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_id] = _RecentLiveTransferSnapshot(
+            root_file_id=file_id, size_local=975, percent_local=97, speed=1000, eta=5,
+        )
+
+        pair_build = self.model_builder.build_authoritative_pair_roots(
+            "pair-a", [local], [remote], set(),
+        )
+
+        self.assertIsNotNone(pair_build)
+        assert pair_build is not None
+        rendered = pair_build.model.get_file(file_id)
+        self.assertEqual(975, rendered.transferred_size)
+        self.assertEqual(97, rendered.download_progress)
+
+    def test_authoritative_pair_adoption_preserves_later_invalidation(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        self.model_builder.set_remote_files([old])
+        live_model = self.model_builder.build_model()
+        replacement = SystemFile("new.bin", 20, False)
+        replacement.path_pair_id = "pair-a"
+        pair_build = self.model_builder.build_authoritative_pair_roots(
+            "pair-a", [], [replacement], set(),
+        )
+        assert pair_build is not None
+        live_model.remove_file(ModelFile.build_file_id("old.bin", "pair-a"))
+        live_model.add_file(pair_build.model.get_file(ModelFile.build_file_id("new.bin", "pair-a")))
+        self.model_builder.set_downloaded_files({ModelFile.build_file_id("later.bin", "pair-a")})
+
+        self.model_builder.adopt_authoritative_pair_delta(live_model, pair_build)
+
+        self.assertTrue(self.model_builder.has_changes())
+        self.assertTrue(self.model_builder._ModelBuilder__pending_invalidation_tokens)
+
+    def test_authoritative_pair_build_reports_staged_terminalizable_collision(self):
+        old = SystemFile("old.bin", 1, False)
+        old.path_pair_id = "pair-a"
+        self.model_builder.set_local_files([old])
+        self.model_builder.set_remote_files([old])
+        self.model_builder.build_model()
+        remote = SystemFile("release", 10, True)
+        remote.path_pair_id = "pair-a"
+        remote.add_child(SystemFile("entry.bin", 10, False))
+        local = SystemFile("release", 10, True)
+        local.path_pair_id = "pair-a"
+        collision = SystemFile("entry.bin", 10, False, is_staging=True)
+        collision.has_staging_collision = True
+        local.add_child(collision)
+
+        pair_build = self.model_builder.build_authoritative_pair_roots(
+            "pair-a", [local], [remote], set(),
+        )
+
+        self.assertIsNotNone(pair_build)
+        assert pair_build is not None
+        release_id = ModelFile.build_file_id("release", "pair-a")
+        self.assertEqual({release_id}, pair_build.unresolved_staging_collision_file_ids)
+        self.assertEqual({release_id}, pair_build.terminalizable_staging_collision_file_ids)
+
+    def test_authoritative_pair_auth_rejection_commits_sources_and_requires_full_rebuild(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        self.model_builder.set_remote_files([old])
+        live_model = self.model_builder.build_model()
+        replacement = SystemFile("new.bin", 20, False)
+        replacement.path_pair_id = "pair-a"
+        pair_build = self.model_builder.build_authoritative_pair_roots(
+            "pair-a", [], [replacement], set(),
+        )
+
+        self.assertIsNotNone(pair_build)
+        assert pair_build is not None
+        self.model_builder.set_downloaded_files(set())
+        self.assertFalse(self.model_builder.authorize_authoritative_pair_delta(
+            lambda file_id: file_id in live_model.get_file_ids(), pair_build,
+        ))
+        self.model_builder.commit_authoritative_pair_sources_for_full_rebuild(pair_build)
+
+        self.assertEqual(
+            {ModelFile.build_file_id("new.bin", "pair-a")},
+            set(self.model_builder._ModelBuilder__remote_files_by_pair["pair-a"]),
+        )
+        self.assertTrue(self.model_builder.has_changes())
+
     def test_active_transfer_delta_builds_only_known_changed_root_and_adopts_live_model(self):
         active = SystemFile("active.bin", 100, False)
         retained = SystemFile("retained.bin", 200, False)
@@ -553,7 +761,7 @@ class TestModelBuilder(unittest.TestCase):
         equal_root.add_child(SystemFile("child.bin", 10, False))
         self.model_builder.set_remote_files([equal_root])
 
-        self.assertIs(retained_root, self.model_builder._ModelBuilder__remote_files["root"])
+        self.assertIs(retained_root, self.model_builder._ModelBuilder__remote_files_by_pair[None]["root"])
         self.assertIs(live_model, self.model_builder.build_model())
 
     def test_equal_local_scan_preserves_shared_system_tree_and_cached_model(self):
@@ -565,7 +773,7 @@ class TestModelBuilder(unittest.TestCase):
 
         self.model_builder.set_local_files([SystemFile("local.bin", 10, False)])
 
-        self.assertIs(retained_file, self.model_builder._ModelBuilder__local_files["local.bin"])
+        self.assertIs(retained_file, self.model_builder._ModelBuilder__local_files_by_pair[None]["local.bin"])
         self.assertIs(live_model, self.model_builder.build_model())
 
     def test_local_only_presence_includes_empty_local_files(self):
@@ -4015,7 +4223,7 @@ class TestModelBuilder(unittest.TestCase):
 
         model = self.model_builder.build_model()
 
-        self.assertEqual(42, self.model_builder._ModelBuilder__local_files["a"].size)
+        self.assertEqual(42, self.model_builder._ModelBuilder__local_files_by_pair[None]["a"].size)
         self.assertEqual(99, self.model_builder._ModelBuilder__active_files["a"].size)
         self.assertEqual(99, model.get_file("a").local_size)
         self.assertEqual(ModelFile.State.DEFAULT, model.get_file("a").state)

@@ -47,7 +47,7 @@ class TestMemoryOwnershipCensus(unittest.TestCase):
         system_child = SystemFile("credential-value", 1, True)
         system_root.add_child(system_child)
         system_child.add_child(system_root)
-        builder._ModelBuilder__local_files = {"private-key": system_root}
+        builder._ModelBuilder__local_files_by_pair = {None: {"private-key": system_root}}
 
         census = self.controller.get_memory_ownership_census()
 
@@ -80,9 +80,9 @@ class TestMemoryOwnershipCensus(unittest.TestCase):
     def test_snapshot_survives_builder_container_replacement(self):
         builder = self.controller._Controller__model_builder
         retained = SystemFile("retained", 1)
-        builder._ModelBuilder__local_files = {"one": retained}
+        builder._ModelBuilder__local_files_by_pair = {None: {"one": retained}}
         roots = self.controller._Controller__capture_memory_ownership_roots()
-        builder._ModelBuilder__local_files = {"two": SystemFile("replacement", 1)}
+        builder._ModelBuilder__local_files_by_pair = {None: {"two": SystemFile("replacement", 1)}}
 
         census = build_ownership_census(roots)
 
@@ -158,8 +158,8 @@ class TestMemoryOwnershipCensus(unittest.TestCase):
         shared_scan_root = SystemFile("scan", 1, True)
         shared_scan_root.add_child(SystemFile("scan-child", 1))
         builder = self.controller._Controller__model_builder
-        builder._ModelBuilder__local_files = {"local": shared_scan_root}
-        builder._ModelBuilder__remote_files = {"remote": shared_scan_root}
+        builder._ModelBuilder__local_files_by_pair = {None: {"local": shared_scan_root}}
+        builder._ModelBuilder__remote_files_by_pair = {None: {"remote": shared_scan_root}}
 
         census = self.controller.get_memory_ownership_census()
 
