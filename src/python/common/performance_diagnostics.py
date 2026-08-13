@@ -70,6 +70,14 @@ MODEL_REBUILD_REASON_DEFERRED_MOVE_PENDING = "deferred_move_pending"
 COUNTER_CANDIDATE_PAIR_FALLBACK = "candidate_pair_fallback"
 COUNTER_CANDIDATE_LIFECYCLE_FALLBACK = "candidate_lifecycle_fallback"
 COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED = "unrelated_candidate_lifecycle_deferred"
+COUNTER_PAIR_SAFETY_REJECT_UNKNOWN_AUTHORITY = "pair_safety_reject_unknown_authority"
+COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER = "pair_safety_reject_extracted_bare_marker"
+COUNTER_PAIR_SAFETY_REJECT_NAME_AMBIGUITY = "pair_safety_reject_name_ambiguity"
+COUNTER_PAIR_SAFETY_REJECT_LOCAL_ROOT_ARBITRATION = "pair_safety_reject_local_root_arbitration"
+COUNTER_PAIR_SAFETY_REJECT_ORPHAN_STATUS = "pair_safety_reject_orphan_status"
+COUNTER_PAIR_SAFETY_REJECT_ORPHAN_ACTIVE = "pair_safety_reject_orphan_active"
+COUNTER_PAIR_SAFETY_REJECT_DIRTY_INPUT = "pair_safety_reject_dirty_input"
+COUNTER_PAIR_SAFETY_REJECT_CROSS_PAIR_TOUCH = "pair_safety_reject_cross_pair_touch"
 CANDIDATE_PAIR_FALLBACK_REASON_PREREQUISITES = "prerequisites"
 CANDIDATE_PAIR_FALLBACK_REASON_AUTHORIZATION_REJECTED = "authorization_rejected"
 CANDIDATE_PAIR_FALLBACK_REASON_MISSING_MODEL = "missing_model"
@@ -195,6 +203,11 @@ _COUNTERS = frozenset((
     "model_rebuild_collision_retry", "model_rebuild_deferred_move_pending",
     COUNTER_CANDIDATE_PAIR_FALLBACK, COUNTER_CANDIDATE_LIFECYCLE_FALLBACK,
     COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED,
+    COUNTER_PAIR_SAFETY_REJECT_UNKNOWN_AUTHORITY, COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER,
+    COUNTER_PAIR_SAFETY_REJECT_NAME_AMBIGUITY,
+    COUNTER_PAIR_SAFETY_REJECT_LOCAL_ROOT_ARBITRATION, COUNTER_PAIR_SAFETY_REJECT_ORPHAN_STATUS,
+    COUNTER_PAIR_SAFETY_REJECT_ORPHAN_ACTIVE, COUNTER_PAIR_SAFETY_REJECT_DIRTY_INPUT,
+    COUNTER_PAIR_SAFETY_REJECT_CROSS_PAIR_TOUCH,
     "progressive_delta_publications", "progressive_delta_root_visits",
     "active_transfer_delta_publications", "active_transfer_delta_root_visits",
     "scan_priority_requests", "scan_priority_interrupts",

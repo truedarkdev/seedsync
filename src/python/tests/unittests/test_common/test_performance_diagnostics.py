@@ -43,6 +43,7 @@ from common.performance_diagnostics import (
     CANDIDATE_PAIR_FALLBACK_REASON_AUTHORIZATION_REJECTED,
     COUNTER_CANDIDATE_LIFECYCLE_FALLBACK,
     COUNTER_CANDIDATE_PAIR_FALLBACK,
+    COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER,
     COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED,
     MODEL_REBUILD_REASON_COLLISION_RETRY,
     FixedDurationRecorder,
@@ -121,6 +122,7 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
         collector.increment(COUNTER_CANDIDATE_PAIR_FALLBACK)
         collector.increment(COUNTER_CANDIDATE_LIFECYCLE_FALLBACK)
         collector.increment(COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED)
+        collector.increment(COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER)
         collector.increment("model_rebuild_collision_retry", -1)
         collector.increment("model_rebuild:/private/path")
         snapshot = collector.snapshot()
@@ -140,6 +142,7 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
         self.assertEqual(1, snapshot["counters"][COUNTER_CANDIDATE_PAIR_FALLBACK])
         self.assertEqual(1, snapshot["counters"][COUNTER_CANDIDATE_LIFECYCLE_FALLBACK])
         self.assertEqual(1, snapshot["counters"][COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED])
+        self.assertEqual(1, snapshot["counters"][COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER])
         self.assertNotIn("model_rebuild:/private/path", snapshot["counters"])
         self.assertEqual("collision_retry", MODEL_REBUILD_REASON_COLLISION_RETRY)
         self.assertEqual("authorization_rejected", CANDIDATE_PAIR_FALLBACK_REASON_AUTHORIZATION_REJECTED)

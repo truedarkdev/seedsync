@@ -17,6 +17,14 @@ from lftp import LftpJobStatus
 from model import ModelFile, Model, ModelError
 from common.breadcrumb_trace import BreadcrumbTraceEmitter
 from common.performance_diagnostics import (
+    COUNTER_PAIR_SAFETY_REJECT_CROSS_PAIR_TOUCH,
+    COUNTER_PAIR_SAFETY_REJECT_DIRTY_INPUT,
+    COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER,
+    COUNTER_PAIR_SAFETY_REJECT_LOCAL_ROOT_ARBITRATION,
+    COUNTER_PAIR_SAFETY_REJECT_NAME_AMBIGUITY,
+    COUNTER_PAIR_SAFETY_REJECT_ORPHAN_ACTIVE,
+    COUNTER_PAIR_SAFETY_REJECT_ORPHAN_STATUS,
+    COUNTER_PAIR_SAFETY_REJECT_UNKNOWN_AUTHORITY,
     DURATION_MODEL_BUILDER_SET_ACTIVE_FILES,
     DURATION_MODEL_BUILDER_SET_LFTP_STATUSES,
     DURATION_MODEL_BUILDER_SET_LOCAL_FILES,
@@ -188,6 +196,11 @@ class ModelBuilder:
             diagnostics.increment(counter)
         except Exception:
             pass
+
+    def __reject_pair_safety(self, counter: str) -> bool:
+        """Record one fixed fail-closed pair-delta category and reject it."""
+        self.__record_cache_invalidation(counter)
+        return False
 
     @staticmethod
     def __file_id_path_pair_id(file_id: str) -> Optional[str]:
@@ -2134,7 +2147,7 @@ class ModelBuilder:
                 self.__unknown_local_path_pair_ids.symmetric_difference(
                     unknown_local_path_pair_ids
                 ).difference({path_pair_id}):
-            return False
+            return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_UNKNOWN_AUTHORITY)
         current_local = self.__local_files_by_pair.get(path_pair_id, {})
         current_remote = self.__remote_files_by_pair.get(path_pair_id, {})
         old_sources = {
@@ -2158,13 +2171,13 @@ class ModelBuilder:
             # root ids are also bare, so preserving the global fallback is the
             # only sound interpretation there.
             if name in self.__extracted_files:
-                return False
+                return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER)
             # Any remaining global count belongs to another pair.  We never
             # assign a duplicate basename to a pair-local publication.
             if self.__source_name_counts.get(name, 0) - old_names.get(name, 0) > 0 or \
                     self.__status_only_name_counts.get(name, 0) > 0 or \
                     self.__active_only_name_counts.get(name, 0) > 0:
-                return False
+                return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_NAME_AMBIGUITY)
         # ``build_model`` applies a second, path-aware visibility arbitration:
         # a local-only root is hidden if a managed root shares its configured
         # local root path and basename, and local-only peers choose one winner.
@@ -2182,27 +2195,29 @@ class ModelBuilder:
                 if self.__local_root_name_key(local_file, path_pair_id) == key
             )
             if self.__local_root_name_counts.get(key, 0) > selected_old_count:
-                return False
+                return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_LOCAL_ROOT_ARBITRATION)
         source_ids = set(next_sources)
         if any(
                 status.path_pair_id == path_pair_id and status.file_id not in source_ids
                 for status in self.__lftp_statuses.values()
         ):
-            return False
+            return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_ORPHAN_STATUS)
         if any(
                 file.path_pair_id == path_pair_id and file_id not in source_ids
                 for file_id, file in self.__active_files.items()
         ):
-            return False
+            return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_ORPHAN_ACTIVE)
         allowed_reasons = {
             MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
             MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
             MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS,
         }
         if not self.__invalidation_reasons.issubset(allowed_reasons):
-            return False
+            return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_DIRTY_INPUT)
         touched_ids = self.__lftp_touched_root_file_ids | self.__active_touched_root_file_ids
-        return all(self.__file_id_path_pair_id(file_id) == path_pair_id for file_id in touched_ids)
+        if not all(self.__file_id_path_pair_id(file_id) == path_pair_id for file_id in touched_ids):
+            return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_CROSS_PAIR_TOUCH)
+        return True
 
     def build_authoritative_pair_roots(
             self, path_pair_id: Optional[str], local_files: List[SystemFile],

@@ -24,6 +24,8 @@ from controller.extract import ExtractStatus
 from controller.validate import ValidateStatus
 from common.breadcrumb_trace import BreadcrumbTraceCollector
 from common.performance_diagnostics import (
+    COUNTER_PAIR_SAFETY_REJECT_NAME_AMBIGUITY,
+    COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER,
     DURATION_MODEL_BUILDER_SET_ACTIVE_FILES,
     DURATION_MODEL_BUILDER_SET_LFTP_STATUSES,
     DURATION_MODEL_BUILDER_SET_LOCAL_FILES,
@@ -150,6 +152,8 @@ class TestModelBuilder(unittest.TestCase):
         self.assertFalse(self.model_builder.has_changes())
 
     def test_authoritative_pair_build_falls_back_for_cross_pair_duplicate_basename(self):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        self.model_builder.set_performance_diagnostics(diagnostics)
         first = SystemFile("shared.bin", 10, False)
         first.path_pair_id = "pair-a"
         second = SystemFile("shared.bin", 20, False)
@@ -163,6 +167,10 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(self.model_builder.build_authoritative_pair_roots(
             "pair-a", [], [replacement], set(),
         ))
+        self.assertEqual(
+            1,
+            diagnostics.snapshot()["counters"][COUNTER_PAIR_SAFETY_REJECT_NAME_AMBIGUITY],
+        )
 
     def test_authoritative_pair_build_falls_back_for_cross_pair_local_root_arbitration(self):
         for other_is_managed in (True, False):
@@ -196,6 +204,31 @@ class TestModelBuilder(unittest.TestCase):
                 # The normal global rebuild preserves the one visible winner.
                 builder.set_local_files([replacement, other_local])
                 self.assertEqual({other_id}, builder.build_model().get_file_ids())
+
+    def test_authoritative_pair_build_attributes_bare_extracted_marker_without_rejecting_safe_pair(self):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        self.model_builder.set_performance_diagnostics(diagnostics)
+        selected = SystemFile("selected.bin", 10, False)
+        selected.path_pair_id = "pair-a"
+        self.model_builder.set_remote_files([selected])
+        self.model_builder.build_model()
+
+        self.assertIsNotNone(self.model_builder.build_authoritative_pair_roots(
+            "pair-a", [], [selected], set(),
+        ))
+        self.assertEqual(
+            0,
+            diagnostics.snapshot()["counters"][COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER],
+        )
+
+        self.model_builder.set_extracted_files({"selected.bin"})
+        self.assertIsNone(self.model_builder.build_authoritative_pair_roots(
+            "pair-a", [], [selected], set(),
+        ))
+        self.assertEqual(
+            1,
+            diagnostics.snapshot()["counters"][COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER],
+        )
 
     def test_authoritative_pair_build_rejects_cross_pair_status_only_duplicate_basename(self):
         selected = SystemFile("release.bin", 10, False)
