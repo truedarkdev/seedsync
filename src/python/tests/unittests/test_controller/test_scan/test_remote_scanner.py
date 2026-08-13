@@ -6,12 +6,13 @@ import sys
 from unittest.mock import patch, call, ANY, MagicMock
 import tempfile
 import os
+import base64
 import json
 import shutil
 import shlex
 
 from controller.scan import RemoteScanner, ScannerError
-from ssh import SshcpError
+from ssh import Sshcp, SshcpError
 from common import Localization, escape_remote_path_for_shell
 from common.performance_diagnostics import (
     DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION,
@@ -2282,11 +2283,45 @@ class TestRemoteScanner(unittest.TestCase):
         scanner.set_progress_callback(lambda *args: events.append(args))
 
         self.assertEqual([], scanner.scan())
-        self.assertIn("--stream-known-root-fingerprints", commands[0])
         arguments = shlex.split(commands[0])
-        encoded_index = arguments.index("--stream-known-root-fingerprints") + 1
-        self.assertEqual({root_name: fingerprint}, json.loads(arguments[encoded_index]))
+        self.assertIn("--stream-known-root-fingerprints-b64", arguments)
+        self.assertNotIn("--stream-known-root-fingerprints", arguments)
+        with patch.object(Sshcp, "_Sshcp__run_command_stream", return_value=b""):
+            Sshcp(host="host", port=22, user="user", password="password").shell_stream(
+                commands[0], lambda _chunk: None, retain_output=False
+            )
+        encoded_index = arguments.index("--stream-known-root-fingerprints-b64") + 1
+        self.assertEqual(
+            {root_name: fingerprint},
+            json.loads(base64.urlsafe_b64decode(arguments[encoded_index]).decode("utf-8")),
+        )
         self.assertIn({root_name: fingerprint}, [event[-1] for event in events if event[-1]])
+
+    def test_progressive_v2_unsupported_hint_falls_back_to_full_scan(self):
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        scanner.set_accepted_root_fingerprints({"root": "a" * 64})
+        commands = []
+
+        def shell_stream(command, on_chunk, retain_output=False):
+            commands.append(command)
+            if "--stream-known-root-fingerprints-b64" in command:
+                raise SshcpError("unrecognized option: --stream-known-root-fingerprints-b64")
+            return json.dumps([{"name": "root", "size": 1, "is_dir": False}]).encode("utf-8")
+
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+        events = []
+        scanner.set_progress_callback(lambda *args: events.append(args))
+
+        self.assertEqual(["root"], [file.name for file in scanner.scan()])
+        self.assertEqual(2, len(commands))
+        self.assertIn("--stream-known-root-fingerprints-b64", shlex.split(commands[0]))
+        self.assertNotIn("--stream-known-root-fingerprints", shlex.split(commands[1]))
+        self.assertTrue(events)
 
     def test_legacy_five_argument_progress_callback_falls_back_to_full_roots(self):
         scanner = RemoteScanner(

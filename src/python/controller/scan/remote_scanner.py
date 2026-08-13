@@ -1,5 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import base64
 import logging
 import json
 import codecs
@@ -448,13 +449,15 @@ class RemoteScanner(IScanner):
             stream_args = " --stream --stream-batch-size 64" if self.__progress_callback is not None else ""
             if stream_args and self.__progress_callback_supports_fingerprints and \
                     self.__accepted_root_fingerprints:
-                encoded_fingerprints = json.dumps(
+                fingerprint_json = json.dumps(
                     self.__accepted_root_fingerprints, sort_keys=True, separators=(",", ":")
                 )
                 # A hint must never make a valid scan exceed shell argument
                 # bounds.  Omit it as a safe full-tree fallback instead.
-                if len(encoded_fingerprints.encode("utf-8")) <= self._MAX_KNOWN_ROOT_FINGERPRINT_BYTES:
-                    stream_args += " --stream-known-root-fingerprints {}".format(
+                fingerprint_bytes = fingerprint_json.encode("utf-8")
+                if len(fingerprint_bytes) <= self._MAX_KNOWN_ROOT_FINGERPRINT_BYTES:
+                    encoded_fingerprints = base64.urlsafe_b64encode(fingerprint_bytes).decode("ascii")
+                    stream_args += " --stream-known-root-fingerprints-b64 {}".format(
                         shlex.quote(encoded_fingerprints)
                     )
             if self.__should_execute_scanfs_directly(self.__local_path_to_scan_script):

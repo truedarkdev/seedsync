@@ -5,13 +5,15 @@
 # so it must not depend on the local SeedSync package layout.
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
 import re
 import sys
 from datetime import datetime
-from typing import List, Optional, Protocol, Tuple, TypedDict
+from typing import Dict, List, Optional, Protocol, Tuple, TypedDict
 
 
 _STREAM_PREFIX = "SEEDSYNC_SCAN_V2\t"
@@ -19,6 +21,8 @@ _STREAM_PREFIX = "SEEDSYNC_SCAN_V2\t"
 # ordered node records below, so a large tree never becomes one buffered line.
 _MAX_STREAM_RECORD_BYTES = 64 * 1024
 _MAX_STREAM_NODE_BATCH_SIZE = 64
+_MAX_KNOWN_ROOT_FINGERPRINT_BYTES = 32 * 1024
+_MAX_KNOWN_ROOT_FINGERPRINT_B64_BYTES = 4 * ((_MAX_KNOWN_ROOT_FINGERPRINT_BYTES + 2) // 3)
 
 
 class SystemFileDataRequired(TypedDict):
@@ -645,6 +649,54 @@ def _write_stream_root(root_id: int, root: SystemFile, node_batch_size: int) -> 
     _write_stream_record({"type": "root_end", "id": root_id, "nodes": next_node_id})
 
 
+def _reject_duplicate_json_keys(pairs: List[Tuple[str, object]]) -> Dict[str, object]:
+    result: Dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate object key")
+        result[key] = value
+    return result
+
+
+def _decode_known_root_fingerprints(
+        encoded_json: Optional[str], encoded_b64: Optional[str], parser: argparse.ArgumentParser
+        ) -> Dict[str, str]:
+    if encoded_json is not None and encoded_b64 is not None:
+        parser.error("only one known-root fingerprint option may be provided")
+
+    if encoded_b64 is not None:
+        if len(encoded_b64) > _MAX_KNOWN_ROOT_FINGERPRINT_B64_BYTES or \
+                not re.fullmatch(r"[A-Za-z0-9_-]*={0,2}", encoded_b64) or len(encoded_b64) % 4:
+            parser.error("--stream-known-root-fingerprints-b64 contains invalid base64")
+        try:
+            decoded_bytes = base64.b64decode(encoded_b64.encode("ascii"), altchars=b"-_", validate=True)
+        except (UnicodeEncodeError, binascii.Error, ValueError):
+            parser.error("--stream-known-root-fingerprints-b64 contains invalid base64")
+        if len(decoded_bytes) > _MAX_KNOWN_ROOT_FINGERPRINT_BYTES:
+            parser.error("known-root fingerprints exceeds decoded-size limit")
+        if base64.urlsafe_b64encode(decoded_bytes).decode("ascii") != encoded_b64:
+            parser.error("--stream-known-root-fingerprints-b64 contains invalid base64")
+        try:
+            encoded_json = decoded_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            parser.error("known-root fingerprints must be UTF-8 JSON")
+
+    if encoded_json is None:
+        return {}
+    try:
+        if len(encoded_json.encode("utf-8")) > _MAX_KNOWN_ROOT_FINGERPRINT_BYTES:
+            raise ValueError("known-root fingerprint JSON exceeded limit")
+        candidate = json.loads(encoded_json, object_pairs_hook=_reject_duplicate_json_keys)
+    except (UnicodeEncodeError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        parser.error("known-root fingerprints must be a bounded JSON object")
+    if not isinstance(candidate, dict) or not all(
+            isinstance(name, str) and isinstance(fingerprint, str) and
+            re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+            for name, fingerprint in candidate.items()):
+        parser.error("known-root fingerprints contains invalid values")
+    return candidate
+
+
 if __name__ == "__main__":
     if sys.hexversion < 0x03080000:
         sys.exit("Python 3.8 or later is required to run this program.")
@@ -661,6 +713,8 @@ if __name__ == "__main__":
                         help="Maximum V2 nodes per bounded record")
     parser.add_argument("--stream-known-root-fingerprints", default=None,
                         help="Compact JSON map of previously accepted V2 root digests")
+    parser.add_argument("--stream-known-root-fingerprints-b64", default=None,
+                        help="URL-safe base64 of a compact JSON map of previously accepted V2 root digests")
     args = parser.parse_args()
 
     scanner = SystemScanner(args.path)
@@ -670,18 +724,11 @@ if __name__ == "__main__":
         if args.stream:
             if args.stream_batch_size < 1 or args.stream_batch_size > _MAX_STREAM_NODE_BATCH_SIZE:
                 parser.error("--stream-batch-size must be between 1 and {}".format(_MAX_STREAM_NODE_BATCH_SIZE))
-            known_fingerprints: dict[str, str] = {}
-            if args.stream_known_root_fingerprints is not None:
-                try:
-                    candidate = json.loads(args.stream_known_root_fingerprints)
-                except json.JSONDecodeError:
-                    parser.error("--stream-known-root-fingerprints must be a JSON object")
-                if not isinstance(candidate, dict) or not all(
-                        isinstance(name, str) and isinstance(fingerprint, str) and
-                        re.fullmatch(r"[0-9a-f]{64}", fingerprint)
-                        for name, fingerprint in candidate.items()):
-                    parser.error("--stream-known-root-fingerprints contains invalid values")
-                known_fingerprints = candidate
+            known_fingerprints = _decode_known_root_fingerprints(
+                args.stream_known_root_fingerprints,
+                args.stream_known_root_fingerprints_b64,
+                parser,
+            )
             root_names = scanner.root_names()
             _write_stream_manifest(root_names)
             emitted_root_id = 0

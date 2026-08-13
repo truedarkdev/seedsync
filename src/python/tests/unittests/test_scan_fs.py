@@ -1,6 +1,8 @@
 # Copyright 2026, SeedSync Contributors, All rights reserved.
 
 import io
+import base64
+from argparse import ArgumentParser
 import json
 import os
 import runpy
@@ -9,13 +11,18 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 from system import SystemFile
-from scan_fs import SystemScanner, stream_root_fingerprint
+from scan_fs import (
+    _MAX_KNOWN_ROOT_FINGERPRINT_BYTES,
+    _decode_known_root_fingerprints,
+    SystemScanner,
+    stream_root_fingerprint,
+)
 
 
 class TestScanFsScript(unittest.TestCase):
@@ -156,6 +163,67 @@ class TestScanFsScript(unittest.TestCase):
         changed_records = [json.loads(line.split("\t", 1)[1]) for line in changed.stdout.splitlines()]
         self.assertIn("root_begin", [record["type"] for record in changed_records])
         self.assertNotIn("root_unchanged", [record["type"] for record in changed_records])
+
+    def test_stream_accepts_urlsafe_base64_known_root_fingerprints(self):
+        self._write_file("root", "nested.bin", content=b"one")
+        root = SystemScanner(self.temp_dir).scan_single("root")
+        fingerprint = stream_root_fingerprint(root)
+        payload = json.dumps({"root": fingerprint}, separators=(",", ":")).encode("utf-8")
+        encoded = base64.urlsafe_b64encode(payload).decode("ascii")
+
+        result = self._run_scan_fs(
+            "--stream", "--stream-known-root-fingerprints-b64", encoded, self.temp_dir,
+            check=True,
+        )
+        records = [json.loads(line.split("\t", 1)[1]) for line in result.stdout.splitlines()]
+        self.assertEqual(
+            [{"type": "root_unchanged", "name": "root", "fingerprint": fingerprint}],
+            [record for record in records if record["type"] == "root_unchanged"],
+        )
+
+    def test_stream_rejects_malformed_known_root_fingerprints(self):
+        malformed = self._run_scan_fs(
+            "--stream", "--stream-known-root-fingerprints-b64", "not-base64!", self.temp_dir,
+            check=False,
+        )
+        self.assertNotEqual(0, malformed.returncode)
+        self.assertIn("invalid base64", malformed.stderr)
+
+    def test_stream_rejects_strict_base64_payloads_and_enforces_decoded_boundary(self):
+        def decode_error(raw_payload):
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                with self.assertRaises(SystemExit):
+                    _decode_known_root_fingerprints(
+                        None,
+                        base64.urlsafe_b64encode(raw_payload).decode("ascii"),
+                        ArgumentParser(),
+                    )
+            return stderr.getvalue()
+
+        duplicate_keys = b'{"root":"' + b"a" * 64 + b'","root":"' + b"a" * 64 + b'"}'
+        self.assertIn("bounded JSON object", decode_error(duplicate_keys))
+        self.assertIn("UTF-8 JSON", decode_error(b"\xff"))
+        self.assertIn("contains invalid values", decode_error(b'{"root":"invalid"}'))
+
+        valid_prefix = b'{"root":null}'
+        exact_size = valid_prefix + b" " * (_MAX_KNOWN_ROOT_FINGERPRINT_BYTES - len(valid_prefix))
+        self.assertIn("contains invalid values", decode_error(exact_size))
+        oversized_size = exact_size + b" "
+        self.assertIn("decoded-size limit", decode_error(oversized_size))
+
+    def test_stream_rejects_both_known_root_fingerprint_forms(self):
+        fingerprint = "a" * 64
+        result = self._run_scan_fs(
+            "--stream",
+            "--stream-known-root-fingerprints", json.dumps({"root": fingerprint}),
+            "--stream-known-root-fingerprints-b64",
+            base64.urlsafe_b64encode(json.dumps({"root": fingerprint}).encode("utf-8")).decode("ascii"),
+            self.temp_dir,
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("only one known-root fingerprint option", result.stderr)
 
     def test_stream_root_fingerprint_uses_iterative_bounded_depth_walk(self):
         root = SystemFile("root", 0, is_dir=True)
