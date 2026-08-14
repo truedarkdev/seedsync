@@ -3993,6 +3993,254 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(65, file_a.download_progress)
         self.assertIn("a", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
 
+    def test_completed_handoff_evicts_only_matching_recent_live_snapshot(self):
+        self.model_builder.clear()
+        remote_root = SystemFile("release", 1000, True)
+        remote_root.add_child(SystemFile("child", 1000, False))
+        local_root = SystemFile("release", 740, True)
+        local_root.add_child(SystemFile("child", 740, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots["release"] = \
+            _RecentLiveTransferSnapshot(
+                root_file_id="release",
+                size_local=750,
+                percent_local=99,
+                speed=14,
+                eta=123,
+            )
+        child_file_id = os.path.join("release", "child")
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[child_file_id] = \
+            _RecentLiveTransferSnapshot(
+                root_file_id="release",
+                size_local=750,
+                percent_local=99,
+                speed=14,
+                eta=123,
+            )
+
+        stale_model = self.model_builder.build_model()
+        stale_file = stale_model.get_file("release")
+        self.assertEqual(ModelFile.State.DOWNLOADING, stale_file.state)
+        self.assertEqual(750, stale_file.transferred_size)
+        self.assertEqual(99, stale_file.download_progress)
+        self.assertEqual(14, stale_file.downloading_speed)
+        self.assertEqual(123, stale_file.eta)
+        self.assertIn(child_file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+        self.model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids({"release"})
+
+        refreshed_file = self.model_builder.build_model().get_file("release")
+        self.assertEqual(ModelFile.State.DEFAULT, refreshed_file.state)
+        self.assertEqual(740, refreshed_file.transferred_size)
+        self.assertIsNone(refreshed_file.download_progress)
+        self.assertIsNone(refreshed_file.downloading_speed)
+        self.assertIsNone(refreshed_file.eta)
+        self.assertNotIn("release", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+        self.assertNotIn(child_file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+    def test_completed_handoff_evicts_unique_legacy_root_alias_and_descendants(self):
+        self.model_builder.clear()
+        file_name = "release"
+        completed_file_id = ModelFile.build_file_id(file_name, "movies")
+        remote_root = SystemFile(file_name, 1000, True)
+        remote_root.path_pair_id = "movies"
+        remote_root.add_child(SystemFile("child", 1000, False))
+        local_root = SystemFile(file_name, 740, True)
+        local_root.path_pair_id = "movies"
+        local_root.add_child(SystemFile("child", 740, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_name] = \
+            _RecentLiveTransferSnapshot(file_name, 750, 75, 14, 123)
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[os.path.join(file_name, "child")] = \
+            _RecentLiveTransferSnapshot(file_name, 750, 75, 14, 123)
+        self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots[completed_file_id] = \
+            _RecentLiveTransferSnapshot(file_name, 750, 75, None, None)
+
+        self.model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids(
+            {completed_file_id},
+        )
+
+        self.assertEqual({}, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+        self.assertIn(
+            completed_file_id,
+            self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots,
+        )
+
+    def test_completed_handoff_evicts_child_only_unique_legacy_root_alias(self):
+        self.model_builder.clear()
+        file_name = "release"
+        completed_file_id = ModelFile.build_file_id(file_name, "movies")
+        remote_root = SystemFile(file_name, 1000, True)
+        remote_root.path_pair_id = "movies"
+        local_root = SystemFile(file_name, 740, True)
+        local_root.path_pair_id = "movies"
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        child_file_id = os.path.join(file_name, "child")
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[child_file_id] = \
+            _RecentLiveTransferSnapshot(file_name, 750, 75, 14, 123)
+
+        self.model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids(
+            {completed_file_id},
+        )
+
+        self.assertEqual({}, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+    def test_completed_handoff_evicts_canonical_key_with_unique_legacy_root_alias(self):
+        self.model_builder.clear()
+        file_name = "release"
+        completed_file_id = ModelFile.build_file_id(file_name, "movies")
+        remote_file = SystemFile(file_name, 1000, False)
+        remote_file.path_pair_id = "movies"
+        local_file = SystemFile(file_name, 740, False)
+        local_file.path_pair_id = "movies"
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[completed_file_id] = \
+            _RecentLiveTransferSnapshot(file_name, 750, 75, 14, 123)
+
+        self.model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids(
+            {completed_file_id},
+        )
+
+        self.assertEqual({}, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+    def test_completed_handoff_preserves_ambiguous_legacy_alias_for_other_path_pair(self):
+        self.model_builder.clear()
+        file_name = "release"
+        movies_file_id = ModelFile.build_file_id(file_name, "movies")
+        tv_file_id = ModelFile.build_file_id(file_name, "tv")
+        remote_files = []
+        local_files = []
+        for path_pair_id in ("movies", "tv"):
+            remote_file = SystemFile(file_name, 1000, False)
+            remote_file.path_pair_id = path_pair_id
+            remote_files.append(remote_file)
+            local_file = SystemFile(file_name, 740, False)
+            local_file.path_pair_id = path_pair_id
+            local_files.append(local_file)
+        self.model_builder.set_remote_files(remote_files)
+        self.model_builder.set_local_files(local_files)
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_name] = \
+            _RecentLiveTransferSnapshot(file_name, 750, 75, 14, 123)
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[movies_file_id] = \
+            _RecentLiveTransferSnapshot(movies_file_id, 750, 75, 14, 123)
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[tv_file_id] = \
+            _RecentLiveTransferSnapshot(tv_file_id, 800, 80, 16, 99)
+
+        self.model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids(
+            {movies_file_id},
+        )
+
+        self.assertIn(file_name, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+        self.assertNotIn(movies_file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+        self.assertIn(tv_file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+    def test_completed_handoff_preserves_legacy_alias_with_multiple_path_pair_claimants(self):
+        self.model_builder.clear()
+        file_name = "release"
+        movies_file_id = ModelFile.build_file_id(file_name, "movies")
+        remote_files = []
+        local_files = []
+        for path_pair_id in ("movies", "tv"):
+            remote_file = SystemFile(file_name, 1000, False)
+            remote_file.path_pair_id = path_pair_id
+            remote_files.append(remote_file)
+            local_file = SystemFile(file_name, 740, False)
+            local_file.path_pair_id = path_pair_id
+            local_files.append(local_file)
+        self.model_builder.set_remote_files(remote_files)
+        self.model_builder.set_local_files(local_files)
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_name] = \
+            _RecentLiveTransferSnapshot(file_name, 750, 75, 14, 123)
+
+        self.model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids(
+            {movies_file_id},
+        )
+
+        self.assertIn(file_name, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+    def test_completed_handoff_preserves_live_legacy_alias_claimed_by_retained_stopped_pairs(self):
+        self.model_builder.clear()
+        file_name = "release"
+        movies_file_id = ModelFile.build_file_id(file_name, "movies")
+        tv_file_id = ModelFile.build_file_id(file_name, "tv")
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_name] = \
+            _RecentLiveTransferSnapshot(file_name, 750, 75, 14, 123)
+        self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots[movies_file_id] = \
+            _RecentLiveTransferSnapshot(file_name, 750, 75, None, None)
+        self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots[tv_file_id] = \
+            _RecentLiveTransferSnapshot(file_name, 800, 80, None, None)
+        self.model_builder.set_stopped_files({movies_file_id, tv_file_id})
+
+        self.model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids(
+            {movies_file_id},
+        )
+
+        self.assertIn(file_name, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+        self.assertIn(
+            movies_file_id,
+            self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots,
+        )
+        self.assertIn(
+            tv_file_id,
+            self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots,
+        )
+
+    def test_bare_completion_preserves_live_alias_with_scoped_path_pair_claimants(self):
+        self.model_builder.clear()
+        file_name = "release"
+        remote_files = []
+        local_files = []
+        for path_pair_id in ("movies", "tv"):
+            remote_file = SystemFile(file_name, 1000, False)
+            remote_file.path_pair_id = path_pair_id
+            remote_files.append(remote_file)
+            local_file = SystemFile(file_name, 740, False)
+            local_file.path_pair_id = path_pair_id
+            local_files.append(local_file)
+        self.model_builder.set_remote_files(remote_files)
+        self.model_builder.set_local_files(local_files)
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_name] = \
+            _RecentLiveTransferSnapshot(file_name, 750, 75, 14, 123)
+
+        self.model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids({file_name})
+
+        self.assertIn(file_name, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+    def test_bare_completion_evicts_singleton_unscoped_live_alias_and_descendants(self):
+        self.model_builder.clear()
+        file_name = "release"
+        self.model_builder.set_remote_files([SystemFile(file_name, 1000, False)])
+        self.model_builder.set_local_files([SystemFile(file_name, 740, False)])
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_name] = \
+            _RecentLiveTransferSnapshot(file_name, 750, 75, 14, 123)
+        child_file_id = os.path.join(file_name, "child")
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[child_file_id] = \
+            _RecentLiveTransferSnapshot(file_name, 750, 75, 14, 123)
+
+        self.model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids({file_name})
+
+        self.assertEqual({}, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+    def test_scoped_completion_preserves_live_alias_claimed_by_child_snapshot_canonical_root(self):
+        self.model_builder.clear()
+        file_name = "release"
+        movies_file_id = ModelFile.build_file_id(file_name, "movies")
+        tv_file_id = ModelFile.build_file_id(file_name, "tv")
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_name] = \
+            _RecentLiveTransferSnapshot(file_name, 750, 75, 14, 123)
+        child_file_id = os.path.join(file_name, "child")
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[child_file_id] = \
+            _RecentLiveTransferSnapshot(tv_file_id, 800, 80, 16, 99)
+
+        self.model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids({movies_file_id})
+
+        self.assertIn(file_name, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+        self.assertIn(child_file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
     def test_evict_recent_live_transfer_snapshots_missing_roots_preserves_stopped_and_evicts_non_stopped(self):
         self.model_builder.clear()
         stopped_local_file = SystemFile("a", 650, False)

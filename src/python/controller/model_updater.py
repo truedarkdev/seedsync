@@ -1452,6 +1452,10 @@ class ModelUpdater(_ControllerCoreAccess):
         ):
             new_file.download_progress = previous_download_progress
 
+        if new_file.remote_size is not None and new_file.transferred_size is not None and \
+                new_file.transferred_size > new_file.remote_size:
+            new_file.transferred_size = new_file.remote_size
+
         if previous_transferred_size is not None:
             transferred_floor = previous_transferred_size
             if new_file.remote_size is not None:
@@ -1466,6 +1470,20 @@ class ModelUpdater(_ControllerCoreAccess):
                 or new_file.transferred_size < transferred_floor
             ):
                 new_file.transferred_size = transferred_floor
+
+        # Completion floors retain the last coherent byte checkpoint while a
+        # fresh local scan catches up. LFTP's rounded percent can disagree
+        # with that checkpoint, so derive display progress from the retained
+        # bytes whenever the remote total is authoritative.
+        if new_file.remote_size is not None:
+            if new_file.remote_size > 0 and new_file.transferred_size is not None:
+                new_file.download_progress = int(round(
+                    (new_file.transferred_size * 100) / new_file.remote_size
+                ))
+            elif new_file.remote_size == 0:
+                # A zero-byte remote root has no meaningful pending-transfer
+                # percentage; avoid carrying a stale live percentage forward.
+                new_file.download_progress = None
 
     @staticmethod
     def _get_exclude_patterns(controller: _ControllerCoreAccess) -> str:
@@ -1609,8 +1627,10 @@ class ModelUpdater(_ControllerCoreAccess):
         }
         if just_completed_file_names:
             completed_path_pair_ids: set[Optional[str]] = set()
+            completed_file_ids: set[str] = set()
             for name, path_pair_id, _ in just_completed_file_names:
                 file_id = ModelFile.build_file_id(name, path_pair_id)
+                completed_file_ids.add(file_id)
                 completed_path_pair_ids.add(path_pair_id)
                 controller.logger.info(
                     "Download completion pending (LFTP job finished): {}".format(
@@ -1626,6 +1646,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     },
                 )
             controller._Controller__pending_completion_file_names.update(just_completed_file_names)
+            controller._Controller__model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids(
+                completed_file_ids,
+            )
             if None in completed_path_pair_ids:
                 controller._Controller__local_scan_process.force_scan()
             else:

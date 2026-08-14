@@ -2982,6 +2982,78 @@ class ModelBuilder:
         if removed:
             self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LFTP_STATUSES)
 
+    def evict_recent_live_transfer_snapshots_for_completed_file_ids(
+            self, completed_file_ids: Set[str]) -> None:
+        """Discard live progress only after an authoritative completion handoff.
+
+        A fresh LFTP status can disappear before a local scan catches up with
+        its final checkpoint. That disappearance is distinct from ordinary
+        transient status loss, whose snapshots remain available until local
+        scan evidence catches up. The completion handoff supplies canonical
+        file ids, so it can safely evict just those live snapshots without
+        affecting stopped-transfer floors or unrelated roots.
+        """
+        root_snapshots: dict[str, _RecentLiveTransferSnapshot] = {}
+        for snapshot in self.__recent_live_transfer_snapshots.values():
+            root_snapshots.setdefault(snapshot.root_file_id, snapshot)
+        canonical_claims_by_legacy_root = self.__completion_snapshot_canonical_claims(
+            completed_file_ids,
+        )
+        root_file_ids_to_evict: set[str] = set()
+        for completed_file_id in completed_file_ids:
+            _, snapshot = self.__resolve_transfer_snapshot(
+                root_snapshots, completed_file_id, completed_file_id,
+            )
+            if snapshot is None:
+                continue
+            root_file_id = snapshot.root_file_id
+            if (self.__file_id_path_pair_id(completed_file_id) is not None and
+                    root_file_id == completed_file_id) or \
+                    canonical_claims_by_legacy_root.get(root_file_id) == {completed_file_id}:
+                root_file_ids_to_evict.add(root_file_id)
+
+        removed = False
+        for file_id, snapshot in list(self.__recent_live_transfer_snapshots.items()):
+            if snapshot.root_file_id in root_file_ids_to_evict:
+                self.__recent_live_transfer_snapshots.pop(file_id, None)
+                removed = True
+        if removed:
+            self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LFTP_STATUSES)
+
+    def __completion_snapshot_canonical_claims(
+            self,
+            completed_file_ids: Set[str],
+    ) -> dict[str, set[str]]:
+        """Build one completion-local census of canonical legacy-alias claims."""
+        authoritative_file_ids = set(completed_file_ids)
+        authoritative_file_ids.update(self.__local_files())
+        authoritative_file_ids.update(self.__remote_files())
+        authoritative_file_ids.update(self.__active_files)
+        authoritative_file_ids.update(self.__lftp_statuses)
+        authoritative_file_ids.update(self.__stopped_files)
+        candidate_file_ids = set(authoritative_file_ids)
+        for file_id, snapshot in self.__recent_live_transfer_snapshots.items():
+            candidate_file_ids.add(file_id)
+            if self.__file_id_path_pair_id(snapshot.root_file_id) is not None:
+                candidate_file_ids.add(snapshot.root_file_id)
+        for file_id, snapshot in self.__retained_stopped_transfer_snapshots.items():
+            candidate_file_ids.add(file_id)
+            if self.__file_id_path_pair_id(snapshot.root_file_id) is not None:
+                candidate_file_ids.add(snapshot.root_file_id)
+
+        claims_by_legacy_root: dict[str, set[str]] = {}
+        for file_id in candidate_file_ids:
+            path_pair_id = self.__file_id_path_pair_id(file_id)
+            if path_pair_id is None:
+                if file_id in authoritative_file_ids:
+                    claims_by_legacy_root.setdefault(file_id, set()).add(file_id)
+                continue
+            aliases = self.__candidate_snapshot_root_aliases(file_id)
+            if len(aliases) < 2:
+                continue
+            claims_by_legacy_root.setdefault(aliases[-1], set()).add(file_id)
+        return claims_by_legacy_root
+
     def set_downloaded_files(self, downloaded_files: Set[str]) -> Optional[int]:
         prev_downloaded_files = self.__downloaded_files
         self.__downloaded_files = set(downloaded_files)

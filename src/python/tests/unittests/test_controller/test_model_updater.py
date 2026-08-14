@@ -3402,6 +3402,7 @@ class TestModelUpdater(unittest.TestCase):
         controller = SimpleNamespace(
             _Controller__prev_downloading_file_names=set(prev_downloading_file_names or []),
             _Controller__pending_completion_file_names=set(),
+            _Controller__model_builder=MagicMock(),
             _Controller__is_explicitly_stopped=MagicMock(return_value=False),
             _Controller__local_scan_process=MagicMock(),
             logger=MagicMock(),
@@ -3737,6 +3738,8 @@ class TestModelUpdater(unittest.TestCase):
             {completion_entry},
             controller._Controller__pending_completion_file_names,
         )
+        controller._Controller__model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids \
+            .assert_called_once_with({ModelFile.build_file_id(*completion_entry[:2])})
         controller._Controller__local_scan_process.force_scan.assert_called_once_with("movies")
         controller.logger.info.assert_called_once_with(
             "Download completion pending (LFTP job finished): {}".format(
@@ -3818,8 +3821,112 @@ class TestModelUpdater(unittest.TestCase):
         )
         self.assertEqual(set(), controller._Controller__pending_completion_file_names)
         controller._Controller__local_scan_process.force_scan.assert_not_called()
+        controller._Controller__model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids \
+            .assert_not_called()
         controller._Controller__is_explicitly_stopped.assert_not_called()
         controller.logger.info.assert_not_called()
+
+    def test_pending_completion_floor_derives_percent_from_retained_bytes(self):
+        file = ModelFile("release", False)
+        file.remote_size = 1000
+        file.local_size = 740
+        file.transferred_size = 740
+        file.download_progress = 99
+        file.state = ModelFile.State.DEFAULT
+
+        ModelUpdater._apply_pending_completion_progress_floor(
+            file,
+            {file.file_id},
+            99,
+            750,
+        )
+
+        self.assertEqual(750, file.transferred_size)
+        self.assertEqual(75, file.download_progress)
+
+    def test_pending_completion_floor_clamps_oversized_current_bytes_without_floor(self):
+        file = ModelFile("release", False)
+        file.remote_size = 500
+        file.local_size = 500
+        file.transferred_size = 750
+        file.download_progress = 99
+        file.state = ModelFile.State.DEFAULT
+
+        ModelUpdater._apply_pending_completion_progress_floor(
+            file,
+            {file.file_id},
+            None,
+            None,
+        )
+
+        self.assertEqual(500, file.transferred_size)
+        self.assertEqual(100, file.download_progress)
+
+    def test_pending_completion_floor_clears_percent_for_zero_remote_total(self):
+        file = ModelFile("release", False)
+        file.remote_size = 0
+        file.local_size = 0
+        file.transferred_size = 1
+        file.download_progress = 99
+        file.state = ModelFile.State.DEFAULT
+
+        ModelUpdater._apply_pending_completion_progress_floor(
+            file,
+            {file.file_id},
+            None,
+            None,
+        )
+
+        self.assertEqual(0, file.transferred_size)
+        self.assertIsNone(file.download_progress)
+
+    def test_completion_registration_publishes_real_builder_scan_state_with_consistent_floor(self):
+        file_name = "release"
+        path_pair_id = "movies"
+        file_id = ModelFile.build_file_id(file_name, path_pair_id)
+        remote_root = SystemFile(file_name, 1000, True)
+        remote_root.path_pair_id = path_pair_id
+        remote_root.path_pair_name = "Movies"
+        remote_root.add_child(SystemFile("child", 1000, False))
+        local_root = SystemFile(file_name, 740, True)
+        local_root.path_pair_id = path_pair_id
+        local_root.path_pair_name = "Movies"
+        local_root.add_child(SystemFile("child", 740, False))
+        builder = ModelBuilder()
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        running_status = LftpJobStatus(
+            0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running_status.path_pair_id = path_pair_id
+        running_status.path_pair_name = "Movies"
+        running_status.total_transfer_state = LftpJobStatus.TransferState(750, 1000, 99, 14, 123)
+        builder.set_lftp_statuses([running_status])
+        live_model = builder.build_model()
+
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__prev_downloading_file_names = {
+            (file_name, path_pair_id, "Movies"),
+        }
+        controller._Controller__is_explicitly_stopped = MagicMock(return_value=False)
+        controller._Controller__lftp.status.return_value = []
+        controller._Controller__lftp.last_status_poll_healthy = True
+
+        ModelUpdater(controller).update()
+
+        published_file = controller._Controller__model.get_file(file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, published_file.state)
+        self.assertEqual(750, published_file.transferred_size)
+        self.assertEqual(75, published_file.download_progress)
+        self.assertIsNone(published_file.downloading_speed)
+        self.assertIsNone(published_file.eta)
+        self.assertIn(
+            (file_name, path_pair_id, "Movies"),
+            controller._Controller__pending_completion_file_names,
+        )
+        controller._Controller__local_scan_process.force_scan.assert_called_once_with(path_pair_id)
 
     def test_active_scan_force_retries_at_checkpoint_cadence_with_long_scan_interval(self):
         controller = SimpleNamespace(
