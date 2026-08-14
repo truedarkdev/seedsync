@@ -157,6 +157,52 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process.pop_completed.return_value = []
         self.controller._Controller__extract_process.pop_failed.return_value = []
 
+    def test_owned_incomplete_transfer_requires_pending_directory_lineage(self):
+        partial_root = ModelFile("sample", True)
+        partial_root.remote_size = 200
+        partial_root.local_size = 100
+        partial_root.state = ModelFile.State.DEFAULT
+
+        self.controller._Controller__pending_completion_file_names = {
+            ("sample", None, None),
+        }
+        self.assertTrue(self.controller.is_owned_incomplete_transfer(partial_root))
+
+        self.controller._Controller__pending_queue_dispatches = {
+            partial_root.file_id: object(),
+        }
+        self.assertFalse(self.controller.is_owned_incomplete_transfer(partial_root))
+        self.controller._Controller__pending_queue_dispatches.clear()
+
+        # Completion (or an accepted replacement lifecycle) removes the
+        # controller-owned retry identity; local presence alone is not enough.
+        self.controller._Controller__pending_completion_file_names.clear()
+        self.assertFalse(self.controller.is_owned_incomplete_transfer(partial_root))
+
+    def test_owned_incomplete_transfer_rejects_files_stopped_subjects_and_active_roots(self):
+        partial_file = ModelFile("sample.bin", False)
+        partial_file.remote_size = 200
+        partial_file.local_size = 100
+        partial_file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__pending_completion_file_names = {
+            ("sample.bin", None, None),
+        }
+        self.assertFalse(self.controller.is_owned_incomplete_transfer(partial_file))
+
+        partial_root = ModelFile("sample", True)
+        partial_root.remote_size = 200
+        partial_root.local_size = 100
+        partial_root.state = ModelFile.State.DEFAULT
+        self.controller._Controller__pending_completion_file_names = {
+            ("sample", None, None),
+        }
+        self.controller._Controller__persist.stopped_file_names = {partial_root.file_id}
+        self.assertFalse(self.controller.is_owned_incomplete_transfer(partial_root))
+
+        self.controller._Controller__persist.stopped_file_names.clear()
+        partial_root.state = ModelFile.State.DOWNLOADING
+        self.assertFalse(self.controller.is_owned_incomplete_transfer(partial_root))
+
     def _settle_collision_compare(self):
         future = getattr(self.controller, "_Controller__collision_compare_future", None)
         self.assertIsNotNone(future)

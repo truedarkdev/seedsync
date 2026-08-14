@@ -419,6 +419,7 @@ class TestAutoQueue(unittest.TestCase):
         self.controller._get_model_root_references.side_effect = get_model
         self.controller.get_model_files_and_add_listener.side_effect = get_model_and_capture_listener
         self.controller.is_file_stopped.return_value = False
+        self.controller.is_owned_incomplete_transfer.return_value = False
         self.controller.has_current_process_final_publication.return_value = False
 
     def test_idle_process_does_not_snapshot_model(self):
@@ -1105,6 +1106,219 @@ class TestAutoQueue(unittest.TestCase):
         file_one_new.remote_size = 200
         self.model_listener.file_updated(file_one, file_one_new)
         auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+    def test_owned_incomplete_directory_is_requeued_after_remote_subtree_growth(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="sample"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        active_root = ModelFile("sample", True)
+        active_root.remote_size = 200
+        active_root.local_size = 100
+        active_root.state = ModelFile.State.DOWNLOADING
+        active_subtree = ModelFile("subtree-c", True)
+        active_subtree.remote_size = 100
+        stable_leaf = ModelFile("stable-leaf", False)
+        stable_leaf.remote_size = 100
+        stable_leaf.local_size = 50
+        active_subtree.add_child(stable_leaf)
+        active_root.add_child(active_subtree)
+
+        grown_root = ModelFile("sample", True)
+        grown_root.remote_size = 200
+        grown_root.local_size = 100
+        grown_root.state = ModelFile.State.DOWNLOADING
+        grown_subtree = ModelFile("subtree-c", True)
+        grown_subtree.remote_size = 100
+        grown_stable_leaf = ModelFile("stable-leaf", False)
+        grown_stable_leaf.remote_size = 100
+        grown_subtree.add_child(grown_stable_leaf)
+        grown_root.add_child(grown_subtree)
+        arrived_subtree = ModelFile("subtree-a", True)
+        arrived_subtree.remote_size = 100
+        arrived_leaf = ModelFile("arrived-leaf", False)
+        arrived_leaf.remote_size = 100
+        arrived_subtree.add_child(arrived_leaf)
+        grown_root.add_child(arrived_subtree)
+
+        partial_root = ModelFile("sample", True)
+        partial_root.remote_size = 200
+        partial_root.local_size = 150
+        partial_root.state = ModelFile.State.DEFAULT
+        partial_subtree = ModelFile("subtree-c", True)
+        partial_subtree.remote_size = 100
+        partial_stable_leaf = ModelFile("stable-leaf", False)
+        partial_stable_leaf.remote_size = 100
+        partial_stable_leaf.local_size = 100
+        partial_subtree.add_child(partial_stable_leaf)
+        partial_root.add_child(partial_subtree)
+        partial_arrived_subtree = ModelFile("subtree-a", True)
+        partial_arrived_subtree.remote_size = 100
+        partial_arrived_leaf = ModelFile("arrived-leaf", False)
+        partial_arrived_leaf.remote_size = 100
+        partial_arrived_subtree.add_child(partial_arrived_leaf)
+        partial_root.add_child(partial_arrived_subtree)
+
+        self.controller.is_owned_incomplete_transfer.side_effect = (
+            lambda file: file.file_id == partial_root.file_id
+        )
+
+        # A new remote subtree appears while the parent mirror is active.
+        self.model_listener.file_updated(active_root, grown_root)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+        self.assertEqual(1, len(auto_queue._AutoQueue__model_listener.modified_files))
+
+        # The job then disappears.  The retained remote-growth event is
+        # evaluated against the fresh pending-completion model state.
+        self.model_listener.file_updated(grown_root, partial_root)
+        auto_queue.process()
+
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
+        self.assertEqual(partial_root.file_id, command.filename)
+        self.assertEqual([], auto_queue._AutoQueue__model_listener.modified_files)
+        auto_queue.process()
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+
+    def test_owned_incomplete_directory_ordinary_completion_does_not_requeue(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="sample"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        downloading_root = ModelFile("sample", True)
+        downloading_root.remote_size = 200
+        downloading_root.local_size = 100
+        downloading_root.state = ModelFile.State.DOWNLOADING
+        downloading_subtree = ModelFile("subtree-c", True)
+        downloading_subtree.remote_size = 100
+        downloading_leaf = ModelFile("stable-leaf", False)
+        downloading_leaf.remote_size = 100
+        downloading_leaf.local_size = 50
+        downloading_subtree.add_child(downloading_leaf)
+        downloading_root.add_child(downloading_subtree)
+
+        partial_root = ModelFile("sample", True)
+        partial_root.remote_size = 200
+        partial_root.local_size = 150
+        partial_root.state = ModelFile.State.DEFAULT
+        partial_subtree = ModelFile("subtree-c", True)
+        partial_subtree.remote_size = 100
+        partial_leaf = ModelFile("stable-leaf", False)
+        partial_leaf.remote_size = 100
+        partial_leaf.local_size = 100
+        partial_subtree.add_child(partial_leaf)
+        partial_root.add_child(partial_subtree)
+        self.controller.is_owned_incomplete_transfer.return_value = True
+
+        self.model_listener.file_updated(downloading_root, partial_root)
+        auto_queue.process()
+        self.assertEqual(0, self.controller.queue_command.call_count)
+
+        # Repeated delivery of an unchanged completion result must not create
+        # a command while the same pending lineage is being reconciled.
+        self.model_listener.file_updated(partial_root, partial_root)
+        auto_queue.process()
+        self.assertEqual(0, self.controller.queue_command.call_count)
+
+    def test_owned_reconciliation_keeps_duplicate_path_pair_identities_isolated(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="sample"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        active_a = ModelFile("sample", True)
+        active_a.path_pair_id = "pair-a"
+        active_a.remote_size = 100
+        active_a.state = ModelFile.State.DOWNLOADING
+        grown_a = ModelFile("sample", True)
+        grown_a.path_pair_id = "pair-a"
+        grown_a.remote_size = 200
+        grown_a.state = ModelFile.State.DOWNLOADING
+
+        active_b = ModelFile("sample", True)
+        active_b.path_pair_id = "pair-b"
+        active_b.remote_size = 100
+        active_b.state = ModelFile.State.DOWNLOADING
+        grown_b = ModelFile("sample", True)
+        grown_b.path_pair_id = "pair-b"
+        grown_b.remote_size = 200
+        grown_b.state = ModelFile.State.DOWNLOADING
+
+        partial_a = ModelFile("sample", True)
+        partial_a.path_pair_id = "pair-a"
+        partial_a.remote_size = 200
+        partial_a.local_size = 50
+        partial_a.state = ModelFile.State.DEFAULT
+        partial_b = ModelFile("sample", True)
+        partial_b.path_pair_id = "pair-b"
+        partial_b.remote_size = 200
+        partial_b.local_size = 50
+        partial_b.state = ModelFile.State.DEFAULT
+        self.controller.is_owned_incomplete_transfer.side_effect = (
+            lambda file: file.file_id == partial_a.file_id
+        )
+
+        self.model_listener.file_updated(active_a, grown_a)
+        self.model_listener.file_updated(active_b, grown_b)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+        self.model_listener.file_updated(grown_a, partial_a)
+        self.model_listener.file_updated(grown_b, partial_b)
+        auto_queue.process()
+
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(partial_a.file_id, command.filename)
+        self.assertEqual([], auto_queue._AutoQueue__model_listener.modified_files)
+
+    def test_stopped_owned_incomplete_directory_is_not_requeued(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="sample"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        running_root = ModelFile("sample", True)
+        running_root.remote_size = 200
+        running_root.local_size = 100
+        running_root.state = ModelFile.State.DOWNLOADING
+        grown_root = ModelFile("sample", True)
+        grown_root.remote_size = 300
+        grown_root.local_size = 100
+        grown_root.state = ModelFile.State.DOWNLOADING
+        partial_root = ModelFile("sample", True)
+        partial_root.remote_size = 300
+        partial_root.local_size = 100
+        partial_root.state = ModelFile.State.DEFAULT
+        self.controller.is_owned_incomplete_transfer.return_value = True
+        self.controller.is_file_stopped.return_value = False
+
+        self.model_listener.file_updated(running_root, grown_root)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+        self.assertEqual(1, len(auto_queue._AutoQueue__model_listener.modified_files))
+
+        self.controller.is_file_stopped.return_value = True
+        self.model_listener.file_updated(grown_root, partial_root)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+        self.assertEqual([], auto_queue._AutoQueue__model_listener.modified_files)
+
+    def test_arbitrary_partial_directory_is_not_requeued(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="sample"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        old_root = ModelFile("sample", True)
+        old_root.remote_size = 200
+        old_root.local_size = 50
+        new_root = ModelFile("sample", True)
+        new_root.remote_size = 300
+        new_root.local_size = 50
+        self.model_listener.file_updated(old_root, new_root)
+        auto_queue.process()
+
         self.controller.queue_command.assert_not_called()
 
     def test_duplicate_names_from_different_path_pairs_are_queued_separately(self):

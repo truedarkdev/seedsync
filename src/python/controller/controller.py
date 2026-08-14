@@ -2910,6 +2910,32 @@ class Controller:
     def is_file_stopped(self, filename: str) -> bool:
         return filename in self.__persist.stopped_file_names
 
+    def is_owned_incomplete_transfer(self, file: ModelFile) -> bool:
+        """Return whether a partial directory belongs to a finished transfer.
+
+        A pending completion identity is controller-owned evidence that an
+        earlier LFTP lifecycle reached its end without publishing a complete
+        local tree.  It is deliberately narrower than local presence: files,
+        arbitrary partial directories, active transfers, and explicitly
+        stopped subjects remain ineligible for automatic reconciliation.
+        """
+        if not isinstance(file, ModelFile) or not file.is_dir or \
+                file.state != ModelFile.State.DEFAULT or \
+                self.__is_explicitly_stopped(file.name, file.path_pair_id):
+            return False
+        pending_completion = getattr(self, "_Controller__pending_completion_file_names", set())
+        if not any(
+                ModelFile.build_file_id(name, path_pair_id) == file.file_id
+                for name, path_pair_id, _ in pending_completion
+        ):
+            return False
+        work_state_lock = getattr(self, "_Controller__work_state_lock", None)
+        if work_state_lock is None:
+            return True
+        with work_state_lock:
+            pending_dispatches = getattr(self, "_Controller__pending_queue_dispatches", {})
+            return file.file_id not in pending_dispatches
+
     def get_stop_resume_trace_metadata(self, file: Optional[ModelFile]) -> Optional[dict[str, object]]:
         """Return active-transfer model stream metadata for this refresh cycle."""
         return self.__model_builder.stop_resume_trace_metadata_for_file(file)

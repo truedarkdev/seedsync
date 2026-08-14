@@ -20,6 +20,7 @@ class _AutoQueueController(Protocol):
     def _get_model_root_references(self) -> list[ModelFile]: ...
     def get_model_files_and_add_listener(self, listener: IModelListener) -> list[ModelFile]: ...
     def is_file_stopped(self, filename: str) -> bool: ...
+    def is_owned_incomplete_transfer(self, file: ModelFile) -> bool: ...
     def clear_extracted_marker(self, file: ModelFile) -> None: ...
     def queue_command(self, command: Controller.Command) -> None: ...
     def is_path_pair_reconciled(self, path_pair_id: Optional[str]) -> bool: ...
@@ -380,7 +381,7 @@ class AutoQueue:
                     accept=lambda f: (
                         f.remote_has_transferable_content and
                         f.state == ModelFile.State.DEFAULT and
-                        not f.local_present and
+                        (not f.local_present or self.__is_owned_incomplete_directory(f)) and
                         self._is_auto_queue_enabled_for_file(f)
                     )
                 )
@@ -389,18 +390,7 @@ class AutoQueue:
                 modified_candidates_actual_update: list[ModelFile] = []
                 modified_candidates_remote_discovery: list[ModelFile] = []
                 for old_file, new_file in self.__model_listener.modified_files:
-                    remote_discovery_changed = (
-                        old_file.remote_size != new_file.remote_size
-                        or (
-                            not old_file.remote_has_transferable_content
-                            and new_file.remote_has_transferable_content
-                        )
-                        or (
-                            not old_file.remote_present
-                            and new_file.remote_present
-                            and new_file.remote_has_transferable_content
-                        )
-                    )
+                    remote_discovery_changed = self.__is_remote_discovery_changed(old_file, new_file)
                     if remote_discovery_changed:
                         if old_file.remote_size is not None:
                             modified_candidates_actual_update.append(new_file)
@@ -415,7 +405,7 @@ class AutoQueue:
                     current_files=current_files,
                     accept=lambda f: f.remote_has_transferable_content and
                     f.state == ModelFile.State.DEFAULT and
-                    not f.local_present and
+                    (not f.local_present or self.__is_owned_incomplete_directory(f)) and
                     self._is_auto_queue_enabled_for_file(f)
                 )
 
@@ -426,7 +416,7 @@ class AutoQueue:
                     accept=lambda f: (
                         f.remote_has_transferable_content and
                         f.state == ModelFile.State.DEFAULT and
-                        not f.local_present and
+                        (not f.local_present or self.__is_owned_incomplete_directory(f)) and
                         self._is_auto_queue_enabled_for_file(f)
                     )
                 )
@@ -666,7 +656,12 @@ class AutoQueue:
             ]
             self.__model_listener.modified_files[:] = [
                 (old_file, new_file) for old_file, new_file in self.__model_listener.modified_files
-                if new_file.file_id in current_file_ids and not self.__is_reconciliation_ready(new_file)
+                if self.__retain_remote_growth_event(
+                    old_file,
+                    new_file,
+                    current_files,
+                    {file.file_id for file, _ in files_to_queue},
+                )
             ]
 
         except Exception:
@@ -713,6 +708,95 @@ class AutoQueue:
                 return False
             return self.__pair_auto_queue.get(file.path_pair_id, False)
         return True
+
+    def __is_owned_incomplete_directory(self, file: ModelFile) -> bool:
+        """Use controller-owned completion lineage for partial directories only."""
+        if not file.is_dir:
+            return False
+        checker = getattr(self.__controller, "is_owned_incomplete_transfer", None)
+        if not callable(checker):
+            return False
+        return checker(file) is True
+
+    @classmethod
+    def __remote_tree_fingerprint(cls, file: ModelFile) -> Optional[tuple[object, ...]]:
+        """Return a remote-only recursive signature for one model root."""
+        child_fingerprints = [
+            child_fingerprint
+            for child in file.get_children()
+            for child_fingerprint in (cls.__remote_tree_fingerprint(child),)
+            if child_fingerprint is not None
+        ]
+        child_fingerprints.sort(key=lambda fingerprint: cast(str, fingerprint[0]))
+        remote_evidence = (
+            file.remote_present
+            or file.remote_size is not None
+            or file.remote_has_transferable_content
+        )
+        if not remote_evidence and not child_fingerprints:
+            return None
+        return (
+            file.name,
+            file.is_dir,
+            file.remote_present,
+            file.remote_size,
+            file.remote_has_transferable_content,
+            tuple(child_fingerprints),
+        )
+
+    @classmethod
+    def __is_remote_discovery_changed(cls, old_file: ModelFile, new_file: ModelFile) -> bool:
+        return (
+            old_file.remote_size != new_file.remote_size
+            or (
+                not old_file.remote_has_transferable_content
+                and new_file.remote_has_transferable_content
+            )
+            or (
+                not old_file.remote_present
+                and new_file.remote_present
+                and new_file.remote_has_transferable_content
+            )
+            or cls.__remote_tree_fingerprint(old_file) != cls.__remote_tree_fingerprint(new_file)
+        )
+
+    @staticmethod
+    def __is_active_transfer_state(state: ModelFile.State) -> bool:
+        return state in (ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING)
+
+    def __retain_remote_growth_event(
+            self,
+            old_file: ModelFile,
+            new_file: ModelFile,
+            current_files: dict[str, ModelFile],
+            selected_file_ids: set[str],
+    ) -> bool:
+        """Retain only remote growth observed before an active root settled."""
+        if new_file.file_id not in current_files:
+            return False
+        if not self.__is_reconciliation_ready(new_file):
+            return True
+        if not self.__is_active_transfer_state(old_file.state) or \
+                not self.__is_remote_discovery_changed(old_file, new_file):
+            return False
+        if new_file.file_id in selected_file_ids:
+            return False
+
+        current_file = current_files[new_file.file_id]
+        if not current_file.is_dir or not current_file.remote_has_transferable_content:
+            return False
+        if self.__is_active_transfer_state(current_file.state):
+            return not self.__controller.is_file_stopped(current_file.file_id)
+        if current_file.state != ModelFile.State.DEFAULT or \
+                self.__controller.is_file_stopped(current_file.file_id):
+            return False
+        if not self.__is_owned_incomplete_directory(current_file):
+            return False
+        if not self._is_auto_queue_enabled_for_file(current_file):
+            return False
+        return not self.__patterns_only or any(
+            self.__match(pattern, current_file) for pattern in self.__persist.patterns
+        )
 
     def __is_reconciliation_ready(self, file: ModelFile) -> bool:
         checker = getattr(self.__controller, "is_path_pair_reconciled", None)
