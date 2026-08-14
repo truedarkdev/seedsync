@@ -1,13 +1,16 @@
 import {Component, OnDestroy, OnInit} from "@angular/core";
 import {CommonModule} from "@angular/common";
 import {ActivatedRoute} from "@angular/router";
-import {Subject} from "rxjs";
+import {Observable, Subject} from "rxjs";
 import {takeUntil} from "rxjs/operators";
 
 import {PathPair, PathPairService} from "../../services/settings/path-pair.service";
 import {resolvePathPairRouteSegment} from "../../services/settings/path-pair-route";
 import {ViewFileFilterService} from "../../services/files/view-file-filter.service";
 import {ModelFileService} from "../../services/files/model-file.service";
+import {ViewFileOptionsService} from "../../services/files/view-file-options.service";
+import {ViewFileOptions} from "../../services/files/view-file-options";
+import {DomService} from "../../services/utils/dom.service";
 import {FileOptionsComponent} from "./file-options.component";
 import {FileListComponent} from "./file-list.component";
 import {PathPairStatsComponent} from "./path-pair-stats.component";
@@ -17,13 +20,16 @@ import {PathPairIdentityComponent} from "./path-pair-identity.component";
     selector: "app-files-page",
     standalone: true,
     imports: [CommonModule, FileOptionsComponent, FileListComponent, PathPairStatsComponent, PathPairIdentityComponent],
-    templateUrl: "./files-page.component.html"
+    templateUrl: "./files-page.component.html",
+    styleUrls: ["./files-page.component.scss"]
 })
 
 export class FilesPageComponent implements OnInit, OnDestroy {
     public showOverview = false;
     public showDetailView = false;
     public selectedPathPair: PathPair | null = null;
+    public readonly fileOptions: Observable<ViewFileOptions>;
+    public readonly headerHeight: Observable<number>;
 
     private readonly _destroy$ = new Subject<void>();
     private _pathPairs: PathPair[] = [];
@@ -33,7 +39,11 @@ export class FilesPageComponent implements OnInit, OnDestroy {
     constructor(private _route: ActivatedRoute,
                 private _pathPairService: PathPairService,
                 private _viewFileFilterService: ViewFileFilterService,
-                private _modelFileService: ModelFileService) {
+                private _modelFileService: ModelFileService,
+                viewFileOptionsService: ViewFileOptionsService,
+                domService: DomService) {
+        this.fileOptions = viewFileOptionsService.options;
+        this.headerHeight = domService.headerHeight;
     }
 
     ngOnInit(): void {

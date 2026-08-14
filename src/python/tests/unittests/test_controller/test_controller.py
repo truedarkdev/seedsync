@@ -2796,7 +2796,8 @@ class TestController(unittest.TestCase):
         self.assertEqual("scanning", inventory["pair-a"].state)
         self.assertEqual(7, inventory["pair-a"].size)
 
-        # A relocated/configured identity is stale rather than up to date.
+        # A relocated/configured identity retains its values only while the
+        # replacement scan is in progress; changed roots are not failures.
         relocated_a = PathPair(id="pair-a", name="Pair A", remote_path="/remote/a", local_path="/local/a-new")
         self.controller._Controller__begin_local_inventory_runtime_generation(
             {"pair-a": pair_a, "pair-b": pair_b},
@@ -2805,8 +2806,20 @@ class TestController(unittest.TestCase):
             {"pair-a": "/local/a-new/incomplete"},
         )
         _, inventory = builder.local_library_inventory_snapshot()
-        self.assertEqual("stale", inventory["pair-a"].state)
+        self.assertEqual("scanning", inventory["pair-a"].state)
         self.assertNotIn("pair-b", inventory)
+
+        # A real failed result is stale and a same-identity retry cannot turn
+        # that failure evidence into scanning.
+        builder.observe_local_scan_result({"pair-a"}, set(), {"pair-a"}, True, {"pair-a"})
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual("stale", inventory["pair-a"].state)
+        self.controller._Controller__begin_local_inventory_runtime_generation(
+            {"pair-a": relocated_a}, {"pair-a": "/local/a-new/incomplete"},
+            {"pair-a": relocated_a}, {"pair-a": "/local/a-new/incomplete"},
+        )
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual("stale", inventory["pair-a"].state)
 
         # Re-enabling a removed scope has no retained runtime authority.
         self.controller._Controller__begin_local_inventory_runtime_generation(

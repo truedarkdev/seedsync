@@ -104,11 +104,17 @@ export class ModelFileService {
             try { this._setSummaries(JSON.parse((<MessageEvent>event).data)); }
             catch (error) { this._logger.warn("Ignoring invalid model summary", error); }
         }));
+        source.onopen = () => {
+            if (source === this._summarySource) {
+                // A new connection can follow a backend restart and therefore
+                // begin a new model-version epoch.  Do not reset on error:
+                // buffered older events from the same stream must not replace
+                // the current summary before the reconnect is established.
+                this._summaryVersion = -1;
+            }
+        };
         source.onerror = () => {
             if (source === this._summarySource) {
-                // EventSource reconnects in place.  A restarted backend can
-                // legitimately begin a new model-version epoch at zero.
-                this._summaryVersion = -1;
                 this._logger.warn("Model summary stream disconnected");
             }
         };

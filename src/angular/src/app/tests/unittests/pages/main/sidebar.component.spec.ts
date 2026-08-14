@@ -107,6 +107,8 @@ describe("Testing sidebar component", () => {
         expect(labels).toContain("Dashboard");
         expect(labels).toContain("Movies");
         expect(labels).toContain("TV");
+        expect(fixture.nativeElement.querySelectorAll("#sidebar a.path-pair-button").length).toBe(2);
+        expect(fixture.nativeElement.querySelector("#sidebar a.dashboard-button")).not.toBeNull();
     });
 
     it("should fall back to IDs when two enabled path pairs normalize to the same slug", () => {

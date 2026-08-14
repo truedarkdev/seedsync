@@ -621,6 +621,15 @@ class TestModelApi(unittest.TestCase):
         stale = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
         self.assertEqual("stale", stale["local_library_state"])
 
+        # A retry/progress observation cannot turn failed evidence into a
+        # healthy-looking scan; only an authoritative completion can.
+        builder.observe_local_scan_result({"pair-a"}, set(), set(), False)
+        retrying = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
+        self.assertEqual("stale", retrying["local_library_state"])
+        builder.record_local_inventory_completion({"pair-a"})
+        recovered = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
+        self.assertEqual("up_to_date", recovered["local_library_state"])
+
     def test_identityless_multi_pair_local_scan_failure_marks_every_configured_scope_stale(self):
         builder = ModelBuilder()
         for pair_id, size in (("pair-a", 7), ("pair-b", 11)):

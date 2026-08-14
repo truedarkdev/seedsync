@@ -31,12 +31,13 @@
         &.selected:hover,
         &.selected:focus,
         &.selected:focus-visible {
-            background-color: $secondary-color;
-            color: white;
-            border-color: #6ac19e;
+            background-color: $secondary-light-color;
+            border-left: 4px solid $secondary-darker-color;
+            color: #124e35;
+            padding-left: 12px;
 
             img {
-                filter: invert(1.0);
+                filter: invert(37%) sepia(50%) saturate(751%) hue-rotate(101deg) brightness(88%) contrast(92%);
             }
         }
 

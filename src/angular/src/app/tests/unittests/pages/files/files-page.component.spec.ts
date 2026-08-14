@@ -8,6 +8,9 @@ import {ActivatedRoute} from "@angular/router";
 import {PathPair, PathPairService} from "../../../../services/settings/path-pair.service";
 import {ViewFileFilterService} from "../../../../services/files/view-file-filter.service";
 import {ModelFileService} from "../../../../services/files/model-file.service";
+import {ViewFileOptionsService} from "../../../../services/files/view-file-options.service";
+import {ViewFileOptions} from "../../../../services/files/view-file-options";
+import {DomService} from "../../../../services/utils/dom.service";
 
 
 @Component({
@@ -82,6 +85,26 @@ class MockModelFileService {
     deactivateScope = jasmine.createSpy("deactivateScope");
     refreshSummary = jasmine.createSpy("refreshSummary");
 }
+class MockViewFileOptionsService {
+    private readonly _options = new BehaviorSubject(new ViewFileOptions({
+        showDetails: false,
+        sortMethod: ViewFileOptions.SortMethod.SMART_STATUS,
+        selectedStatusFilter: null,
+        nameFilter: null,
+        pinFilter: true
+    }));
+
+    get options() { return this._options.asObservable(); }
+
+    setPinned(pinFilter: boolean) {
+        this._options.next(new ViewFileOptions(this._options.getValue().set("pinFilter", pinFilter)));
+    }
+}
+class MockDomService {
+    private readonly _headerHeight = new BehaviorSubject(0);
+
+    get headerHeight() { return this._headerHeight.asObservable(); }
+}
 
 function createPathPair(id: string, name: string, enabled = true): PathPair {
     return {
@@ -101,6 +124,7 @@ describe("Testing files page component", () => {
     let pathPairService: MockPathPairService;
     let viewFileFilterService: MockViewFileFilterService;
     let modelFileService: MockModelFileService;
+    let viewFileOptionsService: MockViewFileOptionsService;
 
     beforeEach(() => {
         TestBed.configureTestingModule({
@@ -109,7 +133,9 @@ describe("Testing files page component", () => {
                 {provide: ActivatedRoute, useClass: MockActivatedRoute},
                 {provide: PathPairService, useClass: MockPathPairService},
                 {provide: ViewFileFilterService, useClass: MockViewFileFilterService},
-                {provide: ModelFileService, useClass: MockModelFileService}
+                {provide: ModelFileService, useClass: MockModelFileService},
+                {provide: ViewFileOptionsService, useClass: MockViewFileOptionsService},
+                {provide: DomService, useClass: MockDomService}
             ]
         });
         TestBed.overrideComponent(FilesPageComponent, {
@@ -125,6 +151,7 @@ describe("Testing files page component", () => {
         pathPairService = TestBed.get(PathPairService);
         viewFileFilterService = TestBed.get(ViewFileFilterService);
         modelFileService = TestBed.get(ModelFileService);
+        viewFileOptionsService = TestBed.get(ViewFileOptionsService) as any;
     });
 
     afterEach(() => {
@@ -148,6 +175,46 @@ describe("Testing files page component", () => {
         expect(fixture.nativeElement.querySelector("app-path-pair-stats")).not.toBeNull();
         expect(fixture.nativeElement.querySelector("app-file-options")).toBeNull();
         expect(fixture.nativeElement.querySelector("app-file-list")).toBeNull();
+    });
+
+    it("groups selected-pair identity and controls in the selected context workspace", () => {
+        route.setParams({pathPairId: "movies"});
+        pathPairService.setPathPairs([
+            createPathPair("movies", "Movies"),
+            createPathPair("tv", "TV")
+        ]);
+
+        fixture.detectChanges();
+
+        const workspace = fixture.nativeElement.querySelector(".selected-pair-workspace.has-selected-pair");
+        const header = workspace.querySelector(".selected-pair-header");
+        expect(workspace).not.toBeNull();
+        expect(header).not.toBeNull();
+        expect(header.classList.contains("pinned")).toBe(true);
+        expect(header.querySelector("app-path-pair-identity")).not.toBeNull();
+        expect(header.querySelector("app-file-options.selected-context")).not.toBeNull();
+        const fileList = workspace.querySelector("app-file-list.selected-context");
+        expect(fileList).not.toBeNull();
+        expect(header.contains(fileList)).toBe(false);
+
+        viewFileOptionsService.setPinned(false);
+        fixture.detectChanges();
+        expect(header.classList.contains("pinned")).toBe(false);
+    });
+
+    it("pins the legacy detail toolbar when no enabled path pair exists", () => {
+        route.setParams({});
+        pathPairService.setPathPairs([]);
+
+        fixture.detectChanges();
+
+        expect(component.showDetailView).toBe(true);
+        expect(modelFileService.activateScope).toHaveBeenCalledWith("__legacy__");
+        const header = fixture.nativeElement.querySelector(".selected-pair-header");
+        expect(header).not.toBeNull();
+        expect(header.classList.contains("pinned")).toBe(true);
+        expect(header.querySelector("app-path-pair-identity")).toBeNull();
+        expect(header.querySelector("app-file-options.selected-context")).toBeNull();
     });
 
     it("does not activate the legacy scope for a cold pair deep link before readiness", () => {

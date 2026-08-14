@@ -1,13 +1,16 @@
 <section class="path-pair-identity" *ngIf="pathPair">
     <div class="identity-main">
+        <img src="assets/icons/directory.svg" class="pair-folder" aria-hidden="true" />
         <h1>{{ pathPair.name }}</h1>
-        <span class="library-summary">{{ formatFileCount() }} files &middot; <ng-container *ngIf="library.size === null; else librarySize">&mdash; local</ng-container><ng-template #librarySize>{{ library.size | fileSize:2 }} local</ng-template></span>
+        <div class="library-summary" aria-label="Local library inventory">
+            <span><strong>{{ formatFileCount() }}</strong><span class="muted">files</span></span>
+            <span class="separator" aria-hidden="true">|</span>
+            <span *ngIf="library.size === null"><strong>&mdash;</strong><span class="muted">local</span></span>
+            <span *ngIf="library.size !== null"><strong>{{ library.size | fileSize:2 }}</strong><span class="muted">local</span></span>
+        </div>
     </div>
     <div class="scan-status" [ngClass]="library.state">
         <span class="state-dot" aria-hidden="true"></span>
-        <div>
-            <strong>{{ stateLabel() }}</strong>
-            <span *ngIf="detail()">{{ detail() }}</span>
-        </div>
+        <strong>{{ stateLabel() }}</strong>
     </div>
 </section>

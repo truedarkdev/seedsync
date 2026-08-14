@@ -1,0 +1,41 @@
+@use '../../common/common' as *;
+
+// The page-level surface owns pinning for both selected and legacy detail
+// views.  The toolbar remains a child so selected routes pin their identity,
+// controls, and scan state as one unit.
+.selected-pair-workspace .selected-pair-header.pinned {
+    box-shadow: 0 2px 5px rgba(0, 0, 0, .16);
+    position: sticky;
+    z-index: $zindex-file-options;
+}
+
+.selected-pair-workspace.has-selected-pair {
+    background: #fff;
+    border-bottom: 1px solid #d9dedb;
+    border-left: 4px solid $secondary-dark-color;
+
+    .selected-pair-header {
+        background: #e7f5ee;
+        border-bottom: 1px solid rgba($secondary-darker-color, .28);
+        min-width: 0;
+
+    }
+}
+
+@media only screen and (min-width: 1200px) {
+    .selected-pair-workspace.has-selected-pair {
+        .selected-pair-header {
+            align-items: center;
+            display: flex;
+            min-height: 46px;
+
+            app-path-pair-identity { display: contents; }
+
+            app-file-options {
+                flex: 1 1 auto;
+                min-width: 0;
+                order: 2;
+            }
+        }
+    }
+}

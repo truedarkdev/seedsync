@@ -1,5 +1,5 @@
 <div id="sidebar">
-    <a class="button"
+    <a class="button dashboard-button"
        [routerLink]="['/' + dashboardRouteInfo.path]"
        [routerLinkActiveOptions]="{exact: true}"
        routerLinkActive="selected">
@@ -9,7 +9,7 @@
 
     <ng-container *ngIf="hasMultipleEnabledPathPairs">
         <a *ngFor="let routeInfo of pathPairRoutes"
-           class="button"
+           class="button path-pair-button"
            [routerLink]="['/' + routeInfo.path]"
            [routerLinkActiveOptions]="{exact: true}"
            routerLinkActive="selected">

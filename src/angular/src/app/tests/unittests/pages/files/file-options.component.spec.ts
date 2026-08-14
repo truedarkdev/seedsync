@@ -34,7 +34,10 @@ class MockViewFileOptionsService {
     public setSelectedStatusFilter(_status: ViewFile.Status) {}
     public setSortMethod(_sortMethod: ViewFileOptions.SortMethod) {}
     public setShowDetails(_show: boolean) {}
-    public setPinFilter(_pinned: boolean) {}
+    public setPinFilter(pinned: boolean) {
+        const current = this._options.getValue();
+        this._options.next(new ViewFileOptions(current.set("pinFilter", pinned)));
+    }
 }
 
 class MockViewFileService {
@@ -104,6 +107,30 @@ describe("Testing file options component", () => {
         expect(menu.classList.contains("show")).toBe(false);
         expect(button.classList.contains("show")).toBe(false);
         expect(button.getAttribute("aria-expanded")).toBe("false");
+    });
+
+    it("keeps the compact filter and existing controls in one toolbar root", () => {
+        const root = fixture.nativeElement.querySelector("#file-options");
+        expect(root.querySelector("#filter-search")).not.toBeNull();
+        expect(root.querySelector("#filter-status")).not.toBeNull();
+        expect(root.querySelector("#sort-status")).not.toBeNull();
+        expect(root.querySelector("#toggle-details")).not.toBeNull();
+        expect(root.querySelector("#pin-filter")).not.toBeNull();
+    });
+
+    it("binds the persisted pin option to the sticky host and visible pin state", () => {
+        viewFileOptionsService.emitOptions(new ViewFileOptions({
+            showDetails: false,
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS,
+            selectedStatusFilter: null,
+            nameFilter: null,
+            pinFilter: true
+        }));
+        fixture.detectChanges();
+
+        expect(fixture.nativeElement.classList.contains("pinned")).toBe(true);
+        expect(fixture.nativeElement.querySelector("#file-options").classList.contains("sticky")).toBe(true);
+        expect(fixture.nativeElement.querySelector("#pin-filter").classList.contains("active")).toBe(true);
     });
 
     it("should keep status filters in sync with the file list and current selection", () => {

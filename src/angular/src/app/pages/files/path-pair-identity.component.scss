@@ -1,53 +1,77 @@
 @use '../../common/common' as *;
 
+:host {
+    display: block;
+    min-width: 0;
+}
+
 .path-pair-identity {
     align-items: center;
-    background: $header-color;
-    border-bottom: 1px solid #d7dce1;
+    background: transparent;
     display: flex;
-    gap: 18px;
+    gap: 12px;
     justify-content: space-between;
-    min-height: 58px;
-    padding: 8px 16px 7px 12px;
+    min-height: 46px;
+    padding: 8px 14px 8px 12px;
 
     .identity-main {
-        align-items: baseline;
+        align-items: center;
         display: flex;
-        flex-wrap: wrap;
-        gap: 14px;
+        flex: 1 1 auto;
+        gap: 9px;
         min-width: 0;
     }
 
+    .pair-folder {
+        filter: invert(37%) sepia(50%) saturate(751%) hue-rotate(101deg) brightness(88%) contrast(92%);
+        flex: 0 0 auto;
+        height: 20px;
+        width: 20px;
+    }
+
     h1 {
-        font-size: 1.05em;
-        font-weight: 600;
+        flex: 0 1 auto;
+        font-size: 1.04em;
+        font-weight: 700;
         margin: 0;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
     }
 
-    .library-summary { font-size: .9em; }
+    .library-summary {
+        align-items: center;
+        display: flex;
+        flex: 0 0 auto;
+        font-size: .84em;
+        gap: 7px;
+        min-width: 0;
+        white-space: nowrap;
+
+        strong { font-weight: 600; }
+        .muted { color: #61716a; margin-left: 3px; }
+        .separator { color: #86a69a; margin: 0 3px; }
+    }
 
     .scan-status {
         align-items: center;
-        color: #717171;
+        color: #5b6b63;
         display: flex;
         flex: 0 0 auto;
-        font-size: .85em;
-        gap: 7px;
+        font-size: .92em;
+        font-weight: 500;
+        gap: 8px;
         text-align: right;
+        white-space: nowrap;
 
         .state-dot {
             background: #888;
             border-radius: 50%;
             box-sizing: border-box;
-            height: 9px;
-            width: 9px;
+            height: 12px;
+            width: 12px;
         }
 
-        strong, span { display: block; font-weight: 500; }
-        span { font-size: .9em; margin-top: 2px; }
         &.up_to_date .state-dot { background: #15b822; }
         &.scanning { color: $primary-color; }
         &.scanning .state-dot {
@@ -55,7 +79,7 @@
             background: transparent;
             border: 2px dotted $primary-color;
         }
-        &.stale .state-dot { background: #b87917; }
+        &.stale .state-dot { background: #f71920; }
     }
 }
 
@@ -67,13 +91,59 @@
     .path-pair-identity .scan-status.scanning .state-dot { animation: none; }
 }
 
+@media only screen and (min-width: 1200px) {
+    // The selected workspace owns the one-row layout.  Flattening this
+    // presentational component lets its identity and independent status sit
+    // on opposite ends of that shared plane without a boxed sub-header.
+    :host,
+    .path-pair-identity { display: contents; }
+
+    .path-pair-identity .identity-main {
+        align-items: center;
+        box-sizing: border-box;
+        display: flex;
+        // Reserve orientation space before yielding width to the filter.  A
+        // bounded identity still permits longer pair names to ellipsize.
+        flex: 0 1 330px;
+        gap: 9px;
+        min-width: 280px;
+        max-width: 330px;
+        order: 1;
+        align-self: stretch;
+        border-right: 1px solid rgba($secondary-darker-color, .2);
+        padding: 5px 12px;
+
+        h1 { min-width: 0; }
+    }
+
+    .path-pair-identity .scan-status {
+        align-items: center;
+        display: flex;
+        flex: 0 0 auto;
+        gap: 8px;
+        margin-left: auto;
+        order: 3;
+        border-left: 1px solid rgba($secondary-darker-color, .2);
+        padding: 5px 14px 5px 12px;
+    }
+}
+
+@media only screen and (max-width: 1199px) {
+    .path-pair-identity {
+        border-bottom: 1px solid rgba($secondary-darker-color, .25);
+        flex-wrap: wrap;
+        gap: 7px 14px;
+
+        .identity-main { flex-basis: 320px; }
+    }
+}
+
 @media only screen and (max-width: $small-max-width) {
     .path-pair-identity {
         align-items: flex-start;
-        flex-direction: column;
-        gap: 4px;
         min-height: 0;
 
-        .scan-status { text-align: left; }
+        .identity-main { flex-basis: 100%; }
+        .scan-status { margin-left: 30px; text-align: left; }
     }
 }

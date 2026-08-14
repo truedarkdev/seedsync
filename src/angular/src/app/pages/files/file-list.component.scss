@@ -115,6 +115,10 @@ app-bulk-actions-bar {
         padding: 10px;
     }
 
+    :host(.selected-context) #file-list #header {
+        padding: 0;
+    }
+
     /* header and content elements */
     #header > div, .content > div {
         padding: 8px 8px;

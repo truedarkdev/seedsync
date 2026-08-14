@@ -7,7 +7,7 @@ import {FileSizePipe} from "../../common/file-size.pipe";
 import {PathPair} from "../../services/settings/path-pair.service";
 import {ModelFileService} from "../../services/files/model-file.service";
 import {
-    formatLocalFileCount, localLibraryDetail, localLibraryStateLabel, localLibrarySummary, LocalLibrarySummary
+    formatLocalFileCount, localLibraryStateLabel, localLibrarySummary, LocalLibrarySummary
 } from "./path-pair-local-library";
 
 @Component({
@@ -50,9 +50,6 @@ export class PathPairIdentityComponent implements OnInit, OnDestroy {
 
     formatFileCount(): string { return formatLocalFileCount(this.library.fileCount); }
     stateLabel(): string { return localLibraryStateLabel(this.library.state); }
-    detail(): string | null {
-        return localLibraryDetail(this.library.state, this.library.fileCount !== null && this.library.size !== null);
-    }
 
     private _updateLibrary(): void {
         const summary = this._summaries.find(value => value?.path_pair_id === this._pathPair?.id);

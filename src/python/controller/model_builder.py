@@ -320,7 +320,6 @@ class ModelBuilder:
             path_pair_id for path_pair_id in enabled_path_pair_ids
             if path_pair_id is None or isinstance(path_pair_id, str)
         }
-        changed = set(changed_path_pair_ids)
         updated = {
             path_pair_id: inventory
             for path_pair_id, inventory in self.__local_library_inventory_by_pair.items()
@@ -330,7 +329,13 @@ class ModelBuilder:
             updated[path_pair_id] = _LocalLibraryInventory(
                 existing.file_count,
                 existing.size,
-                "stale" if path_pair_id in changed else "scanning",
+                # A configuration/root transition needs a replacement scan,
+                # but is not itself a failed scan.  Reserve ``stale`` for
+                # actual failure evidence so a normal runtime refresh cannot
+                # briefly report a false failure.  A retry still cannot
+                # rehabilitate an actual failed snapshot; only the completed
+                # authoritative replacement below may do that.
+                "stale" if existing.state == "stale" else "scanning",
             )
         self.__replace_local_library_inventory(updated)
 
@@ -368,7 +373,7 @@ class ModelBuilder:
                 updated[path_pair_id] = _LocalLibraryInventory(
                     existing.file_count if existing is not None else None,
                     existing.size if existing is not None else None,
-                    "scanning",
+                    "stale" if existing is not None and existing.state == "stale" else "scanning",
                 )
         self.__replace_local_library_inventory(updated)
 

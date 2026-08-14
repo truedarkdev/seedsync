@@ -10,60 +10,57 @@
         </div>
 
         <div class="card-body">
-            <section class="local-library">
-                <h3>Local library</h3>
-                <div class="library-values">
-                    <span>{{ formatLocalFileCount(stat.localFileCount) }} files</span>
-                    <span class="separator">|</span>
-                    <span *ngIf="stat.localLibrarySize === null">&mdash; local</span>
-                    <span *ngIf="stat.localLibrarySize !== null">{{ stat.localLibrarySize | fileSize:2 }} local</span>
-                </div>
-                <p class="library-detail" *ngIf="stat.localLibraryDetail">{{ stat.localLibraryDetail }}</p>
-            </section>
+            <div class="library-values" aria-label="Local library inventory">
+                <img src="assets/icons/directory.svg" class="library-icon" aria-hidden="true" />
+                <span><strong>{{ formatLocalFileCount(stat.localFileCount) }}</strong><span class="muted">files</span></span>
+                <span class="separator" aria-hidden="true">|</span>
+                <span *ngIf="stat.localLibrarySize === null"><strong>&mdash;</strong><span class="muted">local</span></span>
+                <span *ngIf="stat.localLibrarySize !== null"><strong>{{ stat.localLibrarySize | fileSize:2 }}</strong><span class="muted">local</span></span>
+            </div>
 
             <section class="transfers">
                 <h3>Transfers</h3>
-            <div class="progress-section">
-                <div class="progress">
-                    <div class="progress-bar"
-                         [class.progress-bar-animated]="stat.downloadingCount > 0"
-                         [class.progress-bar-striped]="stat.downloadingCount > 0"
-                         [style.width.%]="stat.overallProgress">
+                <div class="progress-section">
+                    <div class="progress">
+                        <div class="progress-bar"
+                             [class.progress-bar-animated]="stat.downloadingCount > 0"
+                             [class.progress-bar-striped]="stat.downloadingCount > 0"
+                             [style.width.%]="stat.overallProgress">
+                        </div>
                     </div>
+                    <span class="progress-text">{{ stat.overallProgress }}%</span>
                 </div>
-                <span class="progress-text">{{ stat.overallProgress }}%</span>
-            </div>
 
-            <div class="stats-row">
-                <div class="stat" *ngIf="stat.downloadingCount > 0">
-                    <img src="assets/icons/downloading.svg" class="stat-icon" />
-                    <span class="stat-value">{{ stat.downloadingCount }}</span>
-                    <span class="stat-label">downloading</span>
+                <div class="stats-row">
+                    <div class="stat" *ngIf="stat.downloadingCount > 0">
+                        <img src="assets/icons/downloading.svg" class="stat-icon" />
+                        <span class="stat-value">{{ stat.downloadingCount }}</span>
+                        <span class="stat-label">downloading</span>
+                    </div>
+                    <div class="stat" *ngIf="stat.queuedCount > 0">
+                        <img src="assets/icons/queued.svg" class="stat-icon" />
+                        <span class="stat-value">{{ stat.queuedCount }}</span>
+                        <span class="stat-label">queued</span>
+                    </div>
+                    <div class="stat" *ngIf="stat.downloadedCount > 0">
+                        <img src="assets/icons/downloaded.svg" class="stat-icon" />
+                        <span class="stat-value">{{ stat.downloadedCount }}</span>
+                        <span class="stat-label">done</span>
+                    </div>
                 </div>
-                <div class="stat" *ngIf="stat.queuedCount > 0">
-                    <img src="assets/icons/queued.svg" class="stat-icon" />
-                    <span class="stat-value">{{ stat.queuedCount }}</span>
-                    <span class="stat-label">queued</span>
-                </div>
-                <div class="stat" *ngIf="stat.downloadedCount > 0">
-                    <img src="assets/icons/downloaded.svg" class="stat-icon" />
-                    <span class="stat-value">{{ stat.downloadedCount }}</span>
-                    <span class="stat-label">done</span>
-                </div>
-            </div>
 
-            <div class="transfer-meta" *ngIf="hasActiveTransfers(stat); else noActiveTransfers">
-                <span class="transfer-bytes">{{ stat.totalLocalSize | fileSize:2 }} / {{ stat.totalRemoteSize | fileSize:2 }}</span>
-                <div class="meta-info">
-                    <div class="speed-info" *ngIf="stat.totalSpeed > 0">
-                        <span class="speed">{{ stat.totalSpeed | fileSize:2 }}/s</span>
-                    </div>
-                    <div class="eta-info" *ngIf="stat.etaSeconds !== null">
-                        <span class="eta-value">ETA {{ formatEta(stat.etaSeconds) }}</span>
+                <div class="transfer-meta" *ngIf="hasActiveTransfers(stat); else noActiveTransfers">
+                    <span class="transfer-bytes">{{ stat.totalLocalSize | fileSize:2 }} / {{ stat.totalRemoteSize | fileSize:2 }}</span>
+                    <div class="meta-info">
+                        <div class="speed-info" *ngIf="stat.totalSpeed > 0">
+                            <span class="speed">{{ stat.totalSpeed | fileSize:2 }}/s</span>
+                        </div>
+                        <div class="eta-info" *ngIf="stat.etaSeconds !== null">
+                            <span class="eta-value">ETA {{ formatEta(stat.etaSeconds) }}</span>
+                        </div>
                     </div>
                 </div>
-            </div>
-            <ng-template #noActiveTransfers><p class="no-active-transfers">No active transfers</p></ng-template>
+                <ng-template #noActiveTransfers><p class="no-active-transfers">No active transfers</p></ng-template>
             </section>
         </div>
     </div>

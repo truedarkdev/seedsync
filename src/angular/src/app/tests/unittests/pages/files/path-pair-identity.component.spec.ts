@@ -28,7 +28,7 @@ describe("Testing path-pair identity component", () => {
         };
     });
 
-    it("shows the selected pair inventory and retained scan state above filters", () => {
+    it("shows the selected pair inventory and scan state without retained-scan copy", () => {
         model.setSummaries([{
             path_pair_id: "sample-pair", local_library_file_count: 10400,
             local_library_size: 320, local_library_state: "scanning"
@@ -37,16 +37,20 @@ describe("Testing path-pair identity component", () => {
 
         expect(model.startSummaryStream).toHaveBeenCalled();
         expect(fixture.nativeElement.textContent).toContain("Sample pair");
-        expect(fixture.nativeElement.textContent).toContain("10.4k files");
+        expect(fixture.nativeElement.textContent).toContain("10.4kfiles");
         expect(fixture.nativeElement.textContent).toContain("Scanning");
-        expect(fixture.nativeElement.textContent).toContain("Showing last complete scan");
+        expect(fixture.nativeElement.textContent).not.toContain("Showing last complete scan");
+        expect(fixture.nativeElement.querySelector(".pair-folder")).not.toBeNull();
+        expect(fixture.nativeElement.querySelector(".identity-main > h1")).not.toBeNull();
+        expect(fixture.nativeElement.querySelector(".library-summary")).not.toBeNull();
         expect(fixture.nativeElement.querySelector(".scan-status.scanning .state-dot")).not.toBeNull();
     });
 
-    it("resets to the current pair summary without waiting for another SSE event", () => {
+    it("selects the current A-to-B-to-C route summary without waiting for another SSE event", () => {
         model.setSummaries([
             {path_pair_id: "sample-pair", local_library_file_count: 10, local_library_size: 10, local_library_state: "up_to_date"},
-            {path_pair_id: "other-pair", local_library_file_count: 215000, local_library_size: 20, local_library_state: "scanning"}
+            {path_pair_id: "other-pair", local_library_file_count: 215000, local_library_size: 20, local_library_state: "up_to_date"},
+            {path_pair_id: "third-pair", local_library_file_count: 4, local_library_size: 3, local_library_state: "up_to_date"}
         ]);
         fixture.detectChanges();
 
@@ -56,8 +60,22 @@ describe("Testing path-pair identity component", () => {
         fixture.detectChanges();
 
         expect(fixture.nativeElement.textContent).toContain("Other pair");
-        expect(fixture.nativeElement.textContent).toContain("215k files");
-        expect(fixture.nativeElement.textContent).toContain("Scanning");
+        expect(fixture.nativeElement.textContent).toContain("215kfiles");
+        expect(fixture.nativeElement.textContent).toContain("Up to date");
+
+        fixture.componentInstance.pathPair = {
+            id: "third-pair", name: "Third pair", remote_path: "/remote-third", local_path: "/local-third", enabled: true, auto_queue: true
+        };
+        fixture.detectChanges();
+        expect(fixture.nativeElement.textContent).toContain("Third pair");
+        expect(fixture.nativeElement.textContent).toContain("Up to date");
+
+        fixture.componentInstance.pathPair = {
+            id: "other-pair", name: "Other pair", remote_path: "/remote-other", local_path: "/local-other", enabled: true, auto_queue: true
+        };
+        fixture.detectChanges();
+        expect(fixture.nativeElement.textContent).toContain("Other pair");
+        expect(fixture.nativeElement.textContent).toContain("Up to date");
     });
 
     it("renders explicit null inventory values as unknown", () => {
@@ -70,7 +88,7 @@ describe("Testing path-pair identity component", () => {
         expect(fixture.componentInstance.library.fileCount).toBeNull();
         expect(fixture.componentInstance.library.size).toBeNull();
         expect(fixture.nativeElement.textContent).toContain("Waiting for scan");
-        expect(fixture.nativeElement.textContent).toContain("— files");
+        expect(fixture.nativeElement.textContent).toContain("—files");
         expect(fixture.nativeElement.textContent).not.toContain("Showing last complete scan");
     });
 });

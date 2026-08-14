@@ -7,7 +7,7 @@ import {PathPairService, PathPair} from "../../services/settings/path-pair.servi
 import {FileSizePipe} from "../../common/file-size.pipe";
 import {ModelFileService} from "../../services/files/model-file.service";
 import {
-    formatLocalFileCount, localLibraryDetail, localLibraryStateLabel, localLibrarySummary, LocalLibraryState
+    formatLocalFileCount, localLibraryStateLabel, localLibrarySummary, LocalLibraryState
 } from "./path-pair-local-library";
 
 export interface PathPairStat {
@@ -16,7 +16,6 @@ export interface PathPairStat {
     localFileCount: number | null;
     localLibrarySize: number | null;
     localLibraryState: LocalLibraryState;
-    localLibraryDetail: string | null;
     downloadingCount: number;
     queuedCount: number;
     downloadedCount: number;
@@ -141,7 +140,6 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
             localFileCount: library.fileCount,
             localLibrarySize: library.size,
             localLibraryState: library.state,
-            localLibraryDetail: localLibraryDetail(library.state, library.fileCount !== null && library.size !== null),
             downloadingCount: Number(current.active_count) || 0,
             queuedCount: Number(current.queued_count) || 0,
             downloadedCount: Number(current.completed_count) || 0,

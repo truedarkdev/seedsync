@@ -138,6 +138,16 @@ describe("Testing app component", () => {
         expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Dashboard");
     });
 
+    it("should retain the mobile SeedSync mark beside the route title", () => {
+        detectSettledChanges();
+
+        const brand = fixture.nativeElement.querySelector(".mobile-brand");
+        expect(brand).not.toBeNull();
+        expect(brand.querySelector("img").getAttribute("src")).toBe("assets/logo.png");
+        expect(brand.textContent).toContain("SeedSync");
+        expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Dashboard");
+    });
+
     it("should keep static route titles working after dashboard detail routes", () => {
         pathPairService.setPathPairs([
             createPathPair("movies-id", "Movies"),

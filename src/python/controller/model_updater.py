@@ -712,6 +712,9 @@ class _ProgressiveScanAccumulator:
             completed_path_pair_ids=completed,
             unknown_path_pair_ids=set(self.__incomplete_pairs),
             is_scan_final=bool(completed) and not self.__incomplete_pairs and not failed,
+            is_targeted_scan=any(
+                bool(getattr(event, "is_targeted_scan", False)) for event in accepted
+            ),
         )
 
     def snapshot(self) -> dict[tuple[Optional[str], str], SystemFile]:
@@ -2087,6 +2090,15 @@ class ModelUpdater(_ControllerCoreAccess):
             or not joint_reconciliation_final
             or not bool(getattr(controller, "_Controller__progressive_joint_authoritative", False))
             or bool(progressive_joint_delta_keys)
+            # A selected-pair final can be content-identical to the standing
+            # roots.  It still advances that pair's authoritative scan
+            # generation and must therefore reach the pair adopter, which
+            # owns clearing retained stale local inventory.
+            or bool(scoped_final_pair_ids) and any(
+                bool(getattr(result, "is_targeted_scan", False))
+                for result in (latest_local_scan, latest_remote_scan)
+                if result is not None
+            )
             or not progressive_final_noop_proven
         )
         if progressive_mode and joint_reconciler is not None and joint_reconciliation_final and \
@@ -2567,7 +2579,25 @@ class ModelUpdater(_ControllerCoreAccess):
                         model_builder.set_remote_files(joint_remote_files)
                         inventory_completion = getattr(model_builder, "record_local_inventory_completion", None)
                         if callable(inventory_completion):
-                            inventory_completion(set(scoped_final_pair_ids or set()))
+                            # Multi-pair progressive finals intentionally use
+                            # the established whole-source publication path.
+                            # ``scoped_final_pair_ids`` is only populated for
+                            # the single-pair delta transaction, so using it
+                            # here stranded every completed inventory at
+                            # scanning despite authoritative local sources.
+                            # Local and remote progressive scanners complete
+                            # independently.  A remote-only final tick still
+                            # reconciles against the local accumulator's
+                            # standing authority, so the current local event
+                            # can legitimately be absent here.
+                            local_accumulator = getattr(
+                                controller, "_Controller__progressive_local_scan_state", None
+                            )
+                            completed_inventory_ids = local_accumulator.completed_pairs() \
+                                if isinstance(local_accumulator, _ProgressiveScanAccumulator) else set(
+                                    getattr(latest_local_scan, "completed_path_pair_ids", set())
+                                ) if latest_local_scan is not None else set()
+                            inventory_completion(completed_inventory_ids)
                     setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
                     if (not authoritative_pair_delta_builds or authoritative_pair_fallback_required) and \
                             callable(setter_unknown_local):

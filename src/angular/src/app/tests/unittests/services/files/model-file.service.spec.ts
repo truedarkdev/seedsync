@@ -14,6 +14,7 @@ const DoNothing = {next: reaction => {}};
 
 class FakeEventSource {
     public onerror: (() => void) | null = null;
+    public onopen: (() => void) | null = null;
     public readonly close = jasmine.createSpy("close");
     private readonly listeners: {[event: string]: Array<(payload: any) => void>} = {};
 
@@ -1016,15 +1017,22 @@ describe("Testing model file service", () => {
         httpMock.verify();
     });
 
-    it("accepts a new lower summary version after current-stream reconnect but rejects a closed source", () => {
+    it("rejects stale summaries after an error until the current stream reconnects", () => {
         const first = new FakeEventSource();
         const second = new FakeEventSource();
         spyOn(ModelEventSourceFactory, "create").and.returnValues(<any>first, <any>second);
         let summaries: any[] = null;
         modelFileService.summaries.subscribe(value => summaries = value);
         modelFileService.startSummaryStream();
-        first.emit("model-summary", JSON.stringify({model_version: 8, path_pairs: [{path_pair_id: "movies", root_count: 8}]}));
+        first.emit("model-summary", JSON.stringify({model_version: 8, path_pairs: [
+            {path_pair_id: "pair-b", local_library_state: "up_to_date"}
+        ]}));
         first.onerror!();
+        first.emit("model-summary", JSON.stringify({model_version: 7, path_pairs: [
+            {path_pair_id: "pair-b", local_library_state: "stale"}
+        ]}));
+        expect(summaries[0].local_library_state).toBe("up_to_date");
+        first.onopen!();
         first.emit("model-summary", JSON.stringify({model_version: 1, path_pairs: [{path_pair_id: "movies", root_count: 1}]}));
         expect(summaries[0].root_count).toBe(1);
 

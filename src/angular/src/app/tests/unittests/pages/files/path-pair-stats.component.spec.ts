@@ -44,8 +44,11 @@ describe("Testing path-pair stats component", () => {
         expect(model.startSummaryStream).toHaveBeenCalled();
         expect(fixture.componentInstance.stats[0].overallProgress).toBe(50);
         expect(fixture.componentInstance.formatLocalFileCount(fixture.componentInstance.stats[0].localFileCount)).toBe("10.4k");
-        expect(fixture.nativeElement.textContent).toContain("Local library");
-        expect(fixture.nativeElement.textContent).toContain("Showing last complete scan");
+        expect(fixture.nativeElement.textContent).toContain("10.4kfiles");
+        expect(fixture.nativeElement.textContent).toContain("320 Blocal");
+        expect(fixture.nativeElement.textContent).not.toContain("Local library");
+        expect(fixture.nativeElement.textContent).not.toContain("Showing last complete scan");
+        expect(fixture.nativeElement.querySelector(".library-values .library-icon")).not.toBeNull();
         expect(fixture.nativeElement.querySelector(".scan-state.scanning .state-dot")).not.toBeNull();
 
         model.setSummaries([{path_pair_id: "movies", root_count: 2, remote_size: 1000, transferred_size: 1000,
@@ -71,7 +74,7 @@ describe("Testing path-pair stats component", () => {
         expect(stat.localFileCount).toBeNull();
         expect(stat.localLibrarySize).toBeNull();
         expect(fixture.nativeElement.textContent).toContain("Waiting for scan");
-        expect(fixture.nativeElement.textContent).toContain("— files");
+        expect(fixture.nativeElement.textContent).toContain("—files");
         expect(fixture.nativeElement.textContent).not.toContain("Showing last complete scan");
     });
 
@@ -90,5 +93,23 @@ describe("Testing path-pair stats component", () => {
         expect(name).not.toBeNull();
         expect(state).not.toBeNull();
         expect(name.textContent).toContain("deliberately long neutral pair name");
+    });
+
+    it("renders a fixed-density nine-card overview without scan-detail copy", () => {
+        const pathPairs = Array.from({length: 9}, (_, index) => pair(`pair-${index}`, `Pair ${index}`));
+        pairs.setPathPairs(pathPairs);
+        model.setSummaries(pathPairs.map((pathPair, index) => ({
+            path_pair_id: pathPair.id,
+            local_library_file_count: index === 0 ? 0 : index * 1000,
+            local_library_size: index,
+            local_library_state: index === 4 ? "stale" : "up_to_date"
+        })));
+        fixture.detectChanges();
+
+        expect(fixture.nativeElement.querySelectorAll(".path-pair-card").length).toBe(9);
+        expect(fixture.nativeElement.querySelectorAll(".card-header").length).toBe(9);
+        expect(fixture.nativeElement.textContent).toContain("0files");
+        expect(fixture.nativeElement.textContent).toContain("8kfiles");
+        expect(fixture.nativeElement.textContent).not.toContain("Showing last complete scan");
     });
 });

@@ -1,4 +1,4 @@
-import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
+import {ChangeDetectionStrategy, ChangeDetectorRef, Component, HostBinding, OnDestroy, OnInit} from "@angular/core";
 import {CommonModule} from "@angular/common";
 import {FormsModule} from "@angular/forms";
 import {Observable, Subscription} from "rxjs";
@@ -9,7 +9,6 @@ import {ViewFileOptionsService} from "../../services/files/view-file-options.ser
 import {ViewFileOptions} from "../../services/files/view-file-options";
 import {ViewFile} from "../../services/files/view-file";
 import {ViewFileService} from "../../services/files/view-file.service";
-import {DomService} from "../../services/utils/dom.service";
 
 @Component({
     selector: "app-file-options",
@@ -37,7 +36,8 @@ export class FileOptionsComponent implements OnInit, OnDestroy {
     };
 
     public options: Observable<ViewFileOptions>;
-    public headerHeight: Observable<number>;
+
+    @HostBinding("class.pinned") public pinned = false;
 
     private _latestOptions: ViewFileOptions;
     private _filesSubscription: Subscription;
@@ -46,10 +46,8 @@ export class FileOptionsComponent implements OnInit, OnDestroy {
 
     constructor(private _changeDetector: ChangeDetectorRef,
                 private viewFileOptionsService: ViewFileOptionsService,
-                private _viewFileService: ViewFileService,
-                private _domService: DomService) {
+                private _viewFileService: ViewFileService) {
         this.options = this.viewFileOptionsService.options;
-        this.headerHeight = this._domService.headerHeight;
     }
 
     ngOnInit() {
@@ -83,8 +81,11 @@ export class FileOptionsComponent implements OnInit, OnDestroy {
         });
 
         // Keep the latest options for the toggle handlers.
-        this._optionsSubscription = this.viewFileOptionsService.options.subscribe(options => this._latestOptions = options);
-
+        this._optionsSubscription = this.viewFileOptionsService.options.subscribe(options => {
+            this._latestOptions = options;
+            this.pinned = Boolean(options && options.pinFilter);
+            this._changeDetector.markForCheck();
+        });
         window.addEventListener("scroll", this._windowScrollListener, true);
     }
 

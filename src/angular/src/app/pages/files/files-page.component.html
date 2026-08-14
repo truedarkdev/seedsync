@@ -1,6 +1,12 @@
 <app-path-pair-stats *ngIf="showOverview"></app-path-pair-stats>
 <ng-container *ngIf="showDetailView">
-    <app-path-pair-identity *ngIf="selectedPathPair" [pathPair]="selectedPathPair"></app-path-pair-identity>
-    <app-file-options></app-file-options>
-    <app-file-list></app-file-list>
+    <section class="selected-pair-workspace" [class.has-selected-pair]="selectedPathPair != null">
+        <div class="selected-pair-header"
+             [class.pinned]="(fileOptions | async)?.pinFilter"
+             [style.top.px]="headerHeight | async">
+            <app-path-pair-identity *ngIf="selectedPathPair" [pathPair]="selectedPathPair"></app-path-pair-identity>
+            <app-file-options [class.selected-context]="selectedPathPair != null"></app-file-options>
+        </div>
+        <app-file-list [class.selected-context]="selectedPathPair != null"></app-file-list>
+    </section>
 </ng-container>

@@ -2045,6 +2045,123 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(0, counters["model_update_choice_active"])
         self.assertEqual(0, counters["model_update_choice_full"])
 
+    def test_targeted_progressive_final_clears_stale_inventory_when_roots_are_unchanged(self):
+        """A selected pair completion publishes even when its roots match standing authority."""
+        builder = ModelBuilder()
+
+        def scan_result(pair_ids, generation, session_token, *, targeted=False):
+            files = []
+            for path_pair_id, name, size in pair_ids:
+                file = SystemFile(name, size)
+                file.path_pair_id = path_pair_id
+                files.append(file)
+            ids = {file.path_pair_id for file in files}
+            return ScannerResult(
+                datetime.now(), files, scanned_path_pair_ids=ids, generation=generation,
+                is_progress=True, completed_path_pair_ids=ids, is_scan_final=True,
+                is_full_snapshot=True, full_snapshot_path_pair_ids=ids,
+                is_targeted_scan=targeted,
+                session_token=session_token,
+            )
+
+        baseline_pairs = [
+            ("pair-a", "same-a.bin", 7),
+            ("pair-b", "same-b.bin", 11),
+        ]
+        baseline_local = scan_result(baseline_pairs, 1, "local-targeted")
+        baseline_remote = scan_result(baseline_pairs, 1, "remote-targeted")
+        targeted_local = scan_result(
+            [("pair-a", "same-a.bin", 7)], 2, "local-targeted", targeted=True,
+        )
+        targeted_remote = scan_result(
+            [("pair-a", "same-a.bin", 7)], 2, "remote-targeted", targeted=True,
+        )
+        targeted_remote_partial = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=2,
+            is_progress=True, is_targeted_scan=True, session_token="remote-targeted",
+        )
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False, model_builder=builder, model=Model(),
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        # The remote selected generation starts first, local completes while
+        # that remote view is still incomplete, and the remote-only final is
+        # the joint publication boundary.
+        controller._Controller__remote_scan_process = self._progressive_process(
+            "remote-targeted", [[baseline_remote], [targeted_remote_partial], [], [targeted_remote]],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            "local-targeted", [[baseline_local], [], [targeted_local], []],
+        )
+        updater = ModelUpdater(controller)
+        updater.update()
+        builder.build_authoritative_pair_roots = MagicMock(
+            wraps=builder.build_authoritative_pair_roots,
+        )
+        updater.update()
+        updater.update()
+        _, before_final = builder.local_library_inventory_snapshot()
+        self.assertIn(before_final["pair-a"].state, {"scanning", "stale"})
+
+        updater.update()
+
+        builder.build_authoritative_pair_roots.assert_called_once()
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual((1, 7, "up_to_date"), (
+            inventory["pair-a"].file_count, inventory["pair-a"].size, inventory["pair-a"].state,
+        ))
+        self.assertEqual((1, 11, "up_to_date"), (
+            inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
+        ))
+
+    def test_multi_pair_progressive_final_completes_local_inventory_after_full_source_publication(self):
+        """A healthy multi-pair final uses whole-source publication, not the single-pair delta."""
+        builder = ModelBuilder()
+        local_a = SystemFile("local-a.bin", 7)
+        local_a.path_pair_id = "pair-a"
+        local_b = SystemFile("local-b.bin", 11)
+        local_b.path_pair_id = "pair-b"
+        remote_a = SystemFile("local-a.bin", 7)
+        remote_a.path_pair_id = "pair-a"
+        remote_b = SystemFile("local-b.bin", 11)
+        remote_b.path_pair_id = "pair-b"
+        local_final = ScannerResult(
+            datetime.now(), [local_a, local_b], scanned_path_pair_ids={"pair-a", "pair-b"},
+            is_progress=True, completed_path_pair_ids={"pair-a", "pair-b"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a", "pair-b"},
+            session_token="local-multi",
+        )
+        remote_final = ScannerResult(
+            datetime.now(), [remote_a, remote_b], scanned_path_pair_ids={"pair-a", "pair-b"},
+            is_progress=True, completed_path_pair_ids={"pair-a", "pair-b"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a", "pair-b"},
+            session_token="remote-multi",
+        )
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False, model_builder=builder, model=Model(),
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        # The local scanner completes first.  The later remote-only tick is
+        # the joint publication boundary, so no current local event is
+        # available to supply completion scope.
+        controller._Controller__remote_scan_process = self._progressive_process(
+            "remote-multi", [[], [remote_final]],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            "local-multi", [[local_final], []],
+        )
+
+        ModelUpdater(controller).update()
+        ModelUpdater(controller).update()
+
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual((1, 7, "up_to_date"), (
+            inventory["pair-a"].file_count, inventory["pair-a"].size, inventory["pair-a"].state,
+        ))
+        self.assertEqual((1, 11, "up_to_date"), (
+            inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
+        ))
+
     def test_completed_pair_with_unrelated_unknown_delta_uses_global_build(self):
         old = SystemFile("old.bin", 10, False)
         old.path_pair_id = "pair-a"
