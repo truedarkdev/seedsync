@@ -11,7 +11,7 @@ import json
 import shutil
 import shlex
 
-from controller.scan import RemoteScanner, ScannerError
+from controller.scan import RemoteScanLease, RemoteScanner, ScannerError
 from ssh import Sshcp, SshcpError
 from common import Localization, escape_remote_path_for_shell
 from common.performance_diagnostics import (
@@ -84,6 +84,85 @@ class TestRemoteScanner(unittest.TestCase):
             escape_remote_path_for_shell(remote_script, allow_tilde_expansion=True),
             escape_remote_path_for_shell(remote_path, allow_tilde_expansion=True)
         )
+
+    def test_remote_scan_lease_uses_runtime_temp_storage(self):
+        config_dir = tempfile.mkdtemp(prefix="test-remote-scan-config-", dir=TestRemoteScanner.temp_dir)
+        self.addCleanup(shutil.rmtree, config_dir)
+        runtime_dir = tempfile.mkdtemp(prefix="test-remote-scan-runtime-", dir=TestRemoteScanner.temp_dir)
+        self.addCleanup(shutil.rmtree, runtime_dir)
+
+        with patch("controller.scan.remote_scanner.tempfile.gettempdir", return_value=runtime_dir), \
+                patch("controller.scan.remote_scanner.os.path.isdir") as isdir:
+            lease = RemoteScanLease.create()
+            rebuilt_lease = RemoteScanLease.create()
+
+        isdir.assert_not_called()
+        self.assertEqual(
+            os.path.normcase(os.path.abspath(runtime_dir)),
+            os.path.normcase(os.path.dirname(os.path.abspath(lease.path))),
+        )
+        self.assertEqual(lease.path, rebuilt_lease.path)
+        self.assertFalse(os.path.exists(os.path.join(config_dir, ".seedsync-remote-scan.lock")))
+
+    def test_remote_scan_lease_releases_after_scan_error(self):
+        runtime_dir = tempfile.mkdtemp(prefix="test-remote-scan-runtime-", dir=TestRemoteScanner.temp_dir)
+        self.addCleanup(shutil.rmtree, runtime_dir)
+        with patch("controller.scan.remote_scanner.tempfile.gettempdir", return_value=runtime_dir):
+            lease = RemoteScanLease.create()
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/files",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/tmp/scanfs",
+            remote_scan_lease=lease,
+        )
+
+        scanner._RemoteScanner__scan = MagicMock(side_effect=RuntimeError("scan failed"))
+        with self.assertRaises(RuntimeError):
+            scanner.scan()
+
+        scanner._RemoteScanner__scan = MagicMock(return_value=[])
+        self.assertEqual([], scanner.scan())
+
+    @unittest.skipUnless(
+        os.name == "posix" and getattr(os, "O_NOFOLLOW", None) is not None and hasattr(os, "symlink"),
+        "POSIX symlink and O_NOFOLLOW support is required",
+    )
+    def test_remote_scan_lease_rejects_runtime_symlink_without_touching_target(self):
+        runtime_dir = tempfile.mkdtemp(prefix="test-remote-scan-runtime-", dir=TestRemoteScanner.temp_dir)
+        target_dir = tempfile.mkdtemp(prefix="test-remote-scan-target-", dir=TestRemoteScanner.temp_dir)
+        self.addCleanup(shutil.rmtree, runtime_dir)
+        self.addCleanup(shutil.rmtree, target_dir)
+        target_path = os.path.join(target_dir, "target.lock")
+        target_contents = b"target remains unchanged\n"
+        with open(target_path, "wb") as target_file:
+            target_file.write(target_contents)
+        os.chmod(target_path, 0o640)
+        target_mode = os.stat(target_path).st_mode
+        lease_path = os.path.join(runtime_dir, ".seedsync-remote-scan.lock")
+        try:
+            os.symlink(target_path, lease_path)
+        except (NotImplementedError, OSError) as error:
+            self.skipTest("unable to create symlink: {}".format(error))
+
+        with patch("controller.scan.remote_scanner.tempfile.gettempdir", return_value=runtime_dir):
+            with self.assertRaises(OSError):
+                RemoteScanLease.create()
+
+            os.unlink(lease_path)
+            lease = RemoteScanLease.create()
+            os.unlink(lease.path)
+            os.symlink(target_path, lease.path)
+            with self.assertRaises(OSError):
+                with lease.hold():
+                    pass
+
+        with open(target_path, "rb") as target_file:
+            self.assertEqual(target_contents, target_file.read())
+        self.assertEqual(target_mode, os.stat(target_path).st_mode)
 
     @staticmethod
     def _framed_stream(root_names):

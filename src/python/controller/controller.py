@@ -721,9 +721,7 @@ class Controller:
         )
         self.__password = self.__ssh_password
 
-        config_file_path = getattr(config, "file_path", None)
-        lock_directory = os.path.dirname(config_file_path) if isinstance(config_file_path, str) else None
-        self.__remote_scan_lease = RemoteScanLease.create(lock_directory)
+        self.__remote_scan_lease = RemoteScanLease.create()
 
         # Preserve the configured legacy roots independently from the runtime
         # fallback. The latter follows the first enabled pair and must return

@@ -2,8 +2,9 @@
 
 import threading
 import unittest
-import os
-from unittest.mock import MagicMock
+import shutil
+import tempfile
+from unittest.mock import MagicMock, patch
 
 from controller.scan import (
     MultiPathLocalScanner,
@@ -118,8 +119,10 @@ class TestMultiPathRemoteScanner(unittest.TestCase):
         )
 
     def test_remote_scan_lease_serializes_refresh_generations(self):
-        lease = RemoteScanLease.create()
-        self.addCleanup(lambda: os.path.exists(lease.path) and os.unlink(lease.path))
+        runtime_dir = tempfile.mkdtemp(prefix="test-remote-scan-runtime-")
+        self.addCleanup(shutil.rmtree, runtime_dir)
+        with patch("controller.scan.remote_scanner.tempfile.gettempdir", return_value=runtime_dir):
+            lease = RemoteScanLease.create()
         old_scanner = RemoteScanner(
             remote_address="host",
             remote_username="user",

@@ -1221,6 +1221,57 @@ class TestController(unittest.TestCase):
             performance_diagnostics=diagnostics,
         )
 
+    def test_build_remote_scanner_reuses_controller_lease_across_rebuilt_multi_path_scanners(self):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        shared_lease = object()
+        scanners = [MagicMock(name="scanner_{}".format(index)) for index in range(4)]
+        pair_a = PathPair(
+            id="pair-a",
+            name="Pair A",
+            remote_path="/remote/a",
+            local_path="/local/a",
+            enabled=True,
+            auto_queue=False,
+        )
+        pair_b = PathPair(
+            id="pair-b",
+            name="Pair B",
+            remote_path="/remote/b",
+            local_path="/local/b",
+            enabled=True,
+            auto_queue=False,
+        )
+        self.controller._Controller__remote_scan_lease = shared_lease
+        self.controller._Controller__context.config = SimpleNamespace(
+            lftp=SimpleNamespace(
+                remote_address="remote.server.com",
+                remote_username="user",
+                remote_port=22,
+                remote_path_to_scan_script="/scanfs",
+                remote_python_path="python3",
+            )
+        )
+        self.controller._Controller__context.args = SimpleNamespace(local_path_to_scanfs="/local-scanfs")
+        self.controller._Controller__context.performance_diagnostics = diagnostics
+
+        with patch("controller.controller.RemoteScanner", side_effect=scanners) as mock_remote, \
+                patch("controller.controller.MultiPathRemoteScanner") as mock_multi:
+            self.controller._Controller__build_remote_scanner([pair_a, pair_b])
+            self.controller._Controller__build_remote_scanner([pair_a, pair_b])
+
+        self.assertEqual(4, mock_remote.call_count)
+        self.assertTrue(all(
+            call.kwargs["remote_scan_lease"] is shared_lease
+            for call in mock_remote.call_args_list
+        ))
+        self.assertEqual(2, mock_multi.call_count)
+        self.assertEqual([scanners[0], scanners[1]], mock_multi.call_args_list[0].args[0])
+        self.assertEqual([scanners[2], scanners[3]], mock_multi.call_args_list[1].args[0])
+        self.assertTrue(all(
+            call.kwargs["performance_diagnostics"] is diagnostics
+            for call in mock_multi.call_args_list
+        ))
+
     def test_constructor_requires_password_for_ftps_even_when_ssh_key_is_enabled(self):
         context = self._make_startup_context(
             local_path="/local",

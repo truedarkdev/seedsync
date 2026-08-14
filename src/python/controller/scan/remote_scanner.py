@@ -10,6 +10,7 @@ import errno
 import hashlib
 import os
 import posixpath
+import stat
 import tempfile
 import time
 from collections.abc import Callable
@@ -27,6 +28,40 @@ from common.performance_diagnostics import (
 from system import SystemFile
 
 
+def _open_remote_scan_lease(path: str) -> int:
+    flags = os.O_CREAT | os.O_RDWR
+    if os.name == "posix":
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow:
+            flags |= nofollow
+        else:
+            # Keep the best available protection on POSIX platforms that do
+            # not expose O_NOFOLLOW. This check cannot close the creation
+            # race, so those platforms should provide O_NOFOLLOW for full
+            # symlink protection.
+            try:
+                if stat.S_ISLNK(os.lstat(path).st_mode):
+                    raise OSError(errno.ELOOP, "Remote scan lease path is a symlink")
+            except FileNotFoundError:
+                pass
+
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(errno.EINVAL, "Remote scan lease path is not a regular file")
+        if os.name == "posix":
+            try:
+                os.fchmod(descriptor, 0o600)
+            except (AttributeError, OSError):
+                pass
+        return descriptor
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+
+
 class _RemoteScanLeaseHandle:
     """One process-held advisory lock handle for a shared scan lease path."""
 
@@ -37,7 +72,7 @@ class _RemoteScanLeaseHandle:
     def acquire(self) -> None:
         if self.__descriptor is not None:
             raise RuntimeError("Remote scan lease is already held")
-        descriptor = os.open(self.__path, os.O_CREAT | os.O_RDWR)
+        descriptor = _open_remote_scan_lease(self.__path)
         try:
             # Windows byte-range locking requires a non-empty file and starts
             # at the current descriptor position.
@@ -97,31 +132,19 @@ class RemoteScanLease:
         self.path = os.fspath(path)
 
     @classmethod
-    def create(cls, directory: Optional[str] = None) -> "RemoteScanLease":
-        if isinstance(directory, str) and directory and os.path.isdir(directory):
-            path = os.path.join(directory, ".seedsync-remote-scan.lock")
-            try:
-                descriptor = os.open(path, os.O_CREAT | os.O_RDWR)
-                os.close(descriptor)
-                if os.name == "posix":
-                    try:
-                        os.chmod(path, 0o600)
-                    except OSError:
-                        pass
-                return cls(path)
-            except OSError:
-                # A read-only or transiently unavailable config directory
-                # should not prevent startup; the per-controller temp lease
-                # still serializes all generations owned by this process.
-                pass
-        descriptor, path = tempfile.mkstemp(prefix=".seedsync-remote-scan-", suffix=".lock")
-        os.close(descriptor)
-        if os.name == "posix":
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-        return cls(path)
+    def create(cls) -> "RemoteScanLease":
+        """Create a lease in the runtime-local temporary directory.
+
+        The lease is process-owned state and must not touch the persistent
+        configuration directory, which may be backed by an uninterruptible
+        filesystem such as FUSE.
+        """
+        path = os.path.join(tempfile.gettempdir(), ".seedsync-remote-scan.lock")
+        descriptor = _open_remote_scan_lease(path)
+        try:
+            return cls(path)
+        finally:
+            os.close(descriptor)
 
     def hold(self) -> _RemoteScanLeaseHandle:
         return _RemoteScanLeaseHandle(self.path)
