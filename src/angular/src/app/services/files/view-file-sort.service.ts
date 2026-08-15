@@ -27,9 +27,8 @@ const LegacyStatusComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): n
 /**
  * Comparator used to sort the ViewFiles
  * First, sorts by smart status buckets.
- * Second, sorts inactive/completed files by newest download start.
- * Third, preserves the existing remote-age order for active/actionable ties.
- * Finally, sorts by canonical name and identity.
+ * Second, sorts rows within each bucket by newest download start.
+ * Finally, sorts by name, keeping rows without a timestamp last.
  * @param {ViewFile} a
  * @param {ViewFile} b
  * @returns {number}
@@ -40,19 +39,12 @@ const SmartStatusComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): nu
     if (statusComparison !== 0) {
         return statusComparison;
     }
-    if (isSmartStatusInactive(a) && isSmartStatusInactive(b)) {
-        const downloadedComparison = compareNullableNumbersDescending(
-            getDownloadedTimestampValue(a),
-            getDownloadedTimestampValue(b),
-        );
-        if (downloadedComparison !== 0) {
-            return downloadedComparison;
-        }
-        return compareByNameThenFileId(a, b);
-    }
-    const timestampComparison = compareRemoteTimestamp(a, b);
-    if (timestampComparison !== 0) {
-        return timestampComparison;
+    const downloadedComparison = compareNullableNumbersDescending(
+        getDownloadedTimestampValue(a),
+        getDownloadedTimestampValue(b),
+    );
+    if (downloadedComparison !== 0) {
+        return downloadedComparison;
     }
     return compareByName(a, b);
 };
@@ -230,15 +222,6 @@ const compareByNameThenFileId = (a: ViewFile, b: ViewFile): number => {
     return String(a.fileId || "").localeCompare(String(b.fileId || ""));
 };
 
-const compareRemoteTimestamp = (a: ViewFile, b: ViewFile): number => {
-    const aTime = getRemoteCreatedTimestampValue(a);
-    const bTime = getRemoteCreatedTimestampValue(b);
-    if (aTime === bTime) {
-        return 0;
-    }
-    return aTime - bTime;
-};
-
 const compareNullableNumbers = (a: number | null, b: number | null): number => {
     const aNumber = normalizeSortNumber(a);
     const bNumber = normalizeSortNumber(b);
@@ -288,17 +271,6 @@ const getEffectiveSize = (file: ViewFile): number | null => {
     return null;
 };
 
-const getRemoteCreatedTimestampValue = (file: ViewFile): number => {
-    if (file.remoteCreatedTimestamp == null || typeof file.remoteCreatedTimestamp.getTime !== "function") {
-        return 0;
-    }
-    const time = file.remoteCreatedTimestamp.getTime();
-    if (typeof time !== "number" || !isFinite(time)) {
-        return 0;
-    }
-    return time;
-};
-
 const getDownloadedTimestampValue = (file: ViewFile): number | null => {
     if (file.downloadedTimestamp == null || typeof file.downloadedTimestamp.getTime !== "function") {
         return null;
@@ -308,21 +280,6 @@ const getDownloadedTimestampValue = (file: ViewFile): number | null => {
         return null;
     }
     return time;
-};
-
-const isSmartStatusInactive = (file: ViewFile): boolean => {
-    switch (file.visibleStatus) {
-        case ViewFile.Status.DEFAULT:
-        case ViewFile.Status.LOCAL_ONLY:
-        case ViewFile.Status.DELETED:
-        case ViewFile.Status.EXTRACTED:
-        case ViewFile.Status.VALIDATED:
-        case ViewFile.Status.DOWNLOADED:
-        case ViewFile.Status.MOVE_SUCCEEDED:
-            return true;
-        default:
-            return false;
-    }
 };
 
 const compareStatusLegacy = (a: ViewFile, b: ViewFile): number => {
@@ -361,20 +318,20 @@ const compareStatusImproved = (a: ViewFile, b: ViewFile): number => {
     const bStatus = b.visibleStatus;
     if (aStatus !== bStatus) {
         const statusPriorities = {
-            [ViewFile.Status.MOVE_FAILED]: -1,
-            [ViewFile.Status.MOVE_SUCCEEDED]: 7,
-            [ViewFile.Status.CORRUPT]: 0,
-            [ViewFile.Status.EXTRACTING]: 1,
-            [ViewFile.Status.VALIDATING]: 2,
-            [ViewFile.Status.DOWNLOADING]: 3,
-            [ViewFile.Status.QUEUED]: 4,
-            [ViewFile.Status.STOPPED]: 5,
-            [ViewFile.Status.DEFAULT]: 7,
-            [ViewFile.Status.LOCAL_ONLY]: 7,
-            [ViewFile.Status.DELETED]: 7,
-            [ViewFile.Status.EXTRACTED]: 7,
-            [ViewFile.Status.VALIDATED]: 7,
-            [ViewFile.Status.DOWNLOADED]: 7
+            [ViewFile.Status.MOVE_FAILED]: 1,
+            [ViewFile.Status.CORRUPT]: 2,
+            [ViewFile.Status.EXTRACTING]: 3,
+            [ViewFile.Status.VALIDATING]: 4,
+            [ViewFile.Status.DOWNLOADING]: 5,
+            [ViewFile.Status.QUEUED]: 6,
+            [ViewFile.Status.STOPPED]: 7,
+            [ViewFile.Status.MOVE_SUCCEEDED]: 8,
+            [ViewFile.Status.EXTRACTED]: 8,
+            [ViewFile.Status.VALIDATED]: 8,
+            [ViewFile.Status.DOWNLOADED]: 8,
+            [ViewFile.Status.DEFAULT]: 9,
+            [ViewFile.Status.LOCAL_ONLY]: 10,
+            [ViewFile.Status.DELETED]: 11
         };
         if (statusPriorities[aStatus] !== statusPriorities[bStatus]) {
             return statusPriorities[aStatus] - statusPriorities[bStatus];

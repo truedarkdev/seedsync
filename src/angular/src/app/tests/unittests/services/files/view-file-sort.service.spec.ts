@@ -186,11 +186,11 @@ describe("Testing view file sort service", () => {
             new ViewFile({status: ViewFile.Status.STOPPED}),
             new ViewFile({status: ViewFile.Status.DELETED})
         )).toBeLessThan(0);
-        // All inactive availability/completion statuses should be intermixed.
+        // Default and Deleted remain distinct Smart Status groups.
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.DEFAULT, name: ""}),
             new ViewFile({status: ViewFile.Status.DELETED, name: ""})
-        )).toBe(0);
+        )).toBeLessThan(0);
 
         // Sort by the status users see: persisted completion lineage must not
         // make a visibly Local Only row tie with genuine Downloaded rows.
@@ -203,7 +203,7 @@ describe("Testing view file sort service", () => {
             new ViewFile({status: ViewFile.Status.DOWNLOADED, isLocalOnly: true, name: "beta"})
         )).toBeLessThan(0);
 
-        // Inactive/completed entries should be ordered by newest genuine download across statuses.
+        // Finished download states share a group and are ordered by download recency.
         expect(sortComparator(
             new ViewFile({
                 status: ViewFile.Status.EXTRACTED,
@@ -228,7 +228,7 @@ describe("Testing view file sort service", () => {
                 name: "gamma",
                 downloadedTimestamp: new Date(2000)
             })
-        )).toBeLessThan(0);
+        )).toBeGreaterThan(0);
 
         // Active/actionable buckets keep their existing priority.
         expect(sortComparator(
@@ -236,7 +236,7 @@ describe("Testing view file sort service", () => {
             new ViewFile({status: ViewFile.Status.STOPPED})
         )).toBeGreaterThan(0);
 
-        // Unknown inactive recency is last, and canonical name/identity breaks ties.
+        // Finished rows precede the available/default group.
         expect(sortComparator(
             new ViewFile({
                 status: ViewFile.Status.MOVE_SUCCEEDED,
@@ -562,7 +562,7 @@ describe("Testing view file sort service", () => {
         expect(sortComparator(unknown, oldest)).toBeGreaterThan(0);
     }));
 
-    it("puts move failed first and orders inactive statuses by download recency", fakeAsync(() => {
+    it("puts move failed first and orders Smart Status groups", fakeAsync(() => {
         viewFileOptionsService._options.next(new ViewFileOptions({
             sortMethod: ViewFileOptions.SortMethod.SMART_STATUS
         }));
@@ -582,8 +582,138 @@ describe("Testing view file sort service", () => {
 
         expect(sortComparator(failed, corrupt)).toBeLessThan(0);
         expect(sortComparator(corrupt, visiblyLocal)).toBeLessThan(0);
-        expect(sortComparator(visiblyLocal, moved)).toBeLessThan(0);
+        expect(sortComparator(visiblyLocal, moved)).toBeGreaterThan(0);
         expect(sortComparator(downloadedB, downloadedA)).toBeLessThan(0);
         expect(sortComparator(moved, downloadedB)).toBeLessThan(0);
+    }));
+
+    it("sorts Smart Status into the approved groups and keeps Downloaded Newest global", fakeAsync(() => {
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS
+        }));
+        tick();
+
+        const files = [
+            new ViewFile({name: "deleted", status: ViewFile.Status.DELETED, downloadedTimestamp: new Date(8000)}),
+            new ViewFile({name: "local-only", status: ViewFile.Status.DEFAULT, isLocalOnly: true, downloadedTimestamp: new Date(9000)}),
+            new ViewFile({name: "default", status: ViewFile.Status.DEFAULT, downloadedTimestamp: new Date(0)}),
+            new ViewFile({name: "moved-missing-b", status: ViewFile.Status.MOVE_SUCCEEDED}),
+            new ViewFile({name: "downloaded-new", status: ViewFile.Status.DOWNLOADED, downloadedTimestamp: new Date(3000)}),
+            new ViewFile({name: "validated-equal-z", status: ViewFile.Status.VALIDATED, downloadedTimestamp: new Date(2000)}),
+            new ViewFile({name: "extracted-equal-a", status: ViewFile.Status.EXTRACTED, downloadedTimestamp: new Date(2000)}),
+            new ViewFile({name: "move-failed", status: ViewFile.Status.MOVE_FAILED, downloadedTimestamp: new Date(1000)}),
+            new ViewFile({name: "corrupt", status: ViewFile.Status.CORRUPT, downloadedTimestamp: new Date(1000)}),
+            new ViewFile({name: "extracting", status: ViewFile.Status.EXTRACTING, downloadedTimestamp: new Date(1000)}),
+            new ViewFile({name: "validating", status: ViewFile.Status.VALIDATING, downloadedTimestamp: new Date(1000)}),
+            new ViewFile({name: "downloading", status: ViewFile.Status.DOWNLOADING, downloadedTimestamp: new Date(1000)}),
+            new ViewFile({name: "queued", status: ViewFile.Status.QUEUED, downloadedTimestamp: new Date(1000)}),
+            new ViewFile({name: "stopped", status: ViewFile.Status.STOPPED, downloadedTimestamp: new Date(1000)}),
+            new ViewFile({name: "downloaded-missing-a", status: ViewFile.Status.DOWNLOADED}),
+            new ViewFile({name: "moved-missing-a", status: ViewFile.Status.MOVE_SUCCEEDED}),
+        ];
+
+        expect(files.sort(sortComparator).map(file => file.name)).toEqual([
+            "move-failed",
+            "corrupt",
+            "extracting",
+            "validating",
+            "downloading",
+            "queued",
+            "stopped",
+            "downloaded-new",
+            "extracted-equal-a",
+            "validated-equal-z",
+            "downloaded-missing-a",
+            "moved-missing-a",
+            "moved-missing-b",
+            "default",
+            "local-only",
+            "deleted",
+        ]);
+        expect(sortComparator(
+            new ViewFile({
+                name: "same-name",
+                fileId: '["b","same-name"]',
+                status: ViewFile.Status.EXTRACTED,
+                downloadedTimestamp: new Date(2000)
+            }),
+            new ViewFile({
+                name: "same-name",
+                fileId: '["a","same-name"]',
+                status: ViewFile.Status.VALIDATED,
+                downloadedTimestamp: new Date(2000)
+            })
+        )).toBe(0);
+
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.DOWNLOADED_NEWEST
+        }));
+        tick();
+        expect(sortComparator(
+            new ViewFile({name: "new-default", status: ViewFile.Status.DEFAULT, downloadedTimestamp: new Date(9000)}),
+            new ViewFile({name: "old-failed", status: ViewFile.Status.MOVE_FAILED, downloadedTimestamp: new Date(1000)})
+        )).toBeLessThan(0);
+    }));
+
+    it("uses valid downloaded timestamps and ignores remote age within a Smart Status group", fakeAsync(() => {
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS
+        }));
+        tick();
+
+        const epoch = new ViewFile({
+            name: "zulu",
+            status: ViewFile.Status.DOWNLOADING,
+            downloadedTimestamp: new Date(0),
+            remoteCreatedTimestamp: new Date(0)
+        });
+        const invalid = new ViewFile({
+            name: "alpha",
+            status: ViewFile.Status.DOWNLOADING,
+            downloadedTimestamp: new Date(Number.NaN),
+            remoteCreatedTimestamp: new Date(9000)
+        });
+        const missing = new ViewFile({
+            name: "bravo",
+            status: ViewFile.Status.DOWNLOADING,
+            downloadedTimestamp: null,
+            remoteCreatedTimestamp: new Date(0)
+        });
+        const negative = new ViewFile({
+            name: "charlie",
+            status: ViewFile.Status.DOWNLOADING,
+            downloadedTimestamp: new Date(-1),
+            remoteCreatedTimestamp: new Date(9000)
+        });
+
+        expect(sortComparator(epoch, invalid)).toBeLessThan(0);
+        expect(sortComparator(invalid, missing)).toBeLessThan(0);
+        expect(sortComparator(missing, negative)).toBeLessThan(0);
+
+        const equalDownloadedRemoteNewer = new ViewFile({
+            name: "alpha",
+            status: ViewFile.Status.DOWNLOADING,
+            downloadedTimestamp: new Date(1000),
+            remoteCreatedTimestamp: new Date(9000)
+        });
+        const equalDownloadedRemoteOlder = new ViewFile({
+            name: "zulu",
+            status: ViewFile.Status.DOWNLOADING,
+            downloadedTimestamp: new Date(1000),
+            remoteCreatedTimestamp: new Date(0)
+        });
+        expect(sortComparator(equalDownloadedRemoteNewer, equalDownloadedRemoteOlder)).toBeLessThan(0);
+
+        const missingDownloadedRemoteNewer = new ViewFile({
+            name: "alpha",
+            status: ViewFile.Status.DOWNLOADING,
+            remoteCreatedTimestamp: new Date(9000)
+        });
+        const missingDownloadedRemoteOlder = new ViewFile({
+            name: "zulu",
+            status: ViewFile.Status.DOWNLOADING,
+            remoteCreatedTimestamp: new Date(0)
+        });
+        expect(sortComparator(missingDownloadedRemoteNewer, missingDownloadedRemoteOlder)).toBeLessThan(0);
     }));
 });
