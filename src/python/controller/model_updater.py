@@ -3151,6 +3151,7 @@ class ModelUpdater(_ControllerCoreAccess):
                             next_tree_count += sum(tree_file_count(file) for file in selected_roots)
                             authoritative_pair_candidate = Model.compose_candidate(
                                 model, previous_root_ids, selected_roots, max(0, next_tree_count),
+                                pair_build.model.downloaded_timestamp_overlay_generation,
                             )
                             authoritative_pair_build = pair_build
                 except Exception:
@@ -3179,6 +3180,7 @@ class ModelUpdater(_ControllerCoreAccess):
         # completion, extraction, validation, or ambiguous status condition
         # returns no ids here and retains the ordinary full-build path.
         active_transfer_delta_applied = False
+        active_transfer_delta_rejected = False
         active_delta_selector = getattr(model_builder, "active_transfer_delta_file_ids", None)
         active_delta_pending = getattr(model_builder, "has_pending_active_transfer_delta", None)
         active_delta_builder = getattr(model_builder, "build_active_transfer_roots", None)
@@ -3227,11 +3229,16 @@ class ModelUpdater(_ControllerCoreAccess):
                 try:
                     authorized = partial_build is not None and partial_model is not None and \
                         bool(active_delta_authorizer(
-                            root_exists, active_delta_file_ids, partial_build,
+                            root_exists, active_delta_file_ids, partial_build, model,
                         ))
                 except Exception:
                     authorized = False
                 if not authorized:
+                    # A progressive partial may be eligible only because it
+                    # carries active status. If its timestamp overlay differs
+                    # from the live model, it cannot publish selected roots
+                    # and must not suppress the established full-build path.
+                    active_transfer_delta_rejected = True
                     partial_model = None
                 if partial_model is None:
                     replacement_roots = []
@@ -3275,7 +3282,7 @@ class ModelUpdater(_ControllerCoreAccess):
 
         candidate_lifecycle_triggered = authoritative_pair_candidate is not None
         full_build_triggered = candidate_lifecycle_triggered or (
-            model_builder.has_changes() and not progressive_delta_eligible and \
+            model_builder.has_changes() and (not progressive_delta_eligible or active_transfer_delta_rejected) and \
             not authoritative_pair_delta_applied
         )
         if not full_build_triggered and self._completion_gate_trace_enabled():

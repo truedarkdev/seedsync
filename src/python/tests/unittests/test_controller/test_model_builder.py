@@ -130,6 +130,40 @@ class TestModelBuilder(unittest.TestCase):
             retained_model.get_file_ids(),
         )
 
+    def test_scoped_candidate_refreshes_all_downloaded_timestamp_overlay_roots(self):
+        """Persisted timestamp sync cannot retain a root rendered before the sync."""
+        first = SystemFile("first.bin", 10, False)
+        first.path_pair_id = "pair-a"
+        second = SystemFile("second.bin", 20, False)
+        second.path_pair_id = "pair-b"
+        first_id = ModelFile.build_file_id("first.bin", "pair-a")
+        second_id = ModelFile.build_file_id("second.bin", "pair-b")
+        self.model_builder.set_remote_files([first, second])
+        self.model_builder.set_downloaded_files({first_id, second_id})
+        live_model = self.model_builder.build_model()
+        self.assertIsNone(live_model.get_file(first_id).downloaded_timestamp)
+        self.assertIsNone(live_model.get_file(second_id).downloaded_timestamp)
+
+        # Startup learns exact persisted timestamps only after the baseline
+        # roots exist. The bounded renderer selects pair A, as an active
+        # transfer/lifecycle tick can do, but pair B must not retain its old
+        # timestamp overlay.
+        self.model_builder.set_downloaded_timestamps({first_id: 1760000010.0, second_id: 1760000020.0})
+        partial = self.model_builder.build_active_transfer_roots({first_id})
+        with self.assertRaises(ModelError):
+            Model.compose_candidate(
+                live_model, {first_id}, partial.model.iter_files(), live_model.tree_file_count,
+                partial.model.downloaded_timestamp_overlay_generation,
+            )
+
+        # The existing full-build fallback renders every persisted overlay
+        # member, preserving the inactive pair without adding a cross-pair
+        # delta mechanism.
+        rebuilt_model = self.model_builder.build_model()
+        self.assertEqual(1760000010.0, rebuilt_model.get_file(first_id).downloaded_timestamp.timestamp())
+        self.assertEqual(1760000020.0, rebuilt_model.get_file(second_id).downloaded_timestamp.timestamp())
+        self.assertIs(rebuilt_model, self.model_builder.build_model())
+
     def test_authoritative_pair_build_replaces_only_completed_pair_and_adopts_after_publication(self):
         first = SystemFile("old.bin", 10, False)
         first.path_pair_id = "pair-a"
@@ -476,6 +510,39 @@ class TestModelBuilder(unittest.TestCase):
         )
         partial = self.model_builder.build_active_transfer_roots({"active.bin"})
         self.assertEqual({"active.bin"}, partial.model.get_file_ids())
+
+    def test_active_transfer_delta_rejects_stale_timestamp_overlay_but_keeps_same_overlay_fast(self):
+        self.model_builder.set_remote_files([SystemFile("active.bin", 100, False)])
+        self.model_builder.set_downloaded_files({"active.bin"})
+        self.model_builder.set_downloaded_timestamps({"active.bin": 1760000010.0})
+        live_model = self.model_builder.build_model()
+
+        # Reapplying the same persisted map does not advance the overlay, so
+        # ordinary active-status repainting remains bounded to its one root.
+        self.model_builder.set_downloaded_timestamps({"active.bin": 1760000010.0})
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        self.model_builder.set_lftp_statuses([status])
+        root_ids = self.model_builder.active_transfer_delta_file_ids(live_model.get_file_ids())
+        self.assertEqual({"active.bin"}, root_ids)
+        assert root_ids is not None
+        partial = self.model_builder.build_active_transfer_roots(root_ids)
+        self.assertTrue(self.model_builder.authorize_active_transfer_delta(
+            live_model.get_file_ids(), root_ids, partial, live_model,
+        ))
+
+        # A fresh timestamp changes the overlay, so retaining any old live
+        # root would be unsafe and the caller must use the full-build path.
+        self.model_builder.set_downloaded_timestamps({"active.bin": 1760000020.0})
+        root_ids = self.model_builder.active_transfer_delta_file_ids(live_model.get_file_ids())
+        self.assertEqual({"active.bin"}, root_ids)
+        assert root_ids is not None
+        partial = self.model_builder.build_active_transfer_roots(root_ids)
+        self.assertFalse(self.model_builder.authorize_active_transfer_delta(
+            live_model.get_file_ids(), root_ids, partial, live_model,
+        ))
 
     def test_confirmed_local_delete_evicts_transfer_snapshots_as_exact_root_delta(self):
         remote = SystemFile("active.bin", 100, False)
@@ -5912,6 +5979,18 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.clear()
 
         self.assertEqual({"a", "b"}, downloaded_files)
+
+    def test_clear_advances_downloaded_timestamp_overlay_generation(self):
+        self.model_builder.set_downloaded_timestamps({"a": 1760000010.0})
+        before_clear = self.model_builder.build_model()
+
+        self.model_builder.clear()
+        after_clear = self.model_builder.build_model()
+
+        self.assertEqual(
+            before_clear.downloaded_timestamp_overlay_generation + 1,
+            after_clear.downloaded_timestamp_overlay_generation,
+        )
 
     def test_rebuild_on_in_place_downloaded_file_mutation_after_reset(self):
         downloaded_files = {"a", "b"}

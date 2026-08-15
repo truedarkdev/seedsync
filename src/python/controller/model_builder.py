@@ -102,6 +102,7 @@ class _AuthoritativePairBuild:
     retained_stopped_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot]
     complete_local_coverage_file_ids: set[str]
     invalidation_tokens: frozenset[int]
+    downloaded_timestamp_overlay_generation: int
 
 
 @dataclass(frozen=True)
@@ -155,6 +156,9 @@ class ModelBuilder:
         self.__retained_stopped_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot] = {}
         self.__downloaded_files: Optional[set[str]] = None
         self.__downloaded_timestamps: dict[str, float] = {}
+        # One builder-owned revision identifies all roots rendered from the
+        # current persisted timestamp overlay.
+        self.__downloaded_timestamp_overlay_generation = 0
         self.__extract_statuses: dict[str, ExtractStatus] = {}
         self.__extracted_files: set[str] = set()
         self.__stopped_files: set[str] = set()
@@ -2388,6 +2392,7 @@ class ModelBuilder:
         }
         partial.__downloaded_files = None if self.__downloaded_files is None else set(self.__downloaded_files)
         partial.__downloaded_timestamps = dict(self.__downloaded_timestamps)
+        partial.__downloaded_timestamp_overlay_generation = self.__downloaded_timestamp_overlay_generation
         partial.__extract_statuses = {
             file_id: status for file_id, status in self.__extract_statuses.items()
             if getattr(status, "path_pair_id", None) in selected_pair_ids
@@ -2546,6 +2551,7 @@ class ModelBuilder:
         }
         partial.__downloaded_files = None if self.__downloaded_files is None else set(self.__downloaded_files)
         partial.__downloaded_timestamps = dict(self.__downloaded_timestamps)
+        partial.__downloaded_timestamp_overlay_generation = self.__downloaded_timestamp_overlay_generation
         partial.__extract_statuses = dict(self.__extract_statuses)
         partial.__extracted_files = set(self.__extracted_files)
         partial.__stopped_files = set(self.__stopped_files)
@@ -2572,6 +2578,7 @@ class ModelBuilder:
                 if partial.has_complete_local_coverage(file_id)
             },
             frozenset(self.__pending_invalidation_tokens),
+            self.__downloaded_timestamp_overlay_generation,
         )
 
     def authorize_authoritative_pair_delta(
@@ -2688,6 +2695,7 @@ class ModelBuilder:
             {},
             set(),
             frozenset(),
+            self.__downloaded_timestamp_overlay_generation,
         ))
         self.record_local_inventory_completion({path_pair_id})
         self.__unknown_local_path_pair_ids = set(unknown_local_path_pair_ids)
@@ -2927,6 +2935,7 @@ class ModelBuilder:
         }
         partial.__downloaded_files = None if self.__downloaded_files is None else set(self.__downloaded_files)
         partial.__downloaded_timestamps = dict(self.__downloaded_timestamps)
+        partial.__downloaded_timestamp_overlay_generation = self.__downloaded_timestamp_overlay_generation
         partial.__extract_statuses = dict(self.__extract_statuses)
         partial.__extracted_files = set(self.__extracted_files)
         partial.__stopped_files = set(self.__stopped_files)
@@ -3083,6 +3092,7 @@ class ModelBuilder:
         previous = self.__downloaded_timestamps
         self.__downloaded_timestamps = dict(downloaded_timestamps)
         if self.__downloaded_timestamps != previous:
+            self.__downloaded_timestamp_overlay_generation += 1
             changed_file_ids = {
                 file_id for file_id in set(previous).union(self.__downloaded_timestamps)
                 if previous.get(file_id) != self.__downloaded_timestamps.get(file_id)
@@ -3162,6 +3172,8 @@ class ModelBuilder:
         self.__recent_live_transfer_snapshots.clear()
         self.__retained_stopped_transfer_snapshots.clear()
         self.__downloaded_files = None
+        if self.__downloaded_timestamps:
+            self.__downloaded_timestamp_overlay_generation += 1
         self.__downloaded_timestamps.clear()
         self.__extract_statuses.clear()
         self.__extracted_files.clear()
@@ -3227,11 +3239,14 @@ class ModelBuilder:
 
     def authorize_active_transfer_delta(
             self, known_root_file_ids: Set[str] | Callable[[str], bool], root_file_ids: Set[str],
-            partial_build: _ActiveTransferRootBuild,
+            partial_build: _ActiveTransferRootBuild, live_model: Optional[Model] = None,
     ) -> bool:
         """Validate a staged delta before it can mutate the live Model."""
         return self.active_transfer_delta_file_ids(known_root_file_ids) == set(root_file_ids) and \
-            partial_build.model.get_file_ids() == set(root_file_ids)
+            partial_build.model.get_file_ids() == set(root_file_ids) and \
+            (live_model is None or
+             partial_build.model.downloaded_timestamp_overlay_generation ==
+             live_model.downloaded_timestamp_overlay_generation)
 
     def adopt_active_transfer_delta(
             self, applied_model: Model, root_file_ids: Set[str],
@@ -3269,6 +3284,9 @@ class ModelBuilder:
 
         model = Model()
         model.logger = self.__build_dummy_model_logger()  # ignore the logs for this temp model
+        model.set_downloaded_timestamp_overlay_generation(
+            self.__downloaded_timestamp_overlay_generation
+        )
         live_transferred_file_ids: set[str] = set()
         effective_local_files = self.__build_effective_local_files()
         self.__cached_unresolved_staging_collision_file_ids = {

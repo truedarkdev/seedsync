@@ -3253,6 +3253,54 @@ class TestModelUpdater(unittest.TestCase):
         self.assertFalse(builder.has_changes())
         builder.build_model.assert_not_called()
 
+    def test_progressive_active_timestamp_overlay_rejection_forces_one_full_build(self):
+        builder = ModelBuilder()
+        first = SystemFile("first.bin", 100, False)
+        first.path_pair_id = "pair-a"
+        second = SystemFile("second.bin", 200, False)
+        second.path_pair_id = "pair-b"
+        first_id = ModelFile.build_file_id("first.bin", "pair-a")
+        second_id = ModelFile.build_file_id("second.bin", "pair-b")
+        builder.set_remote_files([first, second])
+        builder.set_downloaded_files({first_id, second_id})
+        live_model = builder.build_model()
+
+        # Simulate startup timestamp synchronization after the progressive
+        # baseline is visible, while active LFTP status keeps the progressive
+        # active-only eligibility branch open.
+        builder.set_downloaded_timestamps({first_id: 1760000010.0, second_id: 1760000020.0})
+        progressive_first = SystemFile("first.bin", 100, False)
+        progressive_first.path_pair_id = "pair-a"
+        progressive = ScannerResult(
+            datetime.now(), [progressive_first], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, is_scan_final=False,
+        )
+        controller, _ = self._make_progressive_update_controller(
+            progressive, local_scan=progressive, authoritative=True,
+            model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {
+            "pair-a": MagicMock(), "pair-b": MagicMock(),
+        }
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "first.bin", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        controller._Controller__lftp.status.return_value = [status]
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+
+        updater = ModelUpdater(controller)
+        updater.update()
+
+        builder.build_model.assert_called_once_with()
+        self.assertEqual(1760000010.0, live_model.get_file(first_id).downloaded_timestamp.timestamp())
+        self.assertEqual(1760000020.0, live_model.get_file(second_id).downloaded_timestamp.timestamp())
+
+        updater.update()
+        builder.build_model.assert_called_once_with()
+
     def test_active_scan_and_fresh_lftp_progress_share_bounded_root_delta(self):
         builder = ModelBuilder()
         builder.set_remote_files([SystemFile("root", 100, False)])
@@ -3430,6 +3478,26 @@ class TestModelUpdater(unittest.TestCase):
                 call.set_stopped_files(stopped_file_names),
             ],
             model_builder.mock_calls,
+        )
+
+    def test_sync_persist_to_all_builders_keeps_two_pair_timestamp_overlay_after_startup(self):
+        first_id = ModelFile.build_file_id("first.bin", "pair-a")
+        second_id = ModelFile.build_file_id("second.bin", "pair-b")
+        controller, model_builder = self._make_controller(
+            downloaded_file_names={first_id, second_id},
+            extracted_file_names=set(),
+            stopped_file_names=set(),
+            path_pairs_by_id={"pair-a": SimpleNamespace(), "pair-b": SimpleNamespace()},
+        )
+        controller._Controller__persist.downloaded_timestamps = {
+            first_id: 1760000010.0,
+            second_id: 1760000020.0,
+        }
+
+        ModelUpdater(controller).sync_persist_to_all_builders()
+
+        model_builder.set_downloaded_timestamps.assert_called_once_with(
+            controller._Controller__persist.downloaded_timestamps,
         )
 
     def test_sync_persist_to_all_builders_drops_preboundary_separator_keys(self):

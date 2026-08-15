@@ -68,6 +68,9 @@ class Model:
         self.__version = 0
         self.__scope_versions: Dict[Optional[str], int] = {}
         self.__tree_file_count = 0
+        # Scoped publication may reuse roots only if their render overlay
+        # matches the replacement roots' persisted timestamp snapshot.
+        self.__downloaded_timestamp_overlay_generation = 0
 
     @property
     def version(self) -> int:
@@ -81,6 +84,13 @@ class Model:
     @property
     def tree_file_count(self) -> int:
         return self.__tree_file_count
+
+    @property
+    def downloaded_timestamp_overlay_generation(self) -> int:
+        return self.__downloaded_timestamp_overlay_generation
+
+    def set_downloaded_timestamp_overlay_generation(self, value: int) -> None:
+        self.__downloaded_timestamp_overlay_generation = value if type(value) is int and value >= 0 else 0
 
     def set_tree_file_count(self, value: int) -> None:
         self.__tree_file_count = value if type(value) is int and value >= 0 else 0
@@ -106,7 +116,7 @@ class Model:
     @classmethod
     def compose_candidate(
             cls, live_model: "Model", removed_file_ids: Set[str], replacement_files: Iterable[ModelFile],
-            tree_file_count: int,
+            tree_file_count: int, downloaded_timestamp_overlay_generation: Optional[int] = None,
     ) -> "Model":
         """Build an unobserved candidate reusing untouched live root objects.
 
@@ -115,8 +125,15 @@ class Model:
         live model's listeners and versions until the normal diff/lifecycle
         path decides which selected roots to publish.
         """
+        if downloaded_timestamp_overlay_generation is not None and \
+                live_model.downloaded_timestamp_overlay_generation != downloaded_timestamp_overlay_generation:
+            raise ModelError("Cannot reuse roots rendered with a stale downloaded timestamp overlay")
         candidate = cls()
         candidate.logger = live_model.logger
+        candidate.set_downloaded_timestamp_overlay_generation(
+            live_model.downloaded_timestamp_overlay_generation
+            if downloaded_timestamp_overlay_generation is None else downloaded_timestamp_overlay_generation
+        )
         for file in live_model.iter_files():
             if file.file_id not in removed_file_ids:
                 candidate.__insert_candidate_file(file)
