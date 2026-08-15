@@ -151,8 +151,8 @@ describe("Testing view file sort service", () => {
 
         // Check the order based on smart status buckets
         expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.EXTRACTING}),
-            new ViewFile({status: ViewFile.Status.DOWNLOADING})
+            new ViewFile({status: ViewFile.Status.DOWNLOADING}),
+            new ViewFile({status: ViewFile.Status.EXTRACTING})
         )).toBeLessThan(0);
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.DOWNLOADING}),
@@ -163,16 +163,16 @@ describe("Testing view file sort service", () => {
             new ViewFile({status: ViewFile.Status.EXTRACTED})
         )).toBeLessThan(0);
         expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.CORRUPT}),
-            new ViewFile({status: ViewFile.Status.EXTRACTING})
+            new ViewFile({status: ViewFile.Status.EXTRACTING}),
+            new ViewFile({status: ViewFile.Status.CORRUPT})
         )).toBeLessThan(0);
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.EXTRACTING}),
             new ViewFile({status: ViewFile.Status.VALIDATING})
         )).toBeLessThan(0);
         expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.VALIDATING}),
-            new ViewFile({status: ViewFile.Status.DOWNLOADING})
+            new ViewFile({status: ViewFile.Status.DOWNLOADING}),
+            new ViewFile({status: ViewFile.Status.VALIDATING})
         )).toBeLessThan(0);
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.STOPPED}),
@@ -228,15 +228,15 @@ describe("Testing view file sort service", () => {
                 name: "gamma",
                 downloadedTimestamp: new Date(2000)
             })
-        )).toBeGreaterThan(0);
+        )).toBeLessThan(0);
 
-        // Active/actionable buckets keep their existing priority.
+        // Attention states follow active downloads in Smart Status.
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.EXTRACTED}),
             new ViewFile({status: ViewFile.Status.STOPPED})
         )).toBeGreaterThan(0);
 
-        // Finished rows precede the available/default group.
+        // Available/default rows precede finished rows.
         expect(sortComparator(
             new ViewFile({
                 status: ViewFile.Status.MOVE_SUCCEEDED,
@@ -247,11 +247,11 @@ describe("Testing view file sort service", () => {
                 status: ViewFile.Status.DEFAULT,
                 name: "unknown"
             })
-        )).toBeLessThan(0);
+        )).toBeGreaterThan(0);
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.DEFAULT, name: "same", fileId: '["b","same"]'}),
             new ViewFile({status: ViewFile.Status.DOWNLOADED, name: "same", fileId: '["a","same"]'})
-        )).toBeGreaterThan(0);
+        )).toBeLessThan(0);
     }));
 
     it("correctly sorts by legacy status", fakeAsync(() => {
@@ -562,7 +562,7 @@ describe("Testing view file sort service", () => {
         expect(sortComparator(unknown, oldest)).toBeGreaterThan(0);
     }));
 
-    it("puts move failed first and orders Smart Status groups", fakeAsync(() => {
+    it("orders Smart Status groups by the approved lifecycle relevance", fakeAsync(() => {
         viewFileOptionsService._options.next(new ViewFileOptions({
             sortMethod: ViewFileOptions.SortMethod.SMART_STATUS
         }));
@@ -580,8 +580,9 @@ describe("Testing view file sort service", () => {
             downloadedTimestamp: new Date(4000)
         });
 
-        expect(sortComparator(failed, corrupt)).toBeLessThan(0);
-        expect(sortComparator(corrupt, visiblyLocal)).toBeLessThan(0);
+        expect(sortComparator(downloadedA, corrupt)).toBeGreaterThan(0);
+        expect(sortComparator(corrupt, failed)).toBeGreaterThan(0);
+        expect(sortComparator(failed, visiblyLocal)).toBeLessThan(0);
         expect(sortComparator(visiblyLocal, moved)).toBeGreaterThan(0);
         expect(sortComparator(downloadedB, downloadedA)).toBeLessThan(0);
         expect(sortComparator(moved, downloadedB)).toBeLessThan(0);
@@ -613,20 +614,20 @@ describe("Testing view file sort service", () => {
         ];
 
         expect(files.sort(sortComparator).map(file => file.name)).toEqual([
-            "move-failed",
-            "corrupt",
+            "downloading",
             "extracting",
             "validating",
-            "downloading",
-            "queued",
+            "move-failed",
+            "corrupt",
             "stopped",
+            "queued",
+            "default",
             "downloaded-new",
             "extracted-equal-a",
             "validated-equal-z",
             "downloaded-missing-a",
             "moved-missing-a",
             "moved-missing-b",
-            "default",
             "local-only",
             "deleted",
         ]);

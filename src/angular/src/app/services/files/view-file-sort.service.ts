@@ -290,6 +290,8 @@ const compareStatusLegacy = (a: ViewFile, b: ViewFile): number => {
     const aStatus = a.visibleStatus;
     const bStatus = b.visibleStatus;
     if (aStatus !== bStatus) {
+        // Smart Status is ordered by user relevance: active downloads first,
+        // then attention states, next actions, finished work, and archive.
         const statusPriorities = {
             [ViewFile.Status.MOVE_FAILED]: -1,
             [ViewFile.Status.MOVE_SUCCEEDED]: 7,
@@ -318,18 +320,18 @@ const compareStatusImproved = (a: ViewFile, b: ViewFile): number => {
     const bStatus = b.visibleStatus;
     if (aStatus !== bStatus) {
         const statusPriorities = {
-            [ViewFile.Status.MOVE_FAILED]: 1,
-            [ViewFile.Status.CORRUPT]: 2,
-            [ViewFile.Status.EXTRACTING]: 3,
-            [ViewFile.Status.VALIDATING]: 4,
-            [ViewFile.Status.DOWNLOADING]: 5,
-            [ViewFile.Status.QUEUED]: 6,
-            [ViewFile.Status.STOPPED]: 7,
-            [ViewFile.Status.MOVE_SUCCEEDED]: 8,
-            [ViewFile.Status.EXTRACTED]: 8,
-            [ViewFile.Status.VALIDATED]: 8,
-            [ViewFile.Status.DOWNLOADED]: 8,
-            [ViewFile.Status.DEFAULT]: 9,
+            [ViewFile.Status.DOWNLOADING]: 1,
+            [ViewFile.Status.EXTRACTING]: 2,
+            [ViewFile.Status.VALIDATING]: 3,
+            [ViewFile.Status.MOVE_FAILED]: 4,
+            [ViewFile.Status.CORRUPT]: 5,
+            [ViewFile.Status.STOPPED]: 6,
+            [ViewFile.Status.QUEUED]: 7,
+            [ViewFile.Status.DEFAULT]: 8,
+            [ViewFile.Status.MOVE_SUCCEEDED]: 9,
+            [ViewFile.Status.EXTRACTED]: 9,
+            [ViewFile.Status.VALIDATED]: 9,
+            [ViewFile.Status.DOWNLOADED]: 9,
             [ViewFile.Status.LOCAL_ONLY]: 10,
             [ViewFile.Status.DELETED]: 11
         };
