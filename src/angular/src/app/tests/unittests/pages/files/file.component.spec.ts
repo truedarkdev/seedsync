@@ -306,6 +306,18 @@ describe("Testing file component", () => {
         expect(style.marginBottom).toBe("-12px");
     });
 
+    it("should preserve the final move failure label and icon", () => {
+        fixture.componentInstance.file = createViewFile({status: ViewFile.Status.MOVE_FAILED});
+        fixture.componentInstance.options = of(null) as any;
+        fixture.detectChanges();
+
+        const status = fixture.debugElement.query(By.css(".status"));
+        expect(status.query(By.css("img#move-failed")).attributes["src"])
+            .toBe("assets/icons/move-failed.png");
+        expect(status.query(By.css(".move-failed-text")).nativeElement.textContent.trim())
+            .toBe("Final move failed");
+    });
+
     it("should render only the local icon for a downloaded local-only row", () => {
         fixture.componentInstance.file = createViewFile({
             status: ViewFile.Status.DOWNLOADED,

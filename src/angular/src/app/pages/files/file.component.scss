@@ -462,6 +462,10 @@ $file-layout-desktop-min-width: 900px;
     .content .eta {order: 5;}
     .content .size {order: 6;}
 
+    // Keep the final-move failure label readable in the fixed desktop status
+    // column; the narrower mobile column retains its existing wrapping.
+    .content .status .move-failed-text {white-space: nowrap;}
+
     /* Hide the inner eta, show outer eta */
     .content .eta {display: inline;}
     .content .speed .speed-eta {display: none;}

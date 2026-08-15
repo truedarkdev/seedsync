@@ -499,6 +499,35 @@ class TestAdminHandler(unittest.TestCase):
         self.assertIsNotNone(remembered_session)
         self.assertTrue(remembered_session.remembered)
 
+        list_response = self.test_app.get(
+            "/server/admin/api-keys/v1",
+            extra_environ={
+                **trusted_headers,
+                "HTTP_COOKIE": "seedsync_ui_session={}".format(cookie_secret),
+            },
+        )
+        self.assertEqual(self.admin_key_id, json.loads(list_response.text)["current_key_id"])
+
+    def test_current_key_marker_tracks_direct_key_rotation(self):
+        rotate_response = self.test_app.post(
+            "/server/admin/api-keys/v1/{}/rotate".format(self.admin_key_id),
+            extra_environ=self._auth_headers(self.admin_secret),
+        )
+        rotated_secret = json.loads(rotate_response.text)["secret"]
+
+        stale_response = self.test_app.get(
+            "/server/admin/api-keys/v1",
+            extra_environ=self._auth_headers(self.admin_secret),
+            expect_errors=True,
+        )
+        self.assertEqual(401, stale_response.status_int)
+
+        current_response = self.test_app.get(
+            "/server/admin/api-keys/v1",
+            extra_environ=self._auth_headers(rotated_secret),
+        )
+        self.assertEqual(self.admin_key_id, json.loads(current_response.text)["current_key_id"])
+
     def test_revoke_api_key_clears_remembered_browser_sessions(self):
         trusted_headers = self._same_origin_headers()
 
@@ -522,6 +551,13 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(200, revoke_response.status_int)
         self.assertNotIn(cookie_secret, self.auth_store._ApiKeyStore__ui_sessions)
         self.assertIsNone(self.auth_store.find_ui_session_by_secret(cookie_secret))
+
+        stale_session_response = self.test_app.get(
+            "/server/admin/api-keys/v1",
+            extra_environ=admin_cookie_headers,
+            expect_errors=True,
+        )
+        self.assertEqual(401, stale_session_response.status_int)
 
     def test_bootstrap_proof_exchange_rejects_non_same_origin_requests(self):
         empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys-reject-non-origin.json"))
@@ -736,6 +772,7 @@ class TestAdminHandler(unittest.TestCase):
         )
         visible_keys = json.loads(visible_keys_resp.text)
         self.assertEqual(200, visible_keys_resp.status_int)
+        self.assertEqual(self.admin_key_id, visible_keys["current_key_id"])
         self.assertEqual(1, len(visible_keys["keys"]))
         self.assertEqual("admin", visible_keys["keys"][0]["name"])
 
@@ -745,6 +782,7 @@ class TestAdminHandler(unittest.TestCase):
         )
         all_keys = json.loads(all_keys_resp.text)
         self.assertEqual(200, all_keys_resp.status_int)
+        self.assertEqual(self.admin_key_id, all_keys["current_key_id"])
         self.assertEqual(2, len(all_keys["keys"]))
         self.assertTrue(any(key["name"] == "admin" and key["active"] for key in all_keys["keys"]))
         self.assertTrue(any(key["name"] == "reader-updated" and not key["active"] for key in all_keys["keys"]))

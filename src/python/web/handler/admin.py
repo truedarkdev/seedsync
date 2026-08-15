@@ -1,7 +1,7 @@
 # Copyright 2026, SeedSync Contributors, All rights reserved.
 
 import json
-from typing import TypeGuard
+from typing import Optional, TypeGuard
 
 import bottle
 from bottle import HTTPResponse
@@ -227,7 +227,31 @@ class AdminHandler(IHandler):
 
     def __handle_list_api_keys(self) -> HTTPResponse:
         include_revoked = AdminHandler.__query_flag("include_revoked")
-        return self.__json_response({"keys": self.__auth_store.list_api_keys(include_revoked=include_revoked)})
+        return self.__json_response({
+            "keys": self.__auth_store.list_api_keys(include_revoked=include_revoked),
+            "current_key_id": self.__current_api_key_id(),
+        })
+
+    def __current_api_key_id(self) -> Optional[str]:
+        """Return the public id of the API key authenticating this request."""
+        auth_header = bottle.request.get_header("Authorization", "").strip()
+        if auth_header.startswith("Bearer "):
+            token = auth_header[len("Bearer "):].strip()
+            if token:
+                record = self.__auth_store.find_api_key_by_secret(token)
+                if record is not None and not record.is_revoked:
+                    return record.id
+
+        session_secret = bottle.request.get_cookie(self._UI_SESSION_COOKIE_NAME)
+        if not isinstance(session_secret, str) or not session_secret.strip():
+            return None
+
+        session = self.__auth_store.find_ui_session_by_secret(session_secret.strip())
+        if session is None:
+            return None
+
+        record = self.__auth_store.resolve_ui_session_api_key(session)
+        return record.id if record is not None else None
 
     def __handle_create_api_key(self) -> HTTPResponse:
         try:

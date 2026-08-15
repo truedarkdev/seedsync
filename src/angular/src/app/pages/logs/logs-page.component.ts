@@ -7,7 +7,7 @@ import {CommonModule} from "@angular/common";
 import {Observable, Subject} from "rxjs";
 import {takeUntil} from "rxjs/operators";
 
-import {LogService} from "../../services/logs/log.service";
+import {LogDirection, LogService} from "../../services/logs/log.service";
 import {LogRecord} from "../../services/logs/log-record";
 import {StreamServiceRegistry} from "../../services/base/stream-service.registry";
 import {ConnectedService} from "../../services/utils/connected.service";
@@ -32,6 +32,7 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
 
     public headerHeight: Observable<number>;
     public searchQuery = "";
+    public sortDirection: LogDirection = "desc";
     public levelFilter = "";
     public loggerFilter = "";
     public startFilter = "";
@@ -49,6 +50,19 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
     public showScrollToBottomButton = false;
     public isConnected = false;
     public hasReceivedLogs = false;
+
+    public get isNewestFirst(): boolean {
+        return this.sortDirection === "desc";
+    }
+
+    public get sortDirectionLabel(): string {
+        return this.isNewestFirst ? "Newest first" : "Oldest first";
+    }
+
+    public get sortDirectionAriaLabel(): string {
+        const nextDirection = this.isNewestFirst ? "oldest first" : "newest first";
+        return "Log order: " + this.sortDirectionLabel + ". Click to show " + nextDirection;
+    }
 
     private _logService: LogService;
     private _connectedService: ConnectedService;
@@ -124,12 +138,17 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
         this.updateVisibleRecords(false);
     }
 
+    toggleSortDirection() {
+        this.sortDirection = this.isNewestFirst ? "asc" : "desc";
+        this.updateVisibleRecords(false);
+    }
+
     loadHistoricalLogs() {
         this.historyLoading = true;
         this.historyError = "";
         this._logService.loadHistory({text: this.searchQuery.trim(), level: this.levelFilter,
             logger: this.loggerFilter.trim(), start: this.toEpoch(this.startFilter),
-            end: this.toEpoch(this.endFilter)}).pipe(takeUntil(this._destroy$)).subscribe({
+            end: this.toEpoch(this.endFilter)}, this.sortDirection).pipe(takeUntil(this._destroy$)).subscribe({
             next: () => {
                 this._records = this._logService.getHistorySnapshot();
                 this.hasReceivedLogs = this._records.length > 0;
@@ -181,30 +200,32 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
             return;
         }
 
-        // Only auto-follow when the log view is visible and already at the tail.
-        const scrollToBottom = this._elementRef.nativeElement.offsetParent != null &&
-            this.logTail &&
-            LogsPageComponent.isElementInViewport(this.logTail.nativeElement);
+        // Only auto-follow when the log view is visible and already at the latest end.
+        const newestMarker = this.isNewestFirst ? this.logHead : this.logTail;
+        const scrollToNewest = this._elementRef.nativeElement.offsetParent != null &&
+            newestMarker &&
+            LogsPageComponent.isElementInViewport(newestMarker.nativeElement);
         this.hasReceivedLogs = true;
         this._records = this._records.concat(this._pendingRecords);
         this._pendingRecords = [];
         if (this._records.length > this._logService.maxRetainedRecords) {
             this._records.splice(0, this._records.length - this._logService.maxRetainedRecords);
         }
-        this.updateVisibleRecords(scrollToBottom);
+        this.updateVisibleRecords(scrollToNewest);
     }
 
-    private updateVisibleRecords(scrollToBottom: boolean) {
+    private updateVisibleRecords(scrollToNewest: boolean) {
         const filteredRecords = this.getFilteredRecords();
+        const orderedRecords = this.isNewestFirst ? filteredRecords.slice().reverse() : filteredRecords;
         this.filteredRecordCount = filteredRecords.length;
         this.hiddenRecordCount = Math.max(
             0,
             filteredRecords.length - LogsPageComponent.MAX_VISIBLE_RECORDS
         );
-        this.visibleRecords = filteredRecords.slice(-LogsPageComponent.MAX_VISIBLE_RECORDS);
+        this.visibleRecords = orderedRecords.slice(0, LogsPageComponent.MAX_VISIBLE_RECORDS);
         this._changeDetector.detectChanges();
-        if (scrollToBottom) {
-            this.scrollToBottom();
+        if (scrollToNewest) {
+            this.isNewestFirst ? this.scrollToTop() : this.scrollToBottom();
         }
         this.refreshScrollButtonVisibility();
     }
@@ -221,7 +242,7 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
                 (!this.loggerFilter.trim() || record.loggerName === this.loggerFilter.trim()) &&
                 (!this.startFilter || record.time.getTime() >= new Date(this.startFilter).getTime()) &&
                 (!this.endFilter || record.time.getTime() <= new Date(this.endFilter).getTime());
-        });
+        }).sort((left, right) => left.time.getTime() - right.time.getTime());
     }
 
     private toEpoch(value: string): string {

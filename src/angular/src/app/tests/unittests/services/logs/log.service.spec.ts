@@ -185,10 +185,11 @@ describe("Testing log service", () => {
         expect(request.request.params.get("logger")).toBe("seed.Controller");
         expect(request.request.params.get("start")).toBe("10");
         expect(request.request.params.get("end")).toBe("20");
+        expect(request.request.params.get("direction")).toBe("desc");
         request.flush({
             schema: "seedsync.log-history.v1",
             records: [{id: "stable", epoch: 10, level: "ERROR", logger: "seed", message: "failed", exception: null}],
-            page: {limit: 500, direction: "asc", next_cursor: null, has_more: false},
+            page: {limit: 500, direction: "desc", next_cursor: null, has_more: false},
             evidence: {scanned_bytes: 10, malformed_records_skipped: 0, scan_truncated: false}
         });
         tick();

@@ -7,6 +7,8 @@ import {BaseStreamService} from "../base/base-stream.service";
 import {HistoricalLogResponse, LogRecord} from "./log-record";
 import {LoggerService} from "../utils/logger.service";
 
+export type LogDirection = "asc" | "desc";
+
 
 @Injectable()
 export class LogService extends BaseStreamService {
@@ -36,11 +38,12 @@ export class LogService extends BaseStreamService {
         return LogService.MAX_RETAINED_RECORDS;
     }
 
-    loadHistory(filters: {text?: string; level?: string; logger?: string; start?: string; end?: string} = {}): Observable<LogRecord[]> {
+    loadHistory(filters: {text?: string; level?: string; logger?: string; start?: string; end?: string} = {},
+                direction: LogDirection = "desc"): Observable<LogRecord[]> {
         if (!this._http) {
             return throwError(() => new Error("Historical log client is unavailable"));
         }
-        let params = new HttpParams().set("limit", "500").set("direction", "asc");
+        let params = new HttpParams().set("limit", "500").set("direction", direction);
         Object.keys(filters).forEach(key => {
             if (filters[key]) {
                 params = params.set(key, filters[key]);

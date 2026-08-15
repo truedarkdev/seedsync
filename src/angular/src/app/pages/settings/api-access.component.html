@@ -151,13 +151,17 @@
                     </ng-template>
                 </div>
 
-                <div class="key-item" *ngFor="let key of getVisibleApiKeys(apiKeys)" [class.revoked]="!key.active">
+                <div class="key-item" *ngFor="let key of getVisibleApiKeys(apiKeys)"
+                     [class.revoked]="!key.active"
+                     [class.current]="key.current">
                     <div class="key-body">
                         <div class="key-header">
                             <div class="key-title-stack">
                                 <div class="key-title-row">
                                     <span class="key-name">{{key.name}}</span>
                                     <span class="key-status" [class.revoked]="!key.active">{{key.active ? 'Active' : 'Revoked'}}</span>
+                                    <span class="key-current" *ngIf="key.current"
+                                          aria-label="Currently used to access this page">Currently used</span>
                                     <span class="key-id" [attr.title]="key.id">{{key.id}}</span>
                                 </div>
                             </div>

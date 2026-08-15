@@ -11,6 +11,7 @@ import {LogRecord} from "../../../../services/logs/log-record";
 
 class MockLogService {
     public failHistory = false;
+    public lastHistoryDirection = "desc";
     private _history: LogRecord[] = [];
     private _logs = new Subject<LogRecord>();
 
@@ -26,7 +27,8 @@ class MockLogService {
         return this._history.slice();
     }
 
-    loadHistory(_filters = {}) {
+    loadHistory(_filters = {}, direction = "desc") {
+        this.lastHistoryDirection = direction;
         return this.failHistory ? throwError(() => new Error("history unavailable")) : of(this.getHistorySnapshot());
     }
 
@@ -60,6 +62,15 @@ function createRecord(loggerName: string, message: string, traceback: string = n
         loggerName: loggerName,
         message: message,
         exceptionTraceback: traceback
+    });
+}
+
+function createTimedRecord(loggerName: string, message: string, time: number): LogRecord {
+    return new LogRecord({
+        time: new Date(time),
+        level: LogRecord.Level.INFO,
+        loggerName: loggerName,
+        message: message
     });
 }
 
@@ -103,8 +114,43 @@ describe("Testing logs page component", () => {
 
         const records = fixture.nativeElement.querySelectorAll("p.record");
         expect(records.length).toBe(2);
-        expect(records[0].textContent).toContain("Downloader");
-        expect(records[1].textContent).toContain("Scanner");
+        expect(records[0].textContent).toContain("Scanner");
+        expect(records[1].textContent).toContain("Downloader");
+    });
+
+    it("should default to newest-first and toggle to oldest-first", () => {
+        fixture.destroy();
+        logService.seedHistory([
+            createTimedRecord("Older", "older record", 1000),
+            createTimedRecord("Newer", "newer record", 2000)
+        ]);
+
+        fixture = TestBed.createComponent(LogsPageComponent);
+        component = fixture.componentInstance;
+        fixture.detectChanges();
+
+        let records = fixture.nativeElement.querySelectorAll("p.record");
+        const toggle = fixture.nativeElement.querySelector("#logs-sort-direction");
+        expect(records[0].textContent).toContain("Newer");
+        expect(records[1].textContent).toContain("Older");
+        expect(toggle.textContent).toContain("Newest first");
+        expect(toggle.getAttribute("aria-pressed")).toBe("true");
+
+        component.toggleSortDirection();
+        fixture.detectChanges();
+
+        records = fixture.nativeElement.querySelectorAll("p.record");
+        expect(records[0].textContent).toContain("Older");
+        expect(records[1].textContent).toContain("Newer");
+        expect(toggle.textContent).toContain("Oldest first");
+        expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    });
+
+    it("should request history in the active direction", () => {
+        component.toggleSortDirection();
+        component.loadHistoricalLogs();
+
+        expect(logService.lastHistoryDirection).toBe("asc");
     });
 
     it("should show an accessible history error while keeping live logs usable", fakeAsync(() => {
@@ -207,8 +253,8 @@ describe("Testing logs page component", () => {
 
         const records = fixture.nativeElement.querySelectorAll("p.record");
         expect(records.length).toBe(2);
-        expect(records[0].textContent).toContain("Downloader");
-        expect(records[1].textContent).toContain("Scanner");
+        expect(records[0].textContent).toContain("Scanner");
+        expect(records[1].textContent).toContain("Downloader");
     }));
 
     it("should keep search over retained history while rendering only the latest visible window", () => {
@@ -235,7 +281,7 @@ describe("Testing logs page component", () => {
 
         const filteredRecords = fixture.nativeElement.querySelectorAll("p.record");
         expect(filteredRecords.length).toBe(2);
-        expect(filteredRecords[0].textContent).toContain("History hit");
-        expect(filteredRecords[1].textContent).toContain("Latest hit");
+        expect(filteredRecords[0].textContent).toContain("Latest hit");
+        expect(filteredRecords[1].textContent).toContain("History hit");
     });
 });

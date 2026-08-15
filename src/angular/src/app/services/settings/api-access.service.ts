@@ -16,10 +16,12 @@ export interface ApiKeyRecord {
     updated_at: string;
     revoked_at: string | null;
     active: boolean;
+    current?: boolean;
 }
 
 interface ApiKeyListResponse {
     keys: ApiKeyRecord[];
+    current_key_id?: string | null;
 }
 
 interface ApiKeyActionResponse {
@@ -62,7 +64,13 @@ export class ApiAccessService extends BaseWebService {
         return this._http.get<ApiKeyListResponse>(this.API_KEYS_URL, params ? {params} : undefined).pipe(
             map(response => {
                 if (response && Array.isArray(response.keys)) {
-                    return response.keys;
+                    const currentKeyId = typeof response.current_key_id === "string"
+                        ? response.current_key_id
+                        : null;
+                    return response.keys.map(key => ({
+                        ...key,
+                        current: !!currentKeyId && key.active && key.id === currentKeyId
+                    }));
                 }
                 throw new Error("Failed to load API keys");
             })

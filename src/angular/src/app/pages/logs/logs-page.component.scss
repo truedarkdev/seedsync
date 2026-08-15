@@ -50,7 +50,8 @@
 
         .logger-field { flex-basis: 180px; }
         .time-field { flex-basis: 210px; }
-        .history-search-button { flex: 0 0 auto; white-space: nowrap; }
+        .history-search-button,
+        .sort-direction-button { flex: 0 0 auto; white-space: nowrap; }
     }
 
     .logs-summary {
@@ -156,7 +157,8 @@
         }
 
         .compact-field { flex-basis: calc(50% - 5px); }
-        .history-search-button { width: 100%; }
+        .history-search-button,
+        .sort-direction-button { width: 100%; }
     }
 }
 

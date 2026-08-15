@@ -69,11 +69,45 @@ describe("Testing API access service", () => {
         });
 
         httpMock.expectOne("/server/admin/api-keys/v1").flush({
-            keys: baseApiKeys
+            keys: baseApiKeys,
+            current_key_id: "reader"
         });
 
         expect(latestKeys.length).toBe(1);
         expect(latestKeys[0].name).toBe("Reader");
+        expect(latestKeys[0].current).toBeTrue();
+        httpMock.verify();
+    });
+
+    it("should leave every key unmarked when the server reports no current key", () => {
+        let latestKeys: ApiKeyRecord[] = null;
+
+        apiAccessService.apiKeys.subscribe({
+            next: keys => latestKeys = keys
+        });
+
+        httpMock.expectOne("/server/admin/api-keys/v1").flush({
+            keys: baseApiKeys,
+            current_key_id: null
+        });
+
+        expect(latestKeys[0].current).toBeFalse();
+        httpMock.verify();
+    });
+
+    it("should mark only the active key whose public id matches the server marker", () => {
+        let latestKeys: ApiKeyRecord[] = null;
+
+        apiAccessService.apiKeys.subscribe({
+            next: keys => latestKeys = keys
+        });
+
+        httpMock.expectOne("/server/admin/api-keys/v1").flush({
+            keys: [...baseApiKeys, ...revokedApiKeys],
+            current_key_id: "revoked-reader"
+        });
+
+        expect(latestKeys.every(key => key.current === false)).toBeTrue();
         httpMock.verify();
     });
 

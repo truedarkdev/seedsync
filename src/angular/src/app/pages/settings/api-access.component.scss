@@ -372,6 +372,12 @@
             opacity: 0.78;
         }
 
+        &.current {
+            padding-left: 8px;
+            border-left: 4px solid #0f6f8f;
+            background: #f0fbff;
+        }
+
         &:first-child {
             border-top: none;
         }
@@ -452,6 +458,17 @@
             background: rgba(108, 117, 125, 0.13);
             color: #5a6268;
         }
+    }
+
+    .key-current {
+        flex: 0 0 auto;
+        padding: 1px 7px;
+        border-radius: 999px;
+        background: #d8f3ff;
+        color: #075985;
+        font-size: 70%;
+        font-weight: 700;
+        white-space: nowrap;
     }
 
     .key-details {

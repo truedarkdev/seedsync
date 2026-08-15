@@ -691,6 +691,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
 
         list_response = client.get("/server/admin/api-keys/v1")
         self.assertEqual(200, list_response.status_int)
+        self.assertIsNone(list_response.json["current_key_id"])
 
         created = client.post_json(
             "/server/admin/api-keys/v1",

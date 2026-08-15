@@ -246,6 +246,23 @@ describe("Testing API access component", () => {
         expect(host.querySelector(".clear-legacy-btn")).toBeNull();
     });
 
+    it("should highlight the key currently used to access the page", () => {
+        const currentKey = {...adminApiKey, current: true};
+        const otherKey = {...activeApiKeys[0], current: false};
+        apiAccessService.apiKeys.next([currentKey, otherKey]);
+        fixture.detectChanges();
+
+        const host: HTMLElement = fixture.nativeElement;
+        const currentRow = host.querySelector(".key-item.current") as HTMLElement;
+
+        expect(currentRow).not.toBeNull();
+        expect(currentRow.textContent).toContain("Currently used");
+        expect(currentRow.querySelector(".key-current").getAttribute("aria-label"))
+            .toBe("Currently used to access this page");
+        expect(host.querySelectorAll(".key-item.current").length).toBe(1);
+        expect(host.querySelector(".key-item:not(.current) .key-current")).toBeNull();
+    });
+
     it("should subscribe to api keys in ngOnInit and the template", () => {
         let subscribeCount = 0;
         const apiKeysObservable = apiAccessService.apiKeys as BehaviorSubject<ApiKeyRecord[]>;
