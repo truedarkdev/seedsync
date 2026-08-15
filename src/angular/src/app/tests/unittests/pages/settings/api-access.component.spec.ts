@@ -257,10 +257,12 @@ describe("Testing API access component", () => {
 
         expect(currentRow).not.toBeNull();
         expect(currentRow.textContent).toContain("Currently used");
+        expect(currentRow.querySelector(".key-status")).toBeNull();
         expect(currentRow.querySelector(".key-current").getAttribute("aria-label"))
             .toBe("Currently used to access this page");
         expect(host.querySelectorAll(".key-item.current").length).toBe(1);
         expect(host.querySelector(".key-item:not(.current) .key-current")).toBeNull();
+        expect(host.querySelector(".key-item:not(.current) .key-status").textContent).toContain("Active");
     });
 
     it("should subscribe to api keys in ngOnInit and the template", () => {

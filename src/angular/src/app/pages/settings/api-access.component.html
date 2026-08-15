@@ -159,7 +159,7 @@
                             <div class="key-title-stack">
                                 <div class="key-title-row">
                                     <span class="key-name">{{key.name}}</span>
-                                    <span class="key-status" [class.revoked]="!key.active">{{key.active ? 'Active' : 'Revoked'}}</span>
+                                    <span class="key-status" *ngIf="!key.current" [class.revoked]="!key.active">{{key.active ? 'Active' : 'Revoked'}}</span>
                                     <span class="key-current" *ngIf="key.current"
                                           aria-label="Currently used to access this page">Currently used</span>
                                     <span class="key-id" [attr.title]="key.id">{{key.id}}</span>
