@@ -1341,11 +1341,22 @@ class TestScannerProcess(unittest.TestCase):
         result = process.pop_latest_result()
         self.assertEqual(0, len(result.files))
         self.assertTrue(result.failed)
+        self.assertEqual({None}, result.recoverable_failure_path_pair_ids)
         self.assertEqual("recoverable error", result.error_message)
         process.logger.warning.assert_called_once()
         warning_message = process.logger.warning.call_args[0][0]
         self.assertIn("recoverable error", warning_message)
         self.assertIn("failed result", warning_message.lower())
+
+    def test_scanner_result_preserves_legacy_positional_error_message_binding(self):
+        result = ScannerResult(
+            datetime.now(), [], [], [], {"pair"}, True, "legacy error", 17,
+        )
+
+        self.assertEqual(set(), result.recoverable_failure_path_pair_ids)
+        self.assertIsNone(result.terminal_failure_path_pair_ids)
+        self.assertEqual("legacy error", result.error_message)
+        self.assertEqual(17, result.generation)
 
     def test_sends_partial_files_on_recoverable_error(self):
         partial_file = SystemFile("partial", 42, False)

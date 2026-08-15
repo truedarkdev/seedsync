@@ -844,6 +844,369 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual({"pair-b"}, accumulator.incomplete_pairs())
         self.assertEqual({("pair-a", "healthy")}, set(accumulator.snapshot()))
 
+    def test_progressive_accumulator_terminal_failure_wins_over_recoverable_pair_evidence(self):
+        accumulator = _ProgressiveScanAccumulator()
+
+        result = accumulator.apply([
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=1,
+                is_progress=True, failed=True, unknown_path_pair_ids={"pair-b"},
+                recoverable_failure_path_pair_ids={"pair-b"},
+            ),
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=1,
+                is_progress=True, failed=True, unknown_path_pair_ids={"pair-b"},
+            ),
+        ])
+
+        self.assertTrue(result.failed)
+        self.assertEqual({"pair-b"}, result.unknown_path_pair_ids)
+        self.assertEqual(set(), result.recoverable_failure_path_pair_ids)
+        self.assertEqual({"pair-b"}, result.terminal_failure_path_pair_ids)
+
+    def test_progressive_accumulator_terminal_failure_wins_when_it_precedes_recoverable_evidence(self):
+        accumulator = _ProgressiveScanAccumulator()
+
+        result = accumulator.apply([
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=1,
+                is_progress=True, failed=True, unknown_path_pair_ids={"pair-b"},
+            ),
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=1,
+                is_progress=True, failed=True, unknown_path_pair_ids={"pair-b"},
+                recoverable_failure_path_pair_ids={"pair-b"},
+            ),
+        ])
+
+        self.assertTrue(result.failed)
+        self.assertEqual({"pair-b"}, result.unknown_path_pair_ids)
+        self.assertEqual(set(), result.recoverable_failure_path_pair_ids)
+        self.assertEqual({"pair-b"}, result.terminal_failure_path_pair_ids)
+
+    def test_progressive_accumulator_identityless_terminal_clears_cross_tick_recoverable_pair(self):
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=1,
+                is_progress=True, failed=True, unknown_path_pair_ids={"pair-b"},
+                recoverable_failure_path_pair_ids={"pair-b"},
+            ),
+        ])
+
+        terminal = accumulator.apply([
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={None}, generation=2,
+                is_progress=True, failed=True, unknown_path_pair_ids={None},
+            ),
+        ])
+
+        self.assertIn("pair-b", terminal.unknown_path_pair_ids)
+        self.assertEqual(set(), terminal.recoverable_failure_path_pair_ids)
+        builder = ModelBuilder()
+        last_good = SystemFile("pair-b-file", 11)
+        last_good.path_pair_id = "pair-b"
+        builder.set_local_files([last_good])
+        builder.record_local_inventory_completion({"pair-b"})
+        builder.observe_local_scan_result(
+            terminal.scanned_path_pair_ids,
+            terminal.completed_path_pair_ids,
+            terminal.unknown_path_pair_ids,
+            terminal.failed,
+            {"pair-b"},
+            terminal.recoverable_failure_path_pair_ids,
+            terminal.terminal_failure_path_pair_ids,
+        )
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual((1, 11, "stale"), (
+            inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
+        ))
+
+    def test_progressive_accumulator_normalizes_anonymous_recoverable_and_terminal_evidence(self):
+        configured = {"pair-a", "pair-b"}
+        for events in (
+            [
+                ScannerResult(datetime.now(), [], scanned_path_pair_ids={None}, generation=1,
+                              is_progress=True, failed=True, unknown_path_pair_ids={None},
+                              recoverable_failure_path_pair_ids={None}),
+                ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=1,
+                              is_progress=True, failed=True, unknown_path_pair_ids={"pair-b"}),
+            ],
+            [
+                ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=1,
+                              is_progress=True, failed=True, unknown_path_pair_ids={"pair-b"}),
+                ScannerResult(datetime.now(), [], scanned_path_pair_ids={None}, generation=1,
+                              is_progress=True, failed=True, unknown_path_pair_ids={None},
+                              recoverable_failure_path_pair_ids={None}),
+            ],
+        ):
+            result = _ProgressiveScanAccumulator().apply(events, configured)
+            self.assertEqual({"pair-a", "pair-b"}, result.unknown_path_pair_ids)
+            self.assertEqual({"pair-a"}, result.recoverable_failure_path_pair_ids)
+            self.assertNotIn(None, result.unknown_path_pair_ids)
+
+    def test_progressive_accumulator_normalizes_cross_tick_anonymous_failure_to_incomplete_pair(self):
+        configured = {"pair-a", "pair-b"}
+        accumulator = _ProgressiveScanAccumulator()
+        initial_a = SystemFile("pair-a-file", 7)
+        initial_a.path_pair_id = "pair-a"
+        initial_b = SystemFile("pair-b-file", 11)
+        initial_b.path_pair_id = "pair-b"
+        accumulator.apply([
+            ScannerResult(datetime.now(), [initial_a, initial_b], scanned_path_pair_ids=configured,
+                          generation=1, is_progress=True, completed_path_pair_ids=configured,
+                          is_full_snapshot=True, full_snapshot_path_pair_ids=configured),
+        ], configured)
+        accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=2,
+                          is_progress=True, failed=True, unknown_path_pair_ids={"pair-b"},
+                          recoverable_failure_path_pair_ids={"pair-b"}),
+        ], configured)
+        retry = accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={None}, generation=3,
+                          is_progress=True, failed=True, unknown_path_pair_ids={None},
+                          recoverable_failure_path_pair_ids={None}),
+        ], configured)
+        self.assertEqual({"pair-b"}, retry.unknown_path_pair_ids)
+        self.assertEqual({"pair-b"}, retry.recoverable_failure_path_pair_ids)
+        self.assertNotIn(None, retry.unknown_path_pair_ids)
+        terminal = accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={None}, generation=4,
+                          is_progress=True, failed=True, unknown_path_pair_ids={None}),
+        ], configured)
+        self.assertEqual({"pair-b"}, terminal.unknown_path_pair_ids)
+        self.assertEqual(set(), terminal.recoverable_failure_path_pair_ids)
+        self.assertIn(("pair-a", "pair-a-file"), accumulator.snapshot())
+
+    def test_progressive_accumulator_normalizes_same_drain_completion_and_anonymous_retry(self):
+        configured = {"pair-a", "pair-b"}
+        accumulator = _ProgressiveScanAccumulator()
+        healthy_a = SystemFile("pair-a-file", 8)
+        healthy_a.path_pair_id = "pair-a"
+        result = accumulator.apply([
+            ScannerResult(datetime.now(), [healthy_a], scanned_path_pair_ids={"pair-a"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair-a"},
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"}),
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={None}, generation=1,
+                          is_progress=True, failed=True, unknown_path_pair_ids={None},
+                          recoverable_failure_path_pair_ids={None}),
+        ], configured)
+        self.assertEqual({"pair-a"}, result.completed_path_pair_ids)
+        self.assertEqual({"pair-b"}, result.unknown_path_pair_ids)
+        self.assertEqual({"pair-b"}, result.recoverable_failure_path_pair_ids)
+
+    def test_progressive_accumulator_normalizes_nonprogress_terminal_over_recoverable_evidence(self):
+        configured = {"pair-a", "pair-b"}
+        result = _ProgressiveScanAccumulator().apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=1,
+                          failed=True, unknown_path_pair_ids={"pair-b"},
+                          recoverable_failure_path_pair_ids={"pair-b"}),
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={None}, generation=1,
+                          failed=True, unknown_path_pair_ids={None}),
+        ], configured)
+        self.assertEqual({"pair-a", "pair-b"}, result.unknown_path_pair_ids)
+        self.assertEqual(set(), result.recoverable_failure_path_pair_ids)
+        self.assertNotIn(None, result.unknown_path_pair_ids)
+
+    def test_progressive_accumulator_session_replacement_clears_recoverable_incomplete_pair(self):
+        accumulator = _ProgressiveScanAccumulator()
+        recoverable = accumulator.apply([
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=1,
+                is_progress=True, failed=True, unknown_path_pair_ids={"pair-b"},
+                recoverable_failure_path_pair_ids={"pair-b"}, session_token="first-session",
+            ),
+        ])
+        self.assertEqual({"pair-b"}, recoverable.recoverable_failure_path_pair_ids)
+
+        accumulator.set_session_token("replacement-session")
+        progress = accumulator.apply([
+            ScannerResult(
+                datetime.now(), [SystemFile("pair-b-file", 12)], scanned_path_pair_ids={"pair-b"},
+                generation=1, is_progress=True, session_token="replacement-session",
+            ),
+        ])
+
+        self.assertEqual({"pair-b"}, progress.unknown_path_pair_ids)
+        self.assertEqual(set(), progress.recoverable_failure_path_pair_ids)
+
+    def test_progressive_accumulator_authoritative_completion_clears_normalized_retry(self):
+        configured = {"pair-a", "pair-b"}
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=1,
+                          is_progress=True, failed=True, unknown_path_pair_ids={"pair-b"},
+                          recoverable_failure_path_pair_ids={"pair-b"}),
+        ], configured)
+        recovered = SystemFile("pair-b-recovered", 13)
+        recovered.path_pair_id = "pair-b"
+        result = accumulator.apply([
+            ScannerResult(datetime.now(), [recovered], scanned_path_pair_ids={"pair-b"}, generation=2,
+                          is_progress=True, completed_path_pair_ids={"pair-b"},
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-b"}),
+        ], configured)
+        self.assertEqual({"pair-b"}, result.completed_path_pair_ids)
+        self.assertEqual(set(), result.unknown_path_pair_ids)
+        self.assertEqual(set(), result.recoverable_failure_path_pair_ids)
+
+    def test_legacy_healthy_full_result_stays_non_progress_for_joint_mode_selection(self):
+        result = _ProgressiveScanAccumulator().apply([
+            ScannerResult(datetime.now(), [SystemFile("legacy-root", 5)],
+                          scanned_path_pair_ids={"pair-a"}, generation=1,
+                          completed_path_pair_ids={"pair-a"}, is_full_snapshot=True,
+                          full_snapshot_path_pair_ids={"pair-a"}),
+        ], {"pair-a"})
+
+        self.assertFalse(result.is_progress)
+        self.assertTrue(result.is_scan_final)
+
+    def test_targeted_identityless_legacy_recoverable_failure_is_retained_and_normalized(self):
+        result = _ProgressiveScanAccumulator().apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids=set(), generation=1,
+                          failed=True, is_targeted_scan=True, unknown_path_pair_ids={None},
+                          recoverable_failure_path_pair_ids={None}),
+        ], {"pair-a", "pair-b"})
+
+        self.assertTrue(result.failed)
+        self.assertEqual({"pair-a", "pair-b"}, result.unknown_path_pair_ids)
+        self.assertEqual({"pair-a", "pair-b"}, result.recoverable_failure_path_pair_ids)
+
+    def test_stale_completion_does_not_exclude_incomplete_pair_from_anonymous_terminal(self):
+        accumulator = _ProgressiveScanAccumulator()
+        configured = {"pair-a", "pair-b"}
+        accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=2,
+                          is_progress=True, failed=True, unknown_path_pair_ids={"pair-a"},
+                          recoverable_failure_path_pair_ids={"pair-a"}),
+        ], configured)
+
+        result = accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair-a"},
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"}),
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={None}, generation=3,
+                          is_progress=True, failed=True, unknown_path_pair_ids={None}),
+        ], configured)
+
+        self.assertEqual({"pair-a"}, result.unknown_path_pair_ids)
+        self.assertEqual(set(), result.recoverable_failure_path_pair_ids)
+
+    def test_legacy_explicit_unknown_pair_is_not_broadened_to_configured_scopes(self):
+        configured = {"pair-a", "pair-b"}
+        for recoverable in (set(), {"pair-b"}):
+            result = _ProgressiveScanAccumulator().apply([
+                ScannerResult(datetime.now(), [], scanned_path_pair_ids=set(), generation=1,
+                              failed=True, unknown_path_pair_ids={"pair-b"},
+                              recoverable_failure_path_pair_ids=recoverable),
+            ], configured)
+            self.assertEqual({"pair-b"}, result.unknown_path_pair_ids)
+            self.assertEqual(recoverable, result.recoverable_failure_path_pair_ids)
+
+    def test_non_authoritative_completion_marker_does_not_exclude_anonymous_failure_targets(self):
+        configured = {"pair-a", "pair-b"}
+        marker = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=1,
+            is_progress=True, completed_path_pair_ids={"pair-a"},
+        )
+        for recoverable in (False, True):
+            anonymous = ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={None}, generation=1,
+                is_progress=True, failed=True, unknown_path_pair_ids={None},
+                recoverable_failure_path_pair_ids={None} if recoverable else set(),
+            )
+            for events in ((marker, anonymous), (anonymous, marker)):
+                result = _ProgressiveScanAccumulator().apply(events, configured)
+                self.assertEqual({"pair-a", "pair-b"}, result.unknown_path_pair_ids)
+                self.assertEqual(
+                    {"pair-a", "pair-b"} if recoverable else set(),
+                    result.recoverable_failure_path_pair_ids,
+                )
+
+    def test_newer_explicit_failure_revokes_prior_authoritative_completion_for_anonymous_evidence(self):
+        configured = {"pair-a", "pair-b"}
+        completed = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=1,
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_full_snapshot=True,
+            full_snapshot_path_pair_ids={"pair-a"},
+        )
+        for explicit_recoverable, anonymous_recoverable in ((False, True), (True, False)):
+            explicit_failure = ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=2,
+                is_progress=True, failed=True, unknown_path_pair_ids={"pair-a"},
+                recoverable_failure_path_pair_ids={"pair-a"} if explicit_recoverable else set(),
+            )
+            anonymous = ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={None}, generation=2,
+                is_progress=True, failed=True, unknown_path_pair_ids={None},
+                recoverable_failure_path_pair_ids={None} if anonymous_recoverable else set(),
+            )
+            result = _ProgressiveScanAccumulator().apply(
+                (completed, explicit_failure, anonymous), configured,
+            )
+            self.assertEqual({"pair-a", "pair-b"}, result.unknown_path_pair_ids)
+            self.assertNotIn("pair-a", result.completed_path_pair_ids)
+            self.assertEqual(
+                {"pair-b"} if anonymous_recoverable and not explicit_recoverable else set(),
+                result.recoverable_failure_path_pair_ids,
+            )
+
+    def test_authoritative_completion_excludes_only_its_pair_from_anonymous_failure_both_orders(self):
+        configured = {"pair-a", "pair-b"}
+        completed = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=1,
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_full_snapshot=True,
+            full_snapshot_path_pair_ids={"pair-a"},
+        )
+        for recoverable in (False, True):
+            anonymous = ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={None}, generation=1,
+                is_progress=True, failed=True, unknown_path_pair_ids={None},
+                recoverable_failure_path_pair_ids={None} if recoverable else set(),
+            )
+            for events in ((completed, anonymous), (anonymous, completed)):
+                result = _ProgressiveScanAccumulator().apply(events, configured)
+                self.assertEqual({"pair-a"}, result.completed_path_pair_ids)
+                self.assertEqual({"pair-b"}, result.unknown_path_pair_ids)
+                self.assertEqual(
+                    {"pair-b"} if recoverable else set(),
+                    result.recoverable_failure_path_pair_ids,
+                )
+
+    def test_invalid_unchanged_marker_revokes_nominal_completion_before_anonymous_failure_truth(self):
+        configured = {"pair-a", "pair-b"}
+        for recoverable in (False, True):
+            for reverse_order in (False, True):
+                accumulator = _ProgressiveScanAccumulator()
+                original = SystemFile("root", 3)
+                original.path_pair_id = "pair-a"
+                accumulator.apply([
+                    ScannerResult(
+                        datetime.now(), [original], scanned_path_pair_ids={"pair-a"}, generation=1,
+                        is_progress=True, completed_path_pair_ids={"pair-a"}, is_full_snapshot=True,
+                        full_snapshot_path_pair_ids={"pair-a"},
+                    ),
+                ], configured)
+                invalid_full_completion = ScannerResult(
+                    datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=2,
+                    is_progress=True, completed_path_pair_ids={"pair-a"}, is_full_snapshot=True,
+                    full_snapshot_path_pair_ids={"pair-a"},
+                    unchanged_root_fingerprints_by_pair={"pair-a": {"root": "invalid"}},
+                )
+                anonymous = ScannerResult(
+                    datetime.now(), [], scanned_path_pair_ids={None}, generation=2,
+                    is_progress=True, failed=True, unknown_path_pair_ids={None},
+                    recoverable_failure_path_pair_ids={None} if recoverable else set(),
+                )
+                events = (anonymous, invalid_full_completion) if reverse_order else \
+                    (invalid_full_completion, anonymous)
+                result = accumulator.apply(events, configured)
+                self.assertNotIn("pair-a", result.completed_path_pair_ids)
+                self.assertEqual({"pair-a", "pair-b"}, result.unknown_path_pair_ids)
+                self.assertEqual(
+                    {"pair-b"} if recoverable else set(),
+                    result.recoverable_failure_path_pair_ids,
+                )
+
     def test_progressive_accumulator_keeps_lower_generation_full_snapshot_for_untouched_pair(self):
         accumulator = _ProgressiveScanAccumulator()
         pair_b = SystemFile("pair-b-root", 1)
@@ -1224,7 +1587,8 @@ class TestModelUpdater(unittest.TestCase):
         )
         result = accumulator.apply([failed])
 
-        self.assertIs(failed, result)
+        self.assertIsNot(failed, result)
+        self.assertTrue(result.failed)
         self.assertEqual({}, accumulator.accepted_root_fingerprints())
         self.assertEqual({("pair-a", "root-a"), ("pair-b", "root-b")}, set(accumulator.snapshot()))
 
@@ -1690,13 +2054,14 @@ class TestModelUpdater(unittest.TestCase):
         failed_local_scan = ScannerResult(
             datetime.now(), [], scanned_path_pair_ids={None}, failed=True,
         )
+        failed_local_scan.recoverable_failure_path_pair_ids = {None}
         controller, builder = self._make_progressive_update_controller(None, failed_local_scan)
         controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
 
         ModelUpdater(controller).update()
 
         builder.observe_local_scan_result.assert_called_once_with(
-            {None}, set(), set(), True, {"pair-a", "pair-b"},
+            {None}, set(), set(), True, {"pair-a", "pair-b"}, {None}, None,
         )
 
     def _make_controller(self, downloaded_file_names, extracted_file_names, stopped_file_names, path_pairs_by_id=None):
@@ -2161,6 +2526,237 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual((1, 11, "up_to_date"), (
             inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
         ))
+
+    def test_two_pair_progressive_scanner_chronology_rehabilitates_stale_matching_inventory(self):
+        """Per-pair waves and final aggregates must clear stale inventory on both pairs."""
+        configured = {"pair-a", "pair-b"}
+
+        def file_for(pair_id):
+            file = SystemFile("{}-root".format(pair_id), 7 if pair_id == "pair-a" else 11)
+            file.path_pair_id = pair_id
+            return file
+
+        def scanner_events(session_token):
+            files = {pair_id: file_for(pair_id) for pair_id in configured}
+            per_pair = []
+            for pair_id in ("pair-a", "pair-b"):
+                per_pair.append(ScannerResult(
+                    datetime.now(), [files[pair_id]], scanned_path_pair_ids={pair_id}, generation=1,
+                    is_progress=True, is_scan_final=False, root_names={files[pair_id].name},
+                    session_token=session_token,
+                ))
+                per_pair.append(ScannerResult(
+                    datetime.now(), [files[pair_id]], scanned_path_pair_ids={pair_id}, generation=1,
+                    is_progress=True, completed_path_pair_ids={pair_id}, is_full_snapshot=True,
+                    full_snapshot_path_pair_ids={pair_id}, session_token=session_token,
+                ))
+            aggregate = ScannerResult(
+                datetime.now(), list(files.values()), scanned_path_pair_ids=set(configured), generation=1,
+                is_progress=True, completed_path_pair_ids=set(configured), is_full_snapshot=True,
+                full_snapshot_path_pair_ids=set(configured), session_token=session_token,
+            )
+            return per_pair, aggregate
+
+        # Cover fully coalesced delivery and staggered local/remote aggregate
+        # arrival, the two paths observed from spawned ScannerProcess queues.
+        for scenario, (local_batches, remote_batches) in enumerate((
+            (lambda local, aggregate: [[*local, aggregate]],
+             lambda remote, aggregate: [[*remote, aggregate]]),
+            (lambda local, aggregate: [[*local[:2]], [*local[2:], aggregate], []],
+             lambda remote, aggregate: [[], [*remote[:2]], [*remote[2:]], [aggregate]]),
+            (lambda local, aggregate: [[], [*local[:2]], [*local[2:]], [aggregate]],
+             lambda remote, aggregate: [[*remote[:2]], [*remote[2:], aggregate], []]),
+        ), start=1):
+          with self.subTest(scenario=scenario):
+            builder = ModelBuilder()
+            stale_local = [file_for(pair_id) for pair_id in configured]
+            stale_remote = [file_for(pair_id) for pair_id in configured]
+            builder.set_local_files(stale_local)
+            builder.set_remote_files(stale_remote)
+            builder.record_local_inventory_completion(configured)
+            builder.observe_local_scan_result(set(), set(), configured, True, configured)
+            local_events, local_aggregate = scanner_events("local-healthy")
+            remote_events, remote_aggregate = scanner_events("remote-healthy")
+            controller, _ = self._make_progressive_update_controller(
+                None, local_scan=None, authoritative=False, model_builder=builder, model=Model(),
+            )
+            controller._Controller__path_pairs_by_id = {
+                "pair-a": MagicMock(), "pair-b": MagicMock(),
+            }
+            local_delivery = list(local_batches(local_events, local_aggregate))
+            remote_delivery = list(remote_batches(remote_events, remote_aggregate))
+            local_delivery.extend([[]] * (4 - len(local_delivery)))
+            remote_delivery.extend([[]] * (4 - len(remote_delivery)))
+            controller._Controller__local_scan_process = self._progressive_process(
+                "local-healthy", local_delivery,
+            )
+            controller._Controller__remote_scan_process = self._progressive_process(
+                "remote-healthy", remote_delivery,
+            )
+            updater = ModelUpdater(controller)
+            states = []
+            for _ in range(4):
+                updater.update()
+                _, current_inventory = builder.local_library_inventory_snapshot()
+                states.append({
+                    pair_id: current_inventory[pair_id].state for pair_id in sorted(configured)
+                })
+            _, inventory = builder.local_library_inventory_snapshot()
+            self.assertEqual(
+                "up_to_date", inventory["pair-a"].state,
+                "scenario {}; states={}".format(scenario, states),
+            )
+            self.assertEqual(
+                "up_to_date", inventory["pair-b"].state,
+                "scenario {}; states={}".format(scenario, states),
+            )
+
+    def test_progressive_recoverable_local_failure_keeps_mixed_pair_inventory_retrying(self):
+        """A healthy pair in the same drain must not erase another pair's retry truth."""
+        def final_result(files, generation, session_token):
+            path_pair_ids = {file.path_pair_id for file in files}
+            return ScannerResult(
+                datetime.now(), files, scanned_path_pair_ids=path_pair_ids, generation=generation,
+                is_progress=True, completed_path_pair_ids=path_pair_ids, is_scan_final=True,
+                is_full_snapshot=True, full_snapshot_path_pair_ids=path_pair_ids,
+                session_token=session_token,
+            )
+
+        def file_for(pair_id, size):
+            file = SystemFile("{}-file".format(pair_id), size)
+            file.path_pair_id = pair_id
+            return file
+
+        local_initial = final_result([file_for("pair-a", 7), file_for("pair-b", 11)], 1, "local-retry")
+        remote_initial = final_result([file_for("pair-a", 7), file_for("pair-b", 11)], 1, "remote-retry")
+        healthy_a = final_result([file_for("pair-a", 8)], 2, "local-retry")
+        recoverable_b = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=2,
+            # Legacy failure evidence can share this drain with a progressive
+            # healthy pair; normalization must retain its pair-scoped retry.
+            failed=True, recoverable_failure_path_pair_ids={"pair-b"},
+            unknown_path_pair_ids={"pair-b"}, session_token="local-retry",
+        )
+        recovery_progress_b = ScannerResult(
+            datetime.now(), [file_for("pair-b", 12)], scanned_path_pair_ids={"pair-b"}, generation=3,
+            is_progress=True, session_token="local-retry",
+        )
+        recovered_b = final_result([file_for("pair-b", 13)], 3, "local-retry")
+        remote_recovered_b = final_result([file_for("pair-b", 13)], 2, "remote-retry")
+        terminal_b = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=4,
+            is_progress=True, failed=True, unknown_path_pair_ids={"pair-b"}, session_token="local-retry",
+        )
+
+        builder = ModelBuilder()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False, model_builder=builder, model=Model(),
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        controller._Controller__remote_scan_process = self._progressive_process(
+            "remote-retry", [[], [remote_initial], [], [], [remote_recovered_b], [], []],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            "local-retry", [[local_initial], [], [healthy_a, recoverable_b], [recovery_progress_b],
+                             [recovered_b], [], [terminal_b]],
+        )
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        updater.update()
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual((1, 7, "up_to_date"), (
+            inventory["pair-a"].file_count, inventory["pair-a"].size, inventory["pair-a"].state,
+        ))
+        self.assertEqual((1, 11, "up_to_date"), (
+            inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
+        ))
+
+        updater.update()
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual((1, 11, "scanning"), (
+            inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
+        ))
+
+        updater.update()
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual((1, 11, "scanning"), (
+            inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
+        ))
+
+        updater.update()
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual((1, 13, "up_to_date"), (
+            inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
+        ))
+
+        updater.update()
+        updater.update()
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual((1, 13, "stale"), (
+            inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
+        ))
+
+    def test_recoverable_pair_does_not_make_ordinary_incomplete_sibling_stale(self):
+        """Only a terminal pair may be stale while another pair is simply scanning."""
+        def file_for(pair_id, size):
+            file = SystemFile("{}-file".format(pair_id), size)
+            file.path_pair_id = pair_id
+            return file
+
+        def final(files, generation, session_token):
+            pair_ids = {file.path_pair_id for file in files}
+            return ScannerResult(
+                datetime.now(), files, scanned_path_pair_ids=pair_ids, generation=generation,
+                is_progress=True, completed_path_pair_ids=pair_ids, is_scan_final=True,
+                is_full_snapshot=True, full_snapshot_path_pair_ids=pair_ids,
+                session_token=session_token,
+            )
+
+        initial_local = final([file_for("pair-a", 7), file_for("pair-b", 11)], 1, "local-mixed")
+        initial_remote = final([file_for("pair-a", 7), file_for("pair-b", 11)], 1, "remote-mixed")
+        recoverable_a = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=2,
+            is_progress=True, failed=True, unknown_path_pair_ids={"pair-a"},
+            recoverable_failure_path_pair_ids={"pair-a"}, session_token="local-mixed",
+        )
+        progress_b = ScannerResult(
+            datetime.now(), [file_for("pair-b", 12)], scanned_path_pair_ids={"pair-b"}, generation=2,
+            is_progress=True, is_scan_final=False, session_token="local-mixed",
+        )
+        recovered_local = final([file_for("pair-a", 8), file_for("pair-b", 12)], 3, "local-mixed")
+        recovered_remote = final([file_for("pair-a", 8), file_for("pair-b", 12)], 2, "remote-mixed")
+        builder = ModelBuilder()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False, model_builder=builder, model=Model(),
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        controller._Controller__local_scan_process = self._progressive_process(
+            "local-mixed", [[initial_local], [recoverable_a, progress_b], [recovered_local]],
+        )
+        controller._Controller__remote_scan_process = self._progressive_process(
+            "remote-mixed", [[initial_remote], [], [recovered_remote]],
+        )
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual("up_to_date", inventory["pair-a"].state)
+        self.assertEqual("up_to_date", inventory["pair-b"].state)
+
+        updater.update()
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual((1, 7, "scanning"), (
+            inventory["pair-a"].file_count, inventory["pair-a"].size, inventory["pair-a"].state,
+        ))
+        self.assertEqual((1, 11, "scanning"), (
+            inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
+        ))
+
+        updater.update()
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual("up_to_date", inventory["pair-a"].state)
+        self.assertEqual("up_to_date", inventory["pair-b"].state)
 
     def test_completed_pair_with_unrelated_unknown_delta_uses_global_build(self):
         old = SystemFile("old.bin", 10, False)

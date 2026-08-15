@@ -617,20 +617,31 @@ class TestModelApi(unittest.TestCase):
         self.assertEqual(18, scanning["local_library_size"])
         self.assertEqual("scanning", scanning["local_library_state"])
 
-        builder.observe_local_scan_result({"pair-a"}, set(), {"pair-a"}, True)
+        builder.observe_local_scan_result({"pair-a"}, set(), {"pair-a"}, True,
+                                          recoverable_failure_path_pair_ids={"pair-a"})
+        retrying = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
+        self.assertEqual(2, retrying["local_library_file_count"])
+        self.assertEqual(18, retrying["local_library_size"])
+        self.assertEqual("scanning", retrying["local_library_state"])
+
+        # Failed results without recoverable retry ownership remain stale.
+        builder.observe_local_scan_result(
+            {"pair-a"}, set(), {"pair-a"}, True,
+            terminal_failure_path_pair_ids={"pair-a"},
+        )
         stale = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
         self.assertEqual("stale", stale["local_library_state"])
 
         # A retry/progress observation cannot turn failed evidence into a
         # healthy-looking scan; only an authoritative completion can.
         builder.observe_local_scan_result({"pair-a"}, set(), set(), False)
-        retrying = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
-        self.assertEqual("stale", retrying["local_library_state"])
+        stale_after_progress = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
+        self.assertEqual("stale", stale_after_progress["local_library_state"])
         builder.record_local_inventory_completion({"pair-a"})
         recovered = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
         self.assertEqual("up_to_date", recovered["local_library_state"])
 
-    def test_identityless_multi_pair_local_scan_failure_marks_every_configured_scope_stale(self):
+    def test_concrete_multi_pair_local_scan_failure_marks_each_scope_stale(self):
         builder = ModelBuilder()
         for pair_id, size in (("pair-a", 7), ("pair-b", 11)):
             file = SystemFile("file-{}".format(pair_id), size)
@@ -638,12 +649,60 @@ class TestModelApi(unittest.TestCase):
             builder.set_local_files(list(builder.local_source_roots_snapshot()) + [file])
         builder.record_local_inventory_completion({"pair-a", "pair-b"})
 
-        builder.observe_local_scan_result({None}, set(), set(), True, {"pair-a", "pair-b"})
+        builder.observe_local_scan_result(
+            {"pair-a", "pair-b"}, set(), {"pair-a", "pair-b"}, True,
+            {"pair-a", "pair-b"},
+        )
         _, inventory = builder.local_library_inventory_snapshot()
         self.assertEqual("stale", inventory["pair-a"].state)
         self.assertEqual("stale", inventory["pair-b"].state)
         self.assertEqual(7, inventory["pair-a"].size)
         self.assertEqual(11, inventory["pair-b"].size)
+
+    def test_concrete_mixed_recoverable_failure_marks_only_uncompleted_scopes_scanning(self):
+        builder = ModelBuilder()
+        for pair_id, size in (("pair-a", 7), ("pair-b", 11)):
+            file = SystemFile("file-{}".format(pair_id), size)
+            file.path_pair_id = pair_id
+            builder.set_local_files(list(builder.local_source_roots_snapshot()) + [file])
+        builder.record_local_inventory_completion({"pair-a", "pair-b"})
+
+        # Accumulator-normalized evidence completed pair-a and retained a
+        # recoverable retry classification for pair-b.
+        builder.observe_local_scan_result(
+            {"pair-a"}, {"pair-a"}, {"pair-b"}, False, {"pair-a", "pair-b"}, {"pair-b"},
+        )
+        builder.record_local_inventory_completion({"pair-a"})
+        _, inventory = builder.local_library_inventory_snapshot()
+
+        self.assertEqual((1, 7, "up_to_date"), (
+            inventory["pair-a"].file_count, inventory["pair-a"].size, inventory["pair-a"].state,
+        ))
+        self.assertEqual((1, 11, "scanning"), (
+            inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
+        ))
+        self.assertNotIn(None, inventory)
+
+    def test_concrete_mixed_terminal_failure_marks_only_uncompleted_scopes_stale(self):
+        builder = ModelBuilder()
+        for pair_id, size in (("pair-a", 7), ("pair-b", 11)):
+            file = SystemFile("file-{}".format(pair_id), size)
+            file.path_pair_id = pair_id
+            builder.set_local_files(list(builder.local_source_roots_snapshot()) + [file])
+        builder.record_local_inventory_completion({"pair-a", "pair-b"})
+
+        builder.observe_local_scan_result(
+            {"pair-a"}, {"pair-a"}, {"pair-b"}, False, {"pair-a", "pair-b"}, set(),
+            {"pair-b"},
+        )
+        builder.record_local_inventory_completion({"pair-a"})
+        _, inventory = builder.local_library_inventory_snapshot()
+
+        self.assertEqual("up_to_date", inventory["pair-a"].state)
+        self.assertEqual((1, 11, "stale"), (
+            inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
+        ))
+        self.assertNotIn(None, inventory)
 
     def test_summary_bytes_and_speed_match_legacy_path_pair_card(self):
         downloading = self._file("down", "pair-a")

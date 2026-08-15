@@ -109,7 +109,9 @@ class ScannerResult:
                  unchanged_root_fingerprints: Optional[dict[str, str]] = None,
                  unchanged_root_fingerprints_by_pair: Optional[dict[str | None, dict[str, str]]] = None,
                  duration_aggregates: Optional[dict[str, dict[str, float | int]]] = None,
-                 duration_aggregate_token: Optional[tuple[str, int, int]] = None):
+                 duration_aggregate_token: Optional[tuple[str, int, int]] = None,
+                 recoverable_failure_path_pair_ids: Optional[set[str | None]] = None,
+                 terminal_failure_path_pair_ids: Optional[set[str | None]] = None):
         self.timestamp = timestamp
         self.files = files
         self.malformed_status_only_file_ids = [] if malformed_status_only_file_ids is None else malformed_status_only_file_ids
@@ -132,6 +134,12 @@ class ScannerResult:
             else unchanged_root_fingerprints_by_pair
         self.duration_aggregates = duration_aggregates
         self.duration_aggregate_token = duration_aggregate_token
+        # Appended for positional compatibility with downstream result readers.
+        self.recoverable_failure_path_pair_ids = set() if recoverable_failure_path_pair_ids is None \
+            else recoverable_failure_path_pair_ids
+        # ``None`` preserves legacy direct-result terminal fallback. The
+        # progressive accumulator supplies concrete transient evidence.
+        self.terminal_failure_path_pair_ids = terminal_failure_path_pair_ids
 
 
 class _ScannerQueueReleaseMarker:
@@ -459,6 +467,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                 session_token=session_token,
                 duration_aggregates=duration_recorder.snapshot(),
                 duration_aggregate_token=(session_token, generation, performance_diagnostics_generation),
+                recoverable_failure_path_pair_ids=failed_ids or {None},
             )
             outcome = ("recoverable", str(error))
             _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_failed",
@@ -831,11 +840,13 @@ class ScannerProcess:
             failed_ids = getattr(self.__scanner, "failed_path_pair_ids", self.__scanner.scanned_path_pair_ids)()
             result = ScannerResult(timestamp_start, [] if progress_emitted else files, malformed, managed,
                                    failed_ids,
-                                   failed=True, error_message=error_message, generation=self.__scan_generation,
+                                   failed=True, error_message=error_message,
+                                   generation=self.__scan_generation,
                                    is_progress=progress_emitted or bool(failed_ids),
                                    unknown_path_pair_ids=failed_ids,
                                    is_targeted_scan=scan_target_path_pair_ids is not None,
-                                   session_token=self.__session_token)
+                                   session_token=self.__session_token,
+                                   recoverable_failure_path_pair_ids=failed_ids or {None})
             self.__record_breadcrumb("scan_failed", {
                 "file_count": len(files), "failed": True,
                 "scanner_side": _scanner_side(self.__scanner),

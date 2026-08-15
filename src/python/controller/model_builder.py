@@ -347,31 +347,41 @@ class ModelBuilder:
             self, scanned_path_pair_ids: Set[Optional[str]], completed_path_pair_ids: Set[Optional[str]],
             unknown_path_pair_ids: Set[Optional[str]], failed: bool,
             enabled_path_pair_ids: Optional[Set[Optional[str]]] = None,
+            recoverable_failure_path_pair_ids: Optional[Set[Optional[str]]] = None,
+            terminal_failure_path_pair_ids: Optional[Set[Optional[str]]] = None,
     ) -> None:
         """Publish scan freshness without treating partial trees as inventory."""
         affected = set(scanned_path_pair_ids).union(completed_path_pair_ids, unknown_path_pair_ids)
-        explicit_pair_ids = {path_pair_id for path_pair_id in affected if isinstance(path_pair_id, str)}
-        configured_scopes = {
-            path_pair_id for path_pair_id in (enabled_path_pair_ids or set())
-            if path_pair_id is None or isinstance(path_pair_id, str)
-        }
-        # Scanner failures can be emitted before a multi-path scanner has
-        # attributed a pair.  ``None`` is the legacy scope, not evidence that
-        # every configured pair except legacy stayed healthy.
-        if failed and configured_scopes and not explicit_pair_ids:
-            affected = configured_scopes
-        elif not affected:
-            affected = configured_scopes or {None}
+        recoverable_failure_ids = set(recoverable_failure_path_pair_ids or set())
+        terminal_failure_ids = (
+            None if terminal_failure_path_pair_ids is None
+            else set(terminal_failure_path_pair_ids)
+        )
+        normalized_unknown_path_pair_ids = set(unknown_path_pair_ids)
+        # Normal progressive intake resolves anonymous failures to concrete
+        # scopes before publishing.  Keep this only as a legacy direct-call
+        # fallback; ModelBuilder must not independently attribute config.
+        if not affected:
+            affected = {None}
         updated = dict(self.__local_library_inventory_by_pair)
         for path_pair_id in affected:
             if path_pair_id is not None and not isinstance(path_pair_id, str):
                 continue
             existing = updated.get(path_pair_id)
-            if failed or path_pair_id in unknown_path_pair_ids:
+            terminal_failure = path_pair_id in terminal_failure_ids if terminal_failure_ids is not None else (
+                failed and path_pair_id not in recoverable_failure_ids
+            )
+            if terminal_failure:
                 updated[path_pair_id] = _LocalLibraryInventory(
                     existing.file_count if existing is not None else None,
                     existing.size if existing is not None else None,
                     "stale" if existing is not None else "waiting_for_scan",
+                )
+            elif failed or path_pair_id in normalized_unknown_path_pair_ids:
+                updated[path_pair_id] = _LocalLibraryInventory(
+                    existing.file_count if existing is not None else None,
+                    existing.size if existing is not None else None,
+                    "scanning",
                 )
             else:
                 updated[path_pair_id] = _LocalLibraryInventory(

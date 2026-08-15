@@ -292,6 +292,7 @@ class _ProgressiveScanAccumulator:
         self.__failed_pairs: set[tuple[int, Optional[str]]] = set()
         self.__authoritative_by_pair: dict[Optional[str], dict[str, Optional[SystemFile]]] = {}
         self.__incomplete_pairs: set[Optional[str]] = set()
+        self.__recoverable_incomplete_pairs: set[Optional[str]] = set()
         self.__completed_pairs: set[Optional[str]] = set()
         self.__session_has_progressive_evidence = False
         self.__last_touched_keys: set[tuple[Optional[str], str]] = set()
@@ -320,6 +321,7 @@ class _ProgressiveScanAccumulator:
         self.__committed_pairs.clear()
         self.__failed_pairs.clear()
         self.__incomplete_pairs.clear()
+        self.__recoverable_incomplete_pairs.clear()
         self.__authoritative_by_pair.clear()
         self.__completed_pairs.clear()
         self.__committed_root_fingerprints.clear()
@@ -332,6 +334,49 @@ class _ProgressiveScanAccumulator:
     def session_token(self) -> Optional[str]:
         """Return the scanner process identity currently bound to this state."""
         return self.__session_token
+
+    def __apply_drain_failure_truth(
+            self,
+            recoverable_path_pair_ids: set[Optional[str]],
+            terminal_path_pair_ids: set[Optional[str]],
+    ) -> None:
+        """Commit one drain's concrete retry evidence after terminal precedence."""
+        terminal_ids = set(terminal_path_pair_ids)
+        if None in terminal_ids:
+            # Anonymous terminal evidence applies to every still-incomplete
+            # concrete pair, but never to a pair completed in this drain; it
+            # also clears any retained anonymous retry classification itself.
+            terminal_ids.update(
+                path_pair_id for path_pair_id in self.__incomplete_pairs
+                if path_pair_id is not None and path_pair_id not in self.__completed_pairs
+            )
+        self.__recoverable_incomplete_pairs.update(recoverable_path_pair_ids)
+        self.__recoverable_incomplete_pairs.difference_update(terminal_ids)
+        self.__recoverable_incomplete_pairs.intersection_update(self.__incomplete_pairs)
+
+    def __resolve_failure_path_pair_ids(
+            self,
+            path_pair_ids: set[Optional[str]],
+            configured_path_pair_ids: set[str],
+            explicitly_completed_path_pair_ids: set[str],
+            incomplete_path_pair_ids: set[str],
+    ) -> set[Optional[str]]:
+        """Replace anonymous failure evidence at the accumulator boundary.
+
+        A failure without a pair identity belongs to existing incomplete
+        concrete work first.  If no such work exists, it covers configured
+        scopes that did not complete in this drain.  ``None`` remains only
+        for the no-configuration legacy path.
+        """
+        resolved = set(path_pair_ids)
+        if None not in resolved or not configured_path_pair_ids:
+            return resolved
+        incomplete = incomplete_path_pair_ids - explicitly_completed_path_pair_ids
+        resolved.discard(None)
+        resolved.update(incomplete or (
+            configured_path_pair_ids - explicitly_completed_path_pair_ids
+        ))
+        return resolved
 
     def has_move_invalidations(self) -> bool:
         return bool(self.__move_invalidations_by_root)
@@ -374,13 +419,19 @@ class _ProgressiveScanAccumulator:
     @staticmethod
     def __legacy_result_as_progress_snapshot(event: ScannerResult) -> Optional[ScannerResult]:
         """Make legacy evidence explicit when it shares a progressive drain."""
-        selected_ids = set(event.scanned_path_pair_ids)
-        if not selected_ids:
-            if bool(getattr(event, "is_targeted_scan", False)):
-                return None
-            selected_ids = {None}
         failed = bool(event.failed)
+        selected_ids = set(event.scanned_path_pair_ids)
         unknown_ids = set(event.unknown_path_pair_ids)
+        if not selected_ids:
+            # Explicit unknown evidence is more precise than the legacy
+            # empty-scan fallback.  In particular, do not broaden a failed
+            # targeted scan from pair B to every configured scope later.
+            if unknown_ids:
+                selected_ids = set(unknown_ids)
+            elif bool(getattr(event, "is_targeted_scan", False)) and not failed:
+                return None
+            else:
+                selected_ids = {None}
         if failed and not unknown_ids:
             unknown_ids = set(selected_ids)
         return ScannerResult(
@@ -401,9 +452,58 @@ class _ProgressiveScanAccumulator:
             is_full_snapshot=not failed,
             full_snapshot_path_pair_ids=set() if failed else set(selected_ids),
             is_targeted_scan=event.is_targeted_scan,
+            recoverable_failure_path_pair_ids=set(
+                getattr(event, "recoverable_failure_path_pair_ids", set()) or set()
+            ),
+            terminal_failure_path_pair_ids=getattr(
+                event, "terminal_failure_path_pair_ids", None,
+            ),
         )
 
-    def apply(self, events: Sequence[ScannerResult]) -> Optional[ScannerResult]:
+    @staticmethod
+    def __is_authoritative_completion(event: ScannerResult, pair_id: Optional[str]) -> bool:
+        """Return whether one event can replace a pair's committed authority."""
+        return (
+            not event.failed
+            and bool(getattr(event, "is_full_snapshot", False))
+            and pair_id in set(getattr(event, "full_snapshot_path_pair_ids", set()))
+            and pair_id in event.completed_path_pair_ids
+            and pair_id not in event.unknown_path_pair_ids
+        )
+
+    def __authoritative_completed_pair_ids_after(
+            self, events: Sequence[ScannerResult],
+    ) -> set[str]:
+        """Mirror accepted completion state for anonymous-failure resolution.
+
+        This deliberately shares the event-loop admission predicate.  A newer
+        generation or accepted failure revokes an earlier completion before
+        anonymous evidence is attributed.
+        """
+        generation_by_pair = dict(self.__active_generation)
+        completed: set[str] = set()
+        for event in events:
+            generation = int(getattr(event, "generation", 0))
+            for pair_id in set(event.scanned_path_pair_ids).union(event.completed_path_pair_ids):
+                if not isinstance(pair_id, str):
+                    continue
+                previous_generation = generation_by_pair.get(pair_id, -1)
+                if generation < previous_generation:
+                    continue
+                if generation > previous_generation:
+                    generation_by_pair[pair_id] = generation
+                    completed.discard(pair_id)
+                if event.failed:
+                    completed.discard(pair_id)
+                elif self.__is_authoritative_completion(event, pair_id):
+                    completed.add(pair_id)
+        return completed
+
+    def apply(
+            self,
+            events: Sequence[ScannerResult],
+            configured_path_pair_ids: Optional[set[str]] = None,
+    ) -> Optional[ScannerResult]:
         self.__last_touched_keys = set()
         self.__last_final_comparison_proven_pairs = set()
         if not events:
@@ -430,49 +530,7 @@ class _ProgressiveScanAccumulator:
         newest_generation = max((int(getattr(event, "generation", 0)) for event in accepted), default=0)
         if not accepted:
             return None
-        latest = accepted[-1]
-        if not any(getattr(event, "is_progress", False) for event in accepted):
-            selected_ids = set(latest.scanned_path_pair_ids) | set(latest.unknown_path_pair_ids)
-            if not selected_ids:
-                if latest.failed:
-                    # A transport/protocol failure before the first manifest
-                    # carries no reliable pair identity. Keep every committed
-                    # tree, but force all subsequent remote scans in this
-                    # session to establish fresh full-root transport hints.
-                    self.__committed_root_fingerprints.clear()
-                    return latest
-                if bool(getattr(latest, "is_targeted_scan", False)):
-                    return None
-                selected_ids = {None}
-            latest_generation = int(getattr(latest, "generation", 0))
-            if any(
-                latest_generation < self.__active_generation.get(pair_id, -1)
-                for pair_id in selected_ids
-            ):
-                return None
-            if latest.failed:
-                for pair_id in selected_ids:
-                    self.__committed_root_fingerprints.pop(pair_id, None)
-                return latest
-            if latest.files:
-                self.__session_has_progressive_evidence = True
-            for pair_id in selected_ids:
-                self.__active_generation[pair_id] = latest_generation
-                self.__completed_pairs.add(pair_id)
-                self.__incomplete_pairs.discard(pair_id)
-                for name in self.__committed_by_pair.get(pair_id, {}):
-                    self.__last_touched_keys.add((pair_id, name))
-                self.__committed_by_pair.pop(pair_id, None)
-                self.__authoritative_by_pair.pop(pair_id, None)
-                self.__committed_pairs.add(pair_id)
-            for file in latest.files:
-                pair_id = file.path_pair_id if file.path_pair_id in selected_ids else (
-                    next(iter(selected_ids)) if len(selected_ids) == 1 else file.path_pair_id
-                )
-                self.__committed_by_pair.setdefault(pair_id, {})[file.name] = file
-                self.__authoritative_by_pair.setdefault(pair_id, {})[file.name] = file
-                self.__last_touched_keys.add((pair_id, file.name))
-            return latest
+        had_progress_event = any(getattr(event, "is_progress", False) for event in accepted)
         accepted = [
             event if event.is_progress else self.__legacy_result_as_progress_snapshot(event)
             for event in accepted
@@ -480,6 +538,14 @@ class _ProgressiveScanAccumulator:
         accepted = [event for event in accepted if event is not None]
         if not accepted:
             return None
+        configured_ids = {
+            pair_id for pair_id in (configured_path_pair_ids or set())
+            if isinstance(pair_id, str)
+        }
+        explicitly_completed_ids = self.__authoritative_completed_pair_ids_after(accepted)
+        incomplete_before_drain = {
+            pair_id for pair_id in self.__incomplete_pairs if isinstance(pair_id, str)
+        }
         if any(
             not event.failed and bool(event.files)
             for event in accepted
@@ -489,6 +555,8 @@ class _ProgressiveScanAccumulator:
         malformed: list[str] = []
         managed: list[str] = []
         failed = False
+        drain_recoverable_path_pair_ids: set[Optional[str]] = set()
+        drain_terminal_path_pair_ids: set[Optional[str]] = set()
         error_message: Optional[str] = None
         completed: set[Optional[str]] = set()
         touched: set[Optional[str]] = set()
@@ -496,17 +564,22 @@ class _ProgressiveScanAccumulator:
             malformed.extend(event.malformed_status_only_file_ids)
             managed.extend(event.managed_extract_file_ids)
             generation = int(getattr(event, "generation", 0))
-            ids = set(event.scanned_path_pair_ids)
+            raw_ids = set(event.scanned_path_pair_ids)
+            if event.failed:
+                raw_ids.update(event.unknown_path_pair_ids)
+                raw_ids.update(
+                    getattr(event, "recoverable_failure_path_pair_ids", set()) or set()
+                )
+            ids = self.__resolve_failure_path_pair_ids(
+                raw_ids, configured_ids, explicitly_completed_ids, incomplete_before_drain,
+            )
             if not ids:
                 ids = {None}
             for pair_id in ids:
                 full_snapshot_ids = set(getattr(event, "full_snapshot_path_pair_ids", set()))
                 full_snapshot = bool(getattr(event, "is_full_snapshot", False)) \
                     and pair_id in full_snapshot_ids
-                healthy_post_move_snapshot = full_snapshot \
-                    and pair_id in event.completed_path_pair_ids \
-                    and pair_id not in event.unknown_path_pair_ids \
-                    and not event.failed
+                healthy_post_move_snapshot = self.__is_authoritative_completion(event, pair_id)
                 protected_root_names = set()
                 for (invalid_pair_id, root_name), entries in self.__move_invalidations_by_root.items():
                     if invalid_pair_id != pair_id:
@@ -524,6 +597,7 @@ class _ProgressiveScanAccumulator:
                     self.__active_generation[pair_id] = generation
                     self.__incomplete_pairs.add(pair_id)
                     self.__completed_pairs.discard(pair_id)
+                    completed.discard(pair_id)
                     for old_generation in list(self.__working):
                         if old_generation < generation:
                             self.__working[old_generation].pop(pair_id, None)
@@ -544,6 +618,11 @@ class _ProgressiveScanAccumulator:
                             self.__authoritative_by_pair.setdefault(pair_id, {})[root_name] = previous_file
                 touched.add(pair_id)
                 if event.failed:
+                    if ids == {None} and not configured_ids:
+                        # Legacy pre-manifest transport failures have no
+                        # concrete scope.  Retain inventory but force fresh
+                        # full-root hints for every existing pair.
+                        self.__committed_root_fingerprints.clear()
                     # Any recoverable failed generation may have been caused
                     # by a malformed/unsupported hinted stream before marker
                     # evidence reached this accumulator. Preserve committed
@@ -552,11 +631,23 @@ class _ProgressiveScanAccumulator:
                     self.__committed_root_fingerprints.pop(pair_id, None)
                     self.__failed_pairs.add((generation, pair_id))
                     self.__authoritative_by_pair.pop(pair_id, None)
+                    self.__completed_pairs.discard(pair_id)
+                    completed.discard(pair_id)
                     for root_name in protected_root_names:
                         previous_file = self.__committed_by_pair.get(pair_id, {}).get(root_name)
                         if previous_file is not None:
                             self.__authoritative_by_pair.setdefault(pair_id, {})[root_name] = previous_file
                     failed = True
+                    event_recoverable_ids = self.__resolve_failure_path_pair_ids(
+                        set(getattr(
+                            event, "recoverable_failure_path_pair_ids", set(),
+                        ) or set()),
+                        configured_ids,
+                        explicitly_completed_ids,
+                        incomplete_before_drain,
+                    ).intersection(ids)
+                    drain_recoverable_path_pair_ids.update(event_recoverable_ids)
+                    drain_terminal_path_pair_ids.update(ids - event_recoverable_ids)
                     error_message = event.error_message
                     self.__incomplete_pairs.add(pair_id)
                     continue
@@ -616,6 +707,7 @@ class _ProgressiveScanAccumulator:
                         self.__failed_pairs.add((generation, pair_id))
                         self.__incomplete_pairs.add(pair_id)
                         failed = True
+                        drain_terminal_path_pair_ids.add(pair_id)
                         error_message = "Remote unchanged-root fingerprint did not match committed authority"
                         continue
                 for file in event.files:
@@ -672,6 +764,7 @@ class _ProgressiveScanAccumulator:
                     self.__committed_pairs.add(pair_id)
                     completed.add(pair_id)
                     self.__incomplete_pairs.discard(pair_id)
+                    self.__recoverable_incomplete_pairs.discard(pair_id)
                     self.__completed_pairs.add(pair_id)
                     for key, entries in list(self.__move_invalidations_by_root.items()):
                         if key[0] != pair_id:
@@ -682,6 +775,8 @@ class _ProgressiveScanAccumulator:
                         if not entries:
                             self.__move_invalidations_by_root.pop(key, None)
 
+        if not had_progress_event and not touched and not failed and not completed:
+            return None
         visible: dict[tuple[Optional[str], str], SystemFile] = {
             (pair_id, name): file
             for pair_id, files in self.__committed_by_pair.items()
@@ -695,6 +790,19 @@ class _ProgressiveScanAccumulator:
                     continue
                 for name, file in files.items():
                     visible[(pair_id, name)] = file
+        self.__apply_drain_failure_truth(
+            drain_recoverable_path_pair_ids,
+            drain_terminal_path_pair_ids,
+        )
+        published_incomplete = set(self.__incomplete_pairs)
+        if configured_ids:
+            published_incomplete.discard(None)
+        terminal_failure_path_pair_ids = {
+            path_pair_id
+            for generation, path_pair_id in self.__failed_pairs
+            if self.__active_generation.get(path_pair_id) == generation
+            and path_pair_id in published_incomplete
+        }.difference(self.__recoverable_incomplete_pairs)
         return ScannerResult(
             latest.timestamp,
             list(visible.values()),
@@ -706,12 +814,21 @@ class _ProgressiveScanAccumulator:
             # failed flag for an all-unknown update so callers do not discard
             # unrelated progress.
             failed=failed and not completed,
+            # Retain retry evidence through ordinary later progress until a
+            # full completion or terminal failure resolves that same pair.
+            recoverable_failure_path_pair_ids=(
+                self.__recoverable_incomplete_pairs.intersection(published_incomplete)
+            ),
+            terminal_failure_path_pair_ids=terminal_failure_path_pair_ids,
             error_message=error_message,
             generation=newest_generation,
-            is_progress=any(getattr(event, "is_progress", False) for event in accepted),
+            # Legacy snapshots are aggregated internally but must retain
+            # their source publication mode so a normal full scan cannot
+            # permanently opt the controller into progressive joint mode.
+            is_progress=had_progress_event,
             completed_path_pair_ids=completed,
-            unknown_path_pair_ids=set(self.__incomplete_pairs),
-            is_scan_final=bool(completed) and not self.__incomplete_pairs and not failed,
+            unknown_path_pair_ids=published_incomplete,
+            is_scan_final=bool(completed) and not published_incomplete and not failed,
             is_targeted_scan=any(
                 bool(getattr(event, "is_targeted_scan", False)) for event in accepted
             ),
@@ -801,6 +918,7 @@ class _ProgressiveScanAccumulator:
             frozenset(self.__active_generation.items()),
             frozenset(self.__completed_pairs),
             frozenset(self.__incomplete_pairs),
+            frozenset(self.__recoverable_incomplete_pairs),
             frozenset(self.__failed_pairs),
         )
 
@@ -1184,7 +1302,11 @@ def _pop_scan_updates(controller: "Controller", side: str, process: object) -> O
             setattr(controller, "_Controller__progressive_scan_session_changed", True)
             setattr(controller, "_Controller__progressive_{}_scan_session_changed".format(side), True)
         accumulator.set_session_token(session_token)
-        result = accumulator.apply(events)
+        path_pairs_by_id = getattr(controller, "_Controller__path_pairs_by_id", {})
+        configured_path_pair_ids = (
+            set(path_pairs_by_id) if isinstance(path_pairs_by_id, dict) else None
+        )
+        result = accumulator.apply(events, configured_path_pair_ids)
         if trace_enabled:
             after_details = _lifecycle_scan_details(events, accumulator, handoff_file_ids)
             authority_state_changed = before_authority_state != accumulator.lifecycle_trace_transition_token()
@@ -2124,6 +2246,24 @@ class ModelUpdater(_ControllerCoreAccess):
             )
             or not progressive_final_noop_proven
         )
+        # A comparison-proven local final can be deliberately skipped as a
+        # joint rendering no-op. The normal local observation still records
+        # it as in-flight, so retain Builder's existing completion operation
+        # for this narrow no-render finalization.
+        local_noop_inventory_completion_ids: set[Optional[str]] = set()
+        local_accumulator = getattr(controller, "_Controller__progressive_local_scan_state", None)
+        if progressive_mode and joint_reconciliation_final and \
+                not progressive_final_publication_required and \
+                latest_local_scan is not None and \
+                not bool(getattr(latest_local_scan, "failed", False)) and \
+                bool(getattr(latest_local_scan, "is_scan_final", True)) and \
+                not bool(getattr(latest_local_scan, "unknown_path_pair_ids", set())) and \
+                isinstance(local_accumulator, _ProgressiveScanAccumulator):
+            completed_ids = set(getattr(latest_local_scan, "completed_path_pair_ids", set()))
+            if completed_ids and completed_ids.issubset(
+                    local_accumulator.final_comparison_proven_pairs()
+            ):
+                local_noop_inventory_completion_ids = completed_ids
         if progressive_mode and joint_reconciler is not None and joint_reconciliation_final and \
                 progressive_final_publication_required:
             if scoped_final_pair_ids:
@@ -2490,6 +2630,8 @@ class ModelUpdater(_ControllerCoreAccess):
                     set(raw_unknown_ids) if isinstance(raw_unknown_ids, set) else set(),
                     local_scan_failed,
                     set(getattr(controller, "_Controller__path_pairs_by_id", {}).keys()) or {None},
+                    set(getattr(latest_local_scan, "recoverable_failure_path_pair_ids", set()) or set()),
+                    getattr(latest_local_scan, "terminal_failure_path_pair_ids", None),
                 )
             if local_final and not progressive_mode:
                 controller._Controller__last_local_reconciliation_healthy = not local_scan_failed
@@ -2632,6 +2774,10 @@ class ModelUpdater(_ControllerCoreAccess):
                 controller._Controller__last_remote_reconciliation_healthy = True
                 controller._Controller__progressive_joint_first_publication = True
                 controller._Controller__progressive_joint_authoritative = True
+        if local_noop_inventory_completion_ids:
+            inventory_completion = getattr(model_builder, "record_local_inventory_completion", None)
+            if callable(inventory_completion):
+                inventory_completion(local_noop_inventory_completion_ids)
         def reconciled_pair_ids(
                 side: str, result: Optional[ScannerResult]) -> Optional[set[str | None]]:
             session_changed = bool(getattr(
