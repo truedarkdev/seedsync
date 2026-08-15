@@ -22,6 +22,7 @@ class ControllerPersist(Persist):
     __KEY_STOPPED_FILE_NAMES = "stopped"
     __KEY_MOVE_FAILURE_COUNTS = "move_failure_counts"
     __KEY_FINAL_MOVE_SUCCEEDED = "final_move_succeeded"
+    __KEY_RESUME_SOURCES = "resume_sources"
     __KEY_MARKER_IDENTITY_MIGRATION = "marker_identity_migration"
     __MARKER_IDENTITY_PHASE_ONE = 1
     __MARKER_IDENTITY_PHASE_TWO = 2
@@ -34,6 +35,10 @@ class ControllerPersist(Persist):
         self.stopped_file_names: set[str] = set()
         self.move_failure_counts: dict[str, int] = {}
         self.final_move_succeeded_file_names: set[str] = set()
+        # File-only source identity for GET/PGET continuation.  Keys are the
+        # same canonical ModelFile IDs used by every other controller marker;
+        # values are (remote size, portable whole-second raw mtime).
+        self.resume_source_identities: dict[str, tuple[int, int]] = {}
         self.__marker_identity_migration = 0
 
     @contextmanager
@@ -114,6 +119,34 @@ class ControllerPersist(Persist):
                     canonical[normalized] = value
         return canonical
 
+    @classmethod
+    def _canonical_resume_source_id(cls, key: str) -> str | None:
+        """Accept canonical scoped IDs and the unscoped/default canonical ID.
+
+        Resume sources are written only after a confirmed controller start, so
+        a bare key here is not historical path-pair marker input: it is the
+        deterministic ModelFile identity for the default Path Pair.
+        """
+        canonical = cls._canonical_file_id(key, None)
+        if canonical == key:
+            return canonical
+        if KEY_SEP in key:
+            return None
+        if len(key) > 37 and key[36] == ":":
+            try:
+                uuid.UUID(key[:36])
+            except ValueError:
+                pass
+            else:
+                return None
+        try:
+            parsed = json.loads(key)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, list):
+            return None
+        return key if key == ModelFile.build_file_id(key, None) else None
+
     def canonicalize_file_identities(self, default_path_pair_id: str | None = None) -> bool:
         """Perform one phase of the restart-safe canonical marker migration.
 
@@ -189,6 +222,19 @@ class ControllerPersist(Persist):
             persist.final_move_succeeded_file_names = cls._read_string_set(
                 dct.get(cls.__KEY_FINAL_MOVE_SUCCEEDED, []), "final_move_succeeded"
             )
+            raw_resume_sources = dct.get(cls.__KEY_RESUME_SOURCES, {})
+            if not isinstance(raw_resume_sources, dict):
+                raise TypeError("resume_sources must be an object")
+            resume_source_identities: dict[str, tuple[int, int]] = {}
+            for key, value in cast(dict[object, object], raw_resume_sources).items():
+                if not isinstance(key, str) or cls._canonical_resume_source_id(key) != key or not isinstance(value, dict):
+                    raise TypeError("resume_sources must map strings to source identities")
+                size = value.get("size")
+                mtime = value.get("mtime")
+                if type(size) is not int or size < 0 or type(mtime) is not int or mtime < 0:
+                    raise TypeError("resume source identity must contain non-negative integer size and mtime")
+                resume_source_identities[key] = (size, mtime)
+            persist.resume_source_identities = resume_source_identities
             phase = dct.get(cls.__KEY_MARKER_IDENTITY_MIGRATION, 0)
             if type(phase) is not int or phase not in (0, 1, 2):
                 raise TypeError("marker_identity_migration must be 0, 1, or 2")
@@ -208,6 +254,11 @@ class ControllerPersist(Persist):
                 self.__KEY_FINAL_MOVE_SUCCEEDED: list(self.final_move_succeeded_file_names),
                 self.__KEY_MARKER_IDENTITY_MIGRATION: self.__marker_identity_migration,
             }
+            if self.resume_source_identities:
+                dct[self.__KEY_RESUME_SOURCES] = {
+                    key: {"size": identity[0], "mtime": identity[1]}
+                    for key, identity in self.resume_source_identities.items()
+                }
             # Keep old/v0.8.6 files byte-compatible when no completion times
             # have ever been recorded; the field remains optional on disk.
             if self.downloaded_timestamps:

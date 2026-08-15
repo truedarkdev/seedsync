@@ -23,7 +23,7 @@ from controller.validate import ValidateProcess
 from controller.scan import MultiPathActiveScanner, ScannerProcess, ScannerResult
 from controller.controller import (
     ControllerError, DownloadStartLifecycleEntry, PendingQueueDispatch,
-    _MoveMutationOutcome, _MoveMutationTracker,
+    _LftpOperation, _MoveMutationOutcome, _MoveMutationTracker,
 )
 from controller.persist_keys import KEY_SEP, persist_key
 from common import AppError, Config, PathPairError, PathPairManager
@@ -397,6 +397,45 @@ class TestController(unittest.TestCase):
                 time.sleep(0.01)
         self.assertEqual(([status], True), snapshot)
         self.assertTrue(self.controller.wait_for_process_wake(observed_generation, 1))
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+    def test_async_queue_invalidates_completed_pre_queue_status_before_post_queue_poll(self):
+        class TrackingFuture(Future):
+            def __init__(self):
+                super().__init__()
+                self.result_calls = 0
+
+            def result(self, timeout=None):
+                self.result_calls += 1
+                return super().result(timeout)
+
+        file = ModelFile("fast-get.bin", False)
+        file.remote_size = 100
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        model.add_file(file)
+        self.controller._Controller__model = model
+        self.controller._Controller__lftp.backend_name = "lftp"
+        stale_status = TrackingFuture()
+        stale_status.set_result(([], True))
+        self.controller._Controller__lftp_status_future = stale_status
+        self.controller._Controller__lftp.status.return_value = []
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.assertIsNone(self.controller._Controller__lftp_status_future)
+        self.assertEqual(0, stale_status.result_calls)
+        self.assertIsNone(self.controller._get_lftp_status_snapshot())
+        deadline = time.monotonic() + 1
+        snapshot = None
+        while snapshot is None and time.monotonic() < deadline:
+            snapshot = self.controller._get_lftp_status_snapshot()
+            if snapshot is None:
+                time.sleep(0.01)
+        self.assertEqual(([], True), snapshot)
+        self.assertEqual(1, self.controller._Controller__lftp.status.call_count)
+        self.assertEqual(0, stale_status.result_calls)
         self.controller._Controller__lftp_executor.shutdown(wait=True)
 
     def test_async_lftp_status_future_failure_becomes_bounded_unhealthy_snapshot(self):
@@ -3497,6 +3536,30 @@ class TestController(unittest.TestCase):
         self.assertNotIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
         self.controller._Controller__lftp.kill.assert_not_called()
 
+    def test_process_commands_stop_allows_running_get_without_pget_sidecar(self):
+        model_builder = ModelBuilder()
+        model_builder.set_remote_files([SystemFile("example", 100, False)])
+        local_file = SystemFile("example", 10, False, is_staging=True)
+        local_file.status_sidecar_ready = False
+        model_builder.set_local_files([local_file])
+        get_status = LftpJobStatus(
+            0, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "example", "",
+        )
+        get_status.total_transfer_state = LftpJobStatus.TransferState(10, 100, 10, 100, 10)
+        model_builder.set_lftp_statuses([get_status])
+        self.controller._Controller__model = model_builder.build_model()
+        self.controller._Controller__lftp.kill.return_value = True
+
+        command = Controller.Command(Controller.Command.Action.STOP, "example")
+        callback = MagicMock()
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        callback.on_success.assert_called_once_with()
+        self.controller._Controller__lftp.kill.assert_called_once()
+
     def test_process_commands_stop_uses_current_active_scan_readiness_when_model_flag_lags(self):
         file = ModelFile("example", False)
         file.state = ModelFile.State.DOWNLOADING
@@ -5559,6 +5622,229 @@ class TestController(unittest.TestCase):
 
         self.assertEqual(2, self.controller._Controller__lftp.queue.call_count)
 
+    def test_resume_source_binding_waits_for_running_get_or_pget_status(self):
+        file = ModelFile("resume.bin", False)
+        self.controller._Controller__persist.resume_source_identities = {}
+        self.controller._Controller__pending_queue_dispatches = {}
+        self.controller._Controller__pending_queue_dispatches[file.file_id] = PendingQueueDispatch(
+            0.0, file.name, None, False, 1, (100, 1700000000),
+        )
+
+        # A fresh idle handoff never authorizes a pre-existing map; it only
+        # transfers completion ownership to the updater.
+        self.assertEqual(
+            {(file.name, None, None)},
+            self.controller._reconcile_pending_queue_dispatches_from_fresh_status(set()),
+        )
+        self.assertEqual({}, self.controller._Controller__persist.resume_source_identities)
+        self.controller._Controller__pending_queue_dispatches[file.file_id] = PendingQueueDispatch(
+            0.0, file.name, None, False, 1, (100, 1700000000),
+        )
+
+        queued_status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, file.name, "/remote/resume.bin",
+        )
+        self.controller._reconcile_pending_queue_dispatches_from_fresh_status([queued_status])
+        self.assertIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+        self.assertEqual({}, self.controller._Controller__persist.resume_source_identities)
+
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file.name, "/remote/resume.bin",
+        )
+        self.controller._reconcile_pending_queue_dispatches_from_fresh_status([status])
+
+        self.assertEqual({file.file_id: (100, 1700000000)},
+                         self.controller._Controller__persist.resume_source_identities)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+
+    def test_raw_queued_status_keeps_identityless_dispatch_until_idle_or_running(self):
+        file_dispatches = {
+            ModelFile.build_file_id("file", None): PendingQueueDispatch(
+                0.0, "file", None, False, 1,
+            ),
+            ModelFile.build_file_id("directory", "pair-a"): PendingQueueDispatch(
+                0.0, "directory", "pair-a", True, 2,
+            ),
+        }
+        self.controller._Controller__pending_queue_dispatches = file_dispatches
+        queued_statuses = [
+            LftpJobStatus(
+                1, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED,
+                "file", "/remote/file",
+            ),
+            LftpJobStatus(
+                2, LftpJobStatus.Type.GET, LftpJobStatus.State.QUEUED,
+                "directory", "/remote/directory",
+            ),
+        ]
+
+        self.assertEqual(set(), self.controller._reconcile_pending_queue_dispatches_from_fresh_status(queued_statuses))
+        self.assertEqual(file_dispatches, self.controller._Controller__pending_queue_dispatches)
+
+        retired = self.controller._reconcile_pending_queue_dispatches_from_fresh_status([])
+
+        self.assertEqual({("file", None, None), ("directory", "pair-a", None)}, retired)
+        self.assertEqual({}, self.controller._Controller__pending_queue_dispatches)
+
+    def test_fresh_idle_queue_handoff_preserves_scoped_directory_identity_without_binding(self):
+        file_dispatches = {
+            ModelFile.build_file_id("file", None): PendingQueueDispatch(0.0, "file", None, False, 1),
+            ModelFile.build_file_id("directory", "pair-a"): PendingQueueDispatch(
+                0.0, "directory", "pair-a", True, 2,
+            ),
+        }
+        self.controller._Controller__pending_queue_dispatches = file_dispatches
+        self.controller._Controller__persist.resume_source_identities = {}
+
+        retired = self.controller._reconcile_pending_queue_dispatches_from_fresh_status([])
+
+        self.assertEqual({("file", None, None), ("directory", "pair-a", None)}, retired)
+        self.assertEqual({}, self.controller._Controller__pending_queue_dispatches)
+        self.assertEqual({}, self.controller._Controller__persist.resume_source_identities)
+
+    def test_fresh_idle_accepted_queue_future_handoffs_completion_identity(self):
+        file = ModelFile("accepted-queue", False)
+        future = Future()
+        future.set_result(None)
+        self.controller._Controller__pending_queue_dispatches = {
+            file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
+        }
+        self.controller._Controller__lftp_operations = [
+            _LftpOperation("queue", future, file.file_id, 1),
+        ]
+
+        retired = self.controller._reconcile_pending_queue_dispatches_from_fresh_status([])
+
+        self.assertEqual({(file.name, None, None)}, retired)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+
+    def test_fresh_idle_failed_or_cancelled_queue_dispatch_does_not_handoff_completion(self):
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled):
+                file = ModelFile("failed-queue", False)
+                future = Future()
+                if cancelled:
+                    future.cancel()
+                else:
+                    future.set_exception(LftpError("queue failed"))
+                self.controller._Controller__pending_queue_dispatches = {
+                    file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
+                }
+                self.controller._Controller__lftp_operations = [
+                    _LftpOperation("queue", future, file.file_id, 1),
+                ]
+
+                retired = self.controller._reconcile_pending_queue_dispatches_from_fresh_status([])
+
+                self.assertEqual(set(), retired)
+                self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+
+    def test_resume_source_identity_requires_exact_size_and_portable_mtime(self):
+        file_id = ModelFile.build_file_id("resume.bin", "pair-a")
+        self.controller._Controller__persist.resume_source_identities = {
+            file_id: (100, 1700000000),
+        }
+
+        self.assertTrue(self.controller._Controller__allow_file_resume(file_id, False, (100, 1700000000)))
+        self.assertFalse(self.controller._Controller__allow_file_resume(file_id, False, (101, 1700000000)))
+        self.assertFalse(self.controller._Controller__allow_file_resume(file_id, False, (100, 1700000001)))
+        self.assertFalse(self.controller._Controller__allow_file_resume(file_id, False, None))
+
+    def test_resume_source_cleanup_retains_staging_artifacts_and_clears_after_removal(self):
+        file_id = ModelFile.build_file_id("resume.bin", None)
+        self.controller._Controller__persist.resume_source_identities = {file_id: (100, 1700000000)}
+        with tempfile.TemporaryDirectory() as staging_path:
+            self.controller._Controller__staging_path = staging_path
+            target = os.path.join(staging_path, "resume.bin.lftp")
+            Path(target).touch()
+
+            self.controller._Controller__clear_resume_source_if_staging_absent(file_id, "resume.bin", None)
+            self.assertIn(file_id, self.controller._Controller__persist.resume_source_identities)
+
+            os.unlink(target)
+            self.controller._Controller__clear_resume_source_if_staging_absent(file_id, "resume.bin", None)
+            self.assertNotIn(file_id, self.controller._Controller__persist.resume_source_identities)
+
+    def test_queue_passes_matching_resume_identity_to_lftp(self):
+        file = ModelFile("resume.bin", False)
+        file.remote_size = 100
+        identity = (100, 1700000000)
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__model_builder.get_remote_resume_source_identity.return_value = identity
+        self.controller._Controller__persist.resume_source_identities = {file.file_id: identity}
+        self.controller._Controller__lftp.backend_name = "lftp"
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+        self.assertTrue(self.controller._Controller__lftp.queue.call_args.kwargs["allow_resume"])
+
+    def test_queue_disables_resume_for_same_size_mtime_drift(self):
+        file = ModelFile("resume.bin", False)
+        file.remote_size = 100
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__model_builder.get_remote_resume_source_identity.return_value = (100, 1700000001)
+        self.controller._Controller__persist.resume_source_identities = {file.file_id: (100, 1700000000)}
+        self.controller._Controller__lftp.backend_name = "lftp"
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+        self.assertFalse(self.controller._Controller__lftp.queue.call_args.kwargs["allow_resume"])
+
+    def test_queue_bootstraps_legacy_sidecarless_resume_from_confirmed_start(self):
+        file = ModelFile("resume.bin", False)
+        file.remote_size = 100
+        identity = (100, 1700000000)
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__model_builder.get_remote_resume_source_identity.return_value = identity
+        self.controller._Controller__persist.resume_source_identities = {}
+        self.controller._Controller__persist.downloaded_timestamps = {file.file_id: 1700000001.0}
+        self.controller._Controller__lftp.backend_name = "lftp"
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+        queue_kwargs = self.controller._Controller__lftp.queue.call_args.kwargs
+        self.assertFalse(queue_kwargs["allow_resume"])
+        self.assertTrue(queue_kwargs["allow_legacy_get_resume"])
+        self.assertEqual(100, queue_kwargs["expected_size"])
+
+    def test_legacy_resume_bootstrap_rejects_newer_source_or_invalid_start_timestamp(self):
+        file_id = ModelFile.build_file_id("resume.bin", "pair-a")
+        self.controller._Controller__persist.resume_source_identities = {}
+        self.controller._Controller__persist.downloaded_timestamps = {file_id: 1700000000.0}
+
+        self.assertFalse(self.controller._Controller__allow_legacy_file_resume(
+            file_id, False, (100, 1700000001),
+        ))
+        self.controller._Controller__persist.downloaded_timestamps[file_id] = float("nan")
+        self.assertFalse(self.controller._Controller__allow_legacy_file_resume(
+            file_id, False, (100, 1700000000),
+        ))
+
+    def test_failed_fresh_queue_never_commits_resume_source_binding(self):
+        file = ModelFile("resume.bin", False)
+        self.controller._Controller__persist.resume_source_identities = {}
+        self.controller._Controller__pending_queue_dispatches = {
+            file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1, (100, 1700000001)),
+        }
+        failed = Future()
+        failed.set_exception(LftpError("Cannot safely restart a changed remote file while a local partial exists"))
+        self.controller._Controller__lftp_operations = [
+            _LftpOperation("queue", failed, file.file_id, 1),
+        ]
+        self.controller._Controller__lftp_operation_sequences = {file.file_id: 1}
+        self.controller._Controller__lftp_failed_operation_sequences = set()
+
+        self.controller._Controller__drain_lftp_operations()
+
+        self.assertEqual({}, self.controller._Controller__persist.resume_source_identities)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+
     def test_process_commands_queue_pending_guard_clears_when_file_is_missing(self):
         file = ModelFile("removed", False)
         file.remote_size = 10
@@ -5589,7 +5875,7 @@ class TestController(unittest.TestCase):
 
         self.assertEqual(2, self.controller._Controller__lftp.queue.call_count)
 
-    def test_process_commands_queue_fresh_empty_before_deadline_keeps_pending_guard(self):
+    def test_process_commands_queue_fresh_idle_handoff_releases_pending_guard(self):
         file = ModelFile("fresh-empty", False)
         file.remote_size = 10
         self.controller._Controller__model.get_file.return_value = file
@@ -5600,7 +5886,7 @@ class TestController(unittest.TestCase):
         self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
         self.controller._Controller__process_commands()
 
-        self.controller._Controller__lftp.queue.assert_called_once()
+        self.assertEqual(2, self.controller._Controller__lftp.queue.call_count)
 
     def test_process_commands_queue_fresh_empty_then_active_clears_retry_eligibility(self):
         file = ModelFile("eventually-active", False)
@@ -6347,6 +6633,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__persist.move_failure_counts = {file.file_id: 4}
         self.controller._Controller__persist.downloaded_file_names = {file.file_id}
         self.controller._Controller__persist.downloaded_timestamps = {file.file_id: 123.0}
+        self.controller._Controller__persist.resume_source_identities = {file.file_id: (137, 123)}
         self.controller._Controller__pending_completion_file_names = {
             (file.name, file.path_pair_id, "lftp")
         }
@@ -6390,6 +6677,7 @@ class TestController(unittest.TestCase):
         self.assertEqual({}, self.controller._Controller__persist.move_failure_counts)
         self.assertEqual({file.file_id}, self.controller._Controller__persist.downloaded_file_names)
         self.assertEqual({file.file_id: 123.0}, self.controller._Controller__persist.downloaded_timestamps)
+        self.assertEqual({}, self.controller._Controller__persist.resume_source_identities)
         self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
         self.assertEqual({}, self.controller._Controller__pending_completion_progress_floors)
         self.assertEqual(set(), self.controller._Controller__successful_final_move_handoff_file_ids)
@@ -10190,9 +10478,9 @@ class TestController(unittest.TestCase):
     def test_recover_interrupted_downloads_requeues_single_path_temp_file(self):
         self.controller._Controller__persist.downloaded_file_names = set()
 
-        remote_file = SimpleNamespace(name="movie.mkv", path_pair_id=None)
+        remote_file = SimpleNamespace(name="movie.mkv", path_pair_id=None, is_dir=False)
         with patch("controller.controller.os.listdir", return_value=["movie.mkv.lftp"]), \
-                patch("controller.controller.os.path.isdir", return_value=False):
+                patch.object(Controller, "_Controller__safe_recovery_staging_entry", side_effect=lambda root, name, _is_dir: os.path.join(root, name)):
             self.controller._Controller__recover_interrupted_downloads([remote_file])
 
         self.assertTrue(self.controller._Controller__startup_recovery_done)
@@ -10215,9 +10503,9 @@ class TestController(unittest.TestCase):
             release.wait(2)
 
         self.controller._Controller__lftp.queue.side_effect = blocking_queue
-        remote_file = SimpleNamespace(name="movie.mkv", path_pair_id=None)
+        remote_file = SimpleNamespace(name="movie.mkv", path_pair_id=None, is_dir=False)
         with patch("controller.controller.os.listdir", return_value=["movie.mkv.lftp"]), \
-                patch("controller.controller.os.path.isdir", return_value=False):
+                patch.object(Controller, "_Controller__safe_recovery_staging_entry", side_effect=lambda root, name, _is_dir: os.path.join(root, name)):
             started_at = time.monotonic()
             self.controller._Controller__recover_interrupted_downloads([remote_file])
 
@@ -10227,6 +10515,142 @@ class TestController(unittest.TestCase):
         self.assertIn(file_id, self.controller._Controller__pending_queue_dispatches)
         release.set()
         self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+    def test_recovery_async_queue_abandons_pre_queue_idle_status_for_post_queue_poll(self):
+        class TrackingFuture(Future):
+            def __init__(self):
+                super().__init__()
+                self.result_calls = 0
+
+            def result(self, timeout=None):
+                self.result_calls += 1
+                return super().result(timeout)
+
+        self.controller._Controller__persist.downloaded_file_names = set()
+        self.controller._Controller__lftp.backend_name = "lftp"
+        stale_status = TrackingFuture()
+        stale_status.set_result(([], True))
+        self.controller._Controller__lftp_status_future = stale_status
+        self.controller._Controller__lftp_idle_status_authoritative = True
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(minutes=1)
+        queued = threading.Event()
+        release = threading.Event()
+
+        def blocking_queue(*_args, **_kwargs):
+            queued.set()
+            release.wait(2)
+
+        self.controller._Controller__lftp.queue.side_effect = blocking_queue
+        self.controller._Controller__lftp.status.return_value = []
+        remote_file = SimpleNamespace(name="movie.mkv", path_pair_id=None, is_dir=False)
+        with patch("controller.controller.os.listdir", return_value=["movie.mkv.lftp"]), \
+                patch.object(Controller, "_Controller__safe_recovery_staging_entry", side_effect=lambda root, name, _is_dir: os.path.join(root, name)):
+            self.controller._Controller__recover_interrupted_downloads([remote_file])
+
+        self.assertTrue(queued.wait(1))
+        self.assertIsNone(self.controller._Controller__lftp_status_future)
+        self.assertIsNone(self.controller._Controller__next_lftp_status_poll_at)
+        self.assertFalse(self.controller._Controller__lftp_idle_status_authoritative)
+        self.assertEqual(0, stale_status.result_calls)
+        self.assertIsNone(self.controller._get_lftp_status_snapshot())
+        release.set()
+        deadline = time.monotonic() + 1
+        snapshot = None
+        while snapshot is None and time.monotonic() < deadline:
+            snapshot = self.controller._get_lftp_status_snapshot()
+            if snapshot is None:
+                time.sleep(0.01)
+        self.assertEqual(([], True), snapshot)
+        self.assertEqual(1, self.controller._Controller__lftp.status.call_count)
+        self.assertEqual(0, stale_status.result_calls)
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+    def test_recover_interrupted_downloads_bootstraps_legacy_sidecarless_partial(self):
+        self.controller._Controller__persist.downloaded_file_names = set()
+        self.controller._Controller__lftp.backend_name = "lftp"
+        remote_file = SystemFile("movie.mkv", 100, False, mtime_ns=1700000000000000000)
+        self.controller._Controller__persist.downloaded_timestamps = {
+            ModelFile.build_file_id(remote_file.name, remote_file.path_pair_id): 1700000001.0,
+        }
+
+        with patch("controller.controller.os.listdir", return_value=["movie.mkv.lftp"]), \
+                patch.object(Controller, "_Controller__safe_recovery_staging_entry", side_effect=lambda root, name, _is_dir: os.path.join(root, name)):
+            self.controller._Controller__recover_interrupted_downloads([remote_file])
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+        queue_kwargs = self.controller._Controller__lftp.queue.call_args.kwargs
+        self.assertFalse(queue_kwargs["allow_resume"])
+        self.assertTrue(queue_kwargs["allow_legacy_get_resume"])
+        self.assertEqual(100, queue_kwargs["expected_size"])
+
+    def test_recover_interrupted_downloads_discovers_qualifying_legacy_direct_partial(self):
+        self.controller._Controller__lftp.backend_name = "lftp"
+        remote_file = SystemFile("movie.mkv", 100, False, mtime_ns=1700000000000000000)
+        self.controller._Controller__persist.downloaded_timestamps = {
+            ModelFile.build_file_id(remote_file.name, None): 1700000001.0,
+        }
+        with tempfile.TemporaryDirectory() as staging_path, tempfile.TemporaryDirectory() as final_path:
+            Path(os.path.join(staging_path, remote_file.name)).write_bytes(b"partial")
+            self.controller._Controller__staging_path = staging_path
+            self.controller._Controller__legacy_local_path = final_path
+
+            self.controller._Controller__recover_interrupted_downloads([remote_file])
+            self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+        queue_kwargs = self.controller._Controller__lftp.queue.call_args.kwargs
+        self.assertTrue(queue_kwargs["allow_legacy_get_resume"])
+        self.assertEqual(100, queue_kwargs["expected_size"])
+
+    def test_recover_interrupted_downloads_rejects_ambiguous_legacy_direct_and_temp_partials(self):
+        self.controller._Controller__lftp.backend_name = "lftp"
+        remote_file = SystemFile("movie.mkv", 100, False, mtime_ns=1700000000000000000)
+        self.controller._Controller__persist.downloaded_timestamps = {
+            ModelFile.build_file_id(remote_file.name, None): 1700000001.0,
+        }
+        with tempfile.TemporaryDirectory() as staging_path, tempfile.TemporaryDirectory() as final_path:
+            Path(os.path.join(staging_path, remote_file.name)).write_bytes(b"partial")
+            Path(os.path.join(staging_path, remote_file.name + ".lftp")).write_bytes(b"partial")
+            self.controller._Controller__staging_path = staging_path
+            self.controller._Controller__legacy_local_path = final_path
+
+            self.controller._Controller__recover_interrupted_downloads([remote_file])
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+
+    def test_recover_interrupted_downloads_does_not_queue_direct_partial_with_status_map(self):
+        self.controller._Controller__lftp.backend_name = "lftp"
+        remote_file = SystemFile("movie.mkv", 100, False, mtime_ns=1700000000000000000)
+        self.controller._Controller__persist.downloaded_timestamps = {
+            ModelFile.build_file_id(remote_file.name, None): 1700000001.0,
+        }
+        with tempfile.TemporaryDirectory() as staging_path, tempfile.TemporaryDirectory() as final_path:
+            target = os.path.join(staging_path, remote_file.name)
+            Path(target).write_bytes(b"unknown-partial")
+            Path(target + ".lftp-pget-status").write_text("size=100\n0.pos=bad\n")
+            self.controller._Controller__staging_path = staging_path
+            self.controller._Controller__legacy_local_path = final_path
+
+            self.controller._Controller__recover_interrupted_downloads([remote_file])
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+        self.assertEqual({}, getattr(self.controller, "_Controller__pending_queue_dispatches", {}))
+
+    def test_recover_interrupted_downloads_reloads_unscoped_resume_source_binding(self):
+        remote_file = SystemFile("movie.mkv", 100, False, mtime_ns=1700000000000000000)
+        file_id = ModelFile.build_file_id(remote_file.name, None)
+        persisted = ControllerPersist()
+        persisted.resume_source_identities = {file_id: (100, 1700000000)}
+        self.controller._Controller__persist = ControllerPersist.from_str(persisted.to_str())
+        self.controller._Controller__lftp.backend_name = "lftp"
+
+        with patch("controller.controller.os.listdir", return_value=["movie.mkv.lftp"]), \
+                patch.object(Controller, "_Controller__safe_recovery_staging_entry", side_effect=lambda root, name, _is_dir: os.path.join(root, name)):
+            self.controller._Controller__recover_interrupted_downloads([remote_file])
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+        queue_kwargs = self.controller._Controller__lftp.queue.call_args.kwargs
+        self.assertTrue(queue_kwargs["allow_resume"])
+        self.assertEqual(100, queue_kwargs["expected_size"])
 
     def test_recover_interrupted_downloads_skips_previously_downloaded_path_pair_file(self):
         file_id = ModelFile.build_file_id("dup.mkv", "movies")
@@ -10238,9 +10662,9 @@ class TestController(unittest.TestCase):
             "movies": "/local/movies/incomplete"
         }
 
-        remote_file = SimpleNamespace(name="dup.mkv", path_pair_id="movies")
+        remote_file = SimpleNamespace(name="dup.mkv", path_pair_id="movies", is_dir=False)
         with patch("controller.controller.os.listdir", return_value=["dup.mkv.lftp"]), \
-                patch("controller.controller.os.path.isdir", return_value=False):
+                patch.object(Controller, "_Controller__safe_recovery_staging_entry", side_effect=lambda root, name, _is_dir: os.path.join(root, name)):
             self.controller._Controller__recover_interrupted_downloads([remote_file])
 
         self.controller._Controller__lftp.queue.assert_not_called()
@@ -10259,8 +10683,8 @@ class TestController(unittest.TestCase):
         }
 
         remote_files = [
-            SimpleNamespace(name="dup.mkv", path_pair_id="movies"),
-            SimpleNamespace(name="dup.mkv", path_pair_id="tv")
+            SimpleNamespace(name="dup.mkv", path_pair_id="movies", is_dir=False),
+            SimpleNamespace(name="dup.mkv", path_pair_id="tv", is_dir=False)
         ]
 
         def listdir_side_effect(path):
@@ -10271,7 +10695,7 @@ class TestController(unittest.TestCase):
             raise AssertionError(path)
 
         with patch("controller.controller.os.listdir", side_effect=listdir_side_effect), \
-                patch("controller.controller.os.path.isdir", return_value=False):
+                patch.object(Controller, "_Controller__safe_recovery_staging_entry", side_effect=lambda root, name, _is_dir: os.path.join(root, name)):
             self.controller._Controller__recover_interrupted_downloads(remote_files)
 
         self.controller._Controller__lftp.queue.assert_called_once_with(
@@ -10292,7 +10716,7 @@ class TestController(unittest.TestCase):
             "movies": "/local/movies/incomplete"
         }
 
-        remote_file = SimpleNamespace(name="season1", path_pair_id="movies")
+        remote_file = SimpleNamespace(name="season1", path_pair_id="movies", is_dir=True)
 
         def listdir_side_effect(path):
             if path == "/local/movies/incomplete":
@@ -10302,7 +10726,7 @@ class TestController(unittest.TestCase):
             raise AssertionError(path)
 
         with patch("controller.controller.os.listdir", side_effect=listdir_side_effect), \
-                patch("controller.controller.os.path.isdir", side_effect=lambda path: path.endswith("season1")):
+                patch.object(Controller, "_Controller__safe_recovery_staging_entry", side_effect=lambda root, name, _is_dir: os.path.join(root, name)):
             self.controller._Controller__recover_interrupted_downloads([remote_file])
 
         self.controller._Controller__lftp.queue.assert_called_once_with(
@@ -10312,6 +10736,66 @@ class TestController(unittest.TestCase):
             local_base_dir_path="/local/movies/incomplete",
             exclude_patterns="*.nfo,Sample/"
         )
+
+    def test_recover_interrupted_downloads_rejects_staging_directory_symlink(self):
+        """Recovery must never traverse a directory artifact outside staging."""
+        remote_file = SystemFile("sample-directory", 0, True)
+        with tempfile.TemporaryDirectory() as staging_path, \
+                tempfile.TemporaryDirectory() as outside_path, \
+                tempfile.TemporaryDirectory() as final_path:
+            outside_directory = os.path.join(outside_path, remote_file.name)
+            os.mkdir(outside_directory)
+            Path(os.path.join(outside_directory, "part.lftp")).write_bytes(b"partial")
+            os.symlink(outside_directory, os.path.join(staging_path, remote_file.name))
+            self.controller._Controller__staging_path = staging_path
+            self.controller._Controller__legacy_local_path = final_path
+
+            self.controller._Controller__recover_interrupted_downloads([remote_file])
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+        self.assertEqual({}, getattr(self.controller, "_Controller__pending_queue_dispatches", {}))
+
+    def test_recovery_staging_entry_rejects_windows_reparse_directory(self):
+        root_stat = SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=0)
+        reparse_stat = SimpleNamespace(
+            st_mode=stat.S_IFDIR,
+            st_file_attributes=getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400),
+        )
+        with patch.object(
+                Controller, "_Controller__safe_final_move_candidate", return_value="C:\\staging\\sample-directory",
+        ), patch("controller.controller.os.lstat", side_effect=[root_stat, reparse_stat]):
+            self.assertIsNone(Controller._Controller__safe_recovery_staging_entry(
+                "C:\\staging", "sample-directory", True,
+            ))
+
+    def test_recover_interrupted_downloads_rejects_directory_remote_type_mismatch(self):
+        remote_file = SystemFile("sample-directory", 10, False)
+        with tempfile.TemporaryDirectory() as staging_path, tempfile.TemporaryDirectory() as final_path:
+            directory_path = os.path.join(staging_path, remote_file.name)
+            os.mkdir(directory_path)
+            Path(os.path.join(directory_path, "part.lftp")).write_bytes(b"partial")
+            self.controller._Controller__staging_path = staging_path
+            self.controller._Controller__legacy_local_path = final_path
+
+            self.controller._Controller__recover_interrupted_downloads([remote_file])
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+
+    def test_recover_interrupted_downloads_rechecks_artifact_before_queue(self):
+        remote_file = SystemFile("sample-file.bin", 10, False)
+        with tempfile.TemporaryDirectory() as staging_path, tempfile.TemporaryDirectory() as final_path:
+            entry_path = os.path.join(staging_path, remote_file.name + ".lftp")
+            Path(entry_path).write_bytes(b"partial")
+            self.controller._Controller__staging_path = staging_path
+            self.controller._Controller__legacy_local_path = final_path
+            with patch.object(
+                    Controller,
+                    "_Controller__safe_recovery_staging_entry",
+                    side_effect=[entry_path, None],
+            ):
+                self.controller._Controller__recover_interrupted_downloads([remote_file])
+
+        self.controller._Controller__lftp.queue.assert_not_called()
 
     def test_process_commands_queue_records_sanitized_boundary_breadcrumb(self):
         file = ModelFile("dup", False)
@@ -10465,9 +10949,9 @@ class TestController(unittest.TestCase):
                 return SimpleNamespace(st_size=64, st_mtime=222)
             raise OSError(path)
 
-        remote_file = SimpleNamespace(name="movie.mkv", path_pair_id=None)
+        remote_file = SimpleNamespace(name="movie.mkv", path_pair_id=None, is_dir=False)
         with patch("controller.controller.os.listdir", return_value=["movie.mkv.lftp"]), \
-                patch("controller.controller.os.path.isdir", return_value=False), \
+                patch.object(Controller, "_Controller__safe_recovery_staging_entry", side_effect=lambda root, name, _is_dir: os.path.join(root, name)), \
                 patch("controller.controller.os.stat", side_effect=stat_side_effect):
             self.controller._Controller__recover_interrupted_downloads([remote_file])
 

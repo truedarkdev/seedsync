@@ -13,6 +13,7 @@ class LftpJobStatus:
     class Type(Enum):
         MIRROR = "mirror"
         PGET = "pget"
+        GET = "get"
 
     class State(Enum):
         QUEUED = 0

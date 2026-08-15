@@ -3,6 +3,7 @@
 import logging
 import re
 import os
+import stat
 import time
 from functools import wraps
 from typing import Any, Callable, Union, List, Optional, Dict, Iterable, Concatenate, ParamSpec, Protocol, TypeVar
@@ -77,6 +78,8 @@ class Lftp:
     __SET_CMD_SAVE_CWD = "cmd:save-cwd-history"
     __INITIAL_PROMPT_PATTERN = r"lftp.*>[ \t]*"
     __PASSWORD_RESPONSE_PATTERN = r"(?im)^(?:password:|\S+@\S+'s password:)[ \t]*\Z"
+    __PGET_STATUS_FILE_SUFFIX = ".lftp-pget-status"
+    __LFTP_TEMP_FILE_SUFFIX = ".lftp"
 
     @staticmethod
     def __has_valid_umask() -> bool:
@@ -585,6 +588,7 @@ class Lftp:
     @staticmethod
     def __detect_errors_from_output(out: str) -> bool:
         errors = [
+            "get: Access failed",
             "pget: Access failed",
             "pget-chunk: Access failed",
             "mirror: Access failed",
@@ -838,23 +842,19 @@ class Lftp:
     def __annotate_status_path_pairs(self, statuses: List[LftpJobStatus]):
         if not self.__path_pairs_by_id:
             return
-        sorted_pairs = sorted(
-            self.__path_pairs_by_id.items(),
-            key=lambda item: max(len(item[1]["remote_path"]), len(item[1]["local_path"])),
-            reverse=True
-        )
         for status in statuses:
-            match = next((
-                (pair_id, pair) for pair_id, pair in sorted_pairs
-                if self.__status_matches_paths(
-                    status,
-                    pair["remote_path"],
-                    pair["local_path"]
-                )
-            ), None)
-            if match is None:
+            remote_matches = {
+                pair_id for pair_id, pair in self.__path_pairs_by_id.items()
+                if Lftp.__path_is_within(status.remote_path, pair["remote_path"])
+            }
+            local_matches = {
+                pair_id for pair_id, pair in self.__path_pairs_by_id.items()
+                if Lftp.__path_is_within(status.local_path, pair["local_path"])
+            }
+            if len(remote_matches) != 1 or remote_matches != local_matches:
                 continue
-            pair_id, pair = match
+            pair_id = next(iter(remote_matches))
+            pair = self.__path_pairs_by_id[pair_id]
             status.path_pair_id = pair_id
             status.path_pair_name = pair["name"]
 
@@ -878,14 +878,281 @@ class Lftp:
     def __status_matches_paths(status: LftpJobStatus, remote_root: str, local_root: str) -> bool:
         remote_matches = Lftp.__path_is_within(status.remote_path, remote_root)
         local_matches = Lftp.__path_is_within(status.local_path, local_root)
-        return remote_matches or local_matches
+        return remote_matches and local_matches
+
+    @classmethod
+    def __file_resume_artifacts(
+            cls, local_dir: str, name: str, expected_size: Optional[int] = None,
+    ) -> tuple[bool, bool]:
+        """Return (one target exists, it has a valid matching pget map).
+
+        LFTP's multi-connection pget resume requires the segment map beside the
+        target.  This snapshot is intentionally non-mutating: a map is either
+        valid and authorizes pget, absent and authorizes contiguous get, or it
+        is unsafe and fails before queueing.  Both the direct and historical
+        ``.lftp`` forms are inspected so an ambiguous artifact cannot fall
+        through to get -c.
+        """
+        local_root, target_paths = cls.__file_artifact_paths(local_dir, name)
+        targets: list[tuple[str, Optional[str]]] = []
+        status_paths: list[str] = []
+        for target_path, status_path in target_paths:
+            if not cls.__is_lexically_and_really_contained(target_path, local_root):
+                raise LftpError("LFTP queue target is outside the local directory")
+            status_paths.append(status_path)
+            if not cls.__is_lexically_and_really_contained(status_path, local_root):
+                # The only ordinary reason a derived sibling escapes the
+                # resolved root is that it is a link/reparse point. Do not
+                # follow it or downgrade it to a get resume.
+                raise LftpError("LFTP queue status sidecar is unsafe; use Delete Local before Queue")
+            try:
+                target_info = os.stat(target_path, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise LftpError("LFTP queue target is unsafe; use Delete Local before Queue") from error
+            if cls.__is_link_or_reparse(target_path, target_info):
+                raise LftpError("LFTP queue target must be a regular file")
+            if not stat.S_ISREG(target_info.st_mode):
+                raise LftpError("LFTP queue target must be a regular file")
+            try:
+                status_info = os.stat(status_path, follow_symlinks=False)
+            except FileNotFoundError:
+                status_path = None
+            except OSError as error:
+                raise LftpError("LFTP queue status sidecar is unsafe; use Delete Local before Queue") from error
+            targets.append((target_path, status_path))
+
+        for status_path in status_paths:
+            if any(target_status_path == status_path for _, target_status_path in targets):
+                continue
+            try:
+                os.stat(status_path, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise LftpError("LFTP queue status sidecar is unsafe; use Delete Local before Queue") from error
+            raise LftpError("LFTP queue status sidecar is an orphan; use Delete Local before Queue")
+
+        if not targets:
+            return False, False
+        if len(targets) != 1:
+            raise LftpError("LFTP queue has ambiguous local partial artifacts; use Delete Local before Queue")
+
+        _, status_path = targets[0]
+        if status_path is None:
+            return True, False
+        try:
+            status_info = os.stat(status_path, follow_symlinks=False)
+        except OSError as error:
+            raise LftpError("LFTP queue status sidecar is unsafe; use Delete Local before Queue") from error
+        if cls.__is_link_or_reparse(status_path, status_info) or not stat.S_ISREG(status_info.st_mode):
+            raise LftpError("LFTP queue status sidecar is unsafe; use Delete Local before Queue")
+        if not cls.__is_valid_pget_status_file(status_path):
+            raise LftpError("LFTP queue status sidecar is invalid; use Delete Local before Queue")
+        if type(expected_size) is int and expected_size >= 0 and \
+                cls.__pget_status_file_size(status_path) != expected_size:
+            raise LftpError("LFTP queue status sidecar is stale; use Delete Local before Queue")
+        return True, True
+
+    @classmethod
+    def get_safe_file_artifact_delete_paths(cls, local_dir: str, name: str) -> tuple[str, ...]:
+        """Return app-owned exact file/map paths that Delete Local may remove.
+
+        This is deliberately distinct from queue resume validation: malformed
+        maps are unsafe to resume, but a regular malformed map is safe for the
+        user-authorized Delete Local repair to remove.  More than one direct or
+        historical-temp form is ambiguous and remains fail-closed.
+        """
+        cls.__validate_queue_name(name)
+        local_root, target_paths = cls.__file_artifact_paths(local_dir, name)
+        try:
+            root_info = os.lstat(local_root)
+        except OSError as error:
+            raise LftpError("Delete Local staging directory is unsafe") from error
+        if cls.__is_link_or_reparse(local_root, root_info) or not stat.S_ISDIR(root_info.st_mode):
+            raise LftpError("Delete Local staging directory is unsafe")
+
+        forms: list[tuple[str, ...]] = []
+        for target_path, status_path in target_paths:
+            existing: list[str] = []
+            for path in (target_path, status_path):
+                if not cls.__is_lexically_and_really_contained(path, local_root):
+                    raise LftpError("Delete Local staging artifact is unsafe")
+                try:
+                    info = os.lstat(path)
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise LftpError("Delete Local staging artifact is unsafe") from error
+                if cls.__is_link_or_reparse(path, info) or not stat.S_ISREG(info.st_mode):
+                    raise LftpError("Delete Local staging artifact is unsafe")
+                existing.append(path)
+            if existing:
+                forms.append(tuple(existing))
+        if len(forms) > 1:
+            raise LftpError("Delete Local has ambiguous local partial artifacts")
+        return forms[0] if forms else ()
+
+    @classmethod
+    def __file_artifact_paths(cls, local_dir: str, name: str) -> tuple[str, tuple[tuple[str, str], ...]]:
+        local_root = os.path.abspath(os.path.normpath(local_dir))
+        targets = (
+            os.path.join(local_root, name),
+            os.path.join(local_root, name + cls.__LFTP_TEMP_FILE_SUFFIX),
+        )
+        return local_root, tuple((target, target + cls.__PGET_STATUS_FILE_SUFFIX) for target in targets)
+
+    @staticmethod
+    def __pget_status_file_size(status_path: str) -> Optional[int]:
+        try:
+            with open(status_path, "r", encoding="utf-8") as handle:
+                first_line = handle.readline().strip()
+        except (OSError, UnicodeError):
+            return None
+        match = re.fullmatch(r"size=(\d+)", first_line)
+        return int(match.group(1)) if match is not None else None
+
+    @classmethod
+    def __allow_legacy_get_resume(cls, local_dir: str, name: str, expected_size: int) -> bool:
+        """Verify the physical constraints for a v0.9.2 contiguous upgrade.
+
+        This is intentionally narrower than ordinary sidecarless get -c: a
+        legacy timestamp cannot bind pget's non-contiguous segment map.  One
+        contained regular target, no status map, and a bounded partial are the
+        minimum physical evidence required before asking LFTP to continue it.
+        """
+        if type(expected_size) is not int or expected_size < 0:
+            raise LftpError("Legacy resume requires a valid remote size")
+        local_root = os.path.abspath(os.path.normpath(local_dir))
+        targets: list[os.stat_result] = []
+        for target_path in (
+                os.path.join(local_root, name),
+                os.path.join(local_root, name + cls.__LFTP_TEMP_FILE_SUFFIX),
+        ):
+            status_path = target_path + cls.__PGET_STATUS_FILE_SUFFIX
+            if not cls.__is_lexically_and_really_contained(target_path, local_root) or \
+                    not cls.__is_lexically_and_really_contained(status_path, local_root):
+                raise LftpError("LFTP legacy resume target is outside the local directory")
+            try:
+                status_info = os.stat(status_path, follow_symlinks=False)
+            except FileNotFoundError:
+                status_info = None
+            except OSError as error:
+                raise LftpError("LFTP legacy resume status sidecar is unsafe") from error
+            if status_info is not None:
+                raise LftpError("Cannot migrate a legacy partial with an LFTP pget status map")
+            try:
+                target_info = os.stat(target_path, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise LftpError("LFTP legacy resume target is unsafe") from error
+            if cls.__is_link_or_reparse(target_path, target_info) or not stat.S_ISREG(target_info.st_mode):
+                raise LftpError("LFTP legacy resume target must be a regular file")
+            targets.append(target_info)
+        if len(targets) != 1:
+            raise LftpError("Legacy resume requires exactly one local partial")
+        if targets[0].st_size > expected_size:
+            raise LftpError("Legacy resume partial exceeds the remote size")
+        return True
+
+    @staticmethod
+    def __is_lexically_and_really_contained(path: str, root: str) -> bool:
+        try:
+            path_abs = os.path.abspath(os.path.normpath(path))
+            root_abs = os.path.abspath(os.path.normpath(root))
+            lexical_common = os.path.commonpath([path_abs, root_abs])
+            real_common = os.path.commonpath([
+                os.path.realpath(path_abs),
+                os.path.realpath(root_abs),
+            ])
+        except (OSError, ValueError):
+            return False
+        return (
+            os.path.normcase(lexical_common) == os.path.normcase(root_abs)
+            and os.path.normcase(real_common) == os.path.normcase(os.path.realpath(root_abs))
+        )
+
+    @staticmethod
+    def __is_link_or_reparse(path: str, file_info: Optional[os.stat_result] = None) -> bool:
+        try:
+            file_info = file_info or os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        if stat.S_ISLNK(file_info.st_mode):
+            return True
+        reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        return bool(getattr(file_info, "st_file_attributes", 0) & reparse_attribute)
+
+    @staticmethod
+    def __validate_queue_name(name: str) -> None:
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in {".", ".."}
+            or os.path.isabs(name)
+            or os.path.splitdrive(name)[0]
+            or "/" in name
+            or "\\" in name
+        ):
+            raise LftpError("LFTP queue name must be a single file or directory name")
+
+    @staticmethod
+    def __is_valid_pget_status_file(status_path: str) -> bool:
+        """Recognize the segment-map shape emitted by LFTP's pget status.
+
+        The status suffix alone is not enough to preserve a multi-connection
+        resume: stale or malformed files must take the contiguous ``get -c``
+        path instead.  This mirrors the repository scanner's bounded status
+        parser without making queue construction depend on the scanner owner.
+        """
+        try:
+            with open(status_path, "r", encoding="utf-8") as handle:
+                lines = [line.strip() for line in handle.read().splitlines() if line.strip()]
+        except (OSError, UnicodeError):
+            return False
+        if not lines:
+            return False
+        size_match = re.fullmatch(r"size=(\d+)", lines.pop(0))
+        if size_match is None or not lines or len(lines) % 2:
+            return False
+        total_size = int(size_match.group(1))
+        empty_size = 0
+        ranges: list[tuple[int, int]] = []
+        for index in range(0, len(lines), 2):
+            pos_match = re.fullmatch(r"(\d+)\.pos=(\d+)", lines[index])
+            limit_match = re.fullmatch(r"(\d+)\.limit=(\d+)", lines[index + 1])
+            if pos_match is None or limit_match is None:
+                return False
+            expected_segment = index // 2
+            if (
+                int(pos_match.group(1)) != expected_segment or
+                int(limit_match.group(1)) != expected_segment
+            ):
+                return False
+            pos = int(pos_match.group(2))
+            limit = int(limit_match.group(2))
+            if pos > total_size or limit > total_size or limit < pos:
+                return False
+            if any(pos < previous_limit and previous_pos < limit
+                   for previous_pos, previous_limit in ranges):
+                return False
+            ranges.append((pos, limit))
+            empty_size += limit - pos
+        return empty_size <= total_size
 
     def queue(self,
               name: str,
               is_dir: bool,
               remote_base_dir_path: Optional[str] = None,
               local_base_dir_path: Optional[str] = None,
-              exclude_patterns: str | Iterable[str | ExactPathExclusion] | None = None):
+              exclude_patterns: str | Iterable[str | ExactPathExclusion] | None = None,
+              allow_resume: bool = True,
+              allow_legacy_get_resume: bool = False,
+              expected_size: Optional[int] = None):
         """
         Queues a job for download
         This method may cause an exception to be generated in a later method call:
@@ -895,14 +1162,43 @@ class Lftp:
         :param is_dir: true if folder, false if file
         :return:
         """
+        self.__validate_queue_name(name)
         remote_dir = remote_base_dir_path if remote_base_dir_path is not None else self.__base_remote_dir_path
         local_dir = local_base_dir_path if local_base_dir_path is not None else self.__base_local_dir_path
 
+        has_existing_target = False
+        has_valid_pget_map = False
+        if not is_dir:
+            has_existing_target, has_valid_pget_map = self.__file_resume_artifacts(
+                local_dir, name, expected_size if allow_resume else None,
+            )
+        legacy_get_resume = False
+        if allow_legacy_get_resume:
+            if is_dir or allow_resume:
+                raise LftpError("Legacy resume is only valid for a changed file without a source binding")
+            # A timestamp alone is not a partial.  With an empty, already
+            # validated artifact snapshot, start an ordinary fresh pget
+            # instead of sending a legacy get-c that has nothing to continue.
+            if has_existing_target:
+                legacy_get_resume = self.__allow_legacy_get_resume(local_dir, name, expected_size)  # type: ignore[arg-type]
+        if not is_dir and not allow_resume and has_existing_target:
+            # LFTP pget without -c does not clobber a pre-existing target.
+            # Do not queue a transfer that will predictably fail, and do not
+            # delete or rename a user's staging artifact outside the existing
+            # Delete Local lifecycle.  In particular, get -e could leave a
+            # pget map beside a differently configured temporary target.
+            if not legacy_get_resume:
+                raise LftpError(
+                    "Cannot safely restart a changed remote file while a local partial exists; "
+                    "use Delete Local before Queue"
+                )
+        use_get = not is_dir and (legacy_get_resume or (has_existing_target and not has_valid_pget_map))
         parts = [
             "queue",
-            "mirror" if is_dir else "pget",
-            "-c",
+            "mirror" if is_dir else ("get" if use_get else "pget"),
         ]
+        if is_dir or allow_resume or not has_existing_target or legacy_get_resume:
+            parts.append("-c")
         if is_dir:
             user_exclude_patterns, exact_exclude_paths = partition_transfer_exclusions(exclude_patterns)
             if user_exclude_patterns:

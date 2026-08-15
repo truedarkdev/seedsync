@@ -22,6 +22,7 @@ class LftpJobStatusParser:
     Parses the output of lftp's "jobs -v" command into a LftpJobStatus
     """
     __WRONG_TYPE_FAILURE_PREFIXES = (
+        "get: Access failed: Wrong type",
         "pget: Access failed: Wrong type",
         "pget-chunk: Access failed: Wrong type",
         "mirror: Access failed: Wrong type",
@@ -38,13 +39,13 @@ class LftpJobStatusParser:
     __QUOTED_FILE_NAME_REGEX = r"`(?P<name>.*)'"
 
     __QUEUE_DONE_REGEX = r"^\[(?P<id>\d+)\]\sDone\s\(queue\s\(.+\)\)"
-    __QUEUE_COMMAND_ECHO_REGEX = r"^queue\s+(?:mirror|pget)(?:\s|$)"
+    __QUEUE_COMMAND_ECHO_REGEX = r"^queue\s+(?:mirror|pget|get)(?:\s|$)"
     __STATUS_COMMAND_ECHO_MARKER = "jobs -v"
     __STATUS_COMMAND_ECHO_STRUCTURED_LINE_REGEX = re.compile(
         r"^(?:"
-        r"\[\d+\]\s+(?:queue|pget|mirror|Done)\b|"
-        r"(?:Now executing:|-)\s*\[\d+\]\s+(?:pget|mirror)\b|"
-        r"\d+\.\s+(?:pget|mirror)\b|"
+        r"\[\d+\]\s+(?:queue|pget|get|mirror|Done)\b|"
+        r"(?:Now executing:|-)\s*\[\d+\]\s+(?:pget|get|mirror)\b|"
+        r"\d+\.\s+(?:pget|get|mirror)\b|"
         r"(?:Queue is |Commands queued:|(?:sftp|ftp|ftps)://|"
         r"\\(?:mirror|chunk|transfer)\s+|`|Getting file list|cd\s|chmod\s|file:)"
         r")"
@@ -214,7 +215,7 @@ class LftpJobStatusParser:
         # Header patterns
         # pget header
         pget_header_pattern = (r"^\[(?P<id>\d+)\]\s+"
-                               r"pget\s+"
+                               r"(?P<command>pget|get)\s+"
                                r"(?P<flags>.*?)\s+"
                                r"(?P<lq>['\"]|)(?P<remote>.+)(?P=lq)\s+"  # greedy on purpose
                                r"-o\s+"
@@ -383,7 +384,9 @@ class LftpJobStatusParser:
                 id_ = int(result.group("id"))
                 name = os.path.basename(os.path.normpath(result.group("remote")))
                 flags = result.group("flags")
-                type_ = LftpJobStatus.Type.PGET
+                type_ = (LftpJobStatus.Type.GET
+                         if result.group("command") == "get"
+                         else LftpJobStatus.Type.PGET)
                 status = LftpJobStatus(job_id=id_,
                                        job_type=type_,
                                        state=LftpJobStatus.State.RUNNING,
@@ -692,7 +695,7 @@ class LftpJobStatusParser:
 
                 # Parse the queued commands
                 queue_pget_pattern = (r"^(?P<id>\d+)\.\s+"
-                                      r"pget\s+"
+                                      r"(?P<command>pget|get)\s+"
                                       r"(?P<flags>.*?)\s+"
                                       r"(?P<lq>[\'\"]|)(?P<remote>.+)(?P=lq)\s+"  # greedy on purpose
                                       r"(?:-o\s+)"
@@ -726,7 +729,9 @@ class LftpJobStatusParser:
                         result_pget = queue_pget_m.match(line)
                         result_mirror = queue_mirror_m.match(line)
                         if result_pget:
-                            type_ = LftpJobStatus.Type.PGET
+                            type_ = (LftpJobStatus.Type.GET
+                                     if result_pget.group("command") == "get"
+                                     else LftpJobStatus.Type.PGET)
                             result = result_pget
                         elif result_mirror:
                             type_ = LftpJobStatus.Type.MIRROR

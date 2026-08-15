@@ -14,11 +14,11 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from system import SystemFile
-from lftp import LftpJobStatus
+from lftp import LftpJobStatus, LftpJobStatusParser
 from model import ModelError, ModelFile, Model
 from controller import ModelBuilder
 from controller.scan import LocalScanner
-from controller.model_builder import _RecentLiveTransferSnapshot
+from controller.model_builder import _RecentLiveTransferSnapshot, _TransferState
 from controller.model_updater import ModelUpdater
 from controller.extract import ExtractStatus
 from controller.validate import ValidateStatus
@@ -63,6 +63,46 @@ class TestModelBuilder(unittest.TestCase):
         handler.setFormatter(formatter)
         self.model_builder = ModelBuilder()
         self.model_builder.set_base_logger(logger)
+
+    def test_split_root_positive_zero_percent_does_not_reset_same_job_floor(self):
+        remote = SystemFile("sample-directory", 1000, True)
+        previous = _RecentLiveTransferSnapshot(
+            root_file_id="sample-directory", size_local=600, percent_local=60,
+            speed=10, eta=40, lftp_job_id=7,
+        )
+
+        continued = ModelBuilder._ModelBuilder__combine_split_root_transfer_state(
+            _TransferState(1, 900, 0, 10, 40), remote, None, previous, 7,
+        )
+        reset = ModelBuilder._ModelBuilder__combine_split_root_transfer_state(
+            _TransferState(0, 900, 0, 10, 40), remote, None, previous, 8,
+        )
+
+        self.assertEqual(600, continued.size_local)
+        self.assertEqual(0, reset.size_local)
+
+    def test_parser_positive_zero_percent_is_not_a_model_reset_signal(self):
+        status = LftpJobStatusParser().parse(
+            "jobs -v\n"
+            "[0] queue (sftp://user@example.invalid)\n"
+            "sftp://user@example.invalid/remote\n"
+            "Now executing: [2] pget -c /remote/sample-file -o /local/staging/\n"
+            "[2] pget -c /remote/sample-file -o /local/staging/\n"
+            "    sftp://user@example.invalid/remote\n"
+            "    `/remote/sample-file', got 1 of 1000 (0%)\n"
+        )[0]
+        retained = _RecentLiveTransferSnapshot(
+            root_file_id="sample-file", size_local=600, percent_local=60,
+            speed=10, eta=40, lftp_job_id=2,
+        )
+        current = _TransferState(*status.total_transfer_state)
+
+        self.assertFalse(ModelBuilder._ModelBuilder__has_clear_transfer_reset_signal(
+            None, current, retained,
+        ))
+        self.assertTrue(ModelBuilder._ModelBuilder__has_clear_transfer_reset_signal(
+            None, _TransferState(0, 1000, 0, 0, 0), retained,
+        ))
 
     def __enable_trace(self, enabled: bool = True, max_entries: int = 128) -> BreadcrumbTraceCollector:
         self.__trace_enabled = [enabled]
@@ -1677,7 +1717,10 @@ class TestModelBuilder(unittest.TestCase):
 
         model = self.model_builder.build_model()
 
-        self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("movie.mkv").state)
+        staged_file = model.get_file("movie.mkv")
+        self.assertEqual(ModelFile.State.DOWNLOADED, staged_file.state)
+        self.assertEqual(100, staged_file.transferred_size)
+        self.assertIsNone(staged_file.download_progress)
 
     def test_build_scan_only_staging_root_archive_file_promotes_to_downloaded_when_local_size_matches_remote_size(self):
         self.model_builder.set_remote_files([SystemFile("archive.zip", 100, False)])
@@ -1743,6 +1786,112 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(180, release.transferred_size)
         self.assertEqual(60, release.download_progress)
         self.assertEqual(("E06.mkv",), self.model_builder.get_trusted_final_leaf_paths("release"))
+
+    def test_resumed_staging_status_reports_whole_root_progress_and_clamps(self):
+        """LFTP counters cover its resumed subset, not the whole staged root."""
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("resume.bin", 1000, False)])
+        self.model_builder.set_local_files([SystemFile("resume.bin", 700, False, is_staging=True)])
+
+        def build_with_subset_progress(transferred: int):
+            status = LftpJobStatus(
+                0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "resume.bin", "",
+            )
+            status.total_transfer_state = LftpJobStatus.TransferState(
+                transferred, 400, 25, 1000, 5,
+            )
+            self.model_builder.set_lftp_statuses([status])
+            return self.model_builder.build_model().get_file("resume.bin")
+
+        first = build_with_subset_progress(100)
+        self.assertEqual(ModelFile.State.DOWNLOADING, first.state)
+        self.assertEqual(700, first.transferred_size)
+        self.assertEqual(70, first.download_progress)
+
+        second = build_with_subset_progress(200)
+        self.assertEqual(800, second.transferred_size)
+        self.assertEqual(80, second.download_progress)
+
+        clamped = build_with_subset_progress(900)
+        self.assertEqual(1000, clamped.transferred_size)
+        self.assertEqual(100, clamped.download_progress)
+        self.assertLessEqual(clamped.transferred_size, clamped.remote_size)
+
+    def test_resumed_subset_progress_resets_and_stays_monotonic_within_one_lftp_lifecycle(self):
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("resume.bin", 1000, False)])
+        self.model_builder.set_local_files([SystemFile("resume.bin", 700, False, is_staging=True)])
+
+        def render(transferred: int, subset_total: int, percent: int, job_id: int = 7):
+            status = LftpJobStatus(
+                job_id, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "resume.bin", "",
+            )
+            status.total_transfer_state = LftpJobStatus.TransferState(
+                transferred, subset_total, percent, 1000, 5,
+            )
+            self.model_builder.set_lftp_statuses([status])
+            return self.model_builder.build_model().get_file("resume.bin")
+
+        initial = render(200, 400, 50)
+        self.assertEqual(800, initial.transferred_size)
+
+        # The same job can return from a resumed subset total to an exact
+        # whole-root total. Its raw 700-byte report must not discard the
+        # established 800-byte whole-root floor.
+        exact_root_total = render(700, 1000, 70)
+        self.assertEqual(800, exact_root_total.transferred_size)
+        self.assertEqual(80, exact_root_total.download_progress)
+
+        # A zero report is a lifecycle reset, not the implicit 600-byte base
+        # inferred from an old partial staging scan.
+        reset = render(0, 400, 0)
+        self.assertEqual(0, reset.transferred_size)
+        self.assertEqual(0, reset.download_progress)
+
+        resumed = render(50, 600, 8)
+        self.assertEqual(450, resumed.transferred_size)
+        self.assertEqual(45, resumed.download_progress)
+
+        # Later subset-total changes in the same LFTP job cannot regress the
+        # current whole-root checkpoint.
+        monotonic = render(100, 600, 17)
+        self.assertGreaterEqual(monotonic.transferred_size, resumed.transferred_size)
+        self.assertLessEqual(monotonic.transferred_size, monotonic.remote_size)
+
+        # A replacement LFTP job is a new lifecycle, so its subset baseline
+        # is not held to the prior job's display floor.
+        new_lifecycle = render(100, 600, 17, job_id=8)
+        self.assertEqual(500, new_lifecycle.transferred_size)
+
+        oversized_subset = render(100, 1200, 8, job_id=8)
+        self.assertGreaterEqual(oversized_subset.transferred_size, new_lifecycle.transferred_size)
+        self.assertLessEqual(oversized_subset.transferred_size, oversized_subset.remote_size)
+
+    def test_resumed_subset_zero_reset_preserves_only_verified_split_root_final_bytes(self):
+        stamp = 1_700_000_000_000_000_000
+        remote_root = SystemFile("release", 300, True)
+        remote_root.add_child(SystemFile("complete.mkv", 100, False, mtime_ns=stamp))
+        remote_root.add_child(SystemFile("staged.mkv", 200, False, mtime_ns=stamp + 1_000_000_000))
+        local_root = SystemFile("release", 150, True)
+        local_root.add_child(SystemFile("complete.mkv", 100, False, mtime_ns=stamp))
+        local_root.add_child(SystemFile("staged.mkv", 50, False, is_staging=True))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        def render(transferred: int, percent: int):
+            status = LftpJobStatus(
+                8, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "",
+            )
+            status.total_transfer_state = LftpJobStatus.TransferState(
+                transferred, 200, percent, 1000, 5,
+            )
+            self.model_builder.set_lftp_statuses([status])
+            return self.model_builder.build_model().get_file("release")
+
+        self.assertEqual(150, render(50, 25).transferred_size)
+        reset = render(0, 0)
+        self.assertEqual(100, reset.transferred_size)
+        self.assertEqual(33, reset.download_progress)
 
     def test_split_root_rejects_same_second_raw_mtime_difference_despite_display_timezone_difference(self):
         remote_root = SystemFile("release", 200, True)
@@ -1849,6 +1998,15 @@ class TestModelBuilder(unittest.TestCase):
         effective_file = self.model_builder._ModelBuilder__build_effective_local_files()["movie.mkv"]
 
         self.assertIs(final_file, effective_file)
+
+    def test_remote_resume_source_identity_uses_portable_raw_second(self):
+        remote = SystemFile("movie.mkv", 100, False, mtime_ns=1700000000123456789)
+        self.model_builder.set_remote_files([remote])
+
+        self.assertEqual((100, 1700000000), self.model_builder.get_remote_resume_source_identity("movie.mkv"))
+
+        self.model_builder.set_remote_files([SystemFile("movie.mkv", 100, False)])
+        self.assertIsNone(self.model_builder.get_remote_resume_source_identity("movie.mkv"))
 
     def test_active_staging_does_not_supersede_final_without_epoch_provenance(self):
         final_file = SystemFile(
@@ -3007,14 +3165,82 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(file_a.eta)
         self.assertFalse(self.model_builder.has_changes())
 
-    def test_build_staging_file_does_not_use_local_size_as_transferred_size_fallback(self):
+    def test_build_exact_staging_file_publishes_authoritative_completion_bytes(self):
+        """Supersedes the old no-fallback expectation for proven completion only."""
         self.model_builder.clear()
         self.model_builder.set_remote_files([SystemFile("a", 1000, False)])
         self.model_builder.set_local_files([SystemFile("a", 1000, False, is_staging=True)])
 
         model = self.model_builder.build_model()
 
-        self.assertIsNone(model.get_file("a").transferred_size)
+        staged_file = model.get_file("a")
+        self.assertEqual(ModelFile.State.DOWNLOADED, staged_file.state)
+        self.assertEqual(1000, staged_file.transferred_size)
+        self.assertIsNone(staged_file.download_progress)
+
+    def test_build_partial_staging_file_does_not_use_local_size_as_transferred_fallback(self):
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("a", 1000, False)])
+        self.model_builder.set_local_files([SystemFile("a", 999, False, is_staging=True)])
+
+        model = self.model_builder.build_model()
+
+        partial_file = model.get_file("a")
+        self.assertEqual(ModelFile.State.DEFAULT, partial_file.state)
+        self.assertIsNone(partial_file.transferred_size)
+        self.assertIsNone(partial_file.download_progress)
+
+    def test_verified_complete_staging_identity_uses_portable_mtime_without_extras_or_collisions(self):
+        remote_mtime_ns = 1_700_000_000_000_000_000
+        remote_root = SystemFile("release", 10, True)
+        remote_root.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=remote_mtime_ns))
+        self.model_builder.set_remote_files([remote_root])
+
+        def staged_root(*, mtime_ns=remote_mtime_ns, extra=False, collision=False, sidecar=False):
+            root = SystemFile("release", 10, True)
+            leaf = SystemFile("episode.mkv", 10, False, is_staging=True, mtime_ns=mtime_ns)
+            leaf.has_staging_collision = collision
+            leaf.status_sidecar_ready = sidecar
+            root.add_child(leaf)
+            if extra:
+                root.add_child(SystemFile("untrusted.bin", 1, False, is_staging=True, mtime_ns=1))
+            return root
+
+        self.model_builder.set_local_files([staged_root()])
+        self.assertTrue(self.model_builder.has_complete_local_coverage("release"))
+        self.assertTrue(self.model_builder.has_verified_complete_staging_remote_identity("release"))
+
+        # LFTP keeps source mtimes at whole-second precision, so a local
+        # leaf within the same second remains a portable source match.
+        self.model_builder.set_local_files([staged_root(mtime_ns=remote_mtime_ns + 500_000_000)])
+        self.assertTrue(self.model_builder.has_verified_complete_staging_remote_identity("release"))
+
+        for kwargs in (
+            {"mtime_ns": remote_mtime_ns + 1_000_000_000},
+            {"mtime_ns": None},
+            {"extra": True},
+            {"collision": True},
+            # Scanner logical size can come from a syntactically valid pget
+            # map while the physical target remains truncated.
+            {"sidecar": True},
+        ):
+            with self.subTest(**kwargs):
+                self.model_builder.set_local_files([staged_root(**kwargs)])
+                self.assertFalse(self.model_builder.has_verified_complete_staging_remote_identity("release"))
+
+    def test_verified_complete_staging_identity_allows_verified_final_split_leaf(self):
+        remote_root = SystemFile("release", 20, True)
+        remote_root.add_child(SystemFile("complete.mkv", 10, False, mtime_ns=1_700_000_000_000_000_000))
+        remote_root.add_child(SystemFile("staged.mkv", 10, False, mtime_ns=1_700_000_100_000_000_000))
+        local_root = SystemFile("release", 20, True)
+        local_root.add_child(SystemFile("complete.mkv", 10, False, mtime_ns=1_700_000_000_000_000_000))
+        local_root.add_child(SystemFile(
+            "staged.mkv", 10, False, is_staging=True, mtime_ns=1_700_000_100_500_000_000,
+        ))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        self.assertTrue(self.model_builder.has_verified_complete_staging_remote_identity("release"))
 
     def test_build_recent_live_snapshot_promotes_full_size_staging_copy_after_live_status_disappears(self):
         self.model_builder.clear()
@@ -4808,6 +5034,20 @@ class TestModelBuilder(unittest.TestCase):
 
         self.model_builder.clear()
         self.model_builder.set_remote_files([SystemFile("downloading", 100, False)])
+        get_local = SystemFile("downloading", 10, False, is_staging=True)
+        get_local.status_sidecar_ready = False
+        self.model_builder.set_local_files([get_local])
+        get_status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "downloading", "",
+        )
+        get_status.total_transfer_state = LftpJobStatus.TransferState(10, 100, 10, 100, 10)
+        self.model_builder.set_lftp_statuses([get_status])
+
+        model = self.model_builder.build_model()
+        self.assertTrue(model.get_file("downloading").is_stoppable)
+
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("downloading", 100, False)])
         downloading_local = SystemFile("downloading", 10, False)
         self.model_builder.set_local_files([downloading_local])
 
@@ -5670,7 +5910,10 @@ class TestModelBuilder(unittest.TestCase):
 
         model = self.model_builder.build_model()
 
-        self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("a").state)
+        staged_root = model.get_file("a")
+        self.assertEqual(ModelFile.State.DOWNLOADED, staged_root.state)
+        self.assertEqual(42, staged_root.transferred_size)
+        self.assertIsNone(staged_root.download_progress)
 
     def test_build_local_created_timestamp(self):
         self.model_builder.set_local_files([

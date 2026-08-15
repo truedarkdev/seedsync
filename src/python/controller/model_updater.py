@@ -1393,7 +1393,7 @@ class _ControllerCoreAccess:
     _Controller__MAX_MOVE_FAILURES: int
     _Controller__MOVE_RETRY_DELAYS: tuple[int, ...]
 
-    def _reconcile_pending_queue_dispatches_from_fresh_status(self, active_file_ids: set[str]) -> None: ...
+    def _reconcile_pending_queue_dispatches_from_fresh_status(self, statuses: list[LftpJobStatus]) -> None: ...
     def _confirm_fresh_healthy_download_starts(self, statuses: list[LftpJobStatus]) -> None: ...
     def _complete_download_start_lifecycle(self, file_id: str) -> None: ...
     def _record_download_completion(self, file: ModelFile) -> None: ...
@@ -1734,6 +1734,7 @@ class ModelUpdater(_ControllerCoreAccess):
         self,
         current_downloading_file_names: list[tuple[str, str | None, str | None]],
         should_process_completion_detection: bool,
+        retired_queue_dispatches: set[tuple[str, Optional[str], Optional[str]]] | None = None,
     ) -> None:
         if not should_process_completion_detection:
             return
@@ -1743,6 +1744,14 @@ class ModelUpdater(_ControllerCoreAccess):
         just_completed_file_names = (
             controller._Controller__prev_downloading_file_names - current_downloading_file_names_set
         )
+        # A prompt-accepted GET can finish before LFTP emits its first RUNNING
+        # row. Controller has already reconciled the absent queue intent
+        # against a fresh healthy idle snapshot; feed that exact identity into
+        # the same pending-completion registration path as a normal retired
+        # RUNNING job. It is still only a candidate: scan authority and the
+        # physical staging proof gate any move below.
+        if retired_queue_dispatches:
+            just_completed_file_names.update(retired_queue_dispatches)
         just_completed_file_names = {
             file_name for file_name in just_completed_file_names
             if not controller._Controller__is_explicitly_stopped(file_name[0], file_name[1])
@@ -2498,18 +2507,36 @@ class ModelUpdater(_ControllerCoreAccess):
             status for status in lftp_statuses
             if status.file_id not in controller._Controller__malformed_status_only_file_ids
         ]
+        # Render Queue intent for this already-started tick before the fresh
+        # reconciliation below transfers an absent fast GET to completion
+        # ownership. The synthetic row is display-only; all reconciliation and
+        # authorization keeps using the raw authoritative status snapshot.
+        pending_statuses = getattr(controller, "_lftp_statuses_with_pending_dispatches", None)
+        displayed_lftp_statuses = pending_statuses(lftp_statuses) \
+            if callable(pending_statuses) else lftp_statuses
+        retired_queue_dispatches: set[tuple[str, Optional[str], Optional[str]]] = set()
         if lftp_status_snapshot_fresh and lftp_status_poll_healthy:
             reconcile_pending_queues = getattr(
                 controller, "_reconcile_pending_queue_dispatches_from_fresh_status", None
             )
             if callable(reconcile_pending_queues):
-                reconcile_pending_queues({status.file_id for status in lftp_statuses})
+                reconciled_dispatches = reconcile_pending_queues(lftp_statuses)
+                if isinstance(reconciled_dispatches, set):
+                    retired_queue_dispatches = {
+                        entry for entry in reconciled_dispatches
+                        if isinstance(entry, tuple) and len(entry) == 3 and
+                        isinstance(entry[0], str)
+                    }
             confirm_download_starts = getattr(controller, "_confirm_fresh_healthy_download_starts", None)
             if callable(confirm_download_starts):
                 confirm_download_starts(lftp_statuses)
-        pending_statuses = getattr(controller, "_lftp_statuses_with_pending_dispatches", None)
-        if callable(pending_statuses):
-            lftp_statuses = pending_statuses(lftp_statuses)
+        # When this same tick also carries both final scan sides, do not keep
+        # a synthetic Queue row in front of the newly handed-off completion:
+        # it would delay an otherwise exact fast GET by one extra idle update.
+        # Without that scan authority, retain the one-tick Queue display while
+        # the pending-completion owner waits for its proof.
+        lftp_statuses = lftp_statuses if retired_queue_dispatches and joint_reconciliation_final \
+            else displayed_lftp_statuses
         current_downloading_file_names = [
             (s.name, s.path_pair_id, s.path_pair_name)
             for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
@@ -2517,6 +2544,7 @@ class ModelUpdater(_ControllerCoreAccess):
         self._handle_lftp_completion_detection(
             current_downloading_file_names,
             lftp_status_poll_healthy or bool(lftp_statuses),
+            retired_queue_dispatches,
         )
         controller._Controller__active_downloading_file_names = current_downloading_file_names
         if controller._Controller__malformed_status_only_file_ids != previous_malformed_status_only_file_ids:
@@ -3484,6 +3512,30 @@ class ModelUpdater(_ControllerCoreAccess):
                     return file_id in authoritative_pair_build.complete_local_coverage_file_ids
                 return model_builder.has_complete_local_coverage(file_id)
 
+            def candidate_verified_staging_identity(file_id: str) -> bool:
+                """Read physical completion proof from the candidate's source.
+
+                Pair candidates intentionally defer source adoption until their
+                lifecycle side effects have succeeded.  Looking only at the
+                live builder here would test the previous scan and strand an
+                otherwise authoritative selected-pair completion until a later
+                update.  Keep the existing proof, but point it at the staged
+                source for that exact selected Path Pair.
+                """
+                if authoritative_pair_build is not None and \
+                        candidate_pair_id(file_id) == authoritative_pair_build.path_pair_id:
+                    candidate_identity_proof = getattr(
+                        model_builder,
+                        "has_verified_complete_staging_remote_identity_for_authoritative_pair",
+                        None,
+                    )
+                    return callable(candidate_identity_proof) and \
+                        candidate_identity_proof(file_id, authoritative_pair_build) is True
+                identity_proof = getattr(
+                    model_builder, "has_verified_complete_staging_remote_identity", None,
+                )
+                return callable(identity_proof) and identity_proof(file_id) is True
+
             def candidate_terminalizable_collision_file_ids() -> set[str]:
                 cached = model_builder.get_terminalizable_staging_collision_file_ids()
                 if authoritative_pair_build is None:
@@ -3497,6 +3549,52 @@ class ModelUpdater(_ControllerCoreAccess):
             def candidate_lifecycle_allows(file_id: str) -> bool:
                 return authoritative_pair_build is None or \
                     candidate_pair_id(file_id) == authoritative_pair_build.path_pair_id
+
+            def pending_completion_move_authorized(file_id: str) -> bool:
+                """Require current end-to-end authority before an automatic move.
+
+                The pending identity survives LFTP retirement specifically so a
+                quiet model build can finish it.  It is not, however, durable
+                proof that the cached local tree is still current.  A complete
+                staging root becomes move-authoritative only after both scan
+                sides reconciled its exact Path Pair and an authoritative idle
+                LFTP snapshot confirms no active transfer remains.  In
+                particular, a legacy (``None``) scope is not a wildcard: both
+                sides must have reconciled that exact legacy scope.
+                """
+                try:
+                    pending_file = new_model.get_file(file_id)
+                except ModelError:
+                    return False
+                path_pair_id = pending_file.path_pair_id
+                local_reconciled = set(getattr(
+                    controller, "_Controller__reconciled_local_path_pair_ids", set()
+                ))
+                remote_reconciled = set(getattr(
+                    controller, "_Controller__reconciled_remote_path_pair_ids", set()
+                ))
+                if path_pair_id not in local_reconciled or path_pair_id not in remote_reconciled:
+                    return False
+                if not lftp_status_poll_healthy or not bool(getattr(
+                        controller, "_Controller__lftp_idle_status_authoritative", False
+                )):
+                    return False
+                if any(
+                        status.state in (
+                            LftpJobStatus.State.QUEUED,
+                            LftpJobStatus.State.RUNNING,
+                        ) and (
+                            status.file_id == file_id or (
+                                path_pair_id is not None and
+                                status.path_pair_id is None and
+                                status.name == pending_file.name
+                            )
+                        )
+                        for status in lftp_statuses
+                ):
+                    return False
+                return candidate_verified_staging_identity(file_id) and \
+                    candidate_complete_local_coverage(file_id)
 
             def candidate_has_actionable_unrelated_retry(file_id: str) -> bool:
                 """Keep a stale durable marker from invalidating a pair candidate.
@@ -3622,6 +3720,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     })
                     if final_move_succeeded:
                         persist.final_move_succeeded_file_names.add(file.file_id)
+                        persist.resume_source_identities.pop(file.file_id, None)
                     else:
                         persist.final_move_succeeded_file_names.discard(file.file_id)
                     controller._sync_final_move_succeeded_files_to_model()
@@ -3928,6 +4027,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         new_file.path_pair_id,
                     )
                     if completion_candidate and explicitly_stopped:
+                        discard_pending_completion_file(new_file.file_id)
                         completion_reason = "explicitly_stopped"
                     elif completion_candidate:
                         if new_file.state == ModelFile.State.DEFAULT and new_file.local_size is None:
@@ -3944,12 +4044,16 @@ class ModelUpdater(_ControllerCoreAccess):
                             old_file.remote_size is not None
                             and new_file.local_size is not None
                             and new_file.local_size >= old_file.remote_size
-                            and candidate_complete_local_coverage(new_file.file_id)
+                            and pending_completion_move_authorized(new_file.file_id)
                         ):
                             completion_proved = True
                             completion_reason = "complete_local_coverage"
                         elif completion_reason == "not_pending":
                             completion_reason = "completion_evidence_missing"
+
+                        if completion_proved and not pending_completion_move_authorized(new_file.file_id):
+                            completion_proved = False
+                            completion_reason = "completion_authority_missing"
 
                     if new_file is not None and new_file.file_id in pending_candidate_file_ids:
                         self._record_completion_gate_breadcrumb(
@@ -4025,6 +4129,14 @@ class ModelUpdater(_ControllerCoreAccess):
                             downloaded = True
                     if downloaded:
                         assert new_file is not None
+                        # Stop is a cancellation boundary for the entire
+                        # update.  A pending identity may already have been
+                        # discarded above, but that must not let the ordinary
+                        # DOWNLOADED diff path resurrect an automatic move.
+                        if controller._Controller__is_explicitly_stopped(
+                                new_file.name, new_file.path_pair_id,
+                        ):
+                            continue
                         move_result = run_reserved_automatic_move(new_file)
                         if move_result is None:
                             continue
@@ -4050,15 +4162,22 @@ class ModelUpdater(_ControllerCoreAccess):
                             )
 
                 # A pending file often has no subsequent model diff. Drive its
-                # retry budget from the durable pending identity instead of
-                # relying on incidental scan changes.
+                # initial attempt and retry budget from the durable pending
+                # identity instead of relying on incidental scan changes.
                 for file_name, path_pair_id, _ in list(controller._Controller__pending_completion_file_names):
                     file_id = ModelFile.build_file_id(file_name, path_pair_id)
                     if not candidate_lifecycle_allows(file_id):
                         failure_count = persist.move_failure_counts.get(file_id, 0)
-                        if (failure_count > 0 or
-                                file_id in controller._Controller__deferred_move_file_ids) and \
-                                candidate_has_actionable_unrelated_retry(file_id):
+                        # A pending LFTP completion is authoritative work in
+                        # its own right. A selected-pair candidate may not
+                        # mutate an unrelated root, but it must request the
+                        # ordinary global lifecycle even before a first move
+                        # failure has created retry state.
+                        if pending_completion_move_authorized(file_id) or (
+                                (failure_count > 0 or
+                                 file_id in controller._Controller__deferred_move_file_ids) and
+                                candidate_has_actionable_unrelated_retry(file_id)
+                        ):
                             defer_unrelated_candidate_lifecycle_work(
                                 CANDIDATE_UNRELATED_LIFECYCLE_REASON_PENDING_COMPLETION,
                             )
@@ -4066,10 +4185,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     if file_id in attempted_move_file_ids:
                         continue
                     failure_count = persist.move_failure_counts.get(file_id, 0)
-                    if failure_count >= controller._Controller__MAX_MOVE_FAILURES or (
-                        failure_count <= 0
-                        and file_id not in controller._Controller__deferred_move_file_ids
-                    ):
+                    if failure_count >= controller._Controller__MAX_MOVE_FAILURES:
                         continue
                     retry_due = controller._Controller__move_retry_due.get(file_id)
                     if retry_due is not None and datetime.now() < retry_due:
@@ -4078,12 +4194,20 @@ class ModelUpdater(_ControllerCoreAccess):
                         pending_file = new_model.get_file(file_id)
                     except ModelError:
                         continue
+                    # A stop is an explicit cancellation boundary, including
+                    # for a completion whose first move was deferred until a
+                    # quiet no-diff model build.
+                    if controller._Controller__is_explicitly_stopped(
+                            pending_file.name, pending_file.path_pair_id,
+                    ):
+                        discard_pending_completion_file(file_id)
+                        continue
                     # Durable retry state alone must not re-authorize a move:
                     # the current effective local tree can have gained an
                     # active-only branch or collision since the last attempt.
                     # Leave pending/retry state intact until coverage is
                     # proven again.
-                    if not candidate_complete_local_coverage(file_id):
+                    if not pending_completion_move_authorized(file_id):
                         continue
                     move_result = run_reserved_automatic_move(pending_file)
                     if move_result is None:
@@ -4099,6 +4223,11 @@ class ModelUpdater(_ControllerCoreAccess):
                             move_result == controller.MoveFromStagingResult.COMPLETED,
                         )
                     elif move_result == controller.MoveFromStagingResult.NO_MOVE_APPLICABLE:
+                        # A terminal same-path completion has no staging
+                        # source left to resume. Retain bindings on deferred
+                        # or failed moves, but never let this terminal case
+                        # authorize a future unrelated partial.
+                        persist.resume_source_identities.pop(pending_file.file_id, None)
                         publish_completed_download(pending_file, False)
                     elif move_result in (
                         controller.MoveFromStagingResult.FAILED,

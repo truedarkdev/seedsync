@@ -60,6 +60,9 @@ class _RecentLiveTransferSnapshot:
     percent_local: Optional[int]
     speed: Optional[int]
     eta: Optional[int]
+    lftp_job_id: Optional[int] = None
+    subset_size_local: Optional[int] = None
+    subset_size_remote: Optional[int] = None
 
 
 class _TransferState(NamedTuple):
@@ -258,6 +261,19 @@ class ModelBuilder:
 
     def __remote_file(self, file_id: str) -> Optional[SystemFile]:
         return self.__remote_files_by_pair.get(self.__file_id_path_pair_id(file_id), {}).get(file_id)
+
+    def get_remote_resume_source_identity(self, file_id: str) -> tuple[int, int] | None:
+        """Return the portable remote identity that can authorize file resume.
+
+        The raw scanner epoch is intentionally used instead of ModelFile's
+        display datetime.  LFTP preserves source mtimes at whole-second
+        precision, so a finer value would reject legitimate continuations
+        while a missing raw value must fail closed.
+        """
+        remote_file = self.__remote_file(file_id)
+        if remote_file is None or remote_file.is_dir or type(remote_file.mtime_ns) is not int:
+            return None
+        return remote_file.size, remote_file.mtime_ns // 1_000_000_000
 
     def __local_files(self) -> dict[str, SystemFile]:
         """Flatten only callers that already need global authority."""
@@ -981,7 +997,8 @@ class ModelBuilder:
     @staticmethod
     def __is_stoppable_model_file(model_file: ModelFile,
                                   local_file: Optional[SystemFile],
-                                  current_transfer_state: Optional[_TransferState]) -> bool:
+                                  current_transfer_state: Optional[_TransferState],
+                                  status: Optional[LftpJobStatus] = None) -> bool:
         if model_file.state == ModelFile.State.QUEUED:
             return True
         if model_file.state != ModelFile.State.DOWNLOADING:
@@ -990,8 +1007,12 @@ class ModelBuilder:
             return False
         if model_file.is_dir:
             return True
-        # Require the pget status sidecar before STOP can cut a live file download.
-        return local_file is not None and getattr(local_file, "status_sidecar_ready", False)
+        # Parallel pget continuation needs its segment sidecar to stop safely.
+        # A single-stream GET continuation has no map by design, but a parsed
+        # authoritative running GET status identifies that narrower safe case.
+        return (local_file is not None and getattr(local_file, "status_sidecar_ready", False)) or \
+            (status is not None and status.state == LftpJobStatus.State.RUNNING and
+             status.type == getattr(LftpJobStatus.Type, "GET", None))
 
     def set_local_root_paths(self,
                              local_root_paths: Dict[Optional[str], str],
@@ -1330,13 +1351,85 @@ class ModelBuilder:
     @staticmethod
     def __combine_split_root_transfer_state(transfer_state: _TransferState,
                                             remote_file: Optional[SystemFile],
-                                            local_file: Optional[SystemFile]) -> _TransferState:
+                                            local_file: Optional[SystemFile],
+                                            previous_snapshot: Optional[_RecentLiveTransferSnapshot] = None,
+                                            lftp_job_id: Optional[int] = None) -> _TransferState:
         def has_staging_descendant(candidate: Optional[SystemFile]) -> bool:
             if candidate is None:
                 return False
             if getattr(candidate, "is_staging", False):
                 return True
             return any(has_staging_descendant(child) for child in candidate.iter_children())
+
+        if remote_file is not None and transfer_state.size_remote is not None and \
+                transfer_state.size_local is not None:
+            # LFTP reports the currently selected resume subset, not always
+            # the whole root. Classify a genuine zero reset before converting
+            # the subset to root bytes: a new/reset job may report a partial
+            # subset total while having transferred no current-lifecycle
+            # bytes. For a continuing job, preserve the existing live floor
+            # across changing subset totals without inventing another owner.
+            remaining_size = max(0, min(transfer_state.size_remote, remote_file.size))
+            subset_transferred = max(0, min(transfer_state.size_local, remaining_size))
+            is_reset = subset_transferred == 0
+            if is_reset:
+                transfer_state = _TransferState(
+                    0,
+                    remote_file.size,
+                    0,
+                    transfer_state.speed,
+                    transfer_state.eta,
+                )
+            elif remaining_size != remote_file.size:
+                size_local = remote_file.size - (remaining_size - subset_transferred)
+                if previous_snapshot is not None and \
+                        previous_snapshot.lftp_job_id == lftp_job_id and \
+                        previous_snapshot.size_local is not None:
+                    size_local = max(size_local, previous_snapshot.size_local)
+                size_local = max(0, min(size_local, remote_file.size))
+                return _TransferState(
+                    size_local,
+                    remote_file.size,
+                    int(round((size_local * 100) / remote_file.size))
+                    if remote_file.size > 0 else None,
+                    transfer_state.speed,
+                    transfer_state.eta,
+                )
+            elif transfer_state.size_remote > remote_file.size:
+                size_local = subset_transferred
+                if previous_snapshot is not None and \
+                        previous_snapshot.lftp_job_id == lftp_job_id and \
+                        previous_snapshot.size_local is not None:
+                    size_local = max(size_local, previous_snapshot.size_local)
+                size_local = max(0, min(size_local, remote_file.size))
+                transfer_state = _TransferState(
+                    size_local,
+                    remote_file.size,
+                    int(round((size_local * 100) / remote_file.size))
+                    if remote_file.size > 0 else None,
+                    transfer_state.speed,
+                    transfer_state.eta,
+                )
+            elif previous_snapshot is not None and \
+                    previous_snapshot.lftp_job_id == lftp_job_id and \
+                    previous_snapshot.size_local is not None:
+                # A continuing LFTP job can switch from reporting its
+                # remaining subset to the exact whole-root total.  This is
+                # neither a reset (handled above) nor permission to lower the
+                # rendered whole-root floor just because the denominator
+                # changed back to the root size.
+                floor_applied = previous_snapshot.size_local > subset_transferred
+                size_local = max(subset_transferred, previous_snapshot.size_local)
+                size_local = max(0, min(size_local, remote_file.size))
+                transfer_state = _TransferState(
+                    size_local,
+                    remote_file.size,
+                    int(round((size_local * 100) / remote_file.size))
+                    if floor_applied and remote_file.size > 0
+                    else transfer_state.percent_local,
+                    transfer_state.speed,
+                    transfer_state.eta,
+                )
 
         if not has_staging_descendant(local_file):
             return transfer_state
@@ -1412,6 +1505,86 @@ class ModelBuilder:
         remote_file = self.__remote_file(file_id)
         local_file = self.__build_effective_local_files().get(file_id)
         return self.__effective_local_tree_proves_completion(remote_file, local_file)
+
+    def has_verified_complete_staging_remote_identity(self, file_id: str) -> bool:
+        """Prove a pending automatic move has exact staged source identity.
+
+        ``has_complete_local_coverage`` intentionally remains a compatibility
+        predicate for display and existing lifecycle decisions: it may accept
+        complete staging sizes without scanner mtimes.  A quiet automatic move
+        has a narrower trust boundary.  Walk the current effective local tree
+        against the current remote tree, require every staged leaf to match
+        exact size and the portable whole-second raw mtime LFTP preserves,
+        and reject every extra or collision.  Legitimate split roots may
+        retain already-final leaves, but those require the stricter final-leaf
+        identity and the root still needs at least one verified staged leaf.
+        This derives proof from existing scan inputs only; it stores no new
+        state.
+        """
+        return self.__trees_have_verified_complete_staging_remote_identity(
+            self.__remote_file(file_id),
+            self.__build_effective_local_files().get(file_id),
+        )
+
+    def has_verified_complete_staging_remote_identity_for_authoritative_pair(
+            self, file_id: str, pair_build: _AuthoritativePairBuild,
+    ) -> bool:
+        """Apply the quiet-move proof to a staged final Path Pair source.
+
+        A selected final pair is deliberately rendered before its source bucket
+        is adopted.  Its candidate must therefore be able to prove the same
+        physical staging identity from those staged scanner inputs, rather than
+        consulting the unrelated live source bucket and waiting for a later
+        incidental update.
+        """
+        if pair_build.path_pair_id in pair_build.unknown_local_path_pair_ids:
+            return False
+        return self.__trees_have_verified_complete_staging_remote_identity(
+            pair_build.remote_files.get(file_id), pair_build.local_files.get(file_id),
+        )
+
+    @staticmethod
+    def __trees_have_verified_complete_staging_remote_identity(
+            remote_root: Optional[SystemFile], effective_root: Optional[SystemFile],
+    ) -> bool:
+        if remote_root is None or effective_root is None or \
+                remote_root.is_dir != effective_root.is_dir:
+            return False
+
+        def visit(remote_file: SystemFile, effective_file: Optional[SystemFile]) -> tuple[bool, bool]:
+            if effective_file is None or remote_file.is_dir != effective_file.is_dir or \
+                    effective_file.has_staging_collision:
+                return False, False
+            if not remote_file.is_dir:
+                # A parsed pget map can describe a logical full size while
+                # the target is sparse, truncated, or otherwise not yet a
+                # physical completed file.  The sidecar is resume metadata,
+                # not completion proof: wait for LFTP to remove it and for a
+                # subsequent physical scanner result to carry the leaf.
+                if effective_file.status_sidecar_ready:
+                    return False, False
+                if getattr(effective_file, "is_staging", False):
+                    return (
+                        ModelBuilder.__leaf_matches_remote_collision_identity(
+                            remote_file, effective_file
+                        ),
+                        True,
+                    )
+                return ModelBuilder.__is_verified_final_leaf(remote_file, effective_file), False
+            remote_children = {child.name: child for child in remote_file.iter_children()}
+            effective_children = {child.name: child for child in effective_file.iter_children()}
+            if set(remote_children) != set(effective_children):
+                return False, False
+            saw_leaf = False
+            for name, remote_child in remote_children.items():
+                verified, child_saw_leaf = visit(remote_child, effective_children.get(name))
+                if not verified:
+                    return False, False
+                saw_leaf = saw_leaf or child_saw_leaf
+            return True, saw_leaf
+
+        verified, saw_leaf = visit(remote_root, effective_root)
+        return verified and saw_leaf
 
     def has_unresolved_staging_collision(self, file_id: str) -> bool:
         """Whether the effective root still has an unproven staging collision."""
@@ -1605,13 +1778,18 @@ class ModelBuilder:
     def __store_recent_live_transfer_snapshot(self,
                                               file_id: str,
                                               root_file_id: str,
-                                              transfer_state: _TransferState) -> None:
+                                              transfer_state: _TransferState,
+                                              raw_transfer_state: Optional[_TransferState] = None,
+                                              lftp_job_id: Optional[int] = None) -> None:
         snapshot = _RecentLiveTransferSnapshot(
             root_file_id=root_file_id,
             size_local=transfer_state.size_local,
             percent_local=ModelBuilder.__normalize_download_progress(transfer_state.percent_local),
             speed=transfer_state.speed,
-            eta=transfer_state.eta
+            eta=transfer_state.eta,
+            lftp_job_id=lftp_job_id,
+            subset_size_local=raw_transfer_state.size_local if raw_transfer_state is not None else None,
+            subset_size_remote=raw_transfer_state.size_remote if raw_transfer_state is not None else None,
         )
         if snapshot.size_local is None:
             return
@@ -1620,13 +1798,18 @@ class ModelBuilder:
     def __store_retained_stopped_transfer_snapshot(self,
                                                    file_id: str,
                                                    root_file_id: str,
-                                                   transfer_state: _TransferState) -> None:
+                                                   transfer_state: _TransferState,
+                                                   raw_transfer_state: Optional[_TransferState] = None,
+                                                   lftp_job_id: Optional[int] = None) -> None:
         snapshot = _RecentLiveTransferSnapshot(
             root_file_id=root_file_id,
             size_local=transfer_state.size_local,
             percent_local=ModelBuilder.__normalize_download_progress(transfer_state.percent_local),
             speed=transfer_state.speed,
-            eta=transfer_state.eta
+            eta=transfer_state.eta,
+            lftp_job_id=lftp_job_id,
+            subset_size_local=raw_transfer_state.size_local if raw_transfer_state is not None else None,
+            subset_size_remote=raw_transfer_state.size_remote if raw_transfer_state is not None else None,
         )
         if snapshot.size_local is None:
             return
@@ -1850,9 +2033,9 @@ class ModelBuilder:
     def __has_clear_transfer_reset_signal(local: Optional[SystemFile],
                                           current_transfer_state: _TransferState,
                                           retained_snapshot: _RecentLiveTransferSnapshot) -> bool:
-        if current_transfer_state.size_local == 0 or current_transfer_state.percent_local == 0:
-            return True
-        return False
+        # LFTP formats positive sub-1% byte reports as 0%.  Only a confirmed
+        # zero-byte report can reset a retained same-lifecycle progress floor.
+        return current_transfer_state.size_local == 0
 
     def __coalesce_retained_stopped_transfer_state(self,
                                                    file_id: str,
@@ -3396,6 +3579,9 @@ class ModelBuilder:
                 current_transfer_state is not None,
                 status.file_id if status is not None else None,
                 live_transferred_file_ids,
+                self.__transfer_state(status.total_transfer_state) if status is not None and
+                status.state == LftpJobStatus.State.RUNNING else None,
+                status.id if status is not None else None,
             )
             self.__build_children(
                 model_file,
@@ -3421,6 +3607,7 @@ class ModelBuilder:
                 model_file,
                 local,
                 current_transfer_state,
+                status,
             )
 
             # Empty remote directory trees are metadata only. Keep a local
@@ -3553,13 +3740,20 @@ class ModelBuilder:
         recent_transfer_state = None
         retained_transfer_state = None
         arbitration_source = "scan_only"
-        raw_current_transfer_state = self.__transfer_state(status.total_transfer_state) if status and \
+        source_current_transfer_state = self.__transfer_state(status.total_transfer_state) if status and \
             status.state == LftpJobStatus.State.RUNNING else None
-        if raw_current_transfer_state is not None:
+        raw_current_transfer_state = source_current_transfer_state
+        if source_current_transfer_state is not None:
+            _, previous_snapshot = self.__resolve_recent_live_transfer_snapshot(
+                file_id,
+                status.file_id if status is not None else None,
+            )
             raw_current_transfer_state = self.__combine_split_root_transfer_state(
-                raw_current_transfer_state,
+                source_current_transfer_state,
                 remote,
                 local,
+                previous_snapshot,
+                status.id if status is not None else None,
             )
         current_transfer_state = raw_current_transfer_state if not is_stopped else None
         if is_stopped and raw_current_transfer_state is not None:
@@ -3571,12 +3765,16 @@ class ModelBuilder:
             self.__store_recent_live_transfer_snapshot(
                 model_file.file_id,
                 status.file_id if status is not None else model_file.file_id,
-                raw_current_transfer_state
+                raw_current_transfer_state,
+                source_current_transfer_state,
+                status.id if status is not None else None,
             )
             self.__store_retained_stopped_transfer_snapshot(
                 model_file.file_id,
                 status.file_id if status is not None else model_file.file_id,
-                raw_current_transfer_state
+                raw_current_transfer_state,
+                source_current_transfer_state,
+                status.id if status is not None else None,
             )
             arbitration_source = "retained_stopped_snapshot_from_live_status"
         elif current_transfer_state is not None:
@@ -3760,7 +3958,8 @@ class ModelBuilder:
                 _child_model_file.is_stoppable = self.__is_stoppable_model_file(
                     _child_model_file,
                     _local_child,
-                    _child_current_transfer_state
+                    _child_current_transfer_state,
+                    _status,
                 )
                 if self.__is_stop_resume_trace_enabled():
                     self.__trace_target_arbitration(
@@ -3788,6 +3987,8 @@ class ModelBuilder:
         store_recent_snapshot: bool,
         recent_snapshot_root_file_id: Optional[str],
         live_transferred_file_ids: Set[str],
+        raw_transfer_state: Optional[_TransferState] = None,
+        lftp_job_id: Optional[int] = None,
     ) -> None:
         # set local and remote sizes
         model_file.remote_present = remote is not None
@@ -3798,8 +3999,8 @@ class ModelBuilder:
         if local:
             model_file.local_size = local.size
 
-        # Note: no longer use lftp's file sizes
-        #       they represent remaining size for resumed downloads
+        # LFTP counters are normalized to whole-root progress before this
+        # point because resumed jobs can report only their remaining subset.
 
         # set the downloading speed and eta
         if transfer_state:
@@ -3807,7 +4008,9 @@ class ModelBuilder:
                 self.__store_recent_live_transfer_snapshot(
                     model_file.file_id,
                     recent_snapshot_root_file_id if recent_snapshot_root_file_id is not None else model_file.file_id,
-                    transfer_state
+                    transfer_state,
+                    raw_transfer_state,
+                    lftp_job_id,
                 )
             download_progress = ModelBuilder.__normalize_download_progress(transfer_state.percent_local)
             if download_progress is not None:
@@ -3980,6 +4183,10 @@ class ModelBuilder:
                 # they can leave incomplete and continue through the
                 # normal completion path.
                 model_file.state = ModelFile.State.DOWNLOADED
+                model_file.transferred_size = model_file.remote_size
+                model_file.download_progress = None
+                model_file.downloading_speed = None
+                model_file.eta = None
                 arbitration_source = "staging_completion_without_live_status"
             elif not model_file.is_dir and \
                     model_file.local_size is not None and \
@@ -3999,6 +4206,10 @@ class ModelBuilder:
                     # if live transfer state has already disappeared.
                     if not self.__has_incomplete_remote_file_children(model_file):
                         model_file.state = ModelFile.State.DOWNLOADED
+                        model_file.transferred_size = model_file.remote_size
+                        model_file.download_progress = None
+                        model_file.downloading_speed = None
+                        model_file.eta = None
                         arbitration_source = "staging_completion_without_live_status"
                 else:
                     # root is a directory that also exists remotely

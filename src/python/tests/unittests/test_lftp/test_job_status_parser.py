@@ -13,7 +13,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
         self.maxDiff = None
 
     @staticmethod
-    def _parse_pget_with_chunk_tail(chunk_tail):
+    def _parse_pget_with_chunk_tail(chunk_tail, root_progress="1000 of 2000 (50%)"):
         output = (
             "jobs -v\n"
             "[0] queue (sftp://someone:@localhost)\n"
@@ -21,11 +21,17 @@ class TestLftpJobStatusParser(unittest.TestCase):
             "Now executing: [2] pget -c ~/downloads/completed/SomeFile.mkv -o /data/lftpsync//\n"
             "[2] pget -c ~/downloads/completed/SomeFile.mkv -o /data/lftpsync// \n"
             "    sftp://user:pass@host:22/home/user\n"
-            "    `~/downloads/completed/SomeFile.mkv', got 1000 of 2000 (50%) \n"
+            "    `~/downloads/completed/SomeFile.mkv', got {} \n"
             "{}"
-        ).format(chunk_tail)
+        ).format(root_progress, chunk_tail)
         parser = LftpJobStatusParser()
         return parser.parse(output)
+
+    def test_parser_preserves_positive_bytes_when_display_percent_is_zero(self):
+        statuses = self._parse_pget_with_chunk_tail("", "1 of 1000 (0%)")
+
+        self.assertEqual(1, statuses[0].total_transfer_state.size_local)
+        self.assertEqual(0, statuses[0].total_transfer_state.percent_local)
 
     def test_size_to_bytes(self):
         self.assertEqual(345, LftpJobStatusParser._size_to_bytes("345"))
@@ -110,21 +116,25 @@ class TestLftpJobStatusParser(unittest.TestCase):
             parser.parse(output)
 
     def test_queue_command_echo_after_jobs_marker_is_rejected(self):
-        output = (
-            "jobs -v\n"
-            "queue pget -c \"/remote/sample-file\" -o \"/local/staging/\"\n"
-        )
-        parser = LftpJobStatusParser()
+        for command in (
+            "queue pget -c \"/remote/sample-file\" -o \"/local/staging/\"",
+            "queue get -c \"/remote/sample-file\" -o \"/local/staging/\"",
+        ):
+            with self.subTest(command=command):
+                output = "jobs -v\n{}\n".format(command)
+                parser = LftpJobStatusParser()
 
-        with self.assertRaises(LftpJobStatusParserError):
-            parser.parse(output)
+                with self.assertRaises(LftpJobStatusParserError):
+                    parser.parse(output)
 
     def test_interleaved_jobs_echo_is_rejected_on_structured_status_lines(self):
         lines = (
             "[1] mirror -c /remote/sample-directory /local/staging/ jobs -v",
             "[1] pget -c /remote/sample-file -o /local/staging/ jobs -v",
+            "[1] get -c /remote/sample-file -o /local/staging/ jobs -v",
             "Now executing: [1] mirror -c /remote/sample-directory /local/staging/ jobs -v",
             "-[2] pget -c /remote/sample-file -o /local/staging/ jobs -v",
+            "-[2] get -c /remote/sample-file -o /local/staging/ jobs -v",
             "\\mirror `sample-file' -- 10/20 (50%) jobs -v",
             "\\chunk 0-999 jobs -v",
             "\\transfer `sample-file' jobs -v",
@@ -251,6 +261,57 @@ class TestLftpJobStatusParser(unittest.TestCase):
         ]
         self.assertEqual(len(golden), len(statuses))
         self.assertEqual(golden, statuses)
+
+    def test_queued_get_resume_is_reported_as_get(self):
+        output = """
+        [0] queue (sftp://someone:@localhost)
+        sftp://someone:@localhost/home/someone
+        Queue is stopped.
+        Commands queued:
+         1. get -c "/remote/sample-file" -o "/local/staging/"
+        """
+        parser = LftpJobStatusParser()
+
+        statuses = parser.parse(output)
+
+        self.assertEqual(
+            [
+                LftpJobStatus(
+                    job_id=1,
+                    job_type=LftpJobStatus.Type.GET,
+                    state=LftpJobStatus.State.QUEUED,
+                    name="sample-file",
+                    flags="-c",
+                    remote_path="/remote/sample-file",
+                    local_path="/local/staging/",
+                )
+            ],
+            statuses,
+        )
+
+    def test_running_get_resume_preserves_get_status_semantics(self):
+        output = """
+        [0] queue (sftp://someone:@localhost)
+        sftp://someone:@localhost/home/someone
+        Now executing: [1] get -c "/remote/sample-file" -o "/local/staging/"
+        [1] get -c "/remote/sample-file" -o "/local/staging/"
+        sftp://someone:@localhost/home/someone
+        `/remote/sample-file', got 1000 of 2000 (50%)
+        """
+        parser = LftpJobStatusParser()
+
+        statuses = parser.parse(output)
+
+        self.assertEqual(1, len(statuses))
+        self.assertEqual(LftpJobStatus.Type.GET, statuses[0].type)
+        self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
+        self.assertEqual("sample-file", statuses[0].name)
+        self.assertEqual("/remote/sample-file", statuses[0].remote_path)
+        self.assertEqual("/local/staging/", statuses[0].local_path)
+        self.assertEqual(
+            LftpJobStatus.TransferState(1000, 2000, 50, None, None),
+            statuses[0].total_transfer_state,
+        )
 
     def test_queued_items_with_quotes(self):
         """Queue with quotes"""
@@ -1885,7 +1946,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
         self.assertEqual(golden_job1, statuses[0])
 
     def test_failure_before_jobs_slice_does_not_suppress_valid_jobs_for_other_wrong_type_prefixes(self):
-        for prefix in ("pget", "pget-chunk"):
+        for prefix in ("get", "pget", "pget-chunk"):
             with self.subTest(prefix=prefix):
                 output = """
                 {prefix}: Access failed: Wrong type

@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import heapq
+import math
 import os
 import ntpath
 import stat
@@ -176,6 +177,7 @@ class PendingQueueDispatch:
     path_pair_id: Optional[str] = None
     is_dir: bool = False
     operation_sequence: int = 0
+    resume_source_identity: Optional[tuple[int, int]] = None
 
 
 @dataclass
@@ -989,6 +991,14 @@ class Controller:
                     download_start_lifecycle_before,
                 )
             )
+            if action == "queue":
+                # A pre-Queue status can only describe the preceding
+                # lifecycle. Keep its work running for the single-worker PTY
+                # ordering, but abandon the reference so the next updater poll
+                # submits an authoritative post-Queue status behind this job.
+                self.__lftp_status_future = None
+                self.__next_lftp_status_poll_at = None
+                self.__lftp_idle_status_authoritative = False
         return True
 
     def __next_lftp_operation_sequence(self, file_id: str) -> int:
@@ -3203,6 +3213,43 @@ class Controller:
                 except Exception:
                     self.logger.warning("Download start listener failed", exc_info=True)
 
+    @staticmethod
+    def __resume_source_identity(remote_file: object) -> Optional[tuple[int, int]]:
+        """Build the file-resume identity directly from a remote scan root."""
+        size = getattr(remote_file, "size", None)
+        mtime_ns = getattr(remote_file, "mtime_ns", None)
+        if getattr(remote_file, "is_dir", False) or type(size) is not int or size < 0 or \
+                type(mtime_ns) is not int or mtime_ns < 0:
+            return None
+        return size, mtime_ns // 1_000_000_000
+
+    def __allow_file_resume(
+            self, file_id: str, is_dir: bool, source_identity: Optional[tuple[int, int]],
+    ) -> bool:
+        if is_dir or not isinstance(source_identity, tuple) or len(source_identity) != 2 or \
+                type(source_identity[0]) is not int or type(source_identity[1]) is not int:
+            return False
+        return self.__persist.resume_source_identities.get(file_id) == source_identity
+
+    def __allow_legacy_file_resume(
+            self, file_id: str, is_dir: bool, source_identity: Optional[tuple[int, int]],
+    ) -> bool:
+        """Allow one verified contiguous resume while migrating v0.9.2 starts.
+
+        Older persistence recorded the time at which an LFTP start was observed,
+        but not the source revision.  That evidence cannot authorize a pget
+        segment map.  It can only authorize LFTP's separately guarded get -c
+        path when the source has not become newer since that confirmed start.
+        """
+        if is_dir or file_id in self.__persist.resume_source_identities or \
+                not isinstance(source_identity, tuple) or len(source_identity) != 2 or \
+                type(source_identity[0]) is not int or type(source_identity[1]) is not int:
+            return False
+        start_timestamp = self.__persist.downloaded_timestamps.get(file_id)
+        if type(start_timestamp) not in (int, float) or not math.isfinite(start_timestamp):
+            return False
+        return source_identity[1] <= start_timestamp
+
     def remove_remote_delete_success_listener(self, listener: Callable[[ModelFile], None]):
         with self.__remote_delete_success_listeners_lock:
             if listener in self.__remote_delete_success_listeners:
@@ -3840,6 +3887,29 @@ class Controller:
             return candidate
         except (OSError, ValueError):
             return None
+
+    @staticmethod
+    def __safe_recovery_staging_entry(root: str, name: str, is_dir: bool) -> Optional[str]:
+        """Return one non-link staging artifact of the expected type, or None."""
+        candidate = Controller.__safe_final_move_candidate(root, name)
+        if candidate is None:
+            return None
+        try:
+            root_stat = os.lstat(root)
+            entry_stat = os.lstat(candidate)
+        except OSError:
+            return None
+        reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if any((
+                stat.S_ISLNK(root_stat.st_mode),
+                stat.S_ISLNK(entry_stat.st_mode),
+                reparse_point and getattr(root_stat, "st_file_attributes", 0) & reparse_point,
+                reparse_point and getattr(entry_stat, "st_file_attributes", 0) & reparse_point,
+        )):
+            return None
+        if bool(stat.S_ISDIR(entry_stat.st_mode)) != is_dir:
+            return None
+        return candidate
 
     def __resolve_safe_final_move_paths(
             self, name: str, path_pair_id: Optional[str] = None) -> Optional[Tuple[str, str, str, str]]:
@@ -5749,7 +5819,9 @@ class Controller:
             return "Final move reset is blocked by active transfer work"
         return None
 
-    def __complete_delete_local_lifecycle(self, file_id: str, path_pair_id: Optional[str]) -> None:
+    def __complete_delete_local_lifecycle(
+            self, file_id: str, path_pair_id: Optional[str], file_name: Optional[str] = None,
+    ) -> None:
         """Apply the shared metadata transition after a confirmed local delete."""
         self.__advance_transfer_lifecycle(file_id)
         confirm_local_deletions = getattr(
@@ -5775,6 +5847,30 @@ class Controller:
             if count >= Controller.__MAX_MOVE_FAILURES
         })
         self.__reset_download_start_after_local_delete(file_id, path_pair_id)
+        if isinstance(file_name, str):
+            self.__clear_resume_source_if_staging_absent(file_id, file_name, path_pair_id)
+
+    def __clear_resume_source_if_staging_absent(
+            self, file_id: str, file_name: str, path_pair_id: Optional[str],
+    ) -> None:
+        """Forget a binding only when its guarded staging artifacts are gone."""
+        staging_path = self.__get_staging_path(path_pair_id)
+        target = self.__safe_final_move_candidate(staging_path, file_name) \
+            if isinstance(staging_path, str) else None
+        if target is None:
+            return
+        candidates = (
+            target,
+            target + Constants.LFTP_TEMP_FILE_SUFFIX,
+            target + ".lftp-pget-status",
+            target + Constants.LFTP_TEMP_FILE_SUFFIX + ".lftp-pget-status",
+        )
+        try:
+            if any(os.path.lexists(candidate) for candidate in candidates):
+                return
+        except OSError:
+            return
+        self.__persist.resume_source_identities.pop(file_id, None)
 
     @staticmethod
     def __is_delete_command_action(action: "Controller.Command.Action") -> bool:
@@ -5930,13 +6026,22 @@ class Controller:
         self,
         file: ModelFile,
         post_callback: Callable[[], None],
-        command: Optional["Controller.Command"] = None
+        command: Optional["Controller.Command"] = None,
+        artifact_paths: tuple[str, ...] = (),
+        artifact_root: Optional[str] = None,
+        delete_primary: bool = True,
     ) -> None:
         delete_local_path, delete_local_name = self.__get_delete_local_target(file)
-        process = DeleteLocalProcess(
-            local_path=delete_local_path,
-            file_name=delete_local_name
-        )
+        process_kwargs: dict[str, object] = {
+            "local_path": delete_local_path,
+            "file_name": delete_local_name,
+        }
+        if artifact_paths:
+            process_kwargs["artifact_paths"] = artifact_paths
+            process_kwargs["artifact_root"] = artifact_root
+        if not delete_primary:
+            process_kwargs["delete_primary"] = False
+        process = DeleteLocalProcess(**process_kwargs)  # type: ignore[arg-type]
         process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
         command_wrapper = Controller.CommandProcessWrapper(
             command=command or Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id),
@@ -5950,6 +6055,12 @@ class Controller:
         with self.__command_state_lock():
             self.__active_command_processes.append(command_wrapper)
         command_wrapper.process.start()
+
+    def __delete_local_artifact_plan(self, file: ModelFile) -> tuple[tuple[str, ...], Optional[str]]:
+        staging_path = self.__get_staging_path(file.path_pair_id)
+        if not isinstance(staging_path, str) or not staging_path or not os.path.exists(staging_path):
+            return (), None
+        return Lftp.get_safe_file_artifact_delete_paths(staging_path, file.name), staging_path
 
     def __recover_interrupted_downloads(self, remote_files: list[SystemFile]) -> None:
         self.__startup_recovery_done = True
@@ -5968,11 +6079,21 @@ class Controller:
 
             remote_files_for_pair = remote_files_by_pair.get(path_pair_id, {})
             for entry in staging_entries:
-                entry_path = os.path.join(staging_path, entry)
+                entry_path = self.__safe_recovery_staging_entry(staging_path, entry, False)
                 if entry.endswith(suffix):
+                    if entry_path is None:
+                        continue
                     file_name = entry[:-len(suffix)]
+                    # A direct target beside its historical temp form is an
+                    # ambiguous legacy partial. Let neither artifact reach a
+                    # resume command; LFTP cannot prove which bytes belong to
+                    # the observed v0.9.2 start.
+                    if file_name in staging_entries:
+                        continue
                     is_dir = False
-                elif os.path.isdir(entry_path):
+                elif (directory_path := self.__safe_recovery_staging_entry(
+                        staging_path, entry, True)) is not None:
+                    entry_path = directory_path
                     try:
                         has_temp_children = any(
                             child.endswith(suffix)
@@ -5985,10 +6106,38 @@ class Controller:
                     file_name = entry
                     is_dir = True
                 else:
-                    continue
+                    # v0.9.2 could leave a direct sidecarless get target.
+                    # Discover it only when the persisted confirmed-start
+                    # evidence already satisfies the legacy migration gate and
+                    # its physical shape is one bounded regular partial. Any
+                    # map or second target remains fail-closed.
+                    if entry_path is None:
+                        continue
+                    remote_file = remote_files_for_pair.get(entry)
+                    file_id = ModelFile.build_file_id(entry, path_pair_id)
+                    source_identity = self.__resume_source_identity(remote_file) if remote_file is not None else None
+                    if remote_file is None or not self.__allow_legacy_file_resume(
+                            file_id, False, source_identity,
+                    ) or any(candidate in staging_entries for candidate in (
+                        entry + suffix,
+                        entry + ".lftp-pget-status",
+                        entry + suffix + ".lftp-pget-status",
+                    )):
+                        continue
+                    try:
+                        entry_stat = os.lstat(entry_path)
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(entry_stat.st_mode) or \
+                            entry_stat.st_size > source_identity[0]:
+                        continue
+                    file_name = entry
+                    is_dir = False
 
                 remote_file = remote_files_for_pair.get(file_name)
                 if remote_file is None or \
+                        not isinstance(getattr(remote_file, "is_dir", None), bool) or \
+                        remote_file.is_dir != is_dir or \
                         self.__is_previously_downloaded(file_name, path_pair_id) or \
                         self.__is_explicitly_stopped(file_name, path_pair_id):
                     continue
@@ -6005,6 +6154,11 @@ class Controller:
                     pass
                 try:
                     file_id = ModelFile.build_file_id(file_name, path_pair_id)
+                    source_identity = self.__resume_source_identity(remote_file)
+                    allow_resume = self.__allow_file_resume(file_id, is_dir, source_identity)
+                    allow_legacy_get_resume = self.__allow_legacy_file_resume(
+                        file_id, is_dir, source_identity,
+                    )
                     self.__log_stop_resume_trace(
                         "recover_interrupted_download",
                         file_id,
@@ -6020,14 +6174,24 @@ class Controller:
                     exclude_patterns = self.__transfer_exclude_patterns(file_id, is_dir)
                     if exclude_patterns:
                         queue_kwargs["exclude_patterns"] = exclude_patterns
+                    if self.__uses_async_lftp_owner() and not is_dir:
+                        queue_kwargs["allow_resume"] = allow_resume
+                        if source_identity is not None:
+                            queue_kwargs["expected_size"] = source_identity[0]
+                        if allow_legacy_get_resume:
+                            queue_kwargs["allow_legacy_get_resume"] = True
                     def queue_lftp(
                             file_name: str = file_name,
                             is_dir: bool = is_dir,
                             remote_base_dir_path: Optional[str] =
                                 path_pair.remote_path if path_pair is not None else None,
                             local_base_dir_path: Optional[str] = staging_path,
+                            staging_entry: str = entry,
                             queue_kwargs: dict[str, object] = queue_kwargs,
                     ) -> object:
+                        if self.__safe_recovery_staging_entry(
+                                local_base_dir_path, staging_entry, is_dir) is None:
+                            raise LftpError("Interrupted recovery staging artifact is unsafe")
                         return self.__lftp.queue(
                             file_name,
                             is_dir,
@@ -6038,7 +6202,8 @@ class Controller:
                     if self.__uses_async_lftp_owner():
                         operation_sequence = self.__next_lftp_operation_sequence(file_id)
                         self.__queue_dispatch_pending()[file_id] = PendingQueueDispatch(
-                            time.monotonic(), file_name, path_pair_id, is_dir, operation_sequence
+                            time.monotonic(), file_name, path_pair_id, is_dir, operation_sequence,
+                            source_identity if not allow_resume else None,
                         )
                         if not self.__submit_lftp_operation(
                                 "queue", queue_lftp, file_id, operation_sequence):
@@ -6088,14 +6253,90 @@ class Controller:
                 del pending[file_id]
                 continue
 
-    def _reconcile_pending_queue_dispatches_from_fresh_status(self, active_file_ids: Set[str]) -> None:
+    def _reconcile_pending_queue_dispatches_from_fresh_status(
+            self, statuses: Sequence[LftpJobStatus] | Set[str],
+    ) -> set[tuple[str, Optional[str], Optional[str]]]:
+        """Retire acknowledged Queue intent when a fresh idle poll sees no job.
+
+        A prompt can accept a small GET and complete it before its first status
+        listing.  The dispatch still owns the optimistic Queue rendering until
+        a fresh transport reconciliation; once that reconciliation is
+        authoritatively idle, hand the identity to ModelUpdater's existing
+        pending-completion owner.  This is intentionally not a download-start
+        confirmation: only a RUNNING status may commit resume provenance or
+        start-lifecycle effects.
+        """
         pending = self.__queue_dispatch_pending()
+        statuses_by_file_id = {
+            status.file_id: status for status in statuses if isinstance(status, LftpJobStatus)
+        }
+        active_file_ids = set(statuses_by_file_id) if statuses_by_file_id else {
+            file_id for file_id in statuses if isinstance(file_id, str)
+        }
+        retired_without_running: set[tuple[str, Optional[str], Optional[str]]] = set()
         for file_id in list(pending):
+            status = statuses_by_file_id.get(file_id)
             if file_id in active_file_ids:
+                dispatch = pending[file_id]
+                if status is not None and status.state == LftpJobStatus.State.QUEUED:
+                    # A raw QUEUED row is only acknowledgement that the
+                    # backend accepted the operation.  Keep the accepted
+                    # dispatch until RUNNING is authoritative or a fresh
+                    # healthy idle snapshot transfers it to completion
+                    # ownership, including dispatches without resume data.
+                    continue
+                if dispatch.resume_source_identity is not None:
+                    if status is None or status.state != LftpJobStatus.State.RUNNING or status.type not in (
+                            LftpJobStatus.Type.GET, LftpJobStatus.Type.PGET,
+                    ):
+                        # A queued status has not reset an old map yet. Keep
+                        # this existing dispatch until a running GET/PGET is
+                        # authoritative; otherwise a restart could trust the
+                        # stale on-disk map under the replacement identity.
+                        continue
+                    # A replacement binding is durable only after LFTP has
+                    # authoritatively started the fresh GET/PGET.  Recording
+                    # it at prompt acknowledgement could authorize an old map
+                    # after a crash before the queued job starts.
+                    self.__persist.resume_source_identities[file_id] = dispatch.resume_source_identity
                 # A fresh healthy transport snapshot has made the accepted
                 # lifecycle authoritative. The model's active-state guard now
                 # owns duplicate suppression.
                 del pending[file_id]
+                continue
+            if active_file_ids:
+                # The snapshot is not idle, so an absent job remains
+                # ambiguous until its next authoritative reconciliation.
+                continue
+            dispatch = pending[file_id]
+            matching_queue_operations = [
+                operation for operation in getattr(self, "_Controller__lftp_operations", [])
+                if operation.action == "queue" and operation.file_id == file_id and
+                operation.operation_sequence == dispatch.operation_sequence
+            ]
+            if matching_queue_operations:
+                operation = matching_queue_operations[-1]
+                if not operation.future.done():
+                    continue
+                try:
+                    accepted = operation.future.result() is not False
+                except Exception:
+                    accepted = False
+                if not accepted:
+                    # Let the ordinary queue failure path restore its command
+                    # lifecycle, but never let its stale intent become a
+                    # completion candidate in the interim.
+                    del pending[file_id]
+                    continue
+            del pending[file_id]
+            if not self.__is_explicitly_stopped(dispatch.name, dispatch.path_pair_id):
+                retired_without_running.add((
+                    dispatch.name,
+                    dispatch.path_pair_id,
+                    self.__get_path_pair(dispatch.path_pair_id).name
+                    if self.__get_path_pair(dispatch.path_pair_id) is not None else None,
+                ))
+        return retired_without_running
 
     def __set_active_scanner_files(
         self, active_files: list[tuple[str, Optional[str], Optional[str]]]
@@ -6283,10 +6524,27 @@ class Controller:
                         exclude_patterns = self.__transfer_exclude_patterns(file.file_id, file.is_dir)
                         if exclude_patterns:
                             queue_kwargs["exclude_patterns"] = exclude_patterns
+                        source_identity = self.__model_builder.get_remote_resume_source_identity(file.file_id)
+                        if not isinstance(source_identity, tuple) or len(source_identity) != 2 or \
+                                type(source_identity[0]) is not int or type(source_identity[1]) is not int:
+                            source_identity = None
+                        allow_resume = self.__allow_file_resume(
+                            file.file_id, file.is_dir, source_identity,
+                        )
+                        allow_legacy_get_resume = self.__allow_legacy_file_resume(
+                            file.file_id, file.is_dir, source_identity,
+                        )
+                        if self.__uses_async_lftp_owner() and not file.is_dir:
+                            queue_kwargs["allow_resume"] = allow_resume
+                            if source_identity is not None:
+                                queue_kwargs["expected_size"] = source_identity[0]
+                            if allow_legacy_get_resume:
+                                queue_kwargs["allow_legacy_get_resume"] = True
                         operation_sequence = self.__next_lftp_operation_sequence(file.file_id)
                         lifecycle_before_queue = self.__download_start_lifecycle_snapshot(file.file_id)
                         dispatch = PendingQueueDispatch(
-                            time.monotonic(), file.name, file.path_pair_id, file.is_dir, operation_sequence
+                            time.monotonic(), file.name, file.path_pair_id, file.is_dir, operation_sequence,
+                            source_identity if not allow_resume else None,
                         )
                         # Install the visible intent before submitting. This
                         # is deliberately local: Queue HTTP acknowledgement
@@ -6321,11 +6579,6 @@ class Controller:
                         # ambiguity window. Beyond that window Queue is
                         # intentionally at-least-once: LFTP acknowledgement is
                         # not transactional with controller model observation.
-                        # Ensure this acceptance is reconciled against a fresh
-                        # transport snapshot in the updater that follows this
-                        # command drain.
-                        self.__next_lftp_status_poll_at = None
-                        self.__lftp_idle_status_authoritative = False
                         is_new_transfer_lifecycle = stop_boundary or file.state not in (
                             ModelFile.State.QUEUED,
                             ModelFile.State.DOWNLOADING,
@@ -6674,32 +6927,41 @@ class Controller:
                         file
                     )
                     continue
-                elif file.local_size is None:
-                    if file.state != ModelFile.State.MOVE_FAILED:
+                try:
+                    artifact_paths, artifact_root = self.__delete_local_artifact_plan(file)
+                except LftpError as error:
+                    _notify_failure(command, str(error), 409, file)
+                    continue
+
+                delete_primary = file.local_size is not None
+                if file.local_size is None:
+                    if file.state != ModelFile.State.MOVE_FAILED and not artifact_paths:
                         _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404, file)
                         continue
-                    repair_blocker = self.__absent_move_failure_repair_blocker(file)
-                    if repair_blocker is not None:
-                        _notify_failure(command, repair_blocker, 409, file)
-                        continue
-                    self.__persist.stopped_file_names.add(file.file_id)
-                    self.__validate_process.clear(file.file_id)
-                    self.__complete_delete_local_lifecycle(file.file_id, file.path_pair_id)
-                    for callback in command.callbacks:
-                        callback.on_success()
-                    self.__record_command_breadcrumb(
-                        command=command,
-                        message="command_finished",
-                        details={
-                            "command": "DELETE_LOCAL",
-                            "mode": "failed_move_metadata_repair",
-                            "lifecycle_phase": "dispatch",
-                            "completion": "completed",
-                        },
-                        file=file,
-                    )
-                    continue
-                elif self.__has_ambiguous_split_local_target(file):
+                    if file.state == ModelFile.State.MOVE_FAILED:
+                        repair_blocker = self.__absent_move_failure_repair_blocker(file)
+                        if repair_blocker is not None:
+                            _notify_failure(command, repair_blocker, 409, file)
+                            continue
+                        if not artifact_paths:
+                            self.__persist.stopped_file_names.add(file.file_id)
+                            self.__validate_process.clear(file.file_id)
+                            self.__complete_delete_local_lifecycle(file.file_id, file.path_pair_id, file.name)
+                            for callback in command.callbacks:
+                                callback.on_success()
+                            self.__record_command_breadcrumb(
+                                command=command,
+                                message="command_finished",
+                                details={
+                                    "command": "DELETE_LOCAL",
+                                    "mode": "failed_move_metadata_repair",
+                                    "lifecycle_phase": "dispatch",
+                                    "completion": "completed",
+                                },
+                                file=file,
+                            )
+                            continue
+                if self.__has_ambiguous_split_local_target(file):
                     _notify_failure(
                         command,
                         "Local file '{}' has both final and staging content; refusing ambiguous delete".format(
@@ -6709,41 +6971,43 @@ class Controller:
                         file,
                     )
                     continue
-                else:
-                    if len(self.__active_command_processes) >= Controller._MAX_CONCURRENT_COMMAND_PROCESSES:
-                        self.__defer_delete_command(command, deferred_commands)
-                        self.logger.debug(
-                            "Deferring %s for '%s': %d active processes at cap",
-                            command.action,
-                            command.filename,
-                            len(self.__active_command_processes)
-                        )
-                        continue
-                    # Deletion changes the transfer lifecycle as soon as it
-                    # is admitted. A later auto-delete in this same drain
-                    # cannot retain authority captured before local deletion.
-                    self.__advance_transfer_lifecycle(file.file_id)
-                    self.__queue_delete_local_process(
-                        file,
-                        lambda path_pair_id=file.path_pair_id: (
-                            self.__local_scan_process.force_scan()
-                            if path_pair_id is None
-                            else self.__local_scan_process.force_scan(path_pair_id)
-                        ),
-                        command=command
+                if len(self.__active_command_processes) >= Controller._MAX_CONCURRENT_COMMAND_PROCESSES:
+                    self.__defer_delete_command(command, deferred_commands)
+                    self.logger.debug(
+                        "Deferring %s for '%s': %d active processes at cap",
+                        command.action,
+                        command.filename,
+                        len(self.__active_command_processes)
                     )
-                    self.__persist.stopped_file_names.add(file.file_id)
-                    self.__validate_process.clear(file.file_id)
-                    self.__record_command_breadcrumb(
-                        command=command,
-                        message="command_dispatched",
-                        details={
-                            "command": "DELETE_LOCAL",
-                            "mode": "delete_local_process",
-                            "await_completion": True,
-                        },
-                        file=file,
-                    )
+                    continue
+                # Deletion changes the transfer lifecycle as soon as it
+                # is admitted. A later auto-delete in this same drain cannot
+                # retain authority captured before local deletion.
+                self.__advance_transfer_lifecycle(file.file_id)
+                self.__queue_delete_local_process(
+                    file,
+                    lambda path_pair_id=file.path_pair_id: (
+                        self.__local_scan_process.force_scan()
+                        if path_pair_id is None
+                        else self.__local_scan_process.force_scan(path_pair_id)
+                    ),
+                    command=command,
+                    artifact_paths=artifact_paths,
+                    artifact_root=artifact_root,
+                    delete_primary=delete_primary,
+                )
+                self.__persist.stopped_file_names.add(file.file_id)
+                self.__validate_process.clear(file.file_id)
+                self.__record_command_breadcrumb(
+                    command=command,
+                    message="command_dispatched",
+                    details={
+                        "command": "DELETE_LOCAL",
+                        "mode": "delete_local_process",
+                        "await_completion": True,
+                    },
+                    file=file,
+                )
 
             elif command.action == Controller.Command.Action.RETRY_MOVE:
                 if file.state != ModelFile.State.MOVE_FAILED or \
@@ -6861,6 +7125,7 @@ class Controller:
                         self.__move_retry_due.pop(file.file_id, None)
                         self._record_download_completion(file)
                         self.__persist.downloaded_file_names.add(file.file_id)
+                        self.__persist.resume_source_identities.pop(file.file_id, None)
                         if result == Controller.MoveFromStagingResult.COMPLETED:
                             self.__persist.final_move_succeeded_file_names.add(file.file_id)
                             self._mark_successful_final_move_handoff(file.file_id)
@@ -7267,6 +7532,7 @@ class Controller:
                                 self.__complete_delete_local_lifecycle(
                                     command_process.file_id,
                                     getattr(command_process.event_file, "path_pair_id", None),
+                                    command_process.file_name,
                                 )
                             for callback in command_process.command.callbacks:
                                 callback.on_success()
@@ -7318,6 +7584,9 @@ class Controller:
                                 self.__persist.downloaded_timestamps.pop(command_process.file_id, None)
                                 self.__model_builder.set_downloaded_timestamps(
                                     self.__persist.downloaded_timestamps
+                                )
+                                self.__persist.resume_source_identities.pop(
+                                    command_process.file_id, None
                                 )
                                 if event_file is not None:
                                     Controller.__clear_persist_key(

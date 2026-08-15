@@ -33,6 +33,24 @@ class TestDeleteProcessSpawn(unittest.TestCase):
                 process.close_queues()
                 mp_logger.stop()
 
+    def test_explicit_artifact_cleanup_removes_map_only_without_primary_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = os.path.join(temp_dir, "sample-file.lftp-pget-status")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                handle.write("malformed map")
+            process = DeleteLocalProcess(
+                temp_dir,
+                "sample-file",
+                artifact_paths=(status_path,),
+                artifact_root=temp_dir,
+                delete_primary=False,
+            )
+            process.logger = MagicMock()
+
+            process.run_once()
+
+            self.assertFalse(os.path.lexists(status_path))
+
 
 class TestDeleteRemoteProcess(unittest.TestCase):
     @patch("controller.delete.delete_process.Sshcp")

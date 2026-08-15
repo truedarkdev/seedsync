@@ -2,12 +2,14 @@
 
 import unittest
 import logging
+from concurrent.futures import Future
 from datetime import datetime, timedelta
 from threading import RLock
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
-from controller import ModelBuilder
+from controller import Controller, ModelBuilder
+from controller.controller import _LftpOperation, PendingQueueDispatch
 from controller.extract import ExtractCompletedResult
 from controller.persist_keys import KEY_SEP
 from controller.model_updater import (
@@ -44,6 +46,7 @@ from common.performance_diagnostics import (
 from common.breadcrumb_trace import BreadcrumbTraceCollector
 from controller.scan.scanner_process import ScannerProcess, ScannerResult
 from lftp import LftpJobStatus
+from model.diff import ModelDiff
 from model import Model, ModelFile
 from system import SystemFile
 
@@ -2067,6 +2070,7 @@ class TestModelUpdater(unittest.TestCase):
     def _make_controller(self, downloaded_file_names, extracted_file_names, stopped_file_names, path_pairs_by_id=None):
         persist = SimpleNamespace(
             downloaded_file_names=downloaded_file_names,
+            resume_source_identities={},
             extracted_file_names=extracted_file_names,
             stopped_file_names=stopped_file_names,
         )
@@ -2087,6 +2091,7 @@ class TestModelUpdater(unittest.TestCase):
         persist = SimpleNamespace(
             downloaded_file_names=set(downloaded_file_names or set()),
             downloaded_timestamps=dict(downloaded_timestamps or {}),
+            resume_source_identities={},
             extracted_file_names=set(),
             stopped_file_names=set(),
             move_failure_counts={},
@@ -2152,6 +2157,7 @@ class TestModelUpdater(unittest.TestCase):
             _Controller__MAX_MOVE_FAILURES=4,
             _Controller__MOVE_RETRY_DELAYS=(1, 2, 3, 4),
             _Controller__get_path_pair=MagicMock(return_value=None),
+            _Controller__is_explicitly_stopped=MagicMock(return_value=False),
             _Controller__is_target_archive_trace_enabled=MagicMock(return_value=False),
             _Controller__find_target_archive_model_file=MagicMock(return_value=None),
             _Controller__should_auto_purge_local_file=MagicMock(return_value=False),
@@ -2173,6 +2179,364 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__lftp.status.return_value = []
         controller._Controller__lftp.last_status_poll_healthy = True
         return controller, model_builder
+
+    def _make_v092_pending_completion_controller(self, *, complete=True, path_pair_id=None):
+        """Create a retired-LFTP pending root without relying on a model diff."""
+        remote = SystemFile("pending.bin", 10, False, mtime_ns=1)
+        local = SystemFile(
+            "pending.bin", 10 if complete else 9, False, is_staging=True, mtime_ns=1,
+        )
+        remote.path_pair_id = path_pair_id
+        local.path_pair_id = path_pair_id
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "pending.bin", "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(
+            local.size, 10, local.size * 10, 100, 0,
+        )
+        running.path_pair_id = path_pair_id
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        builder.set_lftp_statuses([running])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller.MoveFromStagingResult = Controller.MoveFromStagingResult
+        controller._Controller__is_explicitly_stopped = MagicMock(return_value=False)
+        # ModelUpdater only treats the legacy scope as reconciled when both
+        # scan sides explicitly covered it.  The focused retry fixtures start
+        # from that already-authoritative steady state; the scan-authority
+        # regressions below exercise missing and failed coverage directly.
+        controller._Controller__reconciled_local_path_pair_ids = {path_pair_id}
+        controller._Controller__reconciled_remote_path_pair_ids = {path_pair_id}
+        controller._Controller__prev_downloading_file_names = {("pending.bin", path_pair_id, None)}
+        controller._Controller__lftp.status.return_value = []
+        controller._reserve_move_attempt = MagicMock(return_value=True)
+        controller._release_move_attempt = MagicMock()
+        controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED,
+        )
+        controller._record_download_completion = MagicMock()
+        controller._complete_download_start_lifecycle = MagicMock()
+        controller.clear_extracted_marker = MagicMock()
+        controller._mark_successful_final_move_handoff = MagicMock()
+        controller._mark_current_process_final_publication = MagicMock()
+        controller._Controller__target_archive_trace_selector_matches_file = MagicMock(return_value=False)
+        controller._Controller__target_archive_trace_selector_matches_file = MagicMock(return_value=False)
+        return controller
+
+    def _make_v092_fast_get_controller(
+            self, *, local_size=100, local_mtime_ns=1700000000000000000,
+            local_scan=True, remote_scan=True, stopped=False, defer_scans=False,
+            pending_dispatch=True):
+        """Build the queue-ack/idle-poll boundary for the fast-GET race."""
+        remote = SystemFile("fast-get.bin", 100, False, mtime_ns=local_mtime_ns)
+        staged = SystemFile(
+            "fast-get.bin", local_size, False, is_staging=True,
+            mtime_ns=local_mtime_ns,
+        )
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        live_model = builder.build_model()
+        remote_result = ScannerResult(
+            datetime.now(), [remote], scanned_path_pair_ids={None},
+            is_scan_final=True,
+        ) if remote_scan else None
+        local_result = ScannerResult(
+            datetime.now(), [staged], scanned_path_pair_ids={None},
+            is_scan_final=True,
+        ) if local_scan else None
+        controller, _ = self._make_progressive_update_controller(
+            remote_result,
+            local_scan=local_result,
+            model_builder=builder,
+            model=live_model,
+        )
+        if defer_scans:
+            controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
+                None, remote_result,
+            ]
+            controller._Controller__local_scan_process.pop_latest_result.side_effect = [
+                None, local_result,
+            ]
+        file_id = ModelFile.build_file_id("fast-get.bin", None)
+        controller._Controller__work_state_lock = RLock()
+        controller._Controller__pending_queue_dispatches = {
+            file_id: PendingQueueDispatch(
+                0.0, "fast-get.bin", None, False, 7, (100, 1700000000),
+            ),
+        } if pending_dispatch else {}
+        controller._Controller__queue_dispatch_pending = (
+            Controller._Controller__queue_dispatch_pending.__get__(controller, Controller)
+        )
+        controller._lftp_statuses_with_pending_dispatches = (
+            Controller._lftp_statuses_with_pending_dispatches.__get__(controller, Controller)
+        )
+        controller._reconcile_pending_queue_dispatches_from_fresh_status = (
+            Controller._reconcile_pending_queue_dispatches_from_fresh_status.__get__(
+                controller, Controller,
+            )
+        )
+        controller._Controller__is_explicitly_stopped = MagicMock(return_value=stopped)
+        controller._Controller__prev_downloading_file_names = set()
+        controller._Controller__lftp.status.return_value = []
+        controller._Controller__lftp.last_status_poll_healthy = True
+        controller.MoveFromStagingResult = Controller.MoveFromStagingResult
+        controller._reserve_move_attempt = MagicMock(return_value=True)
+        controller._release_move_attempt = MagicMock()
+        controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED,
+        )
+        controller._record_download_completion = MagicMock()
+        controller._complete_download_start_lifecycle = MagicMock()
+        controller.clear_extracted_marker = MagicMock()
+        controller._mark_successful_final_move_handoff = MagicMock()
+        controller._mark_current_process_final_publication = MagicMock()
+        controller._Controller__target_archive_trace_selector_matches_file = MagicMock(return_value=False)
+        if stopped:
+            controller._Controller__persist.stopped_file_names.add(file_id)
+        return controller, live_model, file_id
+
+    def _prepare_v092_stale_pre_queue_poll(self, controller, file_id):
+        """Install a completed pre-Queue idle poll and an unfinished queue op."""
+        class DeferredStatusExecutor:
+            def __init__(self):
+                self.submissions = []
+
+            def submit(self, operation):
+                future = Future()
+                self.submissions.append((operation, future))
+                return future
+
+            def run_next(self):
+                operation, future = self.submissions.pop(0)
+                try:
+                    future.set_result(operation())
+                except Exception as error:
+                    future.set_exception(error)
+
+        status_future = Future()
+        controller._Controller__lftp_status_future = status_future
+        controller._Controller__uses_async_lftp_owner = MagicMock(return_value=True)
+        controller._Controller__lftp_executor = DeferredStatusExecutor()
+        controller._Controller__ensure_lftp_executor = (
+            Controller._Controller__ensure_lftp_executor.__get__(controller, Controller)
+        )
+        controller._Controller__submit_lftp_operation = (
+            Controller._Controller__submit_lftp_operation.__get__(controller, Controller)
+        )
+        controller.wake_process = MagicMock()
+        controller._get_lftp_status_snapshot = (
+            Controller._get_lftp_status_snapshot.__get__(controller, Controller)
+        )
+        queue_future = Future()
+        controller._Controller__lftp_operation_sequences = {file_id: 7}
+        controller._Controller__lftp_failed_operation_sequences = set()
+        controller._Controller__lftp_operations = [
+            _LftpOperation("queue", queue_future, file_id, 7),
+        ]
+        controller._Controller__lftp_operation_is_current = (
+            Controller._Controller__lftp_operation_is_current.__get__(controller, Controller)
+        )
+        controller._Controller__download_start_lock = RLock()
+        controller._Controller__download_start_state = {}
+        controller._Controller__restore_failed_queue_lifecycle = (
+            Controller._Controller__restore_failed_queue_lifecycle.__get__(controller, Controller)
+        )
+        controller._Controller__drain_lftp_operations = (
+            Controller._Controller__drain_lftp_operations.__get__(controller, Controller)
+        )
+
+        # The status future began before Queue installed this dispatch. Queue
+        # acceptance is visible when the pre-Queue empty status
+        # completes.  The real status-snapshot seam consumes that old result;
+        # this mirrors the controller's post-poll scheduler bookkeeping.
+        controller._Controller__pending_queue_dispatches[file_id] = PendingQueueDispatch(
+            0.0, "fast-get.bin", None, False, 7, (100, 1700000000),
+        )
+        status_future.set_result(([], True))
+        self.assertEqual(([], True), controller._get_lftp_status_snapshot())
+        controller._Controller__last_lftp_statuses = []
+        # The direct Controller test owns the Queue submission boundary. This
+        # updater fixture starts immediately after that boundary, where the
+        # pre-Queue future reference and idle authority were invalidated.
+        controller._Controller__lftp_idle_status_authoritative = False
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_status_cache_expires_at = (
+            datetime.now() + timedelta(seconds=3)
+        )
+        return queue_future, controller._Controller__lftp_executor
+
+    def test_v092_fast_get_idle_exact_staging_finalizes_optimistic_queue(self):
+        """A fast GET can finish between Queue acknowledgement and first status."""
+        controller, live_model, file_id = self._make_v092_fast_get_controller(
+            defer_scans=True,
+        )
+
+        ModelUpdater(controller).update()
+        self.assertEqual(ModelFile.State.QUEUED, live_model.get_file(file_id).state)
+        self.assertEqual([], controller._Controller__last_lftp_statuses)
+        self.assertEqual([], controller._Controller__active_downloading_file_names)
+        self.assertNotIn(file_id, controller._Controller__pending_queue_dispatches)
+        self.assertIn(("fast-get.bin", None, None), controller._Controller__pending_completion_file_names)
+        controller._Controller__move_from_staging.assert_not_called()
+        ModelUpdater(controller).update()
+        self.assertEqual({None}, controller._Controller__reconciled_local_path_pair_ids)
+        self.assertEqual({None}, controller._Controller__reconciled_remote_path_pair_ids)
+        self.assertTrue(controller._Controller__model_builder.has_complete_local_coverage(file_id))
+        self.assertTrue(controller._Controller__model_builder.has_verified_complete_staging_remote_identity(file_id))
+
+        file = live_model.get_file(file_id)
+        self.assertEqual(
+            (
+                True,
+                ModelFile.State.DOWNLOADED,
+                100,
+                100,
+                [call("fast-get.bin", None)],
+                {file_id},
+                {},
+            ),
+            (
+                file_id not in controller._Controller__pending_queue_dispatches,
+                file.state,
+                file.remote_size,
+                file.transferred_size,
+                controller._Controller__move_from_staging.call_args_list,
+                controller._Controller__persist.downloaded_file_names,
+                controller._Controller__persist.resume_source_identities,
+            ),
+        )
+        controller._Controller__remote_scan_process.pop_latest_result.side_effect = None
+        controller._Controller__local_scan_process.pop_latest_result.side_effect = None
+        ModelUpdater(controller).update()
+        controller._Controller__move_from_staging.assert_called_once_with("fast-get.bin", None)
+
+    def test_v092_fast_get_idle_without_exact_reconciliation_does_not_move_or_bind(self):
+        controller, live_model, file_id = self._make_v092_fast_get_controller(
+            local_size=99, remote_scan=False,
+        )
+
+        ModelUpdater(controller).update()
+
+        controller._Controller__move_from_staging.assert_not_called()
+        self.assertEqual({}, controller._Controller__persist.resume_source_identities)
+        self.assertNotEqual(ModelFile.State.DOWNLOADED, live_model.get_file(file_id).state)
+
+    def test_v092_fast_get_stop_before_idle_remains_stopped(self):
+        controller, live_model, file_id = self._make_v092_fast_get_controller(stopped=True)
+
+        ModelUpdater(controller).update()
+
+        controller._Controller__move_from_staging.assert_not_called()
+        self.assertEqual({}, controller._Controller__persist.resume_source_identities)
+        self.assertIn(file_id, controller._Controller__persist.stopped_file_names)
+        self.assertNotEqual(ModelFile.State.DOWNLOADED, live_model.get_file(file_id).state)
+
+    def test_v092_fast_get_stale_pre_queue_idle_does_not_force_post_dispatch_poll(self):
+        """A status result started before Queue must not retire the next lifecycle."""
+        controller, live_model, file_id = self._make_v092_fast_get_controller(
+            defer_scans=True, pending_dispatch=False,
+        )
+        queue_future, status_executor = self._prepare_v092_stale_pre_queue_poll(controller, file_id)
+
+        ModelUpdater(controller).update()
+        self.assertEqual(ModelFile.State.QUEUED, live_model.get_file(file_id).state)
+
+        queue_future.set_result(None)
+        controller._Controller__drain_lftp_operations()
+        self.assertEqual([], controller._Controller__lftp_operations)
+        self.assertEqual(0, controller._Controller__lftp.status.call_count)
+        status_executor.run_next()
+        ModelUpdater(controller).update()
+
+        self.assertEqual({None}, controller._Controller__reconciled_local_path_pair_ids)
+        self.assertEqual({None}, controller._Controller__reconciled_remote_path_pair_ids)
+        self.assertTrue(controller._Controller__model_builder.has_complete_local_coverage(file_id))
+        self.assertTrue(controller._Controller__model_builder.has_verified_complete_staging_remote_identity(file_id))
+        file = live_model.get_file(file_id)
+        self.assertEqual(
+            (
+                True,
+                ModelFile.State.DOWNLOADED,
+                100,
+                100,
+                [call("fast-get.bin", None)],
+                {file_id},
+                {},
+                set(),
+                1,
+            ),
+            (
+                file_id not in controller._Controller__pending_queue_dispatches,
+                file.state,
+                file.remote_size,
+                file.transferred_size,
+                controller._Controller__move_from_staging.call_args_list,
+                controller._Controller__persist.downloaded_file_names,
+                controller._Controller__persist.resume_source_identities,
+                controller._Controller__pending_completion_file_names,
+                controller._Controller__lftp.status.call_count,
+            ),
+        )
+
+    def test_v092_fast_get_stale_idle_alone_does_not_handoff_completion(self):
+        controller, live_model, file_id = self._make_v092_fast_get_controller(defer_scans=True)
+        queue_future, _ = self._prepare_v092_stale_pre_queue_poll(controller, file_id)
+
+        ModelUpdater(controller).update()
+        self.assertFalse(queue_future.done())
+        ModelUpdater(controller).update()
+
+        self.assertIn(file_id, controller._Controller__pending_queue_dispatches)
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        controller._Controller__move_from_staging.assert_not_called()
+        self.assertEqual({}, controller._Controller__persist.resume_source_identities)
+
+    def test_v092_fast_get_post_queue_running_status_binds_without_completion_handoff(self):
+        controller, _, file_id = self._make_v092_fast_get_controller(
+            defer_scans=True, pending_dispatch=False,
+        )
+        queue_future, status_executor = self._prepare_v092_stale_pre_queue_poll(controller, file_id)
+        running = LftpJobStatus(
+            7, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "fast-get.bin", "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(1, 100, 1, 100, 1)
+
+        ModelUpdater(controller).update()
+        queue_future.set_result(None)
+        controller._Controller__drain_lftp_operations()
+        controller._Controller__lftp.status.return_value = [running]
+        status_executor.run_next()
+        ModelUpdater(controller).update()
+
+        self.assertEqual({file_id: (100, 1700000000)}, controller._Controller__persist.resume_source_identities)
+        self.assertNotIn(file_id, controller._Controller__pending_queue_dispatches)
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        controller._Controller__move_from_staging.assert_not_called()
+
+    def test_v092_fast_get_failed_or_cancelled_queue_future_never_registers_completion(self):
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled):
+                controller, live_model, file_id = self._make_v092_fast_get_controller(
+                    defer_scans=True, pending_dispatch=False,
+                )
+                queue_future, _ = self._prepare_v092_stale_pre_queue_poll(controller, file_id)
+                ModelUpdater(controller).update()
+
+                if cancelled:
+                    queue_future.cancel()
+                else:
+                    queue_future.set_exception(RuntimeError("queue failed"))
+                controller._Controller__drain_lftp_operations()
+
+                self.assertNotIn(file_id, controller._Controller__pending_queue_dispatches)
+                self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+                controller._Controller__move_from_staging.assert_not_called()
+                self.assertEqual({}, controller._Controller__persist.resume_source_identities)
+                self.assertNotEqual(ModelFile.State.DOWNLOADED, live_model.get_file(file_id).state)
 
     @staticmethod
     def _progressive_result(name="root", size=1, *, final=False, unknown=None):
@@ -2907,6 +3271,61 @@ class TestModelUpdater(unittest.TestCase):
         self.assertIn(ModelFile.build_file_id("new.bin", "pair-a"), live_model.get_file_ids())
         builder.build_model.assert_not_called()
 
+    def test_pair_candidate_exact_staging_pending_completion_moves_without_model_diff(self):
+        """A selected final pair supplies the physical proof before adoption."""
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        builder = ModelBuilder()
+        builder.set_local_files([old])
+        builder.set_remote_files([old])
+        live_model = builder.build_model()
+        builder.build_model = MagicMock(wraps=builder.build_model)
+
+        staged = SystemFile("release.bin", 30, False, is_staging=True, mtime_ns=1)
+        staged.path_pair_id = "pair-a"
+        remote = SystemFile("release.bin", 30, False, mtime_ns=1)
+        remote.path_pair_id = "pair-a"
+        final_local = ScannerResult(
+            datetime.now(), [staged], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock()}
+        controller._Controller__pending_completion_file_names = {("release.bin", "pair-a", None)}
+        controller.MoveFromStagingResult = Controller.MoveFromStagingResult
+        controller._reserve_move_attempt = MagicMock(return_value=True)
+        controller._release_move_attempt = MagicMock()
+        controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED,
+        )
+        controller._record_download_completion = MagicMock()
+        controller._complete_download_start_lifecycle = MagicMock()
+        controller.clear_extracted_marker = MagicMock()
+        controller._mark_successful_final_move_handoff = MagicMock()
+        controller._mark_current_process_final_publication = MagicMock()
+        controller._Controller__target_archive_trace_selector_matches_file = MagicMock(return_value=False)
+
+        # The candidate itself changes the selected root, but the pending
+        # completion owner must not require a ModelDiff to attempt its move.
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+
+        controller._Controller__move_from_staging.assert_called_once_with("release.bin", "pair-a")
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        self.assertEqual(
+            {ModelFile.build_file_id("release.bin", "pair-a")},
+            controller._Controller__persist.downloaded_file_names,
+        )
+        builder.build_model.assert_not_called()
+
     def test_pair_final_with_stale_markers_uses_candidate_and_prunes_them(self):
         old = SystemFile("old.bin", 10, False)
         old.path_pair_id = "pair-a"
@@ -3217,6 +3636,81 @@ class TestModelUpdater(unittest.TestCase):
             CANDIDATE_UNRELATED_LIFECYCLE_REASON_RETRY,
             deferred_calls[0].kwargs["details"]["reason"],
         )
+
+    def test_pair_candidate_does_not_move_unreconciled_unselected_pending_completion(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        pending_remote = SystemFile("pending.bin", 10, False)
+        pending_remote.path_pair_id = "pair-b"
+        pending_local = SystemFile("pending.bin", 10, False, is_staging=True)
+        pending_local.path_pair_id = "pair-b"
+        builder = ModelBuilder()
+        builder.set_local_files([old, pending_local])
+        builder.set_remote_files([old, pending_remote])
+        builder.set_downloaded_files(set())
+        builder.set_downloaded_timestamps({})
+        builder.set_extracted_files(set())
+        builder.set_stopped_files(set())
+        builder.set_move_failed_files(set())
+        builder.set_final_move_succeeded_files(set())
+        builder.set_unknown_local_path_pair_ids({"pair-b"})
+        live_model = builder.build_model()
+        pending_id = ModelFile.build_file_id("pending.bin", "pair-b")
+        self.assertTrue(builder.has_complete_local_coverage(pending_id))
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        builder.request_rebuild = MagicMock(wraps=builder.request_rebuild)
+        replacement_local = SystemFile("new.bin", 10, False)
+        replacement_local.path_pair_id = "pair-a"
+        replacement_remote = SystemFile("new.bin", 30, False)
+        replacement_remote.path_pair_id = "pair-a"
+        final_local = ScannerResult(
+            datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        controller._Controller__is_explicitly_stopped = MagicMock(return_value=False)
+        controller._Controller__pending_completion_file_names = {("pending.bin", "pair-b", None)}
+        controller._Controller__context.performance_diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        controller.MoveFromStagingResult = Controller.MoveFromStagingResult
+        controller._reserve_move_attempt = MagicMock(return_value=True)
+        controller._release_move_attempt = MagicMock()
+        controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED,
+        )
+        controller._record_download_completion = MagicMock()
+        controller._complete_download_start_lifecycle = MagicMock()
+        controller.clear_extracted_marker = MagicMock()
+        controller._mark_successful_final_move_handoff = MagicMock()
+        controller._mark_current_process_final_publication = MagicMock()
+        controller._Controller__target_archive_trace_selector_matches_file = MagicMock(return_value=False)
+
+        ModelUpdater(controller).update()
+
+        self.assertIn(ModelFile.build_file_id("new.bin", "pair-a"), live_model.get_file_ids())
+        self.assertIn(("pending.bin", "pair-b", None), controller._Controller__pending_completion_file_names)
+        builder.build_model.assert_not_called()
+        # ``has_complete_local_coverage`` deliberately ignores the unknown
+        # bucket; a candidate for pair-a must therefore not turn pair-b's
+        # retained staging tree into a global final move.
+        builder.request_rebuild.assert_not_called()
+        counters = controller._Controller__context.performance_diagnostics.snapshot()["counters"]
+        self.assertEqual(0, counters[COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED])
+
+        # A later idle/candidate update still cannot use stale pair-b staging
+        # evidence until both scan sides reconcile that exact Path Pair.
+        ModelUpdater(controller).update()
+        controller._Controller__move_from_staging.assert_not_called()
+        self.assertIn(("pending.bin", "pair-b", None), controller._Controller__pending_completion_file_names)
+        self.assertNotIn(pending_id, controller._Controller__persist.downloaded_file_names)
 
     def test_multi_pair_final_with_new_duplicate_basenames_uses_global_build(self):
         old_a = SystemFile("old-a.bin", 10, False)
@@ -3990,6 +4484,344 @@ class TestModelUpdater(unittest.TestCase):
         self.assertIn("complete_local_coverage", candidate["details"])
         self.assertNotIn("root", str(entries))
 
+    def test_v092_lftp_finish_exact_staged_directory_without_model_diff_finalizes(self):
+        """Reproduce the v0.9.2 no-diff completion handoff.
+
+        A restarted controller has only the remote inventory and an incomplete
+        staged directory.  Manual Queue then resumes that directory.  By the
+        time the LFTP job disappears, the staged tree can already be byte exact
+        and the model is therefore still Downloaded before/after status loss.
+        The completion owner must move/publish that row even though no model
+        diff is emitted by the status disappearance.
+        """
+        remote_root = SystemFile("generic", 30, True)
+        remote_root.add_child(SystemFile("complete.bin", 10, False, mtime_ns=1))
+        remote_root.add_child(SystemFile("partial.bin", 10, False, mtime_ns=2))
+        remote_root.add_child(SystemFile("missing.bin", 10, False, mtime_ns=3))
+
+        restarted_staging = SystemFile("generic", 15, True)
+        restarted_staging.add_child(SystemFile("complete.bin", 10, False, mtime_ns=1))
+        restarted_staging.add_child(SystemFile("partial.bin", 5, False, is_staging=True))
+
+        builder = ModelBuilder()
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([restarted_staging])
+        restarted_model = builder.build_model()
+        restarted_file = restarted_model.get_file("generic")
+        self.assertEqual(ModelFile.State.DEFAULT, restarted_file.state)
+        self.assertEqual(15, restarted_file.local_size)
+
+        # Manual Queue resumes the valid partial and missing leaves.  The
+        # final LFTP snapshot has no sidecar files and the staged tree is exact
+        # before the status disappears, so both model builds are Downloaded.
+        exact_staging = SystemFile("generic", 30, True)
+        exact_staging.add_child(SystemFile("complete.bin", 10, False, mtime_ns=1))
+        exact_staging.add_child(SystemFile("partial.bin", 10, False, is_staging=True, mtime_ns=2))
+        exact_staging.add_child(SystemFile("missing.bin", 10, False, is_staging=True, mtime_ns=3))
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "generic", "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(30, 30, 100, 100, 0)
+        builder.set_local_files([exact_staging])
+        builder.set_lftp_statuses([running])
+        live_model = builder.build_model()
+        live_file = live_model.get_file("generic")
+        self.assertEqual(ModelFile.State.DOWNLOADED, live_file.state)
+        self.assertEqual(30, live_file.transferred_size)
+        self.assertTrue(builder.has_complete_local_coverage("generic"))
+
+        # These final scans establish both sides of the legacy scope.  This
+        # is deliberately not inferred from exact staging bytes alone.
+        final_local = ScannerResult(
+            datetime.now(), [exact_staging], scanned_path_pair_ids={None},
+            is_scan_final=True,
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [remote_root], scanned_path_pair_ids={None},
+            is_scan_final=True,
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__is_explicitly_stopped = MagicMock(return_value=False)
+        controller.MoveFromStagingResult = Controller.MoveFromStagingResult
+        controller._Controller__prev_downloading_file_names = {("generic", None, None)}
+        controller._Controller__lftp.status.return_value = []
+        controller._reserve_move_attempt = MagicMock(return_value=True)
+        controller._release_move_attempt = MagicMock()
+        controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED,
+        )
+        controller._record_download_completion = MagicMock()
+        controller._complete_download_start_lifecycle = MagicMock()
+        controller.clear_extracted_marker = MagicMock()
+        controller._mark_successful_final_move_handoff = MagicMock()
+        controller._mark_current_process_final_publication = MagicMock()
+        controller._Controller__target_archive_trace_selector_matches_file = MagicMock(return_value=False)
+
+        # Exact local coverage can keep the rendered state Downloaded before
+        # and after status retirement. The production failure is precisely
+        # the quiet ModelDiff path, so exercise it explicitly here.
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]) as diff_models:
+            ModelUpdater(controller).update()
+
+        diff_models.assert_called_once()
+
+        controller._Controller__move_from_staging.assert_called_once_with("generic", None)
+        # These are the fields ViewFile consumes: DOWNLOADED plus equal
+        # transferred/remote bytes maps to 100%, even though completed model
+        # rows deliberately clear the live-only percentage.
+        published_file = live_model.get_file("generic")
+        self.assertEqual(ModelFile.State.DOWNLOADED, published_file.state)
+        self.assertEqual(30, published_file.remote_size)
+        self.assertEqual(30, published_file.transferred_size)
+        self.assertIsNone(published_file.download_progress)
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        self.assertEqual({"generic"}, controller._Controller__persist.downloaded_file_names)
+        self.assertEqual({"generic"}, controller._Controller__persist.final_move_succeeded_file_names)
+
+        # A quiet idle pass after publication must not re-run either the move
+        # or completion publication for an identity that is no longer pending.
+        ModelUpdater(controller).update()
+        controller._Controller__move_from_staging.assert_called_once()
+
+    def test_v092_pending_completion_waits_for_authoritative_local_coverage(self):
+        controller = self._make_v092_pending_completion_controller(complete=False)
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+
+        file_id = ModelFile.build_file_id("pending.bin", None)
+        controller._Controller__move_from_staging.assert_not_called()
+        self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+        self.assertNotIn(file_id, controller._Controller__persist.downloaded_file_names)
+
+    def test_v092_pending_completion_defers_when_local_scan_is_unknown(self):
+        controller = self._make_v092_pending_completion_controller()
+        controller._Controller__local_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("pending.bin", 10, False, is_staging=True)],
+            scanned_path_pair_ids={None}, unknown_path_pair_ids={None},
+        )
+        controller._Controller__remote_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("pending.bin", 10, False)], scanned_path_pair_ids={None},
+        )
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+
+        self.assertNotIn(None, controller._Controller__reconciled_local_path_pair_ids)
+        self.assertIn(None, controller._Controller__reconciled_remote_path_pair_ids)
+        controller._Controller__move_from_staging.assert_not_called()
+        self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+
+    def test_v092_pending_completion_defers_when_remote_scan_is_unknown_or_failed(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                controller = self._make_v092_pending_completion_controller()
+                controller._Controller__local_scan_process.pop_latest_result.return_value = ScannerResult(
+                    datetime.now(), [SystemFile("pending.bin", 10, False, is_staging=True)],
+                    scanned_path_pair_ids={None},
+                )
+                controller._Controller__remote_scan_process.pop_latest_result.return_value = ScannerResult(
+                    datetime.now(), [] if failed else [SystemFile("pending.bin", 10, False)],
+                    scanned_path_pair_ids={None}, failed=failed, unknown_path_pair_ids={None},
+                )
+
+                with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+                    ModelUpdater(controller).update()
+
+                self.assertIn(None, controller._Controller__reconciled_local_path_pair_ids)
+                self.assertNotIn(None, controller._Controller__reconciled_remote_path_pair_ids)
+                controller._Controller__move_from_staging.assert_not_called()
+                self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+
+    def test_v092_pending_path_pair_moves_only_after_both_final_scans_reconcile_it(self):
+        path_pair_id = "pair-b"
+        controller = self._make_v092_pending_completion_controller(path_pair_id=path_pair_id)
+        local = SystemFile("pending.bin", 10, False, is_staging=True, mtime_ns=1)
+        local.path_pair_id = path_pair_id
+        remote = SystemFile("pending.bin", 10, False, mtime_ns=1)
+        remote.path_pair_id = path_pair_id
+        controller._Controller__local_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [local], scanned_path_pair_ids={path_pair_id}, is_scan_final=True,
+        )
+        controller._Controller__remote_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [remote], scanned_path_pair_ids={path_pair_id}, is_scan_final=True,
+        )
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+
+        self.assertEqual({path_pair_id}, controller._Controller__reconciled_local_path_pair_ids)
+        self.assertEqual({path_pair_id}, controller._Controller__reconciled_remote_path_pair_ids)
+        controller._Controller__move_from_staging.assert_called_once_with("pending.bin", path_pair_id)
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+
+    def test_v092_pending_completion_requires_exact_staging_source_identity(self):
+        for mtime_ns in (1_000_000_001, None):
+            with self.subTest(mtime_ns=mtime_ns):
+                controller = self._make_v092_pending_completion_controller()
+                controller._Controller__model_builder.set_local_files([
+                    SystemFile("pending.bin", 10, False, is_staging=True, mtime_ns=mtime_ns),
+                ])
+
+                with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+                    ModelUpdater(controller).update()
+
+                self.assertTrue(
+                    controller._Controller__model_builder.has_complete_local_coverage(
+                        ModelFile.build_file_id("pending.bin", None),
+                    )
+                )
+                self.assertFalse(
+                    controller._Controller__model_builder.has_verified_complete_staging_remote_identity(
+                        ModelFile.build_file_id("pending.bin", None),
+                    )
+                )
+                controller._Controller__move_from_staging.assert_not_called()
+                self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+
+    def test_v092_pending_completion_rejects_full_logical_size_from_pget_sidecar(self):
+        controller = self._make_v092_pending_completion_controller()
+        sidecar_backed_target = SystemFile(
+            "pending.bin", 10, False, is_staging=True, mtime_ns=1,
+        )
+        # This models a syntactically valid pget map whose declared segments
+        # make Scanner publish the remote-sized logical value while the actual
+        # target is truncated. Resume metadata is never physical completion.
+        sidecar_backed_target.status_sidecar_ready = True
+        controller._Controller__model_builder.set_local_files([sidecar_backed_target])
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+
+        file_id = ModelFile.build_file_id("pending.bin", None)
+        self.assertTrue(controller._Controller__model_builder.has_complete_local_coverage(file_id))
+        self.assertFalse(
+            controller._Controller__model_builder.has_verified_complete_staging_remote_identity(file_id)
+        )
+        controller._Controller__move_from_staging.assert_not_called()
+        self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
+        self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+
+    def test_v092_scoped_pending_completion_defers_for_unscoped_same_name_active_status(self):
+        for job_type in (LftpJobStatus.Type.GET, LftpJobStatus.Type.PGET):
+            for state in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING):
+                with self.subTest(job_type=job_type, state=state):
+                    controller = self._make_v092_pending_completion_controller(path_pair_id="pair-b")
+                    unscoped_status = LftpJobStatus(
+                        9, job_type, state, "pending.bin", "",
+                    )
+                    if state == LftpJobStatus.State.RUNNING:
+                        unscoped_status.total_transfer_state = LftpJobStatus.TransferState(
+                            1, 10, 10, 100, 1,
+                        )
+                    # Exercise the ambiguity that matters here: an older
+                    # authoritative-idle marker with a cached one-sided
+                    # status. Its legacy file id differs from pair-b's id.
+                    controller._Controller__last_lftp_statuses = [unscoped_status]
+                    controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(minutes=1)
+                    controller._Controller__lftp_idle_status_authoritative = True
+
+                    with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+                        ModelUpdater(controller).update()
+
+                    controller._Controller__move_from_staging.assert_not_called()
+                    self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
+                    self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
+                    self.assertIn(
+                        ("pending.bin", "pair-b", None),
+                        controller._Controller__pending_completion_file_names,
+                    )
+
+    def test_v092_scoped_pending_completion_ignores_unscoped_active_other_name(self):
+        controller = self._make_v092_pending_completion_controller(path_pair_id="pair-b")
+        other_status = LftpJobStatus(
+            9, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "other.bin", "",
+        )
+        other_status.total_transfer_state = LftpJobStatus.TransferState(1, 10, 10, 100, 1)
+        controller._Controller__last_lftp_statuses = [other_status]
+        controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(minutes=1)
+        controller._Controller__lftp_idle_status_authoritative = True
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+
+        controller._Controller__move_from_staging.assert_called_once_with("pending.bin", "pair-b")
+
+    def test_v092_pending_completion_failure_retries_after_existing_delay(self):
+        controller = self._make_v092_pending_completion_controller()
+        controller._Controller__move_from_staging.side_effect = [
+            Controller.MoveFromStagingResult.FAILED,
+            Controller.MoveFromStagingResult.COMPLETED,
+        ]
+        file_id = ModelFile.build_file_id("pending.bin", None)
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+        self.assertEqual(1, controller._Controller__move_from_staging.call_count)
+        self.assertEqual(1, controller._Controller__persist.move_failure_counts[file_id])
+        self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+        self.assertEqual(1, controller._Controller__move_from_staging.call_count)
+
+        controller._Controller__move_retry_due[file_id] = datetime.now() - timedelta(seconds=1)
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+        self.assertEqual(2, controller._Controller__move_from_staging.call_count)
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        self.assertEqual({file_id}, controller._Controller__persist.downloaded_file_names)
+
+    def test_v092_pending_completion_no_move_clears_resume_source_binding(self):
+        controller = self._make_v092_pending_completion_controller()
+        file_id = ModelFile.build_file_id("pending.bin", None)
+        controller._Controller__persist.resume_source_identities = {file_id: (10, 1)}
+        controller._Controller__move_from_staging.return_value = Controller.MoveFromStagingResult.NO_MOVE_APPLICABLE
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+
+        self.assertEqual({}, controller._Controller__persist.resume_source_identities)
+
+    def test_v092_pending_completion_respects_explicit_stop(self):
+        controller = self._make_v092_pending_completion_controller()
+        controller._Controller__is_explicitly_stopped.return_value = True
+        # Cover an already-registered completion whose stop arrives before
+        # the quiet finalization pass, rather than the earlier LFTP detector
+        # (which correctly avoids registering stopped work in the first place).
+        controller._Controller__pending_completion_file_names = {("pending.bin", None, None)}
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+
+        controller._Controller__move_from_staging.assert_not_called()
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
+
+    def test_v092_stop_cancels_pending_completion_before_downloaded_diff_can_finalize(self):
+        controller = self._make_v092_pending_completion_controller()
+        controller._Controller__is_explicitly_stopped.return_value = True
+        controller._Controller__pending_completion_file_names = {("pending.bin", None, None)}
+        old_file = controller._Controller__model.get_file("pending.bin")
+        downloaded_file = ModelFile("pending.bin", False)
+        downloaded_file.remote_size = 10
+        downloaded_file.local_size = 10
+        downloaded_file.state = ModelFile.State.DOWNLOADED
+
+        with patch(
+                "controller.model_updater.ModelDiffUtil.diff_models",
+                return_value=[ModelDiff(ModelDiff.Change.UPDATED, old_file, downloaded_file)],
+        ):
+            ModelUpdater(controller).update()
+
+        controller._Controller__move_from_staging.assert_not_called()
+        self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
+
     def test_active_delta_authorization_rejection_publishes_only_full_reconciliation(self):
         builder = ModelBuilder()
         builder.set_remote_files([SystemFile("root", 100, False)])
@@ -4203,6 +5035,7 @@ class TestModelUpdater(unittest.TestCase):
         controller = SimpleNamespace(
             _Controller__persist=SimpleNamespace(
                 downloaded_file_names=set(),
+                resume_source_identities={},
                 extracted_file_names=set(),
                 stopped_file_names=set(),
             ),
@@ -4308,6 +5141,7 @@ class TestModelUpdater(unittest.TestCase):
         controller = SimpleNamespace(
             _Controller__persist=SimpleNamespace(
                 downloaded_file_names=set(),
+                resume_source_identities={},
                 extracted_file_names=set(),
                 stopped_file_names=set(),
             ),

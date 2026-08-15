@@ -65,6 +65,30 @@ class TestControllerPersist(unittest.TestCase):
         self.assertEqual({file_id}, restored.final_move_succeeded_file_names)
         self.assertEqual(set(), legacy.final_move_succeeded_file_names)
 
+    def test_resume_sources_round_trip_is_canonical_and_legacy_load_is_empty(self):
+        first = '["pair-a","sample.bin"]'
+        second = '["pair-b","sample.bin"]'
+        default = "default-sample.bin"
+        persist = ControllerPersist()
+        persist.resume_source_identities = {
+            first: (100, 1700000000), second: (100, 1700000001), default: (100, 1700000002),
+        }
+
+        restored = ControllerPersist.from_str(persist.to_str())
+        legacy = ControllerPersist.from_str('{"downloaded": [], "extracted": []}')
+
+        self.assertEqual(persist.resume_source_identities, restored.resume_source_identities)
+        self.assertEqual({}, legacy.resume_source_identities)
+
+    def test_resume_sources_reject_noncanonical_or_invalid_identity(self):
+        for source in (
+            '{"resume_sources": {"pair-a\u001flegacy-name": {"size": 1, "mtime": 2}}, "downloaded": [], "extracted": []}',
+            '{"resume_sources": {"[\\"pair-a\\",\\"sample.bin\\"]": {"size": -1, "mtime": 2}}, "downloaded": [], "extracted": []}',
+            '{"resume_sources": {"[\\"pair-a\\",\\"sample.bin\\"]": {"size": 1, "mtime": true}}, "downloaded": [], "extracted": []}',
+        ):
+            with self.subTest(source=source), self.assertRaises(PersistError):
+                ControllerPersist.from_str(source)
+
     def test_move_failure_counts_drops_invalid_entries(self):
         restored = ControllerPersist.from_str(
             '{"downloaded": [], "extracted": [], "move_failure_counts": '

@@ -269,6 +269,89 @@ class TestLftp(unittest.TestCase):
         self.assertEqual("TV", statuses[0].path_pair_name)
         self.assertTrue(lftp.last_status_poll_healthy)
 
+    def test_status_leaves_cross_pair_remote_and_local_matches_unscoped(self):
+        lftp = self._build_test_lftp()
+        lftp._Lftp__path_pairs_by_id = {
+            "movies": {
+                "name": "Movies",
+                "remote_path": "/remote/movies",
+                "local_path": "/local/movies",
+            },
+            "tv": {
+                "name": "TV",
+                "remote_path": "/remote/tv",
+                "local_path": "/local/tv",
+            },
+        }
+        status = LftpJobStatus(
+            job_id=5,
+            job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING,
+            name="cross-pair",
+            flags="-c",
+            remote_path="/remote/movies/cross-pair",
+            local_path="/local/tv/",
+        )
+
+        lftp._Lftp__annotate_status_path_pairs([status])
+
+        self.assertIsNone(status.path_pair_id)
+        self.assertIsNone(status.path_pair_name)
+
+    def test_status_leaves_overlapping_or_reconfigured_roots_unscoped(self):
+        cases = [
+            {
+                "broad": {
+                    "name": "Broad",
+                    "remote_path": "/remote",
+                    "local_path": "/local",
+                },
+                "specific": {
+                    "name": "Specific",
+                    "remote_path": "/remote/movies",
+                    "local_path": "/other",
+                },
+                "remote_path": "/remote/movies/file.mkv",
+                "local_path": "/local/file.mkv",
+            },
+            {
+                "first": {
+                    "name": "First",
+                    "remote_path": "/remote/movies",
+                    "local_path": "/local/movies",
+                },
+                "reconfigured": {
+                    "name": "Reconfigured",
+                    "remote_path": "/remote/movies",
+                    "local_path": "/local/other",
+                },
+                "remote_path": "/remote/movies/file.mkv",
+                "local_path": "/local/movies/file.mkv",
+            },
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                lftp = self._build_test_lftp()
+                pair_data = {
+                    key: value for key, value in case.items()
+                    if key not in {"remote_path", "local_path"}
+                }
+                lftp._Lftp__path_pairs_by_id = pair_data
+                status = LftpJobStatus(
+                    job_id=5,
+                    job_type=LftpJobStatus.Type.PGET,
+                    state=LftpJobStatus.State.RUNNING,
+                    name="ambiguous",
+                    flags="-c",
+                    remote_path=case["remote_path"],
+                    local_path=case["local_path"],
+                )
+
+                lftp._Lftp__annotate_status_path_pairs([status])
+
+                self.assertIsNone(status.path_pair_id)
+                self.assertIsNone(status.path_pair_name)
+
     def test_status_marks_poll_unhealthy_when_jobs_command_times_out(self):
         lftp = self._build_status_poll_test_lftp(send_side_effect=pexpect.exceptions.TIMEOUT("timeout"))
 
@@ -525,6 +608,7 @@ class TestLftp(unittest.TestCase):
     def test_run_command_records_pending_error_for_common_failure_outputs(self):
         cases = [
             ("pget: Access failed: No such file (/remote/missing)", "No such file"),
+            ("get: Access failed: No such file (/remote/missing)", "No such file"),
             ("mirror: Access failed: No such file (/remote/missing)", "No such file"),
             ("pget: Access failed: Wrong type", "Access failed"),
             ("mirror: Access failed: Wrong type", "Access failed"),
@@ -866,6 +950,8 @@ class TestLftp(unittest.TestCase):
             "test_kill_matches_duplicate_names_by_remote_path",
             "test_set_skips_prompt_readiness_probe",
             "test_status_annotates_path_pairs_from_job_paths",
+            "test_status_leaves_cross_pair_remote_and_local_matches_unscoped",
+            "test_status_leaves_overlapping_or_reconfigured_roots_unscoped",
             "test_status_marks_poll_unhealthy_when_jobs_command_times_out",
             "test_status_marks_poll_unhealthy_when_jobs_command_eof",
             "test_status_marks_poll_unhealthy_when_jobs_command_raises_lftp_error",

@@ -370,6 +370,9 @@ class TestLftpSpawn(unittest.TestCase):
         self.assertTrue(Lftp._Lftp__detect_errors_from_output("Certificate verification failed"))
         self.assertTrue(Lftp._Lftp__detect_errors_from_output("Login failed: 530 Login incorrect"))
 
+    def test_lftp_error_detection_includes_get_failures(self):
+        self.assertTrue(Lftp._Lftp__detect_errors_from_output("get: Access failed: No such file"))
+
     def test_pending_errors_redact_credentialed_urls(self):
         lftp = Lftp.__new__(Lftp)
         lftp.logger = MagicMock()

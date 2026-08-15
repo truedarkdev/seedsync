@@ -3,17 +3,23 @@
 import os
 import posixpath
 import shutil
-from typing import Optional
+import stat
+from typing import Optional, Sequence
 
 from common import AppOneShotProcess, escape_remote_path_for_shell
 from ssh import Sshcp
 
 
 class DeleteLocalProcess(AppOneShotProcess):
-    def __init__(self, local_path: str, file_name: str):
+    def __init__(self, local_path: str, file_name: str,
+                 artifact_paths: Sequence[str] = (), artifact_root: Optional[str] = None,
+                 delete_primary: bool = True):
         super().__init__(name=self.__class__.__name__)
         self.__local_path = local_path
         self.__file_name: object = file_name
+        self.__artifact_paths = tuple(artifact_paths)
+        self.__artifact_root = artifact_root if artifact_root is not None else local_path
+        self.__delete_primary = delete_primary
 
     def run_once(self):
         file_name = self.__file_name
@@ -36,10 +42,10 @@ class DeleteLocalProcess(AppOneShotProcess):
             return
 
         self.logger.debug("Deleting local file {}".format(file_name))
-        if not os.path.exists(file_path):
+        if self.__delete_primary and not os.path.exists(file_path):
             self.logger.error("Failed to delete non-existing file: {}".format(file_path))
             raise FileNotFoundError(file_path)
-        else:
+        elif self.__delete_primary:
             try:
                 if os.path.isfile(file_path):
                     os.remove(file_path)
@@ -56,6 +62,24 @@ class DeleteLocalProcess(AppOneShotProcess):
                 self.logger.warning("File already gone: {}".format(file_path))
             except OSError:
                 self.logger.exception("Failed to delete local file {}".format(file_path))
+                raise
+
+        for artifact_path in self.__artifact_paths:
+            try:
+                artifact_info = os.lstat(artifact_path)
+            except FileNotFoundError:
+                # The primary direct/temp target can be part of the plan.
+                continue
+            if stat.S_ISLNK(artifact_info.st_mode) or not stat.S_ISREG(artifact_info.st_mode):
+                raise OSError("Unsafe Delete Local staging artifact: {}".format(artifact_path))
+            try:
+                artifact_base = os.path.realpath(self.__artifact_root)
+                artifact_real = os.path.realpath(artifact_path)
+                if os.path.normcase(os.path.commonpath([artifact_base, artifact_real])) != os.path.normcase(artifact_base):
+                    raise OSError("Delete Local staging artifact escapes configured root")
+                os.unlink(artifact_path)
+            except OSError:
+                self.logger.exception("Failed to delete local staging artifact %s", artifact_path)
                 raise
 
 
