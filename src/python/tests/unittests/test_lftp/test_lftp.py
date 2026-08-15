@@ -312,6 +312,39 @@ class TestLftp(unittest.TestCase):
             status_poll=True
         )
 
+    def test_status_marks_poll_unhealthy_when_queue_command_echo_leaks_into_snapshot(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__job_status_parser = LftpJobStatusParser()
+        lftp._Lftp__run_command = MagicMock(
+            return_value='queue mirror -c "/remote/sample-directory" "/local/staging/"'
+        )
+
+        statuses = lftp.status()
+
+        self.assertIsNone(statuses)
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual(1, lftp._Lftp__consecutive_status_errors)
+
+    def test_status_marks_poll_unhealthy_when_jobs_command_echo_interleaves_with_progress(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__job_status_parser = LftpJobStatusParser()
+        lftp._Lftp__run_command = MagicMock(return_value=(
+            "jobs -v\n"
+            "[0] queue (sftp://example:@localhost) -- 4.5 MiB/s\n"
+            "sftp://example:@localhost/remote\n"
+            "Now executing: [1] mirror -c /remote/sample-directory /local/staging/ "
+            "-- 4G/10G (40%) 4.5 MiB/s\n"
+            "[1] mirror -c /remote/sample-directory /local/staging/ "
+            "-- 4G/10G (40%) 4.5 MiB/s\n"
+            "\\chunk 0-999 jobs -v\n"
+        ))
+
+        statuses = lftp.status()
+
+        self.assertIsNone(statuses)
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual(1, lftp._Lftp__consecutive_status_errors)
+
     def test_status_marks_poll_unhealthy_when_jobs_command_raises_exception_pexpect(self):
         lftp = self._build_status_poll_test_lftp()
         lftp._Lftp__process.expect.side_effect = pexpect.exceptions.ExceptionPexpect("boom")
@@ -836,6 +869,8 @@ class TestLftp(unittest.TestCase):
             "test_status_marks_poll_unhealthy_when_jobs_command_times_out",
             "test_status_marks_poll_unhealthy_when_jobs_command_eof",
             "test_status_marks_poll_unhealthy_when_jobs_command_raises_lftp_error",
+            "test_status_marks_poll_unhealthy_when_queue_command_echo_leaks_into_snapshot",
+            "test_status_marks_poll_unhealthy_when_jobs_command_echo_interleaves_with_progress",
             "test_status_marks_poll_unhealthy_when_jobs_command_raises_exception_pexpect",
             "test_status_marks_poll_unhealthy_when_jobs_command_raises_oserror",
             "test_status_logs_bounded_summary_when_verbose",
@@ -899,6 +934,10 @@ class TestLftp(unittest.TestCase):
             return
         self.lftp.raise_pending_error()
         self.lftp.exit()
+
+    @requires_live_ssh
+    def test_pty_command_echo_is_disabled(self):
+        self.assertFalse(self.lftp._Lftp__process.getecho())
 
     @requires_live_ssh
     def test_num_connections_per_dir_file(self):
@@ -1817,6 +1856,17 @@ class TestLftpPromptClassification(unittest.TestCase):
             process.sendline.call_args_list
         )
         self.assertEqual(6, process.expect.call_count)
+
+    @patch("lftp.lftp.pexpect.spawn", create=True)
+    def test_init_disables_pty_command_echo_after_setup(self, spawn):
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.expect.return_value = None
+        spawn.return_value = process
+
+        Lftp(address="localhost", port=22, user="seedsynctest", password=None)
+
+        process.setecho.assert_called_once_with(False)
 
     @patch("lftp.lftp.pexpect.spawn", create=True)
     def test_init_preserves_env_while_forcing_wide_columns(self, spawn):

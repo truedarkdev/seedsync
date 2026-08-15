@@ -191,6 +191,13 @@ class Lftp:
                 self.__expect_pattern = Lftp.__INITIAL_PROMPT_PATTERN
                 self.__setup()
                 self.__connect_with_native_password_prompt()
+            # LFTP writes background progress to the same PTY that accepts
+            # control commands. Terminal echo can splice `jobs -v` or queue
+            # commands into those progress lines, producing a corrupt but
+            # superficially parseable status snapshot. Commands are already
+            # logged explicitly when verbose logging is enabled, so their PTY
+            # echo is neither required nor safe.
+            self.__process.setecho(False)
         except Exception:
             self.__cleanup_failed_initialization()
             raise

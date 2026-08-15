@@ -38,6 +38,18 @@ class LftpJobStatusParser:
     __QUOTED_FILE_NAME_REGEX = r"`(?P<name>.*)'"
 
     __QUEUE_DONE_REGEX = r"^\[(?P<id>\d+)\]\sDone\s\(queue\s\(.+\)\)"
+    __QUEUE_COMMAND_ECHO_REGEX = r"^queue\s+(?:mirror|pget)(?:\s|$)"
+    __STATUS_COMMAND_ECHO_MARKER = "jobs -v"
+    __STATUS_COMMAND_ECHO_STRUCTURED_LINE_REGEX = re.compile(
+        r"^(?:"
+        r"\[\d+\]\s+(?:queue|pget|mirror|Done)\b|"
+        r"(?:Now executing:|-)\s*\[\d+\]\s+(?:pget|mirror)\b|"
+        r"\d+\.\s+(?:pget|mirror)\b|"
+        r"(?:Queue is |Commands queued:|(?:sftp|ftp|ftps)://|"
+        r"\\(?:mirror|chunk|transfer)\s+|`|Getting file list|cd\s|chmod\s|file:)"
+        r")"
+    )
+    __STATUS_COMMAND_ECHO_TOKEN_REGEX = re.compile(r"(?<![\w/])jobs -v(?![\w/])")
 
     def __init__(self):
         self.logger = logging.getLogger("LftpJobStatusParser")
@@ -83,6 +95,55 @@ class LftpJobStatusParser:
         eta_s = int((result.group("eta_s") or '0s')[:-1])
         return eta_d*24*3600 + eta_h*3600 + eta_m*60 + eta_s
 
+    @staticmethod
+    def __quoted_spans(line: str) -> list[tuple[int, int]]:
+        spans: list[tuple[int, int]] = []
+        index = 0
+        while index < len(line):
+            if line[index] == '"':
+                end = index + 1
+                escaped = False
+                while end < len(line):
+                    if escaped:
+                        escaped = False
+                    elif line[end] == "\\":
+                        escaped = True
+                    elif line[end] == '"':
+                        spans.append((index, end + 1))
+                        index = end
+                        break
+                    end += 1
+            elif line[index] == "`":
+                end = line.rfind("'")
+                if end > index:
+                    spans.append((index, end + 1))
+                    index = end
+            elif line[index] == "'" and (index == 0 or line[index - 1].isspace()):
+                end = line.find("'", index + 1)
+                if end > index:
+                    spans.append((index, end + 1))
+                    index = end
+            index += 1
+        return spans
+
+    @classmethod
+    def __has_status_command_echo(cls, line: str) -> bool:
+        marker = cls.__STATUS_COMMAND_ECHO_MARKER
+        if marker not in line or line == marker:
+            return False
+
+        if not cls.__STATUS_COMMAND_ECHO_STRUCTURED_LINE_REGEX.match(line):
+            return False
+        quoted_spans = cls.__quoted_spans(line)
+        for occurrence in re.finditer(re.escape(marker), line):
+            if any(start <= occurrence.start() < end for start, end in quoted_spans):
+                continue
+            if cls.__STATUS_COMMAND_ECHO_TOKEN_REGEX.match(line, occurrence.start()):
+                return True
+            if line.startswith(("\\mirror ", "\\chunk ", "\\transfer ", "`")):
+                return True
+        return False
+
     def parse(self, output: str) -> List[LftpJobStatus]:
         statuses: list[LftpJobStatus] = []
         lines = [s.strip() for s in output.splitlines()]
@@ -95,9 +156,28 @@ class LftpJobStatusParser:
                 "\x1b[?2004l",
             }
         ]
-        # remove all lines before the first 'jobs -v'
-        start = next((i+1 for i, l in enumerate(lines) if l == "jobs -v"), 0)
+        # A queue command echoed before the status command is still part of
+        # the captured framing. Check it before slicing away the preamble so
+        # it cannot become a healthy empty snapshot.
+        jobs_marker_index = next((i for i, l in enumerate(lines) if l == "jobs -v"), None)
+        preamble = lines if jobs_marker_index is None else lines[:jobs_marker_index]
+        if any(re.match(LftpJobStatusParser.__QUEUE_COMMAND_ECHO_REGEX, line) for line in preamble):
+            raise LftpJobStatusParserError(
+                "Lftp status output contained a queue command echo before the snapshot"
+            )
+        start = 0 if jobs_marker_index is None else jobs_marker_index + 1
         lines = lines[start:]
+        # A status poll can race with PTY echo from the preceding queue
+        # command. That output is not a complete `jobs -v` snapshot, so it
+        # must never be interpreted as an authoritative empty job list.
+        if any(re.match(LftpJobStatusParser.__QUEUE_COMMAND_ECHO_REGEX, line) for line in lines):
+            raise LftpJobStatusParserError(
+                "Lftp status output contained a queue command echo instead of a complete snapshot"
+            )
+        if any(LftpJobStatusParser.__has_status_command_echo(line) for line in lines):
+            raise LftpJobStatusParserError(
+                "Lftp status command echo was interleaved with transfer progress"
+            )
         # remove any remaining 'jobs -v' lines
         lines = list(filter(lambda s: s != "jobs -v", lines))
         # remove any remaining log line

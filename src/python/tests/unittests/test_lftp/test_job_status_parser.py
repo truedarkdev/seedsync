@@ -99,6 +99,97 @@ class TestLftpJobStatusParser(unittest.TestCase):
         statuses = parser.parse(output)
         self.assertEqual(0, len(statuses))
 
+    def test_queue_command_echo_before_jobs_marker_is_rejected(self):
+        output = (
+            "queue mirror -c \"/remote/sample-directory\" \"/local/staging/\"\n"
+            "jobs -v\n"
+        )
+        parser = LftpJobStatusParser()
+
+        with self.assertRaises(LftpJobStatusParserError):
+            parser.parse(output)
+
+    def test_queue_command_echo_after_jobs_marker_is_rejected(self):
+        output = (
+            "jobs -v\n"
+            "queue pget -c \"/remote/sample-file\" -o \"/local/staging/\"\n"
+        )
+        parser = LftpJobStatusParser()
+
+        with self.assertRaises(LftpJobStatusParserError):
+            parser.parse(output)
+
+    def test_interleaved_jobs_echo_is_rejected_on_structured_status_lines(self):
+        lines = (
+            "[1] mirror -c /remote/sample-directory /local/staging/ jobs -v",
+            "[1] pget -c /remote/sample-file -o /local/staging/ jobs -v",
+            "Now executing: [1] mirror -c /remote/sample-directory /local/staging/ jobs -v",
+            "-[2] pget -c /remote/sample-file -o /local/staging/ jobs -v",
+            "\\mirror `sample-file' -- 10/20 (50%) jobs -v",
+            "\\chunk 0-999 jobs -v",
+            "\\transfer `sample-file' jobs -v",
+            "`sample-file' at 0 (0%) jobs -v",
+            "sftp://someone:@localhost/remote jobs -v",
+            "Getting file list jobs -v",
+            "cd /remote jobs -v",
+            "chmod sample-file jobs -v",
+        )
+
+        for line in lines:
+            with self.subTest(line=line):
+                parser = LftpJobStatusParser()
+                with self.assertRaises(LftpJobStatusParserError):
+                    parser.parse("jobs -v\n{}\n".format(line))
+
+    def test_jobs_echo_text_inside_quoted_filename_is_preserved(self):
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/home/someone\n"
+            "Queue is running.\n"
+            "[1] mirror -c /remote/sample-directory /local/staging/ -- 10/20 (50%)\n"
+            "\\transfer `sample jobs -v'\n"
+            "`sample jobs -v' at 0 (0%) [Connecting...]\n"
+        )
+        parser = LftpJobStatusParser()
+
+        statuses = parser.parse(output)
+
+        self.assertEqual(1, len(statuses))
+        self.assertEqual(["sample jobs -v"], [name for name, _ in statuses[0].get_active_file_transfer_states()])
+
+    def test_each_unquoted_jobs_echo_occurrence_is_rejected(self):
+        lines = (
+            "\\transfer `sample jobs -v' jobs -v",
+            "[1] mirror -c \"/remote/sample jobs -v\" \"/local/staging/\" -- 10/20 (50%) jobs -v",
+            "[0] queue (\"sftp://someone@localhost/remote jobs -v\") jobs -v",
+            "1. mirror -c \"/remote/sample jobs -v\" \"/local/staging/\" jobs -v",
+            "[0] Done (queue (sftp://someone:@localhost)) jobs -v",
+        )
+
+        for line in lines:
+            with self.subTest(line=line):
+                parser = LftpJobStatusParser()
+                with self.assertRaises(LftpJobStatusParserError):
+                    parser.parse("jobs -v\n{}\n".format(line))
+
+    def test_jobs_echo_text_in_actual_path_formats_is_preserved_without_trailing_echo(self):
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/remote/jobs -v\n"
+            "Queue is stopped.\n"
+            "[1] mirror -c \"/remote/sample jobs -v\" \"/local/staging/\" -- 10/20 (50%)\n"
+            "\\transfer `sample jobs -v'\n"
+            "`sample jobs -v' at 0 (0%) [Connecting...]\n"
+        )
+        parser = LftpJobStatusParser()
+
+        statuses = parser.parse(output)
+
+        self.assertEqual(1, len(statuses))
+        self.assertEqual(["sample jobs -v"], [name for name, _ in statuses[0].get_active_file_transfer_states()])
+
     def test_redact_credentials_handles_ftp_and_ftps_urls_with_reserved_characters(self):
         output = (
             "jobs -v\n"
