@@ -50,11 +50,18 @@ RUN set -eux; \
         libxml2-dev libxslt-dev libffi-dev \
     && ln -s /usr/lib/p7zip/Codecs/Rar.so /usr/lib/p7zip/Codecs/Rar29.so \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+        /var/log/apt \
+        /var/log/alternatives.log \
+        /var/log/dpkg.log
 
 # Keep Poetry pinned so the lockfile generation and image installs stay aligned.
 RUN pip3 install "poetry==2.3.2" \
-    && poetry config virtualenvs.create false
+    && poetry config virtualenvs.create false \
+    && find /usr/local/lib/python3.12/site-packages -depth \
+        -type d \( -name test -o -name tests -o -name .pytest_cache \) \
+        -exec rm -rf '{}' + \
+    && rm -rf -- /tmp/.pytest_cache
 
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
@@ -64,7 +71,15 @@ ENV UMASK=""
 RUN mkdir -p /app
 COPY src/python/pyproject.toml /app/python/
 COPY src/python/poetry.lock /app/python/
-RUN cd /app/python && poetry install --only main
+# Keep dependency test suites and build-only pytest caches out of the runtime
+# image layer while retaining the installed runtime modules.
+RUN set -eux; \
+    cd /app/python; \
+    poetry install --only main; \
+    find /usr/local/lib/python3.12/site-packages -depth \
+        -type d \( -name test -o -name tests -o -name .pytest_cache \) \
+        -exec rm -rf '{}' +; \
+    rm -rf -- /tmp/.pytest_cache
 
 
 # Creates environment for Python dev
@@ -118,7 +133,8 @@ USER seedsync
 
 # First time config setup and replacement
 # Seed the default config during image build; runtime bootstrap uses the same tracked code path.
-RUN /scripts/entrypoint.sh --bootstrap-default-config
+RUN /scripts/entrypoint.sh --bootstrap-default-config \
+    && rm -rf -- /tmp/seedsync-bootstrap
 
 # Switch back to root so the runtime entrypoint can validate IDs, fix ownership,
 # and drop privileges with setpriv before launching the app.
