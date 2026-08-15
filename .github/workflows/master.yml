@@ -271,6 +271,16 @@ jobs:
       - name: Resolve E2E platform
         run: echo "SEEDSYNC_PLATFORM=$(src/docker/test/resolve_platform.sh '${{ matrix.arch }}')" >> $GITHUB_ENV
 
+      # Inspect the exact tested digest before starting live Docker/browser
+      # checks. The publish job promotes this same digest after all matrices.
+      - name: Verify exact staging runtime artifact
+        run: |
+          make docker-image-artifact-gate \
+            STAGING_REGISTRY="${{ env.staging_registry }}" \
+            STAGING_VERSION="${{ github.run_number }}" \
+            STAGING_DIGEST="${{ needs.build-docker-image.outputs.staging_digest }}" \
+            SEEDSYNC_PLATFORM="${{ env.SEEDSYNC_PLATFORM }}"
+
       # Run e2e test
       - name: Run e2e test
         run: make run-tests-e2e \

@@ -524,6 +524,39 @@ GitHub Actions builds and tests tagged releases, then promotes the exact tested
 multi-architecture image to the versioned and `latest` Docker Hub tags. Deb
 packages remain build- and E2E-tested but are not currently published.
 
+The publication order is deliberately bounded to the tested candidate:
+
+```text
+private staging image -> exact-digest artifact/privacy gate -> live Docker/Playwright -> promote the same digest
+```
+
+The artifact gate resolves the staging tag, requires the recorded immutable
+digest, exports that exact runtime rootfs, and rejects shipped application or
+dependency test directories, `.pytest_cache`, apt/dpkg/alternatives logs, and
+the build-only `/tmp/seedsync-bootstrap` sidecar. It is a tracked artifact
+check; keep the separate source, build-context, and release-artifact privacy
+review required by the release process.
+
+Run it once for each runtime platform that will be tested, before the live
+Docker/browser checks:
+
+```bash
+make docker-image-artifact-gate \
+  STAGING_REGISTRY=<private staging registry namespace> \
+  STAGING_VERSION=<tested image tag> \
+  STAGING_DIGEST=sha256:<tested image digest> \
+  SEEDSYNC_PLATFORM=<docker platform>
+```
+
+The amd64 Unraid acceptance lane is separate from a formal release: publish
+it only under a dedicated versioned test tag such as `<version>-unraid-test`,
+run its exact-digest gate and live Docker/Playwright checks, and leave the
+stable version and `latest` tags untouched. Formal releases are the supported
+multi-architecture CI lane (`linux/amd64`, `linux/arm64`, and `linux/arm/v7`):
+CI builds to private staging, gates and tests every platform, and then
+promotes the same tested manifest digest to the stable version and `latest`
+tags.
+
 1. Do all of these in one change
    1. Version update in `src/angular/package.json`
    2. Version update and changelog in `src/debian/changelog`.
@@ -552,7 +585,8 @@ This manual method is deprecated in favour of the Github Actions based CI.
 4. make clean && make
 5. Run all tests
 6. Keep the build- and E2E-tested deb artifact local; direct/deb publication is currently disabled
-7. Tag and upload the image to Docker Hub (see below)
+7. Run the exact-digest artifact gate and live Docker/Playwright checks for the image candidate
+8. Tag and upload the image to Docker Hub (see below)
 
 ### Docker image upload to Docker Hub
 

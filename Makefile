@@ -34,7 +34,7 @@ endif
 DOCKER=${DOCKER_BUILDKIT_FLAGS} DOCKER_BUILDKIT=1 docker
 DOCKER_COMPOSE=${DOCKER_BUILDKIT_FLAGS} COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_BUILDKIT=1 docker compose
 
-.PHONY: builddir deb docker-image test-image tests-python run-tests-python run-tests-python-native run-tests-python-wsl verify-deb-glibc verify-scanfs-glibc preflight-linux-wsl upgrade-v086-preflight upgrade-v086-build upgrade-v086-start upgrade-v086-status upgrade-v086-restart upgrade-v086-build-transient upgrade-v086-start-transient upgrade-v086-transient upgrade-v086-stop upgrade-v086-ship-readiness-preflight upgrade-v086-ship-readiness-self-check upgrade-v086-ship-readiness clean coverage-python check-python-tooling lint-python typecheck-python
+.PHONY: builddir deb docker-image docker-image-artifact-gate test-image tests-python run-tests-python run-tests-python-native run-tests-python-wsl verify-deb-glibc verify-scanfs-glibc preflight-linux-wsl upgrade-v086-preflight upgrade-v086-build upgrade-v086-start upgrade-v086-status upgrade-v086-restart upgrade-v086-build-transient upgrade-v086-start-transient upgrade-v086-transient upgrade-v086-stop upgrade-v086-ship-readiness-preflight upgrade-v086-ship-readiness-self-check upgrade-v086-ship-readiness clean coverage-python check-python-tooling lint-python typecheck-python
 
 all: deb docker-image
 
@@ -82,6 +82,15 @@ docker-image: docker-buildx
 		--platform ${DOCKER_IMAGE_PLATFORMS} \
 		--push \
 		${ROOTDIR}
+
+docker-image-artifact-gate:
+	@if [[ -z "${STAGING_REGISTRY}" || -z "${STAGING_VERSION}" || -z "${STAGING_DIGEST}" ]]; then \
+		echo "${red}ERROR: STAGING_REGISTRY, STAGING_VERSION, and STAGING_DIGEST are required${reset}"; exit 1; \
+	fi
+	bash "${SOURCEDIR}/docker/test/verify_runtime_image.sh" \
+		"${STAGING_REGISTRY}/seedsync:${STAGING_VERSION}" \
+		"${STAGING_DIGEST}" \
+		"${SEEDSYNC_PLATFORM}"
 
 docker-image-release:
 	@if [[ -z "${STAGING_REGISTRY}" ]] ; then \
