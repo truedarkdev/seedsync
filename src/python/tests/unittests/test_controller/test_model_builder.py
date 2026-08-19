@@ -1893,13 +1893,13 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(100, reset.transferred_size)
         self.assertEqual(33, reset.download_progress)
 
-    def test_split_root_rejects_same_second_raw_mtime_difference_despite_display_timezone_difference(self):
+    def test_queue_exclusion_precision_identity_completes_root_after_delta_only_transfer(self):
         remote_root = SystemFile("release", 200, True)
         remote_root.add_child(SystemFile(
             "E06.mkv", 100, False,
             time_modified=datetime(2026, 8, 11, 12, 0, 0), mtime_ns=1786400003444444444
         ))
-        remote_root.add_child(SystemFile("E07.mkv", 100, False))
+        remote_root.add_child(SystemFile("E07.mkv", 100, False, mtime_ns=1786400004000000000))
         local_root = SystemFile("release", 120, True)
         # Display timestamps can differ by timezone, but the raw scanner
         # nanoseconds remain the identity proof for a final leaf.
@@ -1907,7 +1907,9 @@ class TestModelBuilder(unittest.TestCase):
             "E06.mkv", 100, False,
             time_modified=datetime(2026, 8, 11, 14, 0, 0), mtime_ns=1786400003000000000
         ))
-        local_root.add_child(SystemFile("E07.mkv", 20, False, is_staging=True))
+        local_root.add_child(SystemFile(
+            "E07.mkv", 20, False, is_staging=True, mtime_ns=1786400004000000000,
+        ))
         running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "")
         running_status.total_transfer_state = LftpJobStatus.TransferState(20, 200, 10, 100, 3)
         self.model_builder.set_remote_files([remote_root])
@@ -1916,8 +1918,27 @@ class TestModelBuilder(unittest.TestCase):
 
         release = self.model_builder.build_model().get_file("release")
 
-        self.assertEqual(20, release.transferred_size)
-        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("release"))
+        # Queue omits E06 and root progress includes it using the same
+        # portable LFTP identity, leaving only E07 for the delta transfer.
+        self.assertEqual(120, release.transferred_size)
+        self.assertEqual(60, release.download_progress)
+        self.assertEqual(("E06.mkv",), self.model_builder.get_trusted_final_leaf_paths("release"))
+        self.assertFalse(self.model_builder.has_verified_complete_staging_remote_identity("release"))
+
+        completed_root = SystemFile("release", 200, True)
+        completed_root.add_child(SystemFile(
+            "E06.mkv", 100, False,
+            time_modified=datetime(2026, 8, 11, 14, 0, 0), mtime_ns=1786400003000000000,
+        ))
+        completed_root.add_child(SystemFile(
+            "E07.mkv", 100, False, is_staging=True, mtime_ns=1786400004000000000,
+        ))
+        self.model_builder.set_local_files([completed_root])
+        self.model_builder.set_lftp_statuses([])
+
+        completed = self.model_builder.build_model().get_file("release")
+        self.assertTrue(self.model_builder.has_verified_complete_staging_remote_identity("release"))
+        self.assertEqual(ModelFile.State.DOWNLOADED, completed.state)
 
     def test_split_root_rejects_unequal_epoch_mtime_even_with_equal_naive_display_time(self):
         displayed_time = datetime(2026, 8, 11, 12, 0, 0)
@@ -2237,14 +2258,16 @@ class TestModelBuilder(unittest.TestCase):
                 )
 
     def test_same_second_different_raw_mtime_is_not_trusted_as_remote_final_leaf(self):
-        remote = SystemFile("movie.mkv", 10, False, mtime_ns=1786400003000000100)
-        local = SystemFile("movie.mkv", 10, False, mtime_ns=1786400003000000900)
-        self.model_builder.set_remote_files([remote])
-        self.model_builder.set_local_files([local])
+        remote_root = SystemFile("release", 10, True)
+        remote_root.add_child(SystemFile("movie.mkv", 10, False, mtime_ns=1786400003000000100))
+        local_root = SystemFile("release", 10, True)
+        local_root.add_child(SystemFile("movie.mkv", 10, False, mtime_ns=1786400003000000900))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
 
         self.model_builder.build_model()
 
-        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("movie.mkv"))
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("release"))
 
     def test_active_only_extra_bytes_cannot_complete_partial_split_root_directory(self):
         mtime_ns = 1786400003000000000
@@ -2442,16 +2465,95 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("release"))
 
-    def test_ordinary_final_directory_does_not_generate_split_root_exclusions(self):
+    def test_ordinary_final_directory_excludes_only_unchanged_remote_leaf_before_staging_exists(self):
         stamp = datetime(2026, 8, 11, 12, 0, 0)
-        remote_root = SystemFile("release", 100, True)
+        remote_root = SystemFile("release", 200, True)
         remote_root.add_child(SystemFile("E06.mkv", 100, False, time_modified=stamp, mtime_ns=4))
+        remote_root.add_child(SystemFile("E07.mkv", 100, False, time_modified=stamp, mtime_ns=5))
         local_root = SystemFile("release", 100, True)
         local_root.add_child(SystemFile("E06.mkv", 100, False, time_modified=stamp, mtime_ns=4))
         self.model_builder.set_remote_files([remote_root])
         self.model_builder.set_local_files([local_root])
 
-        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("release"))
+        # The initial Queue has no staging subtree yet: exclude only the
+        # matching final leaf and leave the remote-only delta downloadable.
+        self.assertEqual(("E06.mkv",), self.model_builder.get_trusted_final_leaf_paths("release"))
+
+    def test_queue_exclusion_rejects_changed_uncertain_or_colliding_final_leaf(self):
+        base_mtime_ns = 1_786_400_003_000_000_000
+
+        def queue_paths(remote_child: SystemFile, local_child: SystemFile) -> tuple[str, ...]:
+            builder = ModelBuilder()
+            remote_root = SystemFile("release", remote_child.size, True)
+            remote_root.add_child(remote_child)
+            local_root = SystemFile("release", local_child.size, True)
+            local_root.add_child(local_child)
+            builder.set_remote_files([remote_root])
+            builder.set_local_files([local_root])
+            return builder.get_trusted_final_leaf_paths("release")
+
+        cases = (
+            (
+                "changed size",
+                SystemFile("changed.mkv", 101, False, mtime_ns=base_mtime_ns + 100),
+                SystemFile("changed.mkv", 100, False, mtime_ns=base_mtime_ns),
+            ),
+            (
+                "changed whole second",
+                SystemFile("changed-second.mkv", 100, False, mtime_ns=base_mtime_ns + 1_000_000_000),
+                SystemFile("changed-second.mkv", 100, False, mtime_ns=base_mtime_ns),
+            ),
+            (
+                "missing mtime",
+                SystemFile("missing-mtime.mkv", 100, False, mtime_ns=base_mtime_ns),
+                SystemFile("missing-mtime.mkv", 100, False),
+            ),
+            (
+                "type mismatch",
+                SystemFile("type-mismatch", 100, True),
+                SystemFile("type-mismatch", 100, False, mtime_ns=base_mtime_ns),
+            ),
+        )
+        for name, remote_child, local_child in cases:
+            with self.subTest(name=name):
+                self.assertEqual((), queue_paths(remote_child, local_child))
+
+        remote_child = SystemFile("collision.mkv", 100, False, mtime_ns=base_mtime_ns + 100)
+        local_child = SystemFile("collision.mkv", 100, False, mtime_ns=base_mtime_ns)
+        local_child.has_staging_collision = True
+        self.assertEqual((), queue_paths(remote_child, local_child))
+
+    def test_queue_exclusion_fails_closed_for_unknown_retained_pair_and_restores_after_rescan(self):
+        base_mtime_ns = 1_786_400_003_000_000_000
+
+        for path_pair_id in ("pair-a", None):
+            with self.subTest(path_pair_id=path_pair_id):
+                builder = ModelBuilder()
+                remote_root = SystemFile("release", 100, True, mtime_ns=base_mtime_ns)
+                remote_root.add_child(SystemFile(
+                    "existing.mkv", 100, False, mtime_ns=base_mtime_ns + 100,
+                ))
+                local_root = SystemFile("release", 100, True, mtime_ns=base_mtime_ns)
+                local_root.add_child(SystemFile(
+                    "existing.mkv", 100, False, mtime_ns=base_mtime_ns,
+                ))
+                remote_root.path_pair_id = path_pair_id
+                local_root.path_pair_id = path_pair_id
+                file_id = ModelFile.build_file_id("release", path_pair_id)
+                builder.set_remote_files([remote_root])
+                builder.set_local_files([local_root])
+
+                # The updater's single unknown-pair overlay represents a
+                # failed/incomplete local or joint scan while retained source
+                # snapshots remain in the builder's source buckets.
+                builder.set_unknown_local_path_pair_ids({path_pair_id})
+                builder.build_model()
+                self.assertEqual((), builder.get_trusted_final_leaf_paths(file_id))
+
+                # Clearing that overlay is the authoritative rescan outcome;
+                # the same retained roots are then eligible for Queue again.
+                builder.set_unknown_local_path_pair_ids(set())
+                self.assertEqual(("existing.mkv",), builder.get_trusted_final_leaf_paths(file_id))
 
     def test_split_root_does_not_trust_same_name_final_leaf_with_changed_size(self):
         stamp = datetime(2026, 8, 11, 12, 0, 0)

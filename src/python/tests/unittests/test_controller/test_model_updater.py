@@ -44,6 +44,7 @@ from common.performance_diagnostics import (
     PerformanceDiagnosticsCollector,
 )
 from common.breadcrumb_trace import BreadcrumbTraceCollector
+from common.exclude_patterns import ExactPathExclusion
 from controller.scan.scanner_process import ScannerProcess, ScannerResult
 from lftp import LftpJobStatus
 from model.diff import ModelDiff
@@ -2604,6 +2605,192 @@ class TestModelUpdater(unittest.TestCase):
         model_builder.set_remote_files.assert_not_called()
         model_builder.build_model.assert_not_called()
 
+    def test_progressive_unknown_authority_blocks_queue_exclusions_until_healthy_final(self):
+        base_mtime_ns = 1_786_400_003_000_000_000
+
+        def scan_root():
+            remote_root = SystemFile("release", 100, True)
+            remote_root.add_child(SystemFile(
+                "existing.mkv", 100, False, mtime_ns=base_mtime_ns + 100,
+            ))
+            local_root = SystemFile("release", 100, True)
+            local_root.add_child(SystemFile(
+                "existing.mkv", 100, False, mtime_ns=base_mtime_ns,
+            ))
+            return remote_root, local_root
+
+        for failed_side in ("local", "remote", "incomplete"):
+            with self.subTest(failed_side=failed_side):
+                remote_root, local_root = scan_root()
+                remote_token = "remote-queue-authority-{}".format(failed_side)
+                local_token = "local-queue-authority-{}".format(failed_side)
+                initial_remote = ScannerResult(
+                    datetime.now(), [remote_root], scanned_path_pair_ids={None}, generation=1,
+                    is_progress=True, completed_path_pair_ids={None}, is_scan_final=True,
+                    session_token=remote_token, is_full_snapshot=True,
+                    full_snapshot_path_pair_ids={None},
+                )
+                initial_local = ScannerResult(
+                    datetime.now(), [local_root], scanned_path_pair_ids={None}, generation=1,
+                    is_progress=True, completed_path_pair_ids={None}, is_scan_final=True,
+                    session_token=local_token, is_full_snapshot=True,
+                    full_snapshot_path_pair_ids={None},
+                )
+                failed = ScannerResult(
+                    datetime.now(), [], scanned_path_pair_ids={None}, generation=2,
+                    is_progress=True, is_scan_final=failed_side != "incomplete", session_token=(
+                        remote_token if failed_side == "remote" else local_token
+                    ), unknown_path_pair_ids={None},
+                    failed=failed_side != "incomplete",
+                )
+                recovered = ScannerResult(
+                    datetime.now(), [remote_root if failed_side == "remote" else local_root],
+                    scanned_path_pair_ids={None}, generation=3, is_progress=True,
+                    completed_path_pair_ids={None}, is_scan_final=True,
+                    session_token=(remote_token if failed_side == "remote" else local_token),
+                    is_full_snapshot=True, full_snapshot_path_pair_ids={None},
+                )
+                builder = ModelBuilder()
+                live_model = builder.build_model()
+                controller, _ = self._make_progressive_update_controller(
+                    None, local_scan=None, authoritative=False,
+                    model_builder=builder, model=live_model,
+                )
+                controller._Controller__remote_scan_process = self._progressive_process(
+                    remote_token,
+                    [[initial_remote], [failed] if failed_side == "remote" else [],
+                     [recovered] if failed_side == "remote" else []],
+                )
+                controller._Controller__local_scan_process = self._progressive_process(
+                    local_token,
+                    [[initial_local], [failed] if failed_side != "remote" else [],
+                     [recovered] if failed_side != "remote" else []],
+                )
+                file_id = ModelFile.build_file_id("release", None)
+                updater = ModelUpdater(controller)
+
+                updater.update()
+                self.assertEqual(("existing.mkv",), builder.get_trusted_final_leaf_paths(file_id))
+
+                updater.update()
+                self.assertEqual((), builder.get_trusted_final_leaf_paths(file_id))
+
+                updater.update()
+                # A healthy report alone cannot clear retained uncertainty:
+                # this no-op final did not adopt both source buckets. Queue
+                # remains fail-closed until a later source-adopting final.
+                self.assertEqual((), builder.get_trusted_final_leaf_paths(file_id))
+
+    def test_two_pair_partial_recovery_retains_a_unknown_until_source_adoption(self):
+        """A's retained leaf stays Queue-unsafe while B holds the joint scan open."""
+        base_mtime_ns = 1_786_400_003_000_000_000
+
+        def root(pair_id: str, leaves: list[str], mtime_offset: int = 0) -> SystemFile:
+            value = SystemFile("release", len(leaves) * 100, True)
+            value.path_pair_id = pair_id
+            for leaf in leaves:
+                value.add_child(SystemFile(leaf, 100, False, mtime_ns=base_mtime_ns + mtime_offset))
+            return value
+
+        def remote_root(pair_id: str, leaves: list[str]) -> SystemFile:
+            return root(pair_id, leaves, 100)
+
+        def result(
+                files: list[SystemFile], generation: int, token: str, *,
+                completed: set[str], unknown: set[str] = set(), final: bool = True,
+                failed: bool = False,
+        ) -> ScannerResult:
+            return ScannerResult(
+                datetime.now(), files, scanned_path_pair_ids={"pair-a", "pair-b"},
+                generation=generation, is_progress=True, completed_path_pair_ids=completed,
+                unknown_path_pair_ids=unknown, is_scan_final=final, failed=failed,
+                is_full_snapshot=final, full_snapshot_path_pair_ids=completed if final else set(),
+                session_token=token,
+            )
+
+        initial_local = result(
+            [root("pair-a", ["stale.mkv", "keep.mkv"]), root("pair-b", ["b.mkv"])],
+            1, "local-two-pair", completed={"pair-a", "pair-b"},
+        )
+        initial_remote = result(
+            [remote_root("pair-a", ["stale.mkv", "keep.mkv"]), remote_root("pair-b", ["b.mkv"])],
+            1, "remote-two-pair", completed={"pair-a", "pair-b"},
+        )
+        failed_a = result([], 2, "local-two-pair", completed=set(), unknown={"pair-a"}, failed=True)
+        # A's current source no longer contains stale.mkv. B is explicitly
+        # incomplete, so this partial transition cannot adopt either bucket.
+        partial_local = result(
+            [root("pair-a", ["keep.mkv"])], 3, "local-two-pair",
+            completed={"pair-a"}, unknown={"pair-b"}, final=False,
+        )
+        final_local = result(
+            [root("pair-a", ["keep.mkv"]), root("pair-b", ["b.mkv"])],
+            4, "local-two-pair", completed={"pair-a", "pair-b"},
+        )
+        final_remote = result(
+            [remote_root("pair-a", ["keep.mkv"]), remote_root("pair-b", ["b.mkv"])],
+            2, "remote-two-pair", completed={"pair-a", "pair-b"},
+        )
+        builder = ModelBuilder()
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        controller._Controller__local_scan_process = self._progressive_process(
+            "local-two-pair", [[initial_local], [failed_a], [partial_local], [final_local]],
+        )
+        controller._Controller__remote_scan_process = self._progressive_process(
+            "remote-two-pair", [[initial_remote], [], [], [final_remote]],
+        )
+        updater = ModelUpdater(controller)
+        a_id = ModelFile.build_file_id("release", "pair-a")
+
+        updater.update()
+        self.assertEqual(("keep.mkv", "stale.mkv"), builder.get_trusted_final_leaf_paths(a_id))
+
+        updater.update()
+        self.assertIn("pair-a", builder.unknown_local_path_pair_ids_snapshot())
+        self.assertEqual((), builder.get_trusted_final_leaf_paths(a_id))
+
+        updater.update()
+        self.assertTrue({"pair-a", "pair-b"}.issubset(builder.unknown_local_path_pair_ids_snapshot()))
+        self.assertEqual((), builder.get_trusted_final_leaf_paths(a_id))
+
+        updater.update()
+        self.assertEqual(frozenset(), builder.unknown_local_path_pair_ids_snapshot())
+        self.assertEqual(("keep.mkv",), builder.get_trusted_final_leaf_paths(a_id))
+
+    def test_healthy_progressive_noop_refresh_does_not_dirty_real_builder(self):
+        remote_root = SystemFile("release", 1, True)
+        remote_root.add_child(SystemFile("existing.mkv", 1, False, mtime_ns=1_786_400_003_000_000_100))
+        local_root = SystemFile("release", 1, True)
+        local_root.add_child(SystemFile("existing.mkv", 1, False, mtime_ns=1_786_400_003_000_000_000))
+        remote_token = "remote-queue-noop"
+        local_token = "local-queue-noop"
+        initial_remote = self._progressive_final_result(remote_token)
+        initial_local = self._progressive_final_result(local_token)
+        initial_remote.files = [remote_root]
+        initial_local.files = [local_root]
+        builder = ModelBuilder()
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False,
+            model_builder=builder, model=live_model,
+        )
+        controller._Controller__remote_scan_process = self._progressive_process(
+            remote_token, [[initial_remote], []],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            local_token, [[initial_local], []],
+        )
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        self.assertFalse(builder.has_changes())
+        updater.update()
+        self.assertFalse(builder.has_changes())
+
     def test_unchanged_remote_progressive_chunk_skips_delta_builder(self):
         remote_token = "remote-unchanged-chunk"
         local_token = "local-standing-authority"
@@ -2767,6 +2954,9 @@ class TestModelUpdater(unittest.TestCase):
             live_model.get_file_ids(),
         )
         self.assertIs(idle_before, live_model.get_file(ModelFile.build_file_id("idle.bin", "pair-b")))
+        # Canonical pair adoption replaces only A's buckets, and is therefore
+        # the transition allowed to publish the reconciler's exact overlay.
+        self.assertEqual(frozenset({"pair-b"}), builder.unknown_local_path_pair_ids_snapshot())
         builder.build_model.assert_not_called()
         self.assertFalse(builder.has_changes())
         counters = controller._Controller__context.performance_diagnostics.snapshot()["counters"]
@@ -3794,19 +3984,26 @@ class TestModelUpdater(unittest.TestCase):
         )
 
     def test_unsafe_completed_pair_fallback_preserves_unrelated_source_bucket(self):
-        old = SystemFile("old.bin", 10, False)
-        old.path_pair_id = "pair-a"
-        untouched = SystemFile("shared.bin", 20, False)
-        untouched.path_pair_id = "pair-b"
+        base_mtime_ns = 1_786_400_003_000_000_000
+
+        def release(pair_id: str, leaf: str, mtime_offset: int = 0) -> SystemFile:
+            value = SystemFile("shared", 100, True)
+            value.path_pair_id = pair_id
+            value.add_child(SystemFile(leaf, 100, False, mtime_ns=base_mtime_ns + mtime_offset))
+            return value
+
+        old = release("pair-a", "stale.mkv")
+        old_remote = release("pair-a", "stale.mkv", 100)
+        untouched = release("pair-b", "other.mkv")
+        untouched_remote = release("pair-b", "other.mkv", 100)
         builder = ModelBuilder()
         builder.set_local_files([old, untouched])
-        builder.set_remote_files([old, untouched])
+        builder.set_remote_files([old_remote, untouched_remote])
+        builder.set_unknown_local_path_pair_ids({"pair-a"})
         live_model = builder.build_model()
         builder.build_model = MagicMock(wraps=builder.build_model)
-        replacement_local = SystemFile("shared.bin", 30, False)
-        replacement_local.path_pair_id = "pair-a"
-        replacement_remote = SystemFile("shared.bin", 30, False)
-        replacement_remote.path_pair_id = "pair-a"
+        replacement_local = release("pair-a", "keep.mkv")
+        replacement_remote = release("pair-a", "keep.mkv", 100)
         final_local = ScannerResult(
             datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
             is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
@@ -3826,16 +4023,25 @@ class TestModelUpdater(unittest.TestCase):
         ModelUpdater(controller).update()
 
         self.assertEqual(
-            {ModelFile.build_file_id("shared.bin", "pair-a"), ModelFile.build_file_id("shared.bin", "pair-b")},
+            {ModelFile.build_file_id("shared", "pair-a"), ModelFile.build_file_id("shared", "pair-b")},
             live_model.get_file_ids(),
         )
         self.assertEqual(
-            {ModelFile.build_file_id("shared.bin", "pair-b")},
+            {ModelFile.build_file_id("shared", "pair-b")},
             set(builder._ModelBuilder__remote_files_by_pair["pair-b"]),
         )
         self.assertEqual(
-            {ModelFile.build_file_id("shared.bin", "pair-a")},
+            {ModelFile.build_file_id("shared", "pair-a")},
             set(builder._ModelBuilder__remote_files_by_pair["pair-a"]),
+        )
+        a_id = ModelFile.build_file_id("shared", "pair-a")
+        # The fallback adopts A only; the reconciler's exact result clears A
+        # while retaining unrelated B, which this targeted scan did not cover.
+        self.assertEqual(frozenset({"pair-b"}), builder.unknown_local_path_pair_ids_snapshot())
+        self.assertEqual(("keep.mkv",), builder.get_trusted_final_leaf_paths(a_id))
+        self.assertEqual(
+            [ExactPathExclusion("keep.mkv")],
+            Controller._Controller__transfer_exclude_patterns(controller, a_id, True),
         )
         builder.build_model.assert_called_once()
 
@@ -3886,6 +4092,10 @@ class TestModelUpdater(unittest.TestCase):
             {("pair-a", "new.bin"), ("pair-b", "idle.bin")},
             {(file.path_pair_id, file.name) for file in builder.set_remote_files.call_args.args[0]},
         )
+        # The declared-capability fallback adopts whole source buckets, so it
+        # also takes the exact-overlay publication path rather than retaining
+        # an obsolete union from an earlier partial wave.
+        builder.set_unknown_local_path_pair_ids.assert_called_with(set())
         builder.build_authoritative_pair_roots.assert_not_called()
 
     def test_authoritative_progressive_no_event_tick_keeps_active_lftp_status_updates(self):
@@ -3936,7 +4146,12 @@ class TestModelUpdater(unittest.TestCase):
         model_builder.build_model.assert_not_called()
         model_builder.set_local_files.assert_not_called()
         model_builder.set_remote_files.assert_not_called()
-        model_builder.set_unknown_local_path_pair_ids.assert_not_called()
+        # The end-of-update publication keeps the unchanged incomplete
+        # overlay current on each event; ModelBuilder's public setter is
+        # idempotent and does not invalidate the real builder when unchanged.
+        self.assertEqual([
+            call({None}), call({None}),
+        ], model_builder.set_unknown_local_path_pair_ids.call_args_list)
         model_builder.set_downloaded_files.assert_not_called()
         model_builder.set_downloaded_timestamps.assert_not_called()
 
@@ -3957,7 +4172,7 @@ class TestModelUpdater(unittest.TestCase):
         )
         model_builder.set_remote_files.assert_not_called()
         model_builder.set_local_files.assert_not_called()
-        model_builder.set_unknown_local_path_pair_ids.assert_not_called()
+        model_builder.set_unknown_local_path_pair_ids.assert_called_once_with({None})
         model_builder.build_model.assert_not_called()
 
     def test_partial_progressive_delta_does_not_mask_pending_full_builder_change(self):

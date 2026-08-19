@@ -8792,6 +8792,36 @@ class TestController(unittest.TestCase):
             exclusions,
         )
 
+    def test_transfer_exclusions_fail_closed_for_unknown_pair_with_retained_scan_snapshot(self):
+        base_mtime_ns = 1_786_400_003_000_000_000
+        builder = ModelBuilder()
+        remote_root = SystemFile("release", 100, True)
+        remote_root.path_pair_id = "pair-a"
+        remote_root.add_child(SystemFile(
+            "existing.mkv", 100, False, mtime_ns=base_mtime_ns + 100,
+        ))
+        local_root = SystemFile("release", 100, True)
+        local_root.path_pair_id = "pair-a"
+        local_root.add_child(SystemFile(
+            "existing.mkv", 100, False, mtime_ns=base_mtime_ns,
+        ))
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        builder.set_unknown_local_path_pair_ids({"pair-a"})
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__exclude_patterns = "*.nfo"
+        file_id = ModelFile.build_file_id("release", "pair-a")
+
+        # The retained roots are real builder inputs, but an incomplete local
+        # or joint scan must not become a typed exact exclusion.
+        self.assertEqual("*.nfo", self.controller._Controller__transfer_exclude_patterns(file_id, True))
+
+        builder.set_unknown_local_path_pair_ids(set())
+        self.assertEqual(
+            ["*.nfo", ExactPathExclusion("existing.mkv")],
+            self.controller._Controller__transfer_exclude_patterns(file_id, True),
+        )
+
     def test_transfer_exclusions_skip_unrepresentable_exact_path_without_losing_user_globs(self):
         self.controller._Controller__exclude_patterns = "*.nfo"
         self.controller._Controller__model_builder.get_trusted_final_leaf_paths.return_value = (

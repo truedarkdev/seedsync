@@ -2165,6 +2165,11 @@ class ModelUpdater(_ControllerCoreAccess):
         joint_unknown_local_ids: set[Optional[str]] = set()
         joint_remote_excluded_keys: set[tuple[Optional[str], str]] = set()
         progressive_joint_delta_keys: set[tuple[Optional[str], str]] = set()
+        # The reconciler owns uncertainty.  The builder only retains its
+        # published safety overlay, which may shrink only with source-bucket
+        # adoption in this update.
+        progressive_source_buckets_adopted = False
+        progressive_unknown_before_event: set[Optional[str]] = set()
         if progressive_mode and joint_reconciler is not None:
             # Standing authority is already represented by the builder after
             # a progressive final publication.  Do not walk every retained
@@ -2193,6 +2198,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     remote_snapshot, remote_authority, remote_incomplete, remote_completed,
                     enabled_pair_ids, progressive_joint_delta_keys, joint_remote_excluded_keys,
                 )
+            unknown_snapshotter = getattr(model_builder, "unknown_local_path_pair_ids_snapshot", None)
+            if callable(unknown_snapshotter):
+                progressive_unknown_before_event = set(unknown_snapshotter())
 
         def scan_final_relevant(side: str, result: Optional[ScannerResult]) -> bool:
             """Return whether this side has a complete, authoritative view.
@@ -2713,10 +2721,6 @@ class ModelUpdater(_ControllerCoreAccess):
             if local_scan_failed and not unknown_local_ids:
                 unknown_local_ids = set(getattr(latest_local_scan, "scanned_path_pair_ids", {None}))
             setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
-            # The joint publication below owns this overlay for progressive
-            # scans.  Keeping the legacy setter here would apply the same
-            # value twice on every final tick (and would bypass the partial
-            # publication gate).
             if callable(setter_unknown_local) and not progressive_mode:
                 setter_unknown_local(unknown_local_ids)
         if progressive_mode and joint_reconciler is not None:
@@ -2762,14 +2766,17 @@ class ModelUpdater(_ControllerCoreAccess):
                                     [file for file in joint_remote_files if file.path_pair_id == pair_id],
                                     joint_unknown_local_ids,
                                 )
+                            progressive_source_buckets_adopted = True
                         else:
                             # A legacy builder cannot preserve pair buckets;
                             # retain its established whole-source adapter.
                             model_builder.set_local_files(joint_local_files)
                             model_builder.set_remote_files(joint_remote_files)
+                            progressive_source_buckets_adopted = True
                     elif not authoritative_pair_delta_builds:
                         model_builder.set_local_files(joint_local_files)
                         model_builder.set_remote_files(joint_remote_files)
+                        progressive_source_buckets_adopted = True
                         inventory_completion = getattr(model_builder, "record_local_inventory_completion", None)
                         if callable(inventory_completion):
                             # Multi-pair progressive finals intentionally use
@@ -2791,10 +2798,6 @@ class ModelUpdater(_ControllerCoreAccess):
                                     getattr(latest_local_scan, "completed_path_pair_ids", set())
                                 ) if latest_local_scan is not None else set()
                             inventory_completion(completed_inventory_ids)
-                    setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
-                    if (not authoritative_pair_delta_builds or authoritative_pair_fallback_required) and \
-                            callable(setter_unknown_local):
-                        setter_unknown_local(joint_unknown_local_ids)
                 if progressive_joint_first_partial_publication:
                     controller._Controller__progressive_joint_first_publication = True
             if joint_reconciliation_final:
@@ -3158,12 +3161,21 @@ class ModelUpdater(_ControllerCoreAccess):
                 )
         progressive_delta_applied = False
         active_only_change = getattr(model_builder, "has_only_pending_active_transfer_delta", None)
+        unknown_overlay_only = False
+        unknown_overlay_checker = getattr(
+            type(model_builder), "has_only_pending_unknown_local_path_pairs", None
+        )
+        if callable(unknown_overlay_checker):
+            try:
+                unknown_overlay_only = bool(model_builder.has_only_pending_unknown_local_path_pairs())
+            except Exception:
+                unknown_overlay_only = False
         progressive_delta_eligible = (
             progressive_mode
             and progressive_joint_partial_publication
             and progressive_joint_publication_allowed
             and not lftp_statuses
-            and not model_builder.has_changes()
+            and (not model_builder.has_changes() or unknown_overlay_only)
         )
         if (
             progressive_mode
@@ -3171,7 +3183,7 @@ class ModelUpdater(_ControllerCoreAccess):
             and progressive_joint_publication_allowed
             and lftp_statuses
             and callable(active_only_change)
-            and bool(active_only_change())
+            and (bool(active_only_change()) or unknown_overlay_only)
         ):
             progressive_delta_eligible = True
         if progressive_delta_eligible:
@@ -3186,7 +3198,7 @@ class ModelUpdater(_ControllerCoreAccess):
             partial_model = model_builder.build_progressive_roots(
                 progressive_local_delta_files,
                 progressive_remote_delta_files,
-                joint_unknown_local_ids,
+                progressive_unknown_before_event.union(joint_unknown_local_ids),
             )
             delta_file_ids = {
                 ModelFile.build_file_id(name, path_pair_id)
@@ -3344,6 +3356,10 @@ class ModelUpdater(_ControllerCoreAccess):
                 if callable(pair_fallback_committer):
                     for staged_pair_build in authoritative_pair_delta_builds:
                         pair_fallback_committer(staged_pair_build)
+                    # The fallback commits the staged pair's current local
+                    # and remote buckets. Its normal return is therefore the
+                    # same authority-adoption boundary as the fast path.
+                    progressive_source_buckets_adopted = True
                 else:
                     model_builder.request_rebuild()
                 authoritative_pair_delta_builds = []
@@ -4425,6 +4441,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         applied_builder_invalidation_tokens,
                     )
                     authoritative_pair_delta_applied = True
+                    progressive_source_buckets_adopted = True
                     refresh_identities = getattr(
                         controller, "_refresh_model_file_command_identities_locked", None
                     )
@@ -4566,5 +4583,18 @@ class ModelUpdater(_ControllerCoreAccess):
                 })
             except Exception:
                 pass
+        # Publish the reconciler's authority after the current source/model
+        # adoption work.  A partial or failed wave can have no changed roots;
+        # it must grow the existing safety overlay, never clear a retained
+        # pair merely because another pair is complete.  Exact reconciliation
+        # is safe only when this transition adopted the source buckets that
+        # the builder will expose to Queue.
+        setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
+        if progressive_mode and joint_reconciler is not None and progressive_scan_event_arrived and \
+                callable(setter_unknown_local):
+            with controller._Controller__model_lock:
+                overlay = set(joint_unknown_local_ids) if progressive_source_buckets_adopted else \
+                    progressive_unknown_before_event.union(joint_unknown_local_ids)
+                setter_unknown_local(overlay)
         return full_build_triggered or progressive_delta_applied or authoritative_pair_delta_applied or \
             active_transfer_delta_applied

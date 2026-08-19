@@ -1276,7 +1276,7 @@ class ModelBuilder:
         has_staging_collision = ancestor_has_staging_collision or \
             getattr(local_file, "has_staging_collision", False)
         if not remote_file.is_dir:
-            if ModelBuilder.__is_verified_final_leaf(remote_file, local_file) and \
+            if ModelBuilder.__leaf_matches_remote_queue_exclusion_identity(remote_file, local_file) and \
                     not has_staging_collision:
                 return min(local_file.size, remote_file.size)
             return 0
@@ -1328,6 +1328,28 @@ class ModelBuilder:
             type(local_mtime_ns) is int and \
             type(remote_mtime_ns) is int and \
             local_mtime_ns == remote_mtime_ns
+
+    @staticmethod
+    def __leaf_matches_remote_queue_exclusion_identity(remote_file: SystemFile,
+                                                       candidate_file: SystemFile) -> bool:
+        """Whether a final leaf is safe to omit from a Queue transfer.
+
+        Queue exclusions may account for LFTP's loss of source mtime
+        precision at the final destination.  The local final leaf must still
+        have the same size and whole epoch second as the remote leaf, and the
+        local mtime must be exactly whole-second aligned.  Thus two distinct
+        fractional scanner mtimes in one second remain downloadable.
+        """
+        local_mtime_ns = candidate_file.mtime_ns
+        remote_mtime_ns = remote_file.mtime_ns
+        if not remote_file.is_dir and not candidate_file.is_dir and \
+                ModelBuilder.__is_authoritative_local_file(candidate_file) and \
+                candidate_file.size == remote_file.size and \
+                type(local_mtime_ns) is int and type(remote_mtime_ns) is int:
+            return local_mtime_ns == remote_mtime_ns or \
+                local_mtime_ns % 1_000_000_000 == 0 and \
+                local_mtime_ns // 1_000_000_000 == remote_mtime_ns // 1_000_000_000
+        return False
 
     @staticmethod
     def __leaf_matches_remote_collision_identity(remote_file: SystemFile,
@@ -1452,24 +1474,25 @@ class ModelBuilder:
         )
 
     def get_trusted_final_leaf_paths(self, file_id: str) -> tuple[str, ...]:
-        """Return exact root-relative final leaves safe to omit on resume.
+        """Return root-relative final leaves safe to omit from Queue.
 
         Only paths present in both the current remote and local scan are
-        returned.  This is intentionally location-based and does not infer a
-        completed final leaf from an equal apparent size in staging.
+        returned.  This uses a Queue-specific final identity rule because
+        LFTP can publish a source mtime at whole-second precision.  It does
+        not establish completion, progress, or collision identity.
         """
         remote_root = self.__remote_file(file_id)
         local_root = self.__local_file(file_id)
         if remote_root is None or local_root is None or not remote_root.is_dir or not local_root.is_dir:
             return ()
-
-        def has_staging_descendant(candidate: SystemFile) -> bool:
-            return getattr(candidate, "is_staging", False) or any(
-                has_staging_descendant(child) for child in candidate.iter_children()
-            )
-
-        if not has_staging_descendant(local_root):
+        # The updater keeps retained source snapshots visible while a local
+        # or joint (local+remote) scan is incomplete.  Its one consolidated
+        # unknown-pair overlay is the authority boundary for Queue: never
+        # turn a retained stale leaf into a typed exclusion until that pair's
+        # scan has completed authoritatively.
+        if self.__file_id_path_pair_id(file_id) in self.__unknown_local_path_pair_ids:
             return ()
+
         paths: list[str] = []
 
         def visit(remote_file: SystemFile, local_file: SystemFile, relative: str,
@@ -1479,7 +1502,8 @@ class ModelBuilder:
             has_staging_collision = ancestor_has_staging_collision or \
                 getattr(local_file, "has_staging_collision", False)
             if not remote_file.is_dir:
-                if ModelBuilder.__is_verified_final_leaf(remote_file, local_file) and \
+                if ModelBuilder.__leaf_matches_remote_queue_exclusion_identity(
+                        remote_file, local_file) and \
                         not has_staging_collision:
                     paths.append(relative)
                 return
@@ -1570,7 +1594,13 @@ class ModelBuilder:
                         ),
                         True,
                     )
-                return ModelBuilder.__is_verified_final_leaf(remote_file, effective_file), False
+                # A final leaf omitted from Queue must contribute the same
+                # portable LFTP identity to the root completion proof. Exact
+                # identity remains required by split-root merge/collision
+                # paths, which do not use this publication proof.
+                return ModelBuilder.__leaf_matches_remote_queue_exclusion_identity(
+                    remote_file, effective_file
+                ), False
             remote_children = {child.name: child for child in remote_file.iter_children()}
             effective_children = {child.name: child for child in effective_file.iter_children()}
             if set(remote_children) != set(effective_children):
@@ -2971,6 +3001,16 @@ class ModelBuilder:
             })
         )
 
+    def unknown_local_path_pair_ids_snapshot(self) -> frozenset[Optional[str]]:
+        """Return the derived unknown-pair overlay without transferring ownership."""
+        return frozenset(self.__unknown_local_path_pair_ids)
+
+    def has_only_pending_unknown_local_path_pairs(self) -> bool:
+        """Whether the derived safety overlay is the only pending render input."""
+        return self.__invalidation_reasons == {
+            MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS,
+        }
+
     def active_transfer_delta_diagnostics(self) -> dict[str, object]:
         """Return identity-free bounded evidence for a rejected root delta."""
         return {
@@ -4226,7 +4266,16 @@ class ModelBuilder:
                                 all_downloaded = False
                                 break
                         frontier.extend(_child_file.iter_children())
-                    if has_downloadable_children and all_downloaded and \
+                    # A split root can finish through a delta-only LFTP job:
+                    # final leaves omitted from Queue use the portable source
+                    # identity, while staged leaves retain their physical
+                    # completion proof.  The same complete-tree proof is
+                    # sufficient even before the child display states are
+                    # individually promoted.
+                    trusted_split_completion = self.__trees_have_verified_complete_staging_remote_identity(
+                        remote, local
+                    )
+                    if has_downloadable_children and (all_downloaded or trusted_split_completion) and \
                             self.__effective_local_tree_proves_completion(remote, local):
                         model_file.state = ModelFile.State.DOWNLOADED
                     else:
