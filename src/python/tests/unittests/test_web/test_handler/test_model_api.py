@@ -710,6 +710,8 @@ class TestModelApi(unittest.TestCase):
         downloading.remote_size = 100
         downloading.transferred_size = None
         downloading.local_size = 35
+        downloading.display_size_total = 160
+        downloading.display_transferred_size = 70
         downloading.downloading_speed = 7
         complete = self._file("complete", "pair-a")
         complete.state = ModelFile.State.DOWNLOADED
@@ -726,13 +728,42 @@ class TestModelApi(unittest.TestCase):
         for file in (downloading, complete, zero_remote, queued):
             self.model.add_file(file)
         summary = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
-        self.assertEqual(110, summary["remote_size"])
-        self.assertEqual(45, summary["transferred_size"])
-        self.assertEqual(45, summary["local_size"])
+        self.assertEqual(170, summary["remote_size"])
+        self.assertEqual(80, summary["transferred_size"])
+        self.assertEqual(80, summary["local_size"])
         self.assertEqual(7, summary["downloading_speed"])
         self.assertEqual(1, summary["active_count"])
         self.assertEqual(1, summary["queued_count"])
         self.assertEqual(2, summary["completed_count"])
+
+    def test_page_record_keeps_raw_and_display_progress_separate(self):
+        file = self._file("sample", "pair-a")
+        file.remote_size = 40
+        file.transferred_size = 10
+        file.display_size_total = 100
+        file.display_transferred_size = 70
+
+        record = Controller._model_file_page_record(file)
+
+        self.assertEqual((40, 10), (record["remote_size"], record["transferred_size"]))
+        self.assertEqual((100, 70), (
+            record["display_size_total"], record["display_transferred_size"],
+        ))
+
+    def test_visible_state_uses_display_union_then_raw_progress_fallback(self):
+        mixed = self._file("mixed", "pair-a")
+        mixed.remote_size = 40
+        mixed.transferred_size = 0
+        mixed.display_size_total = 100
+        mixed.display_transferred_size = 60
+        mixed.remote_has_transferable_content = True
+        self.assertEqual("stopped", Controller._model_record_visible_state(mixed))
+
+        raw = self._file("raw", "pair-a")
+        raw.remote_size = 40
+        raw.transferred_size = 10
+        raw.remote_has_transferable_content = True
+        self.assertEqual("stopped", Controller._model_record_visible_state(raw))
 
     def test_summary_card_counts_and_visible_states_match_view_contract(self):
         downloading = self._file("downloading", "pair-a")

@@ -139,6 +139,8 @@ class ModelFile:
             self.local_present,
             self.remote_has_transferable_content,
             self.transferred_size,
+            self.display_size_total,
+            self.display_transferred_size,
             self.download_progress,
             self.downloading_speed,
             self.eta,
@@ -171,6 +173,8 @@ class ModelFile:
             "_ModelFile__local_presence_explicit": self.__flag(self.__LOCAL_PRESENT_EXPLICIT),
             "_ModelFile__remote_content_explicit": self.__flag(self.__REMOTE_CONTENT_EXPLICIT),
             "_ModelFile__transferred_size": self.transferred_size,
+            "_ModelFile__display_size_total": self.display_size_total,
+            "_ModelFile__display_transferred_size": self.display_transferred_size,
             "_ModelFile__download_progress": self.download_progress,
             "_ModelFile__downloading_speed": self.downloading_speed,
             "_ModelFile__eta": self.eta,
@@ -287,6 +291,26 @@ class ModelFile:
             self.__set_runtime("transferred_size", transferred_size)
         elif transferred_size is None:
             self.__set_runtime("transferred_size", transferred_size)
+        else:
+            raise TypeError
+
+    @property
+    def display_size_total(self) -> Optional[int]: return self.__runtime_value("display_size_total")  # type: ignore[return-value]
+
+    @display_size_total.setter
+    def display_size_total(self, size: Optional[int]):
+        if type(size) == int and size >= 0 or size is None:
+            self.__set_runtime("display_size_total", size)
+        else:
+            raise TypeError
+
+    @property
+    def display_transferred_size(self) -> Optional[int]: return self.__runtime_value("display_transferred_size")  # type: ignore[return-value]
+
+    @display_transferred_size.setter
+    def display_transferred_size(self, size: Optional[int]):
+        if type(size) == int and size >= 0 or size is None:
+            self.__set_runtime("display_transferred_size", size)
         else:
             raise TypeError
 

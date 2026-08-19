@@ -388,12 +388,17 @@ class AutoQueue:
                 queue_candidates.update({file.file_id: file for file in self.__model_listener.new_files})
 
                 modified_candidates_actual_update: list[ModelFile] = []
+                modified_actual_update_proofs: dict[str, bool] = {}
                 modified_candidates_remote_discovery: list[ModelFile] = []
                 for old_file, new_file in self.__model_listener.modified_files:
                     remote_discovery_changed = self.__is_remote_discovery_changed(old_file, new_file)
                     if remote_discovery_changed:
-                        if old_file.remote_size is not None:
+                        if old_file.remote_present:
                             modified_candidates_actual_update.append(new_file)
+                            modified_actual_update_proofs[new_file.file_id] = (
+                                modified_actual_update_proofs.get(new_file.file_id, False) or
+                                self.__has_new_remote_only_transfer_branch(old_file, new_file)
+                            )
                         else:
                             modified_candidates_remote_discovery.append(new_file)
                 queue_candidates.update({file.file_id: file for file in modified_candidates_actual_update})
@@ -405,7 +410,8 @@ class AutoQueue:
                     current_files=current_files,
                     accept=lambda f: f.remote_has_transferable_content and
                     f.state == ModelFile.State.DEFAULT and
-                    (not f.local_present or self.__is_owned_incomplete_directory(f)) and
+                    (not f.local_present or self.__is_owned_incomplete_directory(f) or
+                     modified_actual_update_proofs.get(f.file_id, False)) and
                     self._is_auto_queue_enabled_for_file(f)
                 )
 
@@ -976,6 +982,27 @@ class AutoQueue:
         if self.__controller.is_file_stopped(file.file_id):
             return "explicitly_stopped"
         return "filtered_out"
+
+    @staticmethod
+    def __has_new_remote_only_transfer_branch(old_file: ModelFile, new_file: ModelFile) -> bool:
+        """Prove an actual update introduced a remotely new, locally absent branch."""
+        old_children = {child.name: child for child in old_file.iter_children()}
+        for new_child in new_file.iter_children():
+            old_child = old_children.get(new_child.name)
+            if old_child is not None and old_child.is_dir != new_child.is_dir:
+                # A same-name type collision is not evidence of a new
+                # transferable branch beneath an established local root.
+                continue
+            if (
+                new_child.remote_present
+                and new_child.remote_has_transferable_content
+                and (old_child is None or not old_child.remote_present)
+                and not new_child.local_present
+            ):
+                return True
+            if old_child is not None and AutoQueue.__has_new_remote_only_transfer_branch(old_child, new_child):
+                return True
+        return False
 
     def __extract_block_reason(self, file: ModelFile) -> str:
         if not self.__auto_extract_enabled:

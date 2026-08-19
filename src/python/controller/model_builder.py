@@ -3642,6 +3642,9 @@ class ModelBuilder:
                 retained_transfer_state,
                 arbitration_source,
             )
+            self.__apply_local_only_union_progress(
+                model_file, remote, self.__local_file(file_id),
+            )
             self.__determine_state(model_file, local, incomplete_children)
             model_file.is_stoppable = self.__is_stoppable_model_file(
                 model_file,
@@ -4107,6 +4110,62 @@ class ModelBuilder:
                         _parent_file.transferred_size = 0
                     _parent_file.transferred_size += model_file.transferred_size
                     _parent_file = _parent_file.parent
+
+    @staticmethod
+    def __apply_local_only_union_progress(
+        model_file: ModelFile,
+        remote: Optional[SystemFile],
+        scanned_local: Optional[SystemFile],
+    ) -> None:
+        """Project local-only leaves into the displayed transfer union.
+
+        Scanner and LFTP values remain the authority for remote-covered bytes.
+        A local-only leaf contributes only to a remote-present ancestor's
+        display union; its own Local Only fields stay untouched.  This keeps
+        startup/local-only authority separate from the derived display total.
+        """
+        local_only_size = ModelBuilder.__authoritative_final_local_only_size(remote, scanned_local)
+        if remote is not None and model_file.is_dir and \
+                model_file.remote_has_transferable_content and local_only_size:
+            model_file.display_size_total = (model_file.remote_size or 0) + local_only_size
+            model_file.display_transferred_size = (model_file.transferred_size or 0) + local_only_size
+        remote_children = {child.name: child for child in remote.iter_children()} if remote else {}
+        local_children = {child.name: child for child in scanned_local.iter_children()} if scanned_local else {}
+        for child in model_file.iter_children():
+            remote_child = remote_children.get(child.name)
+            local_child = local_children.get(child.name)
+            if child.is_dir and remote_child is not None and local_child is not None and \
+                    remote_child.is_dir == local_child.is_dir:
+                ModelBuilder.__apply_local_only_union_progress(child, remote_child, local_child)
+
+    @staticmethod
+    def __authoritative_final_local_only_size(
+        remote: Optional[SystemFile], scanned_local: Optional[SystemFile],
+    ) -> int:
+        """Count non-staging final leaves absent from the remote tree.
+
+        This intentionally walks scanner authority rather than rendered model
+        children: active staging overlays can omit final-only siblings.
+        """
+        if scanned_local is None or scanned_local.is_staging or \
+                getattr(scanned_local, "has_staging_collision", False):
+            return 0
+        if remote is None:
+            if not scanned_local.is_dir:
+                return scanned_local.size
+            return sum(ModelBuilder.__authoritative_final_local_only_size(None, child)
+                       for child in scanned_local.iter_children())
+        if remote.is_dir != scanned_local.is_dir:
+            return 0
+        if not scanned_local.is_dir:
+            return 0
+        remote_children = {child.name: child for child in remote.iter_children()}
+        return sum(
+            ModelBuilder.__authoritative_final_local_only_size(
+                remote_children.get(child.name), child,
+            )
+            for child in scanned_local.iter_children()
+        )
 
     @staticmethod
     def __update_extractable_flag(model_file: ModelFile) -> None:

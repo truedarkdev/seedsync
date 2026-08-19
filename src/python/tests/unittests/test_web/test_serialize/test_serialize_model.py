@@ -19,6 +19,16 @@ class TestSerializeModel(unittest.TestCase):
 
         self.assertEqual("move_failed", data[0]["state"])
 
+    def test_display_union_fields_serialize_without_changing_raw_fields(self):
+        file = ModelFile("sample", True)
+        file.remote_size = 40
+        file.transferred_size = 10
+        file.display_size_total = 100
+        file.display_transferred_size = 70
+        data = json.loads(parse_stream(SerializeModel().model([file]))["data"])[0]
+        self.assertEqual((40, 10), (data["remote_size"], data["transferred_size"]))
+        self.assertEqual((100, 70), (data["display_size_total"], data["display_transferred_size"]))
+
     def test_final_move_succeeded_is_additive_metadata(self):
         file = ModelFile("movie.mkv", False)
         file.state = ModelFile.State.DOWNLOADED

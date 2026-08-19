@@ -5790,6 +5790,37 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(set(), controller._Controller__active_scan_ready_file_ids)
         self.assertIsNone(controller._Controller__next_active_scan_force_at)
 
+    def test_pending_completion_floor_uses_raw_progress_not_display_union(self):
+        file = ModelFile("sample", True)
+        file.remote_size = 40
+        file.transferred_size = 10
+        file.download_progress = 25
+        file.display_size_total = 100
+        file.display_transferred_size = 70
+
+        ModelUpdater._apply_pending_completion_progress_floor(
+            file, {file.file_id}, previous_download_progress=25, previous_transferred_size=10,
+        )
+
+        self.assertEqual((40, 10, 25), (file.remote_size, file.transferred_size, file.download_progress))
+        self.assertEqual((100, 70), (file.display_size_total, file.display_transferred_size))
+
+    def test_pending_completion_floor_resynchronizes_display_union_from_raw_floor(self):
+        file = ModelFile("sample", True)
+        file.remote_size = 40
+        file.local_size = 1
+        file.transferred_size = 0
+        file.download_progress = 0
+        file.display_size_total = 100
+        file.display_transferred_size = 60
+
+        ModelUpdater._apply_pending_completion_progress_floor(
+            file, {file.file_id}, previous_download_progress=98, previous_transferred_size=39,
+        )
+
+        self.assertEqual((40, 39, 98), (file.remote_size, file.transferred_size, file.download_progress))
+        self.assertEqual((100, 99), (file.display_size_total, file.display_transferred_size))
+
     def test_delayed_ready_scan_does_not_suppress_same_identity_restart_wake(self):
         controller = SimpleNamespace(
             _Controller__active_scan_process=MagicMock(),

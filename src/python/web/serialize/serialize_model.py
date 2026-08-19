@@ -106,6 +106,8 @@ class SerializeModel(Serialize):
     __KEY_FILE_LOCAL_PRESENT = "local_present"
     __KEY_FILE_REMOTE_HAS_TRANSFERABLE_CONTENT = "remote_has_transferable_content"
     __KEY_FILE_TRANSFERRED_SIZE = "transferred_size"
+    __KEY_FILE_DISPLAY_SIZE_TOTAL = "display_size_total"
+    __KEY_FILE_DISPLAY_TRANSFERRED_SIZE = "display_transferred_size"
     __KEY_FILE_DOWNLOAD_PROGRESS = "download_progress"
     __KEY_FILE_DOWNLOADING_SPEED = "downloading_speed"
     __KEY_FILE_ETA = "eta"
@@ -139,6 +141,8 @@ class SerializeModel(Serialize):
         json_dict[SerializeModel.__KEY_FILE_REMOTE_HAS_TRANSFERABLE_CONTENT] = \
             model_file.remote_has_transferable_content
         json_dict[SerializeModel.__KEY_FILE_TRANSFERRED_SIZE] = model_file.transferred_size
+        json_dict[SerializeModel.__KEY_FILE_DISPLAY_SIZE_TOTAL] = model_file.display_size_total
+        json_dict[SerializeModel.__KEY_FILE_DISPLAY_TRANSFERRED_SIZE] = model_file.display_transferred_size
         json_dict[SerializeModel.__KEY_FILE_DOWNLOAD_PROGRESS] = model_file.download_progress
         json_dict[SerializeModel.__KEY_FILE_DOWNLOADING_SPEED] = model_file.downloading_speed
         json_dict[SerializeModel.__KEY_FILE_ETA] = model_file.eta

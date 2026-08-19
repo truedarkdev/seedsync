@@ -2530,6 +2530,8 @@ class Controller:
             "local_present": file.local_present,
             "remote_has_transferable_content": file.remote_has_transferable_content,
             "transferred_size": file.transferred_size,
+            "display_size_total": file.display_size_total,
+            "display_transferred_size": file.display_transferred_size,
             "download_progress": file.download_progress,
             "downloading_speed": file.downloading_speed,
             "eta": file.eta,
@@ -2559,10 +2561,14 @@ class Controller:
     def _model_record_visible_state(file: ModelFile) -> str:
         if file.local_present and not file.remote_has_transferable_content:
             return "local_only"
+        progress_total = file.display_size_total if file.display_size_total is not None and \
+            file.display_transferred_size is not None else file.remote_size
+        progress_transferred = file.display_transferred_size if file.display_size_total is not None and \
+            file.display_transferred_size is not None else file.transferred_size
         has_retained_progress = (
             file.remote_has_transferable_content
-            and (file.remote_size or 0) > 0
-            and ((file.transferred_size or 0) > 0 or (file.download_progress or 0) > 0)
+            and (progress_total or 0) > 0
+            and ((progress_transferred or 0) > 0 or (file.download_progress or 0) > 0)
         )
         if file.state == ModelFile.State.DEFAULT and has_retained_progress:
             return "stopped"
@@ -2860,12 +2866,14 @@ class Controller:
                 # Match the legacy path-pair card: roots without a positive
                 # remote size still contribute state counts, but not byte
                 # totals. Completion prefers transferred bytes, then local.
-                if file.remote_size is not None and file.remote_size > 0:
-                    completed_bytes = file.transferred_size
+                display_total = file.display_size_total if file.display_size_total is not None else file.remote_size
+                display_completed = file.display_transferred_size if file.display_transferred_size is not None else file.transferred_size
+                if display_total is not None and display_total > 0:
+                    completed_bytes = display_completed
                     if completed_bytes is None:
                         completed_bytes = file.local_size
-                    completed_bytes = min(max(completed_bytes or 0, 0), file.remote_size)
-                    summary["remote_size"] = int(summary["remote_size"]) + file.remote_size
+                    completed_bytes = min(max(completed_bytes or 0, 0), display_total)
+                    summary["remote_size"] = int(summary["remote_size"]) + display_total
                     summary["transferred_size"] = int(summary["transferred_size"]) + completed_bytes
                     summary["local_size"] = int(summary["local_size"]) + completed_bytes
                 state_counts = cast(dict[str, int], summary["state_counts"])

@@ -1607,6 +1607,16 @@ class ModelUpdater(_ControllerCoreAccess):
                 # percentage; avoid carrying a stale live percentage forward.
                 new_file.download_progress = None
 
+        # Display-union values are publication-only, but must follow a raw
+        # pending-completion floor applied above. Preserve the local-only byte
+        # delta without ever feeding it back into lifecycle arbitration.
+        if new_file.display_size_total is not None and new_file.remote_size is not None:
+            local_only_delta = max(new_file.display_size_total - new_file.remote_size, 0)
+            new_file.display_transferred_size = min(
+                (new_file.transferred_size or 0) + local_only_delta,
+                new_file.display_size_total,
+            )
+
     @staticmethod
     def _get_exclude_patterns(controller: _ControllerCoreAccess) -> str:
         exclude_patterns = getattr(controller, "_Controller__exclude_patterns", None)

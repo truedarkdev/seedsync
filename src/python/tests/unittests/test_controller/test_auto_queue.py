@@ -1108,6 +1108,208 @@ class TestAutoQueue(unittest.TestCase):
         auto_queue.process()
         self.controller.queue_command.assert_not_called()
 
+    def test_actual_remote_update_queues_new_remote_only_branch_under_local_root(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="sample"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        old_root = ModelFile("sample", True)
+        old_root.remote_size = 40
+        old_root.local_size = 60
+        old_root.remote_present = True
+        old_root.local_present = True
+        old_root.remote_has_transferable_content = True
+        new_root = ModelFile("sample", True)
+        new_root.remote_size = 80
+        new_root.local_size = 60
+        new_root.remote_present = True
+        new_root.local_present = True
+        new_root.remote_has_transferable_content = True
+        new_branch = ModelFile("arrived", True)
+        new_branch.remote_size = 40
+        new_branch.remote_present = True
+        new_branch.remote_has_transferable_content = True
+        new_leaf = ModelFile("remote.bin", False)
+        new_leaf.remote_size = 40
+        new_leaf.remote_present = True
+        new_leaf.remote_has_transferable_content = True
+        new_branch.add_child(new_leaf)
+        new_root.add_child(new_branch)
+
+        self.model_listener.file_updated(old_root, new_root)
+        # Buffered delivery may include a later same-root update whose old
+        # tree already contains the branch. The strongest proof must survive.
+        later_root = ModelFile("sample", True)
+        later_root.remote_size = 81
+        later_root.local_size = 60
+        later_root.remote_present = later_root.local_present = True
+        later_root.remote_has_transferable_content = True
+        later_branch = ModelFile("arrived", True)
+        later_branch.remote_size = 40
+        later_branch.remote_present = True
+        later_branch.remote_has_transferable_content = True
+        later_leaf = ModelFile("remote.bin", False)
+        later_leaf.remote_size = 41
+        later_leaf.remote_present = True
+        later_leaf.remote_has_transferable_content = True
+        later_branch.add_child(later_leaf)
+        later_root.add_child(later_branch)
+        self.model_listener.file_updated(new_root, later_root)
+        auto_queue.process()
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+        self.assertEqual(new_root.file_id, self.controller.queue_command.call_args[0][0].filename)
+        auto_queue.process()
+        self.controller.queue_command.assert_called_once()
+
+    def test_actual_remote_update_does_not_queue_same_path_growth_under_local_root(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="sample"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        old_root = ModelFile("sample", True)
+        old_root.remote_size = 40
+        old_root.local_size = 40
+        old_root.remote_present = old_root.local_present = True
+        old_root.remote_has_transferable_content = True
+        old_leaf = ModelFile("same.bin", False)
+        old_leaf.remote_size = old_leaf.local_size = 40
+        old_leaf.remote_present = old_leaf.local_present = True
+        old_leaf.remote_has_transferable_content = True
+        old_root.add_child(old_leaf)
+        new_root = ModelFile("sample", True)
+        new_root.remote_size = 80
+        new_root.local_size = 40
+        new_root.remote_present = new_root.local_present = True
+        new_root.remote_has_transferable_content = True
+        new_leaf = ModelFile("same.bin", False)
+        new_leaf.remote_size = 80
+        new_leaf.local_size = 40
+        new_leaf.remote_present = new_leaf.local_present = True
+        new_leaf.remote_has_transferable_content = True
+        new_root.add_child(new_leaf)
+
+        self.model_listener.file_updated(old_root, new_root)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+    def test_remote_discovery_with_stale_size_and_local_root_does_not_bypass_queue_gate(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="sample"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+        old_root = ModelFile("sample", True)
+        old_root.remote_size = 40
+        old_root.remote_present = False
+        old_root.local_size = 60
+        old_root.local_present = True
+        new_root = ModelFile("sample", True)
+        new_root.remote_size = 80
+        new_root.remote_present = True
+        new_root.local_size = 60
+        new_root.local_present = True
+        new_root.remote_has_transferable_content = True
+        branch = ModelFile("arrived", False)
+        branch.remote_size = 40
+        branch.remote_present = True
+        branch.remote_has_transferable_content = True
+        new_root.add_child(branch)
+
+        self.model_listener.file_updated(old_root, new_root)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+    def test_nested_new_branch_queues_but_local_or_type_collision_does_not(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="sample"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+        old_root = ModelFile("sample", True)
+        old_root.remote_size = 40
+        old_root.local_size = 40
+        old_root.remote_has_transferable_content = True
+        old_dir = ModelFile("existing", True)
+        old_dir.remote_size = 40
+        old_dir.remote_has_transferable_content = True
+        old_root.add_child(old_dir)
+        new_root = ModelFile("sample", True)
+        new_root.remote_size = 80
+        new_root.local_size = 40
+        new_root.remote_has_transferable_content = True
+        new_dir = ModelFile("existing", True)
+        new_dir.remote_size = 80
+        new_dir.remote_has_transferable_content = True
+        nested = ModelFile("arrived", False)
+        nested.remote_size = 40
+        nested.remote_has_transferable_content = True
+        new_dir.add_child(nested)
+        new_root.add_child(new_dir)
+        self.model_listener.file_updated(old_root, new_root)
+        auto_queue.process()
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+
+    def test_type_collision_with_local_present_branch_does_not_bypass_autoqueue(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="sample"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+        old_root = ModelFile("sample", True)
+        old_root.remote_size = 40
+        old_root.local_size = 40
+        old_root.remote_has_transferable_content = True
+        old_child = ModelFile("collision", False)
+        old_child.remote_size = 40
+        old_child.remote_has_transferable_content = True
+        old_root.add_child(old_child)
+        new_root = ModelFile("sample", True)
+        new_root.remote_size = 80
+        new_root.local_size = 40
+        new_root.remote_has_transferable_content = True
+        collision = ModelFile("collision", True)
+        collision.remote_size = 80
+        collision.local_size = 40
+        collision.remote_has_transferable_content = True
+        nested = ModelFile("arrived", False)
+        nested.remote_size = 40
+        nested.remote_has_transferable_content = True
+        collision.add_child(nested)
+        new_root.add_child(collision)
+
+        self.model_listener.file_updated(old_root, new_root)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+    def test_local_only_startup_then_remote_discovery_is_not_an_actual_update(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="sample"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        local_only = ModelFile("sample", True)
+        local_only.local_size = 60
+        local_only.local_present = True
+        discovered = ModelFile("sample", True)
+        discovered.local_size = 60
+        discovered.local_present = True
+        discovered.remote_size = 100
+        discovered.remote_present = True
+        discovered.remote_has_transferable_content = True
+
+        self.model_listener.file_updated(local_only, discovered)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+    def test_local_only_size_change_is_not_remote_discovery(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="sample"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        old_file = ModelFile("sample", True)
+        old_file.local_size = 60
+        old_file.local_present = True
+        new_file = ModelFile("sample", True)
+        new_file.local_size = 80
+        new_file.local_present = True
+
+        self.model_listener.file_updated(old_file, new_file)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
     def test_owned_incomplete_directory_is_requeued_after_remote_subtree_growth(self):
         persist = AutoQueuePersist()
         persist.add_pattern(AutoQueuePattern(pattern="sample"))

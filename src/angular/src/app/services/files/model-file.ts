@@ -16,6 +16,8 @@ interface IModelFile {
     local_present: boolean;
     remote_has_transferable_content: boolean;
     transferred_size: number;
+    display_size_total: number | null;
+    display_transferred_size: number | null;
     download_progress: number;
     state: ModelFile.State;
     downloading_speed: number;
@@ -48,6 +50,8 @@ const DefaultModelFile: IModelFile = {
     local_present: false,
     remote_has_transferable_content: false,
     transferred_size: null,
+    display_size_total: null,
+    display_transferred_size: null,
     download_progress: null,
     state: null,
     downloading_speed: null,
@@ -86,6 +90,8 @@ export class ModelFile extends ModelFileRecord implements IModelFile {
     local_present: boolean;
     remote_has_transferable_content: boolean;
     transferred_size: number;
+    display_size_total: number | null;
+    display_transferred_size: number | null;
     download_progress: number;
     state: ModelFile.State;
     downloading_speed: number;

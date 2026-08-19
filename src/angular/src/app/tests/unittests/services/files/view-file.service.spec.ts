@@ -1915,4 +1915,21 @@ describe("Testing view file service", () => {
         expect(latestFiles.size).toBe(600);
         expect(currentPage).toBe(0);
     }));
+    it("should prefer publication-only union progress for mixed roots", fakeAsync(() => {
+        let latest: ViewFile = null;
+        viewService.files.subscribe(list => latest = list.get(0));
+        for (const [rawTransferred, displayTransferred] of [[0, 60], [10, 70], [40, 100]]) {
+            mockModelService._files.next(Immutable.Map<string, ModelFile>().set("sample", new ModelFile({
+                name: "sample", is_dir: true, state: ModelFile.State.DOWNLOADING,
+                remote_size: 40, transferred_size: rawTransferred,
+                display_size_total: 100, display_transferred_size: displayTransferred,
+                remote_present: true, local_present: true, remote_has_transferable_content: true,
+            })));
+            tick();
+            expect(latest.remoteSize).toBe(40);
+            expect(latest.transferredSize).toBe(displayTransferred);
+            expect(latest.displaySizeTotal).toBe(100);
+            expect(latest.percentDownloaded).toBe(displayTransferred);
+        }
+    }));
 });

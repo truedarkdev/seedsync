@@ -492,7 +492,14 @@ export class ViewFileService {
         if (isLocalOnly) {
             transferredSize = localSize;
         }
-        const displaySizeTotal: number = isLocalOnly ? localSize : remoteSize;
+        const hasDisplayUnion: boolean = !isLocalOnly
+            && modelFile.display_size_total != null
+            && modelFile.display_transferred_size != null;
+        if (hasDisplayUnion) {
+            transferredSize = modelFile.display_transferred_size;
+        }
+        const displaySizeTotal: number = isLocalOnly ? localSize :
+            hasDisplayUnion ? modelFile.display_size_total : remoteSize;
         const hasRetainedProgress: boolean = !isLocalOnly
             && remoteHasTransferableContent
             && remoteSize > 0
@@ -501,7 +508,9 @@ export class ViewFileService {
         );
         let percentDownloaded: number = 0;
         // Prefer the live transfer percentage for active downloads; fall back to size ratios otherwise.
-        if (modelFile.state === ModelFile.State.DOWNLOADING && modelFile.download_progress != null) {
+        if (hasDisplayUnion && displaySizeTotal > 0) {
+            percentDownloaded = Math.round(100.0 * transferredSize / displaySizeTotal);
+        } else if (modelFile.state === ModelFile.State.DOWNLOADING && modelFile.download_progress != null) {
             percentDownloaded = modelFile.download_progress;
         } else if (modelFile.state === ModelFile.State.DEFAULT && hasRetainedProgress && modelFile.download_progress != null) {
             percentDownloaded = modelFile.download_progress;

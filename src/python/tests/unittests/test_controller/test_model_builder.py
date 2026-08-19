@@ -2108,6 +2108,31 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.build_model()
         self.assertTrue(self.model_builder.has_complete_local_coverage("release"))
 
+    def test_active_split_root_projects_final_only_bytes_omitted_by_staging_overlay(self):
+        remote_root = SystemFile("sample-directory", 40, True)
+        remote_root.add_child(SystemFile("anchor.zero", 0, False))
+        remote_nested = SystemFile("nested", 40, True)
+        remote_nested.add_child(SystemFile("delta.bin", 40, False))
+        remote_root.add_child(remote_nested)
+        final_root = SystemFile("sample-directory", 60, True)
+        final_root.add_child(SystemFile("anchor.zero", 0, False))
+        final_root.add_child(SystemFile("local-only.bin", 60, False))
+        active_root = SystemFile("sample-directory", 31, True, is_staging=True)
+        active_nested = SystemFile("nested", 31, True, is_staging=True)
+        active_nested.add_child(SystemFile("delta.bin", 31, False, is_staging=True))
+        active_root.add_child(active_nested)
+        status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "sample-directory", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(31, 40, 78, 1, 9)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([final_root])
+        self.model_builder.set_active_files([active_root])
+        self.model_builder.set_lftp_statuses([status])
+
+        model_file = self.model_builder.build_model().get_file("sample-directory")
+
+        self.assertEqual((40, 31), (model_file.remote_size, model_file.transferred_size))
+        self.assertEqual((100, 91), (model_file.display_size_total, model_file.display_transferred_size))
+
     def test_active_duplicate_of_verified_split_leaf_retains_collision_without_double_counting(self):
         mtime_ns = 1786400003000000000
         remote_root = SystemFile("release", 38, True)
@@ -5469,6 +5494,110 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DOWNLOADED, m_aaa.state)
         m_ab = m_a_ch["ab"]
         self.assertEqual(ModelFile.State.DOWNLOADED, m_ab.state)
+
+    def test_local_only_union_progress_counts_disjoint_bytes_once(self):
+        remote_root = SystemFile("sample-directory", 40, True)
+        remote_root.add_child(SystemFile("remote.bin", 40, False))
+        local_root = SystemFile("sample-directory", 60, True)
+        local_root.add_child(SystemFile("local.bin", 60, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        model_file = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual((0, 40), (model_file.transferred_size, model_file.remote_size))
+        self.assertEqual((60, 100), (model_file.display_transferred_size, model_file.display_size_total))
+
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "sample-directory", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(10, 40, 25, 1, 30)
+        self.model_builder.set_lftp_statuses([status])
+        model_file = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual((10, 40), (model_file.transferred_size, model_file.remote_size))
+        self.assertEqual((70, 100), (model_file.display_transferred_size, model_file.display_size_total))
+        self.assertEqual(25, model_file.download_progress)
+
+        completed_local_root = SystemFile("sample-directory", 100, True)
+        completed_local_root.add_child(SystemFile("local.bin", 60, False))
+        completed_local_root.add_child(SystemFile("remote.bin", 40, False))
+        self.model_builder.set_lftp_statuses([])
+        self.model_builder.set_local_files([completed_local_root])
+        model_file = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual((40, 40), (model_file.transferred_size, model_file.remote_size))
+        self.assertEqual((100, 100), (model_file.display_transferred_size, model_file.display_size_total))
+
+        same_remote = SystemFile("same.bin", 100, False)
+        same_local = SystemFile("same.bin", 25, False)
+        self.model_builder.set_remote_files([same_remote])
+        self.model_builder.set_local_files([same_local])
+        model_file = self.model_builder.build_model().get_file("same.bin")
+        self.assertEqual((25, 100), (model_file.transferred_size, model_file.remote_size))
+
+    def test_display_union_excludes_empty_and_zero_byte_remote_metadata(self):
+        remote_root = SystemFile("sample-directory", 0, True)
+        local_root = SystemFile("sample-directory", 60, True)
+        local_root.add_child(SystemFile("local.bin", 60, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        model_file = self.model_builder.build_model().get_file("sample-directory")
+        self.assertIsNone(model_file.display_size_total)
+        self.assertIsNone(model_file.display_transferred_size)
+
+    def test_display_union_counts_local_only_bytes_beside_zero_byte_remote_leaf(self):
+        remote_root = SystemFile("sample-directory", 0, True)
+        remote_leaf = SystemFile("remote.bin", 0, False)
+        remote_root.add_child(remote_leaf)
+        local_root = SystemFile("sample-directory", 60, True)
+        local_root.add_child(SystemFile("local.bin", 60, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        model_file = self.model_builder.build_model().get_file("sample-directory")
+        remote_model_leaf = next(child for child in model_file.get_children() if child.name == "remote.bin")
+        self.assertTrue(remote_model_leaf.remote_present)
+        self.assertTrue(remote_model_leaf.remote_has_transferable_content)
+        self.assertEqual((0, 0), (model_file.remote_size, model_file.transferred_size))
+        self.assertEqual((60, 60), (model_file.display_size_total, model_file.display_transferred_size))
+
+    def test_nested_visible_directory_receives_authoritative_local_only_union(self):
+        remote_root = SystemFile("sample-directory", 40, True)
+        remote_nested = SystemFile("nested", 40, True)
+        remote_nested.add_child(SystemFile("remote.bin", 40, False))
+        remote_root.add_child(remote_nested)
+        local_root = SystemFile("sample-directory", 100, True)
+        local_nested = SystemFile("nested", 100, True)
+        local_nested.add_child(SystemFile("remote.bin", 40, False))
+        local_nested.add_child(SystemFile("local.bin", 60, False))
+        local_root.add_child(local_nested)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        root = self.model_builder.build_model().get_file("sample-directory")
+        nested = root.get_children()[0]
+        self.assertEqual((100, 100), (nested.display_size_total, nested.display_transferred_size))
+
+    def test_display_union_excludes_collision_marked_local_only_branch(self):
+        remote_root = SystemFile("sample-directory", 40, True)
+        remote_root.add_child(SystemFile("remote.bin", 40, False))
+        local_root = SystemFile("sample-directory", 100, True)
+        local_root.add_child(SystemFile("remote.bin", 40, False))
+        collision = SystemFile("local.bin", 60, False)
+        collision.has_staging_collision = True
+        local_root.add_child(collision)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        model_file = self.model_builder.build_model().get_file("sample-directory")
+        self.assertIsNone(model_file.display_size_total)
+
+    def test_display_union_excludes_unmatched_staging_only_extra(self):
+        remote_root = SystemFile("sample-directory", 40, True)
+        remote_root.add_child(SystemFile("remote.bin", 40, False))
+        local_root = SystemFile("sample-directory", 100, True)
+        local_root.add_child(SystemFile("remote.bin", 40, False))
+        local_root.add_child(SystemFile("staging.bin", 60, False, is_staging=True))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        model_file = self.model_builder.build_model().get_file("sample-directory")
+        self.assertIsNone(model_file.display_size_total)
 
     def test_build_children_state_downloaded_full_extra(self):
         """Fully downloaded but with an extra local-only file"""
