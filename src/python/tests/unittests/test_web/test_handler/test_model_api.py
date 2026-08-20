@@ -717,6 +717,7 @@ class TestModelApi(unittest.TestCase):
         complete.state = ModelFile.State.DOWNLOADED
         complete.remote_size = 10
         complete.transferred_size = 99  # clamped to remote size
+        complete.complete_local_coverage = True
         zero_remote = self._file("zero", "pair-a")
         zero_remote.state = ModelFile.State.EXTRACTED
         zero_remote.remote_size = 0
@@ -749,6 +750,8 @@ class TestModelApi(unittest.TestCase):
         self.assertEqual((100, 70), (
             record["display_size_total"], record["display_transferred_size"],
         ))
+        self.assertFalse(record["explicitly_stopped"])
+        self.assertFalse(record["complete_local_coverage"])
 
     def test_visible_state_uses_display_union_then_raw_progress_fallback(self):
         mixed = self._file("mixed", "pair-a")
@@ -765,6 +768,86 @@ class TestModelApi(unittest.TestCase):
         raw.remote_has_transferable_content = True
         self.assertEqual("stopped", Controller._model_record_visible_state(raw))
 
+    def test_visible_state_requires_physical_completion_and_stop_authority_is_preserved(self):
+        vectors = [
+            (100, 100, 100, 100, True, False, "downloaded"),
+            (40, 40, 100, 100, False, False, "stopped"),  # full bytes without physical proof
+            (40, 40, 100, 100, True, False, "downloaded"),  # mixed root physical proof
+            (40, 10, 100, 100, False, False, "stopped"),  # display complete cannot replace incomplete proof
+            (100, 100, 100, 100, True, True, "stopped"),  # persisted stop authority wins
+        ]
+        for raw_total, raw_transferred, display_total, display_transferred, complete_local_coverage, explicitly_stopped, expected in vectors:
+            with self.subTest(raw_total=raw_total, raw_transferred=raw_transferred,
+                              explicitly_stopped=explicitly_stopped):
+                complete = self._file("complete", "pair-a")
+                complete.remote_size = raw_total
+                complete.transferred_size = raw_transferred
+                complete.display_size_total = display_total
+                complete.display_transferred_size = display_transferred
+                complete.remote_has_transferable_content = True
+                complete.complete_local_coverage = complete_local_coverage
+                complete.explicitly_stopped = explicitly_stopped
+                self.assertEqual(expected, Controller._model_record_visible_state(complete))
+
+        zero_display_only = self._file("zero-display-only", "pair-a", directory=True)
+        zero_display_only.remote_size = 0
+        zero_display_only.transferred_size = 0
+        zero_display_only.display_size_total = 60
+        zero_display_only.display_transferred_size = 60
+        zero_display_only.remote_has_transferable_content = True
+        zero_display_only.complete_local_coverage = False
+        self.assertNotEqual("downloaded", Controller._model_record_visible_state(zero_display_only))
+
+        complete_directory = self._file("complete-directory", "pair-a", directory=True)
+        complete_directory.remote_size = 40
+        complete_directory.transferred_size = 0
+        complete_directory.display_size_total = 100
+        complete_directory.display_transferred_size = 100
+        complete_directory.remote_has_transferable_content = True
+        complete_directory.complete_local_coverage = True
+        self.assertEqual("downloaded", Controller._model_record_visible_state(complete_directory))
+
+    def test_visible_state_preserves_terminal_downloaded_unless_explicitly_stopped(self):
+        downloaded = self._file("downloaded", "pair-a")
+        downloaded.state = ModelFile.State.DOWNLOADED
+        downloaded.remote_has_transferable_content = True
+        self.assertEqual("downloaded", Controller._model_record_visible_state(downloaded))
+
+        stopped = self._file("stopped-downloaded", "pair-a")
+        stopped.state = ModelFile.State.DOWNLOADED
+        stopped.remote_has_transferable_content = True
+        stopped.explicitly_stopped = True
+        self.assertEqual("stopped", Controller._model_record_visible_state(stopped))
+
+        moved = self._file("moved", "pair-a")
+        moved.state = ModelFile.State.DOWNLOADED
+        moved.remote_has_transferable_content = True
+        moved.explicitly_stopped = True
+        moved.final_move_succeeded = True
+        self.assertEqual("move_succeeded", Controller._model_record_visible_state(moved))
+
+        extracted = self._file("extracted", "pair-a")
+        extracted.state = ModelFile.State.EXTRACTED
+        extracted.explicitly_stopped = True
+        self.assertEqual("extracted", Controller._model_record_visible_state(extracted))
+
+    def test_visible_state_leaves_untouched_default_without_progress(self):
+        untouched = self._file("untouched", "pair-a")
+        untouched.remote_size = 100
+        untouched.transferred_size = 0
+        untouched.remote_has_transferable_content = True
+        self.assertEqual("default", Controller._model_record_visible_state(untouched))
+
+    def test_visible_state_keeps_default_partial_progress_stopped(self):
+        partial = self._file("partial", "pair-a")
+        partial.remote_size = 100
+        partial.transferred_size = 40
+        partial.display_size_total = 100
+        partial.display_transferred_size = 60
+        partial.remote_has_transferable_content = True
+        partial.complete_local_coverage = False
+        self.assertEqual("stopped", Controller._model_record_visible_state(partial))
+
     def test_summary_card_counts_and_visible_states_match_view_contract(self):
         downloading = self._file("downloading", "pair-a")
         downloading.state = ModelFile.State.DOWNLOADING
@@ -772,6 +855,28 @@ class TestModelApi(unittest.TestCase):
         extracting.state = ModelFile.State.EXTRACTING
         downloaded = self._file("downloaded", "pair-a")
         downloaded.state = ModelFile.State.DOWNLOADED
+        downloaded.complete_local_coverage = True
+        complete_default = self._file("complete-default", "pair-a")
+        complete_default.remote_size = 100
+        complete_default.transferred_size = 100
+        complete_default.display_size_total = 100
+        complete_default.display_transferred_size = 100
+        complete_default.remote_has_transferable_content = True
+        complete_default.complete_local_coverage = True
+        stopped_complete = self._file("stopped-complete", "pair-a")
+        stopped_complete.remote_size = 100
+        stopped_complete.transferred_size = 100
+        stopped_complete.display_size_total = 100
+        stopped_complete.display_transferred_size = 100
+        stopped_complete.remote_has_transferable_content = True
+        stopped_complete.explicitly_stopped = True
+        unproven_complete = self._file("unproven-complete", "pair-a")
+        unproven_complete.remote_size = 100
+        unproven_complete.transferred_size = 100
+        unproven_complete.display_size_total = 100
+        unproven_complete.display_transferred_size = 100
+        unproven_complete.remote_has_transferable_content = True
+        unproven_complete.complete_local_coverage = False
         extracted = self._file("extracted", "pair-a")
         extracted.state = ModelFile.State.EXTRACTED
         validated = self._file("validated", "pair-a")
@@ -782,10 +887,31 @@ class TestModelApi(unittest.TestCase):
         stopped.remote_has_transferable_content = True
         local_only = self._file("local", "pair-a")
         local_only.local_present = True
-        for file in (downloading, extracting, downloaded, extracted, validated, stopped, local_only):
+        for file in (downloading, extracting, downloaded, complete_default, stopped_complete,
+                     unproven_complete,
+                     extracted, validated, stopped, local_only):
             self.model.add_file(file)
         summary = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
         self.assertEqual(1, summary["active_count"])
-        self.assertEqual(2, summary["completed_count"])
-        self.assertEqual(1, summary["visible_state_counts"]["stopped"])
+        self.assertEqual(3, summary["completed_count"])
+        self.assertEqual(2, summary["visible_state_counts"]["downloaded"])
+        self.assertEqual(3, summary["visible_state_counts"]["stopped"])
         self.assertEqual(1, summary["visible_state_counts"]["local_only"])
+
+    def test_summary_excludes_explicit_stop_from_ordinary_downloaded_completion(self):
+        downloaded = self._file("downloaded-terminal", "pair-a")
+        downloaded.state = ModelFile.State.DOWNLOADED
+        downloaded.complete_local_coverage = True
+        downloaded.explicitly_stopped = True
+        extracted = self._file("extracted-terminal", "pair-a")
+        extracted.state = ModelFile.State.EXTRACTED
+        extracted.explicitly_stopped = True
+        self.model.add_file(downloaded)
+        self.model.add_file(extracted)
+
+        summary = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
+
+        self.assertEqual(1, summary["completed_count"])
+        self.assertEqual(0, summary["visible_state_counts"].get("downloaded", 0))
+        self.assertEqual(1, summary["visible_state_counts"]["stopped"])
+        self.assertEqual(1, summary["visible_state_counts"]["extracted"])

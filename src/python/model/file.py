@@ -146,6 +146,8 @@ class ModelFile:
             self.eta,
             self.is_extractable,
             self.is_stoppable,
+            self.explicitly_stopped,
+            self.complete_local_coverage,
             self.__local_created_timestamp,
             self.__local_modified_timestamp,
             self.__remote_created_timestamp,
@@ -180,6 +182,8 @@ class ModelFile:
             "_ModelFile__eta": self.eta,
             "_ModelFile__is_extractable": self.is_extractable,
             "_ModelFile__is_stoppable": self.is_stoppable,
+            "_ModelFile__explicitly_stopped": self.explicitly_stopped,
+            "_ModelFile__complete_local_coverage": self.complete_local_coverage,
             "_ModelFile__local_created_timestamp": self.__local_created_timestamp,
             "_ModelFile__local_modified_timestamp": self.__local_modified_timestamp,
             "_ModelFile__remote_created_timestamp": self.__remote_created_timestamp,
@@ -379,6 +383,21 @@ class ModelFile:
     @is_stoppable.setter
     def is_stoppable(self, is_stoppable: bool):
         self.__set_runtime("is_stoppable", is_stoppable, False)
+
+    @property
+    def explicitly_stopped(self) -> bool: return self.__runtime_value("explicitly_stopped", False)  # type: ignore[return-value]
+
+    @explicitly_stopped.setter
+    def explicitly_stopped(self, explicitly_stopped: bool):
+        self.__set_runtime("explicitly_stopped", explicitly_stopped, False)
+
+    @property
+    def complete_local_coverage(self) -> bool:
+        return self.__runtime_value("complete_local_coverage", False)  # type: ignore[return-value]
+
+    @complete_local_coverage.setter
+    def complete_local_coverage(self, complete_local_coverage: bool):
+        self.__set_runtime("complete_local_coverage", complete_local_coverage, False)
 
     @property
     def local_created_timestamp(self) -> datetime | None: return self.__local_created_timestamp

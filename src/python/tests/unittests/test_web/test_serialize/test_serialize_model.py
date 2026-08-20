@@ -28,6 +28,18 @@ class TestSerializeModel(unittest.TestCase):
         data = json.loads(parse_stream(SerializeModel().model([file]))["data"])[0]
         self.assertEqual((40, 10), (data["remote_size"], data["transferred_size"]))
         self.assertEqual((100, 70), (data["display_size_total"], data["display_transferred_size"]))
+        self.assertFalse(data["explicitly_stopped"])
+        self.assertFalse(data["complete_local_coverage"])
+
+    def test_explicitly_stopped_serializes_as_presentation_authority(self):
+        file = ModelFile("sample", False)
+        file.explicitly_stopped = True
+        file.complete_local_coverage = True
+
+        data = json.loads(parse_stream(SerializeModel().model([file]))["data"])[0]
+
+        self.assertTrue(data["explicitly_stopped"])
+        self.assertTrue(data["complete_local_coverage"])
 
     def test_final_move_succeeded_is_additive_metadata(self):
         file = ModelFile("movie.mkv", False)

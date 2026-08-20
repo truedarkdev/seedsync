@@ -1932,4 +1932,120 @@ describe("Testing view file service", () => {
             expect(latest.percentDownloaded).toBe(displayTransferred);
         }
     }));
+    it("should keep complete union roots Downloaded and partial retained roots Stopped", fakeAsync(() => {
+        let latest: ViewFile = null;
+        viewService.files.subscribe(list => latest = list.get(0));
+        const vectors = [
+            {
+                state: ModelFile.State.DEFAULT,
+                transferred_size: 0, remote_size: 100, expected: ViewFile.Status.DEFAULT,
+            },
+            {
+                state: ModelFile.State.DEFAULT,
+                transferred_size: 10, remote_size: 40,
+                display_size_total: 100, display_transferred_size: 60,
+                expected: ViewFile.Status.STOPPED,
+            },
+            {
+                state: ModelFile.State.DEFAULT,
+                transferred_size: 40, remote_size: 40,
+                display_size_total: 100, display_transferred_size: 100,
+                complete_local_coverage: false,
+                expected: ViewFile.Status.STOPPED,
+            },
+            {
+                state: ModelFile.State.DEFAULT,
+                transferred_size: 40, remote_size: 40,
+                display_size_total: 100, display_transferred_size: 100,
+                complete_local_coverage: true,
+                expected: ViewFile.Status.DOWNLOADED,
+            },
+            {
+                state: ModelFile.State.DEFAULT,
+                transferred_size: 10, remote_size: 40,
+                display_size_total: 100, display_transferred_size: 100,
+                expected: ViewFile.Status.STOPPED,
+            },
+            {
+                state: ModelFile.State.DEFAULT,
+                transferred_size: 100, remote_size: 100,
+                display_size_total: 100, display_transferred_size: 100,
+                complete_local_coverage: true,
+                expected: ViewFile.Status.DOWNLOADED,
+            },
+            {
+                state: ModelFile.State.DEFAULT,
+                transferred_size: 100, remote_size: 100,
+                display_size_total: 100, display_transferred_size: 100,
+                explicitly_stopped: true,
+                complete_local_coverage: true,
+                expected: ViewFile.Status.STOPPED,
+            },
+            {
+                state: ModelFile.State.DEFAULT,
+                transferred_size: 100, remote_size: 100,
+                complete_local_coverage: false,
+                expected: ViewFile.Status.STOPPED,
+            },
+            {
+                state: ModelFile.State.DEFAULT,
+                transferred_size: 0, remote_size: 0,
+                complete_local_coverage: true,
+                expected: ViewFile.Status.DOWNLOADED,
+            },
+            {
+                state: ModelFile.State.DEFAULT,
+                transferred_size: 0, remote_size: 0,
+                display_size_total: 60, display_transferred_size: 60,
+                complete_local_coverage: false,
+                expected: ViewFile.Status.STOPPED,
+            },
+            {
+                state: ModelFile.State.DOWNLOADED,
+                transferred_size: 100, remote_size: 100,
+                expected: ViewFile.Status.DOWNLOADED,
+            },
+            {
+                state: ModelFile.State.DOWNLOADED,
+                transferred_size: 100, remote_size: 100,
+                explicitly_stopped: true,
+                complete_local_coverage: true,
+                expected: ViewFile.Status.STOPPED,
+            },
+            {
+                state: ModelFile.State.DOWNLOADED,
+                transferred_size: 100, remote_size: 100,
+                explicitly_stopped: true, final_move_succeeded: true,
+                complete_local_coverage: true,
+                expected: ViewFile.Status.MOVE_SUCCEEDED,
+            },
+            {
+                state: ModelFile.State.DEFAULT,
+                transferred_size: 100, remote_size: 100,
+                final_move_succeeded: true,
+                complete_local_coverage: true,
+                expected: ViewFile.Status.DOWNLOADED,
+            },
+            {
+                state: ModelFile.State.EXTRACTED,
+                transferred_size: 100, remote_size: 100,
+                explicitly_stopped: true,
+                expected: ViewFile.Status.EXTRACTED,
+            },
+        ];
+        for (const vector of vectors) {
+            mockModelService._files.next(Immutable.Map<string, ModelFile>().set("sample", new ModelFile({
+                name: "sample", state: vector.state,
+                remote_size: vector.remote_size, transferred_size: vector.transferred_size,
+                display_size_total: vector.display_size_total,
+                display_transferred_size: vector.display_transferred_size,
+                explicitly_stopped: vector.explicitly_stopped === true,
+                complete_local_coverage: vector.complete_local_coverage === true,
+                final_move_succeeded: vector.final_move_succeeded === true,
+                remote_present: true, local_present: true, remote_has_transferable_content: true,
+            })));
+            tick();
+            expect(latest.status).toBe(vector.expected);
+        }
+    }));
 });

@@ -11,12 +11,13 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from datetime import datetime
+from threading import RLock
 from types import SimpleNamespace
 
 from system import SystemFile
 from lftp import LftpJobStatus, LftpJobStatusParser
 from model import ModelError, ModelFile, Model
-from controller import ModelBuilder
+from controller import Controller, ModelBuilder
 from controller.scan import LocalScanner
 from controller.model_builder import _RecentLiveTransferSnapshot, _TransferState
 from controller.model_updater import ModelUpdater
@@ -2098,7 +2099,12 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DOWNLOADED, release.state)
         self.assertEqual(28, release.local_size)
         self.assertEqual(28, release.transferred_size)
+        self.assertTrue(release.complete_local_coverage)
         self.assertTrue(release_children["E06.mkv"].local_present)
+        self.assertTrue(release_children["E06.mkv"].complete_local_coverage)
+        self.assertTrue(release_children["nested"].complete_local_coverage)
+        self.assertEqual(ModelFile.State.DEFAULT, release_children["nested"].state)
+        self.assertEqual("downloaded", Controller._model_record_visible_state(release_children["nested"]))
         self.assertEqual(10, release_children["E06.mkv"].transferred_size)
         self.assertTrue(self.model_builder.has_complete_local_coverage("release"))
 
@@ -2198,6 +2204,9 @@ class TestModelBuilder(unittest.TestCase):
         self.assertFalse(effective_leaf.has_staging_collision)
         self.assertFalse(self.model_builder.has_unresolved_staging_collision("release"))
         self.assertTrue(self.model_builder.has_complete_local_coverage("release"))
+        release = self.model_builder.build_model().get_file("release")
+        self.assertTrue(release.complete_local_coverage)
+        self.assertTrue(release.get_children()[0].complete_local_coverage)
 
     def test_nested_same_size_different_mtime_staging_leaf_remains_unresolved_collision(self):
         mtime_ns = 1786400003000000000
@@ -2218,6 +2227,9 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_remote_files([remote_root])
         self.model_builder.set_local_files([local_root])
         self.model_builder.set_active_files([active_root])
+        status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(10, 10, 100, 1, 0)
+        self.model_builder.set_lftp_statuses([status])
 
         effective_root = self.model_builder._ModelBuilder__build_effective_local_files()["release"]
         effective_leaf = next(child for child in next(effective_root.iter_children()).iter_children())
@@ -2226,12 +2238,31 @@ class TestModelBuilder(unittest.TestCase):
         self.assertTrue(self.model_builder.has_unresolved_staging_collision("release"))
         self.assertFalse(self.model_builder.has_complete_local_coverage("release"))
         built_model = self.model_builder.build_model()
+        release = built_model.get_file("release")
+        self.assertEqual((10, 10), (release.remote_size, release.transferred_size))
+        self.assertFalse(release.complete_local_coverage)
+        self.assertFalse(release.get_children()[0].complete_local_coverage)
+        self.assertNotEqual(ModelFile.State.DOWNLOADED, release.state)
 
         self.assertEqual({"release"}, self.model_builder.get_unresolved_staging_collision_file_ids())
         self.assertEqual({"release"}, self.model_builder.get_terminalizable_staging_collision_file_ids())
         self.assertFalse(self.model_builder.has_verified_staging_collision_remote_identity("release"))
         self.assertFalse(self.model_builder.has_changes())
         self.assertIs(built_model, self.model_builder.build_model())
+
+    def test_staging_root_aggregate_without_children_is_not_presentation_complete(self):
+        remote_root = SystemFile("release", 10, True)
+        remote_root.add_child(SystemFile("episode.mkv", 10, False))
+        staging_root = SystemFile("release", 10, True, is_staging=True)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([staging_root])
+
+        release = self.model_builder.build_model().get_file("release")
+
+        self.assertEqual(ModelFile.State.DEFAULT, release.state)
+        self.assertTrue(self.model_builder.has_complete_local_coverage("release"))
+        self.assertFalse(release.complete_local_coverage)
+        self.assertEqual("default", Controller._model_record_visible_state(release))
 
     def test_terminal_collision_identity_accepts_fractional_remote_mtime_at_portable_second(self):
         remote_mtime_ns = 1786400003000000100
@@ -2467,6 +2498,12 @@ class TestModelBuilder(unittest.TestCase):
         release = self.model_builder.build_model().get_file("release")
         children = {child.name: child for child in release.get_children()}
 
+        self.assertEqual((20, 20), (release.remote_size, release.transferred_size))
+        self.assertEqual(ModelFile.State.DEFAULT, release.state)
+        self.assertFalse(release.complete_local_coverage)
+        self.assertFalse(children["E06.mkv"].complete_local_coverage)
+        self.assertFalse(children["E07.mkv"].complete_local_coverage)
+        self.assertEqual("stopped", Controller._model_record_visible_state(release))
         self.assertEqual(ModelFile.State.DOWNLOADED, children["E06.mkv"].state)
         self.assertEqual(ModelFile.State.DOWNLOADED, children["E07.mkv"].state)
         self.assertNotEqual(ModelFile.State.DOWNLOADED, release.state)
@@ -3465,6 +3502,33 @@ class TestModelBuilder(unittest.TestCase):
         self.assertNotIn("a", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
         self.assertNotIn("a", self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
         self.assertFalse(self.model_builder.has_changes())
+
+    def test_build_publishes_and_refreshes_explicit_stop_authority(self):
+        self.model_builder.clear()
+        remote_file = SystemFile("complete.bin", 100, False)
+        local_file = SystemFile("complete.bin", 100, False)
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_stopped_files({"complete.bin"})
+
+        stopped_model = self.model_builder.build_model()
+        stopped_file = stopped_model.get_file("complete.bin")
+        self.assertTrue(stopped_file.explicitly_stopped)
+        self.assertEqual(ModelFile.State.DOWNLOADED, stopped_file.state)
+        self.assertEqual("stopped", Controller._model_record_visible_state(stopped_file))
+
+        summary_controller = Controller.__new__(Controller)
+        summary_controller._Controller__model = stopped_model
+        summary_controller._Controller__model_lock = RLock()
+        summary_controller._Controller__reconciled_local_path_pair_ids = set()
+        summary_controller._Controller__reconciled_remote_path_pair_ids = set()
+        summary = summary_controller.get_model_summary()["path_pairs"][0]
+        self.assertEqual(0, summary["completed_count"])
+        self.assertEqual(1, summary["visible_state_counts"]["stopped"])
+
+        self.model_builder.set_stopped_files(set())
+        refreshed_model = self.model_builder.build_model()
+        self.assertFalse(refreshed_model.get_file("complete.bin").explicitly_stopped)
 
     def test_build_running_file_promotes_to_downloaded_when_active_scan_only_has_staging_copy(self):
         self.model_builder.clear()

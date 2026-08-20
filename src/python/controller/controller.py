@@ -2537,6 +2537,8 @@ class Controller:
             "eta": file.eta,
             "is_extractable": file.is_extractable,
             "is_stoppable": file.is_stoppable,
+            "explicitly_stopped": file.explicitly_stopped,
+            "complete_local_coverage": file.complete_local_coverage,
             "local_created_timestamp": str(file.local_created_timestamp.timestamp()) if file.local_created_timestamp else None,
             "local_modified_timestamp": str(file.local_modified_timestamp.timestamp()) if file.local_modified_timestamp else None,
             "remote_created_timestamp": str(file.remote_created_timestamp.timestamp()) if file.remote_created_timestamp else None,
@@ -2561,17 +2563,29 @@ class Controller:
     def _model_record_visible_state(file: ModelFile) -> str:
         if file.local_present and not file.remote_has_transferable_content:
             return "local_only"
-        progress_total = file.display_size_total if file.display_size_total is not None and \
-            file.display_transferred_size is not None else file.remote_size
-        progress_transferred = file.display_transferred_size if file.display_size_total is not None and \
-            file.display_transferred_size is not None else file.transferred_size
+        has_display_union = file.display_size_total is not None and \
+            file.display_transferred_size is not None
+        has_complete_display_union = file.display_size_total is not None and \
+            file.display_transferred_size is not None and file.display_size_total > 0 and \
+            file.display_transferred_size >= file.display_size_total
+        progress_total = file.display_size_total if has_display_union else file.remote_size
+        progress_transferred = file.display_transferred_size if has_display_union else file.transferred_size
+        has_complete_progress = file.complete_local_coverage and \
+            (not has_display_union or has_complete_display_union) and \
+            not file.explicitly_stopped
         has_retained_progress = (
             file.remote_has_transferable_content
             and (progress_total or 0) > 0
             and ((progress_transferred or 0) > 0 or (file.download_progress or 0) > 0)
         )
-        if file.state == ModelFile.State.DEFAULT and has_retained_progress:
+        if file.state in (ModelFile.State.DEFAULT, ModelFile.State.DOWNLOADED) and \
+                file.explicitly_stopped and not file.final_move_succeeded:
             return "stopped"
+        if file.state == ModelFile.State.DEFAULT:
+            if has_complete_progress:
+                return "downloaded"
+            if has_retained_progress:
+                return "stopped"
         if file.state == ModelFile.State.DOWNLOADED and file.final_move_succeeded:
             return "move_succeeded"
         return file.state.name.lower()
@@ -2896,10 +2910,7 @@ class Controller:
                         )
                 elif file.state == ModelFile.State.QUEUED:
                     summary["queued_count"] = int(summary["queued_count"]) + 1
-                elif file.state in {
-                    ModelFile.State.DOWNLOADED,
-                    ModelFile.State.EXTRACTED,
-                }:
+                elif visible_state in {"downloaded", "move_succeeded", "extracted"}:
                     summary["completed_count"] = int(summary["completed_count"]) + 1
             summary = {
                 "model_version": self.__model.version,

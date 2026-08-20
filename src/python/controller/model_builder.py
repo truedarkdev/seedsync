@@ -1534,8 +1534,8 @@ class ModelBuilder:
         """Prove a pending automatic move has exact staged source identity.
 
         ``has_complete_local_coverage`` intentionally remains a compatibility
-        predicate for display and existing lifecycle decisions: it may accept
-        complete staging sizes without scanner mtimes.  A quiet automatic move
+        predicate for existing lifecycle decisions: it may accept complete
+        staging sizes without scanner mtimes.  A quiet automatic move
         has a narrower trust boundary.  Walk the current effective local tree
         against the current remote tree, require every staged leaf to match
         exact size and the portable whole-second raw mtime LFTP preserves,
@@ -3586,6 +3586,12 @@ class ModelBuilder:
                 raise ModelError("Mismatch in is_dir between sources")
 
             model_file = ModelFile(name, is_dir)
+            model_file.explicitly_stopped = is_stopped
+            # Presentation proof requires each remote leaf; lifecycle state
+            # retains its separate staging-root size fallback.
+            model_file.complete_local_coverage = self.__directory_leaves_cover_remote(
+                remote, local
+            )
             path_pair_id = remote.path_pair_id if remote and remote.path_pair_id is not None else \
                 local.path_pair_id if local else status.path_pair_id if status else None
             path_pair_name = remote.path_pair_name if remote and remote.path_pair_name is not None else \
@@ -3899,12 +3905,18 @@ class ModelBuilder:
         #       merely used for traversing children
         frontier: deque[tuple[
             Optional[SystemFile], Optional[SystemFile], Optional[LftpJobStatus],
-            ModelFile, Optional[SystemFile], Optional[SystemFile]
+            ModelFile, Optional[SystemFile], Optional[SystemFile], bool
         ]] = deque()
         if remote or local:
-            frontier.append((remote, local, status, root_model_file, remote, local))
+            frontier.append((
+                remote, local, status, root_model_file, remote, local,
+                bool(getattr(local, "has_staging_collision", False)),
+            ))
         while frontier:
-            _remote, _local, _status, _model_file, _root_remote, _root_local = frontier.popleft()
+            (
+                _remote, _local, _status, _model_file, _root_remote, _root_local,
+                _ancestor_has_staging_collision,
+            ) = frontier.popleft()
             _remote_children: dict[str, SystemFile] = {sf.name: sf for sf in _remote.iter_children()} if _remote else {}
             _local_children: dict[str, SystemFile] = {sf.name: sf for sf in _local.iter_children()} if _local else {}
             _all_children_names: set[str] = set(_remote_children).union(_local_children)
@@ -3931,6 +3943,9 @@ class ModelBuilder:
                 _model_file.add_child(_child_model_file)
                 seen_file_ids.add(_child_model_file.file_id)
                 _child_is_stopped = _child_model_file.file_id in self.__stopped_files
+                _child_model_file.explicitly_stopped = _child_is_stopped
+                _child_model_file.complete_local_coverage = not _ancestor_has_staging_collision and \
+                    self.__directory_leaves_cover_remote(_remote_child, _local_child)
 
                 # Set the state, first matching criteria below decides state
                 #   child is a directory: Default
@@ -4019,7 +4034,11 @@ class ModelBuilder:
                         _child_arbitration_source
                     )
                 # add child to frontier
-                frontier.append((_remote_child, _local_child, _status, _child_model_file, _root_remote, _root_local))
+                frontier.append((
+                    _remote_child, _local_child, _status, _child_model_file, _root_remote, _root_local,
+                    _ancestor_has_staging_collision or
+                    bool(getattr(_local_child, "has_staging_collision", False)),
+                ))
 
     def __fill_model_file(
         self,

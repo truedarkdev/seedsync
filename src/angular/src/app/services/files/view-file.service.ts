@@ -484,7 +484,8 @@ export class ViewFileService {
         const localPresent: boolean = modelFile.local_present === true;
         const remoteHasTransferableContent: boolean =
             modelFile.remote_has_transferable_content === true;
-        let transferredSize: number = modelFile.transferred_size;
+        const rawTransferredSize: number = modelFile.transferred_size;
+        let transferredSize: number = rawTransferredSize;
         if (transferredSize == null) {
             transferredSize = localSize;
         }
@@ -500,11 +501,18 @@ export class ViewFileService {
         }
         const displaySizeTotal: number = isLocalOnly ? localSize :
             hasDisplayUnion ? modelFile.display_size_total : remoteSize;
+        const hasCompleteDisplayUnion: boolean = hasDisplayUnion
+            && modelFile.display_size_total > 0
+            && modelFile.display_transferred_size >= modelFile.display_size_total;
+        const hasCompleteProgress: boolean = modelFile.complete_local_coverage === true
+            && (!hasDisplayUnion || hasCompleteDisplayUnion)
+            && modelFile.explicitly_stopped !== true;
         const hasRetainedProgress: boolean = !isLocalOnly
             && remoteHasTransferableContent
-            && remoteSize > 0
+            && !hasCompleteProgress
             && (
-            transferredSize > 0 || (modelFile.download_progress != null && modelFile.download_progress > 0)
+            displaySizeTotal > 0
+            && (transferredSize > 0 || (modelFile.download_progress != null && modelFile.download_progress > 0))
         );
         let percentDownloaded: number = 0;
         // Prefer the live transfer percentage for active downloads; fall back to size ratios otherwise.
@@ -533,7 +541,9 @@ export class ViewFileService {
         let status = null;
         switch (modelFile.state) {
             case ModelFile.State.DEFAULT: {
-                if (hasRetainedProgress) {
+                if (hasCompleteProgress) {
+                    status = ViewFile.Status.DOWNLOADED;
+                } else if (hasRetainedProgress) {
                     status = ViewFile.Status.STOPPED;
                 } else {
                     status = ViewFile.Status.DEFAULT;
@@ -584,8 +594,15 @@ export class ViewFileService {
 
         // Final-move success is a presentation refinement of ordinary
         // downloaded state. More-specific terminal states keep precedence.
-        if (status === ViewFile.Status.DOWNLOADED && modelFile.final_move_succeeded === true) {
+        if (status === ViewFile.Status.DOWNLOADED
+            && modelFile.state === ModelFile.State.DOWNLOADED
+            && modelFile.final_move_succeeded === true) {
             status = ViewFile.Status.MOVE_SUCCEEDED;
+        }
+        if (modelFile.explicitly_stopped === true
+            && [ModelFile.State.DEFAULT, ModelFile.State.DOWNLOADED].includes(modelFile.state)
+            && modelFile.final_move_succeeded !== true) {
+            status = ViewFile.Status.STOPPED;
         }
 
         const isQueueable: boolean = [ViewFile.Status.DEFAULT,

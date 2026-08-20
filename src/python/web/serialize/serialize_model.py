@@ -113,6 +113,8 @@ class SerializeModel(Serialize):
     __KEY_FILE_ETA = "eta"
     __KEY_FILE_IS_EXTRACTABLE = "is_extractable"
     __KEY_FILE_IS_STOPPABLE = "is_stoppable"
+    __KEY_FILE_EXPLICITLY_STOPPED = "explicitly_stopped"
+    __KEY_FILE_COMPLETE_LOCAL_COVERAGE = "complete_local_coverage"
     __KEY_FILE_LOCAL_CREATED_TIMESTAMP = "local_created_timestamp"
     __KEY_FILE_LOCAL_MODIFIED_TIMESTAMP = "local_modified_timestamp"
     __KEY_FILE_REMOTE_CREATED_TIMESTAMP = "remote_created_timestamp"
@@ -148,6 +150,8 @@ class SerializeModel(Serialize):
         json_dict[SerializeModel.__KEY_FILE_ETA] = model_file.eta
         json_dict[SerializeModel.__KEY_FILE_IS_EXTRACTABLE] = model_file.is_extractable
         json_dict[SerializeModel.__KEY_FILE_IS_STOPPABLE] = model_file.is_stoppable
+        json_dict[SerializeModel.__KEY_FILE_EXPLICITLY_STOPPED] = model_file.explicitly_stopped
+        json_dict[SerializeModel.__KEY_FILE_COMPLETE_LOCAL_COVERAGE] = model_file.complete_local_coverage
         json_dict[SerializeModel.__KEY_FILE_LOCAL_CREATED_TIMESTAMP] = \
             str(model_file.local_created_timestamp.timestamp()) if model_file.local_created_timestamp else None
         json_dict[SerializeModel.__KEY_FILE_LOCAL_MODIFIED_TIMESTAMP] = \
