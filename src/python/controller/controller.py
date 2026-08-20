@@ -666,6 +666,7 @@ class Controller:
         self.__model_summary_cache: Optional[dict[str, object]] = None
         self.__model_summary_cache_at = 0.0
         self.__model_summary_cache_inventory_revision = -1
+        self.__model_summary_cache_unknown_local_path_pair_ids: frozenset[Optional[str]] = frozenset()
         self.__remote_delete_success_listeners = []
         self.__remote_delete_success_listeners_lock = Lock()
         self.__download_start_listeners = []
@@ -1627,9 +1628,23 @@ class Controller:
             )
 
     def is_path_pair_reconciled(self, path_pair_id: Optional[str]) -> bool:
-        """True only after local and remote scans covered this runtime root."""
-        return path_pair_id in getattr(self, "_Controller__reconciled_local_path_pair_ids", set()) and \
-            path_pair_id in getattr(self, "_Controller__reconciled_remote_path_pair_ids", set())
+        """True only after scans covered this root and no local authority is unknown."""
+        with self.__model_lock:
+            local_reconciled = path_pair_id in getattr(
+                self, "_Controller__reconciled_local_path_pair_ids", set()
+            )
+            remote_reconciled = path_pair_id in getattr(
+                self, "_Controller__reconciled_remote_path_pair_ids", set()
+            )
+            if not local_reconciled or not remote_reconciled:
+                return False
+            unknown_snapshotter = getattr(
+                getattr(self, "_Controller__model_builder", None),
+                "unknown_local_path_pair_ids_snapshot",
+                None,
+            )
+            unknown_path_pair_ids = unknown_snapshotter() if callable(unknown_snapshotter) else ()
+            return path_pair_id not in unknown_path_pair_ids
 
     def is_remote_delete_eligible(self, file: ModelFile) -> bool:
         """Require final publication proof before deleting staged remote data."""
@@ -2827,12 +2842,27 @@ class Controller:
                 getattr(self, "_Controller__model_builder", None), "local_library_inventory_snapshot", None,
             )
             inventory_revision, local_inventory = inventory_snapshot() if callable(inventory_snapshot) else (0, {})
+            unknown_snapshotter = getattr(
+                getattr(self, "_Controller__model_builder", None),
+                "unknown_local_path_pair_ids_snapshot",
+                None,
+            )
+            unknown_snapshot = unknown_snapshotter() if callable(unknown_snapshotter) else ()
+            if not isinstance(unknown_snapshot, (set, frozenset, list, tuple)):
+                unknown_snapshot = ()
+            unknown_local_path_pair_ids = frozenset(
+                value for value in unknown_snapshot
+                if value is None or isinstance(value, str)
+            )
             cached_summary = getattr(self, "_Controller__model_summary_cache", None)
             cached_at = getattr(self, "_Controller__model_summary_cache_at", 0.0)
             if (
                 max_age_seconds > 0 and isinstance(cached_summary, dict)
                 and cached_summary.get("model_version") == self.__model.version
                 and getattr(self, "_Controller__model_summary_cache_inventory_revision", -1) == inventory_revision
+                and getattr(
+                    self, "_Controller__model_summary_cache_unknown_local_path_pair_ids", frozenset()
+                ) == unknown_local_path_pair_ids
                 and now - cached_at < max_age_seconds
             ):
                 return cached_summary
@@ -2856,7 +2886,7 @@ class Controller:
                     "completed_count": 0,
                     "state_counts": {},
                     "visible_state_counts": {},
-                    "reconciled_local": scope_id in reconciled_local_scopes,
+                    "reconciled_local": scope_id in effective_reconciled_local_scopes,
                     "reconciled_remote": scope_id in reconciled_remote_scopes,
                     "local_library_file_count": getattr(inventory, "file_count", None),
                     "local_library_size": getattr(inventory, "size", None),
@@ -2869,6 +2899,11 @@ class Controller:
             reconciled_remote_scopes = {
                 self._model_scope_id(value) for value in self.__reconciled_remote_path_pair_ids
             }
+            unknown_local_scopes = {
+                self._model_scope_id(value)
+                for value in unknown_local_path_pair_ids
+            }
+            effective_reconciled_local_scopes = reconciled_local_scopes - unknown_local_scopes
             for inventory_pair_id in local_inventory:
                 summary_for(self._model_scope_id(inventory_pair_id))
             for file in self.__model.iter_files():
@@ -2919,6 +2954,7 @@ class Controller:
             self.__model_summary_cache = summary
             self.__model_summary_cache_at = now
             self.__model_summary_cache_inventory_revision = inventory_revision
+            self.__model_summary_cache_unknown_local_path_pair_ids = unknown_local_path_pair_ids
             return summary
 
     def notify_model_summary_changed(self) -> None:
@@ -6517,6 +6553,20 @@ class Controller:
                     _notify_failure(
                         command,
                         "File '{}' has no transferable remote content".format(command.filename),
+                        409,
+                        file,
+                    )
+                    continue
+                # AutoQueue selects through the same effective predicate, and
+                # controller-owned builder authority cannot change between
+                # selection and this drain; rejecting its callback-free
+                # command would lose the retained candidate.
+                elif file.is_dir and command.origin != "auto_queue" and not self.is_path_pair_reconciled(
+                        file.path_pair_id
+                ):
+                    _notify_failure(
+                        command,
+                        "Path Pair scan is in progress; retry Queue when it completes",
                         409,
                         file,
                     )

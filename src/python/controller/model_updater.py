@@ -2175,6 +2175,7 @@ class ModelUpdater(_ControllerCoreAccess):
         joint_unknown_local_ids: set[Optional[str]] = set()
         joint_remote_excluded_keys: set[tuple[Optional[str], str]] = set()
         progressive_joint_delta_keys: set[tuple[Optional[str], str]] = set()
+        unknown_overlay_changed = False
         # The reconciler owns uncertainty.  The builder only retains its
         # published safety overlay, which may shrink only with source-bucket
         # adoption in this update.
@@ -2732,7 +2733,10 @@ class ModelUpdater(_ControllerCoreAccess):
                 unknown_local_ids = set(getattr(latest_local_scan, "scanned_path_pair_ids", {None}))
             setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
             if callable(setter_unknown_local) and not progressive_mode:
+                unknown_snapshotter = getattr(model_builder, "unknown_local_path_pair_ids_snapshot", None)
+                unknown_before_setter = set(unknown_snapshotter()) if callable(unknown_snapshotter) else set()
                 setter_unknown_local(unknown_local_ids)
+                unknown_overlay_changed = unknown_before_setter != set(unknown_local_ids)
         if progressive_mode and joint_reconciler is not None:
             if progressive_joint_publication_allowed:
                 if joint_reconciliation_final:
@@ -4557,11 +4561,13 @@ class ModelUpdater(_ControllerCoreAccess):
                     )
             except Exception:
                 pass
+        summary_notified = False
         if local_inventory_revision_before is not None and callable(inventory_revision_getter) and \
                 inventory_revision_getter() != local_inventory_revision_before:
             summary_notifier = getattr(controller, "notify_model_summary_changed", None)
             if callable(summary_notifier):
                 summary_notifier()
+                summary_notified = True
         diagnostics_enabled = False
         if diagnostics is not None:
             try:
@@ -4598,13 +4604,20 @@ class ModelUpdater(_ControllerCoreAccess):
         # it must grow the existing safety overlay, never clear a retained
         # pair merely because another pair is complete.  Exact reconciliation
         # is safe only when this transition adopted the source buckets that
-        # the builder will expose to Queue.
+        # the builder will expose to Queue, or when an unchanged authoritative
+        # local final explicitly revalidated that pair.
         setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
         if progressive_mode and joint_reconciler is not None and progressive_scan_event_arrived and \
                 callable(setter_unknown_local):
             with controller._Controller__model_lock:
                 overlay = set(joint_unknown_local_ids) if progressive_source_buckets_adopted else \
                     progressive_unknown_before_event.union(joint_unknown_local_ids)
+                overlay.difference_update(local_noop_inventory_completion_ids)
+                unknown_overlay_changed = overlay != progressive_unknown_before_event
                 setter_unknown_local(overlay)
+        if unknown_overlay_changed and not summary_notified:
+            summary_notifier = getattr(controller, "notify_model_summary_changed", None)
+            if callable(summary_notifier):
+                summary_notifier()
         return full_build_triggered or progressive_delta_applied or authoritative_pair_delta_applied or \
             active_transfer_delta_applied

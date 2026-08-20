@@ -2676,10 +2676,12 @@ class TestModelUpdater(unittest.TestCase):
                 self.assertEqual((), builder.get_trusted_final_leaf_paths(file_id))
 
                 updater.update()
-                # A healthy report alone cannot clear retained uncertainty:
-                # this no-op final did not adopt both source buckets. Queue
-                # remains fail-closed until a later source-adopting final.
-                self.assertEqual((), builder.get_trusted_final_leaf_paths(file_id))
+                # An unchanged authoritative local final revalidates the
+                # retained local authority even when source buckets need no
+                # rebuild. A remote-only recovery still retains the overlay
+                # until a local authority event confirms it.
+                expected_paths = () if failed_side == "remote" else ("existing.mkv",)
+                self.assertEqual(expected_paths, builder.get_trusted_final_leaf_paths(file_id))
 
     def test_two_pair_partial_recovery_retains_a_unknown_until_source_adoption(self):
         """A's retained leaf stays Queue-unsafe while B holds the joint scan open."""
@@ -4138,6 +4140,11 @@ class TestModelUpdater(unittest.TestCase):
             downloaded_file_names={"root"},
             downloaded_timestamps={"root": 1.0},
         )
+        model_builder.local_library_inventory_revision.return_value = 0
+        model_builder.unknown_local_path_pair_ids_snapshot.side_effect = [
+            frozenset(), frozenset({None}),
+        ]
+        controller.notify_model_summary_changed = MagicMock()
         updater = ModelUpdater(controller)
 
         updater.update()
@@ -4152,6 +4159,7 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual([
             call({None}), call({None}),
         ], model_builder.set_unknown_local_path_pair_ids.call_args_list)
+        controller.notify_model_summary_changed.assert_called_once_with()
         model_builder.set_downloaded_files.assert_not_called()
         model_builder.set_downloaded_timestamps.assert_not_called()
 

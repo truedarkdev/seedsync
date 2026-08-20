@@ -2806,6 +2806,47 @@ class TestController(unittest.TestCase):
         self.assertFalse(self.controller.is_path_pair_reconciled("pair-a"))
         self.assertTrue(self.controller.is_path_pair_reconciled("pair-b"))
 
+    def test_path_pair_reconciliation_authority_includes_unknown_builder_overlay_and_summary(self):
+        file = ModelFile("release", True)
+        file.path_pair_id = "pair-a"
+        self.controller._Controller__model.iter_files.return_value = [file]
+        self.controller._Controller__model.version = 1
+        self.controller._Controller__model_builder.local_library_inventory_snapshot.return_value = (0, {})
+        self.controller._Controller__reconciled_local_path_pair_ids = {"pair-a"}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {"pair-a"}
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset({"pair-a"})
+
+        self.assertFalse(self.controller.is_path_pair_reconciled("pair-a"))
+        summary = self.controller.get_model_summary()["path_pairs"][0]
+        self.assertFalse(summary["reconciled_local"])
+        self.assertTrue(summary["reconciled_remote"])
+
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset()
+        self.assertTrue(self.controller.is_path_pair_reconciled("pair-a"))
+        summary = self.controller.get_model_summary()["path_pairs"][0]
+        self.assertTrue(summary["reconciled_local"])
+        self.assertTrue(summary["reconciled_remote"])
+
+    def test_model_summary_cache_invalidates_when_unknown_local_overlay_changes(self):
+        file = ModelFile("release", True)
+        file.path_pair_id = "pair-a"
+        self.controller._Controller__model.iter_files.return_value = [file]
+        self.controller._Controller__model.version = 1
+        self.controller._Controller__model_builder.local_library_inventory_snapshot.return_value = (0, {})
+        self.controller._Controller__reconciled_local_path_pair_ids = {"pair-a"}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {"pair-a"}
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset()
+
+        initial = self.controller.get_model_summary()
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset({"pair-a"})
+        changed = self.controller.get_model_summary(max_age_seconds=60)
+        self.assertIsNot(initial, changed)
+        self.assertFalse(changed["path_pairs"][0]["reconciled_local"])
+        self.assertTrue(changed["path_pairs"][0]["reconciled_remote"])
+
+        unchanged = self.controller.get_model_summary(max_age_seconds=60)
+        self.assertIs(changed, unchanged)
+
     @patch("controller.controller.ScannerProcess")
     def test_refresh_path_pairs_rebuilds_runtime_state_and_forces_rescan(self, scanner_process_cls):
         pair_a = PathPair(
@@ -8838,6 +8879,8 @@ class TestController(unittest.TestCase):
         file = ModelFile("release", True)
         file.remote_size = 100
         self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__reconciled_local_path_pair_ids = {None}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {None}
         self.controller._Controller__exclude_patterns = "*.nfo"
         self.controller._Controller__model_builder.get_trusted_final_leaf_paths.return_value = (
             "E06.mkv",
@@ -8854,6 +8897,47 @@ class TestController(unittest.TestCase):
             local_base_dir_path="/local/incomplete",
             exclude_patterns=["*.nfo", ExactPathExclusion("E06.mkv")],
         )
+
+    def test_process_commands_queue_rejects_manual_directory_until_path_pair_reconciles(self):
+        file = ModelFile("release", True)
+        file.path_pair_id = "pair-a"
+        file.remote_size = 100
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "pair-a": SimpleNamespace(remote_path="/remote/a", local_path="/local/a")
+        }
+        self.controller._Controller__path_pair_staging_paths = {"pair-a": "/local/a/incomplete"}
+        self.controller._Controller__reconciled_local_path_pair_ids = {"pair-a"}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {"pair-a"}
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset({"pair-a"})
+
+        blocked_callback = MagicMock()
+        blocked = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        blocked.add_callback(blocked_callback)
+        self.controller.queue_command(blocked)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+        blocked_callback.on_failure.assert_called_once()
+        self.assertEqual(409, blocked_callback.on_failure.call_args.args[1])
+        blocked_callback.on_success.assert_not_called()
+
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset()
+        self.controller._Controller__model_builder.get_trusted_final_leaf_paths.return_value = ()
+        admitted_callback = MagicMock()
+        admitted = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        admitted.add_callback(admitted_callback)
+        self.controller.queue_command(admitted)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            "release",
+            True,
+            remote_base_dir_path="/remote/a",
+            local_base_dir_path="/local/a/incomplete",
+        )
+        admitted_callback.on_success.assert_called_once_with()
+        admitted_callback.on_failure.assert_not_called()
 
     def test_ambiguous_split_local_target_refuses_final_delete(self):
         with tempfile.TemporaryDirectory() as temp_dir:
