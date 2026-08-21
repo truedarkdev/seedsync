@@ -20,6 +20,7 @@ import shlex
 from .scanner_process import IScanner, ScannerError, ScanProgressCallback
 from common import overrides, Localization, escape_remote_path_for_shell
 from ssh import Sshcp, SshcpError, TRANSIENT_ERROR_PATTERNS
+from ssh.sshcp import Sshcp as _SshcpTransport
 from common.performance_diagnostics import (
     DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION,
     DURATION_REMOTE_SCAN_STREAM_PARSING,
@@ -361,6 +362,48 @@ class RemoteScanner(IScanner):
         self.__performance_diagnostics = diagnostics
         self.__ssh.set_performance_diagnostics(diagnostics)
 
+    def generation_ssh_reuse_key(self) -> Optional[tuple[object, ...]]:
+        """Return a stable connection identity for one generation only."""
+        if not isinstance(self.__ssh, _SshcpTransport):
+            # Test doubles and custom transports retain the established
+            # independent-connection behavior.
+            return None
+        return self.__ssh.generation_connection_key()
+
+    def create_generation_ssh_reuse(self) -> object:
+        if not isinstance(self.__ssh, _SshcpTransport):
+            return None
+        return self.__ssh.create_generation_control_master()
+
+    def set_generation_ssh_reuse(self, control_master: object) -> None:
+        if isinstance(self.__ssh, _SshcpTransport):
+            self.__ssh.set_generation_control_master(control_master)
+
+    def clear_generation_ssh_reuse(self) -> None:
+        if isinstance(self.__ssh, _SshcpTransport):
+            self.__ssh.clear_generation_control_master()
+
+    def close_generation_ssh_reuse(self) -> None:
+        if isinstance(self.__ssh, _SshcpTransport):
+            self.__ssh.close_generation_control_master()
+
+    def generation_remote_scan_lease(self) -> Optional[RemoteScanLease]:
+        """Expose the shared generation lease to the aggregate owner only."""
+        return self.__remote_scan_lease
+
+    def scan_with_remote_scan_lease_held(self) -> List[SystemFile]:
+        """Scan while MultiPathRemoteScanner owns this generation's lease."""
+        try:
+            self.__ssh.start_generation_control_master()
+        except SshcpError as error:
+            first_run = self.__first_run
+            raise ScannerError(
+                (Localization.Error.REMOTE_SERVER_INSTALL if first_run else
+                 Localization.Error.REMOTE_SERVER_SCAN).format(str(error).strip()),
+                recoverable=(not first_run) or self._is_transient_ssh_error(error),
+            ) from error
+        return self.__scan()
+
     def __begin_duration(self, metric: str) -> object:
         diagnostics = self.__performance_diagnostics
         if diagnostics is None:
@@ -441,9 +484,13 @@ class RemoteScanner(IScanner):
     @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
         if self.__remote_scan_lease is None:
-            return self.__scan()
+            return self.scan_with_remote_scan_lease_held()
         with self.__remote_scan_lease.hold():
-            return self.__scan()
+            # Startup stays inside the same lease that protects the scan. This
+            # prevents overlapping generations from racing on authentication
+            # while allowing compatible scanners to reuse the foreground
+            # master without reacquiring the lease around a generation.
+            return self.scan_with_remote_scan_lease_held()
 
     def __scan(self) -> List[SystemFile]:
         if not self.__is_valid_remote_script_path(self.__remote_path_to_scan_script):

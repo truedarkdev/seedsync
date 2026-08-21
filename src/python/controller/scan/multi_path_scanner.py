@@ -7,7 +7,7 @@ from typing import Callable, List, Optional
 
 from .scanner_process import IScanner, ScannerError, ScanProgressCallback
 from .local_scanner import LocalScanner
-from .remote_scanner import RemoteScanner
+from .remote_scanner import RemoteScanLease, RemoteScanner
 from common import overrides
 from common.performance_diagnostics import (
     DURATION_LOCAL_SCAN_AGGREGATION,
@@ -367,10 +367,10 @@ class MultiPathRemoteScanner(IScanner):
         # the slowest path pair.
         first_run_states = [self.__scanner_is_first_run(scanner) for scanner in scanners]
 
-        def scan_one(scanner: RemoteScanner) -> tuple[RemoteScanner, List[SystemFile], Optional[ScannerError]]:
+        def scan_one(scanner: RemoteScanner, lease_held: bool = False) -> tuple[RemoteScanner, List[SystemFile], Optional[ScannerError]]:
             err: Optional[ScannerError] = None
             try:
-                files = scanner.scan()
+                files = scanner.scan_with_remote_scan_lease_held() if lease_held else scanner.scan()
             except ScannerError as scan_error:
                 if not scan_error.recoverable:
                     raise
@@ -378,10 +378,38 @@ class MultiPathRemoteScanner(IScanner):
                 files = scan_error.files or []
             return scanner, files, err
 
-        if any(first_run_states):
-            scan_results = [scan_one(scanner) for scanner in scanners]
+        generation_lease = self.__shared_generation_lease(scanners)
+        if generation_lease is None:
+            scan_results = self.__run_scan_tasks(scanners, scan_one, first_run_states)
         else:
-            scan_results = _run_bounded_scan_tasks(scanners, scan_one, "remote-scan")
+            # Keep the existing OS lease as the cross-generation SSH boundary,
+            # but acquire it once for an actual reusable-master generation.
+            # Members must not reacquire the non-reentrant lease while the
+            # bounded refresh pool is active.
+            control_master = None
+            with generation_lease.hold():
+                control_master = scanners[0].create_generation_ssh_reuse()
+                if control_master is not None:
+                    # Establish the cleanup owner before any remaining member
+                    # assignment can fail.
+                    scanners[0].set_generation_ssh_reuse(control_master)
+                    try:
+                        for scanner in scanners[1:]:
+                            scanner.set_generation_ssh_reuse(control_master)
+                        scan_results = self.__run_scan_tasks(
+                            scanners, lambda scanner: scan_one(scanner, lease_held=True), first_run_states)
+                    finally:
+                        try:
+                            scanners[0].close_generation_ssh_reuse()
+                        except Exception:
+                            self.logger.warning("Failed to clean up generation-local SSH reuse", exc_info=True)
+                        finally:
+                            for scanner in scanners:
+                                scanner.clear_generation_ssh_reuse()
+            if control_master is None:
+                # Reuse is optional.  Run legacy member scans only after the
+                # outer lease is released, so each scanner can acquire it.
+                scan_results = self.__run_scan_tasks(scanners, scan_one, first_run_states)
 
         for scanner, files, err in scan_results:
             aggregation_started = self.__begin_stage()
@@ -408,6 +436,28 @@ class MultiPathRemoteScanner(IScanner):
                 files=all_files
             )
         return all_files
+
+    @staticmethod
+    def __run_scan_tasks(scanners: List[RemoteScanner], scan_one, first_run_states: List[bool]):
+        if any(first_run_states):
+            return [scan_one(scanner) for scanner in scanners]
+        return _run_bounded_scan_tasks(scanners, scan_one, "remote-scan")
+
+    @staticmethod
+    def __shared_generation_lease(scanners: List[RemoteScanner]) -> Optional[RemoteScanLease]:
+        # Preserve mocks/custom scanners and one-scanner behavior exactly. The
+        # aggregate ownership path is only safe when every selected concrete
+        # RemoteScanner shares the same cross-generation lease.
+        if len(scanners) < 2 or not all(isinstance(scanner, RemoteScanner) for scanner in scanners):
+            return None
+        lease = scanners[0].generation_remote_scan_lease()
+        reuse_key = scanners[0].generation_ssh_reuse_key()
+        if reuse_key is None or lease is None or any(
+                scanner.generation_remote_scan_lease() is not lease or
+                scanner.generation_ssh_reuse_key() != reuse_key
+                for scanner in scanners):
+            return None
+        return lease
 
     @staticmethod
     def __scanner_is_first_run(scanner: object) -> bool:

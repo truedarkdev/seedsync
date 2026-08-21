@@ -97,6 +97,55 @@ class _SerialPathPairScanner:
 
 
 class TestMultiPathRemoteScanner(unittest.TestCase):
+    def _create_remote_scan_lease(self):
+        runtime_dir = tempfile.mkdtemp(prefix="test-remote-scan-runtime-")
+        self.addCleanup(shutil.rmtree, runtime_dir)
+        with patch("controller.scan.remote_scanner.tempfile.gettempdir", return_value=runtime_dir):
+            return RemoteScanLease.create()
+
+    @staticmethod
+    def _create_settled_remote_scanners(lease, roots):
+        scanners = [
+            RemoteScanner("host", "user", "password", 22, root, "/scanfs", "/scanfs", remote_scan_lease=lease)
+            for root in roots
+        ]
+        for scanner in scanners:
+            scanner.apply_recycled_state((False, "/scanfs"))
+        return scanners
+
+    @staticmethod
+    def _run_in_thread(scanner):
+        result = []
+        errors = []
+
+        def run():
+            try:
+                result.append(scanner.scan())
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        return thread, result, errors
+
+    @staticmethod
+    def _blocking_remote_scan_body(state, started, release, finished, name):
+        def run():
+            with state["lock"]:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+            started.set()
+            try:
+                if not release.wait(timeout=5):
+                    raise AssertionError("remote scan body release timed out")
+                return [SystemFile(name, 1, False)]
+            finally:
+                with state["lock"]:
+                    state["active"] -= 1
+                finished.set()
+
+        return run
+
     def test_remote_aggregation_duration_wraps_result_tagging(self):
         release = threading.Event()
         release.set()
@@ -176,6 +225,118 @@ class TestMultiPathRemoteScanner(unittest.TestCase):
         self.assertFalse(old_thread.is_alive())
         self.assertFalse(new_thread.is_alive())
         self.assertTrue(new_entered.is_set())
+
+    def test_settled_compatible_scans_share_master_and_bounded_pool(self):
+        scanners = self._create_settled_remote_scanners(
+            self._create_remote_scan_lease(), ("/one", "/two"))
+        state = {"lock": threading.Lock(), "active": 0, "max_active": 0}
+        started = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+        finished = [threading.Event(), threading.Event()]
+
+        for index, scanner in enumerate(scanners):
+            scanner.create_generation_ssh_reuse = MagicMock()
+            scanner.set_generation_ssh_reuse = MagicMock()
+            scanner.clear_generation_ssh_reuse = MagicMock()
+            scanner.close_generation_ssh_reuse = MagicMock()
+            scanner.scan_with_remote_scan_lease_held = MagicMock(
+                side_effect=self._blocking_remote_scan_body(
+                    state, started[index], release[index], finished[index], "pair-{}.bin".format(index + 1)))
+        control_master = object()
+        scanners[0].create_generation_ssh_reuse.return_value = control_master
+
+        thread, result, errors = self._run_in_thread(MultiPathRemoteScanner(scanners))
+        try:
+            self.assertTrue(started[0].wait(timeout=2))
+            self.assertTrue(started[1].wait(timeout=2))
+            with state["lock"]:
+                self.assertEqual(2, state["max_active"])
+            release[1].set()
+            self.assertTrue(finished[1].wait(timeout=2))
+            self.assertFalse(finished[0].is_set())
+            release[0].set()
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual([], errors)
+            self.assertEqual(["pair-1.bin", "pair-2.bin"], [file.name for file in result[0]])
+            scanners[0].create_generation_ssh_reuse.assert_called_once_with()
+            scanners[1].create_generation_ssh_reuse.assert_not_called()
+            for scanner in scanners:
+                scanner.set_generation_ssh_reuse.assert_called_once_with(control_master)
+                scanner.clear_generation_ssh_reuse.assert_called_once_with()
+                scanner.scan_with_remote_scan_lease_held.assert_called_once_with()
+            scanners[0].close_generation_ssh_reuse.assert_called_once_with()
+            scanners[1].close_generation_ssh_reuse.assert_not_called()
+        finally:
+            for event in release:
+                event.set()
+            thread.join(timeout=5)
+
+    def test_compatible_generations_serialize_with_or_without_master(self):
+        for control_master in (object(), None):
+            with self.subTest(control_master=control_master is not None):
+                lease = self._create_remote_scan_lease()
+                first_scanners = self._create_settled_remote_scanners(
+                    lease, ("/first-one", "/first-two"))
+                second_scanners = self._create_settled_remote_scanners(
+                    lease, ("/second-one", "/second-two"))
+                state = {"lock": threading.Lock(), "active": 0, "max_active": 0}
+                first_started, first_release, first_finished = threading.Event(), threading.Event(), threading.Event()
+                second_started, second_release, second_finished = threading.Event(), threading.Event(), threading.Event()
+                first_scanners[0].scan_with_remote_scan_lease_held = MagicMock(
+                    side_effect=self._blocking_remote_scan_body(
+                        state, first_started, first_release, first_finished, "first-one"))
+                second_scanners[0].scan_with_remote_scan_lease_held = MagicMock(
+                    side_effect=self._blocking_remote_scan_body(
+                        state, second_started, second_release, second_finished, "second-one"))
+                for scanners, second_name in ((first_scanners, "first-two"), (second_scanners, "second-two")):
+                    scanners[1].scan_with_remote_scan_lease_held = MagicMock(
+                        return_value=[SystemFile(second_name, 1, False)])
+                    for scanner in scanners:
+                        scanner.create_generation_ssh_reuse = MagicMock()
+                        scanner.set_generation_ssh_reuse = MagicMock()
+                        scanner.clear_generation_ssh_reuse = MagicMock()
+                        scanner.close_generation_ssh_reuse = MagicMock()
+                    scanners[0].create_generation_ssh_reuse.return_value = control_master
+
+                first_thread, first_result, first_errors = self._run_in_thread(
+                    MultiPathRemoteScanner(first_scanners))
+                second_thread = None
+                try:
+                    self.assertTrue(first_started.wait(timeout=2))
+                    second_thread, second_result, second_errors = self._run_in_thread(
+                        MultiPathRemoteScanner(second_scanners))
+                    self.assertFalse(second_started.wait(timeout=0.1))
+                    first_release.set()
+                    first_thread.join(timeout=5)
+                    self.assertFalse(first_thread.is_alive())
+                    self.assertTrue(second_started.wait(timeout=2))
+                    second_release.set()
+                    second_thread.join(timeout=5)
+                    self.assertFalse(second_thread.is_alive())
+                    self.assertEqual([], first_errors + second_errors)
+                    self.assertEqual(1, state["max_active"])
+                    self.assertEqual(["first-one", "first-two"], [file.name for file in first_result[0]])
+                    self.assertEqual(["second-one", "second-two"], [file.name for file in second_result[0]])
+                    for scanners in (first_scanners, second_scanners):
+                        scanners[0].create_generation_ssh_reuse.assert_called_once_with()
+                        scanners[1].create_generation_ssh_reuse.assert_not_called()
+                        if control_master is None:
+                            scanners[0].close_generation_ssh_reuse.assert_not_called()
+                            for scanner in scanners:
+                                scanner.set_generation_ssh_reuse.assert_not_called()
+                                scanner.clear_generation_ssh_reuse.assert_not_called()
+                        else:
+                            scanners[0].close_generation_ssh_reuse.assert_called_once_with()
+                            for scanner in scanners:
+                                scanner.set_generation_ssh_reuse.assert_called_once_with(control_master)
+                                scanner.clear_generation_ssh_reuse.assert_called_once_with()
+                finally:
+                    first_release.set()
+                    second_release.set()
+                    first_thread.join(timeout=5)
+                    if second_thread is not None:
+                        second_thread.join(timeout=5)
 
     def test_scanner_process_publishes_all_six_selected_pairs(self):
         release = threading.Event()

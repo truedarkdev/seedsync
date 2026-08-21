@@ -6,6 +6,10 @@ import posixpath
 import re
 import shlex
 import shutil
+import subprocess
+import sys
+import tempfile
+import threading
 import time
 from typing import Any, List, Optional
 
@@ -30,11 +34,89 @@ class SshcpError(AppError):
 TRANSIENT_ERROR_PATTERNS = ("Timed out", "Connection refused by server")
 
 
+def _linux_master_parent_death_preexec(parent_pid: int):
+    """Make a foreground POSIX master die if its scanner worker dies."""
+    def preexec() -> None:
+        import ctypes
+        import signal
+        if os.getppid() != parent_pid:
+            os.kill(os.getpid(), signal.SIGTERM)
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+            raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+        if os.getppid() != parent_pid:
+            os.kill(os.getpid(), signal.SIGTERM)
+    return preexec
+
+
+class _SshcpControlMaster:
+    """One generation-local foreground OpenSSH multiplexing session.
+
+    The object deliberately owns only runtime-temporary state.  It is shared
+    by the compatible scanners in one MultiPathRemoteScanner generation and is
+    discarded before scanners can be pickled for their next worker process.
+    """
+
+    def __init__(self):
+        self.directory = tempfile.mkdtemp(prefix=".seedsync-ssh-", dir=tempfile.gettempdir())
+        self.path = os.path.join(self.directory, "control")
+        self.process: Optional[Any] = None
+        self.started = False
+        self.closed = False
+        self.lock = threading.Lock()
+
+    def close(self, logger: logging.Logger, remote_address: str, port: int) -> None:
+        with self.lock:
+            process = self.process
+            self.process = None
+            self.started = False
+            self.closed = True
+
+        # Ask OpenSSH to close the master before force-closing its foreground
+        # pty.  Either step is intentionally best-effort: cleanup must never
+        # replace the scan failure that led here.
+        try:
+            subprocess.run(
+                ["ssh", "-S", self.path, "-O", "exit", "-p", str(port), remote_address],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            logger.warning("Failed to request SSH control master exit", exc_info=True)
+
+        if process is not None:
+            try:
+                close = getattr(process, "close", None)
+                if callable(close):
+                    try:
+                        close(force=True)
+                    except TypeError:
+                        close()
+                else:
+                    terminate = getattr(process, "terminate", None)
+                    if callable(terminate):
+                        terminate()
+                wait = getattr(process, "wait", None)
+                if callable(wait):
+                    wait()
+            except Exception:
+                logger.warning("Failed to clean up SSH control master", exc_info=True)
+
+        try:
+            shutil.rmtree(self.directory, ignore_errors=True)
+        except Exception:
+            logger.warning("Failed to remove SSH control master directory", exc_info=True)
+
+
 class Sshcp:
     """
     Scp command utility
     """
     __TIMEOUT_SECS = 180
+    __CONTROL_MASTER_TIMEOUT_SECS = 30
     # Filesystem scans can return many megabytes of JSON.  Pexpect's 2 KiB
     # default turns that stream into thousands of small reads and repeatedly
     # searches the accumulated buffer for terminal SSH errors.  Keep enough
@@ -66,6 +148,7 @@ class Sshcp:
         self.__performance_diagnostics = performance_diagnostics
         self.__detected_shell: Optional[str] = None
         self.__shell_detection_in_progress = False
+        self.__control_master: Optional[_SshcpControlMaster] = None
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def set_performance_diagnostics(
@@ -75,7 +158,160 @@ class Sshcp:
     def __getstate__(self) -> dict[str, object]:
         state = self.__dict__.copy()
         state["_Sshcp__performance_diagnostics"] = None
+        # A foreground pexpect child and its runtime socket must never cross a
+        # scanner worker serialization boundary.
+        state["_Sshcp__control_master"] = None
         return state
+
+    def generation_connection_key(self) -> tuple[Optional[str], int, Optional[str], Optional[str]]:
+        """Return credentials used only to group compatible scan transports."""
+        return self.__host, self.__port, self.__user, self.__password
+
+    def create_generation_control_master(self) -> Optional[_SshcpControlMaster]:
+        """Allocate a private runtime control socket for one scan generation."""
+        if not sys.platform.startswith("linux") or not callable(getattr(pexpect, "spawn", None)):
+            return None
+        try:
+            return _SshcpControlMaster()
+        except (OSError, ValueError):
+            # A temporary directory failure must not make a compatible scanner
+            # unusable; callers retain the normal one-connection behavior.
+            self.logger.warning("Unable to allocate SSH control master runtime state", exc_info=True)
+            return None
+
+    def set_generation_control_master(self, control_master: object) -> None:
+        if control_master is not None and not isinstance(control_master, _SshcpControlMaster):
+            raise TypeError("Invalid SSH control master")
+        self.__control_master = control_master
+
+    def clear_generation_control_master(self) -> None:
+        self.__control_master = None
+
+    def start_generation_control_master(self) -> None:
+        control_master = self.__control_master
+        if control_master is None:
+            return
+        with control_master.lock:
+            if control_master.closed:
+                return
+            process = control_master.process
+            if control_master.started and process is not None:
+                isalive = getattr(process, "isalive", None)
+                if not callable(isalive) or isalive():
+                    return
+
+            command_args = [
+                "-M",
+                "-S", control_master.path,
+                "-N",
+                "-T",
+                "-o", "ControlMaster=yes",
+                "-o", "ControlPersist=no",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "LogLevel=error",
+            ]
+            if self.__password is None:
+                command_args += ["-o", "PasswordAuthentication=no"]
+            else:
+                command_args += ["-o", "PubkeyAuthentication=no"]
+            command_args += ["-p", str(self.__port), self.__remote_address()]
+
+            self.logger.debug("Starting generation-local SSH control master")
+            start_time = time.time()
+            sp, _using_spawn_fallback = self.__spawn_process(
+                "ssh", command_args, preexec_fn=_linux_master_parent_death_preexec(os.getpid()))
+            control_master.process = sp
+            try:
+                timeout_phase = "control master startup"
+                if self.__password is not None:
+                    timeout_phase = "password prompt"
+                    i = sp.expect([
+                        r'(?i)password:\s*',
+                        pexpect.EOF,
+                        'lost connection',
+                        'Could not resolve hostname',
+                        'Connection refused',
+                        'Name or service not known',
+                        'No route to host',
+                        'Connection timed out',
+                        'REMOTE HOST IDENTIFICATION HAS CHANGED',
+                        'Permission denied',
+                    ], timeout=self.__TIMEOUT_SECS)
+                    self.__classify_expect_result(
+                        "ssh",
+                        sp,
+                        i,
+                        eof_error="Unknown error",
+                        password_error=None,
+                        scp_permission_denied_is_destination_error=False,
+                    )
+                    sp.sendline(self.__password)
+
+                # The master has no success output after authentication. Poll
+                # its socket while nonblockingly consuming only terminal
+                # prompts/errors, so a rejected password retains the current
+                # prompt error behavior instead of waiting for socket timeout.
+                deadline = time.monotonic() + self.__CONTROL_MASTER_TIMEOUT_SECS
+                while time.monotonic() < deadline:
+                    if os.path.exists(control_master.path):
+                        control_master.started = True
+                        return
+                    try:
+                        i = sp.expect([
+                            r'(?i)password:\s*',
+                            pexpect.EOF,
+                            'lost connection',
+                            'Could not resolve hostname',
+                            'Connection refused',
+                            'Name or service not known',
+                            'No route to host',
+                            'Connection timed out',
+                            'REMOTE HOST IDENTIFICATION HAS CHANGED',
+                            'Permission denied',
+                        ], timeout=0)
+                    except pexpect.exceptions.TIMEOUT:
+                        pass
+                    else:
+                        if i == 0:
+                            raise SshcpError("Incorrect password")
+                        self.__classify_expect_result(
+                            "ssh",
+                            sp,
+                            i,
+                            eof_error="Incorrect password" if self.__password is not None else "Unknown error",
+                            password_error="Incorrect password",
+                            scp_permission_denied_is_destination_error=False,
+                        )
+                    isalive = getattr(sp, "isalive", None)
+                    if callable(isalive) and not isalive():
+                        before = self.__decode_spawn_output(getattr(sp, "before", b"")).strip()
+                        self.__check_shell_not_found(before)
+                        raise SshcpError(before or "Unknown error")
+                    time.sleep(0.05)
+
+                self.__log_timeout(timeout_phase, "ssh", sp, start_time)
+                raise SshcpError("Timed out")
+            except pexpect.exceptions.TIMEOUT:
+                self.__log_timeout(timeout_phase, "ssh", sp, start_time)
+                raise SshcpError("Timed out")
+            except Exception:
+                try:
+                    close = getattr(sp, "close", None)
+                    if callable(close):
+                        try:
+                            close(force=True)
+                        except TypeError:
+                            close()
+                except Exception:
+                    self.logger.warning("Failed to clean up failed SSH control master", exc_info=True)
+                control_master.process = None
+                control_master.started = False
+                raise
+
+    def close_generation_control_master(self) -> None:
+        control_master = self.__control_master
+        if control_master is not None:
+            control_master.close(self.logger, self.__remote_address(), self.__port)
 
     def __begin_duration(self) -> object:
         diagnostics = self.__performance_diagnostics
@@ -109,6 +345,22 @@ class Sshcp:
                 raise ValueError("Hostname cannot start with '-'")
             return self.__host
         return "{}@{}".format(self.__user, self.__host)
+
+    def __generation_control_options(self) -> List[str]:
+        control_master = self.__control_master
+        if control_master is None or not control_master.started or control_master.closed:
+            return []
+        # BatchMode is required after the foreground master has consumed the
+        # only password prompt for this generation.
+        return [
+            "-o", "ControlPath={}".format(control_master.path),
+            "-o", "ControlMaster=no",
+            "-o", "BatchMode=yes",
+        ]
+
+    def __using_generation_control_master(self) -> bool:
+        control_master = self.__control_master
+        return control_master is not None and control_master.started and not control_master.closed
 
     def __is_missing_remote_shell_error(self, error_message: str) -> bool:
         if "No such file or directory" not in error_message:
@@ -321,6 +573,8 @@ class Sshcp:
                 "-o", "PubkeyAuthentication=no",
             ]
 
+        command_args += self.__generation_control_options()
+
         command_args += [
             "-P", str(self.__port),
             self.__remote_address(),
@@ -331,7 +585,7 @@ class Sshcp:
         sp, _using_spawn_fallback = self.__spawn_process(command_args[0], command_args[1:])
         try:
             timeout = 30
-            if self.__password is not None:
+            if self.__password is not None and not self.__using_generation_control_master():
                 i = sp.expect([
                     r'(?i)password:\s*',
                     pexpect.EOF,
@@ -382,38 +636,45 @@ class Sshcp:
         )
         self.logger.error("Command output before:\n{}".format(sp.before))
 
-    def __spawn_process(self, command: str, command_args: list[str]) -> tuple[Any, bool]:
+    def __spawn_process(self, command: str, command_args: list[str], preexec_fn=None,
+                        force_popen_spawn: bool = False) -> tuple[Any, bool]:
         spawn_factory = getattr(pexpect, "spawn", None)
-        resolver_options = None
-        resolver_modified = False
+        child_env = None
         if self.__host not in {"127.0.0.1", "localhost"} and "." not in self.__host and ":" not in self.__host:
-            resolver_options = os.environ.get("RES_OPTIONS")
-            os.environ["RES_OPTIONS"] = "attempts:1 timeout:1"
-            resolver_modified = True
-        if callable(spawn_factory):
-            try:
-                return spawn_factory(
-                    command,
-                    command_args,
-                    maxread=self.__PEXPECT_MAX_READ_BYTES,
-                    searchwindowsize=self.__PEXPECT_SEARCH_WINDOW_BYTES,
-                ), False
-            finally:
-                if resolver_modified:
-                    if resolver_options is None:
-                        os.environ.pop("RES_OPTIONS", None)
-                    else:
-                        os.environ["RES_OPTIONS"] = resolver_options
+            child_env = os.environ.copy()
+            child_env["RES_OPTIONS"] = "attempts:1 timeout:1"
+        if callable(spawn_factory) and not force_popen_spawn:
+            spawn_kwargs = {
+                "maxread": self.__PEXPECT_MAX_READ_BYTES,
+                "searchwindowsize": self.__PEXPECT_SEARCH_WINDOW_BYTES,
+            }
+            if child_env is not None:
+                spawn_kwargs["env"] = child_env
+            if preexec_fn is not None:
+                spawn_kwargs["preexec_fn"] = preexec_fn
+            return spawn_factory(command, command_args, **spawn_kwargs), False
         else:
             resolved_command = shutil.which(command) or command
-            try:
-                return pexpect.popen_spawn.PopenSpawn([resolved_command] + command_args), True
-            finally:
-                if resolver_modified:
-                    if resolver_options is None:
-                        os.environ.pop("RES_OPTIONS", None)
-                    else:
-                        os.environ["RES_OPTIONS"] = resolver_options
+            popen_kwargs = {} if child_env is None else {"env": child_env}
+            return pexpect.popen_spawn.PopenSpawn([resolved_command] + command_args, **popen_kwargs), True
+
+    @staticmethod
+    def __bounded_reap_popen_stream(sp: Any) -> Optional[int]:
+        process = getattr(sp, "proc", None)
+        if process is None:
+            return getattr(sp, "exitstatus", None)
+        try:
+            return process.wait(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+        try:
+            return process.wait(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        try:
+            return process.wait(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            return process.poll()
 
     def __run_command(self,
                       command: str,
@@ -438,6 +699,8 @@ class Sshcp:
                 "-o", "PubkeyAuthentication=no"  # don't use key authentication
             ]
 
+        command_args += self.__generation_control_options()
+
         command_args += args
 
         self.logger.debug("Command: {}".format(command_args))
@@ -448,7 +711,7 @@ class Sshcp:
         timeout_phase: str = "command execution"
         cleanup_exitstatus = None
         try:
-            if self.__password is not None:
+            if self.__password is not None and not self.__using_generation_control_master():
                 timeout_phase = "password prompt"
                 i = sp.expect([
                     r'(?i)password:\s*',  # i=0, all's good
@@ -591,6 +854,18 @@ class Sshcp:
                 shlex.quote(command)
             )
 
+        if self.__using_generation_control_master():
+            # A multiplexed SSH channel can disappear without the remote
+            # non-interactive command receiving a hangup.  Keep a stdin-EOF
+            # watchdog beside a dedicated session: channel loss kills that
+            # session and its descendants, while normal command completion
+            # stops the watchdog and preserves the command exit status.
+            command = (
+                "exec 3<&0; setsid sh -c {} & child=$!; "
+                "( while IFS= read -r _ <&3; do :; done; kill -TERM -$child 2>/dev/null ) & watcher=$!; "
+                "wait $child; status=$?; kill $watcher 2>/dev/null; wait $watcher 2>/dev/null; exit $status"
+            ).format(shlex.quote(command))
+
         flags = [
             "-p", str(self.__port),  # port
         ]
@@ -622,18 +897,23 @@ class Sshcp:
             command_args += ["-o", "PasswordAuthentication=no"]
         else:
             command_args += ["-o", "PubkeyAuthentication=no"]
+        command_args += self.__generation_control_options()
         command_args += args
 
         self.logger.debug("Command: {}".format(command_args))
         start_time = time.time()
-        sp, _using_spawn_fallback = self.__spawn_process(command_args[0], command_args[1:])
+        multiplexed_stream = self.__using_generation_control_master()
+        sp, _using_spawn_fallback = self.__spawn_process(
+            command_args[0], command_args[1:],
+            force_popen_spawn=multiplexed_stream,
+        )
         transport_started = self.__begin_duration()
         timeout_phase = "command execution"
         output = bytearray()
         error_output = bytearray()
         cleanup_exitstatus = None
         try:
-            if self.__password is not None:
+            if self.__password is not None and not self.__using_generation_control_master():
                 timeout_phase = "password prompt"
                 i = sp.expect([
                     r'(?i)password:\s*',
@@ -676,6 +956,12 @@ class Sshcp:
                 if not isinstance(chunk, bytes):
                     chunk = self.__decode_spawn_output(chunk).encode()
                 if not chunk:
+                    if _using_spawn_fallback:
+                        remaining_timeout = self.__TIMEOUT_SECS - (time.time() - start_time)
+                        if remaining_timeout <= 0:
+                            self.__log_timeout(timeout_phase, command, sp, start_time)
+                            raise SshcpError("Timed out")
+                        time.sleep(min(0.01, remaining_timeout))
                     continue
                 if retain_output:
                     output.extend(chunk)
@@ -689,13 +975,16 @@ class Sshcp:
             raise SshcpError("Timed out")
         finally:
             try:
-                close = getattr(sp, "close", None)
-                if callable(close):
-                    close()
+                if _using_spawn_fallback:
+                    cleanup_exitstatus = self.__bounded_reap_popen_stream(sp)
                 else:
-                    wait = getattr(sp, "wait", None)
-                    if callable(wait):
-                        cleanup_exitstatus = wait()
+                    close = getattr(sp, "close", None)
+                    if callable(close):
+                        close()
+                    else:
+                        wait = getattr(sp, "wait", None)
+                        if callable(wait):
+                            cleanup_exitstatus = wait()
             except Exception:
                 self.logger.warning("Failed to clean up SSH child process", exc_info=True)
             self.__finish_duration(transport_started)
@@ -703,7 +992,7 @@ class Sshcp:
         exitstatus = getattr(sp, "exitstatus", None)
         if exitstatus is None:
             exitstatus = cleanup_exitstatus
-        if exitstatus is None:
+        if exitstatus is None and not _using_spawn_fallback:
             wait = getattr(sp, "wait", None)
             if callable(wait):
                 exitstatus = wait()

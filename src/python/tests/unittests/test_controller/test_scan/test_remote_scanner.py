@@ -127,6 +127,26 @@ class TestRemoteScanner(unittest.TestCase):
         scanner._RemoteScanner__scan = MagicMock(return_value=[])
         self.assertEqual([], scanner.scan())
 
+    def test_generation_master_startup_errors_keep_scan_error_contract(self):
+        scanner = RemoteScanner(
+            "host", "user", "password", 22, "/remote", TestRemoteScanner.temp_scan_script, "/tmp/scanfs"
+        )
+        scanner._RemoteScanner__ssh.start_generation_control_master.side_effect = SshcpError("Timed out")
+        with self.assertRaises(ScannerError) as transient:
+            scanner.scan_with_remote_scan_lease_held()
+        self.assertTrue(transient.exception.recoverable)
+
+        scanner._RemoteScanner__ssh.start_generation_control_master.side_effect = SshcpError("Incorrect password")
+        with self.assertRaises(ScannerError) as password:
+            scanner.scan_with_remote_scan_lease_held()
+        self.assertFalse(password.exception.recoverable)
+
+        scanner._RemoteScanner__first_run = False
+        scanner._RemoteScanner__ssh.start_generation_control_master.side_effect = SshcpError("Connection refused by server")
+        with self.assertRaises(ScannerError) as settled:
+            scanner.scan_with_remote_scan_lease_held()
+        self.assertTrue(settled.exception.recoverable)
+
     @unittest.skipUnless(
         os.name == "posix" and getattr(os, "O_NOFOLLOW", None) is not None and hasattr(os, "symlink"),
         "POSIX symlink and O_NOFOLLOW support is required",

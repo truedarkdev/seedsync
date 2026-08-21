@@ -2,10 +2,14 @@
 
 import unittest
 import os
+import pickle
 import tempfile
 import shutil
+import shlex
 import filecmp
 import logging
+import subprocess
+import signal
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -17,6 +21,7 @@ from parameterized import parameterized
 from tests.utils import TestUtils, requires_live_ssh
 from common import overrides
 from ssh import Sshcp, SshcpError
+from ssh.sshcp import _linux_master_parent_death_preexec
 from common.performance_diagnostics import DURATION_REMOTE_SCAN_TRANSPORT_READ
 
 
@@ -128,6 +133,211 @@ class TestSshcp(unittest.TestCase):
 
         self.assertEqual("Incorrect password", str(ctx.exception))
         spawn.sendline.assert_not_called()
+
+    def _control_master(self, password=_PASSWORD, port=None):
+        sshcp = Sshcp(host=self.host, port=self.port if port is None else port,
+                      user=self.user, password=password)
+        # Windows pexpect builds may omit spawn. These tests exercise the
+        # Linux-only owner while mocking its child process, so make allocation
+        # independent of the host that runs the unit suite.
+        with patch("ssh.sshcp.pexpect.spawn", MagicMock(), create=True):
+            control_master = sshcp.create_generation_control_master()
+        self.assertIsNotNone(control_master)
+        assert control_master is not None
+        self.addCleanup(shutil.rmtree, control_master.directory, ignore_errors=True)
+        sshcp.set_generation_control_master(control_master)
+        return sshcp, control_master
+
+    @patch("ssh.sshcp.sys.platform", "linux")
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_reused_control_master_options_cover_all_transports(self, mock_spawn_process):
+        sshcp, control_master = self._control_master()
+        control_master.started = True
+        scenarios = [
+            ("ssh-shell", lambda: sshcp.shell("true"), "command"),
+            ("scp-copy", lambda: sshcp.copy(self.local_file, self.remote_file), "command"),
+            ("streamed-ssh", lambda: sshcp.shell_stream("true", lambda _chunk: None), "stream"),
+            ("sftp-shell-probe", lambda: sshcp._Sshcp__sftp_stat("/bin/sh"), "sftp"),
+        ]
+
+        for name, operation, kind in scenarios:
+            with self.subTest(name=name):
+                spawn = MagicMock()
+                spawn.before = spawn.after = b""
+                spawn.exitstatus = 0
+                spawn.expect.return_value = 0
+                if kind == "stream":
+                    spawn.read_nonblocking.side_effect = [pexpect.EOF("done")]
+                elif kind == "sftp":
+                    spawn.expect.side_effect = [0, 0, 0]
+                mock_spawn_process.reset_mock()
+                mock_spawn_process.return_value = (spawn, False)
+
+                operation()
+
+                self.assertEqual(1, mock_spawn_process.call_count)
+                arguments = mock_spawn_process.call_args.args[1]
+                self.assertIn("ControlPath={}".format(control_master.path), arguments)
+                self.assertIn("ControlMaster=no", arguments)
+                self.assertIn("BatchMode=yes", arguments)
+                if kind == "sftp":
+                    spawn.sendline.assert_any_call("ls /bin/sh")
+                    self.assertNotIn(_PASSWORD, [call.args[0] for call in spawn.sendline.call_args_list])
+                else:
+                    spawn.sendline.assert_not_called()
+
+    @parameterized.expand((
+        ("password", _PASSWORD, [0, pexpect.exceptions.TIMEOUT("pending")], "PubkeyAuthentication=no"),
+        ("key", None, [pexpect.exceptions.TIMEOUT("pending")], "PasswordAuthentication=no"),
+    ))
+    @patch("ssh.sshcp.sys.platform", "linux")
+    @patch("ssh.sshcp.os.path.exists", side_effect=[False, True])
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_control_master_starts_with_password_or_key_authentication(
+        self, _, password, expect_results, auth_option, mock_spawn_process, _exists
+    ):
+        sshcp, control_master = self._control_master(password=password)
+        spawn = MagicMock()
+        spawn.expect.side_effect = expect_results
+        mock_spawn_process.return_value = (spawn, False)
+
+        sshcp.start_generation_control_master()
+
+        self.assertTrue(control_master.started)
+        self.assertIn(auth_option, mock_spawn_process.call_args.args[1])
+        if password is None:
+            spawn.sendline.assert_not_called()
+        else:
+            spawn.sendline.assert_called_once_with(password)
+
+    @patch("ssh.sshcp.sys.platform", "linux")
+    @patch("ssh.sshcp.os.path.exists", return_value=False)
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_control_master_startup_classifies_terminal_events_and_resets_state(
+        self, mock_spawn_process, _exists
+    ):
+        scenarios = [
+            ("eof-before-password", [1], b"", b"", "Unknown error"),
+            ("prompt-then-eof", [0, 1], b"", b"", "Incorrect password"),
+            ("repeated-password-prompt", [0, 0], b"", b"", "Incorrect password"),
+            ("host-key-changed", [8], b"REMOTE HOST IDENTIFICATION HAS CHANGED", b"",
+             "Remote host key has changed"),
+            ("connection-refused", [4], b"ssh: connect to host port 22: Connection refused", b"",
+             "Connection refused by server"),
+        ]
+
+        for name, expect_results, before, after, error_message in scenarios:
+            with self.subTest(name=name):
+                sshcp, control_master = self._control_master()
+                spawn = MagicMock()
+                spawn.expect.side_effect = expect_results
+                spawn.before = before
+                spawn.after = after
+                mock_spawn_process.return_value = (spawn, False)
+
+                with self.assertRaisesRegex(SshcpError, error_message):
+                    sshcp.start_generation_control_master()
+
+                spawn.close.assert_called_once_with(force=True)
+                self.assertFalse(control_master.started)
+                self.assertIsNone(control_master.process)
+                mock_spawn_process.reset_mock()
+
+    def test_generation_control_master_is_linux_only_and_uses_parent_death_preexec(self):
+        for platform, expected_control_master in (("linux", True), ("win32", False), ("darwin", False)):
+            with self.subTest(platform=platform), \
+                    patch("ssh.sshcp.sys.platform", platform), \
+                    patch("ssh.sshcp.pexpect.spawn", create=True) as spawn_factory, \
+                    patch("ssh.sshcp.os.path.exists", return_value=True):
+                sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+                control_master = sshcp.create_generation_control_master()
+                if not expected_control_master:
+                    self.assertIsNone(control_master)
+                    spawn_factory.assert_not_called()
+                    continue
+
+                self.assertIsNotNone(control_master)
+                assert control_master is not None
+                self.addCleanup(shutil.rmtree, control_master.directory, ignore_errors=True)
+                sshcp.set_generation_control_master(control_master)
+                sshcp.start_generation_control_master()
+                sshcp._Sshcp__spawn_process("ssh", [])
+
+                self.assertEqual(2, spawn_factory.call_count)
+                master_call = spawn_factory.call_args_list[0]
+                ordinary_call = spawn_factory.call_args_list[1]
+                self.assertIsNotNone(master_call.kwargs.get("preexec_fn"))
+                self.assertNotIn("preexec_fn", ordinary_call.kwargs)
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PDEATHSIG is Linux-only")
+    def test_linux_master_parent_death_preexec_outcomes(self):
+        parent_pid = 1234
+        scenarios = [
+            ("success", [parent_pid, parent_pid], 0, None, False),
+            ("prctl-failure", [parent_pid], 1, OSError, False),
+            ("parent-mismatch-before-prctl", [9999, parent_pid], 0, None, True),
+            ("parent-mismatch-after-prctl", [parent_pid, 9999], 0, None, True),
+        ]
+        for name, parent_ids, prctl_result, expected_error, should_kill in scenarios:
+            with self.subTest(name=name), \
+                    patch("ctypes.CDLL") as cdll, \
+                    patch("ssh.sshcp.os.getpid", return_value=5678), \
+                    patch("ssh.sshcp.os.getppid", side_effect=parent_ids), \
+                    patch("ssh.sshcp.os.kill") as kill:
+                cdll.return_value.prctl.return_value = prctl_result
+                preexec = _linux_master_parent_death_preexec(parent_pid)
+                if expected_error is None:
+                    preexec()
+                else:
+                    with self.assertRaises(expected_error):
+                        preexec()
+
+                cdll.return_value.prctl.assert_called_once_with(1, signal.SIGTERM, 0, 0, 0)
+                if should_kill:
+                    kill.assert_called_once_with(5678, signal.SIGTERM)
+                else:
+                    kill.assert_not_called()
+
+    @patch("ssh.sshcp.sys.platform", "linux")
+    @patch("ssh.sshcp.subprocess.run")
+    def test_control_master_close_exits_exact_endpoint_reaps_and_removes_temp_state(self, mock_run):
+        sshcp, control_master = self._control_master(port=2222)
+        control_master.started = True
+        process = MagicMock()
+        control_master.process = process
+
+        sshcp.close_generation_control_master()
+
+        mock_run.assert_called_once_with(
+            ["ssh", "-S", control_master.path, "-O", "exit", "-p", "2222", self.user + "@" + self.host],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+        process.close.assert_called_once_with(force=True)
+        process.wait.assert_called_once_with()
+        self.assertIsNone(control_master.process)
+        self.assertTrue(control_master.closed)
+        self.assertFalse(os.path.exists(control_master.directory))
+
+    @patch("ssh.sshcp.sys.platform", "linux")
+    def test_control_master_is_removed_by_pickle_round_trip(self):
+        sshcp, control_master = self._control_master()
+
+        restored = pickle.loads(pickle.dumps(sshcp))
+
+        self.assertIsNone(restored._Sshcp__control_master)
+
+    @patch("ssh.sshcp.sys.platform", "linux")
+    @patch("ssh.sshcp.pexpect.spawn", MagicMock(), create=True)
+    @patch("ssh.sshcp._SshcpControlMaster", side_effect=OSError("cannot allocate runtime state"))
+    def test_control_master_allocator_oserror_falls_back(self, mock_control_master):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+
+        self.assertIsNone(sshcp.create_generation_control_master())
+        mock_control_master.assert_called_once_with()
 
     @parameterized.expand(_PARAMS)
     @requires_live_ssh
@@ -488,6 +698,115 @@ class TestSshcp(unittest.TestCase):
             maxread=64 * 1024,
             searchwindowsize=1024,
         )
+
+    def test_short_hostname_resolver_options_are_child_local(self):
+        sshcp = Sshcp(host="shortname", port=self.port, user=self.user, password=None)
+        spawn = MagicMock()
+        original = os.environ.get("RES_OPTIONS")
+        with patch("ssh.sshcp.pexpect.spawn", return_value=spawn, create=True) as pexpect_spawn:
+            sshcp._Sshcp__spawn_process("ssh", ["shortname"])
+        self.assertEqual(original, os.environ.get("RES_OPTIONS"))
+        self.assertEqual("attempts:1 timeout:1", pexpect_spawn.call_args.kwargs["env"]["RES_OPTIONS"])
+
+    def test_bounded_popen_stream_reap_terminates_then_kills_without_sp_wait(self):
+        process = MagicMock()
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired("ssh", 0.25),
+            subprocess.TimeoutExpired("ssh", 0.25),
+            0,
+        ]
+        stream = MagicMock()
+        stream.proc = process
+
+        self.assertEqual(0, Sshcp._Sshcp__bounded_reap_popen_stream(stream))
+        self.assertEqual(3, process.wait.call_count)
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        stream.wait.assert_not_called()
+
+    def test_bounded_popen_stream_reap_returns_normal_exit_status(self):
+        process = MagicMock()
+        process.wait.return_value = 7
+        stream = MagicMock()
+        stream.proc = process
+
+        self.assertEqual(7, Sshcp._Sshcp__bounded_reap_popen_stream(stream))
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
+    @patch("ssh.sshcp.time.sleep")
+    @patch.object(Sshcp, "_Sshcp__log_timeout")
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_fallback_empty_stream_read_honors_total_deadline(self, mock_spawn_process, log_timeout, sleep):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+        sshcp._Sshcp__TIMEOUT_SECS = 0
+        stream = MagicMock()
+        stream.read_nonblocking.return_value = b""
+        stream.before = b""
+        stream.after = b""
+        stream.exitstatus = None
+        stream.proc.wait.return_value = None
+        mock_spawn_process.return_value = (stream, True)
+
+        with self.assertRaisesRegex(SshcpError, "Timed out"):
+            sshcp.shell_stream("true", lambda _chunk: None)
+
+        sleep.assert_not_called()
+        stream.wait.assert_not_called()
+        log_timeout.assert_called_once()
+
+    @patch("ssh.sshcp.time.sleep")
+    @patch("ssh.sshcp.time.time", return_value=0.0)
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_fallback_empty_stream_read_waits_briefly_before_retry(self, mock_spawn_process, _time, sleep):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+        stream = MagicMock()
+        stream.read_nonblocking.side_effect = [b"", pexpect.EOF("done")]
+        stream.before = b""
+        stream.after = b""
+        stream.exitstatus = 0
+        stream.proc.wait.return_value = 0
+        mock_spawn_process.return_value = (stream, True)
+
+        self.assertEqual(b"", sshcp.shell_stream("true", lambda _chunk: None))
+        sleep.assert_called_once_with(0.01)
+
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_reused_stream_forces_popen_spawn_only_for_that_stream(self, mock_spawn_process):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+        sshcp._Sshcp__control_master = SimpleNamespace(started=True, closed=False, path="/tmp/control")
+        stream = MagicMock()
+        stream.read_nonblocking.side_effect = [pexpect.EOF("done")]
+        stream.before = b""
+        stream.after = b""
+        stream.exitstatus = 0
+        stream.proc.wait.return_value = 0
+        mock_spawn_process.return_value = (stream, True)
+
+        original_command = "printf before-error; exit 7"
+        self.assertEqual(b"", sshcp.shell_stream(original_command, lambda _chunk: None))
+        self.assertTrue(mock_spawn_process.call_args.kwargs["force_popen_spawn"])
+        remote_command = mock_spawn_process.call_args.args[1][-1]
+        self.assertIn("exec 3<&0", remote_command)
+        self.assertIn("setsid sh -c {}".format(shlex.quote(original_command)), remote_command)
+        self.assertNotIn("exec " + original_command, remote_command)
+        self.assertIn("read -r _ <&3", remote_command)
+        self.assertIn("kill -TERM -$child", remote_command)
+        self.assertNotIn("kill -TERM --", remote_command)
+        stream.proc.wait.assert_called_once_with(timeout=0.25)
+
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_nonreused_stream_keeps_default_spawn_selection(self, mock_spawn_process):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+        stream = MagicMock()
+        stream.read_nonblocking.side_effect = [pexpect.EOF("done")]
+        stream.before = b""
+        stream.after = b""
+        stream.exitstatus = 0
+        mock_spawn_process.return_value = (stream, False)
+
+        self.assertEqual(b"", sshcp.shell_stream("true", lambda _chunk: None))
+        self.assertFalse(mock_spawn_process.call_args.kwargs["force_popen_spawn"])
 
     @parameterized.expand(_PARAMS)
     @requires_live_ssh
