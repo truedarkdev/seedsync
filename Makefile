@@ -252,6 +252,7 @@ typecheck-python:
 	cd ${SOURCEDIR}/python && npx --yes pyright@1.1.410 --project pyrightconfig.json
 
 tests-angular:
+	mkdir -p ${SOURCEDIR}/angular/node_modules ${SOURCEDIR}/angular/.angular
 	# angular build
 	$(DOCKER) build \
 		-f ${SOURCEDIR}/docker/build/deb/Dockerfile \
