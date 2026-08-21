@@ -145,6 +145,41 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_local_files([local_file])
         return ModelFile.build_file_id(file_name, path_pair_id)
 
+    def __set_mixed_directory_sources(self) -> None:
+        remote_root = SystemFile("sample-directory", 40, True)
+        remote_root.add_child(SystemFile("remote.bin", 40, False))
+        local_root = SystemFile("sample-directory", 60, True)
+        local_root.add_child(SystemFile("local.bin", 60, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+    def __set_mixed_directory_active_transfer(self, size_local: int = 10) -> None:
+        active_root = SystemFile("sample-directory", size_local, True, is_staging=True)
+        active_root.add_child(SystemFile("remote.bin", size_local, False, is_staging=True))
+        self.model_builder.set_active_files([active_root])
+
+    def __set_mixed_directory_staging_scan(
+            self, size_local: int = 10, child_name: str = "remote.bin",
+            sidecar_ready: bool = True,
+    ) -> None:
+        local_root = SystemFile("sample-directory", 60 + size_local, True)
+        local_root.add_child(SystemFile("local.bin", 60, False))
+        staged_leaf = SystemFile(child_name, size_local, False, is_staging=True)
+        staged_leaf.status_sidecar_ready = sidecar_ready
+        local_root.add_child(staged_leaf)
+        self.model_builder.set_local_files([local_root])
+
+    @staticmethod
+    def __mixed_directory_status(size_local: int = 10, job_id: int = 1) -> LftpJobStatus:
+        status = LftpJobStatus(
+            job_id, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING,
+            "sample-directory", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(
+            size_local, 40, 25, 1, 30,
+        )
+        return status
+
     def test_progressive_root_build_does_not_walk_or_replace_retained_roots(self):
         pair_a = SystemFile("a.bin", 10, False)
         pair_a.path_pair_id = "pair-a"
@@ -5558,6 +5593,216 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DOWNLOADED, m_aaa.state)
         m_ab = m_a_ch["ab"]
         self.assertEqual(ModelFile.State.DOWNLOADED, m_ab.state)
+
+    def test_mixed_directory_recent_snapshot_survives_status_gap_with_partial_staging(self):
+        self.__set_mixed_directory_sources()
+        baseline = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual((0, 40), (baseline.transferred_size, baseline.remote_size))
+        self.assertEqual((60, 100), (baseline.display_transferred_size, baseline.display_size_total))
+
+        self.__set_mixed_directory_active_transfer()
+        self.model_builder.set_lftp_statuses([self.__mixed_directory_status()])
+        active = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual((10, 40), (active.transferred_size, active.remote_size))
+        self.assertEqual((70, 100), (active.display_transferred_size, active.display_size_total))
+
+        self.model_builder.set_lftp_statuses([])
+        gap = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual((10, 40), (gap.transferred_size, gap.remote_size))
+        self.assertEqual((70, 100), (gap.display_transferred_size, gap.display_size_total))
+        active_root = self.model_builder._ModelBuilder__active_files["sample-directory"]
+        staged_remote = next(child for child in active_root.iter_children() if child.name == "remote.bin")
+        self.assertTrue(staged_remote.is_staging)
+        self.assertEqual(10, staged_remote.size)
+
+    def test_mixed_directory_stopped_snapshot_survives_status_loss_with_partial_staging(self):
+        self.__set_mixed_directory_sources()
+        self.__set_mixed_directory_active_transfer()
+        self.model_builder.set_lftp_statuses([self.__mixed_directory_status()])
+        self.model_builder.build_model()
+
+        self.model_builder.set_stopped_files({"sample-directory"})
+        stopped = self.model_builder.build_model().get_file("sample-directory")
+        self.assertTrue(stopped.explicitly_stopped)
+        self.assertEqual((10, 40), (stopped.transferred_size, stopped.remote_size))
+        self.assertEqual((70, 100), (stopped.display_transferred_size, stopped.display_size_total))
+
+        self.model_builder.set_lftp_statuses([])
+        stopped_gap = self.model_builder.build_model().get_file("sample-directory")
+        self.assertTrue(stopped_gap.explicitly_stopped)
+        self.assertEqual((10, 40), (stopped_gap.transferred_size, stopped_gap.remote_size))
+        self.assertEqual((70, 100), (stopped_gap.display_transferred_size, stopped_gap.display_size_total))
+        self.assertIn(
+            "sample-directory",
+            self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots,
+        )
+
+    def test_mixed_directory_zero_reset_clears_stopped_floor_before_new_lifecycle(self):
+        self.__set_mixed_directory_sources()
+        self.__set_mixed_directory_active_transfer()
+        self.model_builder.set_lftp_statuses([self.__mixed_directory_status()])
+        self.model_builder.build_model()
+        self.model_builder.set_stopped_files({"sample-directory"})
+        self.model_builder.set_lftp_statuses([])
+        stopped = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual(10, stopped.transferred_size)
+        self.assertIn(
+            "sample-directory",
+            self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots,
+        )
+
+        self.model_builder.set_stopped_files(set())
+        self.model_builder.set_active_files([])
+        self.model_builder.set_local_files([SystemFile("sample-directory", 0, True)])
+        queued_status = LftpJobStatus(
+            1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.QUEUED,
+            "sample-directory", "",
+        )
+        self.model_builder.set_lftp_statuses([queued_status])
+        queued = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual(ModelFile.State.QUEUED, queued.state)
+        self.assertEqual(0, queued.transferred_size)
+        self.assertNotIn(
+            "sample-directory",
+            self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots,
+        )
+
+        running_status = self.__mixed_directory_status(0, job_id=2)
+        self.model_builder.set_lftp_statuses([running_status])
+        running = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual(ModelFile.State.DOWNLOADING, running.state)
+        self.assertEqual((0, 40), (running.transferred_size, running.remote_size))
+
+    def test_mixed_directory_remote_leaf_completion_evicts_snapshots(self):
+        self.__set_mixed_directory_sources()
+        self.__set_mixed_directory_active_transfer()
+        self.model_builder.set_lftp_statuses([self.__mixed_directory_status()])
+        self.model_builder.build_model()
+        self.model_builder.set_stopped_files({"sample-directory"})
+        self.model_builder.build_model()
+
+        self.model_builder.set_active_files([])
+        complete_root = SystemFile("sample-directory", 100, True)
+        complete_root.add_child(SystemFile("local.bin", 60, False))
+        complete_root.add_child(SystemFile("remote.bin", 40, False))
+        self.model_builder.set_local_files([complete_root])
+        self.model_builder.set_lftp_statuses([])
+
+        completed = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual((40, 40), (completed.transferred_size, completed.remote_size))
+        self.assertEqual((100, 100), (completed.display_transferred_size, completed.display_size_total))
+        self.assertNotIn("sample-directory", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+        self.assertNotIn("sample-directory", self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+
+    def test_stopped_restart_reconstructs_mixed_progress_from_staging_scan(self):
+        self.model_builder.clear()
+        self.__set_mixed_directory_sources()
+        self.__set_mixed_directory_staging_scan()
+        self.model_builder.set_stopped_files({"sample-directory"})
+        self.assertEqual({}, self.model_builder._ModelBuilder__active_files)
+
+        restarted = self.model_builder.build_model().get_file("sample-directory")
+        self.assertTrue(restarted.explicitly_stopped)
+        self.assertEqual((10, 40), (restarted.transferred_size, restarted.remote_size))
+        self.assertEqual((70, 100), (restarted.display_transferred_size, restarted.display_size_total))
+        self.assertIsNone(restarted.downloading_speed)
+        self.assertIsNone(restarted.eta)
+        self.assertEqual({}, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+        self.assertEqual({}, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+
+        active_root = SystemFile("sample-directory", 10, True, is_staging=True)
+        active_root.add_child(SystemFile("remote.bin", 10, False, is_staging=True))
+        self.model_builder.set_active_files([active_root])
+        self.__set_mixed_directory_staging_scan()
+        self.model_builder.build_model()
+        self.model_builder.set_active_files([])
+        self.__set_mixed_directory_sources()
+        without_staging = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual((0, 40), (without_staging.transferred_size, without_staging.remote_size))
+        self.assertEqual((60, 100), (without_staging.display_transferred_size, without_staging.display_size_total))
+
+        zero_active_root = SystemFile("sample-directory", 0, True, is_staging=True)
+        self.model_builder.set_active_files([zero_active_root])
+        self.__set_mixed_directory_sources()
+        after_zero = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual((0, 40), (after_zero.transferred_size, after_zero.remote_size))
+        self.assertEqual((60, 100), (after_zero.display_transferred_size, after_zero.display_size_total))
+
+    def test_stopped_restart_ignores_unmatched_staging_leaf(self):
+        self.model_builder.clear()
+        self.__set_mixed_directory_sources()
+        self.__set_mixed_directory_staging_scan(child_name="unmatched.bin")
+        self.model_builder.set_stopped_files({"sample-directory"})
+
+        restarted = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual((0, 40), (restarted.transferred_size, restarted.remote_size))
+        self.assertEqual((60, 100), (restarted.display_transferred_size, restarted.display_size_total))
+
+    def test_stopped_restart_ignores_unready_preallocated_staging_leaf(self):
+        self.model_builder.clear()
+        self.__set_mixed_directory_sources()
+        self.__set_mixed_directory_staging_scan(sidecar_ready=False)
+        self.model_builder.set_stopped_files({"sample-directory"})
+
+        restarted = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual((0, 40), (restarted.transferred_size, restarted.remote_size))
+        self.assertEqual((60, 100), (restarted.display_transferred_size, restarted.display_size_total))
+
+    def test_stopped_restart_merges_verified_final_and_staging_delta_once(self):
+        self.model_builder.clear()
+        remote_root = SystemFile("sample-directory", 140, True)
+        remote_final = SystemFile("final.bin", 100, False, mtime_ns=2_000_000_000)
+        remote_delta = SystemFile("delta.bin", 40, False, mtime_ns=3_000_000_000)
+        remote_root.add_child(remote_final)
+        remote_root.add_child(remote_delta)
+        local_root = SystemFile("sample-directory", 110, True)
+        local_root.add_child(SystemFile("final.bin", 100, False, mtime_ns=2_000_000_000))
+        staged_delta = SystemFile(
+            "delta.bin", 10, False, is_staging=True, mtime_ns=3_000_000_000,
+        )
+        staged_delta.status_sidecar_ready = True
+        local_root.add_child(staged_delta)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_stopped_files({"sample-directory"})
+
+        restarted = self.model_builder.build_model().get_file("sample-directory")
+        self.assertEqual((110, 140), (restarted.transferred_size, restarted.remote_size))
+
+    def test_stopped_restart_isolates_staging_progress_by_path_pair(self):
+        self.model_builder.clear()
+        remote_a = SystemFile("sample-directory", 40, True)
+        remote_a.path_pair_id = "pair-a"
+        remote_a.add_child(SystemFile("remote.bin", 40, False))
+        remote_a.children[0].path_pair_id = "pair-a"
+        remote_b = SystemFile("sample-directory", 40, True)
+        remote_b.path_pair_id = "pair-b"
+        remote_b.add_child(SystemFile("remote.bin", 40, False))
+        remote_b.children[0].path_pair_id = "pair-b"
+        local_a = SystemFile("sample-directory", 70, True)
+        local_a.path_pair_id = "pair-a"
+        local_a.add_child(SystemFile("local.bin", 60, False))
+        local_a.children[0].path_pair_id = "pair-a"
+        staged_remote_a = SystemFile("remote.bin", 10, False, is_staging=True)
+        staged_remote_a.status_sidecar_ready = True
+        local_a.add_child(staged_remote_a)
+        local_a.children[1].path_pair_id = "pair-a"
+        local_b = SystemFile("sample-directory", 60, True)
+        local_b.path_pair_id = "pair-b"
+        local_b.add_child(SystemFile("local.bin", 60, False))
+        local_b.children[0].path_pair_id = "pair-b"
+        self.model_builder.set_remote_files([remote_a, remote_b])
+        self.model_builder.set_local_files([local_a, local_b])
+        self.model_builder.set_stopped_files({
+            ModelFile.build_file_id("sample-directory", "pair-a"),
+            ModelFile.build_file_id("sample-directory", "pair-b"),
+        })
+
+        model = self.model_builder.build_model()
+        result_a = model.get_file(ModelFile.build_file_id("sample-directory", "pair-a"))
+        result_b = model.get_file(ModelFile.build_file_id("sample-directory", "pair-b"))
+        self.assertEqual((10, 40), (result_a.transferred_size, result_a.remote_size))
+        self.assertEqual((0, 40), (result_b.transferred_size, result_b.remote_size))
 
     def test_local_only_union_progress_counts_disjoint_bytes_once(self):
         remote_root = SystemFile("sample-directory", 40, True)

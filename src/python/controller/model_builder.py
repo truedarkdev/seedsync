@@ -1260,6 +1260,55 @@ class ModelBuilder:
         return local_file.size >= remote_file.size
 
     @staticmethod
+    def __authoritative_remote_leaf_progress_bytes(
+            remote_file: Optional[SystemFile],
+            local_file: Optional[SystemFile]) -> int:
+        """Count local bytes that belong to matching remote leaves only."""
+        if remote_file is None or local_file is None or \
+                remote_file.is_dir != local_file.is_dir or \
+                getattr(local_file, "has_staging_collision", False):
+            return 0
+        if not remote_file.is_dir:
+            if not ModelBuilder.__is_authoritative_local_file(local_file):
+                return 0
+            return min(local_file.size, remote_file.size)
+        local_children = {child.name: child for child in local_file.iter_children()}
+        return sum(
+            ModelBuilder.__authoritative_remote_leaf_progress_bytes(
+                remote_child, local_children.get(remote_child.name)
+            )
+            for remote_child in remote_file.iter_children()
+        )
+
+    @staticmethod
+    def __local_transfer_snapshot_is_caught_up(
+            local_file: Optional[SystemFile],
+            remote_file: Optional[SystemFile],
+            retained_size_local: Optional[int] = None) -> bool:
+        """Whether local scan evidence can retire a transfer snapshot.
+
+        Directory aggregate sizes include local-only leaves, so they cannot
+        establish that a remote tree caught up.  Use the existing recursive
+        completion proof when the snapshot's own node is a directory; retain
+        the established size-based behavior for child and single-file nodes.
+        """
+        if remote_file is not None and remote_file.is_dir:
+            if ModelBuilder.__effective_local_tree_proves_completion(
+                    remote_file, local_file):
+                return True
+            return retained_size_local is not None and \
+                ModelBuilder.__authoritative_remote_leaf_progress_bytes(
+                    remote_file, local_file
+                ) >= retained_size_local
+        if retained_size_local is None:
+            return ModelBuilder.__local_file_proves_download_completion(
+                local_file, remote_file
+            )
+        return ModelBuilder.__local_size_is_authoritative_progress(
+            local_file, remote_file, retained_size_local
+        )
+
+    @staticmethod
     def __trusted_final_leaf_bytes(remote_file: Optional[SystemFile],
                                    local_file: Optional[SystemFile],
                                    ancestor_has_staging_collision: bool = False) -> int:
@@ -2044,7 +2093,7 @@ class ModelBuilder:
                 None
             )
             return None
-        if self.__local_size_is_authoritative_progress(local, remote, snapshot.size_local):
+        if self.__local_transfer_snapshot_is_caught_up(local, remote, snapshot.size_local):
             self.__recent_live_transfer_snapshots.pop(
                 resolved_file_id if resolved_file_id is not None else file_id,
                 None
@@ -2125,7 +2174,7 @@ class ModelBuilder:
         )
         if retained_snapshot is None or retained_snapshot.size_local is None:
             return None
-        if self.__local_file_proves_download_completion(local, remote):
+        if self.__local_transfer_snapshot_is_caught_up(local, remote):
             self.__evict_transfer_completion_snapshots(
                 file_id,
                 root_file_id
@@ -2138,7 +2187,9 @@ class ModelBuilder:
                     retained_snapshot.root_file_id
                 )
                 return None
-            if local.size > retained_snapshot.size_local and not preserve_when_local_growth_only:
+            if local.size > retained_snapshot.size_local and \
+                    not preserve_when_local_growth_only and \
+                    not (remote is not None and remote.is_dir):
                 return None
         return self.__build_retained_transfer_state(
             retained_snapshot.size_local,
@@ -2162,12 +2213,68 @@ class ModelBuilder:
                 None
             )
             return None
-        if self.__local_file_proves_download_completion(local, remote):
+        if self.__local_transfer_snapshot_is_caught_up(local, remote):
             self.__evict_transfer_completion_snapshots(file_id, root_file_id)
             return None
         if remote is None:
             return self.__build_retained_transfer_state(snapshot.size_local, None, snapshot.percent_local)
         return self.__build_retained_transfer_state(snapshot.size_local, remote.size, snapshot.percent_local)
+
+    @staticmethod
+    def __staged_remote_leaf_bytes(
+            remote_file: Optional[SystemFile],
+            local_file: Optional[SystemFile]) -> int:
+        """Count staged bytes only on remote-matching leaves."""
+        if remote_file is None or local_file is None or \
+                remote_file.is_dir != local_file.is_dir or \
+                getattr(local_file, "has_staging_collision", False):
+            return 0
+        if not remote_file.is_dir:
+            if not getattr(local_file, "is_staging", False) or \
+                    not getattr(local_file, "status_sidecar_ready", False):
+                return 0
+            return min(local_file.size, remote_file.size)
+        local_children = {child.name: child for child in local_file.iter_children()}
+        return sum(
+            ModelBuilder.__staged_remote_leaf_bytes(
+                remote_child,
+                local_children.get(remote_child.name),
+            )
+            for remote_child in remote_file.iter_children()
+        )
+
+    def __get_stopped_staging_transfer_state_without_live_progress(
+            self,
+            remote: Optional[SystemFile],
+            local: Optional[SystemFile]) -> Optional[_TransferState]:
+        """Reconstruct stopped directory progress from the current staging scan."""
+        if remote is None or local is None or not remote.is_dir or not local.is_dir:
+            return None
+        if ModelBuilder.__effective_local_tree_proves_completion(remote, local):
+            return None
+        staged_bytes = ModelBuilder.__staged_remote_leaf_bytes(remote, local)
+        final_bytes = ModelBuilder.__trusted_final_leaf_bytes(remote, local)
+        if staged_bytes == 0 and final_bytes == 0:
+            return None
+
+        staged_state = _TransferState(
+            staged_bytes,
+            remote.size,
+            int(round((staged_bytes * 100) / remote.size)) if remote.size > 0 else None,
+            None,
+            None,
+        )
+        if ModelBuilder.__has_staging_descendant(local):
+            return ModelBuilder.__combine_split_root_transfer_state(
+                staged_state, remote, local,
+            )
+        return _TransferState(
+            final_bytes,
+            remote.size,
+            int(round((final_bytes * 100) / remote.size)) if remote.size > 0 else None,
+            None,
+            None,
+        )
 
     def __promote_recent_live_transfer_snapshot_to_stopped_floor(
             self,
@@ -3870,6 +3977,12 @@ class ModelBuilder:
                     model_file.file_id
                 )
                 arbitration_source = "retained_recent_live_snapshot"
+        if retained_transfer_state is None and status is None and is_stopped:
+            retained_transfer_state = self.__get_stopped_staging_transfer_state_without_live_progress(
+                remote, local
+            )
+            if retained_transfer_state is not None:
+                arbitration_source = "derived_stopped_staging_scan"
         if status and not is_stopped:
             model_file.state = ModelFile.State.QUEUED if status.state == LftpJobStatus.State.QUEUED \
                                else ModelFile.State.DOWNLOADING
