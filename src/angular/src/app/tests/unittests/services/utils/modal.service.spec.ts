@@ -17,6 +17,10 @@ describe("Testing modal service", () => {
         modal = TestBed.get(Modal);
     });
 
+    afterEach(() => {
+        document.body.querySelectorAll(".modal-overlay").forEach(overlay => overlay.remove());
+    });
+
     it("should render a clickable confirm button above the overlay hit target", fakeAsync(() => {
         let dialogRef: DialogRef<void> = null;
 
@@ -31,14 +35,15 @@ describe("Testing modal service", () => {
 
         flushMicrotasks();
 
-        const overlay = document.body.querySelector(".modal-overlay") as HTMLElement;
+        expect(dialogRef).toBeDefined();
+        expect(dialogRef.overlayRef).toBeDefined();
+        expect(dialogRef.overlayRef.location).toBeDefined();
+        const overlay = dialogRef.overlayRef.location.nativeElement;
         const okButton = Array.prototype.slice.call(
             overlay.querySelectorAll("button")
         ).find((button: HTMLButtonElement) => button.textContent.trim() === "Rotate") as HTMLButtonElement;
 
-        expect(dialogRef).toBeDefined();
-        expect(overlay).not.toBeNull();
-        expect(okButton).not.toBeNull();
+        expect(okButton).toBeDefined();
 
         const buttonRect = okButton.getBoundingClientRect();
         const hitTarget = document.elementFromPoint(
@@ -51,7 +56,7 @@ describe("Testing modal service", () => {
         okButton.click();
         flushMicrotasks();
 
-        expect(document.body.querySelector(".modal-overlay")).toBeNull();
+        expect(document.body.contains(overlay)).toBe(false);
     }));
 
     it("should render formatted body markup while escaping dynamic names", fakeAsync(() => {

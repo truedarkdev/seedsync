@@ -153,6 +153,7 @@ class TestMultiprocessingLogger(unittest.TestCase):
         self.assertNotIn(closed_handler, self.logger.handlers)
         closed_handler.handleError.assert_not_called()
 
+    @pytest.mark.timeout(15)
     def test_logger_levels(self):
         def _wait_for_records(log_capture, expected_count):
             deadline = time.time() + 5

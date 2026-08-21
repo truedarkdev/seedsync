@@ -7,6 +7,10 @@ import {MigrationStatus} from "../../../../services/migration/migration.model";
 import {MigrationService} from "../../../../services/migration/migration.service";
 
 
+declare function require(moduleName: string): any;
+const {version: appVersion} = require("../../../../../../package.json");
+const targetVersion = `v${appVersion}`;
+
 describe("MigrationAppComponent", () => {
     let fixture: ComponentFixture<MigrationAppComponent>;
     let service: jasmine.SpyObj<MigrationService>;
@@ -67,7 +71,7 @@ describe("MigrationAppComponent", () => {
         expect(text).toContain("Migration required");
         expect(text).not.toContain("Migration state: required");
         expect(text).toContain("v0.8.6");
-        expect(text).toContain("v0.9.0");
+        expect(text).toContain(targetVersion);
         expect(text).not.toContain("original-v0.8.6");
         expect(text).toContain("Complete retained backup before migration");
         expect(text).toContain("creates and validates a retained configuration backup");
@@ -161,7 +165,7 @@ describe("MigrationAppComponent", () => {
         expect(fixture.nativeElement.textContent).toContain("Migration readiness check failed");
         expect(fixture.nativeElement.textContent).toContain("retained backup remains available");
         expect(fixture.nativeElement.querySelector(".migration-route").textContent).toContain("v0.8.6");
-        expect(fixture.nativeElement.querySelector(".migration-route").textContent).toContain("v0.9.0");
+        expect(fixture.nativeElement.querySelector(".migration-route").textContent).toContain(targetVersion);
         expect(fixture.nativeElement.querySelector(".primary-button").textContent).toContain("Retry migration");
         expect(fixture.nativeElement.querySelector(".secondary-button")).toBeNull();
     });
@@ -204,7 +208,7 @@ describe("MigrationAppComponent", () => {
             }
             const route: HTMLElement = fixture.nativeElement.querySelector(".migration-route");
             expect(route.textContent).toContain("v0.8.6");
-            expect(route.textContent).toContain("v0.9.0");
+            expect(route.textContent).toContain(targetVersion);
             if (stateName === "complete") {
                 expect(fixture.nativeElement.querySelector(".primary-button").textContent)
                     .toContain("Continue to SeedSync");
@@ -331,19 +335,19 @@ describe("MigrationAppComponent", () => {
             expect(shell.classList).toContain("migration-shell--state-stable");
             expect(route).not.toBeNull();
             expect(route.textContent).toContain("v0.8.6");
-            expect(route.textContent).toContain("v0.9.0");
+            expect(route.textContent).toContain(targetVersion);
             if (stateName === "complete") {
                 expect(route.classList).toContain("is-complete");
                 expect(route.getAttribute("aria-label")).toBe(
-                    "Version transition complete: previous version v0.8.6; current version v0.9.0."
+                    `Version transition complete: previous version v0.8.6; current version ${targetVersion}.`
                 );
                 expect(source.querySelector("small").textContent).toBe("Previous version");
                 expect(target.querySelector("small").textContent).toBe("Current version");
                 const versionSuccessMark: HTMLElement = target.querySelector("strong > .version-success-mark");
                 expect(versionSuccessMark).not.toBeNull();
                 expect(versionSuccessMark.getAttribute("aria-hidden")).toBe("true");
-                expect(target.querySelector("strong > .version-value").textContent).toBe("v0.9.0");
-                expect(target.querySelector("strong").textContent).toContain("✓v0.9.0");
+                expect(target.querySelector("strong > .version-value").textContent).toBe(targetVersion);
+                expect(target.querySelector("strong").textContent).toContain(`✓${targetVersion}`);
                 const successMark: HTMLElement = fixture.nativeElement.querySelector(".success-mark");
                 expect(successMark.getAttribute("role")).toBe("img");
                 expect(successMark.getAttribute("aria-label")).toBe("Migration succeeded");
@@ -352,12 +356,12 @@ describe("MigrationAppComponent", () => {
             } else {
                 expect(route.classList).not.toContain("is-complete");
                 expect(route.getAttribute("aria-label")).toBe(
-                    "Version transition: detected source v0.8.6; migration target v0.9.0."
+                    `Version transition: detected source v0.8.6; migration target ${targetVersion}.`
                 );
                 expect(source.querySelector("small").textContent).toBe("Detected source");
                 expect(target.querySelector("small").textContent).toBe("Migration target");
                 expect(target.querySelector("strong > .version-success-mark")).toBeNull();
-                expect(target.querySelector("strong > .version-value").textContent).toBe("v0.9.0");
+                expect(target.querySelector("strong > .version-value").textContent).toBe(targetVersion);
                 expect(fixture.nativeElement.querySelector(".success-mark")).toBeNull();
                 expect(fixture.nativeElement.querySelector(".status-heading-row").classList)
                     .not.toContain("is-success");
