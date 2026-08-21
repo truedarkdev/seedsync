@@ -4,7 +4,7 @@ FROM node:20-bookworm-slim as seedsync_test_e2e_env
 COPY src/e2e/package*.json /app/
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends curl python3 python-is-python3 && rm -rf /var/lib/apt/lists/*
-RUN npm ci --legacy-peer-deps
+RUN npm install --legacy-peer-deps --no-package-lock
 
 
 # Builds and runs e2e tests

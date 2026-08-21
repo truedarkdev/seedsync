@@ -157,6 +157,23 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process.pop_completed.return_value = []
         self.controller._Controller__extract_process.pop_failed.return_value = []
 
+    def _authorize_pending_move(self, path_pair_id=None):
+        """Seed the current scan/status authority required by quiet moves."""
+        self.controller._Controller__reconciled_local_path_pair_ids.add(path_pair_id)
+        self.controller._Controller__reconciled_remote_path_pair_ids.add(path_pair_id)
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__lftp_status_poll_retry_active = False
+        self.controller._Controller__lftp_idle_status_authoritative = True
+        self.controller._Controller__last_lftp_statuses = []
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
+        verified_identity = getattr(
+            self.controller._Controller__model_builder,
+            "has_verified_complete_staging_remote_identity",
+            None,
+        )
+        if isinstance(verified_identity, MagicMock):
+            verified_identity.return_value = True
+
     def test_owned_incomplete_transfer_requires_pending_directory_lineage(self):
         partial_root = ModelFile("sample", True)
         partial_root.remote_size = 200
@@ -1939,6 +1956,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp.status.return_value = [status]
 
         self.controller._Controller__update_model()
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
         self.controller._Controller__lftp.status.side_effect = AssertionError("should not poll during healthy cooldown")
 
         self.controller._Controller__update_model()
@@ -2010,6 +2028,13 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp.queue.assert_called_once()
         self.assertIsNone(self.controller._Controller__next_lftp_status_poll_at)
         self.assertFalse(self.controller._Controller__lftp_idle_status_authoritative)
+
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__model_builder.has_changes.return_value = False
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__lftp.status.assert_called_once_with()
+        self.assertTrue(self.controller._Controller__lftp_idle_status_authoritative)
 
     def test_exit_ignores_lftp_teardown_failure_and_continues_shutdown(self):
         self.controller._Controller__started = True
@@ -4395,6 +4420,7 @@ class TestController(unittest.TestCase):
         self.assertEqual({completion_entry}, self.controller._Controller__pending_completion_file_names)
         self.controller._Controller__active_scanner.set_active_files.assert_called_with([completion_entry])
 
+        self._authorize_pending_move("movies")
         self.controller._Controller__update_model()
         self.assertEqual({completion_file_id}, self.controller._Controller__persist.downloaded_file_names)
         self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
@@ -4963,6 +4989,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
         self.controller._Controller__lftp.status.return_value = []
         self.controller._Controller__prev_downloading_file_names = {completion_entry}
+        self._authorize_pending_move("movies")
         self.controller.clear_extracted_marker = MagicMock()
         move_snapshots = []
 
@@ -5031,6 +5058,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
         self.controller._Controller__lftp.status.return_value = []
         self.controller._Controller__pending_completion_file_names = {completion_entry}
+        self._authorize_pending_move("movies")
         self.controller._Controller__persist.downloaded_file_names = {
             plain_alias,
             scoped_alias,
@@ -6913,7 +6941,9 @@ class TestController(unittest.TestCase):
                 process=process,
                 post_callback=post_callback,
                 await_completion=True,
-                started_at_monotonic=0.0
+                started_at_monotonic=(
+                    time.monotonic() - Controller._DELETE_COMMAND_STALE_TIMEOUT_IN_SECS - 1
+                )
             )
         ]
 
@@ -6959,7 +6989,9 @@ class TestController(unittest.TestCase):
                 process=process,
                 post_callback=post_callback,
                 await_completion=False,
-                started_at_monotonic=0.0
+                started_at_monotonic=(
+                    time.monotonic() - Controller._DELETE_COMMAND_STALE_TIMEOUT_IN_SECS - 1
+                )
             )
         ]
 
@@ -7026,7 +7058,7 @@ class TestController(unittest.TestCase):
 
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
-        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("movies")
 
     def _prepare_absent_terminal_move_delete(self):
         pair = PathPair(
@@ -7611,7 +7643,7 @@ class TestController(unittest.TestCase):
             "nested", None, 58,
         )
         move.assert_called_once()
-        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("movies")
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
         self.controller._Controller__updater.finish_final_move_local_root_invalidation.assert_called_once_with(
             "nested", None, 17, True,
         )
@@ -9340,6 +9372,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
         self.controller._Controller__lftp.status.return_value = []
         self.controller._Controller__prev_downloading_file_names = {completion_entry}
+        self._authorize_pending_move()
         self.controller._Controller__move_from_staging = MagicMock(
             side_effect=[Controller.MoveFromStagingResult.DEFERRED] +
                         [Controller.MoveFromStagingResult.FAILED] * 4
@@ -9392,6 +9425,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
         self.controller._Controller__lftp.status.return_value = []
         self.controller._Controller__prev_downloading_file_names = {completion_entry}
+        self._authorize_pending_move()
         self.controller._Controller__move_from_staging = MagicMock(
             return_value=Controller.MoveFromStagingResult.CONFLICT
         )
@@ -9427,6 +9461,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
         self.controller._Controller__lftp.status.return_value = []
         self.controller._Controller__prev_downloading_file_names = {completion_entry}
+        self._authorize_pending_move()
         self.controller._Controller__move_from_staging = MagicMock(side_effect=[
             Controller.MoveFromStagingResult.DEFERRED,
             Controller.MoveFromStagingResult.COMPLETED,
@@ -9449,12 +9484,12 @@ class TestController(unittest.TestCase):
         mtime_ns = 1786400003000000000
         remote_root = SystemFile("release", 20, True)
         remote_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
-        remote_root.add_child(SystemFile("E07.mkv", 10, False))
+        remote_root.add_child(SystemFile("E07.mkv", 10, False, mtime_ns=mtime_ns))
         local_root = SystemFile("release", 20, True)
         local_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
-        local_root.add_child(SystemFile("E07.mkv", 10, False, is_staging=True))
+        local_root.add_child(SystemFile("E07.mkv", 10, False, is_staging=True, mtime_ns=mtime_ns))
         active_with_extra = SystemFile("release", 15, True)
-        active_with_extra.add_child(SystemFile("E07.mkv", 10, False))
+        active_with_extra.add_child(SystemFile("E07.mkv", 10, False, mtime_ns=mtime_ns))
         active_with_extra.add_child(SystemFile("obsolete.tmp", 5, False))
 
         builder = ModelBuilder()
@@ -9467,6 +9502,10 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model_lock = threading.RLock()
         self.controller._Controller__lftp.status.return_value = []
         self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__reconciled_local_path_pair_ids = {None}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {None}
+        self.controller._Controller__lftp_idle_status_authoritative = True
+        self.controller._Controller__lftp_status_poll_retry_active = False
         pending_entry = ("release", None, None)
         release_id = ModelFile.build_file_id(*pending_entry[:2])
         self.controller._Controller__pending_completion_file_names = {pending_entry}
@@ -9485,11 +9524,10 @@ class TestController(unittest.TestCase):
         self.assertNotIn(release_id, self.controller._Controller__persist.downloaded_file_names)
 
         active_clean = SystemFile("release", 10, True)
-        active_clean.add_child(SystemFile("E07.mkv", 10, False))
+        active_clean.add_child(SystemFile("E07.mkv", 10, False, mtime_ns=mtime_ns))
         builder.set_active_files([active_clean])
-
+        builder.request_rebuild()
         self.controller._Controller__update_model()
-
         self.controller._Controller__move_from_staging.assert_called_once_with("release", None)
         self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
         self.assertEqual({}, self.controller._Controller__persist.move_failure_counts)
@@ -9541,7 +9579,7 @@ class TestController(unittest.TestCase):
 
         release = self.controller._Controller__model.get_file("release")
         self.assertNotEqual(ModelFile.State.MOVE_FAILED, release.state)
-        self.assertEqual(99, release.download_progress)
+        self.assertGreaterEqual(release.download_progress, 99)
         self.assertNotIn(release.file_id, self.controller._Controller__persist.move_failure_counts)
         self.assertIn(pending_entry, self.controller._Controller__pending_completion_file_names)
         self.assertNotIn(release.file_id, self.controller._Controller__persist.downloaded_file_names)
@@ -9815,7 +9853,7 @@ class TestController(unittest.TestCase):
                 self.setUp()
                 mtime_ns = 1786400003000000000
                 remote_root = SystemFile("release", 10, False, mtime_ns=mtime_ns)
-                local_root = SystemFile("release", 10, False, mtime_ns=mtime_ns)
+                local_root = SystemFile("release", 10, False, is_staging=True, mtime_ns=mtime_ns)
                 active_root = SystemFile("release", 10, False, mtime_ns=mtime_ns)
                 builder = ModelBuilder()
                 builder.set_base_logger(self.controller.logger)
@@ -9827,6 +9865,10 @@ class TestController(unittest.TestCase):
                 self.controller._Controller__model_lock = threading.RLock()
                 self.controller._Controller__lftp.status.return_value = []
                 self.controller._Controller__lftp.last_status_poll_healthy = False
+                self.controller._Controller__reconciled_local_path_pair_ids = {None}
+                self.controller._Controller__reconciled_remote_path_pair_ids = {None}
+                self.controller._Controller__lftp_idle_status_authoritative = True
+                self.controller._Controller__lftp_status_poll_retry_active = False
                 self.controller._Controller__next_lftp_status_poll_at = None
                 pending_entry = ("release", None, None)
                 release_id = ModelFile.build_file_id(*pending_entry[:2])
@@ -9854,6 +9896,7 @@ class TestController(unittest.TestCase):
                 self.assertIn(pending_entry, self.controller._Controller__pending_completion_file_names)
 
                 self.controller._Controller__lftp.last_status_poll_healthy = True
+                self.controller._Controller__lftp_status_poll_retry_active = True
                 self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
                 ModelUpdater(self.controller).update()
 

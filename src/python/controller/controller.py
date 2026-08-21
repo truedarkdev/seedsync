@@ -6643,6 +6643,12 @@ class Controller:
                         else:
                             if queue_lftp() is False:
                                 raise LftpError("Transfer backend rejected queue request")
+                        # A successful Queue changes the transfer state even
+                        # when the previous idle poll is still within its
+                        # cooldown.  Retire that cached deadline so the next
+                        # model update observes the new LFTP state promptly.
+                        self.__next_lftp_status_poll_at = None
+                        self.__lftp_idle_status_authoritative = False
                         # If the prior acknowledgement was never observable,
                         # this successful explicit retry resets the bounded
                         # ambiguity window. Beyond that window Queue is

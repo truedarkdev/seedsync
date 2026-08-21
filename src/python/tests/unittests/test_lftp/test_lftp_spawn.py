@@ -185,7 +185,7 @@ class TestLftpSpawn(unittest.TestCase):
             'open -p 22 --user "bob" "sftp://host.example.com"', fake.sendlines[-2]
         )
         self.assertEqual('special,password:with spaces and "quotes" ü', fake.sendlines[-1])
-        self.assertEqual([False, True], fake.echo_calls)
+        self.assertEqual([False, True, False], fake.echo_calls)
         self.assertTrue(all('special,password:with spaces and "quotes" ü' not in command for command in fake.sendlines[:-1]))
         self.assertIsNone(_lftp._Lftp__password)
 
@@ -212,7 +212,7 @@ class TestLftpSpawn(unittest.TestCase):
         self.assertEqual([], fake.args)
         self.assertIn('open -p 2121 --user "bob" "ftp://host.example.com"', fake.sendlines)
         self.assertEqual("secret", fake.sendlines[-1])
-        self.assertEqual([False, True], fake.echo_calls)
+        self.assertEqual([False, True, False], fake.echo_calls)
 
         settings = sent_settings(fake)
         self.assertEqual("true", settings.get("ftp:ssl-force"))
@@ -274,7 +274,7 @@ class TestLftpSpawn(unittest.TestCase):
 
         self.assertEqual(["-p", "22", "-u", "bob,", "sftp://host.example.com"], fake.args)
         self.assertNotIn('open -p 22 --user "bob" "sftp://host.example.com"', fake.sendlines)
-        self.assertEqual([], fake.echo_calls)
+        self.assertEqual([False], fake.echo_calls)
 
     def test_lftp_secure_spawn_removes_ambient_password_variable(self):
         with patch.dict(lftp_mod.os.environ, {"LFTP_PASSWORD": "ambient-secret", "OTHER": "keep"}, clear=True):

@@ -82,7 +82,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 COPY src/angular/package*.json /app/
 WORKDIR /app
-RUN npm ci --legacy-peer-deps
+RUN npm install --legacy-peer-deps --no-package-lock
 
 # Builds angular app into html
 # Output is in /build/dist/
