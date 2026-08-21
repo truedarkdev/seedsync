@@ -2793,6 +2793,138 @@ class TestModelUpdater(unittest.TestCase):
         updater.update()
         self.assertFalse(builder.has_changes())
 
+    def test_remote_unknown_progress_keeps_real_builder_cache_through_unchanged_final(self):
+        def root(path_pair_id: str, mtime_ns: int) -> SystemFile:
+            value = SystemFile("release", 1, True)
+            value.path_pair_id = path_pair_id
+            value.add_child(SystemFile("existing.mkv", 1, False, mtime_ns=mtime_ns))
+            return value
+
+        def result(files, generation, token, *, completed, unknown=None, final=True, scanned=None):
+            return ScannerResult(
+                datetime.now(), files, scanned_path_pair_ids=scanned or {"pair-a", "pair-b"},
+                generation=generation, is_progress=True, completed_path_pair_ids=completed,
+                unknown_path_pair_ids=set(unknown or set()), is_scan_final=final,
+                is_full_snapshot=final, full_snapshot_path_pair_ids=completed if final else set(),
+                session_token=token,
+            )
+
+        remote_token = "remote-unknown-cache"
+        local_token = "local-standing-cache"
+        initial_remote = result([root("pair-a", 2), root("pair-b", 2)], 1, remote_token,
+                                completed={"pair-a", "pair-b"})
+        initial_local = result([root("pair-a", 1), root("pair-b", 1)], 1, local_token,
+                               completed={"pair-a", "pair-b"})
+        remote_unknown_a = result([], 2, remote_token, completed=set(), unknown={"pair-a"}, final=False,
+                                  scanned={"pair-a"})
+        remote_unknown_b = result([], 2, remote_token, completed=set(), unknown={"pair-b"}, final=False,
+                                  scanned={"pair-b"})
+        unchanged_remote_final = result([root("pair-a", 2), root("pair-b", 2)], 2, remote_token,
+                                        completed={"pair-a", "pair-b"})
+        builder = ModelBuilder()
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        controller._Controller__remote_scan_process = self._progressive_process(
+            remote_token, [[initial_remote], [remote_unknown_a], [remote_unknown_b], [unchanged_remote_final]],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            local_token, [[initial_local], [], [], []],
+        )
+        updater = ModelUpdater(controller)
+        a_id = ModelFile.build_file_id("release", "pair-a")
+
+        updater.update()
+        self.assertFalse(builder.has_changes())
+        builder.build_model = MagicMock(wraps=builder.build_model)
+
+        updater.update()
+        self.assertEqual(frozenset({"pair-a"}), builder.unknown_local_path_pair_ids_snapshot())
+        self.assertEqual((), builder.get_trusted_final_leaf_paths(a_id))
+        updater.update()
+        self.assertEqual(frozenset({"pair-a", "pair-b"}), builder.unknown_local_path_pair_ids_snapshot())
+        updater.update()
+
+        self.assertEqual(frozenset({"pair-a", "pair-b"}), builder.unknown_local_path_pair_ids_snapshot())
+        self.assertEqual((), builder.get_trusted_final_leaf_paths(a_id))
+        builder.build_model.assert_not_called()
+
+    def test_running_mirror_progress_adopts_active_delta_during_unknown_overlay_churn(self):
+        def root(path_pair_id: str, size: int) -> SystemFile:
+            value = SystemFile("release", size, True)
+            value.path_pair_id = path_pair_id
+            value.add_child(SystemFile("existing.mkv", size, False, mtime_ns=1))
+            return value
+
+        def result(files, generation, token, *, completed, unknown=None, final=True, scanned=None):
+            return ScannerResult(
+                datetime.now(), files, scanned_path_pair_ids=scanned or {"pair-a", "pair-b"},
+                generation=generation, is_progress=True, completed_path_pair_ids=completed,
+                unknown_path_pair_ids=set(unknown or set()), is_scan_final=final,
+                is_full_snapshot=final, full_snapshot_path_pair_ids=completed if final else set(),
+                session_token=token,
+            )
+
+        remote_token = "remote-mirror-active"
+        local_token = "local-mirror-standing"
+        initial_remote = result(
+            [root("pair-a", 100), root("pair-b", 200)], 1, remote_token,
+            completed={"pair-a", "pair-b"},
+        )
+        initial_local = result(
+            [root("pair-a", 25), root("pair-b", 200)], 1, local_token,
+            completed={"pair-a", "pair-b"},
+        )
+        unknown_a = result(
+            [], 2, remote_token, completed=set(), unknown={"pair-a"},
+            final=False, scanned={"pair-a"},
+        )
+        unchanged_final = result(
+            [root("pair-a", 100), root("pair-b", 200)], 2, remote_token,
+            completed={"pair-a", "pair-b"},
+        )
+        builder = ModelBuilder()
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        controller._Controller__remote_scan_process = self._progressive_process(
+            remote_token, [[initial_remote], [unknown_a], [unchanged_final]],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            local_token, [[initial_local], [], []],
+        )
+        status = LftpJobStatus(
+            21, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(10, 80, 12, 100, 8)
+        updater = ModelUpdater(controller)
+        updater.update()
+        builder.build_model = MagicMock(wraps=builder.build_model)
+
+        controller._Controller__lftp.status.return_value = [status]
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+
+        active_id = ModelFile.build_file_id("release", "pair-a")
+        unrelated_id = ModelFile.build_file_id("release", "pair-b")
+        self.assertEqual(10, live_model.get_file(active_id).transferred_size)
+        self.assertEqual(200, live_model.get_file(unrelated_id).transferred_size)
+        self.assertEqual(frozenset({"pair-a"}), builder.unknown_local_path_pair_ids_snapshot())
+        self.assertFalse(builder.has_changes())
+        builder.build_model.assert_not_called()
+
+        controller._Controller__next_lftp_status_poll_at = None
+        updater.update()
+
+        self.assertEqual(frozenset({"pair-a"}), builder.unknown_local_path_pair_ids_snapshot())
+        builder.build_model.assert_not_called()
+
     def test_unchanged_remote_progressive_chunk_skips_delta_builder(self):
         remote_token = "remote-unchanged-chunk"
         local_token = "local-standing-authority"

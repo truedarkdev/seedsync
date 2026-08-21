@@ -1424,7 +1424,8 @@ class ModelBuilder:
                                             remote_file: Optional[SystemFile],
                                             local_file: Optional[SystemFile],
                                             previous_snapshot: Optional[_RecentLiveTransferSnapshot] = None,
-                                            lftp_job_id: Optional[int] = None) -> _TransferState:
+                                            lftp_job_id: Optional[int] = None,
+                                            lftp_job_type: Optional[LftpJobStatus.Type] = None) -> _TransferState:
         def has_staging_descendant(candidate: Optional[SystemFile]) -> bool:
             if candidate is None:
                 return False
@@ -1448,6 +1449,28 @@ class ModelBuilder:
                     0,
                     remote_file.size,
                     0,
+                    transfer_state.speed,
+                    transfer_state.eta,
+                )
+            elif lftp_job_type == LftpJobStatus.Type.MIRROR and \
+                    (remaining_size != remote_file.size or transfer_state.size_remote > remote_file.size):
+                # A running MIRROR directory discovers its children while it
+                # runs.  Its denominator can therefore describe only the
+                # currently known subset; treating omitted remote bytes as
+                # already transferred produces a false whole-root progress
+                # value.  The raw transferred bytes and verified final leaves
+                # below are the only authorities available for this state.
+                size_local = subset_transferred
+                if previous_snapshot is not None and \
+                        previous_snapshot.lftp_job_id == lftp_job_id and \
+                        previous_snapshot.subset_size_local is not None:
+                    size_local = max(size_local, previous_snapshot.subset_size_local)
+                size_local = max(0, min(size_local, remote_file.size))
+                transfer_state = _TransferState(
+                    size_local,
+                    remote_file.size,
+                    int(round((size_local * 100) / remote_file.size))
+                    if remote_file.size > 0 else None,
                     transfer_state.speed,
                     transfer_state.eta,
                 )
@@ -1489,8 +1512,14 @@ class ModelBuilder:
                 # neither a reset (handled above) nor permission to lower the
                 # rendered whole-root floor just because the denominator
                 # changed back to the root size.
-                floor_applied = previous_snapshot.size_local > subset_transferred
-                size_local = max(subset_transferred, previous_snapshot.size_local)
+                previous_floor = previous_snapshot.size_local
+                if lftp_job_type == LftpJobStatus.Type.MIRROR:
+                    # The stored whole-root value already includes verified
+                    # final leaves.  Preserve only its raw subset component;
+                    # final leaves are added once below.
+                    previous_floor = previous_snapshot.subset_size_local
+                floor_applied = previous_floor is not None and previous_floor > subset_transferred
+                size_local = max(subset_transferred, previous_floor or 0)
                 size_local = max(0, min(size_local, remote_file.size))
                 transfer_state = _TransferState(
                     size_local,
@@ -2121,7 +2150,10 @@ class ModelBuilder:
                                                    root_file_id: Optional[str],
                                                    remote: Optional[SystemFile],
                                                    local: Optional[SystemFile],
-                                                   current_transfer_state: _TransferState
+                                                   current_transfer_state: _TransferState,
+                                                   raw_transfer_state: Optional[_TransferState] = None,
+                                                   lftp_job_id: Optional[int] = None,
+                                                   lftp_job_type: Optional[LftpJobStatus.Type] = None,
                                                    ) -> _TransferState:
         retained_snapshot_key, retained_snapshot = self.__resolve_retained_stopped_transfer_snapshot(
             file_id,
@@ -2129,6 +2161,21 @@ class ModelBuilder:
         )
         if retained_snapshot is None or retained_snapshot.size_local is None:
             return current_transfer_state
+        if lftp_job_type == LftpJobStatus.Type.MIRROR and raw_transfer_state is not None:
+            # The combined state includes verified final leaves, so a raw zero
+            # report must reach this boundary before it is turned into the
+            # final-only value. A replacement MIRROR job is also a new
+            # lifecycle and cannot inherit a stopped floor from the old one.
+            if raw_transfer_state.size_local == 0 or (
+                    retained_snapshot.lftp_job_id is not None and
+                    lftp_job_id is not None and
+                    retained_snapshot.lftp_job_id != lftp_job_id
+            ):
+                self.__evict_retained_stopped_transfer_snapshots(
+                    retained_snapshot_key if retained_snapshot_key is not None else file_id,
+                    retained_snapshot.root_file_id
+                )
+                return current_transfer_state
         if self.__has_clear_transfer_reset_signal(local, current_transfer_state, retained_snapshot):
             self.__evict_retained_stopped_transfer_snapshots(
                 retained_snapshot_key if retained_snapshot_key is not None else file_id,
@@ -3424,8 +3471,23 @@ class ModelBuilder:
     def set_unknown_local_path_pair_ids(self, path_pair_ids: Set[Optional[str]]) -> None:
         """Keep persisted markers from becoming Deleted while local evidence is incomplete."""
         normalized = set(path_pair_ids)
-        if normalized != self.__unknown_local_path_pair_ids:
-            self.__unknown_local_path_pair_ids = normalized
+        previous = self.__unknown_local_path_pair_ids
+        if normalized == previous:
+            return
+        added = normalized.difference(previous)
+        removed = previous.difference(normalized)
+        self.__unknown_local_path_pair_ids = normalized
+        cached_model = self.__cached_model
+        # Queue safety and model summaries read this overlay directly.  A new
+        # unknown pair only makes the cached render stale when it must hide an
+        # already rendered Deleted root; every other additive change can keep
+        # the standing authoritative model without another full tree walk.
+        added_hides_deleted = cached_model is not None and any(
+            (model_file := cached_model.get_file(file_id)).path_pair_id in added and
+            model_file.state == ModelFile.State.DELETED
+            for file_id in cached_model.get_file_ids()
+        )
+        if cached_model is None or removed or added_hides_deleted:
             self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS)
 
     def set_downloaded_timestamps(self, downloaded_timestamps: Dict[str, float]) -> None:
@@ -3910,6 +3972,7 @@ class ModelBuilder:
                 local,
                 previous_snapshot,
                 status.id if status is not None else None,
+                status.type if status is not None else None,
             )
         current_transfer_state = raw_current_transfer_state if not is_stopped else None
         if is_stopped and raw_current_transfer_state is not None:
@@ -3939,7 +4002,10 @@ class ModelBuilder:
                 status.file_id if status is not None else model_file.file_id,
                 remote,
                 local,
-                current_transfer_state
+                current_transfer_state,
+                source_current_transfer_state,
+                status.id if status is not None else None,
+                status.type if status is not None else None,
             )
             arbitration_source = "live_status"
             if current_transfer_state != raw_current_transfer_state:

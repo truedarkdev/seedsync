@@ -1853,6 +1853,99 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(100, clamped.download_progress)
         self.assertLessEqual(clamped.transferred_size, clamped.remote_size)
 
+    def test_running_mirror_subset_does_not_infer_undiscovered_root_bytes(self):
+        stamp = 1_786_400_003_000_000_000
+        remote_root = SystemFile("release", 1000, True)
+        remote_root.add_child(SystemFile("final.mkv", 200, False, mtime_ns=stamp))
+        remote_root.add_child(SystemFile("staged.mkv", 800, False, mtime_ns=stamp + 1_000_000_000))
+        local_root = SystemFile("release", 231, True)
+        local_root.add_child(SystemFile("final.mkv", 200, False, mtime_ns=stamp))
+        staged = SystemFile("staged.mkv", 31, False, is_staging=True)
+        staged.status_sidecar_ready = True
+        local_root.add_child(staged)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        def render(transferred: int, subset_total: int, job_id: int = 11):
+            status = LftpJobStatus(
+                job_id, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "",
+            )
+            status.total_transfer_state = LftpJobStatus.TransferState(
+                transferred, subset_total, 4, 100, 8,
+            )
+            self.model_builder.set_lftp_statuses([status])
+            return self.model_builder.build_model().get_file("release")
+
+        release = render(31, 700)
+
+        # 31 raw MIRROR bytes plus the one verified final leaf; the 700-byte
+        # discovered subset does not prove the remaining remote bytes done.
+        self.assertEqual((231, 1000), (release.transferred_size, release.remote_size))
+        self.assertEqual(23, release.download_progress)
+
+        # A changing discovered subset cannot lower the same-job raw floor;
+        # an explicit zero reset and a new job still start from raw bytes.
+        continued = render(50, 900)
+        self.assertEqual(250, continued.transferred_size)
+        exact_root = render(60, 1000)
+        self.assertEqual(260, exact_root.transferred_size)
+        reset = render(0, 900)
+        self.assertEqual(200, reset.transferred_size)
+        replacement = render(10, 900, job_id=12)
+        self.assertEqual(210, replacement.transferred_size)
+
+    def test_running_mirror_subset_preserves_retained_stop_progress(self):
+        stamp = 1_786_400_003_000_000_000
+        remote_root = SystemFile("release", 1000, True)
+        remote_root.add_child(SystemFile("final.mkv", 200, False, mtime_ns=stamp))
+        remote_root.add_child(SystemFile("staged.mkv", 800, False, mtime_ns=stamp + 1_000_000_000))
+        local_root = SystemFile("release", 231, True)
+        local_root.add_child(SystemFile("final.mkv", 200, False, mtime_ns=stamp))
+        staged = SystemFile("staged.mkv", 31, False, is_staging=True)
+        staged.status_sidecar_ready = True
+        local_root.add_child(staged)
+        status = LftpJobStatus(
+            12, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(31, 700, 4, 100, 8)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_lftp_statuses([status])
+        self.model_builder.set_stopped_files({"release"})
+
+        stopped = self.model_builder.build_model().get_file("release")
+        self.assertEqual((231, 1000), (stopped.transferred_size, stopped.remote_size))
+        self.model_builder.set_lftp_statuses([])
+
+        retained = self.model_builder.build_model().get_file("release")
+
+        self.assertTrue(retained.explicitly_stopped)
+        self.assertEqual((231, 1000), (retained.transferred_size, retained.remote_size))
+
+        self.model_builder.set_stopped_files(set())
+        status.total_transfer_state = LftpJobStatus.TransferState(0, 700, 0, 100, 8)
+        self.model_builder.set_lftp_statuses([status])
+        reset = self.model_builder.build_model().get_file("release")
+        self.assertEqual((200, 1000), (reset.transferred_size, reset.remote_size))
+
+        # Recreate the stopped floor, then resume with a replacement job. Its
+        # raw bytes are authoritative and must not inherit the old lifecycle.
+        status.total_transfer_state = LftpJobStatus.TransferState(31, 700, 4, 100, 8)
+        self.model_builder.set_stopped_files({"release"})
+        self.model_builder.build_model()
+        self.model_builder.set_lftp_statuses([])
+        self.model_builder.build_model()
+        self.model_builder.set_stopped_files(set())
+        replacement = LftpJobStatus(
+            13, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "",
+        )
+        replacement.total_transfer_state = LftpJobStatus.TransferState(10, 700, 1, 100, 8)
+        self.model_builder.set_lftp_statuses([replacement])
+
+        resumed_replacement = self.model_builder.build_model().get_file("release")
+
+        self.assertEqual((210, 1000), (resumed_replacement.transferred_size, resumed_replacement.remote_size))
+
     def test_resumed_subset_progress_resets_and_stays_monotonic_within_one_lftp_lifecycle(self):
         self.model_builder.clear()
         self.model_builder.set_remote_files([SystemFile("resume.bin", 1000, False)])
@@ -6545,6 +6638,58 @@ class TestModelBuilder(unittest.TestCase):
         # Invalidates when the active overlay is cleared after previously being populated
         self.model_builder.set_active_files([])
         self.assertTrue(self.model_builder.has_changes())
+
+    def test_unknown_pair_addition_preserves_clean_cache_and_blocks_queue_safety(self):
+        path_pair_id = "pair-a"
+        base_mtime_ns = 1_786_400_003_000_000_000
+        remote_root = SystemFile("release", 1, True, mtime_ns=base_mtime_ns)
+        remote_root.path_pair_id = path_pair_id
+        remote_root.add_child(SystemFile("existing.mkv", 1, False, mtime_ns=base_mtime_ns + 100))
+        local_root = SystemFile("release", 1, True, mtime_ns=base_mtime_ns)
+        local_root.path_pair_id = path_pair_id
+        local_root.add_child(SystemFile("existing.mkv", 1, False, mtime_ns=base_mtime_ns))
+        file_id = ModelFile.build_file_id("release", path_pair_id)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        cached = self.model_builder.build_model()
+        self.assertEqual(("existing.mkv",), self.model_builder.get_trusted_final_leaf_paths(file_id))
+
+        self.model_builder.set_unknown_local_path_pair_ids({path_pair_id})
+
+        self.assertEqual(frozenset({path_pair_id}), self.model_builder.unknown_local_path_pair_ids_snapshot())
+        self.assertFalse(self.model_builder.has_changes())
+        self.assertIs(cached, self.model_builder.build_model())
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths(file_id))
+
+    def test_unknown_pair_addition_rebuilds_cached_deleted_root(self):
+        path_pair_id = "pair-a"
+        remote = SystemFile("remote", 1, False)
+        remote.path_pair_id = path_pair_id
+        file_id = ModelFile.build_file_id("remote", path_pair_id)
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_downloaded_files({file_id})
+        cached = self.model_builder.build_model()
+        self.assertEqual(ModelFile.State.DELETED, cached.get_file(file_id).state)
+
+        self.model_builder.set_unknown_local_path_pair_ids({path_pair_id})
+
+        self.assertTrue(self.model_builder.has_changes())
+        self.assertNotEqual(ModelFile.State.DELETED, self.model_builder.build_model().get_file(file_id).state)
+
+    def test_unknown_pair_removal_rebuilds_and_restores_deleted_root(self):
+        path_pair_id = "pair-a"
+        remote = SystemFile("remote", 1, False)
+        remote.path_pair_id = path_pair_id
+        file_id = ModelFile.build_file_id("remote", path_pair_id)
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_downloaded_files({file_id})
+        self.model_builder.set_unknown_local_path_pair_ids({path_pair_id})
+        self.assertNotEqual(ModelFile.State.DELETED, self.model_builder.build_model().get_file(file_id).state)
+
+        self.model_builder.set_unknown_local_path_pair_ids(set())
+
+        self.assertTrue(self.model_builder.has_changes())
+        self.assertEqual(ModelFile.State.DELETED, self.model_builder.build_model().get_file(file_id).state)
 
     def test_cache_invalidation_counters_are_fixed_and_count_changed_inputs(self):
         enabled = [True]
