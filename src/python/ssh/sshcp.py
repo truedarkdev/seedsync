@@ -49,6 +49,17 @@ def _linux_master_parent_death_preexec(parent_pid: int):
     return preexec
 
 
+def _multiplexed_stream_command(command: str) -> str:
+    """Add a hangup watchdog when the remote provides ``setsid``."""
+    return (
+        "if command -v setsid >/dev/null 2>&1; then "
+        "exec 3<&0; setsid sh -c {} & child=$!; "
+        "( while IFS= read -r _ <&3; do :; done; kill -TERM -$child 2>/dev/null ) & watcher=$!; "
+        "wait $child; status=$?; kill $watcher 2>/dev/null; wait $watcher 2>/dev/null; exit $status; "
+        "else exec sh -c {}; fi"
+    ).format(shlex.quote(command), shlex.quote(command))
+
+
 class _SshcpControlMaster:
     """One generation-local foreground OpenSSH multiplexing session.
 
@@ -856,15 +867,11 @@ class Sshcp:
 
         if self.__using_generation_control_master():
             # A multiplexed SSH channel can disappear without the remote
-            # non-interactive command receiving a hangup.  Keep a stdin-EOF
-            # watchdog beside a dedicated session: channel loss kills that
-            # session and its descendants, while normal command completion
-            # stops the watchdog and preserves the command exit status.
-            command = (
-                "exec 3<&0; setsid sh -c {} & child=$!; "
-                "( while IFS= read -r _ <&3; do :; done; kill -TERM -$child 2>/dev/null ) & watcher=$!; "
-                "wait $child; status=$?; kill $watcher 2>/dev/null; wait $watcher 2>/dev/null; exit $status"
-            ).format(shlex.quote(command))
+            # non-interactive command receiving a hangup.  When setsid exists,
+            # keep a stdin-EOF watchdog beside a dedicated session so channel
+            # loss kills its descendants.  Minimal remotes retain the original
+            # command behavior rather than gaining a new package requirement.
+            command = _multiplexed_stream_command(command)
 
         flags = [
             "-p", str(self.__port),  # port

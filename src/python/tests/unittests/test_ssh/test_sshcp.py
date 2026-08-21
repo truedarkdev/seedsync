@@ -21,7 +21,7 @@ from parameterized import parameterized
 from tests.utils import TestUtils, requires_live_ssh
 from common import overrides
 from ssh import Sshcp, SshcpError
-from ssh.sshcp import _linux_master_parent_death_preexec
+from ssh.sshcp import _linux_master_parent_death_preexec, _multiplexed_stream_command
 from common.performance_diagnostics import DURATION_REMOTE_SCAN_TRANSPORT_READ
 
 
@@ -794,6 +794,55 @@ class TestSshcp(unittest.TestCase):
         self.assertIn("kill -TERM -$child", remote_command)
         self.assertNotIn("kill -TERM --", remote_command)
         stream.proc.wait.assert_called_once_with(timeout=0.25)
+
+    def test_multiplexed_stream_wrapper_falls_back_without_setsid(self):
+        shell = shutil.which("sh")
+        if shell is None or os.name == "nt":
+            self.skipTest("requires a POSIX shell")
+
+        with tempfile.TemporaryDirectory() as path:
+            os.symlink(shell, os.path.join(path, "sh"))
+            command = "printf '%s' \"quoted value\"; exit 7 # trailing comment"
+            result = subprocess.run(
+                [shell, "-c", _multiplexed_stream_command(command)],
+                env={"PATH": path},
+                input=b"",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(b"quoted value", result.stdout)
+        self.assertEqual(7, result.returncode)
+        self.assertNotIn(b"setsid", result.stderr)
+
+    def test_multiplexed_stream_wrapper_uses_setsid_when_available(self):
+        shell = shutil.which("sh")
+        setsid = shutil.which("setsid")
+        if shell is None or setsid is None or os.name == "nt":
+            self.skipTest("requires POSIX sh and setsid")
+
+        with tempfile.TemporaryDirectory() as path:
+            marker = os.path.join(path, "setsid-used")
+            setsid_probe = os.path.join(path, "setsid")
+            with open(setsid_probe, "w") as stream:
+                stream.write("#!/bin/sh\nprintf used > {}\nexec {} \"$@\"\n".format(marker, setsid))
+            os.chmod(setsid_probe, 0o755)
+            os.symlink(shell, os.path.join(path, "sh"))
+            command = "printf '%s' \"quoted value\"; exit 7"
+            result = subprocess.run(
+                [shell, "-c", _multiplexed_stream_command(command)],
+                env={"PATH": path},
+                input=b"",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            used_setsid = os.path.exists(marker)
+
+        self.assertEqual(b"quoted value", result.stdout)
+        self.assertEqual(7, result.returncode)
+        self.assertTrue(used_setsid)
 
     @patch.object(Sshcp, "_Sshcp__spawn_process")
     def test_nonreused_stream_keeps_default_spawn_selection(self, mock_spawn_process):
