@@ -45,7 +45,9 @@ CADENCE_TARGET_STORAGE_SIZE_BYTES = (
 )
 CADENCE_TARGET_DIRECTORY_NAME = "remote-workload"
 EXTENSIONS = (".bin", ".dat", ".json", ".part", ".txt", ".tmp")
-PAIR_LOCAL_DIRECTORIES = ("path-pair-01", "path-pair-02", "path-pair-03", "path-pair-04", "path-pair-05", "path-pair-06")
+PAIR_LOCAL_DIRECTORIES = tuple(
+    f"path-pair-{number:02d}" for number in range(1, DEFAULT_PAIRS + 1)
+)
 TOPOLOGY_ALGORITHM = "index-stable-shared-branch-v2"
 CADENCE_FIELDS = (
     "layout", "shared_nodes", "local_only_nodes", "remote_only_nodes",
@@ -101,7 +103,7 @@ def normalize_topology_spec(
                         # Keep the active remote-only file at the pair root so
                         # the dashboard's v1 root-page transport renders it
                         # directly; child pages are not part of this harness.
-                        "relative_path": "path-pair-01/remote-only-target.bin",
+                        "relative_path": f"{PAIR_LOCAL_DIRECTORIES[0]}/remote-only-target.bin",
                         "size_bytes": 32 * 1024 * 1024,
                     }
                 ],
@@ -533,6 +535,90 @@ def _with_experiment_expectations(topology: dict[str, Any], spec: dict[str, Any]
     return result
 
 
+def _legacy_uniform_pair_directory_map(
+    retained: dict[str, Any], spec: dict[str, Any]
+) -> list[tuple[str, str]] | None:
+    """Return ordinal legacy-to-current roots after validating marker shape."""
+    retained_pairs = retained.get("path_pairs")
+    if not isinstance(retained_pairs, list) or len(retained_pairs) != len(spec["pairs"]):
+        return None
+    mapping = []
+    for pair, entry in zip(spec["pairs"], retained_pairs):
+        if not isinstance(entry, dict) or entry.get("id") != pair["id"]:
+            return None
+        directory = entry.get("directory")
+        if (
+            not isinstance(directory, str)
+            or not directory
+            or directory in {".", ".."}
+            or "/" in directory
+            or "\\" in directory
+            or ":" in directory
+            or Path(directory).is_absolute()
+        ):
+            return None
+        mapping.append((directory, pair["directory"]))
+    if len({old for old, _new in mapping}) != len(mapping):
+        return None
+    return mapping
+
+
+def _relocate_legacy_uniform_pair_roots(
+    local_root: Path,
+    remote_root: Path,
+    directory_map: list[tuple[str, str]],
+) -> None:
+    """Move validated retained roots to the current neutral ordinal names."""
+    pending = [(old, new) for old, new in directory_map if old != new]
+    if not pending:
+        return
+    plans = []
+    for root in (local_root, remote_root):
+        sources = [root / old for old, _new in pending]
+        destinations = [root / new for _old, new in pending]
+        temporary = [root / f".seedsync-legacy-pair-{index:02d}" for index, _ in enumerate(pending, 1)]
+        plans.append((sources, destinations, temporary))
+    for sources, destinations, temporary in plans:
+        if any(not source.is_dir() for source in sources):
+            raise RuntimeError("retained legacy fixture root is missing; refusing migration")
+        source_set = set(sources)
+        if any(destination.exists() and destination not in source_set for destination in destinations):
+            raise RuntimeError("retained neutral fixture root already exists; refusing migration")
+        if any(path.exists() for path in temporary):
+            raise RuntimeError("retained fixture migration temporary root already exists")
+
+    staged = []
+    committed = []
+    try:
+        for sources, _destinations, temporary in plans:
+            for source, staging in zip(sources, temporary):
+                source.rename(staging)
+                staged.append((source, staging))
+        for _sources, destinations, temporary in plans:
+            for staging, destination in zip(temporary, destinations):
+                staging.rename(destination)
+                committed.append((staging, destination))
+    except Exception as error:
+        rollback_errors = []
+        for staging, destination in reversed(committed):
+            try:
+                destination.rename(staging)
+            except Exception as rollback_error:  # pragma: no cover - exceptional filesystem failure
+                rollback_errors.append(rollback_error)
+        for source, staging in reversed(staged):
+            try:
+                staging.rename(source)
+            except Exception as rollback_error:  # pragma: no cover - exceptional filesystem failure
+                rollback_errors.append(rollback_error)
+        if rollback_errors:
+            raise RuntimeError(
+                "retained fixture migration failed and rollback was incomplete"
+            ) from error
+        raise RuntimeError(
+            "retained fixture migration failed; marker remains retryable"
+        ) from error
+
+
 def _migrate_legacy_uniform_manifest(
     retained: dict[str, Any], marker_fingerprint: str, spec: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -548,12 +634,7 @@ def _migrate_legacy_uniform_manifest(
         return None
     if topology.get("algorithm") != TOPOLOGY_ALGORITHM:
         return None
-    retained_pairs = retained.get("path_pairs")
-    expected_pairs = [(pair["id"], pair["directory"]) for pair in spec["pairs"]]
-    if not isinstance(retained_pairs, list) or [
-        (entry.get("id"), entry.get("directory"))
-        for entry in retained_pairs if isinstance(entry, dict)
-    ] != expected_pairs:
+    if _legacy_uniform_pair_directory_map(retained, spec) is None:
         return None
     if retained.get("fixture_fingerprint") != marker_fingerprint:
         return None
@@ -814,11 +895,13 @@ def generate_fixture(
         if not isinstance(retained, dict):
             raise RuntimeError("retained fixture marker has an invalid topology fingerprint")
         if "data_topology_spec" not in retained:
+            directory_map = _legacy_uniform_pair_directory_map(retained, spec)
             migrated_topology = _migrate_legacy_uniform_manifest(
                 retained, existing_markers[0]["fixture_fingerprint"], spec
             )
-            if migrated_topology is None:
+            if migrated_topology is None or directory_map is None:
                 raise RuntimeError("retained legacy fixture marker does not match requested topology; refusing regeneration")
+            _relocate_legacy_uniform_pair_roots(local_root, remote_root, directory_map)
             manifest = _manifest_for_spec(spec, migrated_topology, existing_markers[0]["fixture_fingerprint"])
             _repair_retained_pair_root_ownership(local_root, remote_root, spec)
             return _write_manifest_and_markers(

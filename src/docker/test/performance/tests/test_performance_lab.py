@@ -51,6 +51,10 @@ from common.config import Config
 from web.auth_store import ApiKeyStore, _verify_secret
 
 
+PRIMARY_PAIR_DIRECTORY = fixture_module.PAIR_LOCAL_DIRECTORIES[0]
+PRIMARY_REMOTE_ONLY_FILE = f"{PRIMARY_PAIR_DIRECTORY}/remote-only-target.bin"
+
+
 def _cgroup_samples(app_target=1_000_000, app_end=2_500_000, lag=100):
     return [
         {"role": "app", "boundary": "target", "phase_t_epoch_ms": 1_000,
@@ -259,7 +263,7 @@ def test_fixture_is_deterministic_and_idempotent(tmp_path):
     remote_root = tmp_path / "remote"
     manifest_path = tmp_path / "manifest.json"
     first = generate_fixture(local_root, remote_root, manifest_path, pairs=2, nodes_per_pair=40)
-    first_file = local_root / "path-pair-01" / "bucket-000" / "node-00000000.bin"
+    first_file = local_root / PRIMARY_PAIR_DIRECTORY / "bucket-000" / "node-00000000.bin"
     first_payload = first_file.read_bytes()
     second = generate_fixture(local_root, remote_root, manifest_path, pairs=2, nodes_per_pair=40)
     assert second["fixture_fingerprint"] == first["fixture_fingerprint"]
@@ -268,7 +272,7 @@ def test_fixture_is_deterministic_and_idempotent(tmp_path):
     assert first_file.read_bytes() == first_payload
     assert (local_root / ".seedsync-performance-fixture.json").exists()
     if os.name == "posix":
-        assert stat.S_IMODE((local_root / "path-pair-01" / "bucket-000").stat().st_mode) == 0o775
+        assert stat.S_IMODE((local_root / PRIMARY_PAIR_DIRECTORY / "bucket-000").stat().st_mode) == 0o775
 
 
 def test_legacy_generation_does_not_call_cadence_entry_materialization(tmp_path, monkeypatch):
@@ -290,7 +294,7 @@ def test_mixed_profile_normalizes_roles_counts_and_enabled_state():
     assert spec["pairs"][1]["nodes_local"] == spec["pairs"][1]["nodes_remote"] == MIXED_HIGH_CARD_NODES
     assert spec["pairs"][1]["enabled"] is False
     target = spec["pairs"][0]["remote_only_targets"][0]
-    assert target["relative_path"] == "path-pair-01/remote-only-target.bin"
+    assert target["relative_path"] == PRIMARY_REMOTE_ONLY_FILE
     assert target["size_bytes"] >= 32 * 1024 * 1024
 
 
@@ -576,7 +580,7 @@ def test_mixed_config_records_roles_enabled_and_remote_target(tmp_path):
     assert [(pair["role"], pair["enabled"], pair["auto_queue"]) for pair in payload["path_pairs"]] == [
         ("ordinary-active", True, False), ("high-cardinality-idle", False, True)
     ]
-    assert payload["path_pairs"][0]["remote_only_targets"][0]["relative_path"] == "path-pair-01/remote-only-target.bin"
+    assert payload["path_pairs"][0]["remote_only_targets"][0]["relative_path"] == PRIMARY_REMOTE_ONLY_FILE
 
 
 def test_mixed_retained_manifest_reuses_fixture_but_refreshes_enabled_expectations(tmp_path, monkeypatch):
@@ -593,13 +597,15 @@ def test_mixed_retained_manifest_reuses_fixture_but_refreshes_enabled_expectatio
     assert disabled_manifest["topology"]["local_file_nodes"] == 64 + fixture_module.MIXED_HIGH_CARD_NODES
     assert disabled_manifest["topology"]["remote_file_nodes"] == 64 + fixture_module.MIXED_HIGH_CARD_NODES + 1
     assert disabled_manifest["topology"]["local_directory_nodes"] == disabled_manifest["topology"]["remote_directory_nodes"]
-    target = remote_root / "path-pair-01" / "remote-only-target.bin"
+    target = remote_root / PRIMARY_PAIR_DIRECTORY / "remote-only-target.bin"
     assert target.stat().st_size == 32 * 1024 * 1024
 
 
-def test_legacy_uniform_marker_is_validated_and_migrated_without_regeneration(tmp_path):
+def _prepare_legacy_uniform_marker(tmp_path, retained_directory="retained-root-01"):
     local_root, remote_root = tmp_path / "local", tmp_path / "remote"
     original = generate_fixture(local_root, remote_root, tmp_path / "original.json", pairs=1, nodes_per_pair=4)
+    for root in (local_root, remote_root):
+        (root / PRIMARY_PAIR_DIRECTORY).rename(root / retained_directory)
     legacy_topology = {
         key: value for key, value in original["topology"].items()
         if key not in {
@@ -610,7 +616,12 @@ def test_legacy_uniform_marker_is_validated_and_migrated_without_regeneration(tm
             "local_directory_nodes", "remote_directory_nodes",
         }
     }
-    legacy_pairs = [{key: pair[key] for key in ("id", "name", "local_path", "remote_path", "directory", "nodes_per_side")} for pair in original["path_pairs"]]
+    legacy_pairs = [{
+        **{key: pair[key] for key in ("id", "name", "nodes_per_side")},
+        "local_path": f"/mounts/{retained_directory}",
+        "remote_path": f"/home/remoteuser/files/{retained_directory}",
+        "directory": retained_directory,
+    } for pair in original["path_pairs"]]
     legacy_fingerprint = hashlib.sha256(json.dumps(legacy_topology, sort_keys=True).encode("utf-8")).hexdigest()
     legacy_manifest = {
         "schema": "seedsync.performance-lab.fixture.v1",
@@ -622,13 +633,46 @@ def test_legacy_uniform_marker_is_validated_and_migrated_without_regeneration(tm
     marker = {"fixture_fingerprint": legacy_fingerprint, "request_fingerprint": legacy_fingerprint, "manifest": legacy_manifest}
     for root in (local_root, remote_root):
         (root / ".seedsync-performance-fixture.json").write_text(json.dumps(marker), encoding="utf-8")
+    return local_root, remote_root, retained_directory, legacy_fingerprint
+
+
+def test_legacy_uniform_marker_is_validated_and_migrated_without_regeneration(tmp_path):
+    local_root, remote_root, retained_directory, legacy_fingerprint = _prepare_legacy_uniform_marker(tmp_path)
     migrated = generate_fixture(local_root, remote_root, tmp_path / "migrated.json", pairs=1, nodes_per_pair=4)
     assert migrated["data_topology_spec"]["profile"] == "uniform"
     assert migrated["fixture_fingerprint"] == legacy_fingerprint
-    assert (local_root / "path-pair-01" / "bucket-000" / "node-00000000.bin").exists()
+    assert (local_root / PRIMARY_PAIR_DIRECTORY / "bucket-000" / "node-00000000.bin").exists()
+    assert (remote_root / PRIMARY_PAIR_DIRECTORY / "bucket-000" / "node-00000000.bin").exists()
+    assert not (local_root / retained_directory).exists()
+    assert not (remote_root / retained_directory).exists()
     repeated = generate_fixture(local_root, remote_root, tmp_path / "migrated-again.json", pairs=1, nodes_per_pair=4)
     assert repeated["fixture_fingerprint"] == migrated["fixture_fingerprint"]
     assert repeated["config_fingerprint"] == migrated["config_fingerprint"]
+
+
+def test_legacy_uniform_marker_migration_rolls_back_asymmetric_rename(tmp_path, monkeypatch):
+    local_root, remote_root, retained_directory, _legacy_fingerprint = _prepare_legacy_uniform_marker(tmp_path)
+    original_rename = Path.rename
+
+    def fail_remote_source(self, target):
+        if self == remote_root / retained_directory:
+            raise OSError("synthetic remote rename failure")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", fail_remote_source)
+    with pytest.raises(RuntimeError, match="marker remains retryable"):
+        generate_fixture(local_root, remote_root, tmp_path / "failed.json", pairs=1, nodes_per_pair=4)
+    for root in (local_root, remote_root):
+        assert (root / retained_directory).is_dir()
+        assert not (root / PRIMARY_PAIR_DIRECTORY).exists()
+        assert not (root / ".seedsync-legacy-pair-01").exists()
+
+    monkeypatch.undo()
+    retried = generate_fixture(local_root, remote_root, tmp_path / "retried.json", pairs=1, nodes_per_pair=4)
+    assert retried["data_topology_spec"]["profile"] == "uniform"
+    for root in (local_root, remote_root):
+        assert (root / PRIMARY_PAIR_DIRECTORY).is_dir()
+        assert not (root / retained_directory).exists()
 
 
 def test_seed_config_cli_metadata_uses_normalized_profile_counts():
@@ -902,8 +946,8 @@ def test_model_summary_status_is_bounded_and_aggregates_cardinality_without_ids(
 def test_external_summary_requires_stable_model_version_and_sanitized_docker_stats():
     manifest = {
         "fixture_fingerprint": "fixture", "config_fingerprint": "config",
-        "path_pairs": [{"enabled": True, "nodes_local": 64, "directory": "path-pair-01",
-                         "remote_only_targets": [{"relative_path": "path-pair-01/remote-only-target.bin"}]}],
+        "path_pairs": [{"enabled": True, "nodes_local": 64, "directory": PRIMARY_PAIR_DIRECTORY,
+                         "remote_only_targets": [{"relative_path": PRIMARY_REMOTE_ONLY_FILE}]}],
     }
     samples = [
         {"sample_index": 0, "t_epoch_ms": 1000, "root_count": 2, "model_version": 4, "app_cpu_percent": 8.0},
@@ -936,8 +980,8 @@ def test_external_summary_requires_stable_model_version_and_sanitized_docker_sta
 def _external_manifest():
     return {
         "fixture_fingerprint": "fixture", "config_fingerprint": "config",
-        "path_pairs": [{"enabled": True, "nodes_local": 64, "directory": "path-pair-01",
-                         "remote_only_targets": [{"relative_path": "path-pair-01/remote-only-target.bin"}]}],
+        "path_pairs": [{"enabled": True, "nodes_local": 64, "directory": PRIMARY_PAIR_DIRECTORY,
+                         "remote_only_targets": [{"relative_path": PRIMARY_REMOTE_ONLY_FILE}]}],
     }
 
 
@@ -1116,7 +1160,7 @@ def test_capture_cli_rejects_empty_remote_helper_series_in_diagnostics_on_and_of
     manifest.write_text(json.dumps({"fixture_fingerprint": "fixture", "topology": {
         "expected_merged_model_tree_nodes": 200001,
         "expected_model_tree_file_count": 200001,
-    }, "path_pairs": [{"enabled": True, "nodes_local": 64, "directory": "path-pair-01",
+    }, "path_pairs": [{"enabled": True, "nodes_local": 64, "directory": PRIMARY_PAIR_DIRECTORY,
                         "remote_only_targets": []}]}), encoding="utf-8")
     diagnostics.write_text(json.dumps(_settled_diagnostics([75, 80, 0.8, 1.0, 1.0])), encoding="utf-8")
     app_stats.write_text(json.dumps({"samples": [
@@ -1182,7 +1226,7 @@ def test_off_mode_summary_failure_breaks_quiet_readiness_suffix():
 
 def test_external_summary_separates_app_and_remote_helper_resource_roles():
     manifest = {"fixture_fingerprint": "fixture", "config_fingerprint": "config",
-                "path_pairs": [{"enabled": True, "nodes_local": 64, "directory": "path-pair-01",
+                "path_pairs": [{"enabled": True, "nodes_local": 64, "directory": PRIMARY_PAIR_DIRECTORY,
                                  "remote_only_targets": []}]}
     model_samples = [
         {"sample_index": 0, "t_epoch_ms": 1000, "root_count": 1, "model_version": 4, "app_cpu_percent": 9.0},
@@ -1498,7 +1542,7 @@ def test_browser_harness_is_lazy_configurable_and_manifest_driven():
     assert "String(item.pathname || '') === String(scopedPath || '')" in source
     assert "findScopedModelPath" in source and "model-summary" not in source
     assert "target.pair_id === 'pair-01'" in source
-    assert "JSON.stringify(target).includes('pair-01')" in source
+    assert 'JSON.stringify(target).includes(\'"pair_id"\')' in source
     for event_name in ("model-page", "model-invalidate", "model-patch", "model-reset"):
         assert event_name in source
     assert "lastSignature" in source and "if (signature === lastSignature) return" in source
@@ -1735,10 +1779,10 @@ def test_browser_probe_requires_validated_binding_before_live_run(tmp_path):
             "id": "pair-01",
             "name": "Performance Pair 01",
             "role": "ordinary-active",
-            "directory": "path-pair-01",
-            "local_path": "/mounts/path-pair-01",
+            "directory": PRIMARY_PAIR_DIRECTORY,
+            "local_path": f"/mounts/{PRIMARY_PAIR_DIRECTORY}",
             "remote_only_targets": [{
-                "kind": "directory", "relative_path": "path-pair-01/remote-workload",
+                "kind": "directory", "relative_path": f"{PRIMARY_PAIR_DIRECTORY}/remote-workload",
                 "size_bytes": 1024, "storage_mode": "real-bytes-hardlink-deduplicated",
                 "storage_size_bytes": 128, "file_count": 20, "directory_count": 3, "max_depth": 2,
             }],

@@ -710,7 +710,7 @@ function runSelfTest() {
   });
   assert(legacyTarget.kind === 'file' && !Object.prototype.hasOwnProperty.call(legacyTarget, 'file_count'),
     'committed file target descriptor was not retained as a legacy file');
-  assert(!JSON.stringify(target).includes('pair-01'), 'target pair identity leaked into serialized evidence');
+  assert(!JSON.stringify(target).includes('"pair_id"'), 'target pair identity leaked into serialized evidence');
   assert(normalizeAppPath('/server/model/v1/pairs/private-scope/stream') ===
     '/server/model/v1/pairs/<scope-digest:7bc278faa0682944>/stream', 'scoped route normalization failed');
   assert(safeText('/server/model/v1/pairs/private-scope/stream').includes('/server/model/v1/pairs/<scope-digest:'),

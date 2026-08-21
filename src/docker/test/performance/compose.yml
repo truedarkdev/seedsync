@@ -108,7 +108,7 @@ services:
         source: perf_local_fixture
         target: /mounts
       # Keep the historical path available for startup compatibility; seeded
-      # path pairs use /mounts/{path-pair-01,...,path-pair-06} only.
+      # path pairs use the synthetic fixture volume mounted at /mounts.
       - type: volume
         source: perf_local_fixture
         target: /downloads
