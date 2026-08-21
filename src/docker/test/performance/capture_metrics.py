@@ -295,6 +295,21 @@ def _expected_summary_root_count(manifest: dict[str, object]) -> int:
     pairs = manifest.get("path_pairs") if isinstance(manifest, dict) else None
     if not isinstance(pairs, list):
         return 0
+    topology = manifest.get("topology") if isinstance(manifest, dict) else None
+    summary_children = topology.get("summary_children_by_pair") if isinstance(topology, dict) else None
+    if summary_children is not None:
+        if not isinstance(summary_children, dict) or any(
+            not isinstance(pair_id, str) or type(count) is not int or count <= 0
+            for pair_id, count in summary_children.items()
+        ):
+            raise ValueError("summary_children_by_pair must map pair IDs to positive integers")
+        enabled_ids = {
+            pair.get("id") for pair in pairs
+            if isinstance(pair, dict) and pair.get("enabled") is not False
+        }
+        if any(not isinstance(pair_id, str) for pair_id in enabled_ids) or not enabled_ids.issubset(summary_children):
+            raise ValueError("summary_children_by_pair is missing an enabled pair")
+        return sum(summary_children[pair_id] for pair_id in enabled_ids)
     total = 0
     for pair in pairs:
         if not isinstance(pair, dict) or pair.get("enabled") is False:

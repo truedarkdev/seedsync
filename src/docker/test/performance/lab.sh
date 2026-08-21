@@ -6,6 +6,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR/../../../.." rev-parse --show-toplevel)"
+PROJECT_WAS_EXPLICIT="${PERF_PROJECT:-}"
 PROJECT="${PERF_PROJECT:-seedsync-performance-lab}"
 RUN_ID="${PERF_RUN_ID:-$(date -u +%Y%m%dt%H%M%Sz)}"
 if [[ ! "$RUN_ID" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
@@ -18,17 +19,24 @@ PERF_IMAGE="${PERF_IMAGE:-}"
 PERF_API_TOKEN="${PERF_API_TOKEN:-seedsync-performance-local-token}"
 PERF_BREADCRUMB_MODE="${PERF_BREADCRUMB_MODE:-on}"
 PERF_DIAGNOSTICS_MODE="${PERF_DIAGNOSTICS_MODE:-on}"
+PERF_BROWSER_DESTRUCTIVE_APPROVED="${PERF_BROWSER_DESTRUCTIVE_APPROVED:-off}"
 PERF_MOVE_FAILURE_MODE="${PERF_MOVE_FAILURE_MODE:-stale}"
 PERF_REMOTE_ADDRESS="${PERF_REMOTE_ADDRESS:-remote}"
 PERF_PAIRS="${PERF_PAIRS:-6}"
 PERF_NODES_PER_PAIR="${PERF_NODES_PER_PAIR:-32000}"
 PERF_PROFILE="${PERF_PROFILE:-uniform}"
 PERF_HIGH_CARD_ENABLED="${PERF_HIGH_CARD_ENABLED:-on}"
+if [[ "$PERF_PROFILE" == cadence ]]; then
+  # Cadence is intentionally a small asymmetric isolation fixture; keep a
+  # fixed floor below its expected merged tree without weakening uniform/mixed.
+  PERF_MINIMUM_MERGED_NODES=2000
+else
+  PERF_MINIMUM_MERGED_NODES=200000
+fi
 PERF_HOST_PORT="${PERF_HOST_PORT:-18800}"
 PERF_NODE_BINARY="${PERF_NODE_BINARY:-node}"
 PERF_PLAYWRIGHT_MODULE="${PERF_PLAYWRIGHT_MODULE:-${SEEDSYNC_PLAYWRIGHT_MODULE:-playwright}}"
 PERF_NODE_PATH="${PERF_NODE_PATH:-${SEEDSYNC_PLAYWRIGHT_NODE_PATH:-}}"
-PERF_BROWSER_DESTRUCTIVE_APPROVED="${PERF_BROWSER_DESTRUCTIVE_APPROVED:-off}"
 PERF_MEASURE_TIMEOUT_SECONDS="${PERF_MEASURE_TIMEOUT_SECONDS:-900}"
 PERF_SETTLED_SAMPLES="${PERF_SETTLED_SAMPLES:-6}"
 PERF_SAMPLE_SLEEP_SECONDS="${PERF_SAMPLE_SLEEP_SECONDS:-2}"
@@ -58,20 +66,20 @@ if [[ "$PERF_DIAGNOSTICS_MODE" != on && "$PERF_DIAGNOSTICS_MODE" != off ]]; then
   echo "PERF_DIAGNOSTICS_MODE must be on or off" >&2
   exit 2
 fi
+if [[ "$PERF_BROWSER_DESTRUCTIVE_APPROVED" != on && "$PERF_BROWSER_DESTRUCTIVE_APPROVED" != off ]]; then
+  echo "PERF_BROWSER_DESTRUCTIVE_APPROVED must be on or off" >&2
+  exit 2
+fi
 if [[ "$PERF_MOVE_FAILURE_MODE" != stale && "$PERF_MOVE_FAILURE_MODE" != none ]]; then
   echo "PERF_MOVE_FAILURE_MODE must be stale or none" >&2
   exit 2
 fi
-if [[ "$PERF_PROFILE" != uniform && "$PERF_PROFILE" != mixed ]]; then
-  echo "PERF_PROFILE must be uniform or mixed" >&2
+if [[ "$PERF_PROFILE" != uniform && "$PERF_PROFILE" != mixed && "$PERF_PROFILE" != cadence ]]; then
+  echo "PERF_PROFILE must be uniform, mixed, or cadence" >&2
   exit 2
 fi
 if [[ "$PERF_HIGH_CARD_ENABLED" != on && "$PERF_HIGH_CARD_ENABLED" != off ]]; then
   echo "PERF_HIGH_CARD_ENABLED must be on or off" >&2
-  exit 2
-fi
-if [[ "$PERF_BROWSER_DESTRUCTIVE_APPROVED" != on && "$PERF_BROWSER_DESTRUCTIVE_APPROVED" != off ]]; then
-  echo "PERF_BROWSER_DESTRUCTIVE_APPROVED must be on or off" >&2
   exit 2
 fi
 if ! [[ "$PERF_SETTLED_IDLE_CPU_PERCENT" =~ ^[0-9]+([.][0-9]+)?$ ]] || \
@@ -80,12 +88,12 @@ if ! [[ "$PERF_SETTLED_IDLE_CPU_PERCENT" =~ ^[0-9]+([.][0-9]+)?$ ]] || \
   exit 2
 fi
 
-export PERF_IMAGE PERF_API_TOKEN PERF_BREADCRUMB_MODE PERF_DIAGNOSTICS_MODE PERF_MOVE_FAILURE_MODE PERF_REMOTE_ADDRESS PERF_PAIRS PERF_NODES_PER_PAIR PERF_HOST_PORT
+export PERF_IMAGE PERF_API_TOKEN PERF_BREADCRUMB_MODE PERF_DIAGNOSTICS_MODE PERF_BROWSER_DESTRUCTIVE_APPROVED PERF_MOVE_FAILURE_MODE PERF_REMOTE_ADDRESS PERF_PAIRS PERF_NODES_PER_PAIR PERF_HOST_PORT
 export PERF_PROFILE PERF_HIGH_CARD_ENABLED
+export PERF_MINIMUM_MERGED_NODES
 export PERF_POST_TARGET_OBSERVATION_SECONDS
 export PERF_SETTLED_IDLE_CPU_PERCENT
 export PERF_NODE_BINARY PERF_PLAYWRIGHT_MODULE PERF_NODE_PATH
-export PERF_BROWSER_DESTRUCTIVE_APPROVED
 export PERF_LAB_SOURCE_DIR="$SCRIPT_DIR"
 export PERF_ARTIFACT_DIR="$ARTIFACT_DIR"
 export PERF_PROJECT="$PROJECT"
@@ -124,8 +132,12 @@ topology_spec = normalize_topology_spec(
     os.environ["PERF_PROFILE"], requested_pairs, requested_nodes,
     os.environ["PERF_HIGH_CARD_ENABLED"] == "on",
 )
-from seed_config import MIXED_RATE_LIMIT_BYTES_PER_SECOND
-rate_limit = MIXED_RATE_LIMIT_BYTES_PER_SECOND if os.environ["PERF_PROFILE"] == "mixed" else 0
+from seed_config import rate_limit_for_profile
+rate_limit = rate_limit_for_profile(os.environ["PERF_PROFILE"])
+effective_high_card_enabled = next(
+    (pair.get("enabled") for pair in topology_spec["pairs"]
+     if pair.get("role") == "high-cardinality-idle"), True
+)
 payload = {
     "schema": "seedsync.performance-lab.run.v1",
     "phase": sys.argv[2],
@@ -141,7 +153,7 @@ payload = {
     "requested_pairs": requested_pairs,
     "requested_nodes_per_pair": requested_nodes,
     "profile": os.environ["PERF_PROFILE"],
-    "high_card_enabled": os.environ["PERF_HIGH_CARD_ENABLED"] == "on",
+    "high_card_enabled": effective_high_card_enabled,
     "topology_spec": topology_spec,
     "pair_node_counts": {
         pair["id"]: {
@@ -154,6 +166,7 @@ payload = {
     "rate_limit_bytes_per_second": rate_limit,
     "post_target_observation_seconds": int(os.environ["PERF_POST_TARGET_OBSERVATION_SECONDS"]),
     "settled_idle_cpu_threshold_percent": float(os.environ["PERF_SETTLED_IDLE_CPU_PERCENT"]),
+    "minimum_expected_merged_model_tree_nodes": int(os.environ["PERF_MINIMUM_MERGED_NODES"]),
     "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
 }
 
@@ -516,9 +529,14 @@ PY
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     manifest = json.load(handle)
+topology = manifest.get("topology", {})
 total = 0
+summary_children_by_pair = topology.get("summary_children_by_pair")
 for pair in manifest.get("path_pairs", []):
     if pair.get("enabled") is False:
+        continue
+    if isinstance(summary_children_by_pair, dict) and pair.get("id") in summary_children_by_pair:
+        total += int(summary_children_by_pair[pair["id"]])
         continue
     nodes = pair.get("nodes_local")
     if type(nodes) is not int or nodes < 0:
@@ -900,6 +918,7 @@ PY
       --cgroup-stats "$cgroup_cpu_series" \
       --phase-timing "$phase_dir/phase-timing.json" \
       --settled-idle-cpu-percent "$PERF_SETTLED_IDLE_CPU_PERCENT" \
+      --minimum-merged-nodes "$PERF_MINIMUM_MERGED_NODES" \
       --breadcrumb-mode "$PERF_BREADCRUMB_MODE" \
       "${target_argument[@]}" || metrics_status=$?
   else
@@ -919,6 +938,7 @@ PY
       --label "$label" \
       --phase-timing "$phase_dir/phase-timing.json" \
       --settled-idle-cpu-percent "$PERF_SETTLED_IDLE_CPU_PERCENT" \
+      --minimum-merged-nodes "$PERF_MINIMUM_MERGED_NODES" \
       --breadcrumb-mode "$PERF_BREADCRUMB_MODE" \
       "${external_target_argument[@]}" || metrics_status=$?
   fi
@@ -1071,6 +1091,7 @@ run_id_digest = run_manifest.get("run_id_digest")
 if not isinstance(run_id_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", run_id_digest):
     raise SystemExit("run identity digest is missing or invalid")
 targets = []
+target_descriptors = []
 for pair in manifest.get("path_pairs", []):
     if pair.get("role") != "ordinary-active":
         continue
@@ -1079,16 +1100,42 @@ for pair in manifest.get("path_pairs", []):
         if parts and parts[0] == pair.get("directory"):
             parts = parts[1:]
         targets.append(posixpath.join(str(pair.get("local_path", "")), *parts))
+        target_descriptors.append(target)
 if len(targets) != 1:
-    raise SystemExit("manifest must resolve exactly one synthetic browser target")
+    raise SystemExit("manifest must resolve exactly one browser target")
+if len(target_descriptors) != 1:
+    raise SystemExit("manifest must resolve exactly one browser target descriptor")
+descriptor = target_descriptors[0]
+kind = descriptor.get("kind", "file")
+if kind not in ("file", "directory"):
+    raise SystemExit("manifest browser target kind is unsupported")
+if kind == "directory":
+    for field in ("size_bytes", "file_count", "directory_count", "max_depth", "storage_size_bytes"):
+        if not isinstance(descriptor.get(field), int) or descriptor[field] <= 0:
+            raise SystemExit(f"manifest browser directory target has invalid {field}")
+    if descriptor["storage_size_bytes"] > descriptor["size_bytes"]:
+        raise SystemExit("manifest browser directory target storage bound exceeds logical aggregate")
+    if descriptor.get("storage_mode") != "real-bytes-hardlink-deduplicated":
+        raise SystemExit("manifest browser directory target has unexpected storage mode")
 def digest(value):
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
 topology_payload = json.dumps(manifest.get("data_topology_spec"), sort_keys=True, separators=(",", ":"))
+binding_target = {"kind": kind}
+if kind == "directory":
+    binding_target.update({
+        "size_bytes": descriptor["size_bytes"],
+        "storage_mode": descriptor["storage_mode"],
+        "storage_size_bytes": descriptor["storage_size_bytes"],
+        "file_count": descriptor["file_count"],
+        "directory_count": descriptor["directory_count"],
+        "max_depth": descriptor["max_depth"],
+    })
 binding = {
     "schema": "seedsync.performance-lab.browser-target-binding.v1",
     "validated": True,
     "service": "app",
     "target_path": targets[0],
+    "target": binding_target,
     "container_id_digest": digest(app_id),
     "project_digest": project_digest,
     "volume": {
@@ -1118,11 +1165,39 @@ browser() {
     exit 2
   fi
   ensure_artifacts
-  write_run_metadata "browser-$label"
   local phase_dir="$ARTIFACT_DIR/$label"
   mkdir -p "$phase_dir"
   local manifest="$ARTIFACT_DIR/fixture-manifest.json"
   [[ -f "$manifest" ]] || { echo "fixture manifest is missing: $manifest" >&2; return 1; }
+  local target_kind
+  target_kind="$(python3 - "$manifest" <<'PY'
+import json, sys
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+targets = [target for pair in manifest.get("path_pairs", [])
+           if pair.get("role") == "ordinary-active"
+           for target in pair.get("remote_only_targets", [])]
+if len(targets) != 1:
+    raise SystemExit("manifest must resolve exactly one browser target")
+print(targets[0].get("kind", "file"))
+PY
+)"
+  case "$target_kind" in
+    directory)
+      if [[ -z "$PROJECT_WAS_EXPLICIT" ]]; then
+        echo "directory browser target requires a fresh unique PERF_PROJECT; do not reuse the default project" >&2
+        return 2
+      fi
+      local browser_marker="$ARTIFACT_DIR/browser-run.marker"
+      if [[ -e "$browser_marker" ]]; then
+        echo "directory browser target already ran for this PERF_PROJECT; use a fresh unique PERF_PROJECT" >&2
+        return 2
+      fi
+      printf '%s\n' 'seedsync.performance-lab.browser-run.v1' > "$browser_marker"
+      ;;
+    file) ;;
+    *) echo "manifest browser target kind is unsupported: $target_kind" >&2; return 1 ;;
+  esac
+  write_run_metadata "browser-$label"
   local output="$phase_dir/browser-timeline.json"
   local binding="$phase_dir/browser-target-binding.json"
   # Capture the sanitized immutable image identity before browser actions. The
@@ -1145,10 +1220,11 @@ PY
     return 1
   }
   validate_browser_target_binding "$manifest" "$ARTIFACT_DIR/run-manifest.json" "$binding"
-  echo "Live browser Delete Local binding (sanitized digests):"
-  cat "$binding"
-  local delete_targets
-  delete_targets="$(python3 - "$manifest" <<'PY'
+  if [[ "$target_kind" == file ]]; then
+    echo "Live browser Delete Local binding (sanitized digests):"
+    cat "$binding"
+    local delete_targets
+    delete_targets="$(python3 - "$manifest" <<'PY'
 import json, posixpath, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     manifest = json.load(handle)
@@ -1162,12 +1238,16 @@ for pair in manifest.get("path_pairs", []):
         print(posixpath.join(str(pair.get("local_path", "")), *parts))
 PY
 )"
-  [[ -n "$delete_targets" ]] || { echo "no synthetic Delete Local target found" >&2; return 1; }
-  echo "Browser probe Delete Local targets (synthetic Docker volume only):"
-  printf '  %s\n' "$delete_targets"
-  if [[ "$PERF_BROWSER_DESTRUCTIVE_APPROVED" != on ]]; then
-    echo "Refusing destructive browser probe without explicit approval; set PERF_BROWSER_DESTRUCTIVE_APPROVED=on only after the displayed target set is approved" >&2
-    return 2
+    [[ -n "$delete_targets" ]] || { echo "no synthetic Delete Local target found" >&2; return 1; }
+    echo "Browser probe Delete Local targets (synthetic Docker volume only):"
+    printf '  %s\n' "$delete_targets"
+    if [[ "$PERF_BROWSER_DESTRUCTIVE_APPROVED" != on ]]; then
+      echo "Refusing destructive browser probe without explicit approval; set PERF_BROWSER_DESTRUCTIVE_APPROVED=on only after the displayed target set is approved" >&2
+      return 2
+    fi
+  else
+    echo "Live browser target binding (sanitized digests):"
+    cat "$binding"
   fi
   local node_path_args=()
   if [[ -n "$PERF_NODE_PATH" ]]; then

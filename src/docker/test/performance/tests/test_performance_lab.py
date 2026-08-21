@@ -7,6 +7,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -24,9 +25,20 @@ from capture_metrics import (
     summarize_external,
     summarize_cgroup_cpu,
     load_cgroup_cpu_payload,
+    _expected_summary_root_count,
 )
 import generate_fixture as fixture_module
 from generate_fixture import (
+    CADENCE_ACTIVE_REMOTE_NODES,
+    CADENCE_ACTIVE_REMOTE_ONLY_NODES,
+    CADENCE_TARGET_DIRECTORY_COUNT,
+    CADENCE_TARGET_FILE_COUNT,
+    CADENCE_TARGET_LARGE_FILE_COUNT,
+    CADENCE_TARGET_LARGE_FILE_SIZE_BYTES,
+    CADENCE_TARGET_MAX_DEPTH,
+    CADENCE_TARGET_SMALL_FILE_SIZE_BYTES,
+    CADENCE_TARGET_SIZE_BYTES,
+    CADENCE_TARGET_STORAGE_SIZE_BYTES,
     MIXED_HIGH_CARD_NODES,
     config_fingerprint,
     generate_fixture,
@@ -34,7 +46,7 @@ from generate_fixture import (
     topology_fingerprint,
 )
 import sanitize_docker_state
-from seed_config import seed_config
+from seed_config import CADENCE_RATE_LIMIT_BYTES_PER_SECOND, seed_config
 from common.config import Config
 from web.auth_store import ApiKeyStore, _verify_secret
 
@@ -150,6 +162,35 @@ def test_external_summary_requires_validated_end_state_and_resets_on_end_change(
     assert changed_summary["acceptance_valid"] is False
 
 
+def test_external_summary_uses_cadence_summary_children_and_rejects_malformed_contract():
+    manifest = {
+        "fixture_fingerprint": "fixture", "config_fingerprint": "config",
+        "topology": {"summary_children_by_pair": {
+            "path-pair-01": 4, "path-pair-02": 1, "path-pair-03": 1,
+            "path-pair-04": 1, "path-pair-05": 1, "path-pair-06": 1,
+        }},
+        "path_pairs": [
+            {"id": f"path-pair-{index:02d}", "enabled": True, "nodes_local": 12,
+             "directory": f"sample-{index:02d}", "remote_only_targets": []}
+            for index in range(1, 7)
+        ],
+    }
+    assert _expected_summary_root_count(manifest) == 9
+    samples = [
+        {"sample_index": index, "root_count": 9, "model_version": 4, "app_cpu_percent": 0.5}
+        for index in range(3)
+    ]
+    summary = summarize_external(
+        samples, _external_stats(), manifest, "candidate", "off",
+        {"model_target_epoch_ms": 3000}, target_index=2,
+        remote_docker_stats=_external_stats(),
+    )
+    assert summary["expected_summary_root_cardinality"] == 9
+    malformed = {**manifest, "topology": {"summary_children_by_pair": {"path-pair-01": "4"}}}
+    with pytest.raises(ValueError, match="summary_children_by_pair"):
+        _expected_summary_root_count(malformed)
+
+
 def test_diagnostics_summary_requires_validated_end_state_when_cgroup_is_present():
     manifest = {"fixture_fingerprint": "fixture", "topology": {
         "expected_merged_model_tree_nodes": 200001,
@@ -230,6 +271,17 @@ def test_fixture_is_deterministic_and_idempotent(tmp_path):
         assert stat.S_IMODE((local_root / "path-pair-01" / "bucket-000").stat().st_mode) == 0o775
 
 
+def test_legacy_generation_does_not_call_cadence_entry_materialization(tmp_path, monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("legacy profile materialized cadence entry sets")
+    monkeypatch.setattr(fixture_module, "_side_entries", unexpected)
+    generate_fixture(tmp_path / "uniform-local", tmp_path / "uniform-remote",
+                     tmp_path / "uniform.json", pairs=1, nodes_per_pair=4)
+    monkeypatch.setattr(fixture_module, "MIXED_HIGH_CARD_NODES", 4)
+    generate_fixture(tmp_path / "mixed-local", tmp_path / "mixed-remote",
+                     tmp_path / "mixed.json", profile="mixed")
+
+
 def test_mixed_profile_normalizes_roles_counts_and_enabled_state():
     spec = normalize_topology_spec("mixed", high_card_enabled=False)
     assert [pair["role"] for pair in spec["pairs"]] == ["ordinary-active", "high-cardinality-idle"]
@@ -249,10 +301,254 @@ def test_mixed_profile_rejects_misleading_topology_overrides():
         normalize_topology_spec("mixed", nodes_per_pair=4)
 
 
+def test_cadence_profile_normalizes_six_enabled_neutral_pairs_and_asymmetric_shape():
+    spec = normalize_topology_spec("cadence")
+    assert len(spec["pairs"]) == 6
+    assert all(pair["enabled"] for pair in spec["pairs"])
+    active = spec["pairs"][0]
+    assert active["id"] == "path-pair-01"
+    assert active["directory"] == "active-01"
+    assert active["role"] == "ordinary-active"
+    assert active["auto_queue"] is False
+    assert active["nodes_local"] == 1_200
+    assert active["nodes_remote"] == 1_149
+    assert active["shared_nodes"] == 750
+    assert active["local_only_nodes"] == 450
+    assert active["remote_only_nodes"] == 399
+    target = active["remote_only_targets"][0]
+    assert target["kind"] == "directory"
+    assert target["relative_path"] == "active-01/remote-workload"
+    assert target["size_bytes"] == CADENCE_TARGET_SIZE_BYTES == (
+        CADENCE_TARGET_LARGE_FILE_COUNT * CADENCE_TARGET_LARGE_FILE_SIZE_BYTES
+        + (CADENCE_TARGET_FILE_COUNT - CADENCE_TARGET_LARGE_FILE_COUNT)
+        * CADENCE_TARGET_SMALL_FILE_SIZE_BYTES
+    )
+    assert target["storage_mode"] == "real-bytes-hardlink-deduplicated"
+    assert target["storage_size_bytes"] == CADENCE_TARGET_STORAGE_SIZE_BYTES == (
+        CADENCE_TARGET_LARGE_FILE_SIZE_BYTES + CADENCE_TARGET_SMALL_FILE_SIZE_BYTES
+    )
+    assert target["file_count"] == CADENCE_TARGET_FILE_COUNT == 1_199
+    assert target["directory_count"] == CADENCE_TARGET_DIRECTORY_COUNT == 21
+    assert target["max_depth"] == CADENCE_TARGET_MAX_DEPTH == 3
+    assert target["large_file_count"] == CADENCE_TARGET_LARGE_FILE_COUNT == 1_001
+    assert len(active["fractional_mtime_overlaps"]) == 12
+    for case in active["fractional_mtime_overlaps"]:
+        assert case["local_mtime_ns"] // 1_000_000_000 == case["remote_mtime_ns"] // 1_000_000_000
+        assert case["local_mtime_ns"] != case["remote_mtime_ns"]
+    assert all(pair["directory"].startswith(("active-", "sample-")) for pair in spec["pairs"])
+
+
+def test_cadence_fixture_timing_contract_supports_genuine_forward_gaps():
+    stream_count = 4
+    transfer_seconds = CADENCE_TARGET_SIZE_BYTES / (
+        CADENCE_RATE_LIMIT_BYTES_PER_SECOND * stream_count
+    )
+    assert CADENCE_TARGET_SIZE_BYTES == 1_381_318_918_144
+    first_wave_seconds = CADENCE_TARGET_LARGE_FILE_SIZE_BYTES / CADENCE_RATE_LIMIT_BYTES_PER_SECOND
+    assert 21_000 <= first_wave_seconds <= 22_000
+    assert transfer_seconds > first_wave_seconds
+
+
+def test_cadence_fixture_records_asymmetric_counts_staging_mtimes_and_retained_reuse(tmp_path):
+    local_root, remote_root = tmp_path / "local", tmp_path / "remote"
+    first = generate_fixture(local_root, remote_root, tmp_path / "first.json", profile="cadence")
+    active = first["topology"]["file_counts_by_pair"]["path-pair-01"]
+    assert active == {
+        "local": 1_200,
+        "remote": CADENCE_ACTIVE_REMOTE_NODES + CADENCE_TARGET_FILE_COUNT,
+        "shared": 750,
+        "local_only": 450,
+        "remote_only": CADENCE_ACTIVE_REMOTE_ONLY_NODES + CADENCE_TARGET_FILE_COUNT,
+    }
+    active_dirs = first["topology"]["directory_counts_by_pair"]["path-pair-01"]
+    assert active_dirs["local"] > 20 and active_dirs["remote"] > 20
+    assert active_dirs["shared"] > 0
+    assert first["topology"]["summary_children_by_pair"]["path-pair-01"] == 4
+    target_descriptor = first["path_pairs"][0]["remote_only_targets"][0]
+    target_root = remote_root / target_descriptor["relative_path"]
+    assert not (local_root / target_descriptor["relative_path"]).exists()
+    assert "staging_cases" not in first
+    target_files = sorted(target_root.rglob("*.bin"))
+    target_directories = [target_root, *[path for path in target_root.rglob("*") if path.is_dir()]]
+    assert len(target_files) == CADENCE_TARGET_FILE_COUNT
+    assert len(target_directories) == CADENCE_TARGET_DIRECTORY_COUNT
+    assert max(len(path.relative_to(target_root).parts) for path in target_directories) == CADENCE_TARGET_MAX_DEPTH
+    assert Counter(path.stat().st_size for path in target_files) == Counter({
+        CADENCE_TARGET_LARGE_FILE_SIZE_BYTES: CADENCE_TARGET_LARGE_FILE_COUNT,
+        CADENCE_TARGET_SMALL_FILE_SIZE_BYTES: CADENCE_TARGET_FILE_COUNT - CADENCE_TARGET_LARGE_FILE_COUNT,
+    })
+    assert sum(path.stat().st_size for path in target_files) == CADENCE_TARGET_SIZE_BYTES
+    target_first_path = target_root / "group-00" / "payload-0000.bin"
+    def bounded_samples(path: Path) -> tuple[int, tuple[bytes, ...]]:
+        size = path.stat().st_size
+        chunk_size = 4096
+        offsets = (0, size // 2, max(0, size - chunk_size))
+        with path.open("rb") as handle:
+            samples = []
+            for offset in offsets:
+                handle.seek(offset)
+                samples.append(handle.read(chunk_size))
+        return size, tuple(samples)
+
+    target_first_size, target_first_samples = bounded_samples(target_first_path)
+    assert target_first_size == CADENCE_TARGET_LARGE_FILE_SIZE_BYTES
+    assert any(sample and sample != b"\0" * len(sample) for sample in target_first_samples)
+    inode_representatives = {}
+    for path in target_files:
+        stat_result = path.stat()
+        inode_representatives.setdefault((stat_result.st_dev, stat_result.st_ino), path)
+    assert len(inode_representatives) == 2
+    assert sum(path.stat().st_size for path in inode_representatives.values()) == target_descriptor["storage_size_bytes"]
+    large_peer = next(path for path in target_files if path.name == "payload-0001.bin")
+    small_template = next(path for path in target_files if path.name == "payload-1001.bin")
+    small_peer = next(path for path in target_files if path.name == "payload-1002.bin")
+    assert large_peer.stat().st_ino == target_first_path.stat().st_ino
+    assert small_peer.stat().st_ino == small_template.stat().st_ino
+    assert target_first_path.stat().st_nlink == CADENCE_TARGET_LARGE_FILE_COUNT < 1_024
+    assert small_template.stat().st_nlink == CADENCE_TARGET_FILE_COUNT - CADENCE_TARGET_LARGE_FILE_COUNT
+    assert first["topology"]["expected_file_counts_by_pair"]["path-pair-01"] == (
+        active["local"] + active["remote_only"]
+    )
+    assert [pair["name"] for pair in first["path_pairs"]] == [
+        pair["name"] for pair in first["experiment_spec"]["pairs"]
+    ]
+    overlap = first["experiment_spec"]["pairs"][0]["fractional_mtime_overlaps"][0]
+    local_mtime = (local_root / overlap["relative_path"]).stat().st_mtime_ns
+    remote_mtime = (remote_root / overlap["relative_path"]).stat().st_mtime_ns
+    assert local_mtime // 1_000_000_000 == remote_mtime // 1_000_000_000
+    assert local_mtime % 1_000_000_000 and remote_mtime % 1_000_000_000
+    assert local_mtime != remote_mtime
+    second = generate_fixture(local_root, remote_root, tmp_path / "second.json", profile="cadence")
+    assert second["fixture_fingerprint"] == first["fixture_fingerprint"]
+    assert second["topology"]["expected_file_counts_by_pair"] == first["topology"]["expected_file_counts_by_pair"]
+    retained_path = remote_root / target_descriptor["relative_path"] / "group-00" / "payload-0000.bin"
+    retained_size, retained_samples = bounded_samples(retained_path)
+    assert (retained_size, retained_samples) == (target_first_size, target_first_samples)
+
+
+def test_fixture_pair_roots_retain_runtime_ownership_contract(tmp_path):
+    local_root, remote_root = tmp_path / "local", tmp_path / "remote"
+    manifest_path = tmp_path / "fixture.json"
+    first = generate_fixture(local_root, remote_root, manifest_path, profile="cadence")
+    pair_directories = [pair["directory"] for pair in first["experiment_spec"]["pairs"]]
+
+    for root in (local_root, remote_root):
+        for directory in pair_directories:
+            pair_root = root / directory
+            assert pair_root.is_dir()
+            if os.name == "posix":
+                assert stat.S_IMODE(pair_root.stat().st_mode) == 0o775
+
+    for root in (local_root, remote_root):
+        for directory in pair_directories:
+            (root / directory).chmod(0o755)
+
+    generate_fixture(local_root, remote_root, tmp_path / "retained.json", profile="cadence")
+    for root in (local_root, remote_root):
+        for directory in pair_directories:
+            pair_root = root / directory
+            assert pair_root.is_dir()
+            if os.name == "posix":
+                assert stat.S_IMODE(pair_root.stat().st_mode) == 0o775
+
+
+def test_cadence_config_records_staging_and_rate_limit(tmp_path):
+    config_dir = tmp_path / "config"
+    seed_config(config_dir, "local-test-token", profile="cadence")
+    payload = json.loads((config_dir / "path_pairs.json").read_text(encoding="utf-8"))
+    assert payload["profile"] == "cadence"
+    assert payload["rate_limit_bytes_per_second"] == 64_000
+    assert payload["connection_contract"] == {
+        "parallel_files": 4,
+        "connections_per_root_file": 1,
+        "connections_per_dir_file": 1,
+        "total_connections": 4,
+    }
+    cadence_config = Config.from_file(str(config_dir / "settings.cfg"))
+    assert int(cadence_config.lftp.num_max_parallel_files_per_download) == 4
+    assert int(cadence_config.lftp.num_max_connections_per_root_file) == 1
+    assert int(cadence_config.lftp.num_max_connections_per_dir_file) == 1
+    assert int(cadence_config.lftp.num_max_total_connections) == 4
+    assert len(payload["path_pairs"]) == 6
+    assert all(pair["enabled"] for pair in payload["path_pairs"])
+    assert [pair["name"] for pair in payload["path_pairs"]] == [
+        pair["name"] for pair in payload["experiment_spec"]["pairs"]
+    ]
+    assert "staging_cases" not in payload
+    target = payload["path_pairs"][0]["remote_only_targets"][0]
+    assert target["kind"] == "directory"
+    assert target["file_count"] == CADENCE_TARGET_FILE_COUNT
+    assert target["directory_count"] == CADENCE_TARGET_DIRECTORY_COUNT
+    assert target["max_depth"] == CADENCE_TARGET_MAX_DEPTH
+    assert target["storage_mode"] == "real-bytes-hardlink-deduplicated"
+    assert target["storage_size_bytes"] == CADENCE_TARGET_STORAGE_SIZE_BYTES
+    persisted = json.loads((config_dir / "controller.persist").read_text(encoding="utf-8"))
+    assert "resume_sources" not in persisted
+
+
+def test_lab_cadence_summary_count_executes_manifest_calculation(tmp_path):
+    source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    start = source.index('expected_summary_count="$(python3')
+    python_start = source.index("<<'PY'\n", start) + len("<<'PY'\n")
+    python_end = source.index("\nPY\n", python_start)
+    manifest = {
+        "topology": {"summary_children_by_pair": {
+            "path-pair-01": 4, "path-pair-02": 1, "path-pair-03": 1,
+            "path-pair-04": 1, "path-pair-05": 1, "path-pair-06": 1,
+        }},
+        "path_pairs": [
+            {"id": f"path-pair-{index:02d}", "enabled": True, "nodes_local": 12,
+             "directory": f"sample-{index:02d}", "remote_only_targets": []}
+            for index in range(1, 7)
+        ],
+    }
+    manifest_path = tmp_path / "cadence-manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-c", source[python_start:python_end], str(manifest_path)],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "9"
+
+
 def test_run_metadata_mixed_profile_does_not_claim_uniform_nodes_per_pair():
     lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
     assert '"nodes_per_pair": requested_nodes if os.environ["PERF_PROFILE"] == "uniform" else None' in lab_source
     assert '"pair_node_counts"' in lab_source
+
+
+def test_cadence_lab_uses_small_merged_node_floor_without_changing_legacy_profiles():
+    lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    assert "PERF_MINIMUM_MERGED_NODES=2000" in lab_source
+    assert "PERF_MINIMUM_MERGED_NODES=200000" in lab_source
+    assert lab_source.count('--minimum-merged-nodes "$PERF_MINIMUM_MERGED_NODES"') == 2
+    assert '"minimum_expected_merged_model_tree_nodes": int(os.environ["PERF_MINIMUM_MERGED_NODES"])' in lab_source
+
+
+def test_run_metadata_records_effective_high_card_state_for_cadence_and_mixed(tmp_path):
+    source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    start = source.index('python3 - "$ARTIFACT_DIR/run-manifest.json" "$phase" <<\'PY\'')
+    python_start = source.index("import json\n", start)
+    python_end = source.index("\nPY\n", python_start)
+    env_base = os.environ.copy()
+    env_base.update({
+        "PERF_LAB_SOURCE_DIR": str(PERF_DIR), "PERF_PAIRS": "6", "PERF_NODES_PER_PAIR": "32000",
+        "PERF_RUN_ID": "worker-test", "PERF_PROJECT": "synthetic-project", "PERF_IMAGE": "synthetic-image",
+        "PERF_BREADCRUMB_MODE": "on", "PERF_DIAGNOSTICS_MODE": "on", "PERF_MOVE_FAILURE_MODE": "stale",
+        "PERF_REMOTE_ADDRESS": "remote", "PERF_HOST_PORT": "18800", "PERF_POST_TARGET_OBSERVATION_SECONDS": "150",
+        "PERF_SETTLED_IDLE_CPU_PERCENT": "1.0", "PERF_MINIMUM_MERGED_NODES": "2000",
+    })
+    cases = (("cadence", "on", True), ("cadence", "off", True), ("mixed", "off", False))
+    for profile, requested_high_card, expected_effective in cases:
+        env = dict(env_base, PERF_PROFILE=profile, PERF_HIGH_CARD_ENABLED=requested_high_card)
+        output = tmp_path / f"{profile}-{requested_high_card}.json"
+        result = subprocess.run(
+            [sys.executable, "-c", source[python_start:python_end], str(output), "worker-test"],
+            capture_output=True, text=True, env=env, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert json.loads(output.read_text(encoding="utf-8"))["high_card_enabled"] is expected_effective
 
 
 def test_mixed_fingerprints_are_deterministic_and_enabled_ab_is_data_stable():
@@ -341,6 +637,20 @@ def test_seed_config_cli_metadata_uses_normalized_profile_counts():
     assert '"requested_pairs": args.pairs' in source
     assert '"pair_node_counts"' in source
     assert '"config_fingerprint": config_fingerprint(spec)' in source
+
+
+def test_seed_config_cli_reports_effective_high_card_state(tmp_path):
+    env = os.environ.copy()
+    env["PERF_API_TOKEN"] = "effective-state-test-token"
+    for profile, expected in (("cadence", True), ("mixed", False)):
+        result = subprocess.run(
+            [sys.executable, str(PERF_DIR / "seed_config.py"),
+             "--config-dir", str(tmp_path / profile), "--profile", profile,
+             "--high-card-enabled", "off"],
+            capture_output=True, text=True, env=env, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["high_card_enabled"] is expected
 
 
 def test_seed_config_cli_reads_token_from_environment_only(tmp_path):
@@ -987,7 +1297,7 @@ def test_lab_uses_real_go_template_tabs_for_sanitized_docker_fields(tmp_path):
     assert image["identity_digest"] == hashlib.sha256(b"sha256:fixture-image").hexdigest()
 
 
-def test_browser_delete_local_requires_live_project_service_volume_and_marker_binding():
+def test_browser_requires_live_project_service_volume_and_marker_binding():
     lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
     browser_source = (PERF_DIR / "browser_probe.js").read_text(encoding="utf-8")
     assert "validate_browser_target_binding" in lab_source
@@ -1000,15 +1310,15 @@ def test_browser_delete_local_requires_live_project_service_volume_and_marker_bi
     assert "container_id_digest" in lab_source and "source_name_digest" in lab_source
     assert "--binding" in lab_source and "bindingPath" in browser_source
     assert "validated live app/project/service/volume/fixture binding" in browser_source
-    assert lab_source.index("validate_browser_target_binding") < lab_source.index(
-        "PERF_BROWSER_DESTRUCTIVE_APPROVED" , lab_source.index("browser()")
-    )
+    assert "PERF_BROWSER_DESTRUCTIVE_APPROVED" in lab_source
+    assert 'if [[ "$target_kind" == file ]]' in lab_source
+    assert "fresh unique PERF_PROJECT" in lab_source
 
 
 def test_readme_documents_mixed_profile_through_browser_and_cpu_gate():
     readme = (PERF_DIR / "README.md").read_text(encoding="utf-8")
     flow = readme[readme.index("export PERF_PROFILE=mixed"):readme.index("Worker self-check", readme.index("export PERF_PROFILE=mixed"))]
-    browser_flow = readme[readme.index("For a browser timeline"):readme.index("The browser lane")]
+    browser_flow = readme[readme.index("For the cadence directory browser timeline"):readme.index("Worker self-check", readme.index("For the cadence directory browser timeline"))]
     assert "PERF_PROFILE=mixed" in flow and "PERF_PROFILE=mixed" in browser_flow
     assert "lab.sh prepare" in flow and "lab.sh start" in browser_flow and "lab.sh browser candidate" in browser_flow
     assert "settled app-container CPU average" in readme
@@ -1151,6 +1461,12 @@ def test_mixed_rate_limit_is_recorded_and_uniform_default_is_unchanged(tmp_path)
     assert int(uniform_config.lftp.rate_limit) == 0
     mixed_pairs = json.loads((mixed_dir / "path_pairs.json").read_text(encoding="utf-8"))
     assert mixed_pairs["rate_limit_bytes_per_second"] == 64_000
+    assert mixed_pairs["connection_contract"] == {
+        "parallel_files": 4,
+        "connections_per_root_file": 4,
+        "connections_per_dir_file": 4,
+        "total_connections": 16,
+    }
     assert mixed_pairs["diagnostics_mode"] == "on"
 
 
@@ -1187,17 +1503,59 @@ def test_browser_harness_is_lazy_configurable_and_manifest_driven():
         assert event_name in source
     assert "lastSignature" in source and "if (signature === lastSignature) return" in source
     assert "waitForEnabledAction" in source
+    assert "waitForPathPairReconciliation" in source
+    assert "fetch('/server/model/v1/summary'" in source
+    assert "reconciled_local" in source and "reconciled_remote" in source
+    assert "target_path_pair_id_digest" in source
+    assert "ordinary-active pair must have a non-empty string id" in source
+    assert "localAbsent = enabled('Queue') && !enabled('Delete Local')" in source
+    assert "states.includes('local-absent') && localAbsent" in source
+    assert "localAbsentControlsAreReady" in source
+    reconciliation_slice = source[source.index("await attachTargetObserver"):source.index("const measurementEpoch")]
+    assert "await waitForPathPairReconciliation(page, target, timeoutMs, evidence)" in reconciliation_slice
+    summary_fetch = source[source.index("async function fetchSummaryForReconciliation"):source.index("async function selectTarget")]
+    assert summary_fetch.index("response.status < 200") < summary_fetch.index("response.json()")
+    assert "reconciliation-summary-transport" in summary_fetch
+    assert "reconciliation-summary-schema" in summary_fetch
+    assert "target-pair-not-unique" in summary_fetch
+    assert "reconciliation-flags-not-boolean" in summary_fetch
     assert "control_enabled_wait_ms" in source
-    assert "MAX_PROGRESS_GAP_MS = 1_250" in source
-    assert "delete_local: 1_200" in source
+    assert "waitForActiveProgressSamples" in source
+    assert "genuineProgressSamples" in source
+    assert "genuineVisibleSizeSamples" in source
+    assert "parseVisibleSize" in source
+    assert "typeof queueMarker !== 'number' || !Number.isFinite(queueMarker)" in source
+    wait_slice = source[source.index("async function waitForActiveProgressSamples"):source.index("async function waitForEnabledAction")]
+    assert "const source = Array.isArray(timeline.targetDomMutations)" in wait_slice
+    assert "const sizeBytes = parseVisibleSize(sizeInfo)" in wait_slice
+    assert "genuineVisibleSizeSamples >= minimumSamples" in wait_slice
+    assert "let regression = false" in wait_slice
+    assert "return !regression && genuineVisibleSizeSamples >= minimumSamples" in wait_slice
+    assert "Math.max(timeoutMs, 90_000)" in source
+    assert "window.__seedSyncPerfTimeline?.markMeasuredQueue?.() ?? null" in source
+    action_slice = source[source.index("async function clickAction"):source.index("function invalidPrecondition")]
+    assert "action-http-rejected" in source[source.index("function requireAcceptedActionResponse"):source.index("async function clickAction")]
+    confirm_slice_start = action_slice.index("if (confirm)")
+    first_click_at = action_slice.index("  const clickAt = await page.evaluate", confirm_slice_start)
+    confirm_slice_end = action_slice.index("  const clickAt = await page.evaluate", first_click_at + 1)
+    confirm_action = action_slice[confirm_slice_start:confirm_slice_end]
+    direct_action = action_slice[action_slice.rindex("  const clickAt = await page.evaluate"):]
+    for branch in (confirm_action, direct_action):
+        assert branch.index("requireAcceptedActionResponse") < branch.index("const renderedState = await waitForState")
+    assert "accepted_marker_t_ms" in action_slice
+    assert "cleanupRecord.queue_accepted = true" in source
+    assert "cleanupRecord.mutation_accepted = true" in source
+    assert "residual_remote_only_queueable" in source
+    assert "measurement_boundary" in source and "progress_monotonic" in source
     assert "ACTION_RENDER_LIMITS_MS[action]" in source
-    assert "progressSummary.sample_count <= 1" in source
-    progress_gap = source[source.index("function progressGap"):source.index("function latencyStats")]
-    assert "progress > 0 && progress < 100" in progress_gap
-    assert "status !== 'stopped'" in progress_gap and "status !== 'downloaded'" in progress_gap
     assert "await exerciseActions(page, target, targetId, timeoutMs, evidence, modelStreamPath)" in source
-    assert "readTargetId(page, target.name, timeoutMs)" in source
-    assert "async function readTargetId(page, name, timeoutMs)" in source
+    assert "readTargetId(page, target.name, timeoutMs, target)" in source
+    assert "async function readTargetId(page, name, timeoutMs, target = null)" in source
+    assert "synthetic browser target row is not a directory" in source
+    assert "targetRawProgress" in source and "transferred_size" in source
+    assert "target_dom_mutations" in source and "visible_progress" in source
+    assert "visible_size_info" in source and "visibleSizeGap" in source
+    assert "main_thread_responsiveness" in source and "heartbeat" in source
     assert "const actions = evidence.actions" in source
     assert "const cleanupRecord =" in source and "record.steps.push" in source
     assert "evidence.actions = await exerciseActions" not in source
@@ -1208,14 +1566,19 @@ def test_browser_harness_is_lazy_configurable_and_manifest_driven():
         source.index("async function waitForActiveMaterialization"):
         source.index("async function waitForEnabledAction")
     ]
-    assert "progress > 0 && progress < 100" in active_materialization
-    assert "status === 'downloading'" not in active_materialization
+    assert "rawAdvancing" in active_materialization
+    assert "status === 'downloading'" in active_materialization
+    assert "stopEnabled" in active_materialization
+    assert "progress > 0 && progress < 100" not in active_materialization
+    assert "raw_progress_monotonic" in source
+    assert "evidence.statistics.progress_gap = visibleSizeSummary" in source
+    assert "eventTargetRecords" in source and "target_bearing" in source
+    assert "item.target_bearing === true" in source
+    assert "apply_t_ms" in source and "receive_to_apply_ms" in source
     finally_block = source[source.index("} finally {"):source.index("function baseEvidence")]
     assert "await closeQuietly(context);" in finally_block
     assert "await closeQuietly(browser);" in finally_block
-    assert "const LOCAL_ABSENT_STATES = ['deleted', 'default-remote', 'local-absent']" in source
-    assert "record.residual_local_absent = readinessIsQueueable(residual)" in source
-    assert "record.restored_state = record.residual_state" in source
+    assert "record.transfer_quiescent" in source and "partial_retained" not in source
     assert "run_id_digest" in source and "image_tag_digest" in source and "project_digest" in source
     assert "stableDigest" in source
     assert "image: runManifest" not in source and "project: runManifest" not in source
@@ -1226,7 +1589,13 @@ def test_browser_harness_is_lazy_configurable_and_manifest_driven():
     assert "PERF_HOST_PORT" in lab_source
     assert "PERF_BROWSER_DESTRUCTIVE_APPROVED" in source
     assert "PERF_BROWSER_DESTRUCTIVE_APPROVED" in lab_source
-    assert "Browser probe Delete Local targets" in lab_source
+    assert "fresh unique PERF_PROJECT" in lab_source
+    assert 'browser_marker="$ARTIFACT_DIR/browser-run.marker"' in lab_source
+    assert 'browser_marker="$phase_dir/browser-run.marker"' not in lab_source
+    assert "Delete Local" in source and "Delete Local" in lab_source
+    assert "target.kind === 'directory'" in source
+    assert "kind = descriptor.get(\"kind\", \"file\")" in lab_source
+    assert "profile === 'legacy-file'" in source
     assert '"same_image_identity"' in lab_source
     assert 'identity_digest' in lab_source
     assert '--docker-stats "$app_docker_stats_series"' in lab_source
@@ -1243,6 +1612,7 @@ def test_browser_harness_is_lazy_configurable_and_manifest_driven():
     action_slice = source[source.index("async function exerciseActions"):source.index("function finalizeEvidence")]
     assert "try {" in action_slice and "finally" in action_slice
     assert "residual_state" in source and "cleanup.pass" in source
+    assert "partial_retained" not in source
     assert "PERF_DIAGNOSTICS_MODE" in lab_source
     assert "model/v1/summary" in lab_source
     assert "stats-sample" in lab_source and "docker-stats-series" in lab_source
@@ -1253,23 +1623,24 @@ def test_browser_harness_is_lazy_configurable_and_manifest_driven():
     assert "--api-token" not in main_slice
 
 
-def test_browser_harness_normalizes_manifest_target_and_records_preconditions():
+def test_browser_harness_requires_fresh_manifest_target_and_records_preconditions():
     source = (PERF_DIR / "browser_probe.js").read_text(encoding="utf-8")
-    assert "MAX_READINESS_STEPS" in source
+    assert "establishFreshReadiness" in source
+    assert "fresh remote-only before Queue" in source
     assert "normalizeTarget" in source
     assert "readActionPrecondition" in source
     assert "initial_precondition" in source and "final_precondition" in source
     assert "pre_action" in source and "controls" in source
     assert "invalid-precondition" in source
-    assert "result.measured = false" in source
     assert "readinessIsQueueable" in source
-    assert "await normalizeTarget(page, target, targetId, timeoutMs, evidence)" in source
+    assert "await establishReadiness(page, target, targetId, timeoutMs, evidence)" in source
     assert "&& evidence.readiness.pass" in source
     assert "beginMeasurement()" in source and "markMeasuredQueue()" in source
     assert "sample_epoch_source: 'post-measured-queue'" in source
     assert "targetIdentityMatches" in source and "identity_match" in source
     assert "targetId ? id === targetId : title === targetName" in source
     assert "confirmation_identity_match" in source
+    assert "measuredQueueMs == null || Number(item.t_ms) >= Number(measuredQueueMs)" in source
 
 
 def test_browser_self_test_is_documented_as_worker_check():
@@ -1277,6 +1648,15 @@ def test_browser_self_test_is_documented_as_worker_check():
     assert "browser_probe.js --self-test" in readme
     assert "worker self-check" in readme.lower()
     assert "verifier/final validation" in readme
+    assert "visible `.size_info` progress requires at least 20 genuine" in readme
+    assert "p50 <=150 ms" in readme and "p95 <=200 ms" in readme and "<=1000 ms" in readme
+    assert "1,199 real-byte files" in readme and "21 directories" in readme
+    assert "maximum relative depth 3" in readme and "1,381,318,918,144" in readme
+    assert "One thousand one 1,316 MiB files" in readme and "remaining 198 files are" in readme
+    assert "storage_mode=real-bytes-hardlink-deduplicated" in readme
+    assert "1,379,991,552" in readme and "6 hours" in readme
+    assert "no staging artifact" in readme and "absent from the local fixture volume before Queue" in readme
+    assert "forward-cadence evidence threshold" in readme
 
 
 def test_browser_probe_self_test_runs_without_playwright():
@@ -1294,11 +1674,55 @@ def test_browser_probe_self_test_runs_without_playwright():
         "readiness_matrix": True,
         "stable_identity_reorder": True,
         "measurement_epoch": True,
+        "progress_gap_statistics": True,
+        "progress_gap_inactive_reset": True,
+        "progress_gap_duplicate_equal": True,
+        "progress_gap_status_only": True,
+        "raw_progress_gap_duplicate_equal": True,
+        "raw_progress_gap_regression": True,
+        "raw_progress_gap_null_ignored": True,
+        "visible_size_info_duplicate_equal": True,
+        "visible_size_info_zero_regression": True,
+        "progress_gap_decreasing": True,
+        "progress_gap_zero_regression": True,
+        "progress_gap_insufficient_samples": True,
+        "progress_gap_p50_threshold": True,
+        "progress_gap_p95_threshold": True,
+        "progress_gap_max_threshold": True,
+        "progress_gap_allowed_outlier": True,
+        "progress_monotonic": True,
+        "progress_monotonic_pass_fail": True,
+        "progress_wait_zero_regression": True,
+        "raw_progress_wait_byte_values": True,
+        "raw_progress_activity_above_percent_zero": True,
+        "target_apply_causal_attribution": True,
+        "main_thread_responsiveness": True,
+        "measurement_boundary": True,
+        "reconciliation_summary_readiness": True,
     }
+    assert payload["statistics"]["progress_gap"] == {
+        "p50_ms": 100,
+        "p95_ms": 100,
+        "max_ms": 900,
+        "sample_count": 21,
+        "active_sample_count": 21,
+        "gap_count": 20,
+        "gaps_ms": [100] * 19 + [900],
+        "monotonic": True,
+        "regression_count": 0,
+        "value_field": "size_info",
+    }
+    assert payload["statistics"]["visible_size_info_gap"] == payload["statistics"]["progress_gap"]
+    assert payload["thresholds"]["minimum_progress_gap_count"] == 20
+    assert payload["thresholds"]["progress_gap_p50_ms"] == 150
+    assert payload["thresholds"]["progress_gap_p95_ms"] == 200
+    assert payload["thresholds"]["max_progress_gap_ms"] == 1000
+    assert payload["thresholds"]["progress_monotonic"] is True
+    assert payload["thresholds"]["measurement_boundary"] is True
     assert payload["pass"] is True
 
 
-def test_browser_probe_refuses_delete_actions_without_explicit_approval(tmp_path):
+def test_browser_probe_requires_validated_binding_before_live_run(tmp_path):
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node is unavailable for the browser probe approval check")
@@ -1313,12 +1737,15 @@ def test_browser_probe_refuses_delete_actions_without_explicit_approval(tmp_path
             "role": "ordinary-active",
             "directory": "path-pair-01",
             "local_path": "/mounts/path-pair-01",
-            "remote_only_targets": [{"relative_path": "path-pair-01/remote-only-target.bin"}],
+            "remote_only_targets": [{
+                "kind": "directory", "relative_path": "path-pair-01/remote-workload",
+                "size_bytes": 1024, "storage_mode": "real-bytes-hardlink-deduplicated",
+                "storage_size_bytes": 128, "file_count": 20, "directory_count": 3, "max_depth": 2,
+            }],
         }],
     }), encoding="utf-8")
     environment = os.environ.copy()
     environment["PERF_API_TOKEN"] = "synthetic-test-token"
-    environment.pop("PERF_BROWSER_DESTRUCTIVE_APPROVED", None)
     result = subprocess.run([
         node, str(PERF_DIR / "browser_probe.js"),
         "--label", "candidate",
@@ -1329,5 +1756,5 @@ def test_browser_probe_refuses_delete_actions_without_explicit_approval(tmp_path
     assert result.returncode != 0
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["pass"] is False
-    assert payload["failure_classification"] == "destructive-approval"
-    assert "PERF_BROWSER_DESTRUCTIVE_APPROVED=on" in result.stderr
+    assert payload["failure_classification"] == "live-binding"
+    assert "validated live app/project/service/volume/fixture binding" in result.stderr

@@ -15,8 +15,18 @@ const MAX_EVENTS = 256;
 const MAX_MUTATIONS = 1024;
 const MAX_ERRORS = 64;
 const DEFAULT_TIMEOUT_MS = 60_000;
-const MAX_READINESS_STEPS = 4;
-const MAX_PROGRESS_GAP_MS = 1_250;
+const MIN_ACTIVE_PROGRESS_SAMPLES = 21;
+const MIN_PROGRESS_GAPS = MIN_ACTIVE_PROGRESS_SAMPLES - 1;
+const PROGRESS_GAP_P50_LIMIT_MS = 150;
+const PROGRESS_GAP_P95_LIMIT_MS = 200;
+const MAX_PROGRESS_GAP_MS = 1_000;
+const MAIN_THREAD_HEARTBEAT_INTERVAL_MS = 100;
+const MIN_MAIN_THREAD_HEARTBEATS = 5;
+const MAIN_THREAD_DRIFT_LIMIT_MS = 250;
+const MAX_MAIN_THREAD_HEARTBEATS = 256;
+const TERMINAL_PROGRESS_STATUSES = new Set(['stopped', 'downloaded', 'complete', 'completed']);
+const RECONCILIATION_POLL_INTERVAL_MS = 100;
+const MAX_RECONCILIATION_OBSERVATIONS = 64;
 const ACTION_RENDER_LIMITS_MS = Object.freeze({
   queue: 250,
   stop: 250,
@@ -24,12 +34,9 @@ const ACTION_RENDER_LIMITS_MS = Object.freeze({
   requeue: 250,
 });
 const QUEUEABLE_STATES = new Set(['default', 'default-remote', 'stopped', 'deleted', 'corrupt']);
-// Deleting an incomplete first download returns the target to its ordinary
-// remote-only state. A target with completed-download history is instead
-// rendered as deleted. Both prove that local content is absent and Queue is
-// available; requiring only the historical state turns a successful delete
-// into a multi-minute false timeout on a freshly seeded fixture.
 const LOCAL_ABSENT_STATES = ['deleted', 'default-remote', 'local-absent'];
+const FRESH_REMOTE_ONLY_STATE = 'default-remote';
+const MAX_READINESS_STEPS = 4;
 
 function boundedPush(array, value, limit) {
   if (array.length < limit) array.push(value);
@@ -86,25 +93,218 @@ function cadence(samples) {
 }
 
 function progressGap(samples) {
+  return progressGapForField(samples, 'progress');
+}
+
+function progressGapForField(samples, field) {
   const gaps = [];
   let previousActive = null;
   let activeSampleCount = 0;
+  let forwardProgressSampleCount = 0;
+  let regressionCount = 0;
   for (const sample of (Array.isArray(samples) ? samples : [])
     .slice().sort((a, b) => Number(a?.t_ms) - Number(b?.t_ms))) {
-    const progress = Number(sample && sample.progress);
+    const rawValue = sample && sample[field];
+    const progress = rawValue == null ? Number.NaN : Number(rawValue);
     const status = String(sample && sample.status || '').toLowerCase();
-    const active = Number.isFinite(progress) && progress > 0 && progress < 100
-      && status !== 'stopped' && status !== 'downloaded'
+    const terminal = TERMINAL_PROGRESS_STATUSES.has(status);
+    const validTransferProgress = Number.isFinite(progress) && progress >= 0
+      && (field === 'transferred_size' ? progress < Number.MAX_SAFE_INTEGER : progress < 100)
       && Number.isFinite(Number(sample && sample.t_ms));
-    if (!active) {
+    if (terminal || !validTransferProgress) {
+      previousActive = null;
+      continue;
+    }
+    if (progress === 0) {
+      if (previousActive != null) regressionCount += 1;
       previousActive = null;
       continue;
     }
     activeSampleCount += 1;
-    if (previousActive != null) gaps.push(Number(sample.t_ms) - previousActive);
-    previousActive = Number(sample.t_ms);
+    const tMs = Number(sample.t_ms);
+    if (previousActive == null) {
+      previousActive = {t_ms: tMs, progress};
+      forwardProgressSampleCount += 1;
+      continue;
+    }
+    if (progress < previousActive.progress) {
+      regressionCount += 1;
+      previousActive = null;
+      continue;
+    }
+    if (progress === previousActive.progress) continue;
+    gaps.push(tMs - previousActive.t_ms);
+    forwardProgressSampleCount += 1;
+    previousActive = {t_ms: tMs, progress};
   }
-  return {max_ms: maximum(gaps), sample_count: activeSampleCount};
+  const result = {
+    p50_ms: percentile(gaps, 0.5),
+    p95_ms: percentile(gaps),
+    max_ms: maximum(gaps),
+    sample_count: forwardProgressSampleCount,
+    active_sample_count: activeSampleCount,
+    gap_count: gaps.length,
+    gaps_ms: gaps,
+    monotonic: regressionCount === 0,
+    regression_count: regressionCount,
+  };
+  if (field !== 'progress') result.value_field = field;
+  return result;
+}
+
+function visibleSizeBytes(value) {
+  const match = String(value || '').trim().match(
+    /^([0-9]+(?:[.,][0-9]+)?)\s*(B|KB|MB|GB|TB|PB)\b/i,
+  );
+  if (!match) return null;
+  const amount = Number(match[1].replace(',', '.'));
+  const units = {B: 0, KB: 1, MB: 2, GB: 3, TB: 4, PB: 5};
+  const unit = units[String(match[2]).toUpperCase()];
+  if (!Number.isFinite(amount) || unit == null) return null;
+  return amount * (1024 ** unit);
+}
+
+function visibleSizeGap(samples) {
+  const gaps = [];
+  let previousActive = null;
+  let activeSampleCount = 0;
+  let forwardProgressSampleCount = 0;
+  let regressionCount = 0;
+  for (const sample of (Array.isArray(samples) ? samples : [])
+    .slice().sort((a, b) => Number(a?.t_ms) - Number(b?.t_ms))) {
+    const size = visibleSizeBytes(sample && sample.size_info);
+    const status = String(sample && sample.status || '').toLowerCase();
+    const terminal = TERMINAL_PROGRESS_STATUSES.has(status);
+    if (terminal) {
+      previousActive = null;
+      continue;
+    }
+    // A status-only DOM mutation has no visible size sample.  Ignore it so
+    // the next rendered size change is measured from the last real value.
+    if (size == null || !Number.isFinite(Number(sample && sample.t_ms))) continue;
+    if (size === 0) {
+      if (previousActive != null) regressionCount += 1;
+      previousActive = null;
+      continue;
+    }
+    activeSampleCount += 1;
+    const tMs = Number(sample.t_ms);
+    if (previousActive == null) {
+      previousActive = {t_ms: tMs, size};
+      forwardProgressSampleCount += 1;
+      continue;
+    }
+    if (size < previousActive.size) {
+      regressionCount += 1;
+      previousActive = null;
+      continue;
+    }
+    if (size === previousActive.size) continue;
+    gaps.push(tMs - previousActive.t_ms);
+    forwardProgressSampleCount += 1;
+    previousActive = {t_ms: tMs, size};
+  }
+  return {
+    p50_ms: percentile(gaps, 0.5),
+    p95_ms: percentile(gaps),
+    max_ms: maximum(gaps),
+    sample_count: forwardProgressSampleCount,
+    active_sample_count: activeSampleCount,
+    gap_count: gaps.length,
+    gaps_ms: gaps,
+    monotonic: regressionCount === 0,
+    regression_count: regressionCount,
+    value_field: 'size_info',
+  };
+}
+
+function advancingRawTransferredBytes(samples) {
+  let previous = null;
+  for (const sample of (Array.isArray(samples) ? samples : [])
+    .slice().sort((a, b) => Number(a?.t_ms) - Number(b?.t_ms))) {
+    const value = sample?.transferred_size == null ? Number.NaN : Number(sample.transferred_size);
+    if (!Number.isFinite(value) || value < 0 || value >= Number.MAX_SAFE_INTEGER) continue;
+    if (previous != null && value > previous) return true;
+    previous = value;
+  }
+  return false;
+}
+
+function mainThreadResponsiveness(samples) {
+  const drift = (Array.isArray(samples) ? samples : [])
+    .map(sample => Number(sample && sample.drift_ms))
+    .filter(value => Number.isFinite(value) && value >= 0);
+  return {
+    interval_ms: MAIN_THREAD_HEARTBEAT_INTERVAL_MS,
+    count: drift.length,
+    p95_drift_ms: percentile(drift),
+    max_drift_ms: maximum(drift),
+  };
+}
+
+function forwardProgressReady(
+  samples, queueMarker, minimumSamples = MIN_ACTIVE_PROGRESS_SAMPLES, rawBytes = false
+) {
+  if (!finiteMeasurementMarker(queueMarker)) return false;
+  let previousActive = null;
+  let genuineProgressSamples = 0;
+  let regression = false;
+  for (const sample of (Array.isArray(samples) ? samples : [])
+    .filter(item => Number.isFinite(Number(item?.t_ms)) && Number(item.t_ms) >= queueMarker)
+    .sort((a, b) => Number(a.t_ms) - Number(b.t_ms))) {
+    const progress = Number(sample && sample.progress);
+    const status = String(sample && sample.status || '').toLowerCase();
+    const terminal = TERMINAL_PROGRESS_STATUSES.has(status);
+    const validTransferProgress = Number.isFinite(progress) && progress >= 0
+      && (rawBytes ? progress < Number.MAX_SAFE_INTEGER : progress < 100);
+    if (terminal || !validTransferProgress) {
+      previousActive = null;
+      continue;
+    }
+    if (progress === 0) {
+      if (previousActive != null) regression = true;
+      previousActive = null;
+      continue;
+    }
+    if (previousActive == null) {
+      previousActive = progress;
+      genuineProgressSamples += 1;
+    } else if (progress > previousActive) {
+      previousActive = progress;
+      genuineProgressSamples += 1;
+    } else if (progress < previousActive) {
+      regression = true;
+      previousActive = null;
+    }
+  }
+  return !regression && genuineProgressSamples >= minimumSamples;
+}
+
+function progressGapAcceptance(summary) {
+  const gapCount = Number(summary && summary.gap_count);
+  const p50 = Number(summary && summary.p50_ms);
+  const p95 = Number(summary && summary.p95_ms);
+  const max = Number(summary && summary.max_ms);
+  return {
+    minimum_gap_count: Number.isFinite(gapCount) && gapCount >= MIN_PROGRESS_GAPS,
+    p50: summary?.p50_ms != null && Number.isFinite(p50) && p50 <= PROGRESS_GAP_P50_LIMIT_MS,
+    p95: summary?.p95_ms != null && Number.isFinite(p95) && p95 <= PROGRESS_GAP_P95_LIMIT_MS,
+    max: summary?.max_ms != null && Number.isFinite(max) && max <= MAX_PROGRESS_GAP_MS,
+    monotonic: Number(summary?.sample_count) > 0 && summary?.monotonic === true
+      && summary?.regression_count != null
+      && Number.isFinite(Number(summary.regression_count)) && Number(summary.regression_count) === 0,
+  };
+}
+
+function finiteMeasurementMarker(value) {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function measurementBoundaryValid(measurement) {
+  return Boolean(measurement)
+    && finiteMeasurementMarker(measurement.epoch_t_ms)
+    && finiteMeasurementMarker(measurement.measured_queue_t_ms)
+    && measurement.post_readiness === true;
 }
 
 function latencyStats(samples, field) {
@@ -115,10 +315,12 @@ function latencyStats(samples, field) {
   };
 }
 
-function latestRelevantApply(applies, atMs, scopedPath) {
+function latestRelevantApply(applies, atMs, scopedPath, measuredQueueMs = null) {
   return (Array.isArray(applies) ? applies : [])
     .filter(item => item && Number(item.t_ms) <= Number(atMs)
+      && (measuredQueueMs == null || Number(item.t_ms) >= Number(measuredQueueMs))
       && String(item.pathname || '') === String(scopedPath || '')
+      && item.target_bearing === true
       && ['model-init', 'model-added', 'model-updated', 'model-removed',
         'model-page', 'model-invalidate', 'model-patch', 'model-reset'].includes(String(item.event_type)))
     .sort((a, b) => Number(a.t_ms) - Number(b.t_ms)).slice(-1)[0] || null;
@@ -141,9 +343,22 @@ function actionStats(actions, field) {
 
 function cleanupPass(record) {
   if (!record || record.required !== true) return true;
+  if (record.profile === 'legacy-file') {
+    return record.attempted === true
+      && Array.isArray(record.errors) && record.errors.length === 0
+      && record.residual_local_absent === true;
+  }
+  const actionAccepted = record.queue_accepted === true || record.mutation_accepted === true;
+  if (!actionAccepted) {
+    return record.attempted === true
+      && Array.isArray(record.errors) && record.errors.length === 0
+      && record.residual_remote_only_queueable === true
+      && record.transfer_quiescent === true;
+  }
   return record.attempted === true
     && Array.isArray(record.errors) && record.errors.length === 0
-    && record.residual_local_absent === true;
+    && record.residual_state === 'stopped'
+    && record.transfer_quiescent === true;
 }
 
 function safeText(value) {
@@ -164,7 +379,15 @@ function safeText(value) {
 }
 
 function errorRecord(kind, error) {
-  return {kind, message: safeText(error && (error.message || error.errorText || error))};
+  const record = {kind, message: safeText(error && (error.message || error.errorText || error))};
+  if (error?.action) record.action = String(error.action);
+  if (error?.endpoint_action) record.endpoint_action = String(error.endpoint_action);
+  if (error?.endpoint) record.endpoint = safeText(error.endpoint);
+  if (error?.schema_error) record.schema_error = safeText(error.schema_error);
+  if (error?.transport_error) record.transport_error = safeText(error.transport_error);
+  if (Number.isFinite(Number(error?.http_status))) record.http_status = Number(error.http_status);
+  if (error?.response_reported != null) record.response_reported = error.response_reported === true;
+  return record;
 }
 
 function sanitizeTimelinePaths(items) {
@@ -199,6 +422,36 @@ function targetIdentityMismatchError(identity, targetId, targetName) {
   return invalidPrecondition(`target identity mismatch: expected ${expected}, observed ${actual}`);
 }
 
+function summaryPathPairReconciliation(summary, targetPairId) {
+  const pairs = Array.isArray(summary?.path_pairs) ? summary.path_pairs : [];
+  const matches = typeof targetPairId === 'string' && targetPairId.trim().length > 0
+    ? pairs.filter(pair => typeof pair?.path_pair_id === 'string' && pair.path_pair_id === targetPairId)
+    : [];
+  if (matches.length !== 1) {
+    return {
+      path_pair_id_match: false,
+      duplicate_match: matches.length > 1,
+      fields_valid: false,
+      reconciled_local: false,
+      reconciled_remote: false,
+    };
+  }
+  const pair = matches[0];
+  return {
+    path_pair_id_match: true,
+    duplicate_match: false,
+    fields_valid: typeof pair.reconciled_local === 'boolean'
+      && typeof pair.reconciled_remote === 'boolean',
+    reconciled_local: pair.reconciled_local === true,
+    reconciled_remote: pair.reconciled_remote === true,
+  };
+}
+
+function pathPairReconciled(summary, targetPairId) {
+  const pair = summaryPathPairReconciliation(summary, targetPairId);
+  return pair.path_pair_id_match && pair.reconciled_local === true && pair.reconciled_remote === true;
+}
+
 function runSelfTest() {
   assert(percentile([10, 20, 30, 40]) === 40, 'p95 nearest-rank statistic failed');
   assert(maximum([1, 8, 3]) === 8, 'max statistic failed');
@@ -212,52 +465,297 @@ function runSelfTest() {
     {t_ms: 5000, status: 'downloading', progress: 3},
     {t_ms: 5700, status: 'downloading', progress: 4},
   ]);
-  assert(gap.max_ms === 700 && gap.sample_count === 4, 'progress gap statistic failed');
+  assert(gap.p50_ms === 700 && gap.p95_ms === 700 && gap.max_ms === 700
+    && gap.sample_count === 4 && gap.active_sample_count === 4 && gap.gap_count === 2
+    && gap.monotonic === true && gap.regression_count === 0
+    && JSON.stringify(gap.gaps_ms) === JSON.stringify([700, 700]),
+  'progress gap statistic failed');
   assert(progressGap([{t_ms: 1, status: 'local only', progress: 12.5}]).sample_count === 1,
     'non-downloading finite in-flight progress was not counted');
+  const resetGap = progressGap([
+    {t_ms: 100, status: 'downloading', progress: 1},
+    {t_ms: 200, status: 'downloading', progress: 2},
+    {t_ms: 300, status: 'stopped', progress: 2},
+    {t_ms: 1_100, status: 'downloading', progress: 3},
+    {t_ms: 1_200, status: 'downloaded', progress: 100},
+    {t_ms: 1_300, status: 'downloading', progress: 4},
+  ]);
+  assert(JSON.stringify(resetGap.gaps_ms) === JSON.stringify([100]),
+    'inactive and stopped progress segments were not reset');
+  const duplicateProgress = progressGap([
+    {t_ms: 100, status: 'downloading', progress: 1},
+    {t_ms: 150, status: 'downloading', progress: 1},
+    {t_ms: 180, status: 'local only', progress: 1},
+    {t_ms: 200, status: 'downloading', progress: 2},
+    {t_ms: 300, status: 'downloading', progress: 2},
+    {t_ms: 400, status: 'downloading', progress: 3},
+  ]);
+  assert(duplicateProgress.sample_count === 3 && duplicateProgress.active_sample_count === 6
+    && duplicateProgress.gap_count === 2
+    && JSON.stringify(duplicateProgress.gaps_ms) === JSON.stringify([100, 200]),
+  'equal-progress and status-only mutations were counted as forward progress');
+  const rawDuplicateProgress = progressGapForField([
+    {t_ms: 100, status: 'downloading', transferred_size: 100},
+    {t_ms: 150, status: 'downloading', transferred_size: 100},
+    {t_ms: 200, status: 'downloading', transferred_size: 200},
+    {t_ms: 300, status: 'downloading', transferred_size: 200},
+    {t_ms: 400, status: 'downloading', transferred_size: 300},
+  ], 'transferred_size');
+  assert(rawDuplicateProgress.sample_count === 3 && rawDuplicateProgress.gap_count === 2
+    && JSON.stringify(rawDuplicateProgress.gaps_ms) === JSON.stringify([100, 200]),
+  'equal raw transferred bytes were counted as forward progress');
+  const rawRegression = progressGapForField([
+    {t_ms: 100, status: 'downloading', transferred_size: 100},
+    {t_ms: 200, status: 'downloading', transferred_size: 200},
+    {t_ms: 300, status: 'downloading', transferred_size: 150},
+    {t_ms: 400, status: 'downloading', transferred_size: 250},
+  ], 'transferred_size');
+  assert(rawRegression.monotonic === false && rawRegression.regression_count === 1
+    && rawRegression.gap_count === 1,
+  'decreasing raw transferred bytes were accepted');
+  const heartbeatSummary = mainThreadResponsiveness([
+    {drift_ms: 1}, {drift_ms: 3}, {drift_ms: 2},
+  ]);
+  assert(heartbeatSummary.count === 3 && heartbeatSummary.max_drift_ms === 3,
+    'browser main-thread heartbeat statistic failed');
+  const rawNullOnly = progressGapForField([
+    {t_ms: 100, status: 'downloading', transferred_size: null},
+    {t_ms: 200, status: 'downloading', download_progress: 1},
+  ], 'transferred_size');
+  assert(rawNullOnly.sample_count === 0 && rawNullOnly.gap_count === 0,
+    'null raw transferred bytes activated byte-progress acceptance');
+  const unchangedSizeInfo = visibleSizeGap([
+    {t_ms: 100, status: 'downloading', size_info: '0 B of 4 GB'},
+    {t_ms: 200, status: 'downloading', size_info: '64 KB of 4 GB'},
+    {t_ms: 300, status: 'downloading', size_info: '64 KB of 4 GB'},
+  ]);
+  assert(unchangedSizeInfo.sample_count === 1 && unchangedSizeInfo.gap_count === 0,
+    'unchanged visible size_info was counted as forward progress');
+  const visibleSizeProgress = visibleSizeGap([
+    {t_ms: 100, status: 'downloading', size_info: '0 B of 4 GB'},
+    {t_ms: 200, status: 'downloading', size_info: '64 KB of 4 GB'},
+    {t_ms: 300, status: 'downloading', size_info: '128 KB of 4 GB'},
+    {t_ms: 400, status: 'downloading', size_info: '128 KB of 4 GB'},
+  ]);
+  assert(visibleSizeProgress.sample_count === 2 && visibleSizeProgress.gap_count === 1
+    && visibleSizeProgress.gaps_ms[0] === 100,
+  'visible size_info forward cadence was not measured');
+  const visibleZeroRegression = visibleSizeGap([
+    {t_ms: 100, status: 'downloading', size_info: '64 KB of 4 GB'},
+    {t_ms: 200, status: 'downloading', size_info: '0 B of 4 GB'},
+    {t_ms: 300, status: 'downloading', size_info: '64 KB of 4 GB'},
+  ]);
+  assert(visibleZeroRegression.monotonic === false && visibleZeroRegression.regression_count === 1
+    && visibleZeroRegression.gap_count === 0,
+  'active zero visible size_info reset was accepted as a clean segment');
+  const decreasingProgress = progressGap([
+    {t_ms: 100, status: 'downloading', progress: 1},
+    {t_ms: 200, status: 'downloading', progress: 2},
+    {t_ms: 300, status: 'downloading', progress: 1.5},
+    {t_ms: 400, status: 'downloading', progress: 2.5},
+  ]);
+  assert(decreasingProgress.monotonic === false && decreasingProgress.regression_count === 1
+    && decreasingProgress.gap_count === 1
+    && JSON.stringify(decreasingProgress.gaps_ms) === JSON.stringify([100])
+    && !progressGapAcceptance(decreasingProgress).monotonic,
+  'decreasing progress was not rejected');
+  const zeroRegression = progressGap([
+    {t_ms: 100, status: 'downloading', progress: 2},
+    {t_ms: 200, status: 'downloading', progress: 0},
+    {t_ms: 300, status: 'downloading', progress: 3},
+  ]);
+  assert(zeroRegression.monotonic === false && zeroRegression.regression_count === 1
+    && !progressGapAcceptance(zeroRegression).monotonic,
+  'zero progress regression was treated as an inactive reset');
+  assert(!forwardProgressReady([
+    {t_ms: 0, status: 'downloading', progress: 2},
+    {t_ms: 100, status: 'downloading', progress: 0},
+    ...new Array(MIN_ACTIVE_PROGRESS_SAMPLES).fill(null).map((_value, index) =>
+      ({t_ms: 200 + index * 100, status: 'downloading', progress: index + 3})),
+  ], 0), 'wait readiness accepted a zero-progress regression');
+  const rawByteSamples = new Array(MIN_ACTIVE_PROGRESS_SAMPLES).fill(null).map((_value, index) => ({
+    t_ms: index * 100, status: 'downloading', progress: 0, transferred_size: (index + 1) * 256,
+  }));
+  const rawByteProgressSamples = rawByteSamples.map(sample => ({...sample, progress: sample.transferred_size}));
+  assert(forwardProgressReady(rawByteProgressSamples, 0, MIN_ACTIVE_PROGRESS_SAMPLES, true)
+    && !forwardProgressReady(rawByteProgressSamples, 0, MIN_ACTIVE_PROGRESS_SAMPLES, false)
+    && advancingRawTransferredBytes(rawByteSamples)
+    && rawByteSamples.every(sample => sample.progress === 0),
+  'raw bytes above 100 did not establish activity while visible percent remained zero');
+  const terminalZeroReset = progressGap([
+    {t_ms: 100, status: 'downloading', progress: 2},
+    {t_ms: 200, status: 'complete', progress: 0},
+    {t_ms: 300, status: 'downloading', progress: 3},
+  ]);
+  assert(terminalZeroReset.monotonic === true && terminalZeroReset.regression_count === 0,
+    'terminal zero progress was incorrectly treated as a regression');
+  const samplesForGaps = gaps => {
+    const samples = [{t_ms: 0, status: 'downloading', progress: 1}];
+    let tMs = 0;
+    gaps.forEach((gapMs, index) => {
+      tMs += gapMs;
+      samples.push({t_ms: tMs, status: 'downloading', progress: (index % 99) + 2});
+    });
+    return samples;
+  };
+  const insufficient = progressGap(samplesForGaps(new Array(19).fill(100)));
+  assert(insufficient.sample_count === 20 && insufficient.gap_count === 19
+    && !progressGapAcceptance(insufficient).minimum_gap_count,
+  'insufficient active progress samples were accepted');
+  const p50Failure = progressGap(samplesForGaps([...new Array(9).fill(100), ...new Array(11).fill(151)]));
+  assert(!progressGapAcceptance(p50Failure).p50 && progressGapAcceptance(p50Failure).p95,
+    'p50 progress-gap threshold failure was not detected');
+  const p95Failure = progressGap(samplesForGaps([...new Array(18).fill(100), 201, 201]));
+  assert(progressGapAcceptance(p95Failure).p50 && !progressGapAcceptance(p95Failure).p95,
+    'p95 progress-gap threshold failure was not detected');
+  const maxFailure = progressGap(samplesForGaps([...new Array(19).fill(100), 1_001]));
+  assert(progressGapAcceptance(maxFailure).p95 && !progressGapAcceptance(maxFailure).max,
+    'maximum progress-gap threshold failure was not detected');
+  const passingOutlier = progressGap(samplesForGaps([...new Array(19).fill(100), 900]));
+  const passingAcceptance = progressGapAcceptance(passingOutlier);
+  assert(passingOutlier.gap_count === MIN_PROGRESS_GAPS && passingOutlier.p95_ms === 100
+    && passingOutlier.max_ms === 900 && Object.values(passingAcceptance).every(Boolean),
+  'allowed sub-1000ms progress-gap outlier was rejected');
+  const visibleSamplesForGaps = gaps => {
+    const samples = [{t_ms: 0, status: 'downloading', size_info: '64 KB of 4 GB'}];
+    let tMs = 0;
+    gaps.forEach((gapMs, index) => {
+      tMs += gapMs;
+      samples.push({t_ms: tMs, status: 'downloading', size_info: `${65 + index} KB of 4 GB`});
+    });
+    return samples;
+  };
+  const visiblePassingOutlier = visibleSizeGap(visibleSamplesForGaps([...new Array(19).fill(100), 900]));
+  assert(visiblePassingOutlier.gap_count === MIN_PROGRESS_GAPS
+    && Object.values(progressGapAcceptance(visiblePassingOutlier)).every(Boolean),
+  'visible size_info progress-gap acceptance was rejected');
   const latency = latencyStats([{receive_to_dom_ms: 35}, {receive_to_dom_ms: 120}], 'receive_to_dom_ms');
   assert(latency.p95_ms === 120 && latency.max_ms === 120, 'receive-to-dom latency statistic failed');
   assert(latestRelevantApply([
-    {t_ms: 10, pathname: '/server/stream', event_type: 'message'},
-    {t_ms: 20, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-updated'},
+    {t_ms: 10, pathname: '/server/stream', event_type: 'message', target_bearing: false},
+    {t_ms: 20, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-updated', target_bearing: true},
   ], 30, '/server/model/v1/pairs/x/stream').t_ms === 20, 'unrelated stream correlation filter failed');
   assert(latestRelevantApply([
-    {t_ms: 10, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-page'},
-    {t_ms: 20, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-invalidate'},
-    {t_ms: 30, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-patch'},
-    {t_ms: 40, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-reset'},
-    {t_ms: 45, pathname: '/server/model/v1/summary/stream', event_type: 'model-reset'},
+    {t_ms: 10, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-page', target_bearing: true},
+    {t_ms: 20, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-invalidate', target_bearing: true},
+    {t_ms: 30, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-patch', target_bearing: true},
+    {t_ms: 40, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-reset', target_bearing: true},
+    {t_ms: 45, pathname: '/server/model/v1/summary/stream', event_type: 'model-reset', target_bearing: true},
   ], 50, '/server/model/v1/pairs/x/stream').event_type === 'model-reset', 'v1 model event names are not accepted');
   assert(latestRelevantApply([
-    {t_ms: 10, pathname: '/server/model/v1/pairs/other/stream', event_type: 'model-updated'},
-    {t_ms: 20, pathname: '/server/model/v1/pairs/x/stream', event_type: 'message'},
+    {t_ms: 10, pathname: '/server/model/v1/pairs/other/stream', event_type: 'model-updated', target_bearing: true},
+    {t_ms: 20, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-message', target_bearing: false},
   ], 30, '/server/model/v1/pairs/x/stream') === null, 'generic or other-pair events were correlated');
+  assert(latestRelevantApply([
+    {t_ms: 10, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-patch', target_bearing: true},
+    {t_ms: 20, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-patch', target_bearing: false},
+  ], 30, '/server/model/v1/pairs/x/stream').t_ms === 10,
+  'unrelated same-scope apply replaced target attribution');
+  const targetCausalApply = latestRelevantApply([
+    {t_ms: 100, receive_t_ms: 80, pathname: '/server/model/v1/pairs/x/stream',
+      event_type: 'model-patch', target_bearing: true},
+    {t_ms: 110, receive_t_ms: 105, pathname: '/server/model/v1/pairs/x/stream',
+      event_type: 'model-patch', target_bearing: false},
+  ], 120, '/server/model/v1/pairs/x/stream');
+  assert(targetCausalApply.t_ms === 100 && targetCausalApply.receive_t_ms === 80,
+    'unrelated same-scope apply changed target receive/apply latency attribution');
+  const postQueueApply = latestRelevantApply([
+    {t_ms: 90, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-patch', target_bearing: true},
+    {t_ms: 110, pathname: '/server/model/v1/pairs/x/stream', event_type: 'model-patch', target_bearing: true},
+  ], 120, '/server/model/v1/pairs/x/stream', 100);
+  assert(postQueueApply?.t_ms === 110,
+    'pre-Queue target apply was used for post-Queue DOM attribution');
   const target = discoverTarget({
     synthetic_only: true,
     path_pairs: [{id: 'pair-01', name: 'Performance Pair 01', directory: 'path-pair-01', role: 'ordinary-active',
-      remote_only_targets: [{relative_path: ['path-pair-01', 'remote-only', 'target.bin'].join('/')}]}],
+      remote_only_targets: [{kind: 'directory', relative_path: ['path-pair-01', 'remote-only', 'target'].join('/'),
+        size_bytes: 1024, storage_mode: 'real-bytes-hardlink-deduplicated', storage_size_bytes: 128,
+        file_count: 20, directory_count: 3, max_depth: 2}]}],
   });
   assert(target.pair_id === 'pair-01', 'target pair identity was not retained internally');
+  assert(target.kind === 'directory' && target.file_count === 20 && target.directory_count === 3
+    && target.max_depth === 2, 'directory target descriptor was not retained internally');
+  const fileManifestForPairId = pairId => ({
+    synthetic_only: true,
+    path_pairs: [{id: pairId, name: 'Performance Pair File', directory: 'path-pair-01', role: 'ordinary-active',
+      remote_only_targets: [{relative_path: 'path-pair-01/remote-only/target.bin'}]}],
+  });
+  let missingPairIdRejected = false;
+  try { discoverTarget(fileManifestForPairId(undefined)); } catch (_) { missingPairIdRejected = true; }
+  let blankPairIdRejected = false;
+  try { discoverTarget(fileManifestForPairId('   ')); } catch (_) { blankPairIdRejected = true; }
+  assert(missingPairIdRejected && blankPairIdRejected,
+    'missing or blank target pair ids were accepted');
+  const unreconciledSummary = {path_pairs: [{path_pair_id: 'pair-01', reconciled_local: false, reconciled_remote: true}]};
+  assert(!pathPairReconciled(unreconciledSummary, target.pair_id)
+    && !summaryPathPairReconciliation(unreconciledSummary, 'other-pair').path_pair_id_match,
+  'summary reconciliation readiness accepted the wrong or partially reconciled pair');
+  assert(pathPairReconciled({path_pairs: [
+    {path_pair_id: 'pair-01', reconciled_local: true, reconciled_remote: true},
+  ]}, target.pair_id), 'summary reconciliation readiness rejected the exact reconciled pair');
+  assert(!pathPairReconciled({path_pairs: [
+    {path_pair_id: 'pair-01', reconciled_local: true, reconciled_remote: true},
+    {path_pair_id: 'pair-01', reconciled_local: true, reconciled_remote: true},
+  ]}, target.pair_id), 'duplicate summary path-pair identities were accepted');
+  assert(!summaryPathPairReconciliation({path_pairs: [
+    {path_pair_id: '', reconciled_local: true, reconciled_remote: true},
+  ]}, '').path_pair_id_match, 'empty summary pair identity was accepted');
+  assert(!summaryPathPairReconciliation({path_pairs: [
+    {path_pair_id: 'pair-01', reconciled_local: 'true', reconciled_remote: true},
+  ]}, target.pair_id).fields_valid, 'non-boolean reconciliation flags were accepted');
+  const legacyTarget = discoverTarget({
+    synthetic_only: true,
+    path_pairs: [{id: 'pair-file', name: 'Performance Pair File', directory: 'path-pair-01', role: 'ordinary-active',
+      remote_only_targets: [{relative_path: 'path-pair-01/remote-only/target.bin'}]}],
+  });
+  assert(legacyTarget.kind === 'file' && !Object.prototype.hasOwnProperty.call(legacyTarget, 'file_count'),
+    'committed file target descriptor was not retained as a legacy file');
   assert(!JSON.stringify(target).includes('pair-01'), 'target pair identity leaked into serialized evidence');
   assert(normalizeAppPath('/server/model/v1/pairs/private-scope/stream') ===
     '/server/model/v1/pairs/<scope-digest:7bc278faa0682944>/stream', 'scoped route normalization failed');
   assert(safeText('/server/model/v1/pairs/private-scope/stream').includes('/server/model/v1/pairs/<scope-digest:'),
     'normalized scoped route was redacted as a generic path');
-  assert(cleanupPass({required: true, attempted: true, errors: [], restored_state: 'stopped',
-    residual_state: 'stopped', residual_local_absent: true}),
+  assert(cleanupPass({required: true, profile: 'cadence-directory', attempted: true,
+    queue_accepted: true, mutation_accepted: true, errors: [], residual_state: 'stopped',
+    transfer_quiescent: true}),
     'successful cleanup was not accepted');
   assert(!cleanupPass({required: true, attempted: true, errors: [{kind: 'cleanup-stop'}],
-    restored_state: 'deleted', residual_state: 'deleted', residual_local_absent: true}),
+    residual_state: 'stopped', transfer_quiescent: true}),
   'cleanup failure was silently accepted');
+  assert(cleanupPass({required: true, profile: 'legacy-file', attempted: true, errors: [],
+    residual_local_absent: true}), 'legacy local-absent cleanup was not accepted');
+  assert(cleanupPass({required: true, profile: 'cadence-directory', attempted: true,
+    queue_accepted: false, mutation_accepted: false, errors: [],
+    residual_remote_only_queueable: true, transfer_quiescent: true}),
+  'rejected Queue remote-only cleanup was not accepted as a quiescent no-op');
+  assert(!cleanupPass({required: true, profile: 'cadence-directory', attempted: true,
+    queue_accepted: false, mutation_accepted: false, errors: [],
+    residual_remote_only_queueable: false, transfer_quiescent: false}),
+  'rejected Queue cleanup accepted a non-quiescent target');
+  assert(cleanupPass({required: true, profile: 'cadence-directory', attempted: true,
+    queue_accepted: true, mutation_accepted: true, errors: [], residual_state: 'stopped',
+    transfer_quiescent: true}), 'accepted Queue cleanup did not retain Stop completion requirements');
   assert(readinessIsQueueable({status: 'default-remote', controls: {
-    Queue: {enabled: true}, Stop: {enabled: false}, 'Delete Local': {enabled: false},
+    Queue: {enabled: true}, Stop: {enabled: false},
   }}), 'remote-only default target was not recognized as queueable');
   assert(readinessIsQueueable({status: 'stopped', controls: {
-    Queue: {enabled: true}, Stop: {enabled: false}, 'Delete Local': {enabled: false},
-  }}), 'stopped remote target was not recognized as queueable');
-  assert(!readinessIsQueueable({status: 'downloaded', controls: {
-    Queue: {enabled: false}, Stop: {enabled: false}, 'Delete Local': {enabled: true},
-  }}), 'local terminal target was incorrectly recognized as queueable');
+    Queue: {enabled: true}, Stop: {enabled: false},
+  }}), 'legacy stopped remote target was not recognized as queueable');
+  assert(localAbsentControlsAreReady({controls: {
+    Queue: {enabled: true}, 'Delete Local': {enabled: false},
+  }}), 'legacy local-absent Queue fallback was not recognized');
+  assert(!localAbsentControlsAreReady({controls: {
+    Queue: {enabled: true}, 'Delete Local': {enabled: true},
+  }}), 'legacy local-absent Queue fallback ignored Delete Local');
+  assert(!directoryReadinessIsFresh({status: 'stopped', controls: {
+    Queue: {enabled: true}, Stop: {enabled: false},
+  }}), 'stopped directory target was incorrectly recognized as fresh queueable');
+  assert(!readinessIsQueueable({status: 'default-remote', controls: {
+    Queue: {enabled: true}, Stop: {enabled: true}, 'Delete Local': {enabled: true},
+  }}), 'active remote target was incorrectly recognized as fresh queueable');
+  assert(directoryReadinessIsFresh({status: 'default-remote', controls: {
+    Queue: {enabled: true}, Stop: {enabled: false}, 'Delete Local': {enabled: true},
+  }}), 'directory freshness incorrectly depended on destructive control state');
   assert(targetIdentityMatches({file_id: 'stable-id', name: 'reordered-title'}, 'stable-id', 'target.bin'),
     'file-id identity did not take precedence over reordered title');
   assert(!targetIdentityMatches({file_id: 'other-id', name: 'target.bin'}, 'stable-id', 'target.bin'),
@@ -268,16 +766,58 @@ function runSelfTest() {
     'non-exact target-name fallback identity was accepted');
   assert(measuredTargetMutations([{t_ms: 1}, {t_ms: 10}, {t_ms: 11}], 10).length === 2,
     'pre-queue DOM samples were not excluded from measurement');
+  assert(measuredTargetMutations([{t_ms: 0}, {t_ms: 10}], 0).length === 2,
+    'zero measured-queue boundary was not preserved');
+  assert(measuredTargetMutations([{t_ms: 1}, {t_ms: 10}], null).length === 0
+    && measuredTargetMutations([{t_ms: 1}, {t_ms: 10}], Number.NaN).length === 0,
+  'missing measured-queue boundary was accepted');
+  assert(measurementBoundaryValid({epoch_t_ms: 0, measured_queue_t_ms: 0, post_readiness: true}),
+    'zero measurement markers were rejected');
+  assert(!measurementBoundaryValid({epoch_t_ms: 0, measured_queue_t_ms: null, post_readiness: true})
+    && !measurementBoundaryValid({epoch_t_ms: Number.NaN, measured_queue_t_ms: 0, post_readiness: true})
+    && !measurementBoundaryValid({epoch_t_ms: 0, measured_queue_t_ms: 0, post_readiness: false}),
+  'invalid measurement boundary was accepted');
   const output = {
     schema: 'seedsync.performance-lab.browser-self-test.v1',
-    statistics: {p95_ms: percentile([1, 2, 3, 4]), max_ms: maximum([1, 2, 3, 4])},
+    statistics: {
+      p95_ms: percentile([1, 2, 3, 4]), max_ms: maximum([1, 2, 3, 4]),
+      progress_gap: visiblePassingOutlier,
+      visible_size_info_gap: visiblePassingOutlier,
+      raw_progress_gap: passingOutlier,
+    },
     thresholds: {
       target_dom_p95_ms: 200,
       target_dom_max_ms: 500,
+      minimum_progress_gap_count: MIN_PROGRESS_GAPS,
+      progress_gap_p50_ms: PROGRESS_GAP_P50_LIMIT_MS,
+      progress_gap_p95_ms: PROGRESS_GAP_P95_LIMIT_MS,
       max_progress_gap_ms: MAX_PROGRESS_GAP_MS,
+      progress_monotonic: true,
+      raw_progress_monotonic: true,
+      main_thread_heartbeat_interval_ms: MAIN_THREAD_HEARTBEAT_INTERVAL_MS,
+      main_thread_drift_limit_ms: MAIN_THREAD_DRIFT_LIMIT_MS,
+      measurement_boundary: true,
       action_render_limits_ms: ACTION_RENDER_LIMITS_MS,
     },
-    checks: {readiness_matrix: true, stable_identity_reorder: true, measurement_epoch: true},
+    checks: {
+      readiness_matrix: true, stable_identity_reorder: true, measurement_epoch: true,
+      progress_gap_statistics: true, progress_gap_inactive_reset: true,
+      progress_gap_duplicate_equal: true, progress_gap_status_only: true,
+      raw_progress_gap_duplicate_equal: true, raw_progress_gap_regression: true,
+      raw_progress_gap_null_ignored: true,
+      visible_size_info_duplicate_equal: true,
+      visible_size_info_zero_regression: true,
+      progress_gap_decreasing: true, progress_gap_zero_regression: true,
+      progress_gap_insufficient_samples: true, progress_gap_p50_threshold: true,
+      progress_gap_p95_threshold: true, progress_gap_max_threshold: true,
+      progress_gap_allowed_outlier: true, progress_monotonic: true,
+      progress_monotonic_pass_fail: true, progress_wait_zero_regression: true,
+      raw_progress_wait_byte_values: true, raw_progress_activity_above_percent_zero: true,
+      target_apply_causal_attribution: true,
+      main_thread_responsiveness: true,
+      measurement_boundary: true,
+      reconciliation_summary_readiness: true,
+    },
     pass: true,
   };
   process.stdout.write(`${JSON.stringify(output)}\n`);
@@ -343,7 +883,7 @@ async function main() {
   evidence.identities.fixture_fingerprint = manifest.fixture_fingerprint || null;
   evidence.identities.config_fingerprint = manifest.config_fingerprint || null;
   evidence.identities.manifest_schema = manifest.schema || null;
-  if (process.env.PERF_BROWSER_DESTRUCTIVE_APPROVED !== 'on') {
+  if (target.kind !== 'directory' && process.env.PERF_BROWSER_DESTRUCTIVE_APPROVED !== 'on') {
     const error = new Error('PERF_BROWSER_DESTRUCTIVE_APPROVED=on is required after explicit approval of the displayed synthetic Delete Local target');
     evidence.failure_classification = 'destructive-approval';
     boundedPush(evidence.errors, errorRecord(evidence.failure_classification, error), MAX_ERRORS);
@@ -357,7 +897,7 @@ async function main() {
       || typeof binding.fixture?.fixture_fingerprint !== 'string'
       || binding.fixture.fixture_fingerprint !== manifest.fixture_fingerprint
       || binding.target_path !== expectedTargetPath) {
-    const error = new Error('validated live app/project/service/volume/fixture binding is required before Delete Local');
+    const error = new Error('validated live app/project/service/volume/fixture binding is required before browser evidence');
     evidence.failure_classification = 'live-binding';
     boundedPush(evidence.errors, errorRecord(evidence.failure_classification, error), MAX_ERRORS);
     writeEvidence(outputFile, evidence);
@@ -393,13 +933,16 @@ async function main() {
     const modelStreamPath = await waitForScopedModelPath(page, target.pair_id, timeoutMs);
     evidence.identities.model_stream_path = normalizeAppPath(modelStreamPath) || '/server/model/v1/<route>';
     await traverseTargetRows(page, target, timeoutMs);
-    const targetId = await readTargetId(page, target.name, timeoutMs);
+    const targetId = await readTargetId(page, target.name, timeoutMs, target);
     target.file_id_present = Boolean(targetId);
     await exerciseActions(page, target, targetId, timeoutMs, evidence, modelStreamPath);
     const timeline = await page.evaluate(() => window.__seedSyncPerfTimeline?.snapshot?.() || {});
     evidence.samples.event_source_receive = sanitizeTimelinePaths(timeline.eventSourceReceive);
     evidence.samples.event_source_apply = sanitizeTimelinePaths(timeline.eventSourceApply);
+    evidence.samples.target_raw_progress = Array.isArray(timeline.targetRawProgress) ? timeline.targetRawProgress : [];
     evidence.samples.target_dom_mutations = Array.isArray(timeline.targetDomMutations) ? timeline.targetDomMutations : [];
+    evidence.samples.main_thread_responsiveness = Array.isArray(timeline.mainThreadResponsiveness)
+      ? timeline.mainThreadResponsiveness : [];
     evidence.measurement.epoch_t_ms = timeline.measurementEpochMs ?? evidence.measurement.epoch_t_ms;
     evidence.measurement.measured_queue_t_ms = timeline.measuredQueueMs ?? evidence.measurement.measured_queue_t_ms;
     finalizeEvidence(evidence);
@@ -429,7 +972,10 @@ async function main() {
         const timeline = await page.evaluate(() => window.__seedSyncPerfTimeline?.snapshot?.() || {});
         evidence.samples.event_source_receive = sanitizeTimelinePaths(timeline.eventSourceReceive);
         evidence.samples.event_source_apply = sanitizeTimelinePaths(timeline.eventSourceApply);
+        evidence.samples.target_raw_progress = Array.isArray(timeline.targetRawProgress) ? timeline.targetRawProgress : [];
         evidence.samples.target_dom_mutations = Array.isArray(timeline.targetDomMutations) ? timeline.targetDomMutations : [];
+        evidence.samples.main_thread_responsiveness = Array.isArray(timeline.mainThreadResponsiveness)
+          ? timeline.mainThreadResponsiveness : [];
         evidence.measurement.epoch_t_ms = timeline.measurementEpochMs ?? evidence.measurement.epoch_t_ms;
         evidence.measurement.measured_queue_t_ms = timeline.measuredQueueMs ?? evidence.measurement.measured_queue_t_ms;
       }
@@ -474,14 +1020,29 @@ function baseEvidence(label, runManifest, target, initialError) {
     thresholds: {
       target_dom_p95_ms: {limit_ms: 200, observed_ms: null, pass: false},
       target_dom_max_ms: {limit_ms: 500, observed_ms: null, pass: false},
+      minimum_progress_gap_count: {limit: MIN_PROGRESS_GAPS, observed: null, pass: false},
+      progress_gap_p50_ms: {limit_ms: PROGRESS_GAP_P50_LIMIT_MS, observed_ms: null, pass: false},
+      progress_gap_p95_ms: {limit_ms: PROGRESS_GAP_P95_LIMIT_MS, observed_ms: null, pass: false},
       max_progress_gap_ms: {limit_ms: MAX_PROGRESS_GAP_MS, observed_ms: null, pass: false},
+      progress_monotonic: {required: true, observed: null, pass: false},
+      raw_progress_monotonic: {required: true, observed: null, pass: false},
+      main_thread_responsiveness: {
+        minimum_samples: MIN_MAIN_THREAD_HEARTBEATS,
+        max_drift_ms: MAIN_THREAD_DRIFT_LIMIT_MS,
+        observed: null, pass: false,
+      },
+      measurement_boundary: {required: true, observed: null, pass: false},
       action_rendered_state_p95_ms: {
         limit_ms_by_action: ACTION_RENDER_LIMITS_MS, observed: {}, pass: false,
       },
       action_http_response_reported: {required: true, pass: false},
       browser_errors: {limit: 0, observed: 0, pass: false},
     },
-    samples: {event_source_receive: [], event_source_apply: [], target_dom_mutations: [], target_dom_cadence: null, progress: []},
+    samples: {
+      event_source_receive: [], event_source_apply: [], target_raw_progress: [],
+      target_dom_mutations: [], target_dom_cadence: null, progress: [],
+      visible_progress: [], visible_size_info: [], main_thread_responsiveness: [],
+    },
     measurement: {
       required: true, epoch_t_ms: null, measured_queue_t_ms: null,
       post_readiness: false, sample_epoch_source: 'post-measured-queue',
@@ -489,17 +1050,31 @@ function baseEvidence(label, runManifest, target, initialError) {
     actions: [],
     cycles: [],
     max_progress_gap_ms: null,
-    statistics: {action_http_response: {}, action_rendered_state: {}, progress_gap: null},
+    statistics: {
+      action_http_response: {}, action_rendered_state: {}, progress_gap: null,
+      visible_size_info_gap: null, raw_progress_gap: null, visible_progress_gap: null,
+      browser_main_thread_responsiveness: null,
+    },
     expected_request_aborts: [],
     preconditions: [],
     readiness: {
-      required: true, attempted: false, steps: [],
+      required: true, attempted: false,
       initial_precondition: null, final_precondition: null,
-      normalized: false, pass: false, failure_classification: null,
+      reconciliation: {
+        required: target?.kind === 'directory', attempted: false, endpoint: '/server/model/v1/summary',
+        target_path_pair_id_digest: target?.pair_id ? stableDigest(target.pair_id) : null,
+        poll_count: 0, observations: [], last: null, elapsed_ms: null,
+        pass: target?.kind !== 'directory', failure_classification: null,
+      },
+      pass: false, failure_classification: null,
     },
     cleanup: {
       required: false, attempted: false, steps: [], errors: [],
-      restored_state: null, residual_state: null, residual_local_absent: false, pass: false,
+      profile: target?.kind === 'directory' ? 'cadence-directory' : 'legacy-file',
+      observed_state: null, restored_state: null, residual_state: null,
+      residual_local_absent: false, residual_remote_only_queueable: false, transfer_quiescent: false,
+      queue_accepted: false, mutation_accepted: false, noop: false,
+      pass: false,
     },
     errors: initialError ? [initialError] : [],
   };
@@ -513,7 +1088,25 @@ function discoverTarget(manifest) {
   if (!pair || !Array.isArray(pair.remote_only_targets) || !pair.remote_only_targets.length) {
     throw new Error('ordinary-active pair has no remote_only_targets');
   }
+  if (typeof pair.id !== 'string' || pair.id.trim().length === 0) {
+    throw new Error('ordinary-active pair must have a non-empty string id');
+  }
   const remoteTarget = pair.remote_only_targets[0];
+  const kind = remoteTarget.kind || 'file';
+  if (!['file', 'directory'].includes(kind)) {
+    throw new Error('ordinary-active browser target kind is unsupported');
+  }
+  if (kind === 'directory' && (
+      !Number.isInteger(remoteTarget.size_bytes) || remoteTarget.size_bytes <= 0
+      || !Number.isInteger(remoteTarget.file_count) || remoteTarget.file_count < 1
+      || !Number.isInteger(remoteTarget.directory_count) || remoteTarget.directory_count < 1
+      || !Number.isInteger(remoteTarget.max_depth) || remoteTarget.max_depth < 1
+      || remoteTarget.storage_mode !== 'real-bytes-hardlink-deduplicated'
+      || !Number.isInteger(remoteTarget.storage_size_bytes)
+      || remoteTarget.storage_size_bytes <= 0
+      || remoteTarget.storage_size_bytes > remoteTarget.size_bytes)) {
+    throw new Error('ordinary-active browser directory target must be a described aggregate');
+  }
   const relativePath = String(remoteTarget.relative_path || '');
   const parts = relativePath.split('/').filter(Boolean);
   if (parts.length < 2) throw new Error('remote_only target path is not nested');
@@ -525,10 +1118,21 @@ function discoverTarget(manifest) {
     relative_path: relativePath,
     path_segments: parts[0] === pair.directory ? parts.slice(1) : parts,
     name,
+    kind,
     remote_only: true,
     file_id_present: false,
   };
-  Object.defineProperty(target, 'pair_id', {value: pair.id || null, enumerable: false});
+  if (kind === 'directory') {
+    Object.assign(target, {
+      aggregate_size_bytes: remoteTarget.size_bytes,
+      storage_mode: remoteTarget.storage_mode,
+      storage_size_bytes: remoteTarget.storage_size_bytes,
+      file_count: remoteTarget.file_count,
+      directory_count: remoteTarget.directory_count,
+      max_depth: remoteTarget.max_depth,
+    });
+  }
+  Object.defineProperty(target, 'pair_id', {value: pair.id, enumerable: false});
   return target;
 }
 
@@ -564,17 +1168,61 @@ function installPageDiagnostics(page, evidence) {
     const eventSourceReceive = [];
     const eventSourceApply = [];
     const eventSourcePaths = [];
+    const targetRawProgress = [];
     const targetDomMutations = [];
+    const mainThreadResponsiveness = [];
+    const heartbeatIntervalMs = 100;
     const started = performance.now();
     let measurementEpochMs = null;
     let measuredQueueMs = null;
+    let transferActive = false;
+    let targetSelector = null;
+    let heartbeatLastMs = null;
+    let heartbeatTimer = null;
     const add = (array, value) => { if (array.length < limit) array.push(value); };
     const relative = () => Number((performance.now() - started).toFixed(3));
     const paths = new WeakMap();
     let seenEvents = new WeakSet();
     let eventRecords = new WeakMap();
+    let eventTargetRecords = new WeakMap();
     const eventPath = source => {
       try { return new URL(paths.get(source) || '', location.href).pathname; } catch (_) { return null; }
+    };
+    const targetRecordMatches = record => {
+      if (!targetSelector || !record) return false;
+      const recordId = record.file_id == null ? '' : String(record.file_id);
+      const recordName = record.name == null ? '' : String(record.name);
+      return targetSelector.id ? recordId === targetSelector.id : recordName === targetSelector.name;
+    };
+    const recordTargetProgress = (source, event, received) => {
+      if (measurementEpochMs == null || !event || !event.data || !targetSelector) return;
+      const eventType = String(event.type || 'message');
+      if (!['model-page', 'model-invalidate', 'model-patch', 'model-added', 'model-updated'].includes(eventType)) return;
+      let parsed;
+      try { parsed = JSON.parse(String(event.data)); } catch (_) { return; }
+      const records = Array.isArray(parsed) ? parsed
+        : Array.isArray(parsed.records) ? parsed.records
+        : [parsed.new_file, parsed.old_file].filter(Boolean);
+      const targetSamples = [];
+      for (const record of records) {
+        if (!targetRecordMatches(record)) continue;
+        const transferred = record.transferred_size == null ? null : Number(record.transferred_size);
+        const progress = record.download_progress == null ? null : Number(record.download_progress);
+        const targetSample = {
+          t_ms: relative(), event_type: eventType,
+          pathname: eventPath(source),
+          receive_t_ms: received?.t_ms ?? null,
+          apply_t_ms: null,
+          receive_to_apply_ms: null,
+          is_dir: record.is_dir === true,
+          status: String(record.state || '').toLowerCase() || null,
+          transferred_size: Number.isFinite(transferred) ? transferred : null,
+          download_progress: Number.isFinite(progress) ? progress : null,
+        };
+        add(targetRawProgress, targetSample);
+        targetSamples.push(targetSample);
+      }
+      if (event && typeof event === 'object' && targetSamples.length) eventTargetRecords.set(event, targetSamples);
     };
     const recordEvent = (source, event) => {
       if (!event) return null;
@@ -583,14 +1231,22 @@ function installPageDiagnostics(page, evidence) {
       const receivedAt = relative();
       const item = {t_ms: receivedAt, event_type: String(event.type || 'message'), pathname: eventPath(source)};
       add(eventSourceReceive, item);
+      recordTargetProgress(source, event, item);
       if (event && typeof event === 'object') eventRecords.set(event, item);
       return item;
     };
     const recordApply = (source, event, received) => {
-      add(eventSourceApply, {
+      const apply = {
         t_ms: relative(), event_type: String(event?.type || 'message'), pathname: eventPath(source),
         receive_t_ms: received?.t_ms ?? null,
-      });
+        target_bearing: Boolean(event && eventTargetRecords.get(event)?.length),
+      };
+      add(eventSourceApply, apply);
+      for (const sample of (event && eventTargetRecords.get(event) || [])) {
+        sample.apply_t_ms = apply.t_ms;
+        sample.receive_to_apply_ms = sample.receive_t_ms == null
+          ? null : Number((apply.t_ms - sample.receive_t_ms).toFixed(3));
+      }
     };
     const OriginalEventSource = window.EventSource;
     if (OriginalEventSource) {
@@ -631,9 +1287,27 @@ function installPageDiagnostics(page, evidence) {
     const latestScopedApply = (applies, atMs, scopedPath) => (applies || [])
       .filter(item => item && Number(item.t_ms) <= Number(atMs)
         && (measurementEpochMs == null || Number(item.t_ms) >= measurementEpochMs)
+        && (measuredQueueMs == null || Number(item.t_ms) >= measuredQueueMs)
         && String(item.pathname || '') === String(scopedPath || '')
+        && item.target_bearing === true
         && scopedModelEventTypes.includes(String(item.event_type)))
       .sort((a, b) => Number(a.t_ms) - Number(b.t_ms)).slice(-1)[0] || null;
+    const startHeartbeat = () => {
+      if (heartbeatTimer != null) clearInterval(heartbeatTimer);
+      heartbeatTimer = setInterval(() => {
+        if (!transferActive) return;
+        const observedMs = relative();
+        const expectedMs = heartbeatLastMs == null
+          ? observedMs : heartbeatLastMs + heartbeatIntervalMs;
+        heartbeatLastMs = observedMs;
+        add(mainThreadResponsiveness, {
+          t_ms: observedMs,
+          expected_t_ms: Number(expectedMs.toFixed(3)),
+          observed_t_ms: observedMs,
+          drift_ms: Number(Math.max(0, observedMs - expectedMs).toFixed(3)),
+        });
+      }, heartbeatIntervalMs);
+    };
     const pathForPair = pairId => {
       const expected = String(pairId || '');
       if (!expected) return null;
@@ -648,23 +1322,35 @@ function installPageDiagnostics(page, evidence) {
       eventSourceReceive,
       eventSourceApply,
       eventSourcePaths,
+      targetRawProgress,
       targetDomMutations,
+      mainThreadResponsiveness,
       findScopedModelPath: pathForPair,
       beginMeasurement() {
         eventSourceReceive.length = 0;
         eventSourceApply.length = 0;
+        targetRawProgress.length = 0;
         targetDomMutations.length = 0;
+        mainThreadResponsiveness.length = 0;
         seenEvents = new WeakSet();
         eventRecords = new WeakMap();
+        eventTargetRecords = new WeakMap();
         measurementEpochMs = relative();
         measuredQueueMs = null;
+        transferActive = false;
+        heartbeatLastMs = null;
         return {epoch_t_ms: measurementEpochMs};
       },
       markMeasuredQueue() {
         measuredQueueMs = relative();
+        transferActive = true;
+        heartbeatLastMs = measuredQueueMs;
         return measuredQueueMs;
       },
+      markTransferEnded() { transferActive = false; },
       attachTarget(targetId, targetName, scopedPath) {
+        targetSelector = {id: targetId ? String(targetId) : '', name: String(targetName || '')};
+        startHeartbeat();
         const root = document.querySelector('#file-list') || document.body;
         const find = () => Array.from(document.querySelectorAll('#file-list .file')).find(row => {
           const id = row.getAttribute('data-file-id');
@@ -678,8 +1364,12 @@ function installPageDiagnostics(page, evidence) {
           const statusText = row.querySelector('.status .text')?.textContent?.trim();
           const icon = row.querySelector('.status img[id]')?.id || null;
           const status = statusText ? statusText.toLowerCase() : (icon === 'default-remote' ? 'default-remote' : icon);
-          const progressValue = Number(row.querySelector('.progress-bar')?.getAttribute('aria-valuenow'));
-          const signature = `${status || ''}|${Number.isFinite(progressValue) ? progressValue : ''}`;
+          const progressBar = row.querySelector('.progress-bar');
+          const progressAttribute = progressBar?.getAttribute('aria-valuenow');
+          const progressValue = Number(progressAttribute);
+          const sizeInfo = row.querySelector('.size_info')?.textContent?.replace(/\s+/g, ' ').trim() || null;
+          const isDirectory = Boolean(row.querySelector('.name img[src*="directory"]'));
+          const signature = `${status || ''}|${progressAttribute || ''}|${sizeInfo || ''}`;
           if (signature === lastSignature) return;
           lastSignature = signature;
           const tMs = relative();
@@ -687,6 +1377,9 @@ function installPageDiagnostics(page, evidence) {
           add(targetDomMutations, {
             t_ms: tMs, status: status || null,
             progress: Number.isFinite(progressValue) ? progressValue : null,
+            aria_progress: progressAttribute || null,
+            size_info: sizeInfo,
+            is_dir: isDirectory,
             receive_t_ms: apply?.receive_t_ms ?? null,
             apply_t_ms: apply?.t_ms ?? null,
             receive_to_apply_ms: apply && apply.receive_t_ms != null ? Number((apply.t_ms - apply.receive_t_ms).toFixed(3)) : null,
@@ -699,12 +1392,14 @@ function installPageDiagnostics(page, evidence) {
           attributeFilter: ['aria-valuenow', 'class', 'style']});
         window.__seedSyncPerfTimeline.snapshot = () => ({
           eventSourceReceive: eventSourceReceive.slice(), eventSourceApply: eventSourceApply.slice(),
-          eventSourcePaths: eventSourcePaths.slice(), targetDomMutations: targetDomMutations.slice(),
+          eventSourcePaths: eventSourcePaths.slice(), targetRawProgress: targetRawProgress.slice(),
+          targetDomMutations: targetDomMutations.slice(), mainThreadResponsiveness: mainThreadResponsiveness.slice(),
           measurementEpochMs, measuredQueueMs,
         });
       },
       snapshot() { return {eventSourceReceive: eventSourceReceive.slice(), eventSourceApply: eventSourceApply.slice(),
-        eventSourcePaths: eventSourcePaths.slice(), targetDomMutations: targetDomMutations.slice(),
+        eventSourcePaths: eventSourcePaths.slice(), targetRawProgress: targetRawProgress.slice(),
+        targetDomMutations: targetDomMutations.slice(), mainThreadResponsiveness: mainThreadResponsiveness.slice(),
         measurementEpochMs, measuredQueueMs}; },
     };
   });
@@ -823,8 +1518,13 @@ async function visibleRowByName(page, name, timeoutMs) {
   throw new Error(`visible target row not found for manifest segment ${safeText(name)}`);
 }
 
-async function readTargetId(page, name, timeoutMs) {
+async function readTargetId(page, name, timeoutMs, target = null) {
   const row = await visibleRowByName(page, name, timeoutMs);
+  const isDirectory = await row.evaluate(node => Boolean(node.querySelector('.name img[src*="directory"]')));
+  if (target?.kind === 'directory' && !isDirectory) {
+    throw new Error('synthetic browser target row is not a directory');
+  }
+  if (target?.kind === 'directory') target.observed_kind = isDirectory ? 'directory' : 'file';
   return row.getAttribute('data-file-id');
 }
 
@@ -848,6 +1548,7 @@ async function rowIdentity(row) {
   return row.evaluate(node => ({
     file_id: node.getAttribute('data-file-id'),
     name: node.querySelector('.name .title')?.textContent?.trim() || null,
+    is_dir: Boolean(node.querySelector('.name img[src*="directory"]')),
   }));
 }
 
@@ -914,6 +1615,7 @@ async function readTargetState(page, targetId, targetName, timeoutMs) {
       identity: {
         file_id: node.getAttribute('data-file-id'),
         name: node.querySelector('.name .title')?.textContent?.trim() || null,
+        is_dir: Boolean(node.querySelector('.name img[src*="directory"]')),
       }};
   });
 }
@@ -956,6 +1658,7 @@ async function captureActionPrecondition(row, targetId, targetName) {
       identity: {
         file_id: node.getAttribute('data-file-id'),
         name: node.querySelector('.name .title')?.textContent?.trim() || null,
+        is_dir: Boolean(node.querySelector('.name img[src*="directory"]')),
       },
     };
   });
@@ -972,6 +1675,137 @@ async function attachTargetObserver(page, targetId, targetName, scopedPath) {
   await page.evaluate(({targetId: id, targetName: name, scopedPath: pathName}) => {
     window.__seedSyncPerfTimeline?.attachTarget?.(id, name, pathName);
   }, {targetId, targetName, scopedPath});
+}
+
+async function fetchSummaryForReconciliation(page, targetPairId, timeoutMs) {
+  return page.evaluate(async ({pairId, requestTimeoutMs}) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(1, requestTimeoutMs));
+    try {
+      const response = await fetch('/server/model/v1/summary', {
+        credentials: 'same-origin', cache: 'no-store', signal: controller.signal,
+      });
+      if (response.status < 200 || response.status >= 300) {
+        return {status: response.status, summary: null, target_path_pair_count: 0};
+      }
+      let summary = null;
+      try { summary = await response.json(); }
+      catch (_) { return {status: response.status, summary: null, schema_error: 'invalid-json'}; }
+      if (!summary || typeof summary !== 'object' || Array.isArray(summary)) {
+        return {status: response.status, summary: null, schema_error: 'summary-not-object'};
+      }
+      if (!Array.isArray(summary.path_pairs)) {
+        return {status: response.status, summary: null, schema_error: 'path_pairs-not-array'};
+      }
+      const pathPairs = Array.isArray(summary?.path_pairs) ? summary.path_pairs : [];
+      const targetPathPairCount = pathPairs.filter(pair =>
+        typeof pair?.path_pair_id === 'string' && pair.path_pair_id === pairId).length;
+      return {status: response.status, summary, target_path_pair_count: targetPathPairCount};
+    } catch (error) {
+      return {status: 0, summary: null, transport_error: String(error?.message || error || 'summary fetch failed')};
+    } finally {
+      clearTimeout(timer);
+    }
+  }, {pairId: targetPairId, requestTimeoutMs: Math.min(5_000, Math.max(1, timeoutMs))});
+}
+
+async function waitForPathPairReconciliation(page, target, timeoutMs, evidence) {
+  const readiness = evidence.readiness;
+  const reconciliation = readiness.reconciliation;
+  reconciliation.attempted = true;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  while (Date.now() < deadline) {
+    const remainingMs = Math.max(1, deadline - Date.now());
+    const response = await fetchSummaryForReconciliation(page, target.pair_id, remainingMs);
+    const status = Number(response?.status || 0);
+    reconciliation.poll_count += 1;
+    const observation = {
+      http_status: status,
+      target_path_pair_count: Number(response?.target_path_pair_count || 0),
+      path_pair_id_match: false,
+      reconciled_local: false,
+      reconciled_remote: false,
+    };
+    if (response?.transport_error) observation.transport_error = safeText(response.transport_error);
+    if (response?.schema_error) observation.schema_error = safeText(response.schema_error);
+    if (status === 0) {
+      const error = new Error(`path-pair reconciliation summary transport failure; Queue was not attempted`);
+      error.failure_classification = 'reconciliation-summary-transport';
+      error.response_reported = false;
+      error.endpoint = '/server/model/v1/summary';
+      error.transport_error = safeText(response.transport_error || 'summary fetch failed');
+      boundedPush(reconciliation.observations, observation, MAX_RECONCILIATION_OBSERVATIONS);
+      reconciliation.last = observation;
+      reconciliation.failure_classification = error.failure_classification;
+      readiness.pass = false;
+      throw error;
+    }
+    if (status < 200 || status >= 300) {
+      const error = new Error(`path-pair reconciliation summary HTTP ${status || 'unknown'}; Queue was not attempted`);
+      error.failure_classification = 'reconciliation-summary-http';
+      error.http_status = status;
+      error.response_reported = status > 0;
+      error.endpoint = '/server/model/v1/summary';
+      boundedPush(reconciliation.observations, observation, MAX_RECONCILIATION_OBSERVATIONS);
+      reconciliation.last = observation;
+      reconciliation.failure_classification = error.failure_classification;
+      readiness.pass = false;
+      throw error;
+    }
+    if (response?.schema_error) {
+      const error = new Error(`path-pair reconciliation summary schema invalid (${safeText(response.schema_error)}); Queue was not attempted`);
+      error.failure_classification = 'reconciliation-summary-schema';
+      error.http_status = status;
+      error.response_reported = true;
+      error.endpoint = '/server/model/v1/summary';
+      error.schema_error = response.schema_error;
+      boundedPush(reconciliation.observations, observation, MAX_RECONCILIATION_OBSERVATIONS);
+      reconciliation.last = observation;
+      reconciliation.failure_classification = error.failure_classification;
+      readiness.pass = false;
+      throw error;
+    }
+    const pairState = summaryPathPairReconciliation(response.summary, target.pair_id);
+    Object.assign(observation, pairState);
+    boundedPush(reconciliation.observations, observation, MAX_RECONCILIATION_OBSERVATIONS);
+    reconciliation.last = observation;
+    if (!pairState.path_pair_id_match) {
+      const error = new Error(`target path pair identity was not unique in the reconciliation summary; Queue was not attempted`);
+      error.failure_classification = 'reconciliation-summary-schema';
+      error.http_status = status;
+      error.response_reported = true;
+      error.endpoint = '/server/model/v1/summary';
+      error.schema_error = 'target-pair-not-unique';
+      reconciliation.failure_classification = error.failure_classification;
+      readiness.pass = false;
+      throw error;
+    }
+    if (!pairState.fields_valid) {
+      const error = new Error('target path pair reconciliation flags were not boolean; Queue was not attempted');
+      error.failure_classification = 'reconciliation-summary-schema';
+      error.http_status = status;
+      error.response_reported = true;
+      error.endpoint = '/server/model/v1/summary';
+      error.schema_error = 'reconciliation-flags-not-boolean';
+      reconciliation.failure_classification = error.failure_classification;
+      readiness.pass = false;
+      throw error;
+    }
+    if (pairState.reconciled_local === true && pairState.reconciled_remote === true) {
+      reconciliation.pass = true;
+      reconciliation.elapsed_ms = Date.now() - startedAt;
+      return observation;
+    }
+    await page.waitForTimeout(Math.min(RECONCILIATION_POLL_INTERVAL_MS, Math.max(1, deadline - Date.now())));
+  }
+  const error = new Error('target path pair did not report local and remote reconciliation before Queue timeout');
+  error.failure_classification = 'reconciliation-timeout';
+  error.response_reported = reconciliation.poll_count > 0;
+  reconciliation.failure_classification = error.failure_classification;
+  reconciliation.elapsed_ms = Date.now() - startedAt;
+  readiness.pass = false;
+  throw error;
 }
 
 async function selectTarget(page, targetId, targetName, timeoutMs) {
@@ -1019,22 +1853,103 @@ async function waitForState(page, targetId, targetName, allowed, timeoutMs) {
   });
 }
 
+function requireAcceptedActionResponse(response, name, endpointAction) {
+  const status = Number(response?.status?.());
+  if (status >= 200 && status < 300) return status;
+  const error = new Error(`${name} action HTTP ${Number.isFinite(status) ? status : 'unknown'} rejected; waitForState skipped`);
+  error.failure_classification = 'action-http-rejected';
+  error.action = name;
+  error.endpoint_action = endpointAction;
+  error.http_status = Number.isFinite(status) ? status : 0;
+  error.response_reported = true;
+  throw error;
+}
+
 async function waitForActiveMaterialization(page, targetId, targetName, timeoutMs) {
   await page.waitForFunction(({id, name}) => {
+    const timeline = window.__seedSyncPerfTimeline?.snapshot?.() || {};
     const row = Array.from(document.querySelectorAll('#file-list .file')).find(item => id
       ? item.getAttribute('data-file-id') === id
       : item.querySelector('.name .title')?.textContent?.trim() === name);
     if (!row) return false;
     const status = row.querySelector('.status .text')?.textContent?.trim().toLowerCase()
       || row.querySelector('.status img[id]')?.id;
-    const progress = Number(row.querySelector('.progress-bar')?.getAttribute('aria-valuenow'));
-    // During an active transfer the current dashboard can render the source
-    // presence label (for example "Local only") while the progress bar is
-    // advancing. The bounded in-flight progress value is the stable signal;
-    // requiring presentation copy here can miss the entire stop window.
-    return Number.isFinite(progress) && progress > 0 && progress < 100
-      && status !== 'stopped' && status !== 'downloaded';
+    const stop = Array.from(row.querySelectorAll('.actions .button')).find(item =>
+      item.textContent?.trim().includes('Stop'));
+    const stopEnabled = Boolean(stop && !stop.disabled && stop.getAttribute('aria-disabled') !== 'true');
+    const raw = (Array.isArray(timeline.targetRawProgress) ? timeline.targetRawProgress : [])
+      .filter(item => item?.transferred_size != null
+        && Number.isFinite(Number(item.transferred_size))
+        && Number.isFinite(Number(item.t_ms)));
+    let previousRaw = null;
+    let rawAdvancing = false;
+    for (const sample of raw.sort((a, b) => Number(a.t_ms) - Number(b.t_ms))) {
+      const value = Number(sample.transferred_size);
+      if (previousRaw != null && value > previousRaw) {
+        rawAdvancing = true;
+        break;
+      }
+      previousRaw = value;
+    }
+    const terminal = ['stopped', 'downloaded', 'complete', 'completed'].includes(status);
+    return !terminal && (rawAdvancing || status === 'downloading' || stopEnabled);
   }, {id: targetId, name: targetName}, {timeout: timeoutMs});
+  // The aggregate is intentionally long-lived; allow the visible formatter
+  // enough wall time to produce 21 distinct size_info values before stopping.
+  await waitForActiveProgressSamples(page, Math.max(timeoutMs, 90_000));
+}
+
+async function waitForActiveProgressSamples(page, timeoutMs) {
+  await page.waitForFunction(minimumSamples => {
+    const timeline = window.__seedSyncPerfTimeline?.snapshot?.() || {};
+    const queueMarker = timeline.measuredQueueMs;
+    if (typeof queueMarker !== 'number' || !Number.isFinite(queueMarker)) return false;
+    const source = Array.isArray(timeline.targetDomMutations) ? timeline.targetDomMutations : [];
+    const parseVisibleSize = value => {
+      const match = String(value || '').trim().match(
+        /^([0-9]+(?:[.,][0-9]+)?)\s*(B|KB|MB|GB|TB|PB)\b/i,
+      );
+      if (!match) return null;
+      const amount = Number(match[1].replace(',', '.'));
+      const units = {B: 0, KB: 1, MB: 2, GB: 3, TB: 4, PB: 5};
+      const unit = units[String(match[2]).toUpperCase()];
+      return Number.isFinite(amount) && unit != null ? amount * (1024 ** unit) : null;
+    };
+    let previousActive = null;
+    let genuineVisibleSizeSamples = 0;
+    let regression = false;
+    for (const sample of source
+      .filter(item => Number.isFinite(Number(item?.t_ms)) && Number(item.t_ms) >= queueMarker)
+      .sort((a, b) => Number(a.t_ms) - Number(b.t_ms))) {
+      const sizeInfo = String(sample && sample.size_info || '').trim();
+      const sizeBytes = parseVisibleSize(sizeInfo);
+      const status = String(sample && sample.status || '').toLowerCase();
+      const terminal = ['stopped', 'downloaded', 'complete', 'completed'].includes(status);
+      if (terminal) {
+        previousActive = null;
+        continue;
+      }
+      // Status-only mutations do not advance the rendered size and must not
+      // break the interval to the next genuine visible change.
+      if (sizeBytes == null) continue;
+      if (sizeBytes === 0) {
+        if (previousActive != null) regression = true;
+        previousActive = null;
+        continue;
+      }
+      if (previousActive == null) {
+        previousActive = sizeBytes;
+        genuineVisibleSizeSamples += 1;
+      } else if (sizeBytes > previousActive) {
+        previousActive = sizeBytes;
+        genuineVisibleSizeSamples += 1;
+      } else if (sizeBytes < previousActive) {
+        regression = true;
+        previousActive = null;
+      }
+    }
+    return !regression && genuineVisibleSizeSamples >= minimumSamples;
+  }, MIN_ACTIVE_PROGRESS_SAMPLES, {timeout: timeoutMs});
 }
 
 async function waitForEnabledAction(page, targetId, targetName, actionName, timeoutMs) {
@@ -1050,7 +1965,8 @@ async function waitForEnabledAction(page, targetId, targetName, actionName, time
   return Date.now() - startedAt;
 }
 
-async function clickAction(page, target, targetId, name, endpointAction, allowedStates, timeoutMs, confirm, recordName = null) {
+async function clickAction(page, target, targetId, name, endpointAction, allowedStates, timeoutMs,
+  confirm = false, recordName = null, onAccepted = null) {
   const deadline = Date.now() + timeoutMs;
   let row = null;
   let button = null;
@@ -1091,12 +2007,14 @@ async function clickAction(page, target, targetId, name, endpointAction, allowed
     await confirmButton.click();
     const response = await responsePromise;
     const responseAt = await page.evaluate(() => performance.now());
+    const httpStatus = requireAcceptedActionResponse(response, name, endpointAction);
+    const acceptedMarker = typeof onAccepted === 'function'
+      ? await onAccepted({response, httpStatus, clickAt, responseAt}) : null;
     const renderedState = await waitForState(page, targetId, target.name, allowedStates, timeoutMs);
     const renderedAt = await page.evaluate(() => performance.now());
-    return {
+    const result = {
       name: recordName || (name === 'Delete Local' ? 'delete_local' : name.toLowerCase()), measured: true,
-      pre_action: preAction,
-      endpoint_action: endpointAction, http_status: response.status(), response_reported: true,
+      pre_action: preAction, endpoint_action: endpointAction, http_status: httpStatus, response_reported: true,
       confirmation_identity_match: confirmationIdentity.identity_match,
       rendered_state: renderedState, click_to_http_response_ms: Number((responseAt - clickAt).toFixed(3)),
       click_to_rendered_state_ms: Number((renderedAt - clickAt).toFixed(3)),
@@ -1104,6 +2022,8 @@ async function clickAction(page, target, targetId, name, endpointAction, allowed
       confirmation_click_to_http_response_ms: Number((responseAt - clickAt).toFixed(3)),
       confirmation_click_to_rendered_state_ms: Number((renderedAt - clickAt).toFixed(3)),
     };
+    if (acceptedMarker != null) result.accepted_marker_t_ms = acceptedMarker;
+    return result;
   }
   const clickAt = await page.evaluate(() => performance.now());
   const clickIdentity = await verifyTargetIdentity(row, targetId, target.name);
@@ -1111,16 +2031,21 @@ async function clickAction(page, target, targetId, name, endpointAction, allowed
   await button.click();
   const response = await responsePromise;
   const responseAt = await page.evaluate(() => performance.now());
+  const httpStatus = requireAcceptedActionResponse(response, name, endpointAction);
+  const acceptedMarker = typeof onAccepted === 'function'
+    ? await onAccepted({response, httpStatus, clickAt, responseAt}) : null;
   const renderedState = await waitForState(page, targetId, target.name, allowedStates, timeoutMs);
   const renderedAt = await page.evaluate(() => performance.now());
-  return {
+  const result = {
     name: recordName || (name === 'Queue' ? 'queue' : name.toLowerCase()), measured: true,
     pre_action: preAction,
     click_identity_match: clickIdentity.identity_match,
-    endpoint_action: endpointAction, http_status: response.status(), response_reported: true,
+    endpoint_action: endpointAction, http_status: httpStatus, response_reported: true,
     rendered_state: renderedState, click_to_http_response_ms: Number((responseAt - clickAt).toFixed(3)),
     click_to_rendered_state_ms: Number((renderedAt - clickAt).toFixed(3)),
   };
+  if (acceptedMarker != null) result.accepted_marker_t_ms = acceptedMarker;
+  return result;
 }
 
 function invalidPrecondition(message, precondition = null, action = null) {
@@ -1133,11 +2058,18 @@ function invalidPrecondition(message, precondition = null, action = null) {
 
 function readinessIsQueueable(precondition) {
   if (!precondition || !QUEUEABLE_STATES.has(String(precondition.status || ''))) return false;
-  // Queue must be enabled and Delete Local must be disabled. The latter is
-  // the DOM-visible proof that no local copy remains; Queue alone is also
-  // enabled for local-only/default states with retained local content.
-  return precondition.controls?.Queue?.enabled === true
-    && precondition.controls?.['Delete Local']?.enabled !== true;
+  return localAbsentControlsAreReady(precondition);
+}
+
+function localAbsentControlsAreReady(precondition) {
+  return precondition?.controls?.Queue?.enabled === true
+    && precondition?.controls?.['Delete Local']?.enabled !== true;
+}
+
+function directoryReadinessIsFresh(precondition) {
+  return Boolean(precondition && String(precondition.status || '') === FRESH_REMOTE_ONLY_STATE
+    && precondition.controls?.Queue?.enabled === true
+    && precondition.controls?.Stop?.enabled !== true);
 }
 
 async function waitForNormalizationPrecondition(page, targetId, targetName, timeoutMs, initial = null) {
@@ -1163,9 +2095,7 @@ async function normalizeTarget(page, target, targetId, timeoutMs, evidence) {
   readiness.attempted = true;
   let precondition = null;
   try {
-    precondition = await waitForNormalizationPrecondition(
-      page, targetId, target.name, timeoutMs,
-    );
+    precondition = await waitForNormalizationPrecondition(page, targetId, target.name, timeoutMs);
     readiness.initial_precondition = precondition;
     for (let index = 0; index <= MAX_READINESS_STEPS; index += 1) {
       if (readinessIsQueueable(precondition)) {
@@ -1175,21 +2105,16 @@ async function normalizeTarget(page, target, targetId, timeoutMs, evidence) {
         return;
       }
       if (index === MAX_READINESS_STEPS) {
-        throw invalidPrecondition('synthetic browser target did not reach remote-only queueable readiness',
-          precondition);
+        throw invalidPrecondition('synthetic browser target did not reach remote-only queueable readiness', precondition);
       }
-
       let actionName = null;
       let endpointAction = null;
       let allowedStates = null;
       let confirm = false;
       if (precondition.controls?.Stop?.enabled === true) {
-        actionName = 'Stop';
-        endpointAction = 'stop';
-        allowedStates = ['stopped'];
+        actionName = 'Stop'; endpointAction = 'stop'; allowedStates = ['stopped'];
       } else if (precondition.controls?.['Delete Local']?.enabled === true) {
-        actionName = 'Delete Local';
-        endpointAction = 'delete_local';
+        actionName = 'Delete Local'; endpointAction = 'delete_local';
         allowedStates = [...QUEUEABLE_STATES, 'default-local', 'local only', 'downloaded',
           'extracting', 'extracted', 'validating', 'validated', 'move_failed', 'move-succeeded'];
         confirm = true;
@@ -1199,16 +2124,13 @@ async function normalizeTarget(page, target, targetId, timeoutMs, evidence) {
           precondition,
         );
       }
-
       const result = await clickAction(
         page, target, targetId, actionName, endpointAction, allowedStates, timeoutMs, confirm,
         `normalize_${endpointAction}`,
       );
       result.measured = false;
       readiness.steps.push(result);
-      precondition = await waitForNormalizationPrecondition(
-        page, targetId, target.name, timeoutMs,
-      );
+      precondition = await waitForNormalizationPrecondition(page, targetId, target.name, timeoutMs);
     }
   } catch (error) {
     readiness.final_precondition = precondition || error.precondition || null;
@@ -1218,13 +2140,42 @@ async function normalizeTarget(page, target, targetId, timeoutMs, evidence) {
   }
 }
 
+async function establishFreshReadiness(page, targetId, targetName, timeoutMs, evidence) {
+  const readiness = evidence.readiness;
+  readiness.attempted = true;
+  try {
+    const precondition = await readActionPrecondition(page, targetId, targetName, timeoutMs);
+    readiness.initial_precondition = precondition;
+    readiness.final_precondition = precondition;
+    if (!directoryReadinessIsFresh(precondition)) {
+      throw invalidPrecondition(
+        `synthetic directory target must be fresh remote-only before Queue; observed ${precondition.status || 'unknown'}`,
+        precondition,
+      );
+    }
+    readiness.pass = true;
+  } catch (error) {
+    readiness.final_precondition = error.precondition || readiness.final_precondition || null;
+    readiness.failure_classification = error.failure_classification || 'probe';
+    readiness.pass = false;
+    throw error;
+  }
+}
+
+async function establishReadiness(page, target, targetId, timeoutMs, evidence) {
+  if (target.kind === 'directory') {
+    return establishFreshReadiness(page, targetId, target.name, timeoutMs, evidence);
+  }
+  return normalizeTarget(page, target, targetId, timeoutMs, evidence);
+}
+
 function recordCleanupError(evidence, record, step, error) {
   const item = {step, ...errorRecord(`cleanup-${step}`, error)};
   boundedPush(record.errors, item, MAX_ERRORS);
   boundedPush(evidence.errors, item, MAX_ERRORS);
 }
 
-async function cleanupTarget(page, target, targetId, timeoutMs, evidence, record) {
+async function cleanupDirectoryTarget(page, target, targetId, timeoutMs, evidence, record) {
   record.attempted = true;
   let observedState = null;
   try { observedState = await readTargetState(page, targetId, target.name, timeoutMs); }
@@ -1234,16 +2185,29 @@ async function cleanupTarget(page, target, targetId, timeoutMs, evidence, record
   }
   record.observed_state = observedState?.status || null;
   record.observed_identity = observedState?.identity || null;
-
-  const stopRequired = !observedState || Boolean(
-    ['queued', 'downloading', 'extracting'].includes(observedState.status)
-    || (Number.isFinite(observedState.progress) && observedState.progress > 0 && observedState.progress < 100)
-  );
+  const actionAccepted = record.queue_accepted === true || record.mutation_accepted === true;
+  if (!actionAccepted) {
+    const quiescent = Boolean(observedState && directoryReadinessIsFresh(observedState));
+    record.residual_state = observedState?.status || null;
+    record.residual_identity = observedState?.identity || null;
+    record.residual_remote_only_queueable = quiescent;
+    record.residual_local_absent = quiescent;
+    record.transfer_quiescent = quiescent;
+    record.noop = quiescent;
+    if (!quiescent) {
+      recordCleanupError(evidence, record, 'rejected-queue-state',
+        new Error('rejected Queue did not leave the directory target remote-only and quiescent'));
+    }
+    record.pass = cleanupPass(record);
+    return;
+  }
+  const stopRequired = !observedState || observedState.status !== 'stopped'
+    || observedState.controls?.Stop?.enabled === true;
   if (stopRequired) {
     const stopStep = {name: 'cleanup_stop', measured: false, attempted: true};
     try {
       const waitMs = await waitForEnabledAction(page, targetId, target.name, 'Stop', timeoutMs);
-      const result = await clickAction(page, target, targetId, 'Stop', 'stop', ['stopped'], timeoutMs, false);
+      const result = await clickAction(page, target, targetId, 'Stop', 'stop', ['stopped'], timeoutMs);
       result.name = 'cleanup_stop'; result.measured = false; result.control_enabled_wait_ms = waitMs;
       Object.assign(stopStep, result, {completed: true});
     } catch (error) {
@@ -1256,83 +2220,150 @@ async function cleanupTarget(page, target, targetId, timeoutMs, evidence, record
     record.steps.push({name: 'cleanup_stop', measured: false, attempted: false,
       skipped: true, reason: `target state was ${observedState?.status || 'unknown'}`});
   }
+  try {
+    const residual = await readTargetState(page, targetId, target.name, timeoutMs);
+    record.residual_state = residual?.status || null;
+    record.residual_identity = residual?.identity || null;
+    record.transfer_quiescent = residual?.status === 'stopped'
+      && residual?.controls?.Stop?.enabled !== true;
+  }
+  catch (error) {
+    record.residual_state = null;
+    record.transfer_quiescent = false;
+    recordCleanupError(evidence, record, 'residual-state', error);
+  }
+  record.pass = cleanupPass(record);
+}
 
+async function cleanupLegacyTarget(page, target, targetId, timeoutMs, evidence, record) {
+  record.attempted = true;
+  let observedState = null;
+  try { observedState = await readTargetState(page, targetId, target.name, timeoutMs); }
+  catch (error) {
+    record.observed_state_error = errorRecord('cleanup-observe', error);
+    recordCleanupError(evidence, record, 'observe', error);
+  }
+  record.observed_state = observedState?.status || null;
+  record.observed_identity = observedState?.identity || null;
+  const stopRequired = !observedState || ['queued', 'downloading', 'extracting'].includes(observedState.status)
+    || (Number.isFinite(observedState.progress) && observedState.progress > 0 && observedState.progress < 100);
+  if (stopRequired) {
+    const stopStep = {name: 'cleanup_stop', measured: false, attempted: true};
+    try {
+      const waitMs = await waitForEnabledAction(page, targetId, target.name, 'Stop', timeoutMs);
+      const result = await clickAction(page, target, targetId, 'Stop', 'stop', ['stopped'], timeoutMs, false);
+      result.name = 'cleanup_stop'; result.measured = false; result.control_enabled_wait_ms = waitMs;
+      Object.assign(stopStep, result, {completed: true});
+    } catch (error) {
+      stopStep.completed = false; stopStep.error = errorRecord('cleanup-stop', error);
+      recordCleanupError(evidence, record, 'stop', error);
+    }
+    record.steps.push(stopStep);
+  } else {
+    record.steps.push({name: 'cleanup_stop', measured: false, attempted: false, skipped: true,
+      reason: `target state was ${observedState?.status || 'unknown'}`});
+  }
   let deleteCompleted = readinessIsQueueable(observedState);
   if (!deleteCompleted) {
     const deleteStep = {name: 'cleanup_delete_local', measured: false, attempted: true};
     try {
       await waitForEnabledAction(page, targetId, target.name, 'Delete Local', timeoutMs);
-      const result = await clickAction(
-        page, target, targetId, 'Delete Local', 'delete_local', LOCAL_ABSENT_STATES, timeoutMs, true,
-      );
+      const result = await clickAction(page, target, targetId, 'Delete Local', 'delete_local', LOCAL_ABSENT_STATES, timeoutMs, true);
       result.name = 'cleanup_delete_local'; result.measured = false;
       Object.assign(deleteStep, result, {completed: true});
       deleteCompleted = true;
     } catch (error) {
-      deleteStep.completed = false;
-      deleteStep.error = errorRecord('cleanup-delete-local', error);
+      deleteStep.completed = false; deleteStep.error = errorRecord('cleanup-delete-local', error);
       recordCleanupError(evidence, record, 'delete_local', error);
     }
     record.steps.push(deleteStep);
   } else {
-    record.steps.push({name: 'cleanup_delete_local', measured: false, attempted: false,
-      skipped: true, reason: 'target was already deleted'});
+    record.steps.push({name: 'cleanup_delete_local', measured: false, attempted: false, skipped: true,
+      reason: 'target was already deleted'});
   }
-
   try {
     const residual = await readTargetState(page, targetId, target.name, timeoutMs);
     record.residual_state = residual?.status || null;
     record.residual_identity = residual?.identity || null;
     record.residual_local_absent = readinessIsQueueable(residual);
-  }
-  catch (error) {
-    record.residual_state = null;
-    record.residual_local_absent = false;
+  } catch (error) {
+    record.residual_state = null; record.residual_local_absent = false;
     recordCleanupError(evidence, record, 'residual-state', error);
   }
-  if (deleteCompleted && record.residual_local_absent) {
-    record.restored_state = record.residual_state;
-  } else if (!record.errors.length && !record.residual_local_absent) {
+  if (deleteCompleted && record.residual_local_absent) record.restored_state = record.residual_state;
+  else if (!record.errors.length && !record.residual_local_absent) {
     recordCleanupError(evidence, record, 'restore', new Error('target was not restored to a local-absent state'));
   }
   record.pass = cleanupPass(record);
 }
 
+async function cleanupTarget(page, target, targetId, timeoutMs, evidence, record) {
+  if (target.kind === 'directory') return cleanupDirectoryTarget(page, target, targetId, timeoutMs, evidence, record);
+  return cleanupLegacyTarget(page, target, targetId, timeoutMs, evidence, record);
+}
+
 async function exerciseActions(page, target, targetId, timeoutMs, evidence, scopedPath) {
   const actions = evidence.actions;
+  const legacy = target.kind !== 'directory';
   const cleanupRecord = {name: 'cleanup', measured: false, required: false, attempted: false,
+    profile: legacy ? 'legacy-file' : 'cadence-directory',
     steps: [], errors: [], observed_state: null, restored_state: null, residual_state: null,
-    residual_local_absent: false, pass: false};
+    residual_local_absent: false, residual_remote_only_queueable: false, transfer_quiescent: false,
+    queue_accepted: false, mutation_accepted: false, noop: false, pass: false};
   try {
-    // Set the obligation before the first Queue click. If that click or its
-    // response is interrupted after mutating server state, the finally block
-    // still performs best-effort Stop then Delete Local recovery.
-    cleanupRecord.required = true;
-    evidence.cleanup.required = true;
-    await normalizeTarget(page, target, targetId, timeoutMs, evidence);
-    // Start target mutation sampling only after readiness normalization. The
-    // normalization actions are evidence, but are not part of measurement.
+    // Legacy normalization can mutate a reused file target, so its cleanup
+    // obligation starts before readiness. The cadence directory only accepts
+    // a fresh remote-only row and begins cleanup after that proof.
+    if (legacy) {
+      cleanupRecord.required = true;
+      evidence.cleanup.required = true;
+    }
+    await establishReadiness(page, target, targetId, timeoutMs, evidence);
     await attachTargetObserver(page, targetId, target.name, scopedPath);
+    if (target.kind === 'directory') {
+      await waitForPathPairReconciliation(page, target, timeoutMs, evidence);
+    }
     const measurementEpoch = await page.evaluate(() =>
-      window.__seedSyncPerfTimeline?.beginMeasurement?.() || null);
+      window.__seedSyncPerfTimeline?.beginMeasurement?.() ?? null);
     evidence.measurement.epoch_t_ms = measurementEpoch?.epoch_t_ms ?? null;
     evidence.measurement.post_readiness = true;
+    cleanupRecord.required = true;
+    evidence.cleanup.required = true;
     const queueAction = await clickAction(
       page, target, targetId, 'Queue', 'queue', ['queued', 'downloading'], timeoutMs, false, 'queue',
+      async () => {
+        cleanupRecord.queue_accepted = true;
+        cleanupRecord.mutation_accepted = true;
+        const marker = await page.evaluate(() =>
+          window.__seedSyncPerfTimeline?.markMeasuredQueue?.() ?? null);
+        if (!finiteMeasurementMarker(marker)) {
+          const error = new Error('Queue was accepted but the measured-Queue timeline marker was unavailable');
+          error.failure_classification = 'measurement-boundary';
+          error.action = 'Queue';
+          error.endpoint_action = 'queue';
+          error.response_reported = true;
+          throw error;
+        }
+        return marker;
+      },
     );
     actions.push(queueAction);
-    evidence.measurement.measured_queue_t_ms = await page.evaluate(() =>
-      window.__seedSyncPerfTimeline?.markMeasuredQueue?.() || null);
+    evidence.measurement.measured_queue_t_ms = queueAction.accepted_marker_t_ms ?? null;
     await waitForActiveMaterialization(page, targetId, target.name, timeoutMs);
     const stopControlWaitMs = await waitForEnabledAction(page, targetId, target.name, 'Stop', timeoutMs);
     const stopAction = await clickAction(page, target, targetId, 'Stop', 'stop', ['stopped'], timeoutMs, false);
     stopAction.control_enabled_wait_ms = stopControlWaitMs;
     actions.push(stopAction);
-    await waitForEnabledAction(page, targetId, target.name, 'Delete Local', timeoutMs);
-    actions.push(await clickAction(
-      page, target, targetId, 'Delete Local', 'delete_local', LOCAL_ABSENT_STATES, timeoutMs, true,
-    ));
-    actions.push(await clickAction(page, target, targetId, 'Queue', 'queue', ['queued', 'downloading'], timeoutMs, false, 'requeue'));
+    await page.evaluate(() => window.__seedSyncPerfTimeline?.markTransferEnded?.());
+    if (legacy) {
+      await waitForEnabledAction(page, targetId, target.name, 'Delete Local', timeoutMs);
+      actions.push(await clickAction(
+        page, target, targetId, 'Delete Local', 'delete_local', LOCAL_ABSENT_STATES, timeoutMs, true,
+      ));
+      actions.push(await clickAction(
+        page, target, targetId, 'Queue', 'queue', ['queued', 'downloading'], timeoutMs, false, 'requeue',
+      ));
+    }
   } finally {
     if (cleanupRecord.required) {
       await cleanupTarget(page, target, targetId, timeoutMs, evidence, cleanupRecord);
@@ -1343,14 +2374,26 @@ async function exerciseActions(page, target, targetId, timeoutMs, evidence, scop
 }
 
 function finalizeEvidence(evidence) {
-  const measuredQueueTMs = Number(evidence.measurement?.measured_queue_t_ms);
+  const measuredQueueTMs = evidence.measurement?.measured_queue_t_ms;
   const allTargetMutations = Array.isArray(evidence.samples.target_dom_mutations)
     ? evidence.samples.target_dom_mutations : [];
   const targetMutations = measuredTargetMutations(allTargetMutations, measuredQueueTMs);
   evidence.samples.target_dom_mutations = targetMutations.slice(0, MAX_MUTATIONS);
   evidence.measurement.sample_count = evidence.samples.target_dom_mutations.length;
   const cadenceSummary = cadence(evidence.samples.target_dom_mutations);
-  const progressSummary = progressGap(evidence.samples.target_dom_mutations);
+  const visibleProgressSummary = progressGap(evidence.samples.target_dom_mutations);
+  const visibleSizeSummary = visibleSizeGap(evidence.samples.target_dom_mutations);
+  const rawProgress = measuredTargetMutations(
+    Array.isArray(evidence.samples.target_raw_progress) ? evidence.samples.target_raw_progress : [],
+    measuredQueueTMs,
+  ).slice(0, MAX_MUTATIONS);
+  evidence.samples.target_raw_progress = rawProgress;
+  const rawProgressSummary = progressGapForField(rawProgress, 'transferred_size');
+  const heartbeats = (Array.isArray(evidence.samples.main_thread_responsiveness)
+    ? evidence.samples.main_thread_responsiveness : [])
+    .filter(sample => Number(sample?.t_ms) >= Number(measuredQueueTMs));
+  evidence.samples.main_thread_responsiveness = heartbeats.slice(0, MAX_MAIN_THREAD_HEARTBEATS);
+  const responsivenessSummary = mainThreadResponsiveness(evidence.samples.main_thread_responsiveness);
   const receiveToDom = latencyStats(evidence.samples.target_dom_mutations, 'receive_to_dom_ms');
   evidence.samples.target_dom_cadence = {
     count: cadenceSummary.count, p95_ms: cadenceSummary.p95_ms, max_ms: cadenceSummary.max_ms,
@@ -1362,38 +2405,83 @@ function finalizeEvidence(evidence) {
     .filter(sample => Number.isFinite(Number(sample.progress)))
     .slice(0, MAX_MUTATIONS)
     .map(sample => ({t_ms: sample.t_ms, status: sample.status, progress: sample.progress}));
+  evidence.samples.visible_progress = evidence.samples.progress;
+  evidence.samples.visible_size_info = evidence.samples.target_dom_mutations
+    .filter(sample => sample && sample.size_info != null)
+    .map(sample => ({t_ms: sample.t_ms, status: sample.status, size_info: sample.size_info}));
   evidence.statistics.action_http_response = actionStats(evidence.actions, 'click_to_http_response_ms');
   evidence.statistics.action_rendered_state = actionStats(evidence.actions, 'click_to_rendered_state_ms');
-  evidence.statistics.progress_gap = progressSummary;
-  evidence.max_progress_gap_ms = progressSummary.max_ms;
+  evidence.statistics.progress_gap = visibleSizeSummary;
+  evidence.statistics.visible_size_info_gap = visibleSizeSummary;
+  evidence.statistics.visible_progress_gap = visibleProgressSummary;
+  evidence.statistics.raw_progress_gap = rawProgressSummary;
+  evidence.statistics.browser_main_thread_responsiveness = responsivenessSummary;
+  evidence.max_progress_gap_ms = visibleSizeSummary.max_ms;
   evidence.cycles = evidence.actions;
   evidence.thresholds.target_dom_p95_ms.observed_ms = receiveToDom.p95_ms;
   evidence.thresholds.target_dom_p95_ms.pass = receiveToDom.p95_ms != null && receiveToDom.p95_ms <= 200;
   evidence.thresholds.target_dom_max_ms.observed_ms = receiveToDom.max_ms;
   evidence.thresholds.target_dom_max_ms.pass = receiveToDom.max_ms != null && receiveToDom.max_ms <= 500;
-  evidence.thresholds.max_progress_gap_ms.observed_ms = progressSummary.max_ms;
-  evidence.thresholds.max_progress_gap_ms.pass = progressSummary.sample_count <= 1
-    || (progressSummary.max_ms != null && progressSummary.max_ms <= MAX_PROGRESS_GAP_MS);
-  const requiredActions = ['queue', 'stop', 'delete_local'];
+  const progressAcceptance = progressGapAcceptance(visibleSizeSummary);
+  const rawProgressAcceptance = progressGapAcceptance(rawProgressSummary);
+  evidence.thresholds.minimum_progress_gap_count.observed = visibleSizeSummary.gap_count;
+  evidence.thresholds.minimum_progress_gap_count.pass = progressAcceptance.minimum_gap_count;
+  evidence.thresholds.progress_gap_p50_ms.observed_ms = visibleSizeSummary.p50_ms;
+  evidence.thresholds.progress_gap_p50_ms.pass = progressAcceptance.p50;
+  evidence.thresholds.progress_gap_p95_ms.observed_ms = visibleSizeSummary.p95_ms;
+  evidence.thresholds.progress_gap_p95_ms.pass = progressAcceptance.p95;
+  evidence.thresholds.max_progress_gap_ms.observed_ms = visibleSizeSummary.max_ms;
+  evidence.thresholds.max_progress_gap_ms.pass = progressAcceptance.max;
+  evidence.thresholds.progress_monotonic.observed = {
+    monotonic: visibleSizeSummary.monotonic,
+    regression_count: visibleSizeSummary.regression_count,
+  };
+  evidence.thresholds.progress_monotonic.pass = progressAcceptance.monotonic;
+  evidence.thresholds.raw_progress_monotonic.observed = {
+    monotonic: rawProgressSummary.monotonic,
+    regression_count: rawProgressSummary.regression_count,
+    sample_count: rawProgressSummary.sample_count,
+  };
+  evidence.thresholds.raw_progress_monotonic.pass = rawProgressSummary.sample_count > 0
+    && rawProgressAcceptance.monotonic;
+  evidence.thresholds.main_thread_responsiveness.observed = responsivenessSummary;
+  evidence.thresholds.main_thread_responsiveness.pass = responsivenessSummary.count >= MIN_MAIN_THREAD_HEARTBEATS
+    && responsivenessSummary.max_drift_ms != null
+    && responsivenessSummary.max_drift_ms <= MAIN_THREAD_DRIFT_LIMIT_MS;
+  const measurementBoundary = measurementBoundaryValid(evidence.measurement);
+  evidence.thresholds.measurement_boundary.observed = {
+    epoch_t_ms: evidence.measurement.epoch_t_ms,
+    measured_queue_t_ms: evidence.measurement.measured_queue_t_ms,
+    post_readiness: evidence.measurement.post_readiness,
+  };
+  evidence.thresholds.measurement_boundary.pass = measurementBoundary;
+  const legacy = evidence.target?.kind !== 'directory';
+  const requiredActions = legacy ? ['queue', 'stop', 'delete_local', 'requeue'] : ['queue', 'stop'];
   const rendered = evidence.statistics.action_rendered_state;
-  const requeue = rendered.requeue || null;
   evidence.thresholds.action_rendered_state_p95_ms.observed = {
-    queue: rendered.queue || null, stop: rendered.stop || null, delete_local: rendered.delete_local || null,
-    requeue: requeue,
+    queue: rendered.queue || null, stop: rendered.stop || null,
+    delete_local: rendered.delete_local || null, requeue: rendered.requeue || null,
   };
   evidence.thresholds.action_rendered_state_p95_ms.pass = requiredActions.every(action => {
     const stat = rendered[action];
     return stat && stat.p95_ms != null && stat.p95_ms <= ACTION_RENDER_LIMITS_MS[action];
-  }) && Boolean(requeue) && requeue.p95_ms <= ACTION_RENDER_LIMITS_MS.requeue;
+  });
   const measured = evidence.actions.filter(action => action && action.measured !== false && !action.steps);
-  evidence.thresholds.action_http_response_reported.pass = measured.length >= 4
+  evidence.thresholds.action_http_response_reported.pass = measured.length >= requiredActions.length
     && measured.every(action => action.response_reported === true && Number(action.http_status) >= 200 && Number(action.http_status) < 300);
   evidence.thresholds.browser_errors.observed = evidence.errors.length;
   evidence.thresholds.browser_errors.pass = evidence.errors.length === 0;
-  evidence.cleanup.pass = cleanupPass(evidence.cleanup);
+  evidence.cleanup.pass = cleanupPass({...evidence.cleanup, profile: legacy ? 'legacy-file' : 'cadence-directory'});
   evidence.pass = evidence.thresholds.target_dom_p95_ms.pass
     && evidence.thresholds.target_dom_max_ms.pass
+    && evidence.thresholds.minimum_progress_gap_count.pass
+    && evidence.thresholds.progress_gap_p50_ms.pass
+    && evidence.thresholds.progress_gap_p95_ms.pass
     && evidence.thresholds.max_progress_gap_ms.pass
+    && evidence.thresholds.progress_monotonic.pass
+    && evidence.thresholds.raw_progress_monotonic.pass
+    && evidence.thresholds.main_thread_responsiveness.pass
+    && evidence.thresholds.measurement_boundary.pass
     && evidence.thresholds.action_rendered_state_p95_ms.pass
     && evidence.thresholds.action_http_response_reported.pass
     && evidence.readiness.pass
@@ -1404,9 +2492,9 @@ function finalizeEvidence(evidence) {
 
 function measuredTargetMutations(samples, measuredQueueTMs) {
   const values = Array.isArray(samples) ? samples : [];
-  return Number.isFinite(Number(measuredQueueTMs))
-    ? values.filter(sample => Number(sample?.t_ms) >= Number(measuredQueueTMs))
-    : values;
+  return finiteMeasurementMarker(measuredQueueTMs)
+    ? values.filter(sample => Number(sample?.t_ms) >= measuredQueueTMs)
+    : [];
 }
 
 function classifyFailure(error) {

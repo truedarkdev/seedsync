@@ -12,13 +12,22 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from generate_fixture import _data_spec, config_fingerprint, normalize_topology_spec, topology_fingerprint
+from generate_fixture import CADENCE_FIELDS, _data_spec, config_fingerprint, normalize_topology_spec, topology_fingerprint
 
 
-# Mixed-profile transfer must remain observable for the browser timeline while
-# leaving the historical uniform profile unchanged.  This is a synthetic
-# fixture setting, not a production default.
+# Active-profile transfer must remain observable for the browser timeline while
+# leaving the historical uniform profile unchanged.  These are synthetic
+# fixture settings, not production defaults.
 MIXED_RATE_LIMIT_BYTES_PER_SECOND = 64_000
+CADENCE_RATE_LIMIT_BYTES_PER_SECOND = 64_000
+
+
+def rate_limit_for_profile(profile: str) -> int:
+    return {
+        "uniform": 0,
+        "mixed": MIXED_RATE_LIMIT_BYTES_PER_SECOND,
+        "cadence": CADENCE_RATE_LIMIT_BYTES_PER_SECOND,
+    }[profile]
 
 
 def _hash_secret(secret: str) -> str:
@@ -35,7 +44,12 @@ def _synthetic_file_id(pair_id: str, index: int) -> str:
     return json.dumps([pair_id, "node-{0:08d}.{1}".format(index, extension)], separators=(",", ":"))
 
 
-def _seed_persist(config_dir: Path, move_failure_mode: str, pair_ids: list[str]) -> None:
+def _seed_persist(
+    config_dir: Path,
+    move_failure_mode: str,
+    pair_ids: list[str],
+    resume_source_identities: dict[str, tuple[int, int]] | None = None,
+) -> None:
     downloaded = [_synthetic_file_id(pair_ids[index % len(pair_ids)], index)
                   for index in range(24)]
     controller = {
@@ -47,6 +61,11 @@ def _seed_persist(config_dir: Path, move_failure_mode: str, pair_ids: list[str])
         "final_move_succeeded": downloaded[:2],
         "marker_identity_migration": 0,
     }
+    if resume_source_identities:
+        controller["resume_sources"] = {
+            file_id: {"size": identity[0], "mtime": identity[1]}
+            for file_id, identity in resume_source_identities.items()
+        }
     (config_dir / "controller.persist").write_text(json.dumps(controller, indent=2) + "\n", encoding="utf-8")
     (config_dir / "autoqueue.persist").write_text(json.dumps({"patterns": []}, indent=2) + "\n", encoding="utf-8")
 
@@ -80,11 +99,21 @@ def seed_config(config_dir: Path, api_token: str, pairs: int = 6, breadcrumb_mod
         pass
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     spec = normalize_topology_spec(profile, pairs, high_card_enabled=high_card_enabled)
-    rate_limit = MIXED_RATE_LIMIT_BYTES_PER_SECOND if profile == "mixed" else 0
+    rate_limit = rate_limit_for_profile(profile)
+    if profile == "cadence":
+        parallel_files = 4
+        connections_per_root_file = 1
+        connections_per_dir_file = 1
+        total_connections = 4
+    else:
+        parallel_files = 4
+        connections_per_root_file = 4
+        connections_per_dir_file = 4
+        total_connections = 16
     pair_entries = [
         {
             "id": pair["id"],
-            "name": "Performance Pair {0:02d}".format(int(pair["id"][-2:])),
+            "name": pair.get("name", "Performance Pair {0:02d}".format(int(pair["id"][-2:]))),
             "remote_path": "/home/remoteuser/files/{}".format(pair["directory"]),
             "local_path": "/mounts/{}".format(pair["directory"]),
             "directory": pair["directory"],
@@ -94,6 +123,11 @@ def seed_config(config_dir: Path, api_token: str, pairs: int = 6, breadcrumb_mod
             "enabled": pair["enabled"],
             "auto_queue": pair["auto_queue"],
             "remote_only_targets": pair["remote_only_targets"],
+            **{
+                key: pair[key]
+                for key in CADENCE_FIELDS
+                if key in pair
+            },
         }
         for pair in spec["pairs"]
     ]
@@ -123,10 +157,10 @@ remote_path_to_scan_script = /tmp
 remote_python_path = python3
 use_ssh_key = False
 num_max_parallel_downloads = 1
-num_max_parallel_files_per_download = 4
-num_max_connections_per_root_file = 4
-num_max_connections_per_dir_file = 4
-num_max_total_connections = 16
+num_max_parallel_files_per_download = {parallel_files}
+num_max_connections_per_root_file = {connections_per_root_file}
+num_max_connections_per_dir_file = {connections_per_dir_file}
+num_max_total_connections = {total_connections}
 use_temp_file = True
 rate_limit = {rate_limit}
 net_socket_buffer = 8M
@@ -171,16 +205,32 @@ download_start = False
 download_complete = True
 extraction_complete = True
 delete_complete = True
-"""
+    """
     (config_dir / "settings.cfg").write_text(settings, encoding="utf-8")
+    path_pairs_payload = {
+        "version": 1, "profile": profile,
+        "diagnostics_mode": diagnostics_mode,
+        "rate_limit_bytes_per_second": rate_limit,
+        "connection_contract": {
+            "parallel_files": parallel_files,
+            "connections_per_root_file": connections_per_root_file,
+            "connections_per_dir_file": connections_per_dir_file,
+            "total_connections": total_connections,
+        },
+        "topology_fingerprint": topology_fingerprint(spec),
+        "config_fingerprint": config_fingerprint(spec),
+        "data_topology_spec": _data_spec(spec),
+        "experiment_spec": spec,
+        "path_pairs": pair_entries,
+    }
+    staging_cases = [
+        {"pair_id": pair["id"], **pair["staging_case"]}
+        for pair in spec["pairs"] if "staging_case" in pair
+    ]
+    if staging_cases:
+        path_pairs_payload["staging_cases"] = staging_cases
     (config_dir / "path_pairs.json").write_text(
-        json.dumps({"version": 1, "profile": profile,
-                    "diagnostics_mode": diagnostics_mode,
-                    "rate_limit_bytes_per_second": rate_limit,
-                    "topology_fingerprint": topology_fingerprint(spec),
-                    "config_fingerprint": config_fingerprint(spec),
-                    "data_topology_spec": _data_spec(spec),
-                    "experiment_spec": spec, "path_pairs": pair_entries}, indent=2) + "\n",
+        json.dumps(path_pairs_payload, indent=2) + "\n",
         encoding="utf-8",
     )
     api_key = {
@@ -197,10 +247,20 @@ delete_complete = True
                     "browser_handover_claimed_version": ""}, indent=2) + "\n",
         encoding="utf-8",
     )
+    resume_source_identities = {}
+    if profile == "cadence":
+        active_pair = spec["pairs"][0]
+        target = active_pair["remote_only_targets"][0]
+        if target.get("kind") != "directory":
+            raise ValueError("cadence browser target must be a directory")
+        # A directory MIRROR has aggregate progress but no file resume
+        # identity. Leave resume_sources empty so Queue creates the active
+        # state on a fresh remote-only target.
     _seed_persist(
         config_dir,
         move_failure_mode,
         [pair["id"] for pair in spec["pairs"] if pair["enabled"]],
+        resume_source_identities,
     )
     for path in (config_dir / "settings.cfg", config_dir / "path_pairs.json", config_dir / "api-keys.json",
                  config_dir / "controller.persist", config_dir / "autoqueue.persist"):
@@ -218,7 +278,7 @@ def main() -> int:
     parser.add_argument("--breadcrumb-mode", choices=("on", "off"), default="on")
     parser.add_argument("--move-failure-mode", choices=("stale", "none"), default="stale")
     parser.add_argument("--remote-address", default="remote")
-    parser.add_argument("--profile", choices=("uniform", "mixed"), default="uniform")
+    parser.add_argument("--profile", choices=("uniform", "mixed", "cadence"), default="uniform")
     parser.add_argument("--high-card-enabled", choices=("on", "off"), default="on")
     parser.add_argument("--diagnostics-mode", choices=("on", "off"), default="on")
     args = parser.parse_args()
@@ -239,10 +299,14 @@ def main() -> int:
         args.high_card_enabled == "on",
         args.diagnostics_mode,
     )
-    rate_limit = MIXED_RATE_LIMIT_BYTES_PER_SECOND if args.profile == "mixed" else 0
+    rate_limit = rate_limit_for_profile(args.profile)
+    effective_high_card_enabled = next(
+        (pair.get("enabled") for pair in spec["pairs"]
+         if pair.get("role") == "high-cardinality-idle"), True
+    )
     print(json.dumps({"schema": "seedsync-performance-lab.config.v1", "pairs": len(spec["pairs"]),
                       "requested_pairs": args.pairs,
-                      "profile": args.profile, "high_card_enabled": args.high_card_enabled == "on",
+                      "profile": args.profile, "high_card_enabled": effective_high_card_enabled,
                       "diagnostics_mode": args.diagnostics_mode,
                       "pair_node_counts": {
                           pair["id"]: {

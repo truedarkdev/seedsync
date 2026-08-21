@@ -25,6 +25,39 @@ Manifest topology records physical fixture expectations separately from
 `enabled_expected_model_tree_file_count`; the former gates the >=200k fixture
 requirement while the latter drives the enabled experiment's model target.
 
+Set `PERF_PROFILE=cadence` for the active-download progress-cadence fixture.
+It always creates six enabled Path Pairs: `path-pair-01` is the only
+`ordinary-active` pair, has AutoQueue disabled, and exposes one neutral,
+remote-only `remote-workload` directory at the `active-01` root. The target
+descriptor records `kind=directory`, 1,199 real-byte files, 21 directories, maximum relative depth 3,
+and a logical aggregate of 1,381,318,918,144 bytes
+(about 1.381319 TB decimal). One thousand one 1,316 MiB files carry nearly all
+of the bytes and most of the file count; the remaining 198 files are 64 KiB
+each. The target uses
+`storage_mode=real-bytes-hardlink-deduplicated`: each size band has one real
+deterministic template and the other same-size paths are hardlinks, so logical
+SFTP/LFTP bytes remain distinct while target storage is bounded to 1,379,991,552
+bytes. At the synthetic 64,000-byte/s per-stream limit, the first four large
+children remain active for about 6 hours across four MIRROR streams.
+The full logical directory intentionally runs longer; the browser lane stops
+after its visible `.size_info` forward-cadence evidence threshold rather than
+waiting for full completion. Validation fails closed if the target does not expose the declared
+cardinality, storage mode, or depth. The other five `sample-*` pairs are small
+unrelated isolation roots.
+Cadence config fixes MIRROR parallel files at 4, one connection per root or
+directory file, and four total connections; mixed and uniform retain their
+existing 4/4/16 connection settings.
+
+The cadence seed has no staging artifact or file-only resume identity. The
+remote-only directory is absent from the local fixture volume before Queue, so
+Queue itself creates the active MIRROR state used for cadence measurement.
+Generated local pair roots are owned by the legacy app UID:GID 99:100 with
+mode 775, while remote pair roots use 1000:1000; this lets strict startup
+preflight create each pair's `incomplete` and `complete` runtime directories.
+The capture gate remains 200,000 merged nodes for uniform/mixed; cadence records
+and uses a fixed 2,000-node floor because its intentionally small topology is
+about 3,800 merged nodes.
+
 The lab must be given the exact app image under test:
 
 ~~~sh
@@ -44,28 +77,52 @@ Worker self-check (implementation lane): run the focused
 Docker-served app and Playwright against the exact image; worker self-checks
 are not final verification.
 
-For a browser timeline against the already-started Docker app, use the same
-`PERF_PROFILE=mixed` setting through `prepare`, `start`, and `browser`. Set the
+For the cadence directory browser timeline, use a fresh unique `PERF_PROJECT`
+for each browser run; the probe refuses a default/reused project and records a
+one-run marker. Use the same `PERF_PROFILE=mixed` or `PERF_PROFILE=cadence` setting through `prepare`,
+`start`, and `browser`. Set the
 API key only in the environment and run the lab command below. The probe discovers the
 `ordinary-active` pair and its `remote_only_targets` from the current manifest;
 it does not contain fixture names or credentials.
 
 ~~~sh
 export PERF_API_TOKEN=the-local-lab-key
+export PERF_PROJECT=seedsync-performance-browser-unique  # choose a new value per browser run
 export PERF_PROFILE=mixed
+# Mixed keeps the legacy destructive Delete Local/requeue flow; set this only
+# after the lab prints and you approve the synthetic target set.
+export PERF_BROWSER_DESTRUCTIVE_APPROVED=on
 src/docker/test/performance/lab.sh prepare
 src/docker/test/performance/lab.sh start
 export PERF_PLAYWRIGHT_MODULE=playwright       # optional module name
 export PERF_NODE_PATH=/path/to/node_modules    # optional NODE_PATH
-export PERF_BROWSER_DESTRUCTIVE_APPROVED=on    # only after approving displayed exact targets
 src/docker/test/performance/lab.sh browser candidate
 ~~~
 
-The browser lane performs `Delete Local` twice on the manifest's synthetic
-remote-only target. It first prints the exact local Docker-volume path and
-refuses to proceed unless `PERF_BROWSER_DESTRUCTIVE_APPROVED=on`; set that
-opt-in only after the displayed target set has received explicit approval.
-The remote fixture remains intact.
+For `PERF_PROFILE=cadence`, the directory target must be fresh remote-only and
+queueable before `Queue`; stale, stopped, or locally materialized targets fail
+closed. It clicks `Queue`, samples active progress, clicks `Stop`, and retains
+the synthetic directory partial after Stop. Cleanup is stop-only and must prove the final
+state is stopped and quiescent; it performs no `Delete Local` operation. The
+retained volume can be inspected separately, but filesystem retention is not a
+cleanup assertion. Do not rerun this directory lane against the same
+project/volume. Legacy file targets (the committed mixed descriptor) keep the
+existing reusable normalization, explicit `PERF_BROWSER_DESTRUCTIVE_APPROVED=on`
+approval, `Queue` → active → `Stop` → `Delete Local` → requeue sequence, and
+local-absent cleanup; their rerun behavior is unchanged.
+
+After the cadence target observer attaches, the browser probe polls the
+authenticated `/server/model/v1/summary` endpoint for the exact target Path
+Pair until both `reconciled_local` and `reconciled_remote` are true. The
+bounded readiness observations are retained in the browser artifact; `Queue`
+is not attempted when the summary is unavailable or the target pair does not
+reconcile in time. Every action checks its HTTP response before waiting for a
+rendered state, so a rejected `Queue` is reported immediately and cannot enter
+the measured latency or consume the state-wait timeout. Queue measurement
+starts only after its accepted 2xx response. A rejected Queue that leaves the
+fresh remote-only target unchanged is recorded as a quiescent cleanup no-op;
+an accepted Queue retains the Stop cleanup obligation even if later progress
+or rendering evidence fails.
 
 The artifact is `tmp/pytest/performance-lab/<run-id>/candidate/browser-timeline.json`.
 `PERF_NODE_BINARY` (default `node`) and `PERF_BROWSER_TIMEOUT_MS` (5,000 to
@@ -87,18 +144,27 @@ git diff --check
 
 Verifier/final validation (acceptance lane) must run `lab.sh browser <label>`
 against the live Docker-served app with Playwright. The JSON reports relative
-EventSource receive events, target-row DOM mutations/cadence, progress gaps,
-EventSource apply timestamps and bounded receive-to-apply/apply-to-DOM/
+EventSource receive events, raw target transferred-byte records, rendered
+target-row DOM mutations/cadence, raw transferred-byte samples, visible
+`.size_info` changes, and bounded browser-main-thread heartbeat responsiveness
+during the active transfer. EventSource apply
+timestamps and bounded receive-to-apply/apply-to-DOM/
 receive-to-DOM correlations,
 per-action click-to-response and click-to-rendered-state timings, browser
 errors, identities, thresholds, and pass/fail. Worker self-checks do not count
 as verifier/final validation.
 
-The browser experience limits keep ordinary interactions tight while
-recognizing that a confirmed destructive filesystem action has a different
-cost shape: Queue, Stop, and requeue must render within 250 ms; Delete Local
-must render within 1.2 seconds; target DOM receive-to-render remains at 200 ms
-p95 / 500 ms max; and active progress gaps remain bounded at 1.25 seconds.
+The browser experience limits keep ordinary interactions tight: Queue and Stop
+must render within 250 ms; target DOM receive-to-render remains at 200 ms
+p95 / 500 ms max; and visible `.size_info` progress requires at least 20 genuine
+forward gaps (21 genuine forward-progress samples), with p50 <=150 ms, p95 <=200 ms, and max
+<=1000 ms. The primary forward-cadence acceptance source is the rendered
+`.size_info` value: it requires at least 20 genuine visible forward gaps (21
+samples). Equal/status-only mutations and terminal/reset intervals are ignored.
+Raw `transferred_size` samples from scoped model payloads remain an independent
+backend cadence/monotonicity diagnostic and guard; rendered integer percent is
+reported as a secondary visible diagnostic because it is intentionally coarse
+for this aggregate directory.
 
 `PERF_DIAGNOSTICS_MODE=on|off` controls the seeded performance diagnostics
 recorder (default `on`) and is recorded in run/config evidence. For a same-image
