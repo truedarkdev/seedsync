@@ -718,6 +718,23 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertTrue(any(gap["reason"] == "ingress_rejected" for gap in payload["gaps"]))
         self.assertGreater(payload["version"], 0)
 
+    def test_child_ingress_caps_structured_mapping_at_24_items(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        emitter = collector.create_emitter()
+        details = {"field_{:02d}".format(index): index for index in range(25)}
+
+        emitter.record("model_builder", "diagnostic", details)
+
+        payload = collector.query_events(since_version=0)
+        self.assertEqual(1, len(payload["events"]))
+        retained_details = payload["events"][0]["details"]
+        self.assertEqual(
+            {"field_{:02d}".format(index): index for index in range(24)},
+            retained_details,
+        )
+        self.assertEqual(24, len(retained_details))
+        self.assertNotIn("field_24", retained_details)
+
     def test_policy_persist_failure_rolls_back_live_revision(self):
         def fail_persist(policy):
             raise OSError("no write")

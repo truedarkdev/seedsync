@@ -34,6 +34,9 @@ BREADCRUMB_POLICY_LEVELS = ("off", "error", "warning", "info", "debug", "trace")
 # This is deliberately a distinct, small ingress allowance; the configured
 # 256 MiB budget applies only to retained, sanitized evidence.
 _INGRESS_RECORD_MAX_BYTES = 8 * 1024
+# Structured diagnostics may contain more fields than the generic collection
+# limit, but child-process ingress must retain a finite mapping bound.
+_INGRESS_MAPPING_MAX_ITEMS = 24
 
 
 def opaque_trace_correlation(identity: object) -> str:
@@ -119,7 +122,10 @@ def _bounded_ingress_record(source: object, message: object, details: object,
         if value is None or isinstance(value, (bool, int, float)):
             return value
         if isinstance(value, Mapping):
-            return {str(k)[:64]: sanitize(v, str(k), depth + 1) for k, v in list(value.items())[:16]}
+            return {
+                str(k)[:64]: sanitize(v, str(k), depth + 1)
+                for k, v in list(value.items())[:_INGRESS_MAPPING_MAX_ITEMS]
+            }
         if isinstance(value, (list, tuple)):
             return [sanitize(v, None, depth + 1) for v in list(value)[:16]]
         return "<{}>".format(type(value).__name__)
