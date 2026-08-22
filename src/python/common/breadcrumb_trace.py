@@ -37,6 +37,58 @@ _INGRESS_RECORD_MAX_BYTES = 8 * 1024
 # Structured diagnostics may contain more fields than the generic collection
 # limit, but child-process ingress must retain a finite mapping bound.
 _INGRESS_MAPPING_MAX_ITEMS = 24
+_SHARED_POLICY_MAX_BYTES = 64 * 1024
+_EFFECTIVE_POLICY_CATEGORY_CACHE_MAX = 128
+_POLICY_LEVEL_RANK = {level: index for index, level in enumerate(BREADCRUMB_POLICY_LEVELS)}
+
+
+class _EffectiveBreadcrumbPolicy:
+    """Immutable, read-only policy projection used on breadcrumb hot paths."""
+
+    def __init__(self, default: str, rules: Iterable[tuple[str, str]]):
+        self.__default = default
+        self.__rules = tuple(rules)
+        self.__resolved_categories: Dict[str, str] = {}
+
+    @classmethod
+    def from_policy(cls, policy: Mapping[str, object]) -> "_EffectiveBreadcrumbPolicy":
+        rules = policy.get("rules", {})
+        return cls(
+            str(policy.get("default", DEFAULT_BREADCRUMB_POLICY_LEVEL)),
+            tuple((str(category), str(level)) for category, level in rules.items())
+            if isinstance(rules, Mapping) else (),
+        )
+
+    def allows(self, category: object, level: object) -> bool:
+        if not isinstance(category, str):
+            category = str(category)
+        if not isinstance(level, str):
+            level = "info"
+        normalized_level = level.strip().lower()
+        event_rank = _POLICY_LEVEL_RANK.get(normalized_level, _POLICY_LEVEL_RANK["info"])
+        configured_level = self.__resolved_categories.get(category)
+        if configured_level is None:
+            configured_level = self.__resolve(category)
+            if len(self.__resolved_categories) >= _EFFECTIVE_POLICY_CATEGORY_CACHE_MAX:
+                self.__resolved_categories.clear()
+            self.__resolved_categories[category] = configured_level
+        if normalized_level == "off" or configured_level == "off":
+            return False
+        configured_rank = _POLICY_LEVEL_RANK.get(configured_level, _POLICY_LEVEL_RANK["info"])
+        return event_rank <= configured_rank
+
+    def __resolve(self, category: str) -> str:
+        category_parts = category.split(".") if category else [""]
+        selected = self.__default
+        best_score = -1
+        for pattern, level in self.__rules:
+            score = BreadcrumbTraceCollector._BreadcrumbTraceCollector__category_match_score(
+                pattern, category, category_parts,
+            )
+            if score > best_score:
+                best_score = score
+                selected = level
+        return selected
 
 
 def opaque_trace_correlation(identity: object) -> str:
@@ -66,13 +118,21 @@ class BreadcrumbTraceEmitter:
         enabled_gate: _EnabledGate,
         policy_revision: multiprocessing.Value,
         policy_epoch: multiprocessing.Value,
+        policy_generation: multiprocessing.RawValue,
+        policy_length: multiprocessing.RawValue,
+        policy_bytes: multiprocessing.RawArray,
         rejected_count: multiprocessing.Value,
     ):
         self.__record_queue = record_queue
         self.__enabled_gate = enabled_gate
         self.__policy_revision = policy_revision
         self.__policy_epoch = policy_epoch
+        self.__policy_generation = policy_generation
+        self.__policy_length = policy_length
+        self.__policy_bytes = policy_bytes
         self.__rejected_count = rejected_count
+        self.__effective_policy: Optional[_EffectiveBreadcrumbPolicy] = None
+        self.__effective_policy_generation = -1
 
     def is_enabled(self) -> bool:
         """Return the shared opt-in state without allocating a breadcrumb.
@@ -86,9 +146,18 @@ class BreadcrumbTraceEmitter:
         except Exception:
             return False
 
+    def is_effectively_enabled(self, category: object, level: object = "info") -> bool:
+        """Return the system/category/level gate without queueing or sanitizing."""
+        if not self.is_enabled():
+            return False
+        policy = self.__current_effective_policy()
+        return policy is not None and policy.allows(category, level)
+
     def record(self, source: str, message: str, details: object = None, **metadata: Any) -> str:
         if not self.is_enabled():
             return "disabled"
+        if not self.is_effectively_enabled(metadata.get("category", source), metadata.get("level", "info")):
+            return "dropped"
 
         created_ns = time.time_ns()
         record = _bounded_ingress_record(source, message, details, metadata, created_ns, self.__policy_revision, self.__policy_epoch)
@@ -103,6 +172,30 @@ class BreadcrumbTraceEmitter:
         except queue.Full:
             self.__reject()
             return "dropped"
+
+    def __current_effective_policy(self) -> Optional[_EffectiveBreadcrumbPolicy]:
+        try:
+            generation = int(self.__policy_generation.value)
+            if generation == self.__effective_policy_generation:
+                return self.__effective_policy
+            # An odd generation is a writer-owned publication window. Fail
+            # closed rather than reading a partial shared buffer.
+            if generation % 2:
+                return None
+            length = int(self.__policy_length.value)
+            if length < 0 or length > _SHARED_POLICY_MAX_BYTES:
+                return None
+            raw = bytes(self.__policy_bytes[:length])
+            if generation != int(self.__policy_generation.value):
+                return None
+            parsed = json.loads(raw.decode("utf-8"))
+            if not isinstance(parsed, Mapping):
+                return None
+            self.__effective_policy = _EffectiveBreadcrumbPolicy.from_policy(parsed)
+            self.__effective_policy_generation = generation
+            return self.__effective_policy
+        except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+            return None
 
     def __reject(self) -> None:
         try:
@@ -158,6 +251,9 @@ class BreadcrumbTraceNoopEmitter:
     def is_enabled(self) -> bool:
         return False
 
+    def is_effectively_enabled(self, category: object, level: object = "info") -> bool:
+        return False
+
     def record(self, source: str, message: str, details: object = None, **metadata: Any) -> str:
         return "disabled"
 
@@ -192,6 +288,14 @@ class BreadcrumbTraceCollector:
         "api_key",
         "apikey",
     )
+    # These exact aggregate diagnostic fields describe authority state.  Keep
+    # the exception token-safe: credential-bearing keys such as
+    # ``authoritative_auth`` must still take the normal redaction path.
+    __SAFE_DIAGNOSTIC_KEYS = frozenset({
+        "joint_authoritative_before",
+        "joint_authoritative_after",
+        "joint_authoritative",
+    })
     __COMMAND_KEYWORDS = (
         "command",
         "cmd",
@@ -234,9 +338,12 @@ class BreadcrumbTraceCollector:
         self.__gap_watermark_to = 0
         self.__external_records: Optional[multiprocessing.Queue[object]] = None
         self.__external_records_lock = Lock()
-        self.__enabled_gate = multiprocessing.Value("b", 0)
+        self.__enabled_gate = multiprocessing.RawValue("b", 0)
         self.__worker_policy_revision = multiprocessing.Value("L", 0)
         self.__worker_policy_epoch = multiprocessing.Value("L", 0)
+        self.__worker_policy_generation = multiprocessing.RawValue("L", 0)
+        self.__worker_policy_length = multiprocessing.RawValue("L", 0)
+        self.__worker_policy_bytes = multiprocessing.RawArray("B", _SHARED_POLICY_MAX_BYTES)
         self.__ingress_rejected_count = multiprocessing.Value("L", 0)
         self.__ingress_rejected_seen = 0
         self.__worker_policy_ack_revision = 0
@@ -257,11 +364,13 @@ class BreadcrumbTraceCollector:
         self.__last_failure_entry: Optional[Dict[str, Any]] = None
         self.__last_failure_version: Optional[int] = None
         self.__policy: Dict[str, Any] = cast(Dict[str, Any], policy_result["policy"])
+        self.__effective_policy = _EffectiveBreadcrumbPolicy.from_policy(self.__policy)
         self.__policy_revision = 0
         self.__policy_persist = policy_persist
         self.__policy_persistence_state = "not_requested"
         self.__last_clear_scope: Optional[Dict[str, Any]] = None
         self.__category_accounting: Dict[str, Dict[str, int]] = {}
+        self.__publish_effective_policy()
         self.sync_enabled_state()
 
     def create_emitter(self) -> BreadcrumbTraceEmitter:
@@ -281,6 +390,7 @@ class BreadcrumbTraceCollector:
             # runtime enable/disable updates.
             return BreadcrumbTraceEmitter(
                 self.__external_records, self.__enabled_gate, self.__worker_policy_revision, self.__worker_policy_epoch,
+                self.__worker_policy_generation, self.__worker_policy_length, self.__worker_policy_bytes,
                 self.__ingress_rejected_count,
             )
 
@@ -288,6 +398,10 @@ class BreadcrumbTraceCollector:
         enabled = self.__read_enabled_state()
         self.__set_enabled_gate(enabled)
         return enabled
+
+    def is_effectively_enabled(self, category: object, level: object = "info") -> bool:
+        """Return the system/category/level gate before constructing a breadcrumb."""
+        return self.is_enabled() and self.__effective_policy.allows(category, level)
 
     def sync_enabled_state(self) -> bool:
         enabled = self.__read_enabled_state()
@@ -372,8 +486,10 @@ class BreadcrumbTraceCollector:
             old_policy = self.__policy
             old_revision = self.__policy_revision
             self.__policy = cast(Dict[str, Any], result["policy"])
+            self.__effective_policy = _EffectiveBreadcrumbPolicy.from_policy(self.__policy)
             self.__policy_revision += 1
             self.__policy_epoch += 1
+            self.__publish_effective_policy()
             with self.__worker_policy_revision.get_lock():
                 self.__worker_policy_revision.value = self.__policy_revision
             with self.__worker_policy_epoch.get_lock():
@@ -381,8 +497,10 @@ class BreadcrumbTraceCollector:
             if persist:
                 if self.__policy_persist is None:
                     self.__policy = old_policy
+                    self.__effective_policy = _EffectiveBreadcrumbPolicy.from_policy(self.__policy)
                     self.__policy_revision = old_revision
                     self.__policy_epoch += 1
+                    self.__publish_effective_policy()
                     with self.__worker_policy_revision.get_lock():
                         self.__worker_policy_revision.value = old_revision
                     with self.__worker_policy_epoch.get_lock():
@@ -394,8 +512,10 @@ class BreadcrumbTraceCollector:
                     self.__policy_persistence_state = "persisted"
                 except Exception:
                     self.__policy = old_policy
+                    self.__effective_policy = _EffectiveBreadcrumbPolicy.from_policy(self.__policy)
                     self.__policy_revision = old_revision
                     self.__policy_epoch += 1
+                    self.__publish_effective_policy()
                     with self.__worker_policy_revision.get_lock():
                         self.__worker_policy_revision.value = old_revision
                     with self.__worker_policy_epoch.get_lock():
@@ -494,6 +614,12 @@ class BreadcrumbTraceCollector:
                 "protected_reserve_fraction": float(reserve_fraction),
             },
         }
+        worker_payload = json.dumps(
+            {"default": normalized["default"], "rules": normalized["rules"]},
+            separators=(",", ":"), sort_keys=True,
+        ).encode("utf-8")
+        if len(worker_payload) > _SHARED_POLICY_MAX_BYTES:
+            errors.append("policy is too large for worker propagation")
         return {"valid": not errors, "ok": not errors, "errors": errors, "policy": normalized}
 
     @staticmethod
@@ -534,11 +660,7 @@ class BreadcrumbTraceCollector:
         return len(pattern_parts) * 10 + (5 if len(pattern_parts) == len(category_parts) else 0)
 
     def __policy_allows(self, category: str, level: str) -> bool:
-        event_level = self.__normalize_level(level) or "info"
-        configured_level = self.__resolved_level(category)
-        if configured_level == "off":
-            return False
-        return BREADCRUMB_POLICY_LEVELS.index(event_level) <= BREADCRUMB_POLICY_LEVELS.index(configured_level)
+        return self.__effective_policy.allows(category, level)
 
     def __effective_retention_policy(self) -> Dict[str, Any]:
         requested = self.__policy["retention"]
@@ -625,10 +747,29 @@ class BreadcrumbTraceCollector:
 
     def __set_enabled_gate(self, enabled: bool) -> None:
         try:
-            with self.__enabled_gate.get_lock():
-                self.__enabled_gate.value = 1 if enabled else 0
+            self.__enabled_gate.value = 1 if enabled else 0
         except Exception:
             pass
+
+    def __publish_effective_policy(self) -> None:
+        """Publish a compact policy copy for spawned emitters.
+
+        Writers hold ``__lock``. Readers use a seqlock-style generation and
+        only decode this payload after a policy update, never per event.
+        """
+        payload = json.dumps(
+            {"default": self.__policy["default"], "rules": self.__policy["rules"]},
+            separators=(",", ":"), sort_keys=True,
+        ).encode("utf-8")
+        if len(payload) > _SHARED_POLICY_MAX_BYTES:
+            raise ValueError("breadcrumb policy is too large for worker propagation")
+        generation = int(self.__worker_policy_generation.value)
+        if generation % 2 == 0:
+            generation += 1
+        self.__worker_policy_generation.value = generation
+        self.__worker_policy_bytes[:len(payload)] = payload
+        self.__worker_policy_length.value = len(payload)
+        self.__worker_policy_generation.value = generation + 1
 
     def __worker_policy_status(self) -> Dict[str, Any]:
         return {
@@ -744,8 +885,7 @@ class BreadcrumbTraceCollector:
             return {"cleared": True, "scope": "all", "cleared_count": cleared_count, "version": self.__version}
 
     def record(self, source: str, message: str, details: object = None, **metadata: Any) -> str:
-        enabled = self.is_enabled()
-        if not enabled:
+        if not self.is_effectively_enabled(metadata.get("category", source), metadata.get("level", "info")):
             return "disabled"
         self.__drain_external_records_if_due(limit=self.__max_entries)
         return self.__record_entry(source, message, details, allow_when_disabled=True, **metadata)
@@ -1462,7 +1602,12 @@ class BreadcrumbTraceCollector:
 
     def __is_sensitive_key(self, key: str) -> bool:
         lowered = key.lower()
-        return any(keyword in lowered for keyword in BreadcrumbTraceCollector.__SENSITIVE_KEYWORDS)
+        if lowered in BreadcrumbTraceCollector.__SAFE_DIAGNOSTIC_KEYS:
+            return False
+        return any(
+            keyword in lowered
+            for keyword in BreadcrumbTraceCollector.__SENSITIVE_KEYWORDS
+        )
 
     def __is_command_key(self, key: str) -> bool:
         lowered = key.lower()

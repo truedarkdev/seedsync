@@ -1,13 +1,124 @@
 # Copyright 2026, SeedSync Contributors, All rights reserved.
 
 import json
+import os
+from pathlib import Path
 
 from webtest import TestApp
 
+from common.breadcrumb_trace import opaque_trace_correlation
+from controller import Controller
 from tests.integration.test_web.test_web_app import BaseTestWebApp
 
 
 class TestBreadcrumbTraceHandler(BaseTestWebApp):
+    def _make_move_probe(self):
+        controller = Controller.__new__(Controller)
+        controller._Controller__context = self.context
+        controller._Controller__target_archive_trace_file_id = None
+        controller.logger = self.context.logger
+        return controller
+
+    def _assert_retirement_event(
+            self, claim, expected_outcome, expected_reason, sidecar_present, expected_directory_count,
+    ):
+        correlation_id = opaque_trace_correlation(claim)
+        self.assertRegex(correlation_id, r"^[0-9a-f]{16}$")
+        response = self.test_app.get(
+            "/server/breadcrumbs/v1/events?category_prefix=retirement.cleanup"
+            "&correlation_id={}&limit=1".format(correlation_id)
+        )
+        self.assertEqual(200, response.status_int)
+        payload = json.loads(response.text)
+        self.assertEqual(1, len(payload["events"]))
+        event = payload["events"][0]
+        self.assertEqual("retirement.cleanup", event["category"])
+        self.assertEqual("retirement_cleanup", event["stage"])
+        self.assertEqual("retirement_cleanup", event["message"])
+        self.assertEqual("diagnostic", event["event_type"])
+        self.assertEqual(correlation_id, event["corr_id"])
+        details = event["details"]
+        self.assertEqual(
+            {"schema", "outcome", "reason", "directory_count", "candidate_count", "sidecar_present"},
+            set(details),
+        )
+        self.assertEqual("retirement_cleanup.v1", details["schema"])
+        self.assertIn(details["outcome"], ("removed", "retained", "skipped", "bounded"))
+        self.assertIn(
+            details["reason"],
+            (
+                "empty_tree", "sidecar", "not_directory", "symlink_reparse", "mount",
+                "cross_device", "nonempty", "scan_bound", "tree_bound", "scan_error",
+                "race", "rmdir_error",
+            ),
+        )
+        self.assertEqual(expected_outcome, details["outcome"])
+        self.assertEqual(expected_reason, details["reason"])
+        self.assertEqual(expected_directory_count, details["directory_count"])
+        self.assertEqual(1, details["candidate_count"])
+        self.assertEqual(sidecar_present, details["sidecar_present"])
+        return event
+
+    def test_retirement_cleanup_v1_retrieval_is_opaque_after_completed_destination(self):
+        self.context.config.general.breadcrumb_trace_enabled = True
+        staging_root = os.path.join(self.temp_dir, "staging")
+        final_root = os.path.join(self.temp_dir, "finished")
+        name = "payload.bin"
+        source = os.path.join(staging_root, name)
+        destination = os.path.join(final_root, name)
+        claim = os.path.join(staging_root, ".seedsync-retire-" + "a" * 48)
+        os.makedirs(staging_root)
+        os.makedirs(final_root)
+        os.makedirs(claim)
+        Path(destination).write_bytes(b"complete")
+
+        controller = self._make_move_probe()
+        result = controller._Controller__move_from_staging(
+            name,
+            anchored_paths=(staging_root, final_root, source, destination),
+        )
+
+        self.assertEqual(Controller.MoveFromStagingResult.ALREADY_COMPLETED, result)
+        self.assertFalse(os.path.lexists(claim))
+        self.assertFalse(os.path.lexists(source))
+        self.assertEqual(b"complete", Path(destination).read_bytes())
+        event = self._assert_retirement_event(claim, "removed", "empty_tree", False, 1)
+        event_text = json.dumps(event, sort_keys=True)
+        self.assertNotIn(staging_root, event_text)
+        self.assertNotIn(final_root, event_text)
+        self.assertNotIn(name, event_text)
+
+    def test_retirement_cleanup_v1_retrieval_reports_sidecar_refusal(self):
+        self.context.config.general.breadcrumb_trace_enabled = True
+        staging_root = os.path.join(self.temp_dir, "staging")
+        final_root = os.path.join(self.temp_dir, "finished")
+        name = "payload.bin"
+        source = os.path.join(staging_root, name)
+        destination = os.path.join(final_root, name)
+        claim = os.path.join(staging_root, ".seedsync-retire-" + "b" * 48)
+        sidecar = claim + ".json"
+        os.makedirs(staging_root)
+        os.makedirs(final_root)
+        os.makedirs(claim)
+        Path(sidecar).write_bytes(b"reserved")
+        Path(destination).write_bytes(b"complete")
+
+        controller = self._make_move_probe()
+        result = controller._Controller__move_from_staging(
+            name,
+            anchored_paths=(staging_root, final_root, source, destination),
+        )
+
+        self.assertEqual(Controller.MoveFromStagingResult.ALREADY_COMPLETED, result)
+        self.assertTrue(os.path.isdir(claim))
+        self.assertTrue(os.path.isfile(sidecar))
+        self.assertEqual(b"complete", Path(destination).read_bytes())
+        event = self._assert_retirement_event(claim, "skipped", "sidecar", True, 0)
+        event_text = json.dumps(event, sort_keys=True)
+        self.assertNotIn(staging_root, event_text)
+        self.assertNotIn(final_root, event_text)
+        self.assertNotIn(name, event_text)
+
     def test_get_returns_recorded_breadcrumbs_when_enabled(self):
         self.context.config.general.breadcrumb_trace_enabled = True
         self.context.breadcrumb_trace.record(

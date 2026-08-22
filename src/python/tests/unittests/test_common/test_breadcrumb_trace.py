@@ -257,6 +257,32 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertIn("**REDACTED**", details["error_message"])
         self.assertIn("**REDACTED**", details["reason"])
 
+    def test_record_allowlists_scan_authority_keys_without_widening_auth_redaction(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+
+        collector.record(
+            "controller",
+            "scan_authority",
+            {
+                "joint_authoritative_before": False,
+                "joint_authoritative_after": True,
+                "joint_authoritative": True,
+                "authoritative_authentication": "private-authentication",
+                "authoritative_auth": "private-auth",
+            },
+            category="scan.authority",
+            level="info",
+            stage="scan_authority",
+            event_type="diagnostic",
+        )
+
+        details = collector.snapshot()["entries"][0]["details"]
+        self.assertFalse(details["joint_authoritative_before"])
+        self.assertTrue(details["joint_authoritative_after"])
+        self.assertTrue(details["joint_authoritative"])
+        self.assertEqual("<redacted>", details["authoritative_authentication"])
+        self.assertEqual("<redacted>", details["authoritative_auth"])
+
     def test_record_redacts_ftp_and_ftps_urls_with_reserved_characters(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
 
@@ -827,3 +853,74 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         categories = collector.snapshot()["accounting"]["categories"]
         self.assertLessEqual(len(categories), 17)
         self.assertIn("__other_categories__", categories)
+
+    def test_effective_gate_rejects_system_category_and_level_before_serialization(self):
+        def details_factory():
+            raise AssertionError("disabled breadcrumb constructed details")
+
+        disabled = BreadcrumbTraceCollector(lambda: False, policy={"default": "trace"})
+        category_disabled = BreadcrumbTraceCollector(lambda: True, policy={"default": "off"})
+        level_disabled = BreadcrumbTraceCollector(lambda: True, policy={"default": "warning"})
+
+        for collector, category, level in (
+            (disabled, "scan", "trace"),
+            (category_disabled, "scan", "error"),
+            (level_disabled, "scan", "info"),
+        ):
+            with patch.object(
+                collector, "_BreadcrumbTraceCollector__sanitize_value",
+                side_effect=AssertionError("disabled breadcrumb was serialized"),
+            ):
+                self.assertEqual(
+                    "disabled",
+                    collector.record("source", "message", details_factory, category=category, level=level),
+                )
+            self.assertFalse(collector.is_effectively_enabled(category, level))
+
+    def test_effective_gate_preserves_inheritance_and_refreshes_collector_policy(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"transfer": "debug", "transfer.progress": "warning"}},
+        )
+
+        self.assertTrue(collector.is_effectively_enabled("transfer.child", "debug"))
+        self.assertFalse(collector.is_effectively_enabled("transfer.progress.child", "info"))
+        self.assertTrue(collector.is_effectively_enabled("transfer.progress.child", "warning"))
+        collector.apply_policy({"default": "error"})
+        self.assertFalse(collector.is_effectively_enabled("transfer.child", "debug"))
+        self.assertTrue(collector.is_effectively_enabled("transfer.child", "error"))
+
+    def test_effective_gate_denies_off_events_and_off_configured_categories(self):
+        default_off = BreadcrumbTraceCollector(lambda: True, policy={"default": "off"})
+        rule_off = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "debug", "rules": {"scan": "off"}},
+        )
+
+        self.assertFalse(default_off.is_effectively_enabled("scan", "off"))
+        self.assertFalse(rule_off.is_effectively_enabled("scan.child", "off"))
+        self.assertFalse(rule_off.is_effectively_enabled("scan.child", "error"))
+
+    def test_spawned_emitter_effective_gate_skips_ingress_serializer_and_refreshes_policy(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4, policy={"default": "off"})
+        emitter = collector.create_emitter()
+
+        with patch(
+            "common.breadcrumb_trace._bounded_ingress_record",
+            side_effect=AssertionError("disabled breadcrumb entered ingress serialization"),
+        ):
+            self.assertFalse(emitter.is_effectively_enabled("scan", "info"))
+            self.assertFalse(emitter.is_effectively_enabled("scan", "off"))
+            self.assertEqual("dropped", emitter.record("worker", "disabled", object(), category="scan", level="info"))
+
+        collector.apply_policy({"default": "debug", "rules": {"scan": "debug", "scan.deep": "warning"}})
+        self.assertTrue(emitter.is_effectively_enabled("scan", "info"))
+        self.assertTrue(emitter.is_effectively_enabled("scan.deep.child", "warning"))
+        self.assertFalse(emitter.is_effectively_enabled("scan.deep.child", "info"))
+        self.assertEqual("enqueued", emitter.record("worker", "enabled", {"phase": "run"}, category="scan", level="info"))
+        self.assertEqual(["enabled"], [entry["message"] for entry in collector.query_events()["events"]])
+
+        collector.apply_policy({"default": "debug", "rules": {"scan": "off"}})
+        self.assertFalse(emitter.is_effectively_enabled("scan.child", "off"))
+        self.assertFalse(emitter.is_effectively_enabled("scan.child", "error"))
+        collector.apply_policy({"default": "off"})
+        self.assertFalse(emitter.is_effectively_enabled("scan", "info"))

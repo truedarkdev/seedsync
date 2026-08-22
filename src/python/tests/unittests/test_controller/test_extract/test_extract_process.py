@@ -464,6 +464,27 @@ class TestExtractProcess(unittest.TestCase):
         self.assertEqual(["flow-123", "flow-123", "flow-123"], [entry["flow_id"] for entry in entries])
         self.assertEqual(["pair-1", "pair-1", "pair-1"], [entry["corr_id"] for entry in entries])
 
+    def test_extract_breadcrumb_gate_skips_lazy_details_and_emits_when_enabled(self):
+        disabled = BreadcrumbTraceCollector(
+            lambda: True, max_entries=16, policy={"default": "off"},
+        )
+        process = ExtractProcess(
+            out_dir_path="", local_path="", breadcrumb_trace=disabled.create_emitter(),
+        )
+        details = MagicMock(side_effect=AssertionError("disabled extract breadcrumb built details"))
+        process._ExtractProcess__record_breadcrumb("extract_test", details)
+        details.assert_not_called()
+        self.assertEqual([], disabled.snapshot()["entries"])
+
+        enabled = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        process._ExtractProcess__breadcrumb_trace = enabled.create_emitter()
+        process._ExtractProcess__record_breadcrumb(
+            "extract_test", lambda: {"sentinel": "emitted"},
+        )
+        entry = enabled.snapshot()["entries"][0]
+        self.assertEqual("extract_process", entry["category"])
+        self.assertEqual("emitted", entry["details"]["sentinel"])
+
     def test_extract_accepts_extract_request_and_forwards_it_through_dispatch(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=16)
         process = ExtractProcess(out_dir_path="", local_path="", breadcrumb_trace=collector.create_emitter())

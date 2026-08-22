@@ -68,6 +68,143 @@ if TYPE_CHECKING:
 
 _ACTIVE_LFTP_STATUS_POLL_INTERVAL = timedelta(milliseconds=100)
 
+
+def _breadcrumb_effectively_enabled(
+        breadcrumb_trace: object, category: str, level: str = "info",
+) -> bool:
+    """Check the complete breadcrumb gate without allocating trace inputs.
+
+    Real collectors and emitters expose ``is_effectively_enabled``.  Older
+    controller/test doubles may only expose ``is_enabled``; retain that
+    compatibility, while treating record-only fakes as enabled and
+    unconfigured mock method results as disabled.
+    """
+    if breadcrumb_trace is None:
+        return False
+    missing = object()
+    try:
+        effective = getattr(breadcrumb_trace, "is_effectively_enabled", missing)
+    except Exception:
+        return False
+    if effective is not missing:
+        if not callable(effective):
+            return False
+        try:
+            result = effective(category, level)
+            return result if isinstance(result, bool) else False
+        except Exception:
+            return False
+    enabled = getattr(breadcrumb_trace, "is_enabled", None)
+    if not callable(enabled):
+        return True
+    try:
+        result = enabled()
+        return result if isinstance(result, bool) else False
+    except Exception:
+        return False
+
+
+def _controller_breadcrumb_effectively_enabled(
+        controller: object, category: str, level: str = "info",
+) -> bool:
+    context = getattr(controller, "_Controller__context", None)
+    return _breadcrumb_effectively_enabled(
+        getattr(context, "breadcrumb_trace", None), category, level,
+    )
+
+
+_CHILD_FINALIZATION_TRACE_CATEGORY = "finalization.child"
+_CHILD_FINALIZATION_TRACE_SCHEMA = "finalization_child.v1"
+_CHILD_FINALIZATION_TRACE_COUNT_LIMIT = 4096
+_CHILD_FINALIZATION_RESULT_NAMES = frozenset({
+    "completed", "already_completed", "deferred", "failed",
+    "no_move_applicable", "conflict", "exception", "unknown",
+})
+_CHILD_FINALIZATION_RESULT_REASONS = {
+    "completed": "move_completed",
+    "already_completed": "destination_already_present",
+    "deferred": "move_deferred",
+    "failed": "move_failed",
+    "no_move_applicable": "no_move_applicable",
+    "conflict": "destination_conflict",
+    "exception": "dispatch_exception",
+    "unknown": "unexpected_result",
+}
+_CHILD_FINALIZATION_AUTHORITY_REASONS = {
+    (True, True): "reconciled_both_sides",
+    (False, True): "local_unreconciled",
+    (True, False): "remote_unreconciled",
+    (False, False): "local_and_remote_unreconciled",
+}
+
+
+def _bounded_child_finalization_count(value: object) -> int:
+    if type(value) is not int:
+        return 0
+    return max(0, min(value, _CHILD_FINALIZATION_TRACE_COUNT_LIMIT))
+
+
+def _child_finalization_trace_result(result: object) -> str:
+    result_name = getattr(result, "name", None)
+    if isinstance(result_name, str):
+        result_name = result_name.lower()
+        if result_name in _CHILD_FINALIZATION_RESULT_NAMES:
+            return result_name
+    return "unknown"
+
+
+def _child_finalization_trace_identity(
+        root_name: str, relative_path: str, path_pair_id: Optional[str],
+) -> Optional[str]:
+    try:
+        return opaque_trace_correlation(
+            ModelFile.build_file_id(root_name + "/" + relative_path, path_pair_id),
+        )
+    except Exception:
+        return None
+
+
+def _record_child_finalization_breadcrumb(
+        controller: object,
+        message: str,
+        details_factory: Callable[[], dict[str, object]],
+        *,
+        level: str,
+        child_identity: Optional[str] = None,
+        trace_scope: str = "flow",
+) -> None:
+    """Record bounded child-finalization evidence without affecting dispatch."""
+    if not _controller_breadcrumb_effectively_enabled(
+            controller, _CHILD_FINALIZATION_TRACE_CATEGORY, level,
+    ):
+        return
+    recorder = getattr(controller, "_Controller__record_breadcrumb", None)
+    if not callable(recorder):
+        return
+    try:
+        # The gate deliberately precedes payload construction and correlation
+        # so disabled child tracing does not do diagnostic-only work.
+        details = details_factory()
+        corr_id = "child:aggregate" if child_identity is None else "child:{}".format(child_identity)
+        recorder(
+            stage="finalization_child",
+            message=message,
+            details=details,
+            event_type="state_transition",
+            category=_CHILD_FINALIZATION_TRACE_CATEGORY,
+            level=level,
+            corr_id=corr_id,
+            flow_id=corr_id if child_identity is not None else None,
+            trace_scope=trace_scope,
+        )
+    except Exception:
+        logger = getattr(controller, "logger", None)
+        if logger is not None:
+            try:
+                logger.debug("Ignoring child finalization breadcrumb failure", exc_info=True)
+            except Exception:
+                pass
+
 _MODEL_REBUILD_REASON_COUNTERS = {
     MODEL_REBUILD_REASON_TERMINALIZABLE_COLLISION: "model_rebuild_terminalizable_collision",
     MODEL_REBUILD_REASON_MOVE_RETRY_DUE: "model_rebuild_move_retry_due",
@@ -297,6 +434,7 @@ class _ProgressiveScanAccumulator:
         self.__session_has_progressive_evidence = False
         self.__last_touched_keys: set[tuple[Optional[str], str]] = set()
         self.__last_final_comparison_proven_pairs: set[Optional[str]] = set()
+        self.__last_scan_marker_trace: tuple[dict[str, object], ...] = ()
         self.__move_invalidations_by_root: dict[
             tuple[Optional[str], str], dict[int, tuple[int, str]]
         ] = {}
@@ -499,13 +637,142 @@ class _ProgressiveScanAccumulator:
                     completed.add(pair_id)
         return completed
 
+    @staticmethod
+    def __unchanged_marker_maps(
+            event: ScannerResult,
+    ) -> list[tuple[Optional[str], dict[str, str]]]:
+        """Return marker maps without exporting any of their identities."""
+        by_pair = getattr(event, "unchanged_root_fingerprints_by_pair", None)
+        if isinstance(by_pair, dict) and by_pair:
+            return [
+                (pair_id, value)
+                for pair_id, value in by_pair.items()
+                if isinstance(value, dict)
+            ]
+        markers = getattr(event, "unchanged_root_fingerprints", None)
+        if not isinstance(markers, dict) or not markers:
+            return []
+        pair_ids = getattr(event, "scanned_path_pair_ids", set())
+        pair_ids = set(pair_ids) if isinstance(pair_ids, set) else set()
+        pair_id = next(iter(pair_ids)) if len(pair_ids) == 1 else None
+        return [(pair_id, markers)]
+
+    def __scan_marker_generation_relation(
+            self, generation: object, reference_generations: Optional[Sequence[int]],
+    ) -> str:
+        if type(generation) is not int or not reference_generations:
+            return "unknown"
+        relations = {
+            "older" if generation < reference else
+            "same" if generation == reference else
+            "newer"
+            for reference in reference_generations
+            if type(reference) is int
+        }
+        if len(relations) != 1:
+            return "mixed" if relations else "unknown"
+        return next(iter(relations))
+
+    def __build_scan_marker_trace(
+            self, events: Sequence[ScannerResult], session_reset: bool,
+    ) -> tuple[dict[str, object], ...]:
+        """Build only bounded, fixed-enum marker provenance while tracing is on."""
+        reference_generations = tuple(self.__active_generation.values())
+        accepted_hint_count = _bounded_scan_marker_count(sum(
+            len(fingerprints)
+            for fingerprints in self.__committed_root_fingerprints.values()
+            if isinstance(fingerprints, dict)
+        ))
+        accepted_hint_present = accepted_hint_count > 0
+        traces: list[dict[str, object]] = []
+        for event in events:
+            marker_maps = self.__unchanged_marker_maps(event)
+            marker_count = _bounded_scan_marker_count(sum(
+                len(markers) for _, markers in marker_maps
+            ))
+            if marker_count < 1:
+                continue
+            incoming_session = getattr(event, "session_token", None)
+            accumulator_session = self.__session_token
+            if isinstance(accumulator_session, str) and isinstance(incoming_session, str):
+                session_relation = "same" if accumulator_session == incoming_session else "different"
+            elif isinstance(accumulator_session, str):
+                session_relation = "incoming_missing"
+            elif isinstance(incoming_session, str):
+                session_relation = "accumulator_unbound"
+            else:
+                session_relation = "both_missing"
+
+            mismatch_count = 0
+            if session_relation == "same":
+                for pair_id, markers in marker_maps:
+                    committed = self.__committed_by_pair.get(pair_id, {})
+                    fingerprints = self.__committed_root_fingerprints.get(pair_id, {})
+                    for name, fingerprint in markers.items():
+                        if not isinstance(name, str) or not isinstance(fingerprint, str):
+                            mismatch_count += 1
+                            continue
+                        # Marker validation intentionally mirrors the authority
+                        # decision below, but remains aggregate-only here.
+                        valid = name in committed and fingerprints.get(name) == fingerprint
+                        if not valid:
+                            mismatch_count += 1
+            elif session_relation != "same":
+                # A marker from another scanner session was rejected by the
+                # admission filter; it is not evidence of a digest mismatch.
+                mismatch_count = 0
+
+            generation_relation = self.__scan_marker_generation_relation(
+                getattr(event, "generation", None), reference_generations,
+            )
+            generation_class = {
+                "older": "stale",
+                "same": "current",
+                "newer": "future",
+                "mixed": "mixed",
+                "unknown": "unknown",
+            }[generation_relation]
+            applied_after_reset = bool(session_reset and session_relation == "same")
+            outcome = (
+                "stale_session_rejected" if session_relation != "same" else
+                "digest_mismatch" if mismatch_count else
+                "marker_accepted"
+            )
+            traces.append({
+                "schema": _SCAN_MARKER_TRACE_SCHEMA,
+                # Do not use ``session`` in public field names: trace
+                # sanitization correctly treats it as credential-shaped and
+                # would hide this safe, already-digested provenance. These
+                # names remain bounded state, never raw process identity.
+                "stream_binding": session_relation,
+                "accumulator_stream_digest": trace_session_digest(accumulator_session),
+                "incoming_stream_digest": trace_session_digest(incoming_session),
+                "generation_relation": generation_relation,
+                "generation_class": generation_class,
+                "accepted_hint_present": accepted_hint_present,
+                "accepted_hint_count": accepted_hint_count,
+                "marker_count": marker_count,
+                "mismatch_count": _bounded_scan_marker_count(mismatch_count),
+                "marker_after_rebind": applied_after_reset,
+                "outcome": outcome,
+            })
+        return tuple(traces)
+
+    def scan_marker_trace(self) -> tuple[dict[str, object], ...]:
+        """Return the most recent gated marker provenance for the scan boundary."""
+        return tuple(dict(details) for details in self.__last_scan_marker_trace)
+
     def apply(
             self,
             events: Sequence[ScannerResult],
             configured_path_pair_ids: Optional[set[str]] = None,
+            *,
+            scan_marker_trace_enabled: bool = False,
+            scan_marker_session_reset: bool = False,
     ) -> Optional[ScannerResult]:
         self.__last_touched_keys = set()
         self.__last_final_comparison_proven_pairs = set()
+        self.__last_scan_marker_trace = ()
         if not events:
             return None
         if self.__session_token is None:
@@ -515,6 +782,13 @@ class _ProgressiveScanAccumulator:
                 None,
             )
             self.set_session_token(session_token)
+        if scan_marker_trace_enabled:
+            # Build provenance before session admission can discard a stale
+            # handoff row, but after the current process session is bound so
+            # the relation describes the authority that rejected the row.
+            self.__last_scan_marker_trace = self.__build_scan_marker_trace(
+                events, scan_marker_session_reset,
+            )
         if self.__session_token is not None:
             events = [
                 event for event in events
@@ -1217,7 +1491,7 @@ def _record_lifecycle_scan_breadcrumb(
     if breadcrumb_trace is None:
         return
     try:
-        if not breadcrumb_trace.is_enabled():
+        if not _breadcrumb_effectively_enabled(breadcrumb_trace, "scan.lifecycle", "info"):
             return
         breadcrumb_trace.record(
             "model_updater",
@@ -1225,6 +1499,8 @@ def _record_lifecycle_scan_breadcrumb(
             {"scanner_side": side, "session_digest": trace_session_digest(session_token), **details},
             stage="scan_accumulator",
             event_type="diagnostic",
+            category="scan.lifecycle",
+            level="info",
             corr_id="{}:{}".format(side, trace_session_digest(session_token)),
             trace_scope="flow",
         )
@@ -1232,6 +1508,54 @@ def _record_lifecycle_scan_breadcrumb(
         logger = getattr(controller, "logger", None)
         if logger is not None:
             logger.debug("Ignoring lifecycle scan breadcrumb failure", exc_info=True)
+
+
+_SCAN_MARKER_TRACE_CATEGORY = "scan.result"
+_SCAN_MARKER_TRACE_SCHEMA = "scan_unchanged_root_marker.v1"
+_SCAN_MARKER_TRACE_COUNT_LIMIT = 4096
+
+
+def _bounded_scan_marker_count(value: object) -> int:
+    if type(value) is not int:
+        return 0
+    return max(0, min(value, _SCAN_MARKER_TRACE_COUNT_LIMIT))
+
+
+def _record_scan_marker_breadcrumb(
+        controller: "Controller", side: str, details: dict[str, object],
+) -> None:
+    """Record aggregate unchanged-root marker provenance after the hot gate."""
+    if not _controller_breadcrumb_effectively_enabled(
+            controller, _SCAN_MARKER_TRACE_CATEGORY, "info",
+    ):
+        return
+    recorder = getattr(controller, "_Controller__record_breadcrumb", None)
+    if not callable(recorder):
+        return
+    try:
+        accumulator_digest = details.get("accumulator_session_digest", "unknown")
+        incoming_digest = details.get("incoming_session_digest", "unknown")
+        correlation = opaque_trace_correlation(
+            "scan_marker|{}|{}|{}".format(side, accumulator_digest, incoming_digest),
+        )
+        recorder(
+            stage="scan",
+            message="scan_unchanged_root_marker",
+            details={"scanner_side": side, **details},
+            event_type="diagnostic",
+            category=_SCAN_MARKER_TRACE_CATEGORY,
+            level="info",
+            corr_id=correlation,
+            flow_id=correlation,
+            trace_scope="flow",
+        )
+    except Exception:
+        logger = getattr(controller, "logger", None)
+        if logger is not None:
+            try:
+                logger.debug("Ignoring unchanged-root marker breadcrumb failure", exc_info=True)
+            except Exception:
+                pass
 
 
 def _current_scan_session_token(controller: "Controller", side: str) -> Optional[str]:
@@ -1277,10 +1601,12 @@ def _pop_scan_updates(controller: "Controller", side: str, process: object) -> O
         breadcrumb_trace = getattr(
             getattr(controller, "_Controller__context", None), "breadcrumb_trace", None,
         )
-        try:
-            trace_enabled = breadcrumb_trace is not None and breadcrumb_trace.is_enabled()
-        except Exception:
-            trace_enabled = False
+        trace_enabled = _breadcrumb_effectively_enabled(
+            breadcrumb_trace, "scan.lifecycle", "info",
+        )
+        scan_marker_trace_enabled = _breadcrumb_effectively_enabled(
+            breadcrumb_trace, _SCAN_MARKER_TRACE_CATEGORY, "info",
+        )
         # Detect the replacement before binding it; this keeps the lifecycle
         # transition observable while eager/begin callers still synchronize
         # immediately with the current process.
@@ -1306,7 +1632,18 @@ def _pop_scan_updates(controller: "Controller", side: str, process: object) -> O
         configured_path_pair_ids = (
             set(path_pairs_by_id) if isinstance(path_pairs_by_id, dict) else None
         )
-        result = accumulator.apply(events, configured_path_pair_ids)
+        result = accumulator.apply(
+            events,
+            configured_path_pair_ids,
+            scan_marker_trace_enabled=scan_marker_trace_enabled,
+            scan_marker_session_reset=session_changed,
+        )
+        if scan_marker_trace_enabled:
+            # The accumulator may reject every queued row as stale.  Emit the
+            # gated provenance here so that rejection remains observable even
+            # when there is no result for the later model-update boundary.
+            for details in accumulator.scan_marker_trace():
+                _record_scan_marker_breadcrumb(controller, side, details)
         if trace_enabled:
             after_details = _lifecycle_scan_details(events, accumulator, handoff_file_ids)
             authority_state_changed = before_authority_state != accumulator.lifecycle_trace_transition_token()
@@ -1322,6 +1659,27 @@ def _pop_scan_updates(controller: "Controller", side: str, process: object) -> O
                 )
         return result
     return None
+
+
+def _sync_remote_scan_root_fingerprint_hints(controller: "Controller") -> None:
+    """Publish digests only after queued remote authority has been drained.
+
+    A remote scan can begin as soon as its previous result is queued.  Sending
+    hints before that result is applied can therefore bind the next scan to an
+    older committed tree while the accumulator advances to a newer one in the
+    same update.  The returned unchanged marker would then be valid for the
+    hint it received but (correctly) fail the newer authority check.
+    """
+    accumulator = getattr(controller, "_Controller__progressive_remote_scan_state", None)
+    process = getattr(controller, "_Controller__remote_scan_process", None)
+    setter = getattr(process, "set_accepted_root_fingerprints", None)
+    if not isinstance(accumulator, _ProgressiveScanAccumulator) or not callable(setter):
+        return
+    process_session = getattr(process, "session_token", None)
+    setter(
+        accumulator.accepted_root_fingerprints()
+        if accumulator.session_token == process_session else {}
+    )
 
 
 def _merge_targeted_legacy_scan_files(
@@ -1429,7 +1787,8 @@ class _ControllerCoreAccess:
         event_type: str = "diagnostic", file_id: Optional[str] = None,
         path_pair_id: Optional[str] = None, path_pair_name: Optional[str] = None,
         corr_id: Optional[str] = None, flow_id: Optional[str] = None,
-        trace_scope: str = "flow"
+        trace_scope: str = "flow", category: Optional[str] = None,
+        level: Optional[str] = None,
     ) -> None: ...
     def _Controller__recover_interrupted_downloads(self, remote_files: list[SystemFile]) -> None: ...
     def _Controller__set_active_scanner_files(
@@ -1470,16 +1829,19 @@ class ModelUpdater(_ControllerCoreAccess):
         # Diagnostic-only dedupe. Correlations are opaque and this cache never
         # participates in completion, scan, or model authority.
         self.__completion_gate_trace_signatures: OrderedDict[str, str] = OrderedDict()
+        # Diagnostic-only candidate discovery fingerprint. It owns no product
+        # authority and is intentionally updated only while its trace gate is
+        # enabled, so normal empty discoveries do not flood retention.
+        self.__child_finalization_candidate_trace_signature: Optional[
+            tuple[str, int, int]
+        ] = None
 
     def _completion_gate_trace_enabled(self) -> bool:
         """Check the global trace gate before diagnostic-only marker reads."""
         breadcrumb_trace = getattr(
             getattr(self._controller, "_Controller__context", None), "breadcrumb_trace", None,
         )
-        try:
-            return breadcrumb_trace is not None and breadcrumb_trace.is_enabled()
-        except Exception:
-            return False
+        return _breadcrumb_effectively_enabled(breadcrumb_trace, "completion.gate", "info")
 
     def _record_completion_gate_breadcrumb(
             self, file_id: str, message: str, details: dict[str, object],
@@ -1493,7 +1855,7 @@ class ModelUpdater(_ControllerCoreAccess):
         try:
             # This must precede correlation/signature work and every model
             # lookup performed by callers solely for diagnostics.
-            if not breadcrumb_trace.is_enabled():
+            if not _breadcrumb_effectively_enabled(breadcrumb_trace, "completion.gate", "info"):
                 return
             corr_id = "completion:{}".format(opaque_trace_correlation(file_id))
             signature = json.dumps({"message": message, "details": details}, sort_keys=True)
@@ -1506,7 +1868,8 @@ class ModelUpdater(_ControllerCoreAccess):
                 self.__completion_gate_trace_signatures.popitem(last=False)
             breadcrumb_trace.record(
                 "model_updater", message, details,
-                stage="completion_gate", event_type="diagnostic", corr_id=corr_id,
+                stage="completion_gate", event_type="diagnostic",
+                category="completion.gate", level="info", corr_id=corr_id,
                 trace_scope="flow",
             )
         except Exception:
@@ -1769,6 +2132,7 @@ class ModelUpdater(_ControllerCoreAccess):
         if just_completed_file_names:
             completed_path_pair_ids: set[Optional[str]] = set()
             completed_file_ids: set[str] = set()
+            completion_trace_enabled = self._completion_gate_trace_enabled()
             for name, path_pair_id, _ in just_completed_file_names:
                 file_id = ModelFile.build_file_id(name, path_pair_id)
                 completed_file_ids.add(file_id)
@@ -1778,14 +2142,15 @@ class ModelUpdater(_ControllerCoreAccess):
                         file_id
                     )
                 )
-                self._record_completion_gate_breadcrumb(
-                    file_id,
-                    "completion_pending_registered",
-                    {
-                        "registration_source": "lftp_job_finished",
-                        "local_scan_forced": True,
-                    },
-                )
+                if completion_trace_enabled:
+                    self._record_completion_gate_breadcrumb(
+                        file_id,
+                        "completion_pending_registered",
+                        {
+                            "registration_source": "lftp_job_finished",
+                            "local_scan_forced": True,
+                        },
+                    )
             controller._Controller__pending_completion_file_names.update(just_completed_file_names)
             controller._Controller__model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids(
                 completed_file_ids,
@@ -2000,6 +2365,39 @@ class ModelUpdater(_ControllerCoreAccess):
         local_inventory_revision_before = inventory_revision_getter() if callable(inventory_revision_getter) else None
         persist = controller._Controller__persist
         model = controller._Controller__model
+        previous_scan_authority_snapshot = getattr(
+            controller, "_Controller__scan_authority_snapshot", {}
+        )
+        if not isinstance(previous_scan_authority_snapshot, dict):
+            previous_scan_authority_snapshot = {}
+        else:
+            previous_scan_authority_snapshot = dict(previous_scan_authority_snapshot)
+
+        def aggregate_id_set(value: object) -> set[object]:
+            if not isinstance(value, (set, frozenset, list, tuple)):
+                return set()
+            try:
+                return set(value)
+            except TypeError:
+                return set()
+
+        def aggregate_snapshot_ids(snapshotter: object) -> set[object]:
+            if not callable(snapshotter):
+                return set()
+            try:
+                return aggregate_id_set(snapshotter())
+            except Exception:
+                return set()
+
+        local_reconciled_before_ids = aggregate_id_set(
+            getattr(controller, "_Controller__reconciled_local_path_pair_ids", set())
+        )
+        joint_authoritative_before_event = bool(
+            getattr(controller, "_Controller__progressive_joint_authoritative", False)
+        )
+        unknown_overlay_before_ids = aggregate_snapshot_ids(
+            getattr(model_builder, "unknown_local_path_pair_ids_snapshot", None)
+        )
         if not isinstance(getattr(persist, "move_failure_counts", None), dict):
             persist.move_failure_counts = {}
         if not isinstance(getattr(persist, "final_move_succeeded_file_names", None), set):
@@ -2084,22 +2482,13 @@ class ModelUpdater(_ControllerCoreAccess):
         controller._Controller__progressive_remote_scan_session_changed = False
 
         stage_timer.switch(DURATION_MODEL_UPDATE_SCAN_INTAKE)
-        # The accumulator is the sole authority for these hints.  They are
-        # sent only to a future scan; a fresh ScannerProcess session has an
-        # empty accumulator fingerprint map and therefore performs a full
-        # streamed baseline.
-        remote_accumulator = getattr(controller, "_Controller__progressive_remote_scan_state", None)
-        remote_fingerprint_setter = getattr(controller._Controller__remote_scan_process,
-                                            "set_accepted_root_fingerprints", None)
-        if isinstance(remote_accumulator, _ProgressiveScanAccumulator) and callable(remote_fingerprint_setter):
-            process_session = getattr(controller._Controller__remote_scan_process, "session_token", None)
-            remote_fingerprint_setter(
-                remote_accumulator.accepted_root_fingerprints()
-                if remote_accumulator.session_token == process_session else {}
-            )
-        # Grab the latest scan results.
+        # Drain the latest scan results before publishing derived hints for a
+        # future scan.  Otherwise a queued full snapshot can advance the
+        # committed authority after its successor has already received an old
+        # digest (see _sync_remote_scan_root_fingerprint_hints).
         latest_remote_scan = _pop_scan_updates(controller, "remote", controller._Controller__remote_scan_process)
         latest_local_scan = _pop_scan_updates(controller, "local", controller._Controller__local_scan_process)
+        _sync_remote_scan_root_fingerprint_hints(controller)
         latest_active_scan = controller._Controller__active_scan_process.pop_latest_result()
         progressive_mode = bool(getattr(controller, "_Controller__progressive_joint_mode", False)) or \
             bool(getattr(latest_remote_scan, "is_progress", False)) or \
@@ -2180,7 +2569,10 @@ class ModelUpdater(_ControllerCoreAccess):
         # published safety overlay, which may shrink only with source-bucket
         # adoption in this update.
         progressive_source_buckets_adopted = False
-        progressive_unknown_before_event: set[Optional[str]] = set()
+        progressive_unknown_before_event: set[Optional[str]] = {
+            value for value in unknown_overlay_before_ids
+            if value is None or isinstance(value, str)
+        }
         if progressive_mode and joint_reconciler is not None:
             # Standing authority is already represented by the builder after
             # a progressive final publication.  Do not walk every retained
@@ -2211,7 +2603,10 @@ class ModelUpdater(_ControllerCoreAccess):
                 )
             unknown_snapshotter = getattr(model_builder, "unknown_local_path_pair_ids_snapshot", None)
             if callable(unknown_snapshotter):
-                progressive_unknown_before_event = set(unknown_snapshotter())
+                progressive_unknown_before_event = {
+                    value for value in aggregate_snapshot_ids(unknown_snapshotter)
+                    if value is None or isinstance(value, str)
+                }
 
         def scan_final_relevant(side: str, result: Optional[ScannerResult]) -> bool:
             """Return whether this side has a complete, authoritative view.
@@ -2617,7 +3012,9 @@ class ModelUpdater(_ControllerCoreAccess):
         stage_timer.switch(DURATION_MODEL_UPDATE_BUILDER_SYNC)
         # Update model builder state.
         authoritative_pair_delta_builds: list[object] = []
+        authoritative_pair_delta_staged_count = 0
         authoritative_pair_fallback_required = False
+        authoritative_pair_fallback_reason: Optional[str] = None
         remote_files: list[SystemFile] = []
         if latest_remote_scan is not None:
             record_scan_result_attribution("remote", latest_remote_scan)
@@ -2637,27 +3034,30 @@ class ModelUpdater(_ControllerCoreAccess):
                 controller._Controller__last_remote_reconciliation_healthy = not remote_scan_failed
             if not remote_scan_failed and not progressive_mode:
                 model_builder.set_remote_files(remote_files)
-            controller._Controller__record_breadcrumb(
-                stage="scan",
-                message="remote_scan_result",
-                details={
-                    "file_count": len(remote_files),
-                    "failed": remote_scan_failed,
-                    "error_message": latest_remote_scan.error_message,
-                    "is_progress": bool(getattr(latest_remote_scan, "is_progress", False)),
-                    "is_scan_final": bool(getattr(latest_remote_scan, "is_scan_final", True)),
-                    "generation": scan_generation(latest_remote_scan),
-                    "scanned_pair_count": scan_pair_count(latest_remote_scan, "scanned_path_pair_ids"),
-                    "completed_pair_count": scan_pair_count(latest_remote_scan, "completed_path_pair_ids"),
-                    "unknown_pair_count": scan_pair_count(latest_remote_scan, "unknown_path_pair_ids"),
-                    "joint_publication_allowed": progressive_joint_publication_allowed,
-                    "joint_authoritative": joint_authoritative_for_breadcrumb,
-                    "joint_local_root_count": len(joint_local_files),
-                    "joint_remote_root_count": len(joint_remote_files),
-                },
-                event_type="failure" if remote_scan_failed else "state_transition",
-                corr_id=controller._Controller__trace_corr_id_from_files(remote_files, "remote_scan"),
-            )
+            if _controller_breadcrumb_effectively_enabled(controller, "scan.result", "info"):
+                controller._Controller__record_breadcrumb(
+                    stage="scan",
+                    message="remote_scan_result",
+                    details={
+                        "file_count": len(remote_files),
+                        "failed": remote_scan_failed,
+                        "error_message": latest_remote_scan.error_message,
+                        "is_progress": bool(getattr(latest_remote_scan, "is_progress", False)),
+                        "is_scan_final": bool(getattr(latest_remote_scan, "is_scan_final", True)),
+                        "generation": scan_generation(latest_remote_scan),
+                        "scanned_pair_count": scan_pair_count(latest_remote_scan, "scanned_path_pair_ids"),
+                        "completed_pair_count": scan_pair_count(latest_remote_scan, "completed_path_pair_ids"),
+                        "unknown_pair_count": scan_pair_count(latest_remote_scan, "unknown_path_pair_ids"),
+                        "joint_publication_allowed": progressive_joint_publication_allowed,
+                        "joint_authoritative": joint_authoritative_for_breadcrumb,
+                        "joint_local_root_count": len(joint_local_files),
+                        "joint_remote_root_count": len(joint_remote_files),
+                    },
+                    event_type="failure" if remote_scan_failed else "state_transition",
+                    category="scan.result",
+                    level="info",
+                    corr_id=controller._Controller__trace_corr_id_from_files(remote_files, "remote_scan"),
+                )
         if latest_local_scan is not None:
             record_scan_result_attribution("local", latest_local_scan)
             # A failed local scan may contain a partial/empty result. Keep the
@@ -2706,26 +3106,29 @@ class ModelUpdater(_ControllerCoreAccess):
                         ) == file_id
                     ]
                 persist.extracted_file_names.update(recovered_extracted_file_ids)
-            controller._Controller__record_breadcrumb(
-                stage="scan",
-                message="local_scan_result",
-                details={
-                    "file_count": len(latest_local_scan.files),
-                    "managed_extract_file_count": len(recovered_extracted_file_ids),
-                    "is_progress": bool(getattr(latest_local_scan, "is_progress", False)),
-                    "is_scan_final": bool(getattr(latest_local_scan, "is_scan_final", True)),
-                    "generation": scan_generation(latest_local_scan),
-                    "scanned_pair_count": scan_pair_count(latest_local_scan, "scanned_path_pair_ids"),
-                    "completed_pair_count": scan_pair_count(latest_local_scan, "completed_path_pair_ids"),
-                    "unknown_pair_count": scan_pair_count(latest_local_scan, "unknown_path_pair_ids"),
-                    "joint_publication_allowed": progressive_joint_publication_allowed,
-                    "joint_authoritative": joint_authoritative_for_breadcrumb,
-                    "joint_local_root_count": len(joint_local_files),
-                    "joint_remote_root_count": len(joint_remote_files),
-                },
-                event_type="state_transition",
-                corr_id=controller._Controller__trace_corr_id_from_files(latest_local_scan.files, "local_scan"),
-            )
+            if _controller_breadcrumb_effectively_enabled(controller, "scan.result", "info"):
+                controller._Controller__record_breadcrumb(
+                    stage="scan",
+                    message="local_scan_result",
+                    details={
+                        "file_count": len(latest_local_scan.files),
+                        "managed_extract_file_count": len(recovered_extracted_file_ids),
+                        "is_progress": bool(getattr(latest_local_scan, "is_progress", False)),
+                        "is_scan_final": bool(getattr(latest_local_scan, "is_scan_final", True)),
+                        "generation": scan_generation(latest_local_scan),
+                        "scanned_pair_count": scan_pair_count(latest_local_scan, "scanned_path_pair_ids"),
+                        "completed_pair_count": scan_pair_count(latest_local_scan, "completed_path_pair_ids"),
+                        "unknown_pair_count": scan_pair_count(latest_local_scan, "unknown_path_pair_ids"),
+                        "joint_publication_allowed": progressive_joint_publication_allowed,
+                        "joint_authoritative": joint_authoritative_for_breadcrumb,
+                        "joint_local_root_count": len(joint_local_files),
+                        "joint_remote_root_count": len(joint_remote_files),
+                    },
+                    event_type="state_transition",
+                    category="scan.result",
+                    level="info",
+                    corr_id=controller._Controller__trace_corr_id_from_files(latest_local_scan.files, "local_scan"),
+                )
             unknown_local_ids = joint_unknown_local_ids if progressive_mode else set(
                 getattr(latest_local_scan, "unknown_path_pair_ids", set())
             )
@@ -2766,6 +3169,7 @@ class ModelUpdater(_ControllerCoreAccess):
                             if pair_build is None:
                                 authoritative_pair_delta_builds = []
                                 authoritative_pair_fallback_required = True
+                                authoritative_pair_fallback_reason = CANDIDATE_PAIR_FALLBACK_REASON_EXCEPTION
                                 break
                             authoritative_pair_delta_builds.append(pair_build)
                     if authoritative_pair_fallback_required:
@@ -2890,35 +3294,44 @@ class ModelUpdater(_ControllerCoreAccess):
                     ) not in handoff_file_ids
                 ]
             model_builder.set_active_files(active_scan_files)
-            controller._Controller__record_breadcrumb(
-                stage="scan",
-                message="active_scan_result",
-                details={
-                    "file_count": len(latest_active_scan.files),
-                    "malformed_status_only_file_count": len(latest_active_scan.malformed_status_only_file_ids),
-                },
-                event_type="state_transition",
-                corr_id=controller._Controller__trace_corr_id_from_files(latest_active_scan.files, "active_scan"),
-            )
+            if _controller_breadcrumb_effectively_enabled(controller, "scan.result", "info"):
+                controller._Controller__record_breadcrumb(
+                    stage="scan",
+                    message="active_scan_result",
+                    details={
+                        "file_count": len(latest_active_scan.files),
+                        "malformed_status_only_file_count": len(latest_active_scan.malformed_status_only_file_ids),
+                    },
+                    event_type="state_transition",
+                    category="scan.result",
+                    level="info",
+                    corr_id=controller._Controller__trace_corr_id_from_files(latest_active_scan.files, "active_scan"),
+                )
         if lftp_status_snapshot_fresh and not lftp_status_poll_healthy and not lftp_statuses:
             model_builder.evict_recent_live_transfer_snapshots_missing_roots(
                 {status.file_id for status in lftp_statuses}
             )
         if latest_extract_statuses is not None:
             model_builder.set_extract_statuses(latest_extract_statuses.statuses)
-            controller._Controller__record_breadcrumb(
-                stage="extract",
-                message="extract_status_result",
-                details={
-                    "status_count": len(latest_extract_statuses.statuses),
-                    "extracting_count": len([
-                        s for s in latest_extract_statuses.statuses if s.state == ExtractStatus.State.EXTRACTING
-                    ]),
-                },
-                event_type="state_transition",
-                corr_id="extract:aggregate",
-                trace_scope="aggregate",
+            extract_trace_enabled = _controller_breadcrumb_effectively_enabled(
+                controller, "extract.result", "info",
             )
+            if extract_trace_enabled:
+                controller._Controller__record_breadcrumb(
+                    stage="extract",
+                    message="extract_status_result",
+                    details={
+                        "status_count": len(latest_extract_statuses.statuses),
+                        "extracting_count": len([
+                            s for s in latest_extract_statuses.statuses if s.state == ExtractStatus.State.EXTRACTING
+                        ]),
+                    },
+                    event_type="state_transition",
+                    category="extract.result",
+                    level="info",
+                    corr_id="extract:aggregate",
+                    trace_scope="aggregate",
+                )
             if controller._Controller__is_target_archive_trace_enabled():
                 for status in latest_extract_statuses.statuses:
                     trace_target_file = controller._Controller__find_target_archive_model_file(status.name)
@@ -2955,7 +3368,11 @@ class ModelUpdater(_ControllerCoreAccess):
 
         if latest_extracted_results:
             known_extracted_results: list[ExtractCompletedResult] = []
-            extracted_result_summaries: list[dict[str, object]] = []
+            extract_trace_enabled = _controller_breadcrumb_effectively_enabled(
+                controller, "extract.result", "info",
+            )
+            extracted_result_summaries: Optional[list[dict[str, object]]] = [] \
+                if extract_trace_enabled else None
             for result in latest_extracted_results:
                 if not _is_known_extract_result_pair(result, "completion"):
                     continue
@@ -2967,12 +3384,13 @@ class ModelUpdater(_ControllerCoreAccess):
                 ):
                     extracted_file_id = ModelFile.build_file_id(result.name, result.path_pair_id)
                 persist.extracted_file_names.add(extracted_file_id)
-                extracted_result_summaries.append({
-                    "name": result.name,
-                    "file_id": result.file_id,
-                    "is_dir": result.is_dir,
-                    "path_pair_id": result.path_pair_id,
-                })
+                if extracted_result_summaries is not None:
+                    extracted_result_summaries.append({
+                        "name": result.name,
+                        "file_id": result.file_id,
+                        "is_dir": result.is_dir,
+                        "path_pair_id": result.path_pair_id,
+                    })
                 trace_target_file = controller._Controller__find_target_archive_model_file(result.name, result.file_id)
                 if trace_target_file is not None:
                     controller._Controller__trace_target_archive_event("extracted_marker_added", {
@@ -2980,39 +3398,48 @@ class ModelUpdater(_ControllerCoreAccess):
                         "is_dir": result.is_dir,
                     })
             model_builder.set_extracted_files(persist.extracted_file_names)
-            if known_extracted_results:
+            if known_extracted_results and extract_trace_enabled:
                 controller._Controller__record_breadcrumb(
                     stage="extract",
                     message="extract_completed",
                     details={
                         "result_count": len(known_extracted_results),
-                        "results": extracted_result_summaries,
+                        "results": extracted_result_summaries or [],
                     },
                     event_type="state_transition",
+                    category="extract.result",
+                    level="info",
                     corr_id=controller._Controller__trace_corr_id_from_files(known_extracted_results, "extract"),
                 )
         if latest_failed_results:
             known_failed_results: list[ExtractFailedResult] = []
-            failed_result_summaries: list[dict[str, object]] = []
+            extract_trace_enabled = _controller_breadcrumb_effectively_enabled(
+                controller, "extract.result", "info",
+            )
+            failed_result_summaries: Optional[list[dict[str, object]]] = [] \
+                if extract_trace_enabled else None
             for result in latest_failed_results:
                 if not _is_known_extract_result_pair(result, "failure"):
                     continue
                 known_failed_results.append(result)
-                failed_result_summaries.append({
-                    "name": result.name,
-                    "file_id": result.file_id,
-                    "is_dir": result.is_dir,
-                    "path_pair_id": result.path_pair_id,
-                })
-            if known_failed_results:
+                if failed_result_summaries is not None:
+                    failed_result_summaries.append({
+                        "name": result.name,
+                        "file_id": result.file_id,
+                        "is_dir": result.is_dir,
+                        "path_pair_id": result.path_pair_id,
+                    })
+            if known_failed_results and extract_trace_enabled:
                 controller._Controller__record_breadcrumb(
                     stage="extract",
                     message="extract_failed",
                     details={
                         "result_count": len(known_failed_results),
-                        "results": failed_result_summaries,
+                        "results": failed_result_summaries or [],
                     },
                     event_type="failure",
+                    category="extract.result",
+                    level="info",
                     corr_id=controller._Controller__trace_corr_id_from_files(known_failed_results, "extract"),
                 )
         terminal_extract_ids = {
@@ -3282,6 +3709,10 @@ class ModelUpdater(_ControllerCoreAccess):
                 diagnostics.increment(counter)
             except Exception:
                 pass
+            if not _controller_breadcrumb_effectively_enabled(
+                    controller, "model.candidate", "info",
+            ):
+                return
             recorder = getattr(controller, "_Controller__record_breadcrumb", None)
             if callable(recorder):
                 try:
@@ -3294,6 +3725,8 @@ class ModelUpdater(_ControllerCoreAccess):
                             "committer_available": committer_available,
                         },
                         event_type="state_transition",
+                        category="model.candidate",
+                        level="info",
                         corr_id="model_update:aggregate",
                         trace_scope="aggregate",
                     )
@@ -3309,6 +3742,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 committer_available=callable(pair_fallback_committer),
             )
 
+        authoritative_pair_delta_staged_count = len(authoritative_pair_delta_builds)
         if authoritative_pair_delta_builds:
             # The staged transaction is intentionally one non-legacy pair.
             # Startup recovery consumes global remote authority, so it retains
@@ -3360,6 +3794,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     authoritative_pair_candidate = None
                     authoritative_pair_build = None
             if not pair_safe:
+                authoritative_pair_fallback_reason = pair_fallback_reason
                 record_candidate_attribution(
                     COUNTER_CANDIDATE_PAIR_FALLBACK,
                     "candidate_pair_fallback",
@@ -3412,6 +3847,8 @@ class ModelUpdater(_ControllerCoreAccess):
                     message="active_transfer_delta_rejected",
                     details=details,
                     event_type="diagnostic",
+                    category="completion.gate",
+                    level="info",
                     corr_id="model_update:aggregate",
                     trace_scope="aggregate",
                 )
@@ -3489,7 +3926,8 @@ class ModelUpdater(_ControllerCoreAccess):
             model_builder.has_changes() and (not progressive_delta_eligible or active_transfer_delta_rejected) and \
             not authoritative_pair_delta_applied
         )
-        if not full_build_triggered and self._completion_gate_trace_enabled():
+        completion_trace_enabled = self._completion_gate_trace_enabled()
+        if not full_build_triggered and completion_trace_enabled:
             for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names:
                 self._record_completion_gate_breadcrumb(
                     ModelFile.build_file_id(file_name, path_pair_id),
@@ -3913,68 +4351,69 @@ class ModelUpdater(_ControllerCoreAccess):
                 # model diff. Capture the candidate gate for every pending
                 # subject before diff processing so a quiet candidate build is
                 # distinguishable from a deferred or incomplete one.
-                for pending_file_id in pending_candidate_file_ids:
-                    lifecycle_allowed = candidate_lifecycle_allows(pending_file_id)
-                    if authoritative_pair_build is None:
-                        pair_relation = "global"
-                    elif lifecycle_allowed:
-                        pair_relation = "selected"
-                    else:
-                        pair_relation = "unselected"
-                    try:
-                        candidate_file = new_model.get_file(pending_file_id)
-                    except ModelError:
-                        candidate_file = None
-                    try:
-                        live_file = model.get_file(pending_file_id)
-                    except ModelError:
-                        live_file = None
-                    coverage = candidate_complete_local_coverage(pending_file_id)
-                    self._record_completion_gate_breadcrumb(
-                        pending_file_id,
-                        "completion_gate_candidate",
-                        {
-                            "build_kind": lifecycle_publication_build_kind,
-                            "candidate_lifecycle": "allowed" if lifecycle_allowed else "deferred",
-                            "candidate_pair_relation": pair_relation,
-                            "candidate_present": candidate_file is not None,
-                            "live_present": live_file is not None,
-                            "candidate_state": (
-                                getattr(getattr(candidate_file, "state", None), "name", "absent").lower()
-                                if candidate_file is not None else "absent"
-                            ),
-                            "local_size_present": (
-                                getattr(candidate_file, "local_size", None) is not None
-                                if candidate_file is not None else False
-                            ),
-                            "remote_size_present": (
-                                getattr(candidate_file, "remote_size", None) is not None
-                                if candidate_file is not None else False
-                            ),
-                            "complete_local_coverage": coverage,
-                            "model_diff_present": pending_file_id in diff_file_ids,
-                        },
-                    )
-                    if not lifecycle_allowed:
+                if completion_trace_enabled:
+                    for pending_file_id in pending_candidate_file_ids:
+                        lifecycle_allowed = candidate_lifecycle_allows(pending_file_id)
+                        if authoritative_pair_build is None:
+                            pair_relation = "global"
+                        elif lifecycle_allowed:
+                            pair_relation = "selected"
+                        else:
+                            pair_relation = "unselected"
+                        try:
+                            candidate_file = new_model.get_file(pending_file_id)
+                        except ModelError:
+                            candidate_file = None
+                        try:
+                            live_file = model.get_file(pending_file_id)
+                        except ModelError:
+                            live_file = None
+                        coverage = candidate_complete_local_coverage(pending_file_id)
                         self._record_completion_gate_breadcrumb(
                             pending_file_id,
-                            "completion_gate_decision",
+                            "completion_gate_candidate",
                             {
-                                "completion_proved": False,
-                                "decision": "deferred",
-                                "reason": "candidate_pair_unselected",
+                                "build_kind": lifecycle_publication_build_kind,
+                                "candidate_lifecycle": "allowed" if lifecycle_allowed else "deferred",
+                                "candidate_pair_relation": pair_relation,
+                                "candidate_present": candidate_file is not None,
+                                "live_present": live_file is not None,
+                                "candidate_state": (
+                                    getattr(getattr(candidate_file, "state", None), "name", "absent").lower()
+                                    if candidate_file is not None else "absent"
+                                ),
+                                "local_size_present": (
+                                    getattr(candidate_file, "local_size", None) is not None
+                                    if candidate_file is not None else False
+                                ),
+                                "remote_size_present": (
+                                    getattr(candidate_file, "remote_size", None) is not None
+                                    if candidate_file is not None else False
+                                ),
+                                "complete_local_coverage": coverage,
+                                "model_diff_present": pending_file_id in diff_file_ids,
                             },
                         )
-                    elif pending_file_id not in diff_file_ids:
-                        self._record_completion_gate_breadcrumb(
-                            pending_file_id,
-                            "completion_gate_decision",
-                            {
-                                "completion_proved": False,
-                                "decision": "deferred",
-                                "reason": "no_model_diff",
-                            },
-                        )
+                        if not lifecycle_allowed:
+                            self._record_completion_gate_breadcrumb(
+                                pending_file_id,
+                                "completion_gate_decision",
+                                {
+                                    "completion_proved": False,
+                                    "decision": "deferred",
+                                    "reason": "candidate_pair_unselected",
+                                },
+                            )
+                        elif pending_file_id not in diff_file_ids:
+                            self._record_completion_gate_breadcrumb(
+                                pending_file_id,
+                                "completion_gate_decision",
+                                {
+                                    "completion_proved": False,
+                                    "decision": "deferred",
+                                    "reason": "no_model_diff",
+                                },
+                            )
 
                 for file_id, count in persist.move_failure_counts.items():
                     if not candidate_lifecycle_allows(file_id):
@@ -4085,7 +4524,8 @@ class ModelUpdater(_ControllerCoreAccess):
                             completion_proved = False
                             completion_reason = "completion_authority_missing"
 
-                    if new_file is not None and new_file.file_id in pending_candidate_file_ids:
+                    if completion_trace_enabled and new_file is not None and \
+                            new_file.file_id in pending_candidate_file_ids:
                         self._record_completion_gate_breadcrumb(
                             new_file.file_id,
                             "completion_gate_decision",
@@ -4102,16 +4542,19 @@ class ModelUpdater(_ControllerCoreAccess):
                         if failure_count >= controller._Controller__MAX_MOVE_FAILURES or (
                             retry_due is not None and datetime.now() < retry_due
                         ):
-                            self._record_completion_gate_breadcrumb(
-                                new_file.file_id, "completion_gate_move_deferred",
-                                {
-                                    "reason": "retry_or_failure_limit",
-                                    "failure_limit_reached": failure_count >= controller._Controller__MAX_MOVE_FAILURES,
-                                    "retry_waiting": retry_due is not None and datetime.now() < retry_due,
-                                },
-                            )
+                            if completion_trace_enabled:
+                                self._record_completion_gate_breadcrumb(
+                                    new_file.file_id, "completion_gate_move_deferred",
+                                    {
+                                        "reason": "retry_or_failure_limit",
+                                        "failure_limit_reached": failure_count >= controller._Controller__MAX_MOVE_FAILURES,
+                                        "retry_waiting": retry_due is not None and datetime.now() < retry_due,
+                                    },
+                                )
                             continue
-                        move_result = run_reserved_automatic_move(new_file, trace_completion_gate=True)
+                        move_result = run_reserved_automatic_move(
+                            new_file, trace_completion_gate=completion_trace_enabled,
+                        )
                         if move_result is None:
                             continue
                         attempted_move_file_ids.add(new_file.file_id)
@@ -4541,7 +4984,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     )
                 except Exception:
                     controller.logger.debug("Ignoring lifecycle live-publication breadcrumb failure", exc_info=True)
-        if full_build_triggered:
+        if full_build_triggered and _controller_breadcrumb_effectively_enabled(
+                controller, "model.update", "info",
+        ):
             try:
                 model_version = getattr(controller._Controller__model, "version", None)
                 if isinstance(model_version, int):
@@ -4555,6 +5000,8 @@ class ModelUpdater(_ControllerCoreAccess):
                             "model_tree_file_count": getattr(controller._Controller__model, "tree_file_count", 0),
                         },
                         event_type="state_transition",
+                        category="model.update",
+                        level="info",
                         corr_id=correlation,
                         flow_id=correlation,
                         trace_scope="aggregate",
@@ -4562,12 +5009,7 @@ class ModelUpdater(_ControllerCoreAccess):
             except Exception:
                 pass
         summary_notified = False
-        if local_inventory_revision_before is not None and callable(inventory_revision_getter) and \
-                inventory_revision_getter() != local_inventory_revision_before:
-            summary_notifier = getattr(controller, "notify_model_summary_changed", None)
-            if callable(summary_notifier):
-                summary_notifier()
-                summary_notified = True
+        scan_authority_snapshot_changed = False
         diagnostics_enabled = False
         if diagnostics is not None:
             try:
@@ -4615,10 +5057,254 @@ class ModelUpdater(_ControllerCoreAccess):
                 overlay.difference_update(local_noop_inventory_completion_ids)
                 unknown_overlay_changed = overlay != progressive_unknown_before_event
                 setter_unknown_local(overlay)
-        if unknown_overlay_changed and not summary_notified:
+
+        # Emit one bounded authority decision after source adoption and the
+        # safety overlay have both settled.  This is diagnostic evidence only:
+        # all values are aggregate booleans/counts or fixed enums, and the
+        # correlation is an opaque process-local digest.
+        if latest_local_scan is not None or latest_remote_scan is not None:
+            scan_authority_trace_enabled = _controller_breadcrumb_effectively_enabled(
+                controller, "scan.authority", "info",
+            )
+            def scan_full(result: Optional[ScannerResult]) -> bool:
+                return result is not None and bool(getattr(result, "is_full_snapshot", False))
+
+            local_scanned_pair_count = scan_pair_count(latest_local_scan, "scanned_path_pair_ids") \
+                if latest_local_scan is not None else 0
+            remote_scanned_pair_count = scan_pair_count(latest_remote_scan, "scanned_path_pair_ids") \
+                if latest_remote_scan is not None else 0
+            local_completed_pair_count = scan_pair_count(latest_local_scan, "completed_path_pair_ids") \
+                if latest_local_scan is not None else 0
+            remote_completed_pair_count = scan_pair_count(latest_remote_scan, "completed_path_pair_ids") \
+                if latest_remote_scan is not None else 0
+            local_unknown_pair_count = scan_pair_count(latest_local_scan, "unknown_path_pair_ids") \
+                if latest_local_scan is not None else 0
+            remote_unknown_pair_count = scan_pair_count(latest_remote_scan, "unknown_path_pair_ids") \
+                if latest_remote_scan is not None else 0
+            local_full = scan_full(latest_local_scan)
+            remote_full = scan_full(latest_remote_scan)
+            local_final = scan_final_relevant("local", latest_local_scan)
+            remote_final = scan_final_relevant("remote", latest_remote_scan)
+            joint_authoritative_before = joint_authoritative_before_event
+            joint_authoritative_after = bool(
+                getattr(controller, "_Controller__progressive_joint_authoritative", False)
+            )
+
+            unknown_overlay_current_ids = {
+                value for value in joint_unknown_local_ids
+                if value is None or isinstance(value, str)
+            } if progressive_mode else {
+                value for value in aggregate_id_set(
+                    getattr(latest_local_scan, "unknown_path_pair_ids", set())
+                    if latest_local_scan is not None else set()
+                ) if value is None or isinstance(value, str)
+            }
+            unknown_snapshotter = getattr(model_builder, "unknown_local_path_pair_ids_snapshot", None)
+            unknown_overlay_after_ids = aggregate_snapshot_ids(unknown_snapshotter)
+            if not callable(unknown_snapshotter):
+                unknown_overlay_after_ids = set(unknown_overlay_current_ids)
+            unknown_overlay_after_ids = {
+                value for value in unknown_overlay_after_ids
+                if value is None or isinstance(value, str)
+            }
+            local_reconciled_after_ids = aggregate_id_set(
+                getattr(controller, "_Controller__reconciled_local_path_pair_ids", set())
+            )
+            effective_local_reconciled_after_ids = (
+                local_reconciled_after_ids - unknown_overlay_after_ids
+            )
+            staged_bucket_count = min(
+                2,
+                int(bool(joint_local_files)) + int(bool(joint_remote_files)),
+            )
+            if authoritative_pair_delta_staged_count:
+                staged_bucket_count = max(staged_bucket_count, 2)
+            adopted_bucket_count = staged_bucket_count if progressive_source_buckets_adopted \
+                or authoritative_pair_delta_applied else 0
+            if not progressive_mode and full_build_triggered:
+                adopted_bucket_count = int(local_final) + int(remote_final)
+
+            pair_delta_authorized = bool(
+                authoritative_pair_delta_applied or authoritative_pair_candidate is not None
+            )
+            pair_delta_fallback = bool(
+                authoritative_pair_fallback_required or authoritative_pair_fallback_reason
+            )
+            # Report the settled authority boundary, not an optimization
+            # attempt that was superseded later in this update.  A pair
+            # fallback may commit source buckets successfully, and an active
+            # delta rejection may deliberately fall through to a full build.
+            if authoritative_pair_delta_applied:
+                outcome = "adopt"
+                reason = "pair_delta_adopted"
+            elif progressive_source_buckets_adopted:
+                outcome = "adopt"
+                reason = "source_buckets_adopted_after_pair_fallback" \
+                    if pair_delta_fallback else "source_buckets_adopted"
+            elif full_build_triggered or progressive_delta_applied:
+                outcome = "publish"
+                if active_transfer_delta_rejected:
+                    reason = "published_after_active_delta_rejection"
+                elif pair_delta_fallback:
+                    reason = "published_after_pair_fallback"
+                else:
+                    reason = "published"
+            elif active_transfer_delta_rejected:
+                outcome = "reject"
+                reason = "active_delta_rejected"
+            elif pair_delta_fallback:
+                outcome = "reject"
+                reason = "pair_delta_fallback"
+            elif not joint_reconciliation_final:
+                outcome = "no_op"
+                reason = "joint_not_final"
+            elif not progressive_final_publication_required:
+                outcome = "no_op"
+                reason = "comparison_proven_noop"
+            elif len(unknown_overlay_after_ids) > len(progressive_unknown_before_event):
+                outcome = "no_op"
+                reason = "unknown_overlay_retained"
+            else:
+                outcome = "no_op"
+                reason = "no_change"
+
+            def final_comparison_proven_ids(side: str) -> set[object]:
+                accumulator = getattr(
+                    controller, "_Controller__progressive_{}_scan_state".format(side), None,
+                )
+                proven = getattr(accumulator, "final_comparison_proven_pairs", None)
+                if not callable(proven):
+                    return set()
+                try:
+                    return aggregate_id_set(proven())
+                except Exception:
+                    return set()
+
+            comparison_proven_count = len(
+                final_comparison_proven_ids("local") | final_comparison_proven_ids("remote")
+            )
+            staged_pair_count = authoritative_pair_delta_staged_count
+            adopted_pair_count = staged_pair_count if progressive_source_buckets_adopted \
+                or authoritative_pair_delta_applied else 0
+            standing_snapshot = {
+                "final": bool(joint_reconciliation_final),
+                "full": bool(local_full and remote_full),
+                "scanned_pair_count": local_scanned_pair_count + remote_scanned_pair_count,
+                "completed_pair_count": local_completed_pair_count + remote_completed_pair_count,
+                "unknown_pair_count": local_unknown_pair_count + remote_unknown_pair_count,
+                "joint_final": bool(joint_reconciliation_final),
+                "joint_authoritative_after": joint_authoritative_after,
+                "joint_authoritative": joint_authoritative_after,
+                "publication_required": bool(progressive_final_publication_required),
+                "outcome": outcome,
+                "reason": reason,
+                "comparison_proven_count": comparison_proven_count,
+                "delta_count": len(progressive_joint_delta_keys),
+                "staged_bucket_count": staged_bucket_count,
+                "adopted_bucket_count": adopted_bucket_count,
+                "local_noop_count": len(local_noop_inventory_completion_ids),
+                "unknown_overlay_after_count": len(unknown_overlay_after_ids),
+                "raw_local_reconciliation_after_count": len(local_reconciled_after_ids),
+                "effective_local_reconciliation_after_count": len(effective_local_reconciled_after_ids),
+                "pair_delta_allowed": pair_delta_authorized,
+                "pair_delta_fallback": pair_delta_fallback,
+            }
+            controller._Controller__scan_authority_snapshot = standing_snapshot
+            scan_authority_snapshot_changed = (
+                standing_snapshot != previous_scan_authority_snapshot
+            )
+            if scan_authority_trace_enabled:
+                event_details = {
+                    "final": bool(joint_reconciliation_final),
+                    "full": bool(local_full and remote_full),
+                    "local_final": bool(local_final),
+                    "remote_final": bool(remote_final),
+                    "local_full": local_full,
+                    "remote_full": remote_full,
+                    "scanned_pair_count": local_scanned_pair_count + remote_scanned_pair_count,
+                    "completed_pair_count": local_completed_pair_count + remote_completed_pair_count,
+                    "unknown_pair_count": local_unknown_pair_count + remote_unknown_pair_count,
+                    "local_scanned_pair_count": local_scanned_pair_count,
+                    "remote_scanned_pair_count": remote_scanned_pair_count,
+                    "local_completed_pair_count": local_completed_pair_count,
+                    "remote_completed_pair_count": remote_completed_pair_count,
+                    "local_unknown_pair_count": local_unknown_pair_count,
+                    "remote_unknown_pair_count": remote_unknown_pair_count,
+                    "joint_final": bool(joint_reconciliation_final),
+                    "joint_authoritative_before": joint_authoritative_before,
+                    "joint_authoritative_after": joint_authoritative_after,
+                    "joint_authoritative": joint_authoritative_after,
+                    "publication_required": bool(progressive_final_publication_required),
+                    "outcome": outcome,
+                    "reason": reason,
+                    "comparison_proven_count": comparison_proven_count,
+                    "delta_count": len(progressive_joint_delta_keys),
+                    "staged_bucket_count": staged_bucket_count,
+                    "adopted_bucket_count": adopted_bucket_count,
+                    "staged_pair_count": staged_pair_count,
+                    "adopted_pair_count": adopted_pair_count,
+                    "pair_delta_allowed": pair_delta_authorized,
+                    "pair_delta_fallback": pair_delta_fallback,
+                    "local_noop_count": len(local_noop_inventory_completion_ids),
+                    "unknown_overlay_before_count": len(progressive_unknown_before_event),
+                    "unknown_overlay_current_count": len(unknown_overlay_current_ids),
+                    "unknown_overlay_after_count": len(unknown_overlay_after_ids),
+                    "raw_local_reconciliation_before_count": len(local_reconciled_before_ids),
+                    "raw_local_reconciliation_after_count": len(local_reconciled_after_ids),
+                    "effective_local_reconciliation_after_count": len(effective_local_reconciled_after_ids),
+                }
+                try:
+                    authority_parts = []
+                    for side, result, process in (
+                        ("local", latest_local_scan, getattr(controller, "_Controller__local_scan_process", None)),
+                        ("remote", latest_remote_scan, getattr(controller, "_Controller__remote_scan_process", None)),
+                    ):
+                        if result is None:
+                            continue
+                        session_token = getattr(result, "session_token", None)
+                        if not isinstance(session_token, str):
+                            session_token = getattr(process, "session_token", None)
+                        authority_parts.append(
+                            "{}:{}:{}:{}".format(
+                                side,
+                                trace_session_digest(session_token),
+                                scan_generation(result),
+                                getattr(result, "timestamp", ""),
+                            )
+                        )
+                    correlation = opaque_trace_correlation(
+                        "scan_authority|{}".format("|".join(authority_parts) or "aggregate")
+                    )
+                    controller._Controller__record_breadcrumb(
+                        stage="scan_authority",
+                        message="scan_authority",
+                        details=event_details,
+                        event_type="diagnostic",
+                        category="scan.authority",
+                        level="info",
+                        corr_id=correlation,
+                        flow_id=correlation,
+                        trace_scope="aggregate",
+                    )
+                except Exception:
+                    logger = getattr(controller, "logger", None)
+                    if logger is not None:
+                        try:
+                            logger.debug("Ignoring scan authority breadcrumb failure", exc_info=True)
+                        except Exception:
+                            pass
+        inventory_revision_changed = (
+            local_inventory_revision_before is not None
+            and callable(inventory_revision_getter)
+            and inventory_revision_getter() != local_inventory_revision_before
+        )
+        if (
+            scan_authority_snapshot_changed or inventory_revision_changed or unknown_overlay_changed
+        ) and not summary_notified:
             summary_notifier = getattr(controller, "notify_model_summary_changed", None)
             if callable(summary_notifier):
                 summary_notifier()
+                summary_notified = True
 
         # A mirror/directory job owns only its root lifecycle.  Its scanner
         # tree can nevertheless prove one staging leaf complete while another
@@ -4632,10 +5318,20 @@ class ModelUpdater(_ControllerCoreAccess):
         # exact Path Pair checks below; its scanner identity proof is already
         # independent of the root's presentation state.
         if callable(leaf_candidates) and callable(finalize_child):
+            child_trace_info_enabled = _controller_breadcrumb_effectively_enabled(
+                controller, _CHILD_FINALIZATION_TRACE_CATEGORY, "info",
+            )
+            child_trace_warning_enabled = _controller_breadcrumb_effectively_enabled(
+                controller, _CHILD_FINALIZATION_TRACE_CATEGORY, "warning",
+            )
+            candidate_discovery_reason = "available"
             try:
                 candidates = leaf_candidates()
             except Exception:
                 candidates = ()
+                candidate_discovery_reason = "provider_exception"
+            if not isinstance(candidates, tuple):
+                candidate_discovery_reason = "invalid_collection"
             candidate_file_ids: set[str] = set()
             if isinstance(candidates, tuple):
                 for root_file_id, relative_path in candidates:
@@ -4650,6 +5346,46 @@ class ModelUpdater(_ControllerCoreAccess):
                     path_pair_id = parsed[0] if isinstance(parsed, list) and len(parsed) == 2 and \
                         isinstance(parsed[0], str) and isinstance(parsed[1], str) else None
                     candidate_file_ids.add(ModelFile.build_file_id(root_name + "/" + relative_path, path_pair_id))
+            candidate_trace_level = (
+                "warning" if candidate_discovery_reason == "provider_exception" else "info"
+            )
+            candidate_trace_enabled = (
+                child_trace_warning_enabled
+                if candidate_discovery_reason == "provider_exception"
+                else child_trace_info_enabled
+            )
+            if candidate_trace_enabled:
+                candidate_count = len(candidates) if isinstance(candidates, tuple) else 0
+                bounded_candidate_count = _bounded_child_finalization_count(candidate_count)
+                bounded_valid_candidate_count = _bounded_child_finalization_count(
+                    len(candidate_file_ids),
+                )
+                candidate_trace_signature = (
+                    candidate_discovery_reason,
+                    bounded_candidate_count,
+                    bounded_valid_candidate_count,
+                )
+                if (
+                    self.__child_finalization_candidate_trace_signature
+                    != candidate_trace_signature
+                ):
+                    self.__child_finalization_candidate_trace_signature = (
+                        candidate_trace_signature
+                    )
+                    _record_child_finalization_breadcrumb(
+                        controller,
+                        "child_finalization_candidates",
+                        lambda: {
+                            "schema": _CHILD_FINALIZATION_TRACE_SCHEMA,
+                            "phase": "candidate_discovery",
+                            "outcome": "available" if candidate_discovery_reason == "available" else "failed",
+                            "reason": candidate_discovery_reason,
+                            "candidate_count": bounded_candidate_count,
+                            "valid_candidate_count": bounded_valid_candidate_count,
+                        },
+                        level=candidate_trace_level,
+                        trace_scope="aggregate",
+                    )
             prune_child_retry = getattr(controller, "_prune_child_finalization_retry_state", None)
             if callable(prune_child_retry):
                 prune_child_retry(candidate_file_ids)
@@ -4665,12 +5401,97 @@ class ModelUpdater(_ControllerCoreAccess):
                     path_pair_id, root_name = parsed
                 else:
                     path_pair_id, root_name = None, root_file_id
-                if path_pair_id not in controller._Controller__reconciled_local_path_pair_ids or \
-                        path_pair_id not in controller._Controller__reconciled_remote_path_pair_ids:
+                local_authoritative = path_pair_id in controller._Controller__reconciled_local_path_pair_ids
+                remote_authoritative = path_pair_id in controller._Controller__reconciled_remote_path_pair_ids
+                child_trace_identity = None
+                if not local_authoritative or not remote_authoritative:
+                    if child_trace_info_enabled:
+                        child_trace_identity = _child_finalization_trace_identity(
+                            root_name, relative_path, path_pair_id,
+                        )
+                        _record_child_finalization_breadcrumb(
+                            controller,
+                            "child_finalization_authority",
+                            lambda: {
+                                "schema": _CHILD_FINALIZATION_TRACE_SCHEMA,
+                                "phase": "authority",
+                                "decision": "rejected",
+                                "reason": _CHILD_FINALIZATION_AUTHORITY_REASONS[
+                                    (local_authoritative, remote_authoritative)
+                                ],
+                            },
+                            level="info",
+                            child_identity=child_trace_identity,
+                        )
                     continue
+                if child_trace_info_enabled:
+                    child_trace_identity = _child_finalization_trace_identity(
+                        root_name, relative_path, path_pair_id,
+                    )
+                    _record_child_finalization_breadcrumb(
+                        controller,
+                        "child_finalization_authority",
+                        lambda: {
+                            "schema": _CHILD_FINALIZATION_TRACE_SCHEMA,
+                            "phase": "authority",
+                            "decision": "accepted",
+                            "reason": _CHILD_FINALIZATION_AUTHORITY_REASONS[
+                                (local_authoritative, remote_authoritative)
+                            ],
+                        },
+                        level="info",
+                        child_identity=child_trace_identity,
+                    )
                 try:
-                    finalize_child(root_name, relative_path, path_pair_id)
+                    result = finalize_child(root_name, relative_path, path_pair_id)
                 except Exception:
                     controller.logger.debug("Ignoring independent child finalization failure", exc_info=True)
+                    if child_trace_warning_enabled:
+                        if child_trace_identity is None:
+                            child_trace_identity = _child_finalization_trace_identity(
+                                root_name, relative_path, path_pair_id,
+                            )
+                        _record_child_finalization_breadcrumb(
+                            controller,
+                            "child_finalization_result",
+                            lambda: {
+                                "schema": _CHILD_FINALIZATION_TRACE_SCHEMA,
+                                "phase": "dispatch",
+                                "outcome": "exception",
+                                "reason": _CHILD_FINALIZATION_RESULT_REASONS["exception"],
+                                "attempt_failure": True,
+                            },
+                            level="warning",
+                            child_identity=child_trace_identity,
+                        )
+                    continue
+                result_name = _child_finalization_trace_result(result)
+                result_level = (
+                    "warning"
+                    if result_name in {"failed", "conflict", "exception", "unknown"}
+                    else "info"
+                )
+                if (
+                    result_level == "info" and child_trace_info_enabled
+                ) or (
+                    result_level == "warning" and child_trace_warning_enabled
+                ):
+                    if child_trace_identity is None:
+                        child_trace_identity = _child_finalization_trace_identity(
+                            root_name, relative_path, path_pair_id,
+                        )
+                    _record_child_finalization_breadcrumb(
+                        controller,
+                        "child_finalization_result",
+                        lambda: {
+                            "schema": _CHILD_FINALIZATION_TRACE_SCHEMA,
+                            "phase": "dispatch",
+                            "outcome": result_name,
+                            "reason": _CHILD_FINALIZATION_RESULT_REASONS[result_name],
+                            "attempt_failure": result_level == "warning",
+                        },
+                        level=result_level,
+                        child_identity=child_trace_identity,
+                    )
         return full_build_triggered or progressive_delta_applied or authoritative_pair_delta_applied or \
             active_transfer_delta_applied

@@ -285,7 +285,7 @@ class ModelApiHandler(IHandler):
             trace = self.__breadcrumb_trace
             if trace is not None:
                 try:
-                    if not trace.is_enabled():
+                    if not trace.is_effectively_enabled("model_api", "info"):
                         return rendered
                     global_version = version if publication == "summary" else global_model_version
                     if not isinstance(global_version, int):

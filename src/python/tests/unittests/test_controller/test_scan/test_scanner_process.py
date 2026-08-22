@@ -29,7 +29,7 @@ from controller import IScanner, ScannerProcess, ScannerError
 from controller.scan import MultiPathRemoteScanner, RemoteScanner
 from controller.scan.scanner_process import (
     ScannerResult, _ScannerQueueReleaseMarker, _create_scanner_worker, _publish_bounded_result,
-    _run_scanner_once,
+    _record_scan_breadcrumb, _run_scanner_once,
 )
 from controller.extract import ExtractProcess
 from system import SystemFile
@@ -80,6 +80,44 @@ class FingerprintProgressiveScanner(ProgressiveScanner):
         self.callback([], self.path_pair_id, self.path_pair_name, {"a"}, False)
         self.callback([], self.path_pair_id, self.path_pair_name, None, False, fingerprints)
         self.callback([], self.path_pair_id, self.path_pair_name, None, True)
+        return []
+
+
+class BlockingFingerprintScanner(DummyScanner):
+    """Expose whether a staged hint can mutate an already admitted scan."""
+    def __init__(self):
+        self.accepted = {}
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.observed = []
+
+    def set_accepted_root_fingerprints(self, fingerprints):
+        self.accepted = fingerprints
+
+    def scan(self):
+        self.started.set()
+        self.release.wait(timeout=2)
+        self.observed.append(self.accepted)
+        return []
+
+
+class SpawnedFingerprintScanner(DummyScanner):
+    """Report each spawned child's admitted hint while coordinating its scan."""
+    def __init__(self):
+        spawn_context = multiprocessing.get_context("spawn")
+        self.accepted = {}
+        self.started = spawn_context.Event()
+        self.release = spawn_context.Event()
+        self.observed = spawn_context.Queue()
+
+    def set_accepted_root_fingerprints(self, fingerprints):
+        self.accepted = fingerprints
+
+    def scan(self):
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise AssertionError("spawned scan was not released")
+        self.observed.put(self.accepted)
         return []
 
 
@@ -499,6 +537,25 @@ class TestScannerProcess(unittest.TestCase):
             self.process.close_queues()
             self.process = None
             mp_logger.stop()
+
+    def test_scan_breadcrumb_gate_skips_lazy_details_and_preserves_enabled_emission(self):
+        scanner = DummyScanner()
+        disabled = BreadcrumbTraceCollector(
+            lambda: True, max_entries=16, policy={"default": "off"},
+        )
+        details = MagicMock(side_effect=AssertionError("disabled scan breadcrumb built details"))
+        _record_scan_breadcrumb(scanner, disabled.create_emitter(), "flow-id", "scan_started", details)
+        details.assert_not_called()
+        self.assertEqual([], disabled.snapshot()["entries"])
+
+        enabled = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        _record_scan_breadcrumb(
+            scanner, enabled.create_emitter(), "flow-id", "scan_started",
+            lambda: {"generation": 1, "session_digest": "opaque"},
+        )
+        entry = enabled.snapshot()["entries"][0]
+        self.assertEqual("scanner_process", entry["category"])
+        self.assertEqual("scan_started", entry["message"])
 
     def test_spawned_remote_duration_aggregates_reach_parent_collector(self):
         self._scan_run_patcher.stop()
@@ -1019,6 +1076,71 @@ class TestScannerProcess(unittest.TestCase):
                             for result in marker_events))
         final = next(result for result in results if result.is_full_snapshot)
         self.assertEqual({"pair": {"a": fingerprint}}, final.unchanged_root_fingerprints_by_pair)
+
+    def test_forced_successor_scan_uses_hint_staged_after_queued_scan_admission(self):
+        scanner = BlockingFingerprintScanner()
+        process = ScannerProcess(scanner=scanner, interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+        old = {"pair": {"root": "old"}}
+        current = {"pair": {"root": "current"}}
+        process.set_accepted_root_fingerprints(old)
+
+        admitted_scan = threading.Thread(target=process.run_loop)
+        admitted_scan.start()
+        self.assertTrue(scanner.started.wait(timeout=1))
+
+        # ModelUpdater drains the queued result then stages its newly accepted
+        # fingerprints while a forced successor is waiting to begin.  This
+        # must not mutate the already-admitted scan's scanner instance.
+        process.set_accepted_root_fingerprints(current)
+        self.assertEqual(old, scanner.accepted)
+        scanner.release.set()
+        admitted_scan.join(timeout=1)
+        self.assertFalse(admitted_scan.is_alive())
+
+        process.force_scan()
+        process.run_loop()
+
+        self.assertEqual([old, current], scanner.observed)
+
+    def test_spawned_scan_handoff_keeps_admitted_hint_and_updates_successor(self):
+        self._scan_run_patcher.stop()
+        scanner = SpawnedFingerprintScanner()
+        self.addCleanup(scanner.observed.join_thread)
+        self.addCleanup(scanner.observed.close)
+        process = ScannerProcess(
+            scanner=scanner,
+            interval_in_ms=0,
+            verbose=False,
+            recycle_scan_worker=True,
+        )
+        self.addCleanup(process.close_queues)
+        old = {"pair": {"root": "old"}}
+        current = {"pair": {"root": "current"}}
+        process.set_accepted_root_fingerprints(old)
+
+        process.run_loop()
+        self.assertTrue(scanner.started.wait(timeout=2))
+
+        # The first child has already crossed the admission boundary.  A
+        # concurrent model update must stage for the successor, not mutate it.
+        process.set_accepted_root_fingerprints(current)
+        self.assertEqual(old, scanner.accepted)
+        scanner.release.set()
+
+        deadline = time.monotonic() + 5
+        while process._ScannerProcess__scan_worker is not None and time.monotonic() < deadline:
+            process.run_loop()
+        self.assertIsNone(process._ScannerProcess__scan_worker)
+        self.assertEqual(old, scanner.observed.get(timeout=2))
+
+        process.force_scan()
+        process.run_loop()
+        deadline = time.monotonic() + 5
+        while process._ScannerProcess__scan_worker is not None and time.monotonic() < deadline:
+            process.run_loop()
+        self.assertIsNone(process._ScannerProcess__scan_worker)
+        self.assertEqual(current, scanner.observed.get(timeout=2))
 
     def test_multi_path_scanner_routes_root_fingerprints_only_to_matching_pair(self):
         first = MagicMock()

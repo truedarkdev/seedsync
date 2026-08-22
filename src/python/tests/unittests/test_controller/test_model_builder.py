@@ -7414,6 +7414,51 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DEFAULT, model.get_file("sample-directory").state)
         self.assertEqual([], self.__trace_entries(collector, include_root_decisions=True))
 
+    def test_root_default_trace_category_gate_skips_coverage_and_correlation_work(self):
+        remote_root = SystemFile("sample-directory", 20, True)
+        remote_root.add_child(SystemFile("remote.bin", 20, False))
+        local_root = SystemFile("sample-directory", 10, True)
+        local_root.add_child(SystemFile("remote.bin", 10, False))
+
+        class CategoryGate:
+            def is_effectively_enabled(self, category, level="info"):
+                return category != "queue.exclusion"
+
+            def record(self, *args, **kwargs):
+                raise AssertionError("disabled root breadcrumb was emitted")
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_stop_resume_trace_breadcrumb(CategoryGate())
+        with patch.object(
+                ModelBuilder,
+                "_ModelBuilder__root_trace_coverage_categories",
+                side_effect=AssertionError("disabled root diagnostics were built"),
+        ):
+            model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("sample-directory").state)
+
+    def test_persist_trace_verbosity_gate_skips_signature_and_correlation_work(self):
+        class VerbosityGate:
+            def is_effectively_enabled(self, category, level="info"):
+                return category == "lifecycle.persist" and level == "debug"
+
+            def record(self, *args, **kwargs):
+                raise AssertionError("disabled persistence breadcrumb was emitted")
+
+        self.model_builder.set_stop_resume_trace_breadcrumb(VerbosityGate())
+        with patch(
+                "controller.model_builder.json.dumps",
+                side_effect=AssertionError("disabled persistence signature was built"),
+        ), patch(
+                "controller.model_builder.opaque_trace_correlation",
+                side_effect=AssertionError("disabled persistence correlation was built"),
+        ):
+            self.model_builder._ModelBuilder__record_lifecycle_persist_breadcrumb_for_file_id(
+                "persist_authority_before", "opaque-file-id", {"state": "default"},
+            )
+
     def test_root_default_trace_preserves_legacy_default_behavior(self):
         remote_root = SystemFile("sample-directory", 20, True)
         remote_root.add_child(SystemFile("remote.bin", 20, False))

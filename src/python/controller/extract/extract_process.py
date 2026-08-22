@@ -5,7 +5,7 @@ import time
 import queue
 import threading
 from datetime import datetime
-from typing import Optional, Protocol, cast
+from typing import Callable, Optional, Protocol, cast
 import logging
 import os
 import json
@@ -20,7 +20,28 @@ from model import ModelFile
 
 
 class _BreadcrumbEmitter(Protocol):
+    def is_effectively_enabled(self, category: object, level: object = "info") -> bool: ...
+
     def record(self, source: str, message: str, details: object = None, **metadata: object) -> str: ...
+
+
+def _breadcrumb_effectively_enabled(trace: object, category: str, level: str = "info") -> bool:
+    """Check the cheap breadcrumb gate before constructing extraction evidence."""
+    if trace is None:
+        return False
+    gate = getattr(trace, "is_effectively_enabled", None)
+    if callable(gate):
+        try:
+            return bool(gate(category, level))
+        except Exception:
+            return False
+    enabled = getattr(trace, "is_enabled", None)
+    if callable(enabled):
+        try:
+            return bool(enabled())
+        except Exception:
+            return False
+    return True
 
 
 ExtractItem = ExtractRequest | ModelFile
@@ -94,18 +115,18 @@ class ExtractProcess(AppProcess):
             flow_id = self.trace_owner._listener_pop_inflight_flow_id(file_id=file_id, file_name=name)
             self.trace_owner._listener_record_breadcrumb(
                 "extract_completed",
-                {
+                lambda: {
                     "file_name": name,
                     "is_dir": is_dir,
                     "file_id": file_id,
                     "path_pair_id": path_pair_id,
                 },
-                corr_id=self.trace_owner._listener_trace_corr_id(file_id, path_pair_id, name),
+                corr_id=lambda: self.trace_owner._listener_trace_corr_id(file_id, path_pair_id, name),
                 flow_id=flow_id,
                 file_id=file_id,
                 path_pair_id=path_pair_id,
             )
-            self.trace_owner._listener_trace_target_archive_event("extract_completed", {
+            self.trace_owner._listener_trace_target_archive_event("extract_completed", lambda: {
                 "file_name": name,
                 "is_dir": is_dir,
                 "file_id": file_id,
@@ -127,19 +148,19 @@ class ExtractProcess(AppProcess):
             flow_id = self.trace_owner._listener_pop_inflight_flow_id(file_id=file_id, file_name=name)
             self.trace_owner._listener_record_breadcrumb(
                 "extract_failed",
-                {
+                lambda: {
                     "file_name": name,
                     "is_dir": is_dir,
                     "file_id": file_id,
                     "path_pair_id": path_pair_id,
                 },
                 event_type="failure",
-                corr_id=self.trace_owner._listener_trace_corr_id(file_id, path_pair_id, name),
+                corr_id=lambda: self.trace_owner._listener_trace_corr_id(file_id, path_pair_id, name),
                 flow_id=flow_id,
                 file_id=file_id,
                 path_pair_id=path_pair_id,
             )
-            self.trace_owner._listener_trace_target_archive_event("extract_failed", {
+            self.trace_owner._listener_trace_target_archive_event("extract_failed", lambda: {
                 "file_name": name,
                 "is_dir": is_dir,
                 "file_id": file_id,
@@ -224,9 +245,17 @@ class ExtractProcess(AppProcess):
         selector_name = self.__extract_trace_selector_name(self.__target_archive_trace_file_id)
         return selector_name == file_name
 
-    def __trace_target_archive_event(self, event: str, payload: dict[str, object]) -> None:
+    def __trace_target_archive_event(
+            self, event: str,
+            payload: dict[str, object] | Callable[[], dict[str, object]],
+    ) -> None:
         if not self.__is_target_archive_trace_enabled():
             return
+        if self.__breadcrumb_trace is not None and not _breadcrumb_effectively_enabled(
+                self.__breadcrumb_trace, "extract_process", "info"):
+            return
+        if callable(payload):
+            payload = payload()
         trace_payload: dict[str, object] = {
             "event": event,
             "target_selector": self.__target_archive_trace_file_id,
@@ -316,7 +345,7 @@ class ExtractProcess(AppProcess):
                 assert isinstance(model_file, ModelFile)
                 self.__record_breadcrumb(
                     "extract_command_dequeued",
-                    {
+                    lambda: {
                         "file_name": model_file.name,
                         "is_dir": model_file.is_dir,
                     },
@@ -330,7 +359,7 @@ class ExtractProcess(AppProcess):
                     self.__dispatch.extract(file)
                     self.__record_breadcrumb(
                         "extract_command_dispatched",
-                        {
+                        lambda: {
                             "file_name": model_file.name,
                             "is_dir": model_file.is_dir,
                         },
@@ -344,7 +373,7 @@ class ExtractProcess(AppProcess):
                     self.logger.warning(str(e))
                     self.__record_breadcrumb(
                         "extract_dispatch_blocked",
-                        {
+                        lambda: {
                             "file_name": model_file.name,
                             "is_dir": model_file.is_dir,
                             "reason": str(e),
@@ -356,7 +385,7 @@ class ExtractProcess(AppProcess):
                         path_pair_id=model_file.path_pair_id,
                     )
                     if self.__target_archive_trace_selector_matches_name(model_file.name):
-                        self.__trace_target_archive_event("extract_dispatch_blocked", {
+                        self.__trace_target_archive_event("extract_dispatch_blocked", lambda: {
                             "file_name": model_file.name,
                             "is_dir": model_file.is_dir,
                             "reason": str(e),
@@ -407,14 +436,18 @@ class ExtractProcess(AppProcess):
 
     def __record_breadcrumb(self,
                             message: str,
-                            details: dict[str, object],
+                            details: dict[str, object] | Callable[[], dict[str, object]],
                             event_type: str = "state_transition",
-                            corr_id: Optional[str] = None,
+                            corr_id: Optional[str] | Callable[[], Optional[str]] = None,
                             flow_id: Optional[str] = None,
                             file_id: Optional[str] = None,
                             path_pair_id: Optional[str] = None) -> None:
-        if self.__breadcrumb_trace is None:
+        if not _breadcrumb_effectively_enabled(self.__breadcrumb_trace, "extract_process", "info"):
             return
+        if callable(details):
+            details = details()
+        if callable(corr_id):
+            corr_id = corr_id()
         self.__breadcrumb_trace.record(
             "extract_process",
             message,
@@ -425,14 +458,16 @@ class ExtractProcess(AppProcess):
             flow_id=flow_id,
             file_id=file_id,
             path_pair_id=path_pair_id,
+            category="extract_process",
+            level="info",
         )
 
     def _listener_record_breadcrumb(
             self,
             message: str,
-            details: dict[str, object],
+            details: dict[str, object] | Callable[[], dict[str, object]],
             event_type: str = "state_transition",
-            corr_id: Optional[str] = None,
+            corr_id: Optional[str] | Callable[[], Optional[str]] = None,
             flow_id: Optional[str] = None,
             file_id: Optional[str] = None,
             path_pair_id: Optional[str] = None
@@ -447,7 +482,10 @@ class ExtractProcess(AppProcess):
             path_pair_id=path_pair_id,
         )
 
-    def _listener_trace_target_archive_event(self, event: str, payload: dict[str, object]) -> None:
+    def _listener_trace_target_archive_event(
+            self, event: str,
+            payload: dict[str, object] | Callable[[], dict[str, object]],
+    ) -> None:
         self.__trace_target_archive_event(event, payload)
 
     def __track_inflight_flow_id(self, file: ModelFile, flow_id: Optional[str] = None) -> None:
@@ -536,7 +574,7 @@ class ExtractProcess(AppProcess):
         assert isinstance(model_file, ModelFile)
         self.__record_breadcrumb(
             "extract_command_queued",
-            {
+            lambda: {
                 "file_name": model_file.name,
                 "is_dir": model_file.is_dir,
             },

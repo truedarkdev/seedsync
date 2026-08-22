@@ -1,5 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import copy
 import logging
 import time
 from abc import ABC, abstractmethod
@@ -21,7 +22,28 @@ from system import SystemFile
 
 
 class _BreadcrumbEmitter(Protocol):
+    def is_effectively_enabled(self, category: object, level: object = "info") -> bool: ...
+
     def record(self, source: str, message: str, details: object = None, **metadata: object) -> str: ...
+
+
+def _breadcrumb_effectively_enabled(trace: object, category: str, level: str = "info") -> bool:
+    """Check the cheap breadcrumb gate before constructing scan evidence."""
+    if trace is None:
+        return False
+    gate = getattr(trace, "is_effectively_enabled", None)
+    if callable(gate):
+        try:
+            return bool(gate(category, level))
+        except Exception:
+            return False
+    enabled = getattr(trace, "is_enabled", None)
+    if callable(enabled):
+        try:
+            return bool(enabled())
+        except Exception:
+            return False
+    return True
 
 
 class ScannerError(AppError):
@@ -302,16 +324,21 @@ def _scanner_correlation(scanner: IScanner, session_token: str, generation: int)
 
 
 def _record_scan_breadcrumb(scanner: IScanner, breadcrumb_trace: Optional[_BreadcrumbEmitter], flow_id: str,
-                            message: str, details: dict[str, object], event_type: str = "state_transition") -> None:
-    if breadcrumb_trace is None:
+                            message: str,
+                            details: dict[str, object] | Callable[[], dict[str, object]],
+                            event_type: str = "state_transition") -> None:
+    if not _breadcrumb_effectively_enabled(breadcrumb_trace, "scanner_process", "info"):
         return
+    if callable(details):
+        details = details()
     scanner_side = _scanner_side(scanner)
     correlation = "{}:{}:{}".format(
         scanner_side, details.get("session_digest", ""), details.get("generation", 0),
     )
     breadcrumb_trace.record("scanner_process", message, details, stage="scan", event_type=event_type,
                             corr_id=correlation, flow_id=opaque_trace_correlation(flow_id),
-                            trace_scope="flow", scanner_side=scanner_side)
+                            trace_scope="flow", scanner_side=scanner_side,
+                            category="scanner_process", level="info")
 
 
 def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
@@ -432,18 +459,18 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                 duration_aggregate_token=(session_token, generation, performance_diagnostics_generation),
             )
             _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_completed",
-                                    {"file_count": len(files),
-                                     "targeted": scan_target_path_pair_ids is not None,
-                                     "progress": progress_emitted, "failed": False,
-                                     "generation": generation,
-                                     "session_digest": trace_session_digest(session_token),
-                                     "monotonic_ms": int(time.monotonic_ns() / 1_000_000)})
+                                    lambda: {"file_count": len(files),
+                                             "targeted": scan_target_path_pair_ids is not None,
+                                             "progress": progress_emitted, "failed": False,
+                                             "generation": generation,
+                                             "session_digest": trace_session_digest(session_token),
+                                             "monotonic_ms": int(time.monotonic_ns() / 1_000_000)})
         except ScannerError as error:
             if not error.recoverable:
                 _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_failed",
-                                        {"failed": True, "generation": generation,
-                                         "session_digest": trace_session_digest(session_token),
-                                         "monotonic_ms": int(time.monotonic_ns() / 1_000_000)}, "failure")
+                                        lambda: {"failed": True, "generation": generation,
+                                                 "session_digest": trace_session_digest(session_token),
+                                                 "monotonic_ms": int(time.monotonic_ns() / 1_000_000)}, "failure")
                 raise
             files = error.files if error.files is not None else []
             malformed = scanner.pop_malformed_status_only_file_ids()
@@ -471,11 +498,11 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
             )
             outcome = ("recoverable", str(error))
             _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_failed",
-                                    {"file_count": len(files), "failed": True,
-                                     "targeted": scan_target_path_pair_ids is not None,
-                                     "generation": generation,
-                                     "session_digest": trace_session_digest(session_token),
-                                     "monotonic_ms": int(time.monotonic_ns() / 1_000_000)}, "failure")
+                                    lambda: {"file_count": len(files), "failed": True,
+                                             "targeted": scan_target_path_pair_ids is not None,
+                                             "generation": generation,
+                                             "session_digest": trace_session_digest(session_token),
+                                             "monotonic_ms": int(time.monotonic_ns() / 1_000_000)}, "failure")
         if result_via_control:
             # A spawn child must not leave a multiprocessing.Queue feeder
             # thread behind.  Send the authoritative aggregate over the
@@ -484,7 +511,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
             send_control_message(("result", result))
         elif output_queue is not None:
             _publish_bounded_result(output_queue, result)
-        _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_result_published", {
+        _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_result_published", lambda: {
             "targeted": scan_target_path_pair_ids is not None,
             "final": bool(result.is_scan_final), "full": bool(result.is_full_snapshot),
             "progress": bool(result.is_progress), "failed": bool(result.failed),
@@ -585,6 +612,13 @@ class ScannerProcess:
         self.__scan_worker_pending_status: object | None = None
         self.__scan_worker_force_pending = False
         self.__scan_worker_target_path_pair_ids: Optional[set[str]] = None
+        # The model updater may publish a new accepted-root snapshot while the
+        # coordinator is recycling a worker.  Keep it process-owned until a
+        # scan admission atomically transfers it to the scanner copied by that
+        # worker.  In particular, never mutate a scanner while it is scanning.
+        self.__scan_admission_lock = threading.RLock()
+        self.__pending_accepted_root_fingerprints: object = {}
+        self.__has_pending_accepted_root_fingerprints = False
         self.__priority_interrupt_event = threading.Event()
         self.__priority_target_lock = threading.Lock()
         self.__priority_target_path_pair_ids: set[str] = set()
@@ -694,7 +728,7 @@ class ScannerProcess:
         is_priority_targeted = bool(priority_target_path_pair_ids)
         self.__record_breadcrumb(
             "scan_started",
-            {
+            lambda: {
                 "targeted": scan_target_path_pair_ids is not None,
                 "scanner_side": _scanner_side(self.__scanner),
                 "generation": self.__scan_generation + 1,
@@ -717,12 +751,20 @@ class ScannerProcess:
             diagnostics_enabled, diagnostics_generation = False, 0
         else:
             diagnostics_enabled, diagnostics_generation = diagnostics.duration_worker_state()
-        worker = _create_scanner_worker(self.__scanner, None, scan_target_path_pair_ids, send_connection,
-                                        self.__breadcrumb_trace, flow_id, self._mp_log_queue, self._mp_log_level,
-                                        self.__scan_generation, self.__session_token,
-                                        diagnostics_enabled, diagnostics_generation)
-        worker.daemon = True
-        worker.start()
+        # Keep setting the hint and spawning its consumer in one admission
+        # critical section.  A concurrent model update is then deterministically
+        # either part of this worker's scanner snapshot or staged for its
+        # successor; it cannot replace the scanner state mid-handoff.
+        with self.__scan_admission_lock:
+            self.__apply_pending_accepted_root_fingerprints()
+            worker = _create_scanner_worker(
+                self.__scanner, None, scan_target_path_pair_ids, send_connection,
+                self.__breadcrumb_trace, flow_id, self._mp_log_queue, self._mp_log_level,
+                self.__scan_generation, self.__session_token,
+                diagnostics_enabled, diagnostics_generation,
+            )
+            worker.daemon = True
+            worker.start()
         send_connection.close()
         self.__scan_worker = worker
         self.__scan_worker_target_path_pair_ids = scan_target_path_pair_ids
@@ -741,16 +783,18 @@ class ScannerProcess:
         priority_target_path_pair_ids = self.__drain_priority_target_path_pair_ids()
         scan_target_path_pair_ids = priority_target_path_pair_ids \
             if priority_target_path_pair_ids else self.__drain_scan_target_path_pair_ids()
-        self.__record_breadcrumb("scan_started", {
+        self.__record_breadcrumb("scan_started", lambda: {
             "targeted": scan_target_path_pair_ids is not None,
             "scanner_side": _scanner_side(self.__scanner),
             "generation": self.__scan_generation + 1,
             "session_digest": trace_session_digest(self.__session_token),
             "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
         }, flow_id=flow_id)
-        setter = getattr(self.__scanner, "set_scan_target_path_pair_ids", None)
-        if callable(setter):
-            setter(scan_target_path_pair_ids)
+        with self.__scan_admission_lock:
+            self.__apply_pending_accepted_root_fingerprints()
+            setter = getattr(self.__scanner, "set_scan_target_path_pair_ids", None)
+            if callable(setter):
+                setter(scan_target_path_pair_ids)
         self.__scan_generation += 1
         progress_emitted = False
         progress_files_by_pair: dict[Optional[str], list[SystemFile]] = {}
@@ -813,17 +857,17 @@ class ScannerProcess:
                                     is_targeted_scan=scan_target_path_pair_ids is not None,
                                     session_token=self.__session_token,
                                     unchanged_root_fingerprints_by_pair=unchanged_root_fingerprints_by_pair)
-            self.__record_breadcrumb("scan_completed", {
-                "file_count": len(files), "targeted": scan_target_path_pair_ids is not None,
-                "scanner_side": _scanner_side(self.__scanner),
-                "progress": progress_emitted, "failed": False,
-                "generation": self.__scan_generation,
-                "session_digest": trace_session_digest(self.__session_token),
-                "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
-            }, flow_id=flow_id)
+            self.__record_breadcrumb("scan_completed", lambda: {
+                    "file_count": len(files), "targeted": scan_target_path_pair_ids is not None,
+                    "scanner_side": _scanner_side(self.__scanner),
+                    "progress": progress_emitted, "failed": False,
+                    "generation": self.__scan_generation,
+                    "session_digest": trace_session_digest(self.__session_token),
+                    "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
+                }, flow_id=flow_id)
         except ScannerError as error:
             if not error.recoverable:
-                self.__record_breadcrumb("scan_failed", {
+                self.__record_breadcrumb("scan_failed", lambda: {
                     "failed": True, "generation": self.__scan_generation,
                     "scanner_side": _scanner_side(self.__scanner),
                     "session_digest": trace_session_digest(self.__session_token),
@@ -847,7 +891,7 @@ class ScannerProcess:
                                    is_targeted_scan=scan_target_path_pair_ids is not None,
                                    session_token=self.__session_token,
                                    recoverable_failure_path_pair_ids=failed_ids or {None})
-            self.__record_breadcrumb("scan_failed", {
+            self.__record_breadcrumb("scan_failed", lambda: {
                 "file_count": len(files), "failed": True,
                 "scanner_side": _scanner_side(self.__scanner),
                 "targeted": scan_target_path_pair_ids is not None,
@@ -864,7 +908,7 @@ class ScannerProcess:
         assert self.__queue is not None
         assert self.__queue is not None
         self.__publish_result(result)
-        self.__record_breadcrumb("scan_result_published", {
+        self.__record_breadcrumb("scan_result_published", lambda: {
             "targeted": scan_target_path_pair_ids is not None,
             "scanner_side": _scanner_side(self.__scanner),
             "final": bool(result.is_scan_final), "full": bool(result.is_full_snapshot),
@@ -1087,11 +1131,15 @@ class ScannerProcess:
         path_pair_name = getattr(self.__scanner, "path_pair_name", None)
         return path_pair_name if isinstance(path_pair_name, str) else None
 
-    def __record_breadcrumb(self, message: str, details: dict[str, object], event_type: str = "state_transition",
+    def __record_breadcrumb(self, message: str,
+                            details: dict[str, object] | Callable[[], dict[str, object]],
+                            event_type: str = "state_transition",
                             corr_id: str | None = None, flow_id: str | None = None,
                             path_pair_id: str | None = None, path_pair_name: str | None = None) -> None:
-        if self.__breadcrumb_trace is None:
+        if not _breadcrumb_effectively_enabled(self.__breadcrumb_trace, "scanner_process", "info"):
             return
+        if callable(details):
+            details = details()
         self.__breadcrumb_trace.record(
             "scanner_process",
             message,
@@ -1106,6 +1154,8 @@ class ScannerProcess:
                 ) if "generation" in details else self.__trace_corr_id()
             ),
             flow_id=opaque_trace_correlation(flow_id) if flow_id is not None else None,
+            category="scanner_process",
+            level="info",
             )
 
     def pop_latest_result(self, max_items: int = _MAX_SCAN_QUEUE_ITEMS_PER_POP) -> Optional[ScannerResult]:
@@ -1183,10 +1233,25 @@ class ScannerProcess:
         self.__wake_event.set()
 
     def set_accepted_root_fingerprints(self, fingerprints: object) -> None:
-        """Pass model-owned accepted root digests to the next remote scan."""
+        """Stage model-owned accepted root digests for the next scan admission."""
+        with self.__scan_admission_lock:
+            # The accepted map is model-owned.  Copy it at the process boundary
+            # so a later accumulator update cannot alter the snapshot already
+            # selected for a worker.  Preserve unusual legacy inputs if they
+            # cannot be copied; concrete remote scanners normally receive dicts.
+            try:
+                self.__pending_accepted_root_fingerprints = copy.deepcopy(fingerprints)
+            except Exception:
+                self.__pending_accepted_root_fingerprints = fingerprints
+            self.__has_pending_accepted_root_fingerprints = True
+
+    def __apply_pending_accepted_root_fingerprints(self) -> None:
+        """Transfer the staged hint while the next scan is being admitted."""
+        if not self.__has_pending_accepted_root_fingerprints:
+            return
         setter = getattr(self.__scanner, "set_accepted_root_fingerprints", None)
         if callable(setter):
-            setter(fingerprints)
+            setter(self.__pending_accepted_root_fingerprints)
 
     def prioritize_scan(self, path_pair_id: str) -> None:
         """Move one selected pair ahead of ordinary full-scan work."""

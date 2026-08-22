@@ -53,6 +53,34 @@ from .extract import ExtractStatus, Extract
 from .validate import ValidateStatus
 
 
+def _breadcrumb_effectively_enabled(
+        breadcrumb: object, category: str, level: str = "info",
+) -> bool:
+    """Check the complete breadcrumb gate before diagnostic-only work.
+
+    Keep legacy test doubles that only implement ``is_enabled`` working while
+    treating record-only fakes as enabled and unconfigured mocks as disabled.
+    """
+    if breadcrumb is None:
+        return False
+    effective = getattr(breadcrumb, "is_effectively_enabled", None)
+    if callable(effective):
+        try:
+            result = effective(category, level)
+            if isinstance(result, bool):
+                return result
+        except Exception:
+            pass
+    enabled = getattr(breadcrumb, "is_enabled", None)
+    if not callable(enabled):
+        return True
+    try:
+        result = enabled()
+        return result if isinstance(result, bool) else False
+    except Exception:
+        return False
+
+
 @dataclass
 class _RecentLiveTransferSnapshot:
     root_file_id: str
@@ -571,7 +599,7 @@ class ModelBuilder:
 
     def record_lifecycle_candidate_publication(self, candidate: Model, build_kind: str) -> set[str]:
         """Trace global-marker subjects before a candidate reaches the live model."""
-        if not self.__is_stop_resume_trace_enabled():
+        if not self.__is_stop_resume_trace_enabled("lifecycle.persist", "info"):
             return set()
         subject_ids = set(self.__downloaded_files or set()) | set(self.__final_move_succeeded_files)
         for file_id in tuple(subject_ids):
@@ -596,7 +624,7 @@ class ModelBuilder:
             build_kind: str, adoption_kind: str,
     ) -> None:
         """Trace the resulting live state for the same ephemeral candidate subjects."""
-        if not self.__is_stop_resume_trace_enabled():
+        if not self.__is_stop_resume_trace_enabled("lifecycle.persist", "info"):
             return
         for file_id in subject_ids:
             candidate_state = "absent"
@@ -627,7 +655,7 @@ class ModelBuilder:
 
     def stop_resume_trace_metadata_for_file(self, model_file: Optional[ModelFile]) -> Optional[dict[str, object]]:
         """Return metadata for active/recent transfer SSE correlation."""
-        if model_file is None or not self.__is_stop_resume_trace_enabled() or \
+        if model_file is None or not self.__is_stop_resume_trace_enabled("model.lifecycle", "info") or \
                 not self.__is_relevant_trace_file(model_file):
             return None
         cycle = self.__stop_resume_trace_cycle_id
@@ -641,13 +669,15 @@ class ModelBuilder:
             "backend_timestamp_ms": int(time.time_ns() / 1_000_000),
         }
 
-    def __is_stop_resume_trace_enabled(self) -> bool:
+    def __is_stop_resume_trace_enabled(
+            self, category: str = "model.lifecycle", level: str = "info",
+    ) -> bool:
         emitter = self.__stop_resume_trace_breadcrumb
         if emitter is None:
             self.__stop_resume_trace_last_enabled = False
             return False
         try:
-            enabled = bool(emitter.is_enabled())
+            enabled = _breadcrumb_effectively_enabled(emitter, category, level)
         except Exception:
             enabled = False
         if enabled and not self.__stop_resume_trace_last_enabled:
@@ -701,7 +731,7 @@ class ModelBuilder:
             self, file_id: str, details: dict[str, object],
     ) -> None:
         """Emit one bounded, identity-free Queue exclusion decision."""
-        if not self.__is_stop_resume_trace_enabled():
+        if not self.__is_stop_resume_trace_enabled("queue.exclusion", "info"):
             return
         breadcrumb = self.__stop_resume_trace_breadcrumb
         if breadcrumb is None:
@@ -839,7 +869,7 @@ class ModelBuilder:
             root_state: str,
     ) -> None:
         """Emit bounded, private evidence for an ordinary root decision."""
-        if not self.__is_stop_resume_trace_enabled():
+        if not self.__is_stop_resume_trace_enabled("queue.exclusion", "info"):
             return
         coverage = self.__root_trace_coverage_categories(remote, local)
         marker_present = (
@@ -945,7 +975,7 @@ class ModelBuilder:
             self, event: str, file_id: str, details: dict[str, object],
     ) -> None:
         """Retain a subject's opaque correlation even when a candidate lost it."""
-        if not self.__is_stop_resume_trace_enabled():
+        if not self.__is_stop_resume_trace_enabled("lifecycle.persist", "info"):
             return
         try:
             signature = json.dumps(details, sort_keys=True, default=str)
@@ -958,6 +988,7 @@ class ModelBuilder:
                 outcome = breadcrumb.record(
                     "model_builder", event, {**details, "monotonic_ms": int(time.monotonic_ns() / 1_000_000)},
                     stage="persist_authority", event_type="diagnostic",
+                    category="lifecycle.persist", level="info",
                     corr_id=opaque_trace_correlation(file_id), trace_scope="flow",
                     _coalesce_key=self.__lifecycle_trace_coalesce_key(
                         event, "persist_authority", file_id, details,
@@ -1438,6 +1469,8 @@ class ModelBuilder:
                     details,
                     stage=breadcrumb_stage,
                     event_type="diagnostic",
+                    category="model.lifecycle",
+                    level="info",
                     corr_id="stop-resume:{}:{}".format(
                         file_id,
                         self.__stop_resume_trace_cycle_id,
@@ -1849,7 +1882,7 @@ class ModelBuilder:
         LFTP can publish a source mtime at whole-second precision.  It does
         not establish completion, progress, or collision identity.
         """
-        trace_enabled = self.__is_stop_resume_trace_enabled()
+        trace_enabled = self.__is_stop_resume_trace_enabled("queue.exclusion", "info")
         if not trace_enabled:
             return self.__get_trusted_final_leaf_paths_without_trace(file_id)
         remote_root = self.__remote_file(file_id)
@@ -4397,7 +4430,7 @@ class ModelBuilder:
             # Trace failed presentation/lifecycle decisions and explicit Stop
             # boundaries; successful, unstopped roots without a marker remain
             # quiet.
-            trace_enabled = self.__is_stop_resume_trace_enabled()
+            trace_enabled = self.__is_stop_resume_trace_enabled("queue.exclusion", "info")
             if trace_enabled:
                 effective_tree_proof = self.__effective_local_tree_proves_completion(remote, local)
                 has_root_lifecycle_marker = (

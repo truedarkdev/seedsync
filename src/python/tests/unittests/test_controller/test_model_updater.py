@@ -14,6 +14,7 @@ from controller.extract import ExtractCompletedResult
 from controller.persist_keys import KEY_SEP
 from controller.model_updater import (
     ModelUpdater,
+    _breadcrumb_effectively_enabled,
     _ProgressiveScanAccumulator,
     _JointProgressiveReconciler,
     _filter_progressive_remote_state,
@@ -21,6 +22,7 @@ from controller.model_updater import (
     _merge_targeted_legacy_scan_files,
     _remote_reconciliation_established,
     _pop_scan_updates,
+    _sync_remote_scan_root_fingerprint_hints,
     _ModelUpdateStageTimer,
     _MoveRetryRebuildGate,
     _filter_actionable_move_retry_ids,
@@ -43,7 +45,7 @@ from common.performance_diagnostics import (
     MODEL_REBUILD_REASON_MOVE_RETRY_DUE,
     PerformanceDiagnosticsCollector,
 )
-from common.breadcrumb_trace import BreadcrumbTraceCollector
+from common.breadcrumb_trace import BreadcrumbTraceCollector, trace_session_digest
 from common.exclude_patterns import ExactPathExclusion
 from controller.scan.scanner_process import ScannerProcess, ScannerResult
 from lftp import LftpJobStatus
@@ -418,6 +420,209 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotIn("path-pair-a", str(snapshot))
         self.assertNotIn("sample-remote-root", str(snapshot))
 
+    def test_scan_authority_breadcrumb_is_aggregate_queryable_and_sanitized(self):
+        remote = ScannerResult(
+            datetime.now(), [SystemFile("private-remote-root", 1)],
+            scanned_path_pair_ids={"private-pair"},
+            completed_path_pair_ids={"private-pair"},
+            is_progress=True, is_scan_final=True, is_full_snapshot=True,
+            session_token="private-remote-session",
+        )
+        local = ScannerResult(
+            datetime.now(), [SystemFile("private-local-root", 1)],
+            scanned_path_pair_ids={"private-pair"},
+            completed_path_pair_ids={"private-pair"},
+            is_progress=True, is_scan_final=True, is_full_snapshot=True,
+            session_token="private-local-session",
+        )
+        remote.files[0].path_pair_id = "private-pair"
+        local.files[0].path_pair_id = "private-pair"
+        controller, _ = self._make_progressive_update_controller(
+            remote, local, authoritative=False,
+        )
+        controller._Controller__path_pairs_by_id = {"private-pair": MagicMock()}
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+
+        def record_breadcrumb(**kwargs):
+            metadata = {
+                "stage": kwargs["stage"], "event_type": kwargs["event_type"],
+                "corr_id": kwargs.get("corr_id"), "flow_id": kwargs.get("flow_id"),
+                "trace_scope": kwargs.get("trace_scope", "flow"),
+            }
+            if "category" in kwargs:
+                metadata["category"] = kwargs["category"]
+            if "level" in kwargs:
+                metadata["level"] = kwargs["level"]
+            trace.record(
+                "controller", kwargs["message"], kwargs["details"],
+                **metadata,
+            )
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        ModelUpdater(controller).update()
+
+        payload = trace.query_events(
+            category="scan.authority", stage="scan_authority", limit=1,
+        )
+        self.assertEqual(1, len(payload["events"]))
+        entry = payload["events"][0]
+        details = entry["details"]
+        self.assertEqual("scan.authority", entry["category"])
+        self.assertEqual("info", entry["level"])
+        self.assertEqual("scan_authority", entry["stage"])
+        self.assertEqual("diagnostic", entry["event_type"])
+        self.assertEqual("aggregate", entry["trace_scope"])
+        self.assertTrue(details["final"])
+        self.assertTrue(details["full"])
+        self.assertTrue(details["joint_final"])
+        self.assertFalse(details["joint_authoritative_before"])
+        self.assertTrue(details["joint_authoritative_after"])
+        self.assertEqual(2, details["scanned_pair_count"])
+        self.assertEqual(2, details["completed_pair_count"])
+        self.assertEqual(0, details["unknown_pair_count"])
+        self.assertEqual(2, details["staged_bucket_count"])
+        self.assertEqual(2, details["adopted_bucket_count"])
+        self.assertFalse(details["pair_delta_allowed"])
+        self.assertFalse(details["pair_delta_fallback"])
+        self.assertEqual(0, details["unknown_overlay_before_count"])
+        self.assertEqual(0, details["unknown_overlay_current_count"])
+        self.assertEqual(0, details["unknown_overlay_after_count"])
+        self.assertEqual(0, details["raw_local_reconciliation_before_count"])
+        self.assertEqual(1, details["raw_local_reconciliation_after_count"])
+        self.assertEqual(1, details["effective_local_reconciliation_after_count"])
+        self.assertNotIn("private-remote-session", str(entry))
+        self.assertNotIn("private-local-session", str(entry))
+        self.assertNotIn("private-pair", str(entry))
+        self.assertNotIn("private-remote-root", str(entry))
+        self.assertNotIn("private-local-root", str(entry))
+        self.assertNotEqual("private-remote-session", entry["corr_id"])
+        self.assertEqual(
+            details,
+            controller._Controller__scan_authority_snapshot | {
+                "local_final": details["local_final"],
+                "remote_final": details["remote_final"],
+                "local_full": details["local_full"],
+                "remote_full": details["remote_full"],
+                "local_scanned_pair_count": details["local_scanned_pair_count"],
+                "remote_scanned_pair_count": details["remote_scanned_pair_count"],
+                "local_completed_pair_count": details["local_completed_pair_count"],
+                "remote_completed_pair_count": details["remote_completed_pair_count"],
+                "local_unknown_pair_count": details["local_unknown_pair_count"],
+                "remote_unknown_pair_count": details["remote_unknown_pair_count"],
+                "joint_authoritative_before": details["joint_authoritative_before"],
+                "joint_authoritative": details["joint_authoritative"],
+                "staged_pair_count": details["staged_pair_count"],
+                "adopted_pair_count": details["adopted_pair_count"],
+                "pair_delta_allowed": details["pair_delta_allowed"],
+                "pair_delta_fallback": details["pair_delta_fallback"],
+                "unknown_overlay_before_count": details["unknown_overlay_before_count"],
+                "unknown_overlay_current_count": details["unknown_overlay_current_count"],
+                "raw_local_reconciliation_before_count": details["raw_local_reconciliation_before_count"],
+            },
+        )
+
+    def test_scan_result_category_gate_skips_payload_and_correlation_work(self):
+        remote = ScannerResult(
+            datetime.now(), [SystemFile("sample-remote-root", 1)],
+            scanned_path_pair_ids={"path-pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(remote)
+
+        class CategoryGate:
+            def is_effectively_enabled(self, category, level="info"):
+                return category != "scan.result"
+
+        controller._Controller__context.breadcrumb_trace = CategoryGate()
+        controller._Controller__trace_corr_id_from_files = MagicMock(
+            side_effect=AssertionError("disabled scan correlation was built"),
+        )
+
+        ModelUpdater(controller).update()
+
+        self.assertFalse(any(
+            call.kwargs.get("message") in {
+                "remote_scan_result", "local_scan_result", "active_scan_result",
+            }
+            for call in controller._Controller__record_breadcrumb.call_args_list
+        ))
+
+    def test_scan_result_verbosity_gate_skips_payload_and_correlation_work(self):
+        remote = ScannerResult(
+            datetime.now(), [SystemFile("sample-remote-root", 1)],
+            scanned_path_pair_ids={"path-pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(remote)
+
+        class VerbosityGate:
+            def is_effectively_enabled(self, category, level="info"):
+                return level == "debug"
+
+        controller._Controller__context.breadcrumb_trace = VerbosityGate()
+        controller._Controller__trace_corr_id_from_files = MagicMock(
+            side_effect=AssertionError("disabled scan correlation was built"),
+        )
+
+        ModelUpdater(controller).update()
+
+        self.assertFalse(any(
+            call.kwargs.get("message") == "remote_scan_result"
+            for call in controller._Controller__record_breadcrumb.call_args_list
+        ))
+
+    def test_effective_breadcrumb_gate_fails_closed_without_legacy_fallback(self):
+        class RaisingGate:
+            def is_effectively_enabled(self, category, level="info"):
+                raise RuntimeError("gate unavailable")
+
+            def is_enabled(self):
+                return True
+
+        class NonBooleanGate:
+            def is_effectively_enabled(self, category, level="info"):
+                return MagicMock()
+
+            def is_enabled(self):
+                return True
+
+        class LegacyGate:
+            def is_enabled(self):
+                return True
+
+        self.assertFalse(_breadcrumb_effectively_enabled(RaisingGate(), "finalization.child"))
+        self.assertFalse(_breadcrumb_effectively_enabled(NonBooleanGate(), "finalization.child"))
+        self.assertTrue(_breadcrumb_effectively_enabled(LegacyGate(), "finalization.child"))
+
+    def test_remote_only_final_noop_notifies_summary_after_authority_snapshot(self):
+        remote = self._progressive_result(final=True)
+        controller, model_builder = self._make_progressive_update_controller(
+            remote, local_scan=None, authoritative=True, model=Model(),
+        )
+        model_builder.local_library_inventory_revision.return_value = 0
+        model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset()
+        observed_snapshots = []
+
+        class SummaryReader:
+            def model_summary_changed(self):
+                observed_snapshots.append(
+                    controller.get_model_summary()["scan_authority"]
+                )
+
+        controller.get_model_summary = lambda: {
+            "scan_authority": dict(controller._Controller__scan_authority_snapshot),
+        }
+        controller._Controller__model.add_listener(SummaryReader())
+        controller.notify_model_summary_changed = lambda: controller._Controller__model.notify_summary_changed()
+
+        updater = ModelUpdater(controller)
+        updater.update()
+
+        self.assertEqual(1, len(observed_snapshots))
+        self.assertEqual(
+            controller._Controller__scan_authority_snapshot,
+            observed_snapshots[0],
+        )
+        self.assertEqual("no_op", observed_snapshots[0]["outcome"])
+
     def test_full_build_and_sse_publication_share_authoritative_version_correlation(self):
         builder = ModelBuilder()
         first_root = SystemFile("root-a", 1)
@@ -433,11 +638,18 @@ class TestModelUpdater(unittest.TestCase):
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
 
         def record_breadcrumb(**kwargs):
+            metadata = {
+                "stage": kwargs["stage"], "event_type": kwargs["event_type"],
+                "corr_id": kwargs["corr_id"], "flow_id": kwargs["flow_id"],
+                "trace_scope": kwargs["trace_scope"],
+            }
+            if "category" in kwargs:
+                metadata["category"] = kwargs["category"]
+            if "level" in kwargs:
+                metadata["level"] = kwargs["level"]
             trace.record(
                 "controller", kwargs["message"], kwargs["details"],
-                stage=kwargs["stage"], event_type=kwargs["event_type"],
-                corr_id=kwargs["corr_id"], flow_id=kwargs["flow_id"],
-                trace_scope=kwargs["trace_scope"],
+                **metadata,
             )
 
         controller._Controller__record_breadcrumb = record_breadcrumb
@@ -1524,6 +1736,84 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotIn("pair", accumulator.incomplete_pairs())
         self.assertIn("pair", accumulator.accepted_root_fingerprints())
 
+    def test_remote_hint_sync_uses_authority_drained_from_the_queued_snapshot(self):
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [SystemFile("root", 3)], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="stream",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        older_fingerprint = accumulator.accepted_root_fingerprints()["pair"]["root"]
+
+        # This is the queued full snapshot that must be drained before the
+        # next remote scan receives any hint.
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [SystemFile("root", 4)], scanned_path_pair_ids={"pair"}, generation=2,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="stream",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        current_fingerprint = accumulator.accepted_root_fingerprints()["pair"]["root"]
+        self.assertNotEqual(older_fingerprint, current_fingerprint)
+        process = SimpleNamespace(session_token="stream", set_accepted_root_fingerprints=MagicMock())
+        controller = SimpleNamespace(
+            _Controller__progressive_remote_scan_state=accumulator,
+            _Controller__remote_scan_process=process,
+        )
+
+        _sync_remote_scan_root_fingerprint_hints(controller)
+
+        process.set_accepted_root_fingerprints.assert_called_once_with({
+            "pair": {"root": current_fingerprint},
+        })
+        retained = accumulator.apply([
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=3,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="stream",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+                unchanged_root_fingerprints_by_pair={"pair": {"root": current_fingerprint}},
+            ),
+        ])
+        self.assertFalse(retained.failed)
+
+    def test_progressive_accumulator_marker_trace_uses_public_safe_stream_fields(self):
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [SystemFile("root", 3)], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="stream-a",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+
+        result = accumulator.apply([
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=2,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="stream-a",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+                unchanged_root_fingerprints_by_pair={"pair": {"root": "0" * 64}},
+            ),
+        ], scan_marker_trace_enabled=True)
+
+        self.assertTrue(result.failed)
+        self.assertEqual([{
+            "schema": "scan_unchanged_root_marker.v1",
+            "stream_binding": "same",
+            "accumulator_stream_digest": trace_session_digest("stream-a"),
+            "incoming_stream_digest": trace_session_digest("stream-a"),
+            "generation_relation": "newer",
+            "generation_class": "future",
+            "accepted_hint_present": True,
+            "accepted_hint_count": 1,
+            "marker_count": 1,
+            "mismatch_count": 1,
+            "marker_after_rebind": False,
+            "outcome": "digest_mismatch",
+        }], list(accumulator.scan_marker_trace()))
+
     def test_progressive_accumulator_clears_root_fingerprints_on_new_session(self):
         accumulator = _ProgressiveScanAccumulator()
         accumulator.apply([
@@ -2129,6 +2419,9 @@ class TestModelUpdater(unittest.TestCase):
             _Controller__context=SimpleNamespace(
                 config=SimpleNamespace(general=SimpleNamespace(exclude_patterns="")),
                 status=SimpleNamespace(controller=status, server=SimpleNamespace()),
+                breadcrumb_trace=SimpleNamespace(
+                    is_effectively_enabled=lambda category, level="info": True,
+                ),
             ),
             logger=MagicMock(),
             _Controller__temp_diag=MagicMock(),
@@ -3215,6 +3508,323 @@ class TestModelUpdater(unittest.TestCase):
             inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
         ))
 
+    def test_two_tick_progressive_final_keeps_summary_authority_aligned_without_local_event(self):
+        """A remote-only final tick must consume the local final already held by the accumulator."""
+        pair_id = "path-pair-a"
+
+        def scanned_file(name, size):
+            file = SystemFile(name, size)
+            file.path_pair_id = pair_id
+            return file
+
+        local_final = ScannerResult(
+            datetime.now(), [scanned_file("local-root", 7)],
+            scanned_path_pair_ids={pair_id}, completed_path_pair_ids={pair_id},
+            is_progress=True, is_scan_final=True, is_full_snapshot=True,
+            full_snapshot_path_pair_ids={pair_id}, session_token="local-session",
+        )
+        remote_final = ScannerResult(
+            datetime.now(), [scanned_file("remote-root", 7)],
+            scanned_path_pair_ids={pair_id}, completed_path_pair_ids={pair_id},
+            is_progress=True, is_scan_final=True, is_full_snapshot=True,
+            full_snapshot_path_pair_ids={pair_id}, session_token="remote-session",
+        )
+        builder = ModelBuilder()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False,
+            model_builder=builder, model=Model(),
+        )
+        controller._Controller__path_pairs_by_id = {pair_id: MagicMock()}
+        controller._Controller__local_scan_process = self._progressive_process(
+            "local-session", [[local_final], []],
+        )
+        controller._Controller__remote_scan_process = self._progressive_process(
+            "remote-session", [[], [remote_final]],
+        )
+
+        summary_snapshots = []
+
+        def read_summary():
+            _, inventory = builder.local_library_inventory_snapshot()
+            return {
+                "scan_authority": dict(controller._Controller__scan_authority_snapshot),
+                "inventory_state": inventory[pair_id].state,
+                "reconciled": (
+                    pair_id in controller._Controller__reconciled_local_path_pair_ids,
+                    pair_id in controller._Controller__reconciled_remote_path_pair_ids,
+                ),
+            }
+
+        controller.get_model_summary = read_summary
+        controller.notify_model_summary_changed = lambda: summary_snapshots.append(
+            controller.get_model_summary()
+        )
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        _, first_inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual("scanning", first_inventory[pair_id].state)
+        self.assertEqual(frozenset({pair_id}), builder.unknown_local_path_pair_ids_snapshot())
+        self.assertEqual({pair_id}, controller._Controller__reconciled_local_path_pair_ids)
+        self.assertEqual(set(), controller._Controller__reconciled_remote_path_pair_ids)
+
+        updater.update()
+        _, final_inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual((1, 7, "up_to_date"), (
+            final_inventory[pair_id].file_count,
+            final_inventory[pair_id].size,
+            final_inventory[pair_id].state,
+        ))
+        self.assertEqual(frozenset(), builder.unknown_local_path_pair_ids_snapshot())
+        self.assertEqual({pair_id}, controller._Controller__reconciled_local_path_pair_ids)
+        self.assertEqual({pair_id}, controller._Controller__reconciled_remote_path_pair_ids)
+
+        authority_calls = [
+            call for call in controller._Controller__record_breadcrumb.call_args_list
+            if call.kwargs.get("message") == "scan_authority"
+        ]
+        self.assertEqual(2, len(authority_calls))
+        final_authority = authority_calls[-1].kwargs["details"]
+        self.assertTrue(final_authority["final"])
+        self.assertTrue(final_authority["joint_final"])
+        self.assertTrue(final_authority["local_final"])
+        self.assertTrue(final_authority["remote_final"])
+        self.assertEqual(0, final_authority["local_scanned_pair_count"])
+        self.assertEqual(1, final_authority["remote_scanned_pair_count"])
+        self.assertEqual("adopt", final_authority["outcome"])
+        self.assertEqual("source_buckets_adopted", final_authority["reason"])
+        for key, value in controller._Controller__scan_authority_snapshot.items():
+            self.assertEqual(value, final_authority[key])
+
+        self.assertEqual(2, len(summary_snapshots))
+        self.assertEqual("scanning", summary_snapshots[0]["inventory_state"])
+        self.assertEqual((True, False), summary_snapshots[0]["reconciled"])
+        self.assertEqual("up_to_date", summary_snapshots[-1]["inventory_state"])
+        self.assertEqual((True, True), summary_snapshots[-1]["reconciled"])
+        self.assertEqual(
+            controller._Controller__scan_authority_snapshot,
+            summary_snapshots[-1]["scan_authority"],
+        )
+
+    def test_combined_progressive_authority_scenario_keeps_overlay_and_snapshot_truthful(self):
+        """Exercise replacement, no-op, pair delta, and failed-pair recovery together."""
+        pair_a = "fixture-pair-a"
+        pair_b = "fixture-pair-b"
+        old_remote_session = "fixture-old-remote-session"
+        old_local_session = "fixture-old-local-session"
+        new_remote_session = "fixture-new-remote-session"
+        new_local_session = "fixture-new-local-session"
+        root_names = {
+            pair_a: "fixture-root-a",
+            pair_b: "fixture-root-b",
+        }
+        stale_root_name = "fixture-stale-root"
+        configured_pairs = {pair_a, pair_b}
+
+        def scan_file(pair_id):
+            file = SystemFile(root_names[pair_id], 10 if pair_id == pair_a else 20)
+            file.path_pair_id = pair_id
+            return file
+
+        def final_result(session_token, generation, pair_ids, *, targeted=False, files=None):
+            selected = set(pair_ids)
+            result_files = (
+                list(files)
+                if files is not None
+                else [scan_file(pair_id) for pair_id in sorted(selected)]
+            )
+            return ScannerResult(
+                datetime.now(), result_files,
+                scanned_path_pair_ids=selected,
+                generation=generation,
+                is_progress=True,
+                completed_path_pair_ids=selected,
+                is_scan_final=True,
+                unknown_path_pair_ids=set(),
+                session_token=session_token,
+                is_full_snapshot=True,
+                full_snapshot_path_pair_ids=selected,
+                is_targeted_scan=targeted,
+            )
+
+        def failed_result(session_token, generation, pair_id):
+            return ScannerResult(
+                datetime.now(), [],
+                scanned_path_pair_ids={pair_id},
+                generation=generation,
+                is_progress=True,
+                failed=True,
+                error_message="fixture scan failure",
+                unknown_path_pair_ids={pair_id},
+                session_token=session_token,
+                recoverable_failure_path_pair_ids={pair_id},
+            )
+
+        def stale_result(session_token):
+            stale_file = SystemFile(stale_root_name, 999)
+            stale_file.path_pair_id = pair_a
+            return ScannerResult(
+                datetime.now(), [stale_file],
+                scanned_path_pair_ids={pair_a},
+                generation=99,
+                is_progress=True,
+                completed_path_pair_ids={pair_a},
+                is_scan_final=True,
+                session_token=session_token,
+                is_full_snapshot=True,
+                full_snapshot_path_pair_ids={pair_a},
+            )
+
+        builder = ModelBuilder()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False,
+            model_builder=builder, model=Model(),
+        )
+        controller._Controller__path_pairs_by_id = {
+            pair_a: MagicMock(), pair_b: MagicMock(),
+        }
+        controller._Controller__remote_scan_process = self._progressive_process(
+            old_remote_session,
+            [[final_result(old_remote_session, 1, configured_pairs)]],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            old_local_session,
+            [[final_result(old_local_session, 1, configured_pairs)]],
+        )
+
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=128)
+        controller._Controller__context.breadcrumb_trace = trace
+
+        def record_breadcrumb(**kwargs):
+            metadata = {
+                "stage": kwargs["stage"],
+                "event_type": kwargs["event_type"],
+                "trace_scope": kwargs.get("trace_scope", "flow"),
+            }
+            for key in ("category", "level", "corr_id", "flow_id"):
+                if key in kwargs:
+                    metadata[key] = kwargs[key]
+            trace.record(
+                "controller", kwargs["message"], kwargs.get("details"), **metadata,
+            )
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        updater = ModelUpdater(controller)
+        authority_seen = 0
+
+        def authority_events():
+            # Query immediately after each update so this uses the real
+            # collector's synchronous in-memory retrieval path.
+            return trace.query_events(
+                category="scan.authority", stage="scan_authority", limit=128,
+            )["events"]
+
+        def run_update(expected_new_events):
+            nonlocal authority_seen
+            updater.update()
+            events = authority_events()
+            new_events = events[authority_seen:]
+            self.assertEqual(expected_new_events, len(new_events))
+            standing = controller._Controller__scan_authority_snapshot
+            for event in new_events:
+                details = event["details"]
+                for key, value in standing.items():
+                    self.assertIn(key, details)
+                    self.assertEqual(value, details[key], key)
+            authority_seen = len(events)
+            return new_events
+
+        baseline = run_update(1)[0]["details"]
+        self.assertEqual("adopt", baseline["outcome"])
+        self.assertTrue(baseline["joint_authoritative_after"])
+        baseline_snapshot = dict(controller._Controller__scan_authority_snapshot)
+
+        recovered_remote = final_result(new_remote_session, 3, configured_pairs)
+        recovered_local = final_result(new_local_session, 3, configured_pairs)
+        no_op_remote = final_result(
+            new_remote_session, 3, configured_pairs, files=recovered_remote.files,
+        )
+        no_op_local = final_result(
+            new_local_session, 3, configured_pairs, files=recovered_local.files,
+        )
+
+        # Replacing the scanner sessions must discard queued rows from the old
+        # sessions before any new authority event is emitted.
+        controller._Controller__remote_scan_process = self._progressive_process(
+            new_remote_session,
+            [
+                [stale_result(old_remote_session)],
+                [failed_result(new_remote_session, 2, pair_b)],
+                [recovered_remote],
+                [],
+                [no_op_remote],
+                [final_result(new_remote_session, 4, {pair_a}, targeted=True)],
+                [failed_result(new_remote_session, 5, pair_b)],
+                [final_result(new_remote_session, 6, {pair_b}, targeted=True)],
+            ],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            new_local_session,
+            [
+                [stale_result(old_local_session)],
+                [failed_result(new_local_session, 2, pair_b)],
+                [recovered_local],
+                [],
+                [no_op_local],
+                [final_result(new_local_session, 4, {pair_a}, targeted=True)],
+                [failed_result(new_local_session, 5, pair_b)],
+                [final_result(new_local_session, 6, {pair_b}, targeted=True)],
+            ],
+        )
+
+        self.assertEqual([], run_update(0))
+        self.assertEqual(baseline_snapshot, controller._Controller__scan_authority_snapshot)
+        self.assertNotIn(stale_root_name, controller._Controller__model.get_file_names())
+
+        failed = run_update(1)[0]["details"]
+        self.assertEqual("no_op", failed["outcome"])
+        self.assertEqual("joint_not_final", failed["reason"])
+        self.assertEqual(2, failed["unknown_overlay_after_count"])
+
+        recovered = run_update(1)[0]["details"]
+        self.assertEqual("adopt", recovered["outcome"])
+        self.assertEqual("source_buckets_adopted", recovered["reason"])
+        self.assertEqual(0, recovered["unknown_overlay_after_count"])
+        self.assertTrue(recovered["joint_authoritative_after"])
+
+        self.assertEqual([], run_update(0))
+        no_op = run_update(1)[0]["details"]
+        self.assertEqual("no_op", no_op["outcome"])
+        self.assertEqual("comparison_proven_noop", no_op["reason"])
+        self.assertEqual(2, no_op["local_noop_count"])
+
+        pair_a_final = run_update(1)[0]["details"]
+        self.assertEqual("adopt", pair_a_final["outcome"])
+        self.assertEqual("pair_delta_adopted", pair_a_final["reason"])
+        self.assertTrue(pair_a_final["pair_delta_allowed"])
+        self.assertFalse(pair_a_final["pair_delta_fallback"])
+        self.assertEqual(0, pair_a_final["unknown_overlay_after_count"])
+
+        failed_again = run_update(1)[0]["details"]
+        self.assertEqual("no_op", failed_again["outcome"])
+        self.assertEqual(1, failed_again["unknown_overlay_after_count"])
+
+        pair_b_final = run_update(1)[0]["details"]
+        self.assertEqual("adopt", pair_b_final["outcome"])
+        self.assertEqual("pair_delta_adopted", pair_b_final["reason"])
+        self.assertTrue(pair_b_final["pair_delta_allowed"])
+        self.assertFalse(pair_b_final["pair_delta_fallback"])
+        self.assertEqual(0, pair_b_final["unknown_overlay_after_count"])
+
+        fixture_values = (
+            pair_a, pair_b, old_remote_session, old_local_session,
+            new_remote_session, new_local_session, *root_names.values(),
+            stale_root_name,
+        )
+        for event in authority_events():
+            for value in fixture_values:
+                self.assertNotIn(value, str(event))
+
     def test_two_pair_progressive_scanner_chronology_rehabilitates_stale_matching_inventory(self):
         """Per-pair waves and final aggregates must clear stale inventory on both pairs."""
         configured = {"pair-a", "pair-b"}
@@ -3850,6 +4460,17 @@ class TestModelUpdater(unittest.TestCase):
             CANDIDATE_PAIR_FALLBACK_REASON_AUTHORIZATION_REJECTED,
             fallback_calls[0].kwargs["details"]["reason"],
         )
+        authority_calls = [
+            call for call in controller._Controller__record_breadcrumb.call_args_list
+            if call.kwargs.get("message") == "scan_authority"
+        ]
+        self.assertEqual(1, len(authority_calls))
+        self.assertEqual("adopt", authority_calls[0].kwargs["details"]["outcome"])
+        self.assertEqual(
+            "source_buckets_adopted_after_pair_fallback",
+            authority_calls[0].kwargs["details"]["reason"],
+        )
+        self.assertTrue(authority_calls[0].kwargs["details"]["pair_delta_fallback"])
 
     def test_pair_candidate_ignores_unrelated_stale_move_failure_marker(self):
         old = SystemFile("old.bin", 10, False)
@@ -5000,6 +5621,353 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
         self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
 
+    def test_child_finalization_breadcrumbs_are_queryable_and_identity_free(self):
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None,
+        )
+        model_builder.get_finalizable_staging_leaf_candidates.return_value = (
+            ('["accepted-private-pair", "private-root"]', "private-complete.bin"),
+            ('["rejected-private-pair", "private-root"]', "private-skipped.bin"),
+        )
+        controller._Controller__reconciled_local_path_pair_ids = {"accepted-private-pair"}
+        controller._Controller__reconciled_remote_path_pair_ids = {"accepted-private-pair"}
+        controller._finalize_staging_child = MagicMock(
+            return_value=Controller.MoveFromStagingResult.FAILED,
+        )
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=32)
+        controller._Controller__context.breadcrumb_trace = trace
+
+        def record_breadcrumb(**kwargs):
+            metadata = {
+                "stage": kwargs["stage"],
+                "event_type": kwargs["event_type"],
+                "category": kwargs["category"],
+                "level": kwargs["level"],
+                "corr_id": kwargs["corr_id"],
+                "flow_id": kwargs.get("flow_id"),
+                "trace_scope": kwargs.get("trace_scope", "flow"),
+            }
+            trace.record(
+                "controller", kwargs["message"], kwargs["details"], **metadata,
+            )
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        ModelUpdater(controller).update()
+
+        events = trace.query_events(
+            category="finalization.child", stage="finalization_child", limit=16,
+        )["events"]
+        self.assertEqual(4, len(events))
+        self.assertEqual("child_finalization_candidates", events[0]["message"])
+        self.assertEqual(
+            2,
+            sum(event["message"] == "child_finalization_authority" for event in events),
+        )
+        self.assertEqual(
+            ["child_finalization_result"],
+            [event["message"] for event in events if event["message"] == "child_finalization_result"],
+        )
+        candidate = events[0]
+        self.assertEqual("aggregate", candidate["trace_scope"])
+        self.assertEqual("state_transition", candidate["event_type"])
+        self.assertEqual("finalization_child.v1", candidate["details"]["schema"])
+        self.assertEqual("candidate_discovery", candidate["details"]["phase"])
+        self.assertEqual("available", candidate["details"]["outcome"])
+        self.assertEqual(2, candidate["details"]["candidate_count"])
+        self.assertEqual(2, candidate["details"]["valid_candidate_count"])
+        authority_events = [
+            event for event in events if event["message"] == "child_finalization_authority"
+        ]
+        accepted = next(
+            event for event in authority_events
+            if event["details"]["decision"] == "accepted"
+        )
+        rejected = next(
+            event for event in authority_events
+            if event["details"]["decision"] == "rejected"
+        )
+        self.assertEqual("accepted", accepted["details"]["decision"])
+        self.assertEqual("reconciled_both_sides", accepted["details"]["reason"])
+        self.assertEqual("rejected", rejected["details"]["decision"])
+        self.assertEqual("local_and_remote_unreconciled", rejected["details"]["reason"])
+        result = next(
+            event for event in events if event["message"] == "child_finalization_result"
+        )
+        self.assertEqual("failed", result["details"]["outcome"])
+        self.assertEqual("move_failed", result["details"]["reason"])
+        self.assertTrue(result["details"]["attempt_failure"])
+        self.assertNotIn("terminal_failure", result["details"])
+        self.assertEqual("warning", result["level"])
+        self.assertEqual("state_transition", accepted["event_type"])
+        self.assertEqual("state_transition", result["event_type"])
+        self.assertNotEqual(accepted["corr_id"], rejected["corr_id"])
+        self.assertEqual("child:aggregate", candidate["corr_id"])
+        for event in events:
+            self.assertNotIn("private-", str(event))
+            self.assertNotIn("accepted-private-pair", str(event))
+            self.assertNotIn("rejected-private-pair", str(event))
+        controller._finalize_staging_child.assert_called_once_with(
+            "private-root", "private-complete.bin", "accepted-private-pair",
+        )
+
+    def test_child_finalization_state_transitions_survive_idle_retention(self):
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None,
+        )
+        model_builder.get_finalizable_staging_leaf_candidates.side_effect = (
+            [(('["private-pair", "private-root"]', "private-child.bin"),)]
+            + [()] * 80
+        )
+        controller._Controller__reconciled_local_path_pair_ids = {"private-pair"}
+        controller._Controller__reconciled_remote_path_pair_ids = {"private-pair"}
+        controller._finalize_staging_child = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED,
+        )
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=32)
+        controller._Controller__context.breadcrumb_trace = trace
+
+        def record_breadcrumb(**kwargs):
+            trace.record(
+                "controller",
+                kwargs["message"],
+                kwargs["details"],
+                stage=kwargs["stage"],
+                event_type=kwargs["event_type"],
+                category=kwargs["category"],
+                level=kwargs["level"],
+                corr_id=kwargs["corr_id"],
+                flow_id=kwargs.get("flow_id"),
+                trace_scope=kwargs.get("trace_scope", "flow"),
+            )
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        updater = ModelUpdater(controller)
+        updater.update()
+        for _ in range(64):
+            updater.update()
+
+        payload = trace.query_events(
+            category="finalization.child", stage="finalization_child", limit=16,
+        )
+        events = payload["events"]
+        messages = [event["message"] for event in events]
+        self.assertIn("child_finalization_authority", messages)
+        self.assertIn("child_finalization_result", messages)
+        candidate_events = [
+            event for event in events
+            if event["message"] == "child_finalization_candidates"
+        ]
+        self.assertEqual(2, len(candidate_events))
+        self.assertEqual(
+            [1, 0],
+            [event["details"]["candidate_count"] for event in candidate_events],
+        )
+        category_accounting = trace.query_events()["accounting"]["categories"][
+            "finalization.child"
+        ]
+        self.assertEqual(4, category_accounting["admitted"])
+        self.assertEqual(0, category_accounting["evicted"])
+        for event in events:
+            self.assertEqual("state_transition", event["event_type"])
+            self.assertNotIn("private-", str(event))
+        self.assertEqual(1, controller._finalize_staging_child.call_count)
+
+    def test_child_finalization_plain_empty_candidates_emit_one_transition(self):
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None,
+        )
+        model_builder.get_finalizable_staging_leaf_candidates.return_value = ()
+        controller._finalize_staging_child = MagicMock()
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        controller._Controller__context.breadcrumb_trace = trace
+
+        def record_breadcrumb(**kwargs):
+            trace.record(
+                "controller",
+                kwargs["message"],
+                kwargs["details"],
+                stage=kwargs["stage"],
+                event_type=kwargs["event_type"],
+                category=kwargs["category"],
+                level=kwargs["level"],
+                corr_id=kwargs["corr_id"],
+                flow_id=kwargs.get("flow_id"),
+                trace_scope=kwargs.get("trace_scope", "flow"),
+            )
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        updater = ModelUpdater(controller)
+        updater.update()
+        updater.update()
+
+        events = trace.query_events(
+            category="finalization.child", stage="finalization_child", limit=8,
+        )["events"]
+        candidate_events = [
+            event for event in events
+            if event["message"] == "child_finalization_candidates"
+        ]
+        self.assertEqual(1, len(candidate_events))
+        self.assertEqual(0, candidate_events[0]["details"]["candidate_count"])
+        self.assertEqual("state_transition", candidate_events[0]["event_type"])
+        self.assertEqual(
+            1,
+            trace.query_events()["accounting"]["categories"][
+                "finalization.child"
+            ]["admitted"],
+        )
+        controller._finalize_staging_child.assert_not_called()
+
+    def test_child_finalization_disabled_category_skips_trace_only_work(self):
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None,
+        )
+        model_builder.get_finalizable_staging_leaf_candidates.return_value = (
+            ('["private-pair", "private-root"]', "private-child.bin"),
+        )
+        controller._Controller__reconciled_local_path_pair_ids = {"private-pair"}
+        controller._Controller__reconciled_remote_path_pair_ids = {"private-pair"}
+        controller._finalize_staging_child = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED,
+        )
+
+        class CategoryGate:
+            def is_effectively_enabled(self, category, level="info"):
+                return category != "finalization.child"
+
+        controller._Controller__context.breadcrumb_trace = CategoryGate()
+        with patch(
+            "controller.model_updater.opaque_trace_correlation",
+            side_effect=AssertionError("disabled child trace built a correlation"),
+        ):
+            ModelUpdater(controller).update()
+
+        controller._finalize_staging_child.assert_called_once_with(
+            "private-root", "private-child.bin", "private-pair",
+        )
+        self.assertFalse(any(
+            call.kwargs.get("category") == "finalization.child"
+            for call in controller._Controller__record_breadcrumb.call_args_list
+        ))
+
+    def test_child_finalization_disabled_verbosity_skips_trace_only_work(self):
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None,
+        )
+        model_builder.get_finalizable_staging_leaf_candidates.return_value = (
+            ('["private-pair", "private-root"]', "private-child.bin"),
+        )
+        controller._Controller__reconciled_local_path_pair_ids = {"private-pair"}
+        controller._Controller__reconciled_remote_path_pair_ids = {"private-pair"}
+        controller._finalize_staging_child = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED,
+        )
+
+        class VerbosityGate:
+            def is_effectively_enabled(self, category, level="info"):
+                return level == "debug"
+
+        controller._Controller__context.breadcrumb_trace = VerbosityGate()
+        with patch(
+            "controller.model_updater.opaque_trace_correlation",
+            side_effect=AssertionError("disabled child trace built a correlation"),
+        ):
+            ModelUpdater(controller).update()
+
+        controller._finalize_staging_child.assert_called_once_with(
+            "private-root", "private-child.bin", "private-pair",
+        )
+        self.assertFalse(controller._Controller__record_breadcrumb.called)
+
+    def test_child_finalization_warning_only_policy_skips_info_correlations(self):
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None,
+        )
+        model_builder.get_finalizable_staging_leaf_candidates.return_value = (
+            ('["rejected-pair", "private-root"]', "private-rejected.bin"),
+            ('["complete-pair", "private-root"]', "private-complete.bin"),
+            ('["deferred-pair", "private-root"]', "private-deferred.bin"),
+        )
+        controller._Controller__reconciled_local_path_pair_ids = {
+            "complete-pair", "deferred-pair",
+        }
+        controller._Controller__reconciled_remote_path_pair_ids = {
+            "complete-pair", "deferred-pair",
+        }
+        controller._finalize_staging_child = MagicMock(
+            side_effect=[
+                Controller.MoveFromStagingResult.COMPLETED,
+                Controller.MoveFromStagingResult.DEFERRED,
+            ],
+        )
+
+        class WarningOnlyGate:
+            def is_effectively_enabled(self, category, level="info"):
+                return category == "finalization.child" and level == "warning"
+
+        controller._Controller__context.breadcrumb_trace = WarningOnlyGate()
+        with patch(
+            "controller.model_updater._child_finalization_trace_identity",
+            side_effect=AssertionError("info-only child path built a correlation"),
+        ):
+            ModelUpdater(controller).update()
+
+        controller._finalize_staging_child.assert_has_calls([
+            call("private-root", "private-complete.bin", "complete-pair"),
+            call("private-root", "private-deferred.bin", "deferred-pair"),
+        ])
+        self.assertEqual(2, controller._finalize_staging_child.call_count)
+        self.assertFalse(any(
+            call.kwargs.get("category") == "finalization.child"
+            for call in controller._Controller__record_breadcrumb.call_args_list
+        ))
+
+    def test_child_finalization_failed_result_is_attempt_failure_at_retry_boundaries(self):
+        for failure_count in (1, 4):
+            with self.subTest(failure_count=failure_count):
+                controller, model_builder = self._make_progressive_update_controller(
+                    None, local_scan=None,
+                )
+                model_builder.get_finalizable_staging_leaf_candidates.return_value = (
+                    ('["private-pair", "private-root"]', "private-child.bin"),
+                )
+                controller._Controller__reconciled_local_path_pair_ids = {"private-pair"}
+                controller._Controller__reconciled_remote_path_pair_ids = {"private-pair"}
+                controller._Controller__child_final_move_failure_counts = {
+                    ModelFile.build_file_id(
+                        "private-root/private-child.bin", "private-pair",
+                    ): failure_count,
+                }
+                controller._finalize_staging_child = MagicMock(
+                    return_value=Controller.MoveFromStagingResult.FAILED,
+                )
+                trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+                controller._Controller__context.breadcrumb_trace = trace
+
+                def record_breadcrumb(**kwargs):
+                    trace.record(
+                        "controller",
+                        kwargs["message"],
+                        kwargs["details"],
+                        stage=kwargs["stage"],
+                        event_type=kwargs["event_type"],
+                        category=kwargs["category"],
+                        level=kwargs["level"],
+                        corr_id=kwargs["corr_id"],
+                        flow_id=kwargs.get("flow_id"),
+                        trace_scope=kwargs.get("trace_scope", "flow"),
+                    )
+
+                controller._Controller__record_breadcrumb = record_breadcrumb
+                ModelUpdater(controller).update()
+
+                result = next(event for event in trace.query_events(
+                    category="finalization.child", stage="finalization_child", limit=16,
+                )["events"] if event["message"] == "child_finalization_result")
+                self.assertEqual("failed", result["details"]["outcome"])
+                self.assertTrue(result["details"]["attempt_failure"])
+                self.assertNotIn("terminal_failure", result["details"])
+
     def test_v092_pending_completion_waits_for_authoritative_local_coverage(self):
         controller = self._make_v092_pending_completion_controller(complete=False)
 
@@ -5243,8 +6211,12 @@ class TestModelUpdater(unittest.TestCase):
         live_model = builder.build_model()
         listener = MagicMock()
         live_model.add_listener(listener)
+        remote_scan = ScannerResult(
+            datetime.now(), [SystemFile("root", 100, False)],
+            scanned_path_pair_ids={None}, is_scan_final=True,
+        )
         controller, _ = self._make_progressive_update_controller(
-            None, local_scan=None, model_builder=builder, model=live_model,
+            remote_scan, local_scan=None, model_builder=builder, model=live_model,
         )
         status = LftpJobStatus(
             1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "",
@@ -5260,6 +6232,16 @@ class TestModelUpdater(unittest.TestCase):
         builder.build_model.assert_called_once()
         listener.file_updated.assert_called_once()
         self.assertEqual(25, live_model.get_file("root").transferred_size)
+        authority_calls = [
+            call for call in controller._Controller__record_breadcrumb.call_args_list
+            if call.kwargs.get("message") == "scan_authority"
+        ]
+        self.assertEqual(1, len(authority_calls))
+        self.assertEqual("publish", authority_calls[0].kwargs["details"]["outcome"])
+        self.assertEqual(
+            "published_after_active_delta_rejection",
+            authority_calls[0].kwargs["details"]["reason"],
+        )
 
     def test_clean_idle_tick_skips_active_delta_model_root_lookup(self):
         builder = ModelBuilder()
@@ -5470,6 +6452,9 @@ class TestModelUpdater(unittest.TestCase):
                     controller=SimpleNamespace(),
                     server=SimpleNamespace(),
                 ),
+                breadcrumb_trace=SimpleNamespace(
+                    is_effectively_enabled=lambda category, level="info": True,
+                ),
             ),
             logger=MagicMock(),
             _Controller__temp_diag=MagicMock(),
@@ -5531,6 +6516,8 @@ class TestModelUpdater(unittest.TestCase):
                 "joint_remote_root_count": 0,
             },
             event_type="state_transition",
+            category="scan.result",
+            level="info",
             corr_id="remote-scan-corr",
         )
 

@@ -16,6 +16,25 @@ from .controller import Controller
 CandidateMatch = tuple[ModelFile, Optional["AutoQueuePattern"]]
 
 
+def _breadcrumb_effectively_enabled(trace: object, category: str, level: str = "info") -> bool:
+    """Check the cheap breadcrumb gate before constructing auto-queue evidence."""
+    if trace is None:
+        return False
+    gate = getattr(trace, "is_effectively_enabled", None)
+    if callable(gate):
+        try:
+            return bool(gate(category, level))
+        except Exception:
+            return False
+    enabled = getattr(trace, "is_enabled", None)
+    if callable(enabled):
+        try:
+            return bool(enabled())
+        except Exception:
+            return False
+    return True
+
+
 class _AutoQueueController(Protocol):
     def _get_model_root_references(self) -> list[ModelFile]: ...
     def get_model_files_and_add_listener(self, listener: IModelListener) -> list[ModelFile]: ...
@@ -285,9 +304,17 @@ class AutoQueue:
         selector_name = self.__extract_trace_selector_name(self.__target_archive_trace_file_id)
         return selector_name == file.name
 
-    def __trace_target_archive_event(self, event: str, payload: dict[str, object]) -> None:
+    def __trace_target_archive_event(
+            self, event: str,
+            payload: dict[str, object] | Callable[[], dict[str, object]],
+    ) -> None:
         if not self.__is_target_archive_trace_enabled():
             return
+        if self.__breadcrumb_trace is not None and not _breadcrumb_effectively_enabled(
+                self.__breadcrumb_trace, "auto_queue", "info"):
+            return
+        if callable(payload):
+            payload = payload()
         trace_payload: dict[str, object] = {
             "event": event,
             "target_selector": self.__target_archive_trace_file_id,
@@ -343,7 +370,7 @@ class AutoQueue:
             if not self.__idle_cycle_breadcrumb_recorded:
                 self.__record_breadcrumb(
                     "auto_queue_cycle",
-                    {
+                    lambda: {
                         "cycle": self.__cycle_sequence,
                         "new_queue_candidates": 0,
                         "modified_queue_candidates": 0,
@@ -487,7 +514,7 @@ class AutoQueue:
                     None
                 )
                 if trace_target_file is None:
-                    self.__trace_target_archive_event("auto_extract_decision", {
+                    self.__trace_target_archive_event("auto_extract_decision", lambda: {
                         "decision": "not_found",
                         "reason": "not_present_in_model",
                     })
@@ -540,7 +567,7 @@ class AutoQueue:
                         decision = "blocked"
                         reason = "filtered_out"
 
-                    self.__trace_target_archive_event("auto_extract_decision", {
+                    self.__trace_target_archive_event("auto_extract_decision", lambda: {
                         "decision": decision,
                         "reason": reason,
                         "file": {
@@ -586,7 +613,7 @@ class AutoQueue:
 
             self.__record_breadcrumb(
                 "auto_queue_cycle",
-                {
+                lambda: {
                     "cycle": self.__cycle_sequence,
                     "new_queue_candidates": len(new_files_to_queue),
                     "modified_queue_candidates": len(modified_files_actual_update) + len(modified_files_remote_discovery),
@@ -677,9 +704,14 @@ class AutoQueue:
             })
             raise
 
-    def __record_breadcrumb(self, message: str, details: dict[str, object]) -> None:
-        if self.__breadcrumb_trace is None:
+    def __record_breadcrumb(
+            self, message: str,
+            details: dict[str, object] | Callable[[], dict[str, object]],
+    ) -> None:
+        if not _breadcrumb_effectively_enabled(self.__breadcrumb_trace, "auto_queue", "info"):
             return
+        if callable(details):
+            details = details()
         self.__breadcrumb_trace.record(
             "auto_queue",
             message,
@@ -687,6 +719,8 @@ class AutoQueue:
             stage="auto_queue",
             event_type="state_transition",
             corr_id="auto_queue",
+            category="auto_queue",
+            level="info",
         )
 
     def __refresh_queue_state(self) -> None:

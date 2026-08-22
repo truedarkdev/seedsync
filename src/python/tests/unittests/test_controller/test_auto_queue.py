@@ -9,6 +9,7 @@ import json
 import threading
 
 from common import overrides, PersistError, Config, PathPair
+from common.breadcrumb_trace import BreadcrumbTraceCollector
 from controller import AutoQueue, AutoQueuePersist, IAutoQueuePersistListener, AutoQueuePattern
 from controller.auto_queue import AutoQueuePersistListener
 from controller import Controller
@@ -668,6 +669,26 @@ class TestAutoQueue(unittest.TestCase):
         self.assertEqual({"state_not_downloaded": 1}, details["extract_blocked_reason_counts"])
         self.assertEqual(1, len(details["blocked_samples"]))
         self.assertEqual("state_not_downloaded", details["blocked_samples"][0]["reason"])
+
+    def test_auto_queue_breadcrumb_gate_skips_lazy_details_and_emits_when_enabled(self):
+        auto_queue = AutoQueue(self.context, AutoQueuePersist(), self.controller)
+        disabled = BreadcrumbTraceCollector(
+            lambda: True, max_entries=16, policy={"default": "off"},
+        )
+        auto_queue._AutoQueue__breadcrumb_trace = disabled.create_emitter()
+        details = MagicMock(side_effect=AssertionError("disabled auto-queue breadcrumb built details"))
+        auto_queue._AutoQueue__record_breadcrumb("auto_queue_cycle", details)
+        details.assert_not_called()
+        self.assertEqual([], disabled.snapshot()["entries"])
+
+        enabled = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        auto_queue._AutoQueue__breadcrumb_trace = enabled.create_emitter()
+        auto_queue._AutoQueue__record_breadcrumb(
+            "auto_queue_cycle", lambda: {"sentinel": "emitted"},
+        )
+        entry = enabled.snapshot()["entries"][0]
+        self.assertEqual("auto_queue", entry["category"])
+        self.assertEqual("emitted", entry["details"]["sentinel"])
 
     def test_process_records_blocked_reason_counts_for_stopped_and_pattern_mismatch(self):
         persist = AutoQueuePersist()

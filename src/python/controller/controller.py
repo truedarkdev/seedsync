@@ -75,6 +75,26 @@ LocalScannerRuntime = LocalScanner | MultiPathLocalScanner
 RemoteScannerRuntime = RemoteScanner | MultiPathRemoteScanner
 
 
+def _breadcrumb_effectively_enabled(trace: object, category: str, level: str = "info") -> bool:
+    """Check the cheap breadcrumb gate before constructing trace evidence."""
+    if trace is None:
+        return False
+    gate = getattr(trace, "is_effectively_enabled", None)
+    if callable(gate):
+        try:
+            return bool(gate(category, level))
+        except Exception:
+            return False
+    enabled = getattr(trace, "is_enabled", None)
+    if callable(enabled):
+        try:
+            return bool(enabled())
+        except Exception:
+            return False
+    # Keep compatibility with the small record-only fakes used by callers.
+    return True
+
+
 def _final_move_errno_class(error: Optional[BaseException]) -> str:
     """Normalize publication failures without retaining platform text."""
     if error is None:
@@ -147,7 +167,7 @@ class _MoveMutationTracker:
         if breadcrumb_trace is None or not isinstance(self.file_id, str):
             return
         try:
-            if not breadcrumb_trace.is_enabled():
+            if not _breadcrumb_effectively_enabled(breadcrumb_trace, "final_move.publication", "info"):
                 return
 
             def probe(path: Optional[str]) -> Optional[bool]:
@@ -287,6 +307,12 @@ _COLLISION_CLAIM_SIDECAR_MAX_BYTES = 4096
 _COLLISION_CLAIM_SCAN_LIMIT = 128
 _EMPTY_RETIRED_DIRECTORY_SCAN_LIMIT = 128
 _EMPTY_RETIRED_DIRECTORY_TREE_LIMIT = 1024
+_RETIREMENT_CLEANUP_OUTCOMES = frozenset(("removed", "retained", "skipped", "bounded"))
+_RETIREMENT_CLEANUP_REASONS = frozenset((
+    "empty_tree", "sidecar", "not_directory", "symlink_reparse", "mount",
+    "cross_device", "nonempty", "scan_bound", "tree_bound", "scan_error",
+    "race", "rmdir_error",
+))
 
 
 class Controller:
@@ -793,6 +819,29 @@ class Controller:
         self.__model_summary_cache_at = 0.0
         self.__model_summary_cache_inventory_revision = -1
         self.__model_summary_cache_unknown_local_path_pair_ids: frozenset[Optional[str]] = frozenset()
+        self.__scan_authority_snapshot: dict[str, object] = {
+            "final": False,
+            "full": False,
+            "scanned_pair_count": 0,
+            "completed_pair_count": 0,
+            "unknown_pair_count": 0,
+            "joint_final": False,
+            "joint_authoritative_after": False,
+            "joint_authoritative": False,
+            "publication_required": False,
+            "outcome": "no_op",
+            "reason": "no_scan_event",
+            "comparison_proven_count": 0,
+            "delta_count": 0,
+            "staged_bucket_count": 0,
+            "adopted_bucket_count": 0,
+            "local_noop_count": 0,
+            "unknown_overlay_after_count": 0,
+            "raw_local_reconciliation_after_count": 0,
+            "effective_local_reconciliation_after_count": 0,
+            "pair_delta_allowed": False,
+            "pair_delta_fallback": False,
+        }
         self.__remote_delete_success_listeners = []
         self.__remote_delete_success_listeners_lock = Lock()
         self.__download_start_listeners = []
@@ -3020,6 +3069,9 @@ class Controller:
             )
             cached_summary = getattr(self, "_Controller__model_summary_cache", None)
             cached_at = getattr(self, "_Controller__model_summary_cache_at", 0.0)
+            scan_authority_snapshot = getattr(self, "_Controller__scan_authority_snapshot", {})
+            if not isinstance(scan_authority_snapshot, dict):
+                scan_authority_snapshot = {}
             if (
                 max_age_seconds > 0 and isinstance(cached_summary, dict)
                 and cached_summary.get("model_version") == self.__model.version
@@ -3027,6 +3079,7 @@ class Controller:
                 and getattr(
                     self, "_Controller__model_summary_cache_unknown_local_path_pair_ids", frozenset()
                 ) == unknown_local_path_pair_ids
+                and getattr(self, "_Controller__model_summary_cache_scan_authority_snapshot", {}) == scan_authority_snapshot
                 and now - cached_at < max_age_seconds
             ):
                 return cached_summary
@@ -3114,11 +3167,13 @@ class Controller:
             summary = {
                 "model_version": self.__model.version,
                 "path_pairs": [summaries[key] for key in sorted(summaries)],
+                "scan_authority": dict(scan_authority_snapshot),
             }
             self.__model_summary_cache = summary
             self.__model_summary_cache_at = now
             self.__model_summary_cache_inventory_revision = inventory_revision
             self.__model_summary_cache_unknown_local_path_pair_ids = unknown_local_path_pair_ids
+            self.__model_summary_cache_scan_authority_snapshot = dict(scan_authority_snapshot)
             return summary
 
     def notify_model_summary_changed(self) -> None:
@@ -3183,9 +3238,11 @@ class Controller:
         details: Optional[dict[str, object]] = None,
     ) -> None:
         """Record stream breadcrumbs without exposing local/remote paths."""
-        metadata = self.get_stop_resume_trace_metadata(file)
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
-        if not isinstance(metadata, dict) or breadcrumb_trace is None:
+        if not _breadcrumb_effectively_enabled(breadcrumb_trace, "model_stream", "info"):
+            return
+        metadata = self.get_stop_resume_trace_metadata(file)
+        if not isinstance(metadata, dict):
             return
         supplied_details = details if isinstance(details, dict) else {}
         supplied_corr_id = supplied_details.get("corr_id")
@@ -3212,6 +3269,8 @@ class Controller:
                 corr_id=corr_id,
                 file_id=file_id,
                 trace_scope="flow",
+                category="model_stream",
+                level="info",
             )
         except Exception:
             # Diagnostics must never affect SSE/model delivery.
@@ -3804,12 +3863,7 @@ class Controller:
                                 local_base_dir_path: Optional[str] = None,
                                 stopped_marked: bool = False):
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
-        if breadcrumb_trace is None:
-            return
-        try:
-            if not breadcrumb_trace.is_enabled():
-                return
-        except Exception:
+        if not _breadcrumb_effectively_enabled(breadcrumb_trace, "controller", "info"):
             return
 
         temp_path = None
@@ -3848,6 +3902,8 @@ class Controller:
                 ),
                 file_id=file_id,
                 trace_scope="flow",
+                category="controller",
+                level="info",
             )
         except Exception:
             # Diagnostics must never alter transfer commands or model delivery.
@@ -3868,7 +3924,12 @@ class Controller:
         return identifier
 
     def __is_target_archive_trace_enabled(self) -> bool:
-        return self.__target_archive_trace_file_id is not None
+        if self.__target_archive_trace_file_id is None:
+            return False
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        return breadcrumb_trace is None or _breadcrumb_effectively_enabled(
+            breadcrumb_trace, "controller", "info",
+        )
 
     def __target_archive_trace_selector_matches_file(self, file_id: str, file_name: str) -> bool:
         if not self.__is_target_archive_trace_enabled():
@@ -3910,9 +3971,14 @@ class Controller:
                 return file
         return None
 
-    def __trace_target_archive_event(self, event: str, payload: dict[str, object]) -> None:
+    def __trace_target_archive_event(
+            self, event: str,
+            payload: dict[str, object] | Callable[[], dict[str, object]],
+    ) -> None:
         if not self.__is_target_archive_trace_enabled():
             return
+        if callable(payload):
+            payload = payload()
         trace_payload: dict[str, object] = {
             "event": event,
             "target_selector": self.__target_archive_trace_file_id,
@@ -3927,29 +3993,42 @@ class Controller:
     def __record_breadcrumb(self,
                             stage: str,
                             message: str,
-                            details: Optional[dict[str, object]] = None,
+                            details: Optional[dict[str, object] | Callable[[], dict[str, object]]] = None,
                             event_type: str = "diagnostic",
                             file_id: Optional[str] = None,
                             path_pair_id: Optional[str] = None,
                             path_pair_name: Optional[str] = None,
                             corr_id: Optional[str] = None,
                             flow_id: Optional[str] = None,
-                            trace_scope: str = "flow") -> None:
+                            trace_scope: str = "flow",
+                            category: Optional[str] = None,
+                            level: Optional[str] = None) -> None:
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
-        if breadcrumb_trace is None:
+        effective_category = category if category is not None else "controller"
+        effective_level = level if level is not None else "info"
+        if not _breadcrumb_effectively_enabled(breadcrumb_trace, effective_category, effective_level):
             return
+        if callable(details):
+            details = details()
+        metadata: dict[str, object] = {
+            "stage": stage,
+            "event_type": event_type,
+            "corr_id": corr_id if corr_id is not None else (file_id if file_id is not None else stage),
+            "flow_id": flow_id,
+            "file_id": file_id,
+            "path_pair_id": path_pair_id,
+            "path_pair_name": path_pair_name,
+            "trace_scope": trace_scope,
+        }
+        if category is not None:
+            metadata["category"] = category
+        if level is not None:
+            metadata["level"] = level
         breadcrumb_trace.record(
             "controller",
             message,
             {} if details is None else details,
-            stage=stage,
-            event_type=event_type,
-            corr_id=corr_id if corr_id is not None else (file_id if file_id is not None else stage),
-            flow_id=flow_id,
-            file_id=file_id,
-            path_pair_id=path_pair_id,
-            path_pair_name=path_pair_name,
-            trace_scope=trace_scope,
+            **metadata,
         )
 
     def __record_fractional_queue_trace(
@@ -3983,16 +4062,12 @@ class Controller:
 
     def __fractional_queue_trace_is_enabled(self) -> bool:
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
-        if breadcrumb_trace is None:
-            return False
-        try:
-            return bool(breadcrumb_trace.is_enabled())
-        except Exception:
-            return False
+        return _breadcrumb_effectively_enabled(breadcrumb_trace, "queue.exclusion", "info")
 
-    @staticmethod
-    def __fractional_queue_flow_id(file_id: str, operation_sequence: object) -> Optional[str]:
+    def __fractional_queue_flow_id(self, file_id: str, operation_sequence: object) -> Optional[str]:
         if type(operation_sequence) is not int or operation_sequence < 1:
+            return None
+        if not self.__fractional_queue_trace_is_enabled():
             return None
         return "fractional-queue:{}".format(
             opaque_trace_correlation("queue:{}:{}".format(file_id, operation_sequence))
@@ -4564,10 +4639,7 @@ class Controller:
                 mutation_tracker.mutated()
             self.logger.info("Moved '%s' from staging '%s' to '%s'", name, staging_path, final_path)
             breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
-            try:
-                trace_enabled = breadcrumb_trace is not None and breadcrumb_trace.is_enabled()
-            except Exception:
-                trace_enabled = False
+            trace_enabled = _breadcrumb_effectively_enabled(breadcrumb_trace, "controller", "info")
             if trace_enabled:
                 try:
                     self.__record_breadcrumb(
@@ -5027,6 +5099,47 @@ class Controller:
                 mutation_tracker.uncertain()
             raise
 
+    def __record_retirement_cleanup_breadcrumb(
+            self, identity: str, outcome: str, reason: str,
+            directory_count: int = 0, candidate_count: int = 1,
+            sidecar_present: bool = False,
+    ) -> None:
+        """Record bounded, identity-free evidence for private claim cleanup."""
+        if outcome not in _RETIREMENT_CLEANUP_OUTCOMES or reason not in _RETIREMENT_CLEANUP_REASONS:
+            return
+        if not isinstance(identity, str) or not identity:
+            return
+        if type(directory_count) is not int:
+            directory_count = 0
+        if type(candidate_count) is not int:
+            candidate_count = 0
+        directory_count = max(0, min(directory_count, _EMPTY_RETIRED_DIRECTORY_TREE_LIMIT))
+        candidate_count = max(0, min(candidate_count, _EMPTY_RETIRED_DIRECTORY_SCAN_LIMIT))
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        level = "info" if outcome == "removed" else "warning"
+        if not _breadcrumb_effectively_enabled(breadcrumb_trace, "retirement.cleanup", level):
+            return
+        try:
+            self.__record_breadcrumb(
+                stage="retirement_cleanup",
+                message="retirement_cleanup",
+                details={
+                    "schema": "retirement_cleanup.v1",
+                    "outcome": outcome,
+                    "reason": reason,
+                    "directory_count": directory_count,
+                    "candidate_count": candidate_count,
+                    "sidecar_present": bool(sidecar_present),
+                },
+                event_type="diagnostic",
+                corr_id=opaque_trace_correlation(identity),
+                trace_scope="flow",
+                category="retirement.cleanup",
+                level=level,
+            )
+        except Exception:
+            self.logger.debug("Ignoring retirement cleanup breadcrumb failure", exc_info=True)
+
     def __cleanup_empty_retired_source_claims(self, source_parent: str) -> None:
         """Remove only empty legacy publication claims left after final publish.
 
@@ -5043,60 +5156,120 @@ class Controller:
                     if re.fullmatch(r"\.seedsync-retire-[0-9a-f]{48}", entry.name):
                         retired.append(entry.path)
                         if len(retired) > _EMPTY_RETIRED_DIRECTORY_SCAN_LIMIT:
+                            self.__record_retirement_cleanup_breadcrumb(
+                                source_parent, "bounded", "scan_bound", candidate_count=len(retired),
+                            )
                             self.logger.warning(
                                 "Skipping empty retired-source cleanup in '%s': bounded scan limit reached", source_parent,
                             )
                             return
         except OSError:
+            self.__record_retirement_cleanup_breadcrumb(
+                source_parent, "skipped", "scan_error", candidate_count=0,
+            )
             return
         for claim in retired:
             sidecar_path = self.__collision_claim_sidecar_path(claim)
             if os.path.lexists(sidecar_path):
+                self.__record_retirement_cleanup_breadcrumb(
+                    claim, "skipped", "sidecar", sidecar_present=True,
+                )
                 continue
+            directories: list[str] = []
             try:
                 claim_stat = os.lstat(claim)
                 reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-                if not stat.S_ISDIR(claim_stat.st_mode) or stat.S_ISLNK(claim_stat.st_mode) or \
-                        (reparse_point and getattr(claim_stat, "st_file_attributes", 0) & reparse_point) or \
-                        os.path.ismount(claim) or self.__has_linux_mountpoint_at_or_below(claim):
+                if not stat.S_ISDIR(claim_stat.st_mode):
+                    self.__record_retirement_cleanup_breadcrumb(claim, "skipped", "not_directory")
                     continue
-                directories: list[str] = []
+                if stat.S_ISLNK(claim_stat.st_mode) or \
+                        (reparse_point and getattr(claim_stat, "st_file_attributes", 0) & reparse_point):
+                    self.__record_retirement_cleanup_breadcrumb(claim, "skipped", "symlink_reparse")
+                    continue
+                if os.path.ismount(claim) or self.__has_linux_mountpoint_at_or_below(claim):
+                    self.__record_retirement_cleanup_breadcrumb(claim, "skipped", "mount")
+                    continue
                 pending_directories = [claim]
                 tree_is_empty = True
+                tree_failure_reason = "nonempty"
                 while pending_directories:
                     if len(directories) >= _EMPTY_RETIRED_DIRECTORY_TREE_LIMIT:
                         tree_is_empty = False
+                        tree_failure_reason = "tree_bound"
                         break
                     directory = pending_directories.pop()
                     directory_stat = os.lstat(directory)
-                    if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(directory_stat.st_mode) or \
-                            directory_stat.st_dev != claim_stat.st_dev or os.path.ismount(directory) or \
+                    if not stat.S_ISDIR(directory_stat.st_mode):
+                        tree_is_empty = False
+                        tree_failure_reason = "not_directory"
+                        break
+                    if stat.S_ISLNK(directory_stat.st_mode) or \
                             (reparse_point and getattr(directory_stat, "st_file_attributes", 0) & reparse_point):
                         tree_is_empty = False
+                        tree_failure_reason = "symlink_reparse"
+                        break
+                    if directory_stat.st_dev != claim_stat.st_dev:
+                        tree_is_empty = False
+                        tree_failure_reason = "cross_device"
+                        break
+                    if os.path.ismount(directory):
+                        tree_is_empty = False
+                        tree_failure_reason = "mount"
+                        break
+                    if self.__has_linux_mountpoint_at_or_below(directory):
+                        tree_is_empty = False
+                        tree_failure_reason = "mount"
                         break
                     directories.append(directory)
                     for child in os.scandir(directory):
                         child_stat = os.lstat(child.path)
-                        if not stat.S_ISDIR(child_stat.st_mode) or stat.S_ISLNK(child_stat.st_mode):
+                        if not stat.S_ISDIR(child_stat.st_mode):
                             tree_is_empty = False
+                            tree_failure_reason = "nonempty"
+                            break
+                        if stat.S_ISLNK(child_stat.st_mode) or \
+                                (reparse_point and getattr(child_stat, "st_file_attributes", 0) & reparse_point):
+                            tree_is_empty = False
+                            tree_failure_reason = "symlink_reparse"
                             break
                         if len(directories) + len(pending_directories) >= _EMPTY_RETIRED_DIRECTORY_TREE_LIMIT:
                             tree_is_empty = False
+                            tree_failure_reason = "tree_bound"
                             break
                         pending_directories.append(child.path)
                     if not tree_is_empty:
                         break
                 if not tree_is_empty:
+                    self.__record_retirement_cleanup_breadcrumb(
+                        claim,
+                        "bounded" if tree_failure_reason == "tree_bound" else "retained",
+                        tree_failure_reason,
+                        directory_count=len(directories),
+                    )
                     continue
                 for directory in reversed(directories):
                     if self.__has_linux_mountpoint_at_or_below(claim):
                         raise OSError(errno.EXDEV, "Linux mount appeared during retired-source cleanup", claim)
                     os.rmdir(directory)
                 self.__sync_directory_if_supported(source_parent)
+                self.__record_retirement_cleanup_breadcrumb(
+                    claim, "removed", "empty_tree", directory_count=len(directories),
+                )
                 self.logger.info("Removed empty retired staging claim '%s' after completed publication", claim)
             except OSError as error:
                 # A concurrent writer turns the candidate into retained
                 # residue; never retry recursively or remove its content.
+                if error.errno == errno.EXDEV:
+                    reason = "cross_device"
+                elif error.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                    reason = "nonempty"
+                elif error.errno in (errno.ENOENT, getattr(errno, "ESTALE", errno.ENOENT), errno.EAGAIN):
+                    reason = "race"
+                else:
+                    reason = "rmdir_error"
+                self.__record_retirement_cleanup_breadcrumb(
+                    claim, "retained", reason, directory_count=len(directories),
+                )
                 self.logger.warning("Retained private source cleanup claim '%s': %s", claim, error)
 
     def __recover_collision_claims(

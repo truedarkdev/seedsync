@@ -2873,6 +2873,39 @@ class TestController(unittest.TestCase):
         unchanged = self.controller.get_model_summary(max_age_seconds=60)
         self.assertIs(changed, unchanged)
 
+    def test_model_summary_exposes_current_scan_authority_and_invalidates_cache(self):
+        self.controller._Controller__model.version = 1
+        self.controller._Controller__model.iter_files.return_value = []
+        self.controller._Controller__model_builder.local_library_inventory_snapshot.return_value = (0, {})
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset()
+        self.controller._Controller__scan_authority_snapshot = {
+            "final": False,
+            "full": False,
+            "outcome": "no_op",
+            "reason": "joint_not_final",
+            "effective_local_reconciliation_after_count": 0,
+        }
+
+        initial = self.controller.get_model_summary(max_age_seconds=60)
+        self.assertEqual(
+            "joint_not_final",
+            initial["scan_authority"]["reason"],
+        )
+
+        self.controller._Controller__scan_authority_snapshot = {
+            **self.controller._Controller__scan_authority_snapshot,
+            "final": True,
+            "full": True,
+            "outcome": "adopt",
+            "reason": "source_buckets_adopted",
+            "effective_local_reconciliation_after_count": 1,
+        }
+        changed = self.controller.get_model_summary(max_age_seconds=60)
+        self.assertIsNot(initial, changed)
+        self.assertEqual("adopt", changed["scan_authority"]["outcome"])
+        self.assertEqual(1, changed["scan_authority"]["effective_local_reconciliation_after_count"])
+        self.assertIs(changed, self.controller.get_model_summary(max_age_seconds=60))
+
     @patch("controller.controller.ScannerProcess")
     def test_refresh_path_pairs_rebuilds_runtime_state_and_forces_rescan(self, scanner_process_cls):
         pair_a = PathPair(
@@ -8955,6 +8988,72 @@ class TestController(unittest.TestCase):
                              self.controller._Controller__move_from_staging("Example Directory"))
             self.assertFalse(os.path.lexists(claim))
 
+    def test_retirement_cleanup_breadcrumb_is_opaque_bounded_and_retrievable(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        with tempfile.TemporaryDirectory(prefix="password=hunter2-") as temp_dir:
+            source_parent = os.path.join(temp_dir, "private-authentication=secret")
+            claim = os.path.join(source_parent, ".seedsync-retire-" + "f" * 48)
+            os.makedirs(claim)
+
+            self.controller._Controller__cleanup_empty_retired_source_claims(source_parent)
+
+            snapshot = trace.snapshot()
+            self.assertEqual(1, snapshot["entry_count"])
+            entry = snapshot["entries"][0]
+            self.assertEqual("retirement_cleanup", entry["message"])
+            self.assertEqual("retirement_cleanup", entry["stage"])
+            self.assertEqual("retirement.cleanup", entry["category"])
+            self.assertEqual("info", entry["level"])
+            self.assertEqual(opaque_trace_correlation(claim), entry["corr_id"])
+            self.assertEqual(
+                entry["corr_id"], trace.snapshot(corr_id=entry["corr_id"])["entries"][0]["corr_id"],
+            )
+            self.assertEqual({
+                "schema", "outcome", "reason", "directory_count", "candidate_count", "sidecar_present",
+            }, set(entry["details"]))
+            self.assertEqual("retirement_cleanup.v1", entry["details"]["schema"])
+            self.assertEqual("removed", entry["details"]["outcome"])
+            self.assertEqual("empty_tree", entry["details"]["reason"])
+            self.assertEqual(1, entry["details"]["directory_count"])
+            self.assertEqual(1, entry["details"]["candidate_count"])
+            self.assertFalse(entry["details"]["sidecar_present"])
+            self.assertNotIn(source_parent, str(snapshot))
+            self.assertNotIn("hunter2", str(snapshot))
+            self.assertNotIn("private-authentication", str(snapshot))
+
+    def test_retirement_cleanup_breadcrumb_distinguishes_retained_and_skipped_claims(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retained = os.path.join(temp_dir, ".seedsync-retire-" + "1" * 48)
+            sidecar = os.path.join(temp_dir, ".seedsync-retire-" + "2" * 48)
+            removed = os.path.join(temp_dir, ".seedsync-retire-" + "f" * 48)
+            os.makedirs(retained); Path(os.path.join(retained, "payload")).write_bytes(b"keep")
+            os.makedirs(sidecar); Path(sidecar + ".json").write_bytes(b"reserved")
+            os.makedirs(removed)
+
+            self.controller._Controller__cleanup_empty_retired_source_claims(temp_dir)
+
+            entries = {
+                entry["details"]["reason"]: entry
+                for entry in trace.snapshot()["entries"]
+            }
+            self.assertEqual(("retained", "nonempty"), (
+                entries["nonempty"]["details"]["outcome"], entries["nonempty"]["details"]["reason"],
+            ))
+            self.assertEqual("warning", entries["nonempty"]["level"])
+            self.assertEqual(("skipped", "sidecar"), (
+                entries["sidecar"]["details"]["outcome"], entries["sidecar"]["details"]["reason"],
+            ))
+            self.assertTrue(entries["sidecar"]["details"]["sidecar_present"])
+            self.assertEqual(("removed", "empty_tree"), (
+                entries["empty_tree"]["details"]["outcome"], entries["empty_tree"]["details"]["reason"],
+            ))
+            self.assertTrue(os.path.isdir(retained))
+            self.assertTrue(os.path.exists(sidecar + ".json"))
+            self.assertFalse(os.path.lexists(removed))
+
     def test_completed_move_retains_nonempty_or_sidecar_retired_directory_claim(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
@@ -9375,6 +9474,51 @@ class TestController(unittest.TestCase):
 
         for details_factory in factories.values():
             details_factory.assert_not_called()
+
+    def test_generic_breadcrumb_gate_skips_lazy_details_and_preserves_enabled_emission(self):
+        disabled = BreadcrumbTraceCollector(
+            lambda: True, max_entries=16, policy={"default": "off"},
+        )
+        self.controller._Controller__context.breadcrumb_trace = disabled
+        details = MagicMock(side_effect=AssertionError("disabled breadcrumb built details"))
+        self.controller._Controller__record_breadcrumb(
+            stage="controller_test",
+            message="controller_test",
+            details=details,
+        )
+        details.assert_not_called()
+        self.assertEqual([], disabled.snapshot()["entries"])
+
+        enabled = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = enabled
+        self.controller._Controller__record_breadcrumb(
+            stage="controller_test",
+            message="controller_test",
+            details=lambda: {"sentinel": "emitted"},
+        )
+        entry = enabled.snapshot()["entries"][0]
+        self.assertEqual("controller", entry["category"])
+        self.assertEqual("emitted", entry["details"]["sentinel"])
+
+    def test_publication_breadcrumb_gate_skips_filesystem_probes(self):
+        disabled = BreadcrumbTraceCollector(
+            lambda: True, max_entries=16,
+            policy={"default": "info", "rules": {"final_move.publication": "off"}},
+        )
+        probe = MagicMock(side_effect=AssertionError("disabled publication probe"))
+        tracker = _MoveMutationTracker("sample-file", disabled)
+        with patch("controller.controller.os.path.lexists", probe):
+            tracker.record_publication(
+                "destination", "replace", "destination",
+                source_path="source", destination_path="destination",
+            )
+        probe.assert_not_called()
+        self.assertEqual([], disabled.snapshot()["entries"])
+
+        enabled = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        tracker = _MoveMutationTracker("sample-file", enabled)
+        tracker.record_publication("destination", "replace", "destination")
+        self.assertEqual(1, len(enabled.snapshot()["entries"]))
 
     def test_transfer_exclusions_fail_closed_for_unknown_pair_with_retained_scan_snapshot(self):
         base_mtime_ns = 1_786_400_003_000_000_000

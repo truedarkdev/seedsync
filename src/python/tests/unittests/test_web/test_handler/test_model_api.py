@@ -81,6 +81,56 @@ class TestModelApi(unittest.TestCase):
         self.assertEqual(0, diagnostics.snapshot()["counters"]["model_summary_sse_emissions"])
         self.assertEqual(1, len(breadcrumbs.snapshot()["entries"]))
 
+    def test_disabled_model_api_category_skips_breadcrumb_payload_construction(self):
+        class FormattingInt(int):
+            def __new__(cls, value):
+                instance = super().__new__(cls, value)
+                instance.format_calls = 0
+                return instance
+
+            def __format__(self, format_spec):
+                self.format_calls += 1
+                return super().__format__(format_spec)
+
+        breadcrumbs = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8, policy={"rules": {"model_api": "off"}},
+        )
+        global_version = FormattingInt(2)
+        with patch.object(breadcrumbs, "record", wraps=breadcrumbs.record) as record:
+            rendered = ModelApiHandler(self.controller, breadcrumb_trace=breadcrumbs)._ModelApiHandler__sse(
+                "scoped", "model-page", {}, 1, global_version,
+            )
+
+        self.assertIn("event: model-page", rendered)
+        self.assertEqual(0, global_version.format_calls)
+        self.assertEqual(0, record.call_count)
+        self.assertEqual([], breadcrumbs.snapshot()["entries"])
+
+    def test_disabled_model_api_info_level_skips_breadcrumb_payload_construction(self):
+        class FormattingInt(int):
+            def __new__(cls, value):
+                instance = super().__new__(cls, value)
+                instance.format_calls = 0
+                return instance
+
+            def __format__(self, format_spec):
+                self.format_calls += 1
+                return super().__format__(format_spec)
+
+        breadcrumbs = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8, policy={"rules": {"model_api": "error"}},
+        )
+        global_version = FormattingInt(2)
+        with patch.object(breadcrumbs, "record", wraps=breadcrumbs.record) as record:
+            rendered = ModelApiHandler(self.controller, breadcrumb_trace=breadcrumbs)._ModelApiHandler__sse(
+                "scoped", "model-page", {}, 1, global_version,
+            )
+
+        self.assertIn("event: model-page", rendered)
+        self.assertEqual(0, global_version.format_calls)
+        self.assertEqual(0, record.call_count)
+        self.assertEqual([], breadcrumbs.snapshot()["entries"])
+
     def test_scoped_sse_correlates_to_global_version_without_exposing_scope_identity(self):
         breadcrumbs = BreadcrumbTraceCollector(lambda: True, max_entries=8)
         self.model.add_file(self._file("root-a", "pair-a"))
