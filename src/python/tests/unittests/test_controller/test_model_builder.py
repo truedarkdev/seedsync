@@ -2515,6 +2515,28 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertTrue(self.model_builder.has_complete_local_coverage("release"))
 
+    def test_presentation_coverage_ignores_unmatched_staging_extra(self):
+        remote_root = SystemFile("sample-directory", 20, True)
+        remote_root.add_child(SystemFile("part-a.bin", 10, False))
+        remote_root.add_child(SystemFile("part-b.bin", 10, False))
+        local_root = SystemFile("sample-directory", 21, True)
+        local_root.add_child(SystemFile("part-a.bin", 10, False))
+        local_root.add_child(SystemFile("part-b.bin", 10, False, is_staging=True))
+        local_root.add_child(SystemFile("unmatched.tmp", 1, False, is_staging=True))
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        release = self.model_builder.build_model().get_file("sample-directory")
+
+        self.assertTrue(release.complete_local_coverage)
+        self.assertEqual(ModelFile.State.DEFAULT, release.state)
+        self.assertEqual("downloaded", Controller._model_record_visible_state(release))
+        self.assertFalse(self.model_builder.has_complete_local_coverage("sample-directory"))
+        self.assertFalse(
+            self.model_builder.has_verified_complete_staging_remote_identity("sample-directory")
+        )
+
     def test_active_file_type_mismatch_preserves_remote_matching_final_directory_shape(self):
         mtime_ns = 1786400003000000000
         remote_root = SystemFile("release", 15, True)

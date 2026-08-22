@@ -2622,6 +2622,31 @@ class ModelBuilder:
         )
 
     @staticmethod
+    def __directory_leaves_cover_remote_for_presentation(
+            remote_file: Optional[SystemFile], local_file: Optional[SystemFile]) -> bool:
+        """Whether every remote leaf is locally complete for presentation.
+
+        Presentation coverage is intentionally independent of unmatched local
+        staging branches.  Those branches remain lifecycle ambiguity and are
+        rejected by ``__directory_leaves_cover_remote`` and the strict
+        completion predicates below; the model view only needs to report
+        whether each remote leaf has a locally present complete counterpart.
+        """
+        if remote_file is None or local_file is None or remote_file.is_dir != local_file.is_dir:
+            return False
+        if local_file.has_staging_collision:
+            return False
+        if not remote_file.is_dir:
+            return local_file.size >= remote_file.size
+        local_children = {child.name: child for child in local_file.iter_children()}
+        return all(
+            ModelBuilder.__directory_leaves_cover_remote_for_presentation(
+                remote_child, local_children.get(remote_child.name)
+            )
+            for remote_child in remote_file.iter_children()
+        )
+
+    @staticmethod
     def __effective_local_tree_proves_completion(remote_file: Optional[SystemFile],
                                                  local_file: Optional[SystemFile]) -> bool:
         """Apply split-root collision and staging-extra completion rules."""
@@ -3758,7 +3783,7 @@ class ModelBuilder:
             model_file.explicitly_stopped = is_stopped
             # Presentation proof requires each remote leaf; lifecycle state
             # retains its separate staging-root size fallback.
-            model_file.complete_local_coverage = self.__directory_leaves_cover_remote(
+            model_file.complete_local_coverage = self.__directory_leaves_cover_remote_for_presentation(
                 remote, local
             )
             path_pair_id = remote.path_pair_id if remote and remote.path_pair_id is not None else \
@@ -4124,7 +4149,7 @@ class ModelBuilder:
                 _child_is_stopped = _child_model_file.file_id in self.__stopped_files
                 _child_model_file.explicitly_stopped = _child_is_stopped
                 _child_model_file.complete_local_coverage = not _ancestor_has_staging_collision and \
-                    self.__directory_leaves_cover_remote(_remote_child, _local_child)
+                    self.__directory_leaves_cover_remote_for_presentation(_remote_child, _local_child)
 
                 # Set the state, first matching criteria below decides state
                 #   child is a directory: Default
