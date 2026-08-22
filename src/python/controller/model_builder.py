@@ -163,6 +163,8 @@ class ModelBuilder:
     __STOP_RESUME_TRACE_SIGNATURE_CACHE_SIZE = 1024
 
     __QUEUE_EXCLUSION_TRACE_SCHEMA = "fractional_mtime_redownload.queue_exclusion.v2"
+    __MODEL_PRESENTATION_TRACE_SCHEMA = "model_builder.model_presentation.v1"
+    __MODEL_PRESENTATION_TRACE_COUNT_MAX = 256
 
     def __init__(self):
         self.logger = logging.getLogger("ModelBuilder")
@@ -685,6 +687,19 @@ class ModelBuilder:
         self.__stop_resume_trace_last_enabled = enabled
         return enabled
 
+    def __is_model_presentation_trace_enabled(self) -> bool:
+        """Read the presentation category gate without changing trace state."""
+        emitter = self.__stop_resume_trace_breadcrumb
+        if emitter is None:
+            return False
+        effective = getattr(emitter, "is_effectively_enabled", None)
+        if not callable(effective):
+            return False
+        try:
+            return effective("model.presentation", "info") is True
+        except Exception:
+            return False
+
     @staticmethod
     def __queue_exclusion_mtime_category(
             remote_file: SystemFile, local_file: Optional[SystemFile],
@@ -757,6 +772,116 @@ class ModelBuilder:
         state = getattr(model_file, "state", None)
         name = getattr(state, "name", None)
         return name.lower() if isinstance(name, str) else "unknown"
+
+    @staticmethod
+    def __model_presentation_visible_state(model_file: ModelFile) -> str:
+        """Mirror the web presentation arbitration for diagnostic comparison."""
+        if model_file.local_present and not model_file.remote_has_transferable_content:
+            return "local_only"
+        has_display_union = model_file.display_size_total is not None and \
+            model_file.display_transferred_size is not None
+        has_complete_display_union = model_file.display_size_total is not None and \
+            model_file.display_transferred_size is not None and \
+            model_file.display_size_total > 0 and \
+            model_file.display_transferred_size >= model_file.display_size_total
+        progress_total = model_file.display_size_total if has_display_union else model_file.remote_size
+        progress_transferred = model_file.display_transferred_size \
+            if has_display_union else model_file.transferred_size
+        has_complete_progress = model_file.complete_local_coverage and \
+            (not has_display_union or has_complete_display_union) and \
+            not model_file.explicitly_stopped
+        has_retained_progress = (
+            model_file.remote_has_transferable_content
+            and (progress_total or 0) > 0
+            and ((progress_transferred or 0) > 0 or (model_file.download_progress or 0) > 0)
+        )
+        if model_file.state in (ModelFile.State.DEFAULT, ModelFile.State.DOWNLOADED) and \
+                model_file.explicitly_stopped and not model_file.final_move_succeeded:
+            return "stopped"
+        if model_file.state == ModelFile.State.DEFAULT:
+            if has_complete_progress:
+                return "downloaded"
+            if has_retained_progress:
+                return "stopped"
+        if model_file.state == ModelFile.State.DOWNLOADED and model_file.final_move_succeeded:
+            return "move_succeeded"
+        return ModelBuilder.__state_category(model_file)
+
+    def __record_model_presentation_anomaly(self, model_file: ModelFile) -> None:
+        """Emit identity-free evidence for a raw/visible or root/child split."""
+        if not self.__is_model_presentation_trace_enabled():
+            return
+
+        child_counts = {
+            "total": 0,
+            "remote_only": 0,
+            "local_only": 0,
+            "both": 0,
+            "downloaded_presentation": 0,
+            "local_only_presentation": 0,
+        }
+        root_remote_present = bool(model_file.remote_present)
+        root_local_present = bool(model_file.local_present)
+        child_presence_split = False
+        max_children = self.__MODEL_PRESENTATION_TRACE_COUNT_MAX
+        for index, child in enumerate(model_file.iter_children()):
+            if index >= max_children:
+                break
+            child_counts["total"] += 1
+            child_remote_present = bool(child.remote_present)
+            child_local_present = bool(child.local_present)
+            if child_remote_present and child_local_present:
+                child_counts["both"] += 1
+            elif child_remote_present:
+                child_counts["remote_only"] += 1
+            elif child_local_present:
+                child_counts["local_only"] += 1
+            child_presence_split |= (
+                child_remote_present != root_remote_present or
+                child_local_present != root_local_present
+            )
+            child_visible_state = self.__model_presentation_visible_state(child)
+            if child_visible_state == "downloaded":
+                child_counts["downloaded_presentation"] += 1
+            elif child_visible_state == "local_only":
+                child_counts["local_only_presentation"] += 1
+
+        derived_visible_state = self.__model_presentation_visible_state(model_file)
+        raw_state = self.__state_category(model_file)
+        if raw_state == derived_visible_state and not child_presence_split:
+            return
+
+        details: dict[str, object] = {
+            "schema": self.__MODEL_PRESENTATION_TRACE_SCHEMA,
+            "version": 1,
+            "raw_state": raw_state,
+            "derived_visible_state": derived_visible_state,
+            "presence": {
+                "remote_present": root_remote_present,
+                "local_present": root_local_present,
+                "root_child_split": child_presence_split,
+            },
+            "transferable": bool(model_file.remote_has_transferable_content),
+            "coverage": bool(model_file.complete_local_coverage),
+            "stopped": bool(model_file.explicitly_stopped),
+            "child_counts": child_counts,
+        }
+        try:
+            breadcrumb = self.__stop_resume_trace_breadcrumb
+            if breadcrumb is not None:
+                breadcrumb.record(
+                    "model_builder",
+                    "model_presentation_anomaly",
+                    details,
+                    stage="model_presentation",
+                    event_type="diagnostic",
+                    category="model.presentation",
+                    level="info",
+                    corr_id=opaque_trace_correlation(model_file.file_id),
+                    trace_scope="flow",
+                )
+        except Exception:
+            self.logger.debug("Ignoring model presentation breadcrumb failure", exc_info=True)
 
     @staticmethod
     def __root_trace_coverage_categories(
@@ -4557,6 +4682,10 @@ class ModelBuilder:
             visible_root_files.append(built_root_file)
             if normalized_local_root_path is not None:
                 seen_names_by_path[normalized_local_root_path].add(built_root_file.model_file.name)
+
+        if self.__is_model_presentation_trace_enabled():
+            for built_root_file in visible_root_files:
+                self.__record_model_presentation_anomaly(built_root_file.model_file)
 
         seen_file_ids: set[str] = set()
         for built_root_file in visible_root_files:

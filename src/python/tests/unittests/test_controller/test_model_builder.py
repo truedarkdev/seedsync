@@ -2196,6 +2196,116 @@ class TestModelBuilder(unittest.TestCase):
         self.assertNotIn("fractional.bin", str(entry))
         self.assertNotIn(str(base_mtime_ns), str(entry))
 
+    def test_model_presentation_trace_is_gated_before_trace_only_work(self):
+        remote_root = SystemFile("sample-directory", 10, True)
+        remote_root.add_child(SystemFile("remote.bin", 10, False))
+        local_root = SystemFile("sample-directory", 10, True)
+        local_root.add_child(SystemFile("local.bin", 10, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        collector = self.__enable_trace(False)
+
+        with patch.object(
+                self.model_builder,
+                "_ModelBuilder__record_model_presentation_anomaly",
+                side_effect=AssertionError("disabled presentation trace did trace-only work"),
+        ), patch(
+                "controller.model_builder.opaque_trace_correlation",
+                side_effect=AssertionError("disabled presentation trace correlated"),
+        ):
+            self.model_builder.build_model()
+
+        time.sleep(0.05)
+        self.assertEqual([], collector.snapshot()["entries"])
+
+    def test_model_presentation_trace_reports_raw_visible_and_child_presence_split(self):
+        remote_root = SystemFile("sample-directory", 10, True)
+        remote_root.add_child(SystemFile("remote.bin", 10, False))
+        local_root = SystemFile("sample-directory", 10, True)
+        local_root.add_child(SystemFile("local.bin", 10, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        collector = self.__enable_trace()
+
+        self.model_builder.build_model()
+
+        entries = [
+            entry for entry in self.__trace_entries(collector)
+            if entry["message"] == "model_presentation_anomaly"
+        ]
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertEqual("model_builder.model_presentation.v1", entry["details"]["schema"])
+        self.assertEqual(1, entry["details"]["version"])
+        self.assertEqual("default", entry["details"]["raw_state"])
+        self.assertEqual("stopped", entry["details"]["derived_visible_state"])
+        self.assertEqual({
+            "remote_present": True,
+            "local_present": True,
+            "root_child_split": True,
+        }, entry["details"]["presence"])
+        self.assertTrue(entry["details"]["transferable"])
+        self.assertFalse(entry["details"]["coverage"])
+        self.assertFalse(entry["details"]["stopped"])
+        self.assertEqual({
+            "total": 2,
+            "remote_only": 1,
+            "local_only": 1,
+            "both": 0,
+            "downloaded_presentation": 0,
+            "local_only_presentation": 1,
+        }, entry["details"]["child_counts"])
+        self.assertIsNone(entry["file_id"])
+        self.assertIsNone(entry["path_pair_id"])
+        self.assertIsNone(entry["path_pair_name"])
+        self.assertTrue(entry["corr_id"])
+        self.assertNotIn("sample-directory", str(entry))
+        self.assertNotIn("remote.bin", str(entry))
+        self.assertNotIn("local.bin", str(entry))
+
+    def test_model_presentation_trace_is_quiet_for_normal_model(self):
+        remote_file = SystemFile("sample.bin", 10, False)
+        local_file = SystemFile("sample.bin", 10, False)
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        collector = self.__enable_trace()
+
+        self.model_builder.build_model()
+
+        self.assertFalse(any(
+            entry["message"] == "model_presentation_anomaly"
+            for entry in self.__trace_entries(collector)
+        ))
+
+    def test_disabled_model_presentation_gate_does_not_reset_existing_trace_deduplication(self):
+        remote_root = SystemFile("sample-directory", 10, True)
+        remote_root.add_child(SystemFile("remote.bin", 10, False))
+        local_root = SystemFile("sample-directory", 10, True)
+        local_root.add_child(SystemFile("local.bin", 10, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.__trace_enabled = [True]
+        collector = BreadcrumbTraceCollector(
+            lambda: self.__trace_enabled[0],
+            policy={"default": "info", "rules": {"model.presentation": "off"}},
+        )
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+
+        self.model_builder.build_model()
+        self.model_builder.request_rebuild()
+        self.model_builder.build_model()
+
+        root_events = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "root_default_decision"
+        ]
+        self.assertEqual(1, len(root_events))
+        self.assertEqual(2, root_events[0]["repeat_count"])
+        self.assertFalse(any(
+            entry["message"] == "model_presentation_anomaly"
+            for entry in self.__trace_entries(collector, include_root_decisions=True)
+        ))
+
     def test_queue_exclusion_trace_marks_local_readiness_unknown_and_is_disabled_cleanly(self):
         base_mtime_ns = 1_700_000_000_000_000_000
         remote_root = SystemFile("sample-directory", 10, True)
