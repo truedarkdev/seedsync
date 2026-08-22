@@ -686,7 +686,8 @@ def validate_completed_migration_claimed_auth_state(config_dir: str | Path, bind
     allowed_events = {
         "store_loaded", "store_saved", "bootstrap_proof_created", "bootstrap_proof_cleared",
         "bootstrap_exchange_created", "bootstrap_exchange_cleared", "api_key_created",
-        "ui_session_created", "api_key_updated", "api_key_rotated", "api_key_revoked", "api_key_deleted",
+        "ui_session_created", "ui_sessions_discarded", "api_key_updated", "api_key_rotated",
+        "api_key_revoked", "api_key_deleted",
     }
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) not in (

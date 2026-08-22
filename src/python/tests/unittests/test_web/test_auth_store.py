@@ -68,6 +68,9 @@ class TestApiKeyStore(unittest.TestCase):
             store.create_remembered_browser_session_for_api_key(created["record"].id)
             store.complete_completed_migration_claim_transition(created["record"].id, version)
             store.finish_completed_migration_claim_transaction()
+            secondary = store.create_api_key("temporary", ["read"])
+            store.create_remembered_browser_session_for_api_key(secondary["record"].id)
+            store.revoke_api_key(secondary["record"].id)
             validate_completed_migration_claimed_auth_state(temp_dir, binding)
             restarted = ApiKeyStore.from_file(store_path)
             restarted.bind_completed_migration_claimed_handover_version(
