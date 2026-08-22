@@ -82,6 +82,46 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(600, continued.size_local)
         self.assertEqual(0, reset.size_local)
 
+    def test_finalizable_staging_leaf_candidates_ignore_active_sibling_and_require_identity(self):
+        remote_root = SystemFile("release", 20, True)
+        remote_root.add_child(SystemFile("complete.bin", 8, False, mtime_ns=1_000_000_000))
+        remote_root.add_child(SystemFile("incomplete.bin", 12, False, mtime_ns=1_000_000_000))
+        local_root = SystemFile("release", 20, True, is_staging=True)
+        completed = SystemFile("complete.bin", 8, False, is_staging=True, mtime_ns=1_000_000_000)
+        incomplete = SystemFile("incomplete.bin", 12, False, is_staging=True, mtime_ns=1_000_000_000)
+        incomplete.status_sidecar_ready = True
+        local_root.add_child(completed)
+        local_root.add_child(incomplete)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        self.assertEqual(
+            (("release", "complete.bin"),),
+            self.model_builder.get_finalizable_staging_leaf_candidates(),
+        )
+
+        mismatched_root = SystemFile("release", 20, True, is_staging=True)
+        mismatched_root.add_child(SystemFile(
+            "complete.bin", 8, False, is_staging=True, mtime_ns=2_000_000_000,
+        ))
+        mismatched_incomplete = SystemFile(
+            "incomplete.bin", 12, False, is_staging=True, mtime_ns=1_000_000_000,
+        )
+        mismatched_incomplete.status_sidecar_ready = True
+        mismatched_root.add_child(mismatched_incomplete)
+        self.model_builder.set_local_files([mismatched_root])
+        self.assertEqual((), self.model_builder.get_finalizable_staging_leaf_candidates())
+
+    def test_finalizable_staging_leaf_candidates_reject_backslash_filename(self):
+        remote_root = SystemFile("release", 8, True)
+        remote_root.add_child(SystemFile("nested\\complete.bin", 8, False, mtime_ns=1))
+        local_root = SystemFile("release", 8, True, is_staging=True)
+        local_root.add_child(SystemFile("nested\\complete.bin", 8, False, is_staging=True, mtime_ns=1))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        self.assertEqual((), self.model_builder.get_finalizable_staging_leaf_candidates())
+
     def test_parser_positive_zero_percent_is_not_a_model_reset_signal(self):
         status = LftpJobStatusParser().parse(
             "jobs -v\n"
@@ -112,12 +152,29 @@ class TestModelBuilder(unittest.TestCase):
         return collector
 
     @staticmethod
-    def __trace_entries(collector: BreadcrumbTraceCollector) -> list[dict[str, object]]:
+    def __trace_entries(
+            collector: BreadcrumbTraceCollector,
+            include_root_decisions: bool = False,
+    ) -> list[dict[str, object]]:
         # Breadcrumb emitters use a multiprocessing.Queue so worker processes
         # never block model work. Give its feeder a bounded moment to publish a
         # same-cycle burst before asserting the complete retained window.
         time.sleep(0.05)
-        return collector.snapshot()["entries"]
+        entries = collector.snapshot()["entries"]
+        if include_root_decisions:
+            return entries
+        return [entry for entry in entries if entry["message"] != "root_default_decision"]
+
+    def __assert_no_exact_count_fields(self, value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                self.assertFalse(str(key).endswith("_count"), key)
+                self.__assert_no_exact_count_fields(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                self.__assert_no_exact_count_fields(child)
+        elif isinstance(value, str):
+            self.assertNotIn(value, {"none", "one", "few", "many"})
 
     def __assert_generic_lifecycle_trace_is_private(
             self, entries: list[dict[str, object]], subject_file_id: str,
@@ -205,6 +262,26 @@ class TestModelBuilder(unittest.TestCase):
             },
             retained_model.get_file_ids(),
         )
+
+    def test_progressive_root_trace_reports_unmatched_staging_after_presentation_coverage(self):
+        remote_root = SystemFile("sample-directory", 10, True)
+        remote_root.add_child(SystemFile("remote.bin", 10, False))
+        local_root = SystemFile("sample-directory", 15, True)
+        local_root.add_child(SystemFile("remote.bin", 10, False))
+        local_root.add_child(SystemFile("staging-extra.bin", 5, False, is_staging=True))
+        collector = self.__enable_trace()
+
+        self.model_builder.build_progressive_roots([local_root], [remote_root], set())
+
+        entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "root_default_decision"
+        ]
+        self.assertEqual(1, len(entries))
+        details = entries[0]["details"]
+        self.assertTrue(details["coverage"]["presentation"])
+        self.assertFalse(details["coverage"]["effective_tree_proof"])
+        self.assertEqual("unmatched_staging", details["reason"])
 
     def test_scoped_candidate_refreshes_all_downloaded_timestamp_overlay_roots(self):
         """Persisted timestamp sync cannot retain a root rendered before the sync."""
@@ -2068,6 +2145,148 @@ class TestModelBuilder(unittest.TestCase):
         completed = self.model_builder.build_model().get_file("release")
         self.assertTrue(self.model_builder.has_verified_complete_staging_remote_identity("release"))
         self.assertEqual(ModelFile.State.DOWNLOADED, completed.state)
+
+    def test_queue_exclusion_trace_covers_fractional_overlap_delta_and_staging_sibling(self):
+        base_mtime_ns = 1_700_000_000_000_000_000
+        remote_root = SystemFile("sample-directory", 30, True)
+        remote_root.add_child(SystemFile("fractional.bin", 10, False, mtime_ns=base_mtime_ns + 400_000_000))
+        remote_root.add_child(SystemFile("whole-second.bin", 10, False, mtime_ns=base_mtime_ns + 400_000_000))
+        remote_root.add_child(SystemFile("remote-only.bin", 10, False, mtime_ns=base_mtime_ns + 400_000_000))
+        local_root = SystemFile("sample-directory", 30, True)
+        local_root.add_child(SystemFile("fractional.bin", 10, False, mtime_ns=base_mtime_ns + 900_000_000))
+        local_root.add_child(SystemFile("whole-second.bin", 10, False, mtime_ns=base_mtime_ns))
+        local_root.add_child(SystemFile("staging-sibling.bin", 10, False, is_staging=True, mtime_ns=base_mtime_ns))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        collector = self.__enable_trace()
+
+        self.assertEqual(("whole-second.bin",), self.model_builder.get_trusted_final_leaf_paths("sample-directory"))
+        self.assertEqual(("whole-second.bin",), self.model_builder.get_trusted_final_leaf_paths("sample-directory"))
+
+        time.sleep(0.05)
+        entries = collector.snapshot()["entries"]
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertEqual("queue_exclusion_decision", entry["message"])
+        self.assertEqual("fractional_mtime_redownload.queue_exclusion.v2", entry["details"]["schema"])
+        self.assertTrue(entry["corr_id"].startswith("fractional-mtime:"))
+        self.assertIsNone(entry["file_id"])
+        self.assertIsNone(entry["path_pair_id"])
+        self.assertEqual(1, len(collector.snapshot(corr_id=entry["corr_id"])["entries"]))
+        details = entry["details"]
+        self.assertTrue(details["leaf_observations_present"]["remote_leaf_present"])
+        self.assertTrue(details["leaf_observations_present"]["remote_only_leaf_present"])
+        self.assertTrue(details["leaf_observations_present"]["local_only_leaf_present"])
+        self.assertTrue(details["leaf_observations_present"]["staging_sibling_leaf_present"])
+        self.assertTrue(details["decisions"]["excluded"])
+        self.assertTrue(details["decisions"]["rejected"])
+        self.assertTrue(details["mtime_categories_present"]["raw_mismatch_present"])
+        self.assertTrue(details["mtime_categories_present"]["portable_second_match_present"])
+        self.assertTrue(details["mtime_categories_present"]["missing_present"])
+        self.assertTrue(details["readiness_reasons"]["local_present"])
+        self.assertTrue(details["readiness_reasons"]["remote_present"])
+        self.assertNotIn("leaf_counts", details)
+        self.assertNotIn("readiness_reason_counts", details)
+        self.assertNotIn("rejection_reason_counts", details)
+        self.assertNotIn("exclusion_paths_count", details)
+        self.assertNotIn("leaf_observations", details)
+        self.assertNotIn("mtime_comparison", details)
+        self.__assert_no_exact_count_fields(details)
+        self.assertNotIn("sample-directory", str(entry))
+        self.assertNotIn("fractional.bin", str(entry))
+        self.assertNotIn(str(base_mtime_ns), str(entry))
+
+    def test_queue_exclusion_trace_marks_local_readiness_unknown_and_is_disabled_cleanly(self):
+        base_mtime_ns = 1_700_000_000_000_000_000
+        remote_root = SystemFile("sample-directory", 10, True)
+        remote_root.add_child(SystemFile("remote.bin", 10, False, mtime_ns=base_mtime_ns))
+        local_root = SystemFile("sample-directory", 10, True)
+        local_root.add_child(SystemFile("remote.bin", 10, False, mtime_ns=base_mtime_ns))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        collector = self.__enable_trace()
+        self.model_builder.set_unknown_local_path_pair_ids({None})
+
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("sample-directory"))
+        time.sleep(0.05)
+        entry = collector.snapshot()["entries"][0]
+        self.assertEqual("unknown", entry["details"]["readiness_reason"])
+        self.assertTrue(entry["details"]["readiness"]["local_readiness_unknown"])
+        self.assertTrue(entry["details"]["rejection_reasons"]["not_ready_present"])
+        self.assertNotIn("rejection_reason_counts", entry["details"])
+
+        disabled_collector = self.__enable_trace(False)
+        self.model_builder.set_unknown_local_path_pair_ids(set())
+        with patch.object(
+                self.model_builder,
+                "_ModelBuilder__queue_exclusion_trace_empty_counts",
+                side_effect=AssertionError("disabled Queue trace allocated a census"),
+        ), patch.object(
+                self.model_builder,
+                "_ModelBuilder__queue_exclusion_mtime_category",
+                side_effect=AssertionError("disabled Queue trace classified mtimes"),
+        ), patch.object(
+                self.model_builder,
+                "_ModelBuilder__record_queue_exclusion_trace",
+                side_effect=AssertionError("disabled Queue trace emitted a breadcrumb"),
+        ):
+            self.assertEqual(
+                ("remote.bin",),
+                self.model_builder.get_trusted_final_leaf_paths("sample-directory"),
+            )
+        time.sleep(0.05)
+        self.assertEqual([], disabled_collector.snapshot()["entries"])
+
+    def test_queue_exclusion_trace_retries_after_enqueue_only_admission(self):
+        remote_root = SystemFile("sample-directory", 10, True)
+        remote_root.add_child(SystemFile("remote.bin", 10, False, mtime_ns=1_700_000_000_000_000_000))
+        local_root = SystemFile("sample-directory", 10, True)
+        local_root.add_child(SystemFile("remote.bin", 10, False, mtime_ns=1_700_000_000_000_000_000))
+        emitter = MagicMock()
+        emitter.is_enabled.return_value = True
+        # A worker emitter can only report enqueue admission, not retention.
+        emitter.record.return_value = "enqueued"
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_stop_resume_trace_breadcrumb(emitter)
+
+        self.assertEqual(("remote.bin",), self.model_builder.get_trusted_final_leaf_paths("sample-directory"))
+        self.assertEqual(("remote.bin",), self.model_builder.get_trusted_final_leaf_paths("sample-directory"))
+
+        self.assertEqual(2, emitter.record.call_count)
+
+    def test_lifecycle_trace_retries_after_loss_instead_of_caching_enqueue(self):
+        emitter = MagicMock()
+        emitter.is_enabled.return_value = True
+        emitter.record.side_effect = ("dropped", "enqueued")
+        self.model_builder.set_stop_resume_trace_breadcrumb(emitter)
+        recorder = self.model_builder._ModelBuilder__record_lifecycle_persist_breadcrumb_for_file_id
+
+        recorder("persist_authority_before", "opaque-subject", {"state": "default"})
+        recorder("persist_authority_before", "opaque-subject", {"state": "default"})
+
+        self.assertEqual(2, emitter.record.call_count)
+
+    def test_lifecycle_coalescing_keeps_event_and_subject_identity_isolated(self):
+        collector = self.__enable_trace()
+        recorder = self.model_builder._ModelBuilder__record_lifecycle_persist_breadcrumb_for_file_id
+        details = {"state": "default"}
+
+        recorder("persist_authority_before", "subject-a", details)
+        recorder("persist_authority_before", "subject-a", details)
+        recorder("persist_authority_before", "subject-b", details)
+        recorder("persist_authority_after", "subject-a", details)
+
+        entries = self.__trace_entries(collector)
+        self.assertEqual(3, len(entries))
+        self.assertEqual(2, next(
+            entry["repeat_count"] for entry in entries
+            if entry["message"] == "persist_authority_before" and entry["repeat_count"] == 2
+        ))
+        self.assertEqual(
+            2,
+            len({entry["corr_id"] for entry in entries if entry["message"] == "persist_authority_before"}),
+        )
 
     def test_split_root_rejects_unequal_epoch_mtime_even_with_equal_naive_display_time(self):
         displayed_time = datetime(2026, 8, 11, 12, 0, 0)
@@ -7028,6 +7247,189 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual([], self.__trace_entries(collector))
         self.assertIsNone(self.model_builder.stop_resume_trace_metadata_for_file(model.get_file("a")))
 
+    def test_root_default_trace_emits_and_is_retrievable_without_raw_identity(self):
+        remote_root = SystemFile("sample-directory", 20, True)
+        remote_root.add_child(SystemFile("remote.bin", 20, False))
+        local_root = SystemFile("sample-directory", 10, True)
+        local_root.add_child(SystemFile("remote.bin", 10, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        collector = self.__enable_trace()
+
+        model = self.model_builder.build_model()
+        root = model.get_file("sample-directory")
+
+        self.assertEqual(ModelFile.State.DEFAULT, root.state)
+        entries = self.__trace_entries(collector, include_root_decisions=True)
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertEqual("root_default_decision", entry["message"])
+        self.assertIsNone(entry["file_id"])
+        self.assertIsNone(entry["path_pair_id"])
+        self.assertTrue(entry["corr_id"])
+        self.assertNotIn("sample-directory", str(entry))
+        self.assertNotIn("remote.bin", str(entry))
+        self.assertEqual(1, len(collector.snapshot(corr_id=entry["corr_id"])["entries"]))
+        details = entry["details"]
+        self.assertEqual("model_builder.root_default_decision.v2", details["schema"])
+        self.assertEqual("presentation_coverage_incomplete", details["reason"])
+        self.assertEqual("default", details["root_state"])
+        self.assertFalse(details["presence"]["status"])
+        self.assertFalse(details["lifecycle"]["explicit_stop"])
+        self.assertFalse(details["lifecycle"]["marker_present"])
+        self.assertFalse(details["lifecycle"]["transfer_hint_present"])
+        self.assertFalse(details["coverage"]["effective_tree_proof"])
+        self.assertNotIn("strict_lifecycle", details)
+        self.assertTrue(details["coverage"]["remote_leaves_present"])
+        self.assertFalse(details["coverage"]["covered_remote_leaves_present"])
+        self.__assert_no_exact_count_fields(details)
+        self.assertNotIn("remote_leaf_count", details["coverage"])
+        self.assertNotIn("covered_remote_leaf_count", details["coverage"])
+        self.assertNotIn("mismatch_count", details["type"])
+        self.assertNotIn("collision_node_count", details["staging"])
+        self.assertNotIn("unmatched_staging_leaf_count", details["staging"])
+
+    def test_root_trace_emits_remote_only_coverage_failure(self):
+        remote_root = SystemFile("sample-directory", 20, True)
+        remote_root.add_child(SystemFile("remote.bin", 20, False))
+        self.model_builder.set_remote_files([remote_root])
+        collector = self.__enable_trace()
+
+        model = self.model_builder.build_model()
+        entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "root_default_decision"
+        ]
+
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("sample-directory").state)
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertEqual("root_default_decision", entry["message"])
+        self.assertIsNone(entry["file_id"])
+        self.assertIsNone(entry["path_pair_id"])
+        self.assertNotIn("sample-directory", str(entry))
+        self.assertNotIn("remote.bin", str(entry))
+        self.assertEqual(1, len(collector.snapshot(corr_id=entry["corr_id"])["entries"]))
+        self.assertEqual("local_absent", entry["details"]["reason"])
+        self.assertTrue(entry["details"]["presence"]["remote"])
+        self.assertFalse(entry["details"]["presence"]["local"])
+        self.assertFalse(entry["details"]["lifecycle"]["explicit_stop"])
+
+    def test_root_trace_emits_move_failed_marker_decision(self):
+        remote_file = SystemFile("failed.bin", 10, False)
+        local_file = SystemFile("failed.bin", 10, False)
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_move_failed_files({ModelFile.build_file_id("failed.bin", None)})
+        collector = self.__enable_trace()
+
+        model = self.model_builder.build_model()
+        entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "root_default_decision"
+        ]
+
+        self.assertEqual(ModelFile.State.MOVE_FAILED, model.get_file("failed.bin").state)
+        self.assertEqual(1, len(entries))
+        details = entries[0]["details"]
+        self.assertEqual("move_failed", details["reason"])
+        self.assertTrue(details["lifecycle"]["marker_present"])
+        self.assertTrue(details["lifecycle"]["move_failed"])
+        self.assertNotIn("remote_leaf_count", details["coverage"])
+
+    def test_root_trace_emits_explicit_stop_for_covered_root(self):
+        remote_file = SystemFile("sample-file", 100, False)
+        local_file = SystemFile("sample-file", 100, False)
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_stopped_files({"sample-file"})
+        collector = self.__enable_trace()
+
+        model = self.model_builder.build_model()
+        entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "root_default_decision"
+        ]
+
+        self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("sample-file").state)
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertEqual("root_default_decision", entry["message"])
+        self.assertIsNone(entry["file_id"])
+        self.assertIsNone(entry["path_pair_id"])
+        self.assertNotIn("sample-file", str(entry))
+        self.assertEqual(1, len(collector.snapshot(corr_id=entry["corr_id"])["entries"]))
+        self.assertEqual("explicit_stop", entry["details"]["reason"])
+        self.assertTrue(entry["details"]["coverage"]["presentation"])
+        self.assertTrue(entry["details"]["lifecycle"]["explicit_stop"])
+
+    def test_root_default_trace_changed_reason_reemits(self):
+        remote_root = SystemFile("sample-directory", 20, True)
+        remote_root.add_child(SystemFile("remote.bin", 20, False))
+        local_root = SystemFile("sample-directory", 10, True)
+        local_root.add_child(SystemFile("remote.bin", 10, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        collector = self.__enable_trace()
+
+        self.model_builder.build_model()
+        first = self.__trace_entries(collector, include_root_decisions=True)
+        self.model_builder.set_stopped_files({"sample-directory"})
+        self.model_builder.build_model()
+        second = self.__trace_entries(collector, include_root_decisions=True)
+        root_entries = [entry for entry in second if entry["message"] == "root_default_decision"]
+
+        self.assertEqual(2, len(root_entries))
+        self.assertNotEqual(first[0]["details"]["reason"], root_entries[1]["details"]["reason"])
+        self.assertEqual("explicit_stop", root_entries[1]["details"]["reason"])
+        self.assertTrue(root_entries[1]["details"]["lifecycle"]["explicit_stop"])
+        self.assertEqual(first[0]["corr_id"], root_entries[1]["corr_id"])
+
+    def test_root_default_trace_identical_decision_dedupes(self):
+        remote_root = SystemFile("sample-directory", 20, True)
+        remote_root.add_child(SystemFile("remote.bin", 20, False))
+        local_root = SystemFile("sample-directory", 10, True)
+        local_root.add_child(SystemFile("remote.bin", 10, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        collector = self.__enable_trace()
+
+        self.model_builder.build_model()
+        self.model_builder.request_rebuild()
+        self.model_builder.build_model()
+
+        self.assertEqual(1, len(self.__trace_entries(collector, include_root_decisions=True)))
+
+    def test_root_default_trace_disabled_produces_no_event(self):
+        remote_root = SystemFile("sample-directory", 20, True)
+        remote_root.add_child(SystemFile("remote.bin", 20, False))
+        local_root = SystemFile("sample-directory", 10, True)
+        local_root.add_child(SystemFile("remote.bin", 10, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        collector = self.__enable_trace(False)
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("sample-directory").state)
+        self.assertEqual([], self.__trace_entries(collector, include_root_decisions=True))
+
+    def test_root_default_trace_preserves_legacy_default_behavior(self):
+        remote_root = SystemFile("sample-directory", 20, True)
+        remote_root.add_child(SystemFile("remote.bin", 20, False))
+        local_root = SystemFile("sample-directory", 10, True)
+        local_root.add_child(SystemFile("remote.bin", 10, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        model = self.model_builder.build_model()
+        root = model.get_file("sample-directory")
+
+        self.assertEqual(ModelFile.State.DEFAULT, root.state)
+        self.assertFalse(root.complete_local_coverage)
+        self.assertEqual(20, root.remote_size)
+        self.assertEqual(10, root.local_size)
+
     def test_trace_captures_all_active_files_with_canonical_ids(self):
         file_name = "verifier-stop-regression-1g.bin"
         remote_file = SystemFile(file_name, 1073741824, False)
@@ -7395,6 +7797,11 @@ class TestModelBuilder(unittest.TestCase):
         # A fresh global enable clears the process-local dedupe window while
         # retaining the collector's independent bounded retention contract.
         self.model_builder.set_stop_resume_trace_breadcrumb(None)
+        # Keep this retention assertion focused on lifecycle records; the
+        # root diagnostic intentionally reports the preceding local-absence
+        # failure and is covered by the dedicated root-trace test above.
+        self.model_builder.set_downloaded_files({subject_id})
+        self.model_builder.set_local_files([SystemFile(subject_name, 100, False)])
         self.model_builder.request_rebuild()
         self.model_builder.build_model()
         bounded = BreadcrumbTraceCollector(lambda: True, max_entries=2)
@@ -7405,11 +7812,14 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.record_lifecycle_live_publication(
             candidate, candidate, subject_ids, "full_build", "full_model_adopted",
         )
-        bounded_entries = bounded.snapshot()["entries"]
+        bounded_entries = self.__trace_entries(bounded, include_root_decisions=True)
         self.assertEqual(2, len(bounded_entries))
-        self.assertEqual(["model_candidate", "model_live_publication"], [
+        self.assertEqual(["root_default_decision", "model_live_publication"], [
             entry["message"] for entry in bounded_entries
         ])
+        root_entry = bounded_entries[0]
+        self.assertTrue(root_entry["details"]["lifecycle"]["marker_present"])
+        self.assertTrue(root_entry["details"]["lifecycle"]["move_failed"] is False)
 
         self.model_builder.set_downloaded_files({subject_id})
         empty_candidate = Model()

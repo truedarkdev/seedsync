@@ -86,19 +86,23 @@ class BreadcrumbTraceEmitter:
         except Exception:
             return False
 
-    def record(self, source: str, message: str, details: object = None, **metadata: Any) -> None:
+    def record(self, source: str, message: str, details: object = None, **metadata: Any) -> str:
         if not self.is_enabled():
-            return
+            return "disabled"
 
         created_ns = time.time_ns()
         record = _bounded_ingress_record(source, message, details, metadata, created_ns, self.__policy_revision, self.__policy_epoch)
         if record is None:
             self.__reject()
-            return
+            return "dropped"
         try:
             self.__record_queue.put_nowait(record)
+            # This only acknowledges process-queue admission. The collector
+            # remains authoritative for retention, policy, and deduplication.
+            return "enqueued"
         except queue.Full:
             self.__reject()
+            return "dropped"
 
     def __reject(self) -> None:
         try:
@@ -154,8 +158,8 @@ class BreadcrumbTraceNoopEmitter:
     def is_enabled(self) -> bool:
         return False
 
-    def record(self, source: str, message: str, details: object = None, **metadata: Any) -> None:
-        pass
+    def record(self, source: str, message: str, details: object = None, **metadata: Any) -> str:
+        return "disabled"
 
 
 class BreadcrumbTraceCollector:
@@ -249,6 +253,7 @@ class BreadcrumbTraceCollector:
         self.__external_queue_drain_limited = False
         self.__external_queue_last_drain_monotonic: Optional[float] = None
         self.__last_signature: Optional[str] = None
+        self.__coalesce_entries: Dict[str, Dict[str, Any]] = {}
         self.__last_failure_entry: Optional[Dict[str, Any]] = None
         self.__last_failure_version: Optional[int] = None
         self.__policy: Dict[str, Any] = cast(Dict[str, Any], policy_result["policy"])
@@ -705,6 +710,7 @@ class BreadcrumbTraceCollector:
                 self.__entry_sizes = kept_sizes
                 self.__retained_bytes = retained_bytes
             self.__last_signature = self.__signature(self.__entries[-1]) if self.__entries else None
+            self.__coalesce_entries.clear()
             self.__refresh_failure_locked()
             self.__last_reset_version = self.__version
             self.__last_reset_reason = "clear"
@@ -727,6 +733,7 @@ class BreadcrumbTraceCollector:
             self.__entry_sizes.clear()
             self.__retained_bytes = 0
             self.__last_signature = None
+            self.__coalesce_entries.clear()
             self.__last_failure_entry = None
             self.__last_failure_version = None
             self.__last_reset_version = self.__version
@@ -736,12 +743,12 @@ class BreadcrumbTraceCollector:
             self.__window_truncated_pending = False
             return {"cleared": True, "scope": "all", "cleared_count": cleared_count, "version": self.__version}
 
-    def record(self, source: str, message: str, details: object = None, **metadata: Any) -> None:
+    def record(self, source: str, message: str, details: object = None, **metadata: Any) -> str:
         enabled = self.is_enabled()
         if not enabled:
-            return
+            return "disabled"
         self.__drain_external_records_if_due(limit=self.__max_entries)
-        self.__record_entry(source, message, details, allow_when_disabled=True, **metadata)
+        return self.__record_entry(source, message, details, allow_when_disabled=True, **metadata)
 
     def __record_entry(
         self,
@@ -750,9 +757,9 @@ class BreadcrumbTraceCollector:
         details: object = None,
         allow_when_disabled: bool = False,
         **metadata: Any,
-    ) -> None:
+    ) -> str:
         if not allow_when_disabled and not self.is_enabled():
-            return
+            return "disabled"
 
         created_ns = metadata.pop("created_ns", None)
         created_ms = metadata.pop("created_ms", None)
@@ -773,6 +780,12 @@ class BreadcrumbTraceCollector:
         level = metadata.pop("level", "info")
         worker_policy_revision = metadata.pop("worker_policy_revision", None)
         worker_policy_epoch = metadata.pop("worker_policy_epoch", None)
+        # Producers may supply a privacy-safe, opaque semantic signature for
+        # collector-owned coalescing. It is intentionally consumed here and
+        # never retained or exported with the breadcrumb.
+        coalesce_key = metadata.pop("_coalesce_key", None)
+        if not isinstance(coalesce_key, str) or not coalesce_key:
+            coalesce_key = None
         if not isinstance(category, str):
             category = str(category)
         if not isinstance(level, str):
@@ -819,12 +832,19 @@ class BreadcrumbTraceCollector:
                 self.__policy_dropped_count += 1
                 self.__category_counter(entry)["policy_dropped"] += 1
                 self.__record_gap_range(self.__version, self.__version, "policy")
-                return
+                return "dropped"
             self.__accepted_count += 1
             self.__category_counter(entry)["admitted"] += 1
-            signature = self.__signature(entry)
-            if self.__entries and signature == self.__last_signature:
-                last_entry = self.__entries[-1]
+            signature = self.__signature(entry, coalesce_key)
+            coalesced_entry = self.__coalesce_entries.get(signature) if coalesce_key is not None else None
+            coalesced_index = next(
+                (index for index, candidate in enumerate(self.__entries) if candidate is coalesced_entry),
+                None,
+            )
+            if self.__entries and (signature == self.__last_signature or coalesced_index is not None):
+                if coalesced_index is None:
+                    coalesced_index = len(self.__entries) - 1
+                last_entry = self.__entries[coalesced_index]
                 last_entry["repeat_count"] = last_entry.get("repeat_count", 1) + 1
                 last_entry["last_seen_ms"] = created_ms
                 last_entry["last_seen_ns"] = created_ns
@@ -832,15 +852,15 @@ class BreadcrumbTraceCollector:
                 self.__coalesced_count += 1
                 self.__category_counter(last_entry)["coalesced"] += 1
                 last_entry["last_seen_version"] = self.__version
-                old_size = self.__entry_sizes[-1]
+                old_size = self.__entry_sizes[coalesced_index]
                 new_size = self.__estimate_entry_bytes(last_entry)
-                self.__entry_sizes[-1] = new_size
+                self.__entry_sizes[coalesced_index] = new_size
                 self.__retained_bytes += new_size - old_size
                 if event_type == "failure":
                     self.__last_failure_entry = copy.deepcopy(last_entry)
                     self.__last_failure_version = self.__version
                 self.__evict_to_budget()
-                return
+                return "retained" if self.__entry_range_is_retained(self.__version) else "dropped"
 
             self.__version += 1
             entry["version"] = self.__version
@@ -854,15 +874,26 @@ class BreadcrumbTraceCollector:
                 self.__oversized_dropped_count += 1
                 self.__category_counter(entry)["oversized_dropped"] += 1
                 self.__record_gap_range(self.__version, self.__version, "oversized")
-                return
+                return "dropped"
             self.__entries.append(entry)
             self.__entry_sizes.append(entry_size)
             self.__retained_bytes += entry_size
             self.__last_signature = signature
+            if coalesce_key is not None:
+                self.__coalesce_entries[signature] = entry
             if event_type == "failure":
                 self.__last_failure_entry = copy.deepcopy(entry)
                 self.__last_failure_version = self.__version
             self.__evict_to_budget()
+            return "retained" if self.__entry_range_is_retained(self.__version) else "dropped"
+
+    def __entry_range_is_retained(self, version: int) -> bool:
+        return any(
+            int(entry.get("version", 0)) <= version <= int(
+                entry.get("last_seen_version", entry.get("version", 0)),
+            )
+            for entry in self.__entries
+        )
 
     @staticmethod
     def __entry_matches(entry: Mapping[str, Any], filters: Mapping[str, Any]) -> bool:
@@ -925,6 +956,9 @@ class BreadcrumbTraceCollector:
             evicted_size = self.__entry_sizes[chosen_index]
             del self.__entries[chosen_index]
             del self.__entry_sizes[chosen_index]
+            for signature, candidate in tuple(self.__coalesce_entries.items()):
+                if candidate is evicted:
+                    del self.__coalesce_entries[signature]
             self.__retained_bytes -= evicted_size
             self.__evicted_count += 1
             self.__category_counter(evicted)["evicted"] += 1
@@ -1364,7 +1398,9 @@ class BreadcrumbTraceCollector:
             "window_entry_count": len(recent_entries),
         }
 
-    def __signature(self, entry: Dict[str, Any]) -> str:
+    def __signature(self, entry: Dict[str, Any], coalesce_key: Optional[str] = None) -> str:
+        if coalesce_key is not None:
+            return "coalesce:" + coalesce_key
         signature_payload = {
             "source": entry["source"],
             "category": entry.get("category"),
@@ -1518,6 +1554,7 @@ class BreadcrumbTraceCollector:
                 file_id=metadata.get("file_id"),
                 path_pair_id=metadata.get("path_pair_id"),
                 path_pair_name=metadata.get("path_pair_name"),
+                _coalesce_key=metadata.get("_coalesce_key"),
                 worker_policy_revision=revision,
                 worker_policy_epoch=epoch,
                 created_ns=record_mapping.get("created_ns"),

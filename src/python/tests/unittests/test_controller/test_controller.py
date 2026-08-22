@@ -39,6 +39,7 @@ from common.performance_diagnostics import (
     PerformanceDiagnosticsCollector,
 )
 from common.exclude_patterns import ExactPathExclusion
+from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation
 from common.path_pair import PathPair
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import IModelListener, Model, ModelDiff, ModelError, ModelFile
@@ -5675,6 +5676,30 @@ class TestController(unittest.TestCase):
         failed_callback.on_success.assert_not_called()
         retried_callback.on_success.assert_called_once_with()
 
+    def test_process_commands_queue_sync_backend_false_is_a_rejection_trace(self):
+        file = ModelFile("sync-rejected", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.queue.return_value = False
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        callback = MagicMock()
+
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        callback.on_failure.assert_called_once_with("Transfer backend error: Transfer backend rejected queue request", 500)
+        time.sleep(0.05)
+        entry = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "queue_dispatch"
+        )
+        self.assertEqual("queue_dispatch", entry["message"])
+        self.assertEqual("backend_rejection", entry["details"]["future_outcome"])
+        self.assertEqual("backend_rejected", entry["details"]["reason"])
+
     def test_process_commands_queue_pending_guard_clears_after_authoritative_lifecycle_exit(self):
         file = ModelFile("lifecycle", False)
         file.remote_size = 10
@@ -5775,6 +5800,8 @@ class TestController(unittest.TestCase):
         file = ModelFile("accepted-queue", False)
         future = Future()
         future.set_result(None)
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
         self.controller._Controller__pending_queue_dispatches = {
             file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
         }
@@ -5782,10 +5809,35 @@ class TestController(unittest.TestCase):
             _LftpOperation("queue", future, file.file_id, 1),
         ]
 
+        self.controller._Controller__drain_lftp_operations()
         retired = self.controller._reconcile_pending_queue_dispatches_from_fresh_status([])
 
         self.assertEqual({(file.name, None, None)}, retired)
         self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+        time.sleep(0.05)
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(
+            {"queue_future_outcome", "queue_status_ack"},
+            {entry["message"] for entry in entries},
+        )
+        self.assertEqual(1, len({entry["flow_id"] for entry in entries}))
+        self.assertEqual("success", next(
+            entry for entry in entries if entry["message"] == "queue_future_outcome"
+        )["details"]["future_outcome"])
+
+    def test_pending_autoqueue_dispatch_with_other_active_status_stays_ambiguous(self):
+        file = ModelFile("fallback-autoqueue", False)
+        self.controller._Controller__pending_queue_dispatches = {
+            file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
+        }
+        unrelated = LftpJobStatus(
+            2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "other-active", "",
+        )
+
+        retired = self.controller._reconcile_pending_queue_dispatches_from_fresh_status([unrelated])
+
+        self.assertEqual(set(), retired)
+        self.assertIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
 
     def test_fresh_idle_failed_or_cancelled_queue_dispatch_does_not_handoff_completion(self):
         for cancelled in (False, True):
@@ -7696,6 +7748,86 @@ class TestController(unittest.TestCase):
 
             self.assertEqual(_MoveMutationOutcome.UNCERTAIN, tracker.outcome)
 
+    def test_regular_fallback_missing_destination_parent_after_temporary_creation_is_private_and_source_safe(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=32)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "staging")
+            final_root = os.path.join(temp_dir, "final")
+            residue_root = os.path.join(temp_dir, "residue")
+            os.mkdir(staging_root)
+            os.mkdir(final_root)
+            os.mkdir(residue_root)
+            source = os.path.join(staging_root, "sample-file.bin")
+            destination = os.path.join(final_root, "sample-file.bin")
+            temporary_path = os.path.join(residue_root, "temporary.bin")
+            Path(source).write_bytes(b"payload")
+            Path(temporary_path).write_bytes(b"payload")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            file_id = ModelFile.build_file_id("sample-file.bin", None)
+            rename_calls = 0
+
+            def disappear_destination_parent(_source: str, _destination: str) -> None:
+                nonlocal rename_calls
+                rename_calls += 1
+                if rename_calls == 1:
+                    raise OSError(errno.EINVAL, "capability fallback")
+                os.rmdir(final_root)
+                raise OSError(errno.ENOENT, "destination parent disappeared")
+
+            def preserve_temporary_residue(path: str) -> None:
+                if path == temporary_path:
+                    raise OSError(errno.EACCES, "temporary cleanup denied")
+                os.unlink(path)
+
+            with patch.object(
+                    Controller, "_Controller__rename_no_replace",
+                    side_effect=disappear_destination_parent), \
+                    patch.object(
+                        Controller, "_Controller__copy_to_publish_temporary",
+                        return_value=(temporary_path, None),
+                    ), \
+                    patch("controller.controller.os.unlink", side_effect=preserve_temporary_residue):
+                result = self.controller._Controller__move_from_staging("sample-file.bin")
+
+            os.unlink(temporary_path)
+
+            self.assertEqual(Controller.MoveFromStagingResult.FAILED, result)
+            self.assertTrue(os.path.exists(source))
+            self.assertFalse(os.path.exists(destination))
+            entries = trace.snapshot()["entries"]
+            self.assertEqual(
+                ["fallback", "create_temporary", "copy", "publish", "cleanup"],
+                [entry["details"]["phase"] for entry in entries],
+            )
+            publish_details = entries[-2]["details"]
+            self.assertEqual("enoent", publish_details["errno_class"])
+            self.assertTrue(publish_details["temporary_created"])
+            self.assertFalse(publish_details["destination_parent_exists"])
+            self.assertTrue(publish_details["source_exists"])
+            self.assertFalse(publish_details["destination_exists"])
+            self.assertTrue(publish_details["residue_present"])
+            cleanup_details = entries[-1]["details"]
+            self.assertEqual("permission", cleanup_details["errno_class"])
+            self.assertTrue(cleanup_details["residue_present"])
+            self.assertTrue(cleanup_details["temporary_created"])
+            self.assertEqual("final_move.publication", entries[-1]["category"])
+            self.assertEqual("final_move_publication", entries[-1]["stage"])
+            self.assertEqual("info", entries[-1]["level"])
+            self.assertEqual(opaque_trace_correlation(file_id), entries[-1]["corr_id"])
+            for entry in entries:
+                self.assertNotIn("sample-file.bin", str(entry))
+                self.assertNotIn(file_id, str(entry))
+                self.assertTrue({
+                    "phase", "operation", "side", "errno_class", "mutation_state",
+                }.issubset(entry["details"]))
+                self.assertTrue(set(entry["details"]).issubset({
+                    "phase", "operation", "side", "errno_class", "mutation_state",
+                    "temporary_created", "residue_present", "source_exists",
+                    "destination_parent_exists", "destination_exists",
+                }))
+
     def test_collision_sidecar_partial_write_retains_uncertain_mutation_outcome(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             tracker = _MoveMutationTracker()
@@ -7842,6 +7974,269 @@ class TestController(unittest.TestCase):
         move.assert_not_called()
         self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result)
         self.controller._Controller__local_scan_process.force_scan.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix" and os.path.isdir("/proc/self/fd"),
+                         "child finalization requires descriptor-anchored POSIX directories")
+    def test_directory_move_publishes_verified_complete_child_while_sibling_remains_incomplete(self):
+        """A directory transfer must not make one completed child wait for another.
+
+        The fixture uses the ordinary LFTP sidecar shape: ``complete.bin`` is
+        a completed remote leaf and ``incomplete.bin.lftp`` is an unresolved
+        sibling.  The incomplete artifact must remain in staging, while the
+        completed child becomes visible at its final relative path.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release")
+            completed_source = os.path.join(source_tree, "complete.bin")
+            incomplete_source = os.path.join(source_tree, "incomplete.bin.lftp")
+            completed_destination = os.path.join(final_root, "release", "complete.bin")
+            os.makedirs(source_tree)
+            os.makedirs(final_root)
+            Path(completed_source).write_bytes(b"complete")
+            Path(incomplete_source).write_bytes(b"partial")
+
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            self.controller._Controller__model_builder.is_remote_leaf_path.side_effect = \
+                lambda _file_id, relative_path: relative_path in {"complete.bin", "incomplete.bin"}
+
+            result = self.controller._finalize_staging_child("release", "complete.bin")
+
+            self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
+            self.assertEqual(b"complete", Path(completed_destination).read_bytes())
+            self.assertTrue(os.path.exists(incomplete_source))
+            self.assertFalse(os.path.exists(os.path.join(final_root, "release", "incomplete.bin")))
+            self.assertNotIn("release", self.controller._Controller__persist.final_move_succeeded_file_names)
+            self.assertNotIn("release", self.controller._Controller__persist.downloaded_file_names)
+
+    def test_directory_child_finalization_rechecks_parent_stop_before_move(self):
+        self.controller._Controller__is_explicitly_stopped = MagicMock(return_value=True)
+        self.controller._Controller__move_from_staging = MagicMock()
+
+        result = self.controller._finalize_staging_child("release", "complete.bin")
+
+        self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result)
+        self.controller._Controller__move_from_staging.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix" and os.path.isdir("/proc/self/fd"),
+                         "child finalization requires descriptor-anchored POSIX directories")
+    def test_directory_child_finalization_retries_without_root_markers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            os.makedirs(os.path.join(staging_root, "release"))
+            os.mkdir(final_root)
+            Path(os.path.join(staging_root, "release", "complete.bin")).write_bytes(b"staged")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            self.controller._Controller__is_explicitly_stopped = MagicMock(return_value=False)
+            self.controller._Controller__move_from_staging = MagicMock(
+                return_value=Controller.MoveFromStagingResult.FAILED,
+            )
+            child_id = ModelFile.build_file_id("release/complete.bin", None)
+
+            self.assertEqual(
+                Controller.MoveFromStagingResult.FAILED,
+                self.controller._finalize_staging_child("release", "complete.bin"),
+            )
+            self.assertEqual(1, self.controller._Controller__child_final_move_failure_counts[child_id])
+            self.assertEqual(
+                Controller.MoveFromStagingResult.DEFERRED,
+                self.controller._finalize_staging_child("release", "complete.bin"),
+            )
+            self.controller._Controller__move_from_staging.assert_called_once()
+            self.assertNotIn("release", self.controller._Controller__persist.final_move_succeeded_file_names)
+
+    @unittest.skipUnless(os.name == "posix" and os.path.isdir("/proc/self/fd"),
+                         "child finalization requires descriptor-anchored POSIX directories")
+    def test_directory_child_finalization_refuses_existing_destination_without_root_marker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            os.makedirs(os.path.join(staging_root, "release"))
+            os.makedirs(os.path.join(final_root, "release"))
+            Path(os.path.join(staging_root, "release", "complete.bin")).write_bytes(b"staged")
+            Path(os.path.join(final_root, "release", "complete.bin")).write_bytes(b"existing")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            result = self.controller._finalize_staging_child("release", "complete.bin")
+
+            self.assertEqual(Controller.MoveFromStagingResult.CONFLICT, result)
+            self.assertEqual(b"existing", Path(os.path.join(final_root, "release", "complete.bin")).read_bytes())
+            self.assertTrue(os.path.exists(os.path.join(staging_root, "release", "complete.bin")))
+            self.assertNotIn("release", self.controller._Controller__persist.final_move_succeeded_file_names)
+
+    @unittest.skipUnless(os.name == "posix" and os.path.isdir("/proc/self/fd"),
+                         "descriptor race coverage requires POSIX procfs")
+    def test_directory_child_finalization_held_parent_does_not_follow_substituted_symlink(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            outside_root = os.path.join(temp_dir, "outside")
+            os.makedirs(os.path.join(staging_root, "release"))
+            os.makedirs(os.path.join(final_root, "release"))
+            os.mkdir(outside_root)
+            Path(os.path.join(staging_root, "release", "complete.bin")).write_bytes(b"staged")
+            source_fd = self.controller._Controller__open_contained_finalization_parent(
+                staging_root, ["release"], False,
+            )
+            destination_fd = self.controller._Controller__open_contained_finalization_parent(
+                final_root, ["release"], True,
+            )
+            self.assertIsNotNone(source_fd)
+            self.assertIsNotNone(destination_fd)
+            held_destination = os.path.join(final_root, "held-release")
+            os.rename(os.path.join(final_root, "release"), held_destination)
+            os.symlink(outside_root, os.path.join(final_root, "release"))
+            try:
+                result = self.controller._Controller__move_from_staging(
+                    "release/complete.bin",
+                    anchored_paths=(
+                        staging_root,
+                        final_root,
+                        os.path.join("/proc/self/fd", str(source_fd), "complete.bin"),
+                        os.path.join("/proc/self/fd", str(destination_fd), "complete.bin"),
+                    ),
+                )
+            finally:
+                os.close(source_fd)
+                os.close(destination_fd)
+
+            self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
+            self.assertFalse(os.path.exists(os.path.join(outside_root, "complete.bin")))
+            self.assertEqual(b"staged", Path(os.path.join(held_destination, "complete.bin")).read_bytes())
+
+    def test_child_finalization_parent_fails_closed_without_no_follow_capability(self):
+        with patch("controller.controller.os.name", "posix"), \
+                patch("controller.controller.os.path.isdir", return_value=True), \
+                patch("controller.controller.os.O_NOFOLLOW", None, create=True), \
+                patch("controller.controller.os.open") as open_file:
+            descriptor = self.controller._Controller__open_contained_finalization_parent(
+                "/generic-root", ["child"], True,
+            )
+
+        self.assertIsNone(descriptor)
+        open_file.assert_not_called()
+
+    def test_child_finalization_parent_closes_held_descriptor_after_traversal_failure(self):
+        with patch("controller.controller.os.name", "posix"), \
+                patch("controller.controller.os.path.isdir", return_value=True), \
+                patch("controller.controller.os.O_DIRECTORY", 0x10000, create=True), \
+                patch("controller.controller.os.O_NOFOLLOW", 0x20000, create=True), \
+                patch("controller.controller.os.open", side_effect=[41, OSError("traversal failed")]) as open_file, \
+                patch("controller.controller.os.mkdir") as make_directory, \
+                patch("controller.controller.os.close") as close_file, \
+                patch("controller.controller.os.supports_dir_fd") as supports_dir_fd:
+            supports_dir_fd.__contains__.return_value = True
+            descriptor = self.controller._Controller__open_contained_finalization_parent(
+                "/generic-root", ["child"], True,
+            )
+
+        self.assertIsNone(descriptor)
+        close_file.assert_called_once_with(41)
+
+    def test_child_finalization_terminal_failure_count_prevents_reservation(self):
+        child_id = ModelFile.build_file_id("release/complete.bin", None)
+        self.controller._Controller__child_final_move_failure_counts = {child_id: 4}
+        self.controller._reserve_move_attempt = MagicMock()
+
+        result = self.controller._finalize_staging_child("release", "complete.bin")
+
+        self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result)
+        self.controller._reserve_move_attempt.assert_not_called()
+
+    def test_child_finalization_containment_failure_is_accounted(self):
+        self.controller._Controller__is_explicitly_stopped = MagicMock(return_value=False)
+        self.controller._Controller__resolve_safe_final_move_paths = MagicMock(return_value=None)
+        child_id = ModelFile.build_file_id("release/complete.bin", None)
+
+        result = self.controller._finalize_staging_child("release", "complete.bin")
+
+        self.assertEqual(Controller.MoveFromStagingResult.FAILED, result)
+        self.assertEqual(1, self.controller._Controller__child_final_move_failure_counts[child_id])
+
+    def test_child_finalization_new_root_lifecycle_clears_descendant_retry_state(self):
+        child_id = ModelFile.build_file_id("release/complete.bin", None)
+        self.controller._Controller__child_final_move_failure_counts = {child_id: 2}
+        self.controller._Controller__child_final_move_retry_due = {child_id: datetime.now()}
+
+        self.controller._Controller__advance_transfer_lifecycle("release")
+
+        self.assertEqual({}, self.controller._Controller__child_final_move_failure_counts)
+        self.assertEqual({}, self.controller._Controller__child_final_move_retry_due)
+
+    def test_child_finalization_prunes_state_when_candidate_disappears(self):
+        child_id = ModelFile.build_file_id("release/complete.bin", None)
+        self.controller._Controller__child_final_move_failure_counts = {child_id: 1}
+        self.controller._Controller__child_final_move_retry_due = {child_id: datetime.now()}
+
+        self.controller._prune_child_finalization_retry_state(set())
+
+        self.assertEqual({}, self.controller._Controller__child_final_move_failure_counts)
+        self.assertEqual({}, self.controller._Controller__child_final_move_retry_due)
+
+    @unittest.skipUnless(os.name == "posix" and os.path.isdir("/proc/self/fd"),
+                         "descriptor-anchored child source check requires POSIX procfs")
+    def test_child_finalization_rejects_directory_source_leaf(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            os.makedirs(os.path.join(staging_root, "release", "complete.bin"))
+            os.mkdir(final_root)
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            result = self.controller._finalize_staging_child("release", "complete.bin")
+
+            self.assertEqual(Controller.MoveFromStagingResult.FAILED, result)
+
+    @unittest.skipUnless(os.name == "posix" and os.path.isdir("/proc/self/fd"),
+                         "descriptor-anchored child source check requires POSIX procfs")
+    def test_child_finalization_accounts_runtime_move_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            os.makedirs(os.path.join(staging_root, "release"))
+            os.mkdir(final_root)
+            Path(os.path.join(staging_root, "release", "complete.bin")).write_bytes(b"staged")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            self.controller._Controller__move_from_staging = MagicMock(side_effect=RuntimeError("generic failure"))
+
+            result = self.controller._finalize_staging_child("release", "complete.bin")
+
+            self.assertEqual(Controller.MoveFromStagingResult.FAILED, result)
+            self.assertEqual(1, self.controller._Controller__child_final_move_failure_counts[
+                ModelFile.build_file_id("release/complete.bin", None)
+            ])
+
+    @unittest.skipUnless(os.name == "posix" and os.path.isdir("/proc/self/fd"),
+                         "descriptor-anchored child source check requires POSIX procfs")
+    def test_child_finalization_missing_source_with_regular_destination_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            os.makedirs(os.path.join(staging_root, "release"))
+            os.makedirs(os.path.join(final_root, "release"))
+            Path(os.path.join(final_root, "release", "complete.bin")).write_bytes(b"published")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            result = self.controller._finalize_staging_child("release", "complete.bin")
+
+            self.assertEqual(Controller.MoveFromStagingResult.ALREADY_COMPLETED, result)
+
+    def test_child_finalization_lifecycle_reset_removes_orphan_due_entry(self):
+        child_id = ModelFile.build_file_id("release/complete.bin", None)
+        self.controller._Controller__child_final_move_failure_counts = {}
+        self.controller._Controller__child_final_move_retry_due = {child_id: datetime.now()}
+
+        self.controller._Controller__advance_transfer_lifecycle("release")
+
+        self.assertEqual({}, self.controller._Controller__child_final_move_retry_due)
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_allows_directory_with_remote_lftp_payload_name(self, move):
@@ -8864,6 +9259,122 @@ class TestController(unittest.TestCase):
             ],
             exclusions,
         )
+
+    def test_fractional_queue_exclusion_serialization_trace_is_target_correlated(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__exclude_patterns = "*.nfo"
+        self.controller._Controller__model_builder.get_trusted_final_leaf_paths.return_value = (
+            "existing.bin", "nested/other.bin",
+        )
+
+        exclusions = self.controller._Controller__transfer_exclude_patterns("sample-directory", True)
+
+        self.assertEqual(
+            ["*.nfo", ExactPathExclusion("existing.bin"), ExactPathExclusion("nested/other.bin")],
+            exclusions,
+        )
+        time.sleep(0.05)
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertEqual("queue_exclusion_serialization", entry["message"])
+        details = entry["details"]
+        self.assertEqual("fractional_mtime_redownload.queue_exclusion_serialization.v2", details["schema"])
+        self.assertTrue(details["configured_patterns_present"])
+        self.assertTrue(details["exact_leaf_candidates_present"])
+        self.assertTrue(details["exact_exclusions_serialized"])
+        self.assertFalse(details["serialization_skipped"])
+        self.assertTrue(details["serialized_exclusions_present"])
+        self.assertNotIn("configured_pattern_count", details)
+        self.assertNotIn("exact_leaf_candidate_count", details)
+        self.assertNotIn("exact_leaf_serialized_count", details)
+        self.assertNotIn("exact_leaf_serialization_skipped_count", details)
+        self.assertNotIn("serialized_exclusion_count", details)
+        self.assertNotIn("exact_leaf_candidates", details)
+        self.assertEqual(1, len(trace.snapshot(corr_id=entry["corr_id"])["entries"]))
+        self.assertIsNone(entry["file_id"])
+        self.assertNotIn("sample-directory", str(entry))
+        self.assertNotIn("existing.bin", str(entry))
+
+    def test_fractional_queue_file_exclusion_trace_reports_configured_only(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__exclude_patterns = "*.nfo"
+
+        self.assertEqual(
+            "*.nfo",
+            self.controller._Controller__transfer_exclude_patterns("sample-file", False),
+        )
+
+        time.sleep(0.05)
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(1, len(entries))
+        details = entries[0]["details"]
+        self.assertFalse(details["exact_leaf_candidates_present"])
+        self.assertTrue(details["configured_patterns_present"])
+        self.assertFalse(details["exact_exclusions_serialized"])
+        self.assertTrue(details["serialized_exclusions_present"])
+        self.assertEqual("configured_only", details["result"])
+
+    def test_fractional_queue_trace_carries_opaque_operation_flow_id(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        flow_id = self.controller._Controller__fractional_queue_flow_id("sample-file", 7)
+
+        self.assertIsNotNone(flow_id)
+        self.controller._Controller__record_fractional_queue_trace(
+            "sample-file",
+            "queue_dispatch",
+            {
+                "schema": "fractional_mtime_redownload.queue_dispatch.v2",
+                "dispatch_mode": "sync_backend",
+                "future_outcome": "not_applicable",
+                "status_acknowledgement": "pending",
+                "exclusions_present": False,
+                "result": "submitted",
+            },
+            flow_id=flow_id,
+        )
+
+        time.sleep(0.05)
+        entry = trace.snapshot()["entries"][0]
+        self.assertEqual(flow_id, entry["flow_id"])
+        self.assertNotIn("sample-file", entry["flow_id"])
+
+    def test_fractional_queue_trace_is_silent_when_breadcrumbs_are_disabled(self):
+        trace = BreadcrumbTraceCollector(lambda: False, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__exclude_patterns = "*.nfo"
+        self.controller._Controller__model_builder.get_trusted_final_leaf_paths.return_value = ("existing.bin",)
+
+        self.controller._Controller__transfer_exclude_patterns("sample-directory", True)
+
+        time.sleep(0.05)
+        self.assertEqual([], trace.snapshot()["entries"])
+
+    def test_fractional_queue_trace_does_not_evaluate_lazy_details_when_disabled(self):
+        trace = BreadcrumbTraceCollector(lambda: False, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        factories = {
+            event: MagicMock(side_effect=AssertionError("disabled trace built details"))
+            for event in (
+                "queue_dispatch",
+                "startup_recovery_queue_dispatch",
+                "queue_future_outcome",
+                "queue_status_ack",
+            )
+        }
+
+        for event, details_factory in factories.items():
+            self.controller._Controller__record_fractional_queue_trace(
+                "sample-directory",
+                event,
+                details_factory,
+            )
+
+        for details_factory in factories.values():
+            details_factory.assert_not_called()
 
     def test_transfer_exclusions_fail_closed_for_unknown_pair_with_retained_scan_snapshot(self):
         base_mtime_ns = 1_786_400_003_000_000_000
@@ -10637,7 +11148,11 @@ class TestController(unittest.TestCase):
 
         remote_file = SimpleNamespace(name="movie.mkv", path_pair_id=None, is_dir=False)
         with patch("controller.controller.os.listdir", return_value=["movie.mkv.lftp"]), \
-                patch.object(Controller, "_Controller__safe_recovery_staging_entry", side_effect=lambda root, name, _is_dir: os.path.join(root, name)):
+                patch.object(Controller, "_Controller__safe_recovery_staging_entry", side_effect=lambda root, name, _is_dir: os.path.join(root, name)), \
+                patch.object(
+                    self.controller, "_Controller__transfer_exclude_patterns",
+                    wraps=self.controller._Controller__transfer_exclude_patterns,
+                ) as exclude_patterns:
             self.controller._Controller__recover_interrupted_downloads([remote_file])
 
         self.assertTrue(self.controller._Controller__startup_recovery_done)
@@ -10647,6 +11162,7 @@ class TestController(unittest.TestCase):
             remote_base_dir_path=None,
             local_base_dir_path="/local/incomplete"
         )
+        self.assertIsNotNone(exclude_patterns.call_args.args[2])
         self.assertEqual({}, self.controller._Controller__download_start_state)
 
     def test_recover_interrupted_downloads_uses_async_owner_for_real_lftp(self):
@@ -10672,6 +11188,46 @@ class TestController(unittest.TestCase):
         self.assertIn(file_id, self.controller._Controller__pending_queue_dispatches)
         release.set()
         self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+    def test_recovery_queue_trace_correlates_serialization_dispatch_future_and_status(self):
+        self.controller._Controller__persist.downloaded_file_names = set()
+        self.controller._Controller__lftp.backend_name = "lftp"
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        remote_file = SimpleNamespace(name="movie.mkv", path_pair_id=None, is_dir=False)
+        with patch("controller.controller.os.listdir", return_value=["movie.mkv.lftp"]), \
+                patch.object(
+                    Controller, "_Controller__safe_recovery_staging_entry",
+                    side_effect=lambda root, name, _is_dir: os.path.join(root, name),
+                ):
+            self.controller._Controller__recover_interrupted_downloads([remote_file])
+
+        deadline = time.monotonic() + 1
+        while self.controller._Controller__lftp_operations and time.monotonic() < deadline:
+            self.controller._Controller__drain_lftp_operations()
+            time.sleep(0.01)
+        self.controller._reconcile_pending_queue_dispatches_from_fresh_status([])
+
+        time.sleep(0.05)
+        entries = trace.snapshot()["entries"]
+        selected = [
+            entry for entry in entries if entry["message"] in {
+                "queue_exclusion_serialization",
+                "startup_recovery_queue_dispatch",
+                "queue_future_outcome",
+                "queue_status_ack",
+            }
+        ]
+        self.assertEqual(
+            {
+                "queue_exclusion_serialization",
+                "startup_recovery_queue_dispatch",
+                "queue_future_outcome",
+                "queue_status_ack",
+            },
+            {entry["message"] for entry in selected},
+        )
+        self.assertEqual(1, len({entry["flow_id"] for entry in selected}))
 
     def test_recovery_async_queue_abandons_pre_queue_idle_status_for_post_queue_poll(self):
         class TrackingFuture(Future):

@@ -695,6 +695,24 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertTrue(any(gap["reason"] == "evicted" for gap in payload["gaps"]))
         self.assertLessEqual(payload["retained_bytes"], 10_000)
 
+    def test_record_reports_dropped_when_budget_evicts_the_new_event(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=1, memory_budget_bytes=10_000)
+        self.assertEqual(
+            "retained",
+            collector.record(
+                "controller", "failure", event_type="failure",
+                category="queue.exclusion", level="error",
+            ),
+        )
+        self.assertEqual(
+            "dropped",
+            collector.record("controller", "ordinary", event_type="diagnostic", category="queue.exclusion"),
+        )
+
+        payload = collector.query_events(since_version=0)
+        self.assertEqual(["failure"], [event["message"] for event in payload["events"]])
+        self.assertTrue(any(gap["reason"] == "evicted" for gap in payload["gaps"]))
+
     def test_scoped_clear_does_not_reset_policy_and_export_is_bounded(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=None)
         collector.apply_policy({"default": "debug"})

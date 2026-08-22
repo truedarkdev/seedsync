@@ -134,6 +134,8 @@ class ModelBuilder:
     # evict the rare transition being diagnosed.
     __STOP_RESUME_TRACE_SIGNATURE_CACHE_SIZE = 1024
 
+    __QUEUE_EXCLUSION_TRACE_SCHEMA = "fractional_mtime_redownload.queue_exclusion.v2"
+
     def __init__(self):
         self.logger = logging.getLogger("ModelBuilder")
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
@@ -654,16 +656,290 @@ class ModelBuilder:
         return enabled
 
     @staticmethod
+    def __queue_exclusion_mtime_category(
+            remote_file: SystemFile, local_file: Optional[SystemFile],
+    ) -> str:
+        """Classify the mtime comparison used by Queue's exact exclusion gate."""
+        if local_file is None or remote_file.is_dir != local_file.is_dir:
+            return "missing"
+        local_mtime_ns = local_file.mtime_ns
+        remote_mtime_ns = remote_file.mtime_ns
+        if type(local_mtime_ns) is not int or type(remote_mtime_ns) is not int:
+            return "missing"
+        if local_mtime_ns == remote_mtime_ns:
+            return "exact"
+        if local_mtime_ns % 1_000_000_000 == 0 and \
+                local_mtime_ns // 1_000_000_000 == remote_mtime_ns // 1_000_000_000:
+            return "portable_second_match"
+        return "raw_mismatch"
+
+    @staticmethod
+    def __queue_exclusion_trace_empty_counts() -> dict[str, int]:
+        return {
+            "remote_leaf_count": 0,
+            "local_leaf_count": 0,
+            "remote_only_leaf_count": 0,
+            "local_only_leaf_count": 0,
+            "staging_sibling_leaf_count": 0,
+            "staging_candidate_leaf_count": 0,
+            "excluded_leaf_count": 0,
+            "rejected_leaf_count": 0,
+            "collision_rejected_leaf_count": 0,
+            "size_mismatch_leaf_count": 0,
+            "type_mismatch_leaf_count": 0,
+            "status_sidecar_leaf_count": 0,
+        }
+
+    @staticmethod
+    def __queue_trace_presence(counts: dict[str, int]) -> dict[str, bool]:
+        return {
+            "{}_present".format(key.removesuffix("_count")): value > 0
+            for key, value in counts.items()
+        }
+
+    def __record_queue_exclusion_trace(
+            self, file_id: str, details: dict[str, object],
+    ) -> None:
+        """Emit one bounded, identity-free Queue exclusion decision."""
+        if not self.__is_stop_resume_trace_enabled():
+            return
+        breadcrumb = self.__stop_resume_trace_breadcrumb
+        if breadcrumb is None:
+            return
+        correlation = "fractional-mtime:{}".format(opaque_trace_correlation(file_id))
+        try:
+            breadcrumb.record(
+                "model_builder",
+                "queue_exclusion_decision",
+                details,
+                stage="queue_exclusion",
+                event_type="diagnostic",
+                category="queue.exclusion",
+                level="info",
+                corr_id=correlation,
+                trace_scope="flow",
+            )
+        except Exception:
+            self.logger.debug("Ignoring Queue exclusion breadcrumb failure", exc_info=True)
+
+    @staticmethod
     def __state_category(model_file: ModelFile) -> str:
         state = getattr(model_file, "state", None)
         name = getattr(state, "name", None)
         return name.lower() if isinstance(name, str) else "unknown"
+
+    @staticmethod
+    def __root_trace_coverage_categories(
+            remote_file: Optional[SystemFile], local_file: Optional[SystemFile],
+    ) -> dict[str, int]:
+        """Summarize root coverage without retaining names or file identities."""
+        counts = {
+            "remote_leaf_count": 0,
+            "covered_remote_leaf_count": 0,
+            "collision_node_count": 0,
+            "unmatched_staging_leaf_count": 0,
+            "type_mismatch_count": 0,
+        }
+
+        def staging_leaf_count(candidate: Optional[SystemFile]) -> int:
+            if candidate is None or not ModelBuilder.__has_staging_descendant(candidate):
+                return 0
+            if not candidate.is_dir:
+                return 1 if candidate.is_staging else 0
+            children = tuple(candidate.iter_children())
+            if not children:
+                return 1 if candidate.is_staging else 0
+            return sum(staging_leaf_count(child) for child in children)
+
+        def visit(
+                remote: Optional[SystemFile], local: Optional[SystemFile],
+                ancestor_has_collision: bool = False,
+        ) -> None:
+            if local is not None and local.has_staging_collision:
+                counts["collision_node_count"] += 1
+            has_collision = ancestor_has_collision or bool(
+                getattr(local, "has_staging_collision", False)
+            )
+            if remote is None:
+                counts["unmatched_staging_leaf_count"] += staging_leaf_count(local)
+                return
+            if not remote.is_dir:
+                counts["remote_leaf_count"] += 1
+                if local is not None and remote.is_dir == local.is_dir and \
+                        not has_collision and local.size >= remote.size:
+                    counts["covered_remote_leaf_count"] += 1
+                if local is not None and remote.is_dir != local.is_dir:
+                    counts["type_mismatch_count"] += 1
+                return
+            if local is None:
+                for child in remote.iter_children():
+                    visit(child, None, has_collision)
+                return
+            if remote.is_dir != local.is_dir:
+                counts["type_mismatch_count"] += 1
+                for child in remote.iter_children():
+                    visit(child, None, has_collision)
+                counts["unmatched_staging_leaf_count"] += staging_leaf_count(local)
+                return
+
+            remote_children = {child.name: child for child in remote.iter_children()}
+            local_children = {child.name: child for child in local.iter_children()}
+            for child in remote_children.values():
+                visit(child, local_children.get(child.name), has_collision)
+            for name, child in local_children.items():
+                if name not in remote_children:
+                    counts["unmatched_staging_leaf_count"] += staging_leaf_count(child)
+
+        visit(remote_file, local_file)
+        return counts
+
+    @staticmethod
+    def __root_trace_reason(
+            remote_present: bool, local_present: bool, type_mismatch: bool,
+            presentation_coverage: bool, strict_lifecycle_proof: bool,
+            explicit_stop: bool, marker_present: bool, move_failed: bool,
+            transfer_hint_present: bool,
+            collision_count: int, unmatched_staging_count: int,
+    ) -> str:
+        """Return a bounded reason enum for a default-root diagnostic."""
+        if type_mismatch:
+            return "type_mismatch"
+        if not remote_present:
+            return "remote_absent"
+        if not local_present:
+            return "local_absent"
+        if explicit_stop:
+            return "explicit_stop"
+        if move_failed:
+            return "move_failed"
+        if collision_count:
+            return "staging_collision"
+        if unmatched_staging_count:
+            return "unmatched_staging"
+        if not presentation_coverage:
+            return "presentation_coverage_incomplete"
+        if not strict_lifecycle_proof:
+            return "strict_lifecycle_unproven"
+        if marker_present:
+            return "lifecycle_marker"
+        if transfer_hint_present:
+            return "transfer_hint"
+        return "ordinary_default"
+
+    def __record_root_default_decision(
+            self,
+            file_id: str,
+            remote: Optional[SystemFile],
+            local: Optional[SystemFile],
+            status: Optional[LftpJobStatus],
+            is_stopped: bool,
+            presentation_coverage: bool,
+            strict_lifecycle_proof: bool,
+            transfer_hint_present: bool,
+            root_state: str,
+    ) -> None:
+        """Emit bounded, private evidence for an ordinary root decision."""
+        if not self.__is_stop_resume_trace_enabled():
+            return
+        coverage = self.__root_trace_coverage_categories(remote, local)
+        marker_present = (
+            file_id in (self.__downloaded_files or set()) or
+            file_id in self.__final_move_succeeded_files or
+            file_id in self.__extracted_files or
+            file_id in self.__move_failed_files
+        )
+        move_failed = root_state == "move_failed" or file_id in self.__move_failed_files
+        remote_present = remote is not None
+        local_present = local is not None
+        type_mismatch = coverage["type_mismatch_count"] > 0 or (
+            remote is not None and local is not None and remote.is_dir != local.is_dir
+        ) or (
+            status is not None and remote is not None and
+            (status.type == LftpJobStatus.Type.MIRROR) != remote.is_dir
+        ) or (
+            status is not None and local is not None and
+            (status.type == LftpJobStatus.Type.MIRROR) != local.is_dir
+        )
+        collision_count = coverage["collision_node_count"]
+        unmatched_staging_count = coverage["unmatched_staging_leaf_count"]
+        reason = self.__root_trace_reason(
+            remote_present,
+            local_present,
+            type_mismatch,
+            presentation_coverage,
+            strict_lifecycle_proof,
+            is_stopped,
+            marker_present,
+            move_failed,
+            transfer_hint_present,
+            collision_count,
+            unmatched_staging_count,
+        )
+        correlation = opaque_trace_correlation(file_id)
+        details: dict[str, object] = {
+            "schema": "model_builder.root_default_decision.v2",
+            "reason": reason,
+            "presence": {
+                "remote": remote_present,
+                "local": local_present,
+                "status": status is not None,
+            },
+            "type": {
+                "mismatch": type_mismatch,
+            },
+            "coverage": {
+                "presentation": presentation_coverage,
+                "effective_tree_proof": strict_lifecycle_proof,
+                "remote_leaves_present": coverage["remote_leaf_count"] > 0,
+                "covered_remote_leaves_present": coverage["covered_remote_leaf_count"] > 0,
+            },
+            "lifecycle": {
+                "explicit_stop": is_stopped,
+                "marker_present": marker_present,
+                "move_failed": move_failed,
+                "transfer_hint_present": transfer_hint_present,
+            },
+            "staging": {
+                "collision": collision_count > 0,
+                "unmatched": unmatched_staging_count > 0,
+            },
+            "root_state": root_state,
+        }
+        try:
+            breadcrumb = self.__stop_resume_trace_breadcrumb
+            if breadcrumb is not None:
+                breadcrumb.record(
+                    "model_builder",
+                    "root_default_decision",
+                    details,
+                    stage="model_root_default_decision",
+                    event_type="diagnostic",
+                    category="queue.exclusion",
+                    level="info",
+                    corr_id=correlation,
+                    trace_scope="flow",
+                )
+        except Exception:
+            self.logger.debug("Ignoring root default decision breadcrumb failure", exc_info=True)
 
     def __record_lifecycle_persist_breadcrumb(
             self, event: str, model_file: ModelFile, details: dict[str, object],
     ) -> None:
         """Emit deduplicated generic persist-arbitration evidence under the shared gate."""
         self.__record_lifecycle_persist_breadcrumb_for_file_id(event, model_file.file_id, details)
+
+    @staticmethod
+    def __lifecycle_trace_coalesce_key(
+            event: str, stage: str, file_id: str, details: dict[str, object],
+    ) -> str:
+        """Create a private semantic key without retaining any source identity."""
+        payload = {
+            "event": event,
+            "stage": stage,
+            "corr_id": opaque_trace_correlation(file_id),
+            "details": details,
+        }
+        return opaque_trace_correlation(json.dumps(payload, sort_keys=True, default=str))
 
     def __record_lifecycle_persist_breadcrumb_for_file_id(
             self, event: str, file_id: str, details: dict[str, object],
@@ -674,20 +950,25 @@ class ModelBuilder:
         try:
             signature = json.dumps(details, sort_keys=True, default=str)
             signature_key = (file_id, event)
-            if self.__stop_resume_trace_last_signatures.get(signature_key) == signature:
+            if self.__stop_resume_trace_last_signatures.get(signature_key) == "retained:" + signature:
                 self.__stop_resume_trace_last_signatures.move_to_end(signature_key)
                 return
-            self.__stop_resume_trace_last_signatures[signature_key] = signature
-            self.__stop_resume_trace_last_signatures.move_to_end(signature_key)
-            while len(self.__stop_resume_trace_last_signatures) > self.__STOP_RESUME_TRACE_SIGNATURE_CACHE_SIZE:
-                self.__stop_resume_trace_last_signatures.popitem(last=False)
             breadcrumb = self.__stop_resume_trace_breadcrumb
             if breadcrumb is not None:
-                breadcrumb.record(
+                outcome = breadcrumb.record(
                     "model_builder", event, {**details, "monotonic_ms": int(time.monotonic_ns() / 1_000_000)},
                     stage="persist_authority", event_type="diagnostic",
                     corr_id=opaque_trace_correlation(file_id), trace_scope="flow",
+                    _coalesce_key=self.__lifecycle_trace_coalesce_key(
+                        event, "persist_authority", file_id, details,
+                    ),
                 )
+                # Enqueued signatures are bounded bookkeeping only; they are
+                # never used to suppress retry. The collector coalesces them
+                # using the private opaque key above.
+                self.__remember_trace_signature(signature_key, signature, outcome == "retained")
+                return
+            self.__remember_trace_signature(signature_key, signature, True)
         except Exception:
             self.logger.debug("Ignoring lifecycle persist breadcrumb failure", exc_info=True)
 
@@ -1105,15 +1386,11 @@ class ModelBuilder:
             signature = repr(signature_payload)
         signature_key = (file_id, event)
         previous_signature = self.__stop_resume_trace_last_signatures.get(signature_key)
-        if previous_signature == signature:
+        if previous_signature == "retained:" + signature:
             # Keep recently used keys near the tail while preserving one
             # signature per canonical file/event pair.
             self.__stop_resume_trace_last_signatures.move_to_end(signature_key)
             return
-        self.__stop_resume_trace_last_signatures[signature_key] = signature
-        self.__stop_resume_trace_last_signatures.move_to_end(signature_key)
-        while len(self.__stop_resume_trace_last_signatures) > self.__STOP_RESUME_TRACE_SIGNATURE_CACHE_SIZE:
-            self.__stop_resume_trace_last_signatures.popitem(last=False)
         breadcrumb = self.__stop_resume_trace_breadcrumb
         if breadcrumb is not None:
             final_model = payload.get("final_model")
@@ -1155,7 +1432,7 @@ class ModelBuilder:
                     "no_rebuild": "model_no_rebuild",
                     "target_not_rendered": "model_target_not_rendered",
                 }.get(event, "model_trace")
-                breadcrumb.record(
+                outcome = breadcrumb.record(
                     "model_builder",
                     "stop_resume_trace",
                     details,
@@ -1167,9 +1444,22 @@ class ModelBuilder:
                     ),
                     file_id=file_id,
                     trace_scope="flow",
+                    _coalesce_key=opaque_trace_correlation(signature),
                 )
+                self.__remember_trace_signature(signature_key, signature, outcome == "retained")
             except Exception:
                 self.logger.debug("Ignoring stop/resume breadcrumb emission failure", exc_info=True)
+
+    def __remember_trace_signature(
+            self, signature_key: tuple[str, str], signature: str, retained: bool,
+    ) -> None:
+        """Bound signature bookkeeping; only retained entries suppress retries."""
+        self.__stop_resume_trace_last_signatures[signature_key] = (
+            "retained:" if retained else "enqueued:"
+        ) + signature
+        self.__stop_resume_trace_last_signatures.move_to_end(signature_key)
+        while len(self.__stop_resume_trace_last_signatures) > self.__STOP_RESUME_TRACE_SIGNATURE_CACHE_SIZE:
+            self.__stop_resume_trace_last_signatures.popitem(last=False)
 
     def __trace_target_arbitration(self,
                                    model_file: ModelFile,
@@ -1559,15 +1849,234 @@ class ModelBuilder:
         LFTP can publish a source mtime at whole-second precision.  It does
         not establish completion, progress, or collision identity.
         """
+        trace_enabled = self.__is_stop_resume_trace_enabled()
+        if not trace_enabled:
+            return self.__get_trusted_final_leaf_paths_without_trace(file_id)
         remote_root = self.__remote_file(file_id)
         local_root = self.__local_file(file_id)
-        if remote_root is None or local_root is None or not remote_root.is_dir or not local_root.is_dir:
-            return ()
+        counts = self.__queue_exclusion_trace_empty_counts() if trace_enabled else None
+        mtime_counts = {
+            "exact": 0,
+            "raw_mismatch": 0,
+            "portable_second_match": 0,
+            "missing": 0,
+        } if trace_enabled else None
+        readiness_counts = {"local": 0, "remote": 0, "unknown": 0} if trace_enabled else None
+        rejection_reasons = {
+            "remote_only": 0,
+            "local_only": 0,
+            "type_mismatch": 0,
+            "staging": 0,
+            "collision": 0,
+            "status_sidecar": 0,
+            "size_mismatch": 0,
+            "mtime_raw_mismatch": 0,
+            "mtime_missing": 0,
+            "not_ready": 0,
+        } if trace_enabled else None
+
+        def trace_increment(counter: Optional[dict[str, int]], key: str) -> None:
+            if counter is not None:
+                counter[key] += 1
+
+        pair_id = self.__file_id_path_pair_id(file_id)
+        unknown_local = pair_id in self.__unknown_local_path_pair_ids
+        if remote_root is None:
+            readiness_reason = "remote"
+        elif local_root is None:
+            readiness_reason = "unknown" if unknown_local else "local"
+        elif unknown_local:
+            readiness_reason = "unknown"
+        else:
+            readiness_reason = "local"
         # The updater keeps retained source snapshots visible while a local
         # or joint (local+remote) scan is incomplete.  Its one consolidated
         # unknown-pair overlay is the authority boundary for Queue: never
         # turn a retained stale leaf into a typed exclusion until that pair's
         # scan has completed authoritatively.
+        if remote_root is None or local_root is None or not remote_root.is_dir or not local_root.is_dir:
+            if trace_enabled:
+                self.__record_queue_exclusion_trace(file_id, {
+                    "schema": self.__QUEUE_EXCLUSION_TRACE_SCHEMA,
+                    "readiness_reason": readiness_reason,
+                    "readiness": {
+                        "local_present": local_root is not None,
+                        "remote_present": remote_root is not None,
+                        "local_readiness_unknown": unknown_local,
+                    },
+                    "leaf_observations_present": self.__queue_trace_presence(counts),
+                    "mtime_categories_present": self.__queue_trace_presence(mtime_counts),
+                    "readiness_reasons": self.__queue_trace_presence(readiness_counts),
+                    "decisions": {
+                        "excluded": False,
+                        "rejected": False,
+                    },
+                    "rejection_reasons": self.__queue_trace_presence(rejection_reasons),
+                    "exclusions_present": False,
+                })
+            return ()
+
+        if unknown_local:
+            # Preserve the fail-closed authority boundary while still making
+            # the reason and the currently visible tree explicit.
+            if trace_enabled:
+                def count_remote_leaves(remote_file: SystemFile) -> None:
+                    if remote_file.is_dir:
+                        for child in remote_file.iter_children():
+                            count_remote_leaves(child)
+                        return
+                    trace_increment(counts, "remote_leaf_count")
+                    trace_increment(counts, "remote_only_leaf_count")
+                    trace_increment(mtime_counts, "missing")
+                    trace_increment(readiness_counts, "unknown")
+                    trace_increment(rejection_reasons, "not_ready")
+
+                count_remote_leaves(remote_root)
+                self.__record_queue_exclusion_trace(file_id, {
+                    "schema": self.__QUEUE_EXCLUSION_TRACE_SCHEMA,
+                    "readiness_reason": "unknown",
+                    "readiness": {
+                        "local_present": True,
+                        "remote_present": True,
+                        "local_readiness_unknown": True,
+                    },
+                    "leaf_observations_present": self.__queue_trace_presence(counts),
+                    "mtime_categories_present": self.__queue_trace_presence(mtime_counts),
+                    "readiness_reasons": self.__queue_trace_presence(readiness_counts),
+                    "decisions": {
+                        "excluded": False,
+                        "rejected": counts["remote_leaf_count"] > 0,
+                    },
+                    "rejection_reasons": self.__queue_trace_presence(rejection_reasons),
+                    "exclusions_present": False,
+                })
+            return ()
+
+        paths: list[str] = []
+
+        def count_local_only(local_file: SystemFile, ancestor_staging: bool = False) -> None:
+            has_staging = ancestor_staging or local_file.is_staging
+            if local_file.is_dir:
+                for child in local_file.iter_children():
+                    count_local_only(child, has_staging)
+                return
+            trace_increment(counts, "local_leaf_count")
+            trace_increment(counts, "local_only_leaf_count")
+            if has_staging:
+                trace_increment(counts, "staging_sibling_leaf_count")
+            trace_increment(rejection_reasons, "local_only")
+
+        def count_remote_type_mismatch(remote_file: SystemFile) -> None:
+            if remote_file.is_dir:
+                for child in remote_file.iter_children():
+                    count_remote_type_mismatch(child)
+                return
+            trace_increment(counts, "remote_leaf_count")
+            trace_increment(counts, "type_mismatch_leaf_count")
+            trace_increment(counts, "rejected_leaf_count")
+            trace_increment(mtime_counts, "missing")
+            trace_increment(readiness_counts, "unknown")
+            trace_increment(rejection_reasons, "type_mismatch")
+
+        def visit(remote_file: SystemFile, local_file: SystemFile, relative: str,
+                  ancestor_has_staging_collision: bool = False) -> None:
+            if remote_file.is_dir != local_file.is_dir:
+                if trace_enabled:
+                    count_remote_type_mismatch(remote_file)
+                return
+            has_staging_collision = ancestor_has_staging_collision or \
+                getattr(local_file, "has_staging_collision", False)
+            if not remote_file.is_dir:
+                trace_increment(counts, "remote_leaf_count")
+                trace_increment(counts, "local_leaf_count")
+                if local_file.is_staging:
+                    trace_increment(counts, "staging_candidate_leaf_count")
+                mtime_category = self.__queue_exclusion_mtime_category(remote_file, local_file)
+                trace_increment(mtime_counts, mtime_category)
+                if mtime_category == "missing":
+                    trace_increment(readiness_counts, "unknown")
+                else:
+                    trace_increment(readiness_counts, "local")
+                size_matches = local_file.size == remote_file.size
+                if not size_matches:
+                    trace_increment(counts, "size_mismatch_leaf_count")
+                if local_file.status_sidecar_ready:
+                    trace_increment(counts, "status_sidecar_leaf_count")
+                if has_staging_collision:
+                    trace_increment(counts, "collision_rejected_leaf_count")
+                    trace_increment(rejection_reasons, "collision")
+                elif local_file.is_staging:
+                    trace_increment(rejection_reasons, "staging")
+                elif local_file.status_sidecar_ready:
+                    trace_increment(rejection_reasons, "status_sidecar")
+                elif not size_matches:
+                    trace_increment(rejection_reasons, "size_mismatch")
+                elif mtime_category == "missing":
+                    trace_increment(rejection_reasons, "mtime_missing")
+                elif mtime_category == "raw_mismatch":
+                    trace_increment(rejection_reasons, "mtime_raw_mismatch")
+                if ModelBuilder.__leaf_matches_remote_queue_exclusion_identity(
+                    remote_file, local_file) and not has_staging_collision:
+                    paths.append(relative)
+                    trace_increment(counts, "excluded_leaf_count")
+                else:
+                    trace_increment(counts, "rejected_leaf_count")
+                return
+            remote_children = {child.name: child for child in remote_file.iter_children()}
+            local_children = {child.name: child for child in local_file.iter_children()}
+            for remote_child in remote_file.iter_children():
+                local_child = local_children.get(remote_child.name)
+                if local_child is None:
+                    if trace_enabled:
+                        def count_remote_only(remote_only: SystemFile) -> None:
+                            if remote_only.is_dir:
+                                for child in remote_only.iter_children():
+                                    count_remote_only(child)
+                                return
+                            trace_increment(counts, "remote_leaf_count")
+                            trace_increment(counts, "remote_only_leaf_count")
+                            trace_increment(mtime_counts, "missing")
+                            trace_increment(readiness_counts, "remote")
+                            trace_increment(rejection_reasons, "remote_only")
+                            trace_increment(counts, "rejected_leaf_count")
+                        count_remote_only(remote_child)
+                    continue
+                child_relative = local_child.name if not relative else relative + "/" + local_child.name
+                visit(remote_child, local_child, child_relative, has_staging_collision)
+            for local_child_name, local_child in local_children.items():
+                if local_child_name not in remote_children:
+                    if trace_enabled:
+                        count_local_only(local_child, has_staging_collision)
+
+        visit(remote_root, local_root, "")
+        paths = sorted(set(paths))
+        if trace_enabled:
+            self.__record_queue_exclusion_trace(file_id, {
+                "schema": self.__QUEUE_EXCLUSION_TRACE_SCHEMA,
+                "readiness_reason": readiness_reason,
+                "readiness": {
+                    "local_present": True,
+                    "remote_present": True,
+                    "local_readiness_unknown": False,
+                },
+                "leaf_observations_present": self.__queue_trace_presence(counts),
+                "mtime_categories_present": self.__queue_trace_presence(mtime_counts),
+                "readiness_reasons": self.__queue_trace_presence(readiness_counts),
+                "decisions": {
+                    "excluded": counts["excluded_leaf_count"] > 0,
+                    "rejected": counts["rejected_leaf_count"] > 0,
+                },
+                "rejection_reasons": self.__queue_trace_presence(rejection_reasons),
+                "exclusions_present": bool(paths),
+            })
+        return tuple(paths)
+
+    def __get_trusted_final_leaf_paths_without_trace(self, file_id: str) -> tuple[str, ...]:
+        """Preserve Queue's pre-trace traversal when diagnostics are disabled."""
+        remote_root = self.__remote_file(file_id)
+        local_root = self.__local_file(file_id)
+        if remote_root is None or local_root is None or not remote_root.is_dir or not local_root.is_dir:
+            return ()
         if self.__file_id_path_pair_id(file_id) in self.__unknown_local_path_pair_ids:
             return ()
 
@@ -1581,8 +2090,7 @@ class ModelBuilder:
                 getattr(local_file, "has_staging_collision", False)
             if not remote_file.is_dir:
                 if ModelBuilder.__leaf_matches_remote_queue_exclusion_identity(
-                        remote_file, local_file) and \
-                        not has_staging_collision:
+                        remote_file, local_file) and not has_staging_collision:
                     paths.append(relative)
                 return
             remote_children = {child.name: child for child in remote_file.iter_children()}
@@ -1607,6 +2115,36 @@ class ModelBuilder:
         remote_file = self.__remote_file(file_id)
         local_file = self.__build_effective_local_files().get(file_id)
         return self.__effective_local_tree_proves_completion(remote_file, local_file)
+
+    def get_finalizable_staging_leaf_candidates(self) -> tuple[tuple[str, str], ...]:
+        """Return exact-identity staging leaves safe to publish independently."""
+        candidates: list[tuple[str, str]] = []
+
+        def visit(remote_file: SystemFile, local_file: Optional[SystemFile], relative: str,
+                  collision_ancestor: bool = False) -> None:
+            if local_file is None or remote_file.is_dir != local_file.is_dir:
+                return
+            collision = collision_ancestor or bool(getattr(local_file, "has_staging_collision", False))
+            if not remote_file.is_dir:
+                if relative and "\\" not in relative and not collision and bool(getattr(local_file, "is_staging", False)) and \
+                        not bool(getattr(local_file, "status_sidecar_ready", False)) and \
+                        ModelBuilder.__leaf_matches_remote_collision_identity(remote_file, local_file):
+                    candidates.append((root_file_id, relative))
+                return
+            local_children = {child.name: child for child in local_file.iter_children()}
+            for remote_child in remote_file.iter_children():
+                child_relative = remote_child.name if not relative else relative + "/" + remote_child.name
+                visit(remote_child, local_children.get(remote_child.name), child_relative, collision)
+
+        for root_file_id, remote_root in self.__remote_files().items():
+            if not remote_root.is_dir:
+                continue
+            # Use only the authoritative local scanner tree. Active-transfer
+            # presentation overlays must not authorize a physical move.
+            local_root = self.__local_file(root_file_id)
+            if local_root is not None:
+                visit(remote_root, local_root, "")
+        return tuple(sorted(candidates))
 
     def has_verified_complete_staging_remote_identity(self, file_id: str) -> bool:
         """Prove a pending automatic move has exact staged source identity.
@@ -2765,6 +3303,11 @@ class ModelBuilder:
         partial = ModelBuilder()
         partial.logger = self.logger
         partial.__target_archive_trace_logger = self.__target_archive_trace_logger
+        partial.__stop_resume_trace_cycle_id = self.__stop_resume_trace_cycle_id
+        partial.__stop_resume_trace_cycle_context = dict(self.__stop_resume_trace_cycle_context)
+        partial.__stop_resume_trace_breadcrumb = self.__stop_resume_trace_breadcrumb
+        partial.__stop_resume_trace_last_signatures = OrderedDict(self.__stop_resume_trace_last_signatures)
+        partial.__stop_resume_trace_last_enabled = self.__stop_resume_trace_last_enabled
         selected_pair_ids = {
             file.path_pair_id for file in local_files + remote_files
         }
@@ -3305,6 +3848,11 @@ class ModelBuilder:
         partial = ModelBuilder()
         partial.logger = self.logger
         partial.__target_archive_trace_logger = self.__target_archive_trace_logger
+        partial.__stop_resume_trace_cycle_id = self.__stop_resume_trace_cycle_id
+        partial.__stop_resume_trace_cycle_context = dict(self.__stop_resume_trace_cycle_context)
+        partial.__stop_resume_trace_breadcrumb = self.__stop_resume_trace_breadcrumb
+        partial.__stop_resume_trace_last_signatures = OrderedDict(self.__stop_resume_trace_last_signatures)
+        partial.__stop_resume_trace_last_enabled = self.__stop_resume_trace_last_enabled
         selected_pair_ids = {
             self.__file_id_path_pair_id(file_id) for file_id in root_file_ids
         }
@@ -3846,6 +4394,37 @@ class ModelBuilder:
                 model_file, remote, self.__local_file(file_id),
             )
             self.__determine_state(model_file, local, incomplete_children)
+            # Trace failed presentation/lifecycle decisions and explicit Stop
+            # boundaries; successful, unstopped roots without a marker remain
+            # quiet.
+            trace_enabled = self.__is_stop_resume_trace_enabled()
+            if trace_enabled:
+                effective_tree_proof = self.__effective_local_tree_proves_completion(remote, local)
+                has_root_lifecycle_marker = (
+                    file_id in (self.__downloaded_files or set()) or
+                    file_id in self.__final_move_succeeded_files or
+                    file_id in self.__extracted_files or
+                    file_id in self.__move_failed_files
+                )
+                if (
+                    not model_file.complete_local_coverage or
+                    not effective_tree_proof or
+                    is_stopped or
+                    model_file.state == ModelFile.State.MOVE_FAILED or
+                    has_root_lifecycle_marker
+                ):
+                    self.__record_root_default_decision(
+                        file_id,
+                        remote,
+                        local,
+                        status,
+                        is_stopped,
+                        model_file.complete_local_coverage,
+                        effective_tree_proof,
+                        status is not None or current_transfer_state is not None or
+                        recent_transfer_state is not None or retained_transfer_state is not None,
+                        self.__state_category(model_file),
+                    )
             model_file.is_stoppable = self.__is_stoppable_model_file(
                 model_file,
                 local,

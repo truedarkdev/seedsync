@@ -8,7 +8,7 @@ from threading import Condition, Event, Lock, RLock
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from queue import Queue
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timedelta
 import copy
 import hashlib
 import json
@@ -75,6 +75,36 @@ LocalScannerRuntime = LocalScanner | MultiPathLocalScanner
 RemoteScannerRuntime = RemoteScanner | MultiPathRemoteScanner
 
 
+def _final_move_errno_class(error: Optional[BaseException]) -> str:
+    """Normalize publication failures without retaining platform text."""
+    if error is None:
+        return "none"
+    error_number = getattr(error, "errno", None)
+    classes = {
+        errno.ENOENT: "enoent",
+        errno.EEXIST: "eexist",
+        errno.EACCES: "permission",
+        errno.EPERM: "permission",
+        errno.ENOSPC: "enospc",
+        errno.EXDEV: "exdev",
+        errno.EINVAL: "einval",
+        errno.ENOSYS: "enosys",
+        errno.EIO: "eio",
+        errno.EAGAIN: "eagain",
+        errno.ELOOP: "eloop",
+        errno.EISDIR: "eisdir",
+        errno.ENOTEMPTY: "enotempty",
+    }
+    ecanceled = getattr(errno, "ECANCELED", None)
+    if ecanceled is not None:
+        classes[ecanceled] = "ecanceled"
+    eopnotsupp = getattr(errno, "EOPNOTSUPP", None)
+    if eopnotsupp is not None:
+        classes[eopnotsupp] = "enotsup"
+    classes[errno.ENOTSUP] = "enotsup"
+    return classes.get(error_number, "unknown")
+
+
 class _MoveMutationOutcome(Enum):
     """Physical-move evidence used only until its local scan fence is finished."""
 
@@ -86,8 +116,10 @@ class _MoveMutationOutcome(Enum):
 class _MoveMutationTracker:
     """Fail closed: only an observed no-mutation path may cancel a fence."""
 
-    def __init__(self) -> None:
+    def __init__(self, file_id: Optional[str] = None, breadcrumb_trace: object = None) -> None:
         self.outcome = _MoveMutationOutcome.NO_MUTATION
+        self.file_id = file_id
+        self.breadcrumb_trace = breadcrumb_trace
 
     def mutated(self) -> None:
         if self.outcome == _MoveMutationOutcome.NO_MUTATION:
@@ -96,6 +128,65 @@ class _MoveMutationTracker:
     def uncertain(self) -> None:
         if self.outcome == _MoveMutationOutcome.NO_MUTATION:
             self.outcome = _MoveMutationOutcome.UNCERTAIN
+
+    def record_publication(
+            self,
+            phase: str,
+            operation: str,
+            side: str,
+            error: Optional[BaseException] = None,
+            source_path: Optional[str] = None,
+            temporary_path: Optional[str] = None,
+            destination_parent_path: Optional[str] = None,
+            destination_path: Optional[str] = None,
+            temporary_created: Optional[bool] = None,
+            residue_path: Optional[str] = None,
+    ) -> None:
+        """Emit fixed-schema, identity-free final publication evidence."""
+        breadcrumb_trace = self.breadcrumb_trace
+        if breadcrumb_trace is None or not isinstance(self.file_id, str):
+            return
+        try:
+            if not breadcrumb_trace.is_enabled():
+                return
+
+            def probe(path: Optional[str]) -> Optional[bool]:
+                if path is None:
+                    return None
+                try:
+                    return bool(os.path.lexists(path))
+                except (OSError, ValueError, TypeError):
+                    return None
+
+            details: dict[str, object] = {
+                "phase": phase,
+                "operation": operation,
+                "side": side,
+                "errno_class": _final_move_errno_class(error),
+                "mutation_state": self.outcome.value,
+            }
+            known_bools = {
+                "temporary_created": temporary_created,
+                "residue_present": probe(residue_path if residue_path is not None else temporary_path),
+                "source_exists": probe(source_path),
+                "destination_parent_exists": probe(destination_parent_path),
+                "destination_exists": probe(destination_path),
+            }
+            details.update({key: value for key, value in known_bools.items() if type(value) is bool})
+            breadcrumb_trace.record(
+                "controller",
+                "final_move_publication",
+                details,
+                category="final_move.publication",
+                stage="final_move_publication",
+                level="info",
+                event_type="diagnostic",
+                corr_id=opaque_trace_correlation(self.file_id),
+                trace_scope="flow",
+            )
+        except Exception:
+            # Diagnostic evidence must never affect finalization or source safety.
+            return
 
 
 # A single-path configuration still has no persisted path-pair id.  The web
@@ -439,26 +530,59 @@ class Controller:
         return exclude_patterns if isinstance(exclude_patterns, str) else ""
 
     def __transfer_exclude_patterns(
-            self, file_id: str, is_dir: bool
+            self, file_id: str, is_dir: bool, flow_id: Optional[str] = None,
     ) -> str | list[str | ExactPathExclusion]:
         configured_patterns = Controller.__get_exclude_patterns(self)
         patterns = parse_exclude_patterns(configured_patterns)
+        trace_enabled = self.__fractional_queue_trace_is_enabled()
         if not is_dir:
+            self.__record_fractional_queue_trace(file_id, "queue_exclusion_serialization", lambda: {
+                "schema": "fractional_mtime_redownload.queue_exclusion_serialization.v2",
+                "configured_patterns_present": bool(patterns),
+                "exact_leaf_candidates_present": False,
+                "exact_exclusions_serialized": False,
+                "serialization_skipped": False,
+                "serialized_exclusions_present": bool(patterns),
+                "result": "configured_only",
+            }, flow_id=flow_id)
             return configured_patterns
         trusted_patterns: list[ExactPathExclusion] = []
-        for relative_path in self.__model_builder.get_trusted_final_leaf_paths(file_id):
+        trusted_paths = self.__model_builder.get_trusted_final_leaf_paths(file_id)
+        serialization_skipped = 0
+        for relative_path in trusted_paths:
             try:
                 exact_path = ExactPathExclusion(relative_path)
             except (TypeError, ValueError):
                 # A Linux filename can contain control characters which neither
                 # transport can safely encode in its command grammar.  Keep
                 # user globs and redownload that uncertain leaf instead.
+                if trace_enabled:
+                    serialization_skipped += 1
                 continue
             if exact_path not in trusted_patterns:
                 trusted_patterns.append(exact_path)
         if not trusted_patterns:
+            self.__record_fractional_queue_trace(file_id, "queue_exclusion_serialization", lambda: {
+                "schema": "fractional_mtime_redownload.queue_exclusion_serialization.v2",
+                "configured_patterns_present": bool(patterns),
+                "exact_leaf_candidates_present": bool(trusted_paths),
+                "exact_exclusions_serialized": False,
+                "serialization_skipped": serialization_skipped > 0,
+                "serialized_exclusions_present": bool(patterns),
+                "result": "configured_only",
+            }, flow_id=flow_id)
             return configured_patterns
-        return [*patterns, *trusted_patterns]
+        result = [*patterns, *trusted_patterns]
+        self.__record_fractional_queue_trace(file_id, "queue_exclusion_serialization", lambda: {
+            "schema": "fractional_mtime_redownload.queue_exclusion_serialization.v2",
+            "configured_patterns_present": bool(patterns),
+            "exact_leaf_candidates_present": bool(trusted_paths),
+            "exact_exclusions_serialized": bool(trusted_patterns),
+            "serialization_skipped": serialization_skipped > 0,
+            "serialized_exclusions_present": bool(result),
+            "result": "configured_plus_exact",
+        }, flow_id=flow_id)
+        return result
 
     @staticmethod
     def collect_missing_startup_fields(
@@ -593,6 +717,8 @@ class Controller:
         self.__collision_compare_cancel_event = None
         self.__collision_compare_epoch = 0
         self.__move_retry_due = {}
+        self.__child_final_move_retry_due = {}
+        self.__child_final_move_failure_counts = {}
         self.__move_attempt_reservations = set()
         self.__move_attempt_lock = Lock()
         self.__deferred_move_file_ids = set()
@@ -799,6 +925,8 @@ class Controller:
         self.__collision_compare_claim = None
         self.__collision_compare_cancel_event = None
         self.__move_retry_due = {}
+        self.__child_final_move_retry_due = {}
+        self.__child_final_move_failure_counts = {}
         self.__move_attempt_reservations = set()
         self.__move_attempt_lock = Lock()
         self.__deferred_move_file_ids = set()
@@ -1059,13 +1187,30 @@ class Controller:
             if not operation.future.done():
                 remaining.append(operation)
                 continue
+            future_outcome = "accepted"
             try:
                 result = operation.future.result()
                 failed = operation.action in ("queue", "stop") and result is False
+                if failed:
+                    future_outcome = "rejected"
             except Exception as exc:
                 result = None
                 failed = True
+                future_outcome = "error"
                 self.logger.warning("Asynchronous lftp %s failed: %s", operation.action, exc)
+            operation_file_id = getattr(operation, "file_id", None)
+            if operation.action == "queue" and operation_file_id is not None:
+                self.__record_fractional_queue_trace(operation_file_id, "queue_future_outcome", lambda: {
+                    "schema": "fractional_mtime_redownload.queue_future.v2",
+                    "dispatch_mode": "async_future",
+                    "future_outcome": "success" if future_outcome == "accepted" else (
+                        "backend_rejection" if future_outcome == "rejected" else future_outcome
+                    ),
+                    "status_acknowledgement": "not_observed" if not failed else "not_applicable",
+                    "result": "accepted" if not failed else "rejected",
+                }, flow_id=self.__fractional_queue_flow_id(
+                    operation_file_id, operation.operation_sequence,
+                ))
             if (
                 failed
                 and operation.action == "queue"
@@ -1677,6 +1822,25 @@ class Controller:
         if not hasattr(self, "_Controller__transfer_lifecycle_epochs"):
             self.__transfer_lifecycle_epochs = {}
         self.__transfer_lifecycle_epochs[file_id] = self.__transfer_lifecycle_epochs.get(file_id, 0) + 1
+        counts = getattr(self, "_Controller__child_final_move_failure_counts", {})
+        due = getattr(self, "_Controller__child_final_move_retry_due", {})
+        if not isinstance(counts, dict) or not isinstance(due, dict):
+            return
+        def belongs(child_id: str) -> bool:
+            if child_id.startswith(file_id + "/"):
+                return True
+            try:
+                root = json.loads(file_id)
+                child = json.loads(child_id)
+            except (TypeError, ValueError):
+                return False
+            return isinstance(root, list) and isinstance(child, list) and len(root) == len(child) == 2 and \
+                root[0] == child[0] and isinstance(root[1], str) and isinstance(child[1], str) and \
+                child[1].startswith(root[1] + "/")
+        for child_id in set(counts).union(due):
+            if belongs(child_id):
+                counts.pop(child_id, None)
+                due.pop(child_id, None)
 
     def _record_path_pair_reconciliation(
             self,
@@ -3788,6 +3952,52 @@ class Controller:
             trace_scope=trace_scope,
         )
 
+    def __record_fractional_queue_trace(
+            self, file_id: str, event: str,
+            details: dict[str, object] | Callable[[], dict[str, object]],
+            flow_id: Optional[str] = None,
+    ) -> None:
+        """Record identity-free Queue evidence for fractional-mtime diagnosis."""
+        if not self.__fractional_queue_trace_is_enabled():
+            return
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        try:
+            if callable(details):
+                details = details()
+            breadcrumb_trace.record(
+                "controller",
+                event,
+                details,
+                stage="queue_fractional_mtime",
+                event_type="diagnostic",
+                category="queue.exclusion",
+                level="info",
+                corr_id="fractional-mtime:{}".format(opaque_trace_correlation(file_id)),
+                flow_id=flow_id,
+                trace_scope="flow",
+            )
+        except Exception:
+            # Diagnostic evidence must never alter Queue admission or status
+            # reconciliation.
+            self.logger.debug("Ignoring fractional-mtime Queue breadcrumb failure", exc_info=True)
+
+    def __fractional_queue_trace_is_enabled(self) -> bool:
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        if breadcrumb_trace is None:
+            return False
+        try:
+            return bool(breadcrumb_trace.is_enabled())
+        except Exception:
+            return False
+
+    @staticmethod
+    def __fractional_queue_flow_id(file_id: str, operation_sequence: object) -> Optional[str]:
+        if type(operation_sequence) is not int or operation_sequence < 1:
+            return None
+        return "fractional-queue:{}".format(
+            opaque_trace_correlation("queue:{}:{}".format(file_id, operation_sequence))
+        )
+
     def __command_state_lock(self):
         lock = getattr(self, "_Controller__command_flow_lock", None)
         if lock is None:
@@ -4217,11 +4427,15 @@ class Controller:
             name: str,
             path_pair_id: Optional[str] = None,
             require_collision_proof: bool = False,
+            anchored_paths: Optional[Tuple[str, str, str, str]] = None,
     ) -> MoveFromStagingResult:
-        resolved = self.__resolve_safe_final_move_paths(name, path_pair_id)
-        if resolved is None:
-            return Controller.MoveFromStagingResult.FAILED
-        staging_path, final_path, src, dst = resolved
+        if anchored_paths is None:
+            resolved = self.__resolve_safe_final_move_paths(name, path_pair_id)
+            if resolved is None:
+                return Controller.MoveFromStagingResult.FAILED
+            staging_path, final_path, src, dst = resolved
+        else:
+            staging_path, final_path, src, dst = anchored_paths
 
         trace_file_id = ModelFile.build_file_id(name, path_pair_id)
         required_collision_sources = None
@@ -4301,13 +4515,19 @@ class Controller:
             return Controller.MoveFromStagingResult.DEFERRED
 
         local_root_invalidation: Optional[tuple[str, int]] = None
-        mutation_tracker = _MoveMutationTracker()
+        mutation_tracker = _MoveMutationTracker(
+            trace_file_id,
+            getattr(self.__context, "breadcrumb_trace", None),
+        )
         try:
             # Re-resolve immediately before the mutation to narrow the window
             # for a path component to be replaced with a symlink.
-            current = self.__resolve_safe_final_move_paths(name, path_pair_id)
-            if current is None or current[2:] != (src, dst):
-                return Controller.MoveFromStagingResult.FAILED
+            if anchored_paths is None:
+                current = self.__resolve_safe_final_move_paths(name, path_pair_id)
+                if current is None or current[2:] != (src, dst):
+                    return Controller.MoveFromStagingResult.FAILED
+                if not self.__ensure_safe_final_move_parent(final_path, name):
+                    return Controller.MoveFromStagingResult.FAILED
             local_generation = getattr(self.__local_scan_process, "generation", None)
             updater = getattr(self, "_Controller__updater", None)
             invalidate = getattr(updater, "begin_final_move_local_root_invalidation", None)
@@ -4417,6 +4637,26 @@ class Controller:
                         local_root_invalidation[0], path_pair_id, local_root_invalidation[1],
                         mutation_tracker.outcome != _MoveMutationOutcome.NO_MUTATION,
                     )
+
+    @staticmethod
+    def __ensure_safe_final_move_parent(final_root: str, name: str) -> bool:
+        """Create only contained final parents, rejecting link substitution."""
+        current = final_root
+        try:
+            for part in name.replace("\\", "/").split("/")[:-1]:
+                if not part or part in (".", ".."):
+                    return False
+                current = os.path.join(current, part)
+                try:
+                    entry = os.lstat(current)
+                except FileNotFoundError:
+                    os.mkdir(current)
+                    entry = os.lstat(current)
+                if not stat.S_ISDIR(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
+                    return False
+            return True
+        except OSError:
+            return False
     @staticmethod
     def __rename_no_replace(src: str, dst: str) -> None:
         """Atomically publish src at dst without replacing an existing target."""
@@ -5639,41 +5879,123 @@ class Controller:
             cls.__rename_no_replace(src, dst)
             if mutation_tracker is not None:
                 mutation_tracker.mutated()
-            if os.path.lexists(src) or not os.path.lexists(dst):
-                raise OSError(errno.EIO, "native publication did not reach the expected final state", dst)
-            published_stat = os.lstat(dst)
-            cls.__sync_directory_if_supported(os.path.dirname(dst))
-            cls.__sync_directory_if_supported(os.path.dirname(src))
-            # A process which replaces dst after this check is outside this
-            # pathname-only publication contract; it cannot be prevented once
-            # this call has returned to an uncooperative external writer.
-            if not cls.__same_path_identity(dst, published_stat):
-                raise OSError(errno.EAGAIN, "final target changed during native publication", dst)
-            if cls.__publication_tree_manifest(dst) != source_manifest:
-                raise OSError(errno.EAGAIN, "final target changed during native publication", dst)
+            if mutation_tracker is not None:
+                mutation_tracker.record_publication(
+                    "publish", "publish", "destination",
+                    source_path=src,
+                    destination_parent_path=os.path.dirname(dst),
+                    destination_path=dst,
+                    temporary_created=False,
+                )
+            try:
+                if os.path.lexists(src) or not os.path.lexists(dst):
+                    raise OSError(errno.EIO, "native publication did not reach the expected final state", dst)
+                published_stat = os.lstat(dst)
+                cls.__sync_directory_if_supported(os.path.dirname(dst))
+                cls.__sync_directory_if_supported(os.path.dirname(src))
+                # A process which replaces dst after this check is outside this
+                # pathname-only publication contract; it cannot be prevented once
+                # this call has returned to an uncooperative external writer.
+                if not cls.__same_path_identity(dst, published_stat):
+                    raise OSError(errno.EAGAIN, "final target changed during native publication", dst)
+                if cls.__publication_tree_manifest(dst) != source_manifest:
+                    raise OSError(errno.EAGAIN, "final target changed during native publication", dst)
+            except BaseException as error:
+                if mutation_tracker is not None:
+                    mutation_tracker.record_publication(
+                        "verify", "verify", "destination", error,
+                        source_path=src,
+                        destination_parent_path=os.path.dirname(dst),
+                        destination_path=dst,
+                        temporary_created=False,
+                    )
+                raise
+            if mutation_tracker is not None:
+                mutation_tracker.record_publication(
+                    "verify", "verify", "destination",
+                    source_path=src,
+                    destination_parent_path=os.path.dirname(dst),
+                    destination_path=dst,
+                    temporary_created=False,
+                )
             return
         except OSError as error:
             if not cls.__is_no_replace_capability_error(error):
+                if mutation_tracker is not None:
+                    mutation_tracker.record_publication(
+                        "publish", "publish", "destination", error,
+                        source_path=src,
+                        destination_parent_path=os.path.dirname(dst),
+                        destination_path=dst,
+                        temporary_created=False,
+                    )
                 raise
+            if mutation_tracker is not None:
+                # Capability fallback has begun destination-side private work.
+                # A later failure cannot prove the move was untouched.
+                mutation_tracker.uncertain()
+                mutation_tracker.record_publication(
+                    "fallback", "fallback", "destination", error,
+                    source_path=src,
+                    destination_parent_path=os.path.dirname(dst),
+                    destination_path=dst,
+                    temporary_created=False,
+                )
 
         destination_parent = os.path.dirname(dst)
-        if mutation_tracker is not None:
-            # Capability fallback has begun destination-side private work. A
-            # later failure cannot prove the move was untouched.
-            mutation_tracker.uncertain()
         source_stat = os.lstat(src)
         source_snapshot = cls.__source_tree_snapshot(src)
         source_claim_snapshot = cls.__source_tree_snapshot(src, ignore_root_ctime=True)
         temporary_path: Optional[str] = None
         temporary_root: Optional[str] = None
+        temporary_created = False
         publication_error = False
         try:
-            temporary_path, temporary_root = cls.__copy_to_publish_temporary(src, destination_parent)
+            try:
+                temporary_path, temporary_root = cls.__copy_to_publish_temporary(src, destination_parent)
+            except BaseException as error:
+                if mutation_tracker is not None:
+                    mutation_tracker.record_publication(
+                        "create_temporary", "create_temporary", "destination_parent", error,
+                        source_path=src,
+                        destination_parent_path=destination_parent,
+                        destination_path=dst,
+                        temporary_created=False,
+                    )
+                raise
+            temporary_created = True
+            if mutation_tracker is not None:
+                mutation_tracker.record_publication(
+                    "create_temporary", "create_temporary", "destination_parent",
+                    source_path=src,
+                    temporary_path=temporary_path,
+                    destination_parent_path=destination_parent,
+                    destination_path=dst,
+                    temporary_created=True,
+                )
+                mutation_tracker.record_publication(
+                    "copy", "copy", "temporary",
+                    source_path=src,
+                    temporary_path=temporary_path,
+                    destination_parent_path=destination_parent,
+                    destination_path=dst,
+                    temporary_created=True,
+                )
             temporary_manifest = cls.__publication_tree_manifest(temporary_path)
+            temporary_rename_completed = False
             try:
                 cls.__rename_no_replace(temporary_path, dst)
+                temporary_rename_completed = True
                 if mutation_tracker is not None:
                     mutation_tracker.mutated()
+                    mutation_tracker.record_publication(
+                        "publish", "publish", "destination",
+                        source_path=src,
+                        temporary_path=temporary_path,
+                        destination_parent_path=destination_parent,
+                        destination_path=dst,
+                        temporary_created=temporary_created,
+                    )
                 if not os.path.lexists(dst) or os.path.lexists(temporary_path):
                     raise OSError(errno.EIO, "temporary publication did not reach the expected final state", dst)
                 published_stat = os.lstat(dst)
@@ -5682,15 +6004,83 @@ class Controller:
                     raise OSError(errno.EAGAIN, "final target changed during native publication", dst)
                 if cls.__publication_tree_manifest(dst) != temporary_manifest:
                     raise OSError(errno.EAGAIN, "final target changed during native publication", dst)
+                if mutation_tracker is not None:
+                    mutation_tracker.record_publication(
+                        "verify", "verify", "destination",
+                        source_path=src,
+                        temporary_path=temporary_path,
+                        destination_parent_path=destination_parent,
+                        destination_path=dst,
+                        temporary_created=temporary_created,
+                    )
             except OSError as error:
                 if not cls.__is_no_replace_capability_error(error):
+                    if mutation_tracker is not None:
+                        mutation_tracker.record_publication(
+                            "verify" if temporary_rename_completed else "publish",
+                            "verify" if temporary_rename_completed else "publish",
+                            "destination", error,
+                            source_path=src,
+                            temporary_path=temporary_path,
+                            destination_parent_path=destination_parent,
+                            destination_path=dst,
+                            temporary_created=temporary_created,
+                        )
                     raise
-                cls.__publish_temporary_no_replace(temporary_path, dst, mutation_tracker)
+                try:
+                    cls.__publish_temporary_no_replace(temporary_path, dst, mutation_tracker)
+                except BaseException as fallback_error:
+                    if mutation_tracker is not None:
+                        mutation_tracker.record_publication(
+                            "publish", "publish", "destination", fallback_error,
+                            source_path=src,
+                            temporary_path=temporary_path,
+                            destination_parent_path=destination_parent,
+                            destination_path=dst,
+                            temporary_created=temporary_created,
+                        )
+                    raise
+                if mutation_tracker is not None:
+                    mutation_tracker.record_publication(
+                        "publish", "publish", "destination",
+                        source_path=src,
+                        temporary_path=temporary_path,
+                        destination_parent_path=destination_parent,
+                        destination_path=dst,
+                        temporary_created=temporary_created,
+                    )
+                    mutation_tracker.record_publication(
+                        "verify", "verify", "destination",
+                        source_path=src,
+                        temporary_path=temporary_path,
+                        destination_parent_path=destination_parent,
+                        destination_path=dst,
+                        temporary_created=temporary_created,
+                    )
             temporary_path = None
-            if cls.__source_tree_snapshot(src) != source_snapshot:
-                raise OSError(errno.EAGAIN, "staging source changed during publication", src)
-            cls.__remove_published_source(src, source_stat, source_claim_snapshot)
-            cls.__sync_directory_if_supported(os.path.dirname(src))
+            try:
+                if cls.__source_tree_snapshot(src) != source_snapshot:
+                    raise OSError(errno.EAGAIN, "staging source changed during publication", src)
+                cls.__remove_published_source(src, source_stat, source_claim_snapshot)
+                cls.__sync_directory_if_supported(os.path.dirname(src))
+            except BaseException as error:
+                if mutation_tracker is not None:
+                    mutation_tracker.record_publication(
+                        "remove_source", "remove_source", "source", error,
+                        source_path=src,
+                        destination_parent_path=destination_parent,
+                        destination_path=dst,
+                        temporary_created=temporary_created,
+                    )
+                raise
+            if mutation_tracker is not None:
+                mutation_tracker.record_publication(
+                    "remove_source", "remove_source", "source",
+                    source_path=src,
+                    destination_parent_path=destination_parent,
+                    destination_path=dst,
+                    temporary_created=temporary_created,
+                )
         except BaseException:
             publication_error = True
             raise
@@ -5700,19 +6090,64 @@ class Controller:
                 cleanup_paths.append(temporary_path)
             if temporary_root is not None:
                 cleanup_paths.append(temporary_root)
+            cleanup_recorded = False
             for cleanup_path in cleanup_paths:
                 try:
                     if os.path.isdir(cleanup_path) and not os.path.islink(cleanup_path):
                         shutil.rmtree(cleanup_path)
                     else:
                         os.unlink(cleanup_path)
-                except FileNotFoundError:
+                except FileNotFoundError as error:
+                    if mutation_tracker is not None:
+                        mutation_tracker.record_publication(
+                            "cleanup", "cleanup", "temporary", error,
+                            source_path=src,
+                            temporary_path=cleanup_path,
+                            destination_parent_path=destination_parent,
+                            destination_path=dst,
+                            temporary_created=temporary_created,
+                            residue_path=cleanup_path,
+                        )
+                    cleanup_recorded = True
                     continue
-                except OSError:
+                except OSError as error:
+                    if mutation_tracker is not None:
+                        mutation_tracker.record_publication(
+                            "cleanup", "cleanup", "temporary", error,
+                            source_path=src,
+                            temporary_path=cleanup_path,
+                            destination_parent_path=destination_parent,
+                            destination_path=dst,
+                            temporary_created=temporary_created,
+                            residue_path=cleanup_path,
+                        )
+                    cleanup_recorded = True
                     # Keep uncertain private residue.  In a failure path it
                     # must not mask the error that controls source safety.
                     if not publication_error:
                         raise
+                else:
+                    if mutation_tracker is not None:
+                        mutation_tracker.record_publication(
+                            "cleanup", "cleanup", "temporary",
+                            source_path=src,
+                            temporary_path=cleanup_path,
+                            destination_parent_path=destination_parent,
+                            destination_path=dst,
+                            temporary_created=temporary_created,
+                            residue_path=cleanup_path,
+                        )
+                    cleanup_recorded = True
+            if mutation_tracker is not None and not cleanup_recorded:
+                mutation_tracker.record_publication(
+                    "cleanup", "cleanup", "temporary",
+                    source_path=src,
+                    temporary_path=temporary_path,
+                    destination_parent_path=destination_parent,
+                    destination_path=dst,
+                    temporary_created=temporary_created,
+                    residue_path=temporary_path,
+                )
 
     def _reserve_move_attempt(self, file_id: str) -> bool:
         # Lock order is model_lock -> move_attempt_lock. This helper never
@@ -5726,6 +6161,133 @@ class Controller:
     def _release_move_attempt(self, file_id: str) -> None:
         with self.__move_attempt_lock:
             self.__move_attempt_reservations.discard(file_id)
+
+    def _prune_child_finalization_retry_state(self, candidate_file_ids: set[str]) -> None:
+        """Forget retry state once scanner proof no longer names the child."""
+        for attribute in ("_Controller__child_final_move_failure_counts", "_Controller__child_final_move_retry_due"):
+            state = getattr(self, attribute, None)
+            if isinstance(state, dict):
+                for file_id in tuple(state):
+                    if file_id not in candidate_file_ids:
+                        state.pop(file_id, None)
+
+    def _finalize_staging_child(
+            self, root_name: str, relative_path: str, path_pair_id: Optional[str] = None,
+    ) -> "Controller.MoveFromStagingResult":
+        """Publish one proven directory leaf without completing its root."""
+        child_name = root_name.rstrip("/\\") + "/" + relative_path
+        child_file_id = ModelFile.build_file_id(child_name, path_pair_id)
+        if not hasattr(self, "_Controller__child_final_move_retry_due"):
+            self.__child_final_move_retry_due = {}
+        if not hasattr(self, "_Controller__child_final_move_failure_counts"):
+            self.__child_final_move_failure_counts = {}
+        max_failures = getattr(self, "_Controller__MAX_MOVE_FAILURES", 4)
+        if type(max_failures) is not int:
+            max_failures = 4
+        if self.__is_explicitly_stopped(root_name, path_pair_id):
+            return Controller.MoveFromStagingResult.DEFERRED
+        if self.__child_final_move_failure_counts.get(child_file_id, 0) >= max_failures:
+            return Controller.MoveFromStagingResult.DEFERRED
+        retry_due = self.__child_final_move_retry_due.get(child_file_id)
+        if retry_due is not None and datetime.now() < retry_due:
+            return Controller.MoveFromStagingResult.DEFERRED
+        if not self._reserve_move_attempt(child_file_id):
+            return Controller.MoveFromStagingResult.DEFERRED
+        result = Controller.MoveFromStagingResult.FAILED
+        try:
+            if self.__is_explicitly_stopped(root_name, path_pair_id):
+                result = Controller.MoveFromStagingResult.DEFERRED
+                resolved = None
+            else:
+                resolved = self.__resolve_safe_final_move_paths(child_name, path_pair_id)
+            if resolved is not None:
+                staging_root, final_root, _src, _dst = resolved
+                components = child_name.split("/")[:-1]
+                source_parent_fd = self.__open_contained_finalization_parent(staging_root, components, False)
+                destination_parent_fd = self.__open_contained_finalization_parent(final_root, components, True)
+                if source_parent_fd is not None and destination_parent_fd is not None:
+                    try:
+                        leaf_name = child_name.split("/")[-1]
+                        anchored_source = os.path.join("/proc/self/fd", str(source_parent_fd), leaf_name)
+                        anchored_destination = os.path.join("/proc/self/fd", str(destination_parent_fd), leaf_name)
+                        try:
+                            source_stat = os.lstat(anchored_source)
+                        except FileNotFoundError:
+                            destination_stat = os.lstat(anchored_destination)
+                            if stat.S_ISREG(destination_stat.st_mode):
+                                result = Controller.MoveFromStagingResult.ALREADY_COMPLETED
+                        else:
+                            if stat.S_ISREG(source_stat.st_mode):
+                                result = self.__move_from_staging(
+                                    child_name, path_pair_id,
+                                    anchored_paths=(staging_root, final_root, anchored_source, anchored_destination),
+                                )
+                    finally:
+                        os.close(source_parent_fd)
+                        os.close(destination_parent_fd)
+                else:
+                    if source_parent_fd is not None:
+                        os.close(source_parent_fd)
+                    if destination_parent_fd is not None:
+                        os.close(destination_parent_fd)
+        except Exception:
+            result = Controller.MoveFromStagingResult.FAILED
+        try:
+            if result in (Controller.MoveFromStagingResult.COMPLETED,
+                          Controller.MoveFromStagingResult.ALREADY_COMPLETED):
+                self.__child_final_move_failure_counts.pop(child_file_id, None)
+                self.__child_final_move_retry_due.pop(child_file_id, None)
+            elif result in (Controller.MoveFromStagingResult.FAILED,
+                            Controller.MoveFromStagingResult.CONFLICT):
+                count = min(max_failures,
+                            self.__child_final_move_failure_counts.get(child_file_id, 0) + 1)
+                self.__child_final_move_failure_counts[child_file_id] = count
+                if count < max_failures:
+                    self.__child_final_move_retry_due[child_file_id] = datetime.now() + timedelta(
+                        seconds=self.__MOVE_RETRY_DELAYS[count - 1]
+                    )
+            return result
+        finally:
+            self._release_move_attempt(child_file_id)
+
+    @staticmethod
+    def __open_contained_finalization_parent(root: str, components: list[str], create: bool) -> Optional[int]:
+        """Hold a no-follow directory descriptor for a contained child parent."""
+        if os.name != "posix" or not os.path.isdir("/proc/self/fd"):
+            return None
+        o_directory = getattr(os, "O_DIRECTORY", None)
+        o_no_follow = getattr(os, "O_NOFOLLOW", None)
+        if type(o_directory) is not int or type(o_no_follow) is not int or \
+                os.open not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd:
+            return None
+        flags = os.O_RDONLY | o_directory | o_no_follow
+        descriptor: Optional[int] = None
+        try:
+            descriptor = os.open(root, flags)
+            for component in components:
+                if not component or component in (".", ".."):
+                    return None
+                try:
+                    child = os.open(component, flags, dir_fd=descriptor)
+                except FileNotFoundError:
+                    if not create:
+                        return None
+                    os.mkdir(component, dir_fd=descriptor)
+                    child = os.open(component, flags, dir_fd=descriptor)
+                parent_descriptor = descriptor
+                descriptor = child
+                os.close(parent_descriptor)
+            result = descriptor
+            descriptor = None
+            return result
+        except OSError:
+            return None
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     def _reset_move_retry_rebuild_gate(self, file_id: str) -> None:
         gate = getattr(self, "_Controller__move_retry_rebuild_gate", None)
@@ -6209,6 +6771,7 @@ class Controller:
                     pass
                 try:
                     file_id = ModelFile.build_file_id(file_name, path_pair_id)
+                    operation_sequence = self.__next_lftp_operation_sequence(file_id)
                     source_identity = self.__resume_source_identity(remote_file)
                     allow_resume = self.__allow_file_resume(file_id, is_dir, source_identity)
                     allow_legacy_get_resume = self.__allow_legacy_file_resume(
@@ -6226,7 +6789,11 @@ class Controller:
                         False
                     )
                     queue_kwargs: dict[str, object] = {}
-                    exclude_patterns = self.__transfer_exclude_patterns(file_id, is_dir)
+                    exclude_patterns = self.__transfer_exclude_patterns(
+                        file_id,
+                        is_dir,
+                        self.__fractional_queue_flow_id(file_id, operation_sequence),
+                    )
                     if exclude_patterns:
                         queue_kwargs["exclude_patterns"] = exclude_patterns
                     if self.__uses_async_lftp_owner() and not is_dir:
@@ -6255,7 +6822,6 @@ class Controller:
                             **queue_kwargs
                         )
                     if self.__uses_async_lftp_owner():
-                        operation_sequence = self.__next_lftp_operation_sequence(file_id)
                         self.__queue_dispatch_pending()[file_id] = PendingQueueDispatch(
                             time.monotonic(), file_name, path_pair_id, is_dir, operation_sequence,
                             source_identity if not allow_resume else None,
@@ -6272,11 +6838,49 @@ class Controller:
                                 file_name,
                                 staging_path,
                             )
+                            self.__record_fractional_queue_trace(file_id, "startup_recovery_queue_dispatch", lambda: {
+                                "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
+                                "dispatch_mode": "async_future",
+                                "future_outcome": "backend_rejection",
+                                "status_acknowledgement": "not_applicable",
+                                "result": "rejected",
+                                "reason": "backend_shutting_down",
+                            }, flow_id=self.__fractional_queue_flow_id(file_id, operation_sequence))
                             continue
+                        self.__record_fractional_queue_trace(file_id, "startup_recovery_queue_dispatch", lambda: {
+                            "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
+                            "dispatch_mode": "async_future",
+                            "future_outcome": "pending",
+                            "status_acknowledgement": "pending",
+                            "result": "submitted",
+                        }, flow_id=self.__fractional_queue_flow_id(file_id, operation_sequence))
                     else:
-                        queue_lftp()
+                        if queue_lftp() is False:
+                            self.__record_fractional_queue_trace(file_id, "startup_recovery_queue_dispatch", lambda: {
+                                "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
+                                "dispatch_mode": "sync_backend",
+                                "future_outcome": "backend_rejection",
+                                "status_acknowledgement": "not_applicable",
+                                "result": "rejected",
+                            }, flow_id=self.__fractional_queue_flow_id(file_id, operation_sequence))
+                            continue
+                        self.__record_fractional_queue_trace(file_id, "startup_recovery_queue_dispatch", lambda: {
+                            "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
+                            "dispatch_mode": "sync_backend",
+                            "future_outcome": "not_applicable",
+                            "status_acknowledgement": "pending",
+                            "result": "submitted",
+                        }, flow_id=self.__fractional_queue_flow_id(file_id, operation_sequence))
                     self.logger.info("Recovered interrupted download '%s' from '%s'", file_name, staging_path)
                 except (LftpError, RcloneTransferError) as error:
+                    self.__record_fractional_queue_trace(file_id, "startup_recovery_queue_dispatch", lambda: {
+                        "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
+                        "dispatch_mode": "async_future" if self.__uses_async_lftp_owner() else "sync_backend",
+                        "future_outcome": "error",
+                        "status_acknowledgement": "not_applicable",
+                        "result": "rejected",
+                        "reason": "backend_error",
+                    }, flow_id=self.__fractional_queue_flow_id(file_id, operation_sequence))
                     self.logger.warning(
                         "Failed to recover interrupted download '%s' from '%s': %s",
                         file_name,
@@ -6334,6 +6938,14 @@ class Controller:
             if file_id in active_file_ids:
                 dispatch = pending[file_id]
                 if status is not None and status.state == LftpJobStatus.State.QUEUED:
+                    self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+                        "schema": "fractional_mtime_redownload.queue_status_ack.v2",
+                        "status_acknowledgement": "queued",
+                        "future_outcome": "not_observed",
+                        "result": "pending",
+                    }, flow_id=self.__fractional_queue_flow_id(
+                        file_id, dispatch.operation_sequence,
+                    ))
                     # A raw QUEUED row is only acknowledgement that the
                     # backend accepted the operation.  Keep the accepted
                     # dispatch until RUNNING is authoritative or a fresh
@@ -6344,6 +6956,15 @@ class Controller:
                     if status is None or status.state != LftpJobStatus.State.RUNNING or status.type not in (
                             LftpJobStatus.Type.GET, LftpJobStatus.Type.PGET,
                     ):
+                        self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+                            "schema": "fractional_mtime_redownload.queue_status_ack.v2",
+                            "status_acknowledgement": "ambiguous",
+                            "future_outcome": "not_observed",
+                            "result": "pending",
+                            "reason": "running_identity_unproven",
+                        }, flow_id=self.__fractional_queue_flow_id(
+                            file_id, dispatch.operation_sequence,
+                        ))
                         # A queued status has not reset an old map yet. Keep
                         # this existing dispatch until a running GET/PGET is
                         # authoritative; otherwise a restart could trust the
@@ -6357,11 +6978,29 @@ class Controller:
                 # A fresh healthy transport snapshot has made the accepted
                 # lifecycle authoritative. The model's active-state guard now
                 # owns duplicate suppression.
+                self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+                    "schema": "fractional_mtime_redownload.queue_status_ack.v2",
+                    "status_acknowledgement": "running",
+                    "future_outcome": "not_observed",
+                    "result": "accepted",
+                }, flow_id=self.__fractional_queue_flow_id(
+                    file_id, dispatch.operation_sequence,
+                ))
                 del pending[file_id]
                 continue
             if active_file_ids:
                 # The snapshot is not idle, so an absent job remains
                 # ambiguous until its next authoritative reconciliation.
+                dispatch = pending[file_id]
+                self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+                    "schema": "fractional_mtime_redownload.queue_status_ack.v2",
+                    "status_acknowledgement": "ambiguous",
+                    "future_outcome": "not_observed",
+                    "result": "pending",
+                    "reason": "other_active_work",
+                }, flow_id=self.__fractional_queue_flow_id(
+                    file_id, dispatch.operation_sequence,
+                ))
                 continue
             dispatch = pending[file_id]
             matching_queue_operations = [
@@ -6372,18 +7011,46 @@ class Controller:
             if matching_queue_operations:
                 operation = matching_queue_operations[-1]
                 if not operation.future.done():
+                    self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+                        "schema": "fractional_mtime_redownload.queue_status_ack.v2",
+                        "status_acknowledgement": "future_pending",
+                        "future_outcome": "pending",
+                        "result": "pending",
+                    }, flow_id=self.__fractional_queue_flow_id(
+                        file_id, dispatch.operation_sequence,
+                    ))
                     continue
+                future_outcome = "success"
                 try:
                     accepted = operation.future.result() is not False
                 except Exception:
                     accepted = False
+                    future_outcome = "error"
+                if not accepted and future_outcome != "error":
+                    future_outcome = "backend_rejection"
                 if not accepted:
+                    self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+                        "schema": "fractional_mtime_redownload.queue_status_ack.v2",
+                        "status_acknowledgement": "rejected",
+                        "future_outcome": future_outcome,
+                        "result": "rejected",
+                    }, flow_id=self.__fractional_queue_flow_id(
+                        file_id, dispatch.operation_sequence,
+                    ))
                     # Let the ordinary queue failure path restore its command
                     # lifecycle, but never let its stale intent become a
                     # completion candidate in the interim.
                     del pending[file_id]
                     continue
             del pending[file_id]
+            self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+                "schema": "fractional_mtime_redownload.queue_status_ack.v2",
+                "status_acknowledgement": "idle_completion",
+                "future_outcome": future_outcome if matching_queue_operations else "not_observed",
+                "result": "accepted",
+            }, flow_id=self.__fractional_queue_flow_id(
+                file_id, dispatch.operation_sequence,
+            ))
             if not self.__is_explicitly_stopped(dispatch.name, dispatch.path_pair_id):
                 retired_without_running.add((
                     dispatch.name,
@@ -6534,6 +7201,13 @@ class Controller:
                         file.name,
                         file.path_pair_id
                     )
+                    self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                        "schema": "fractional_mtime_redownload.queue_dispatch.v2",
+                        "dispatch_mode": "idempotent_noop",
+                        "future_outcome": "not_applicable",
+                        "status_acknowledgement": "already_active" if already_active else "pending",
+                        "result": "accepted",
+                    })
                     self.__record_command_breadcrumb(
                         command=command,
                         message="command_dispatched",
@@ -6547,9 +7221,25 @@ class Controller:
                         file=file,
                     )
                 elif file.remote_size is None:
+                    self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                        "schema": "fractional_mtime_redownload.queue_dispatch.v2",
+                        "dispatch_mode": "not_dispatched",
+                        "future_outcome": "not_applicable",
+                        "status_acknowledgement": "not_applicable",
+                        "result": "rejected",
+                        "reason": "remote_unavailable",
+                    })
                     _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404, file)
                     continue
                 elif not file.remote_has_transferable_content:
+                    self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                        "schema": "fractional_mtime_redownload.queue_dispatch.v2",
+                        "dispatch_mode": "not_dispatched",
+                        "future_outcome": "not_applicable",
+                        "status_acknowledgement": "not_applicable",
+                        "result": "rejected",
+                        "reason": "remote_has_no_transferable_content",
+                    })
                     _notify_failure(
                         command,
                         "File '{}' has no transferable remote content".format(command.filename),
@@ -6564,6 +7254,14 @@ class Controller:
                 elif file.is_dir and command.origin != "auto_queue" and not self.is_path_pair_reconciled(
                         file.path_pair_id
                 ):
+                    self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                        "schema": "fractional_mtime_redownload.queue_dispatch.v2",
+                        "dispatch_mode": "not_dispatched",
+                        "future_outcome": "not_applicable",
+                        "status_acknowledgement": "not_applicable",
+                        "result": "rejected",
+                        "reason": "local_readiness_unavailable",
+                    })
                     _notify_failure(
                         command,
                         "Path Pair scan is in progress; retry Queue when it completes",
@@ -6574,6 +7272,8 @@ class Controller:
                 else:
                     operation_sequence = None
                     lifecycle_before_queue = None
+                    sync_backend_rejected = False
+                    exclusions_present = False
                     try:
                         path_pair = self.__get_path_pair(file.path_pair_id)
                         local_base_dir_path = self.__get_staging_path(file.path_pair_id if path_pair else None)
@@ -6590,9 +7290,18 @@ class Controller:
                             stopped_marked
                         )
                         queue_kwargs: dict[str, object] = {}
-                        exclude_patterns = self.__transfer_exclude_patterns(file.file_id, file.is_dir)
+                        # Allocate the operation identity before exclusion
+                        # serialization so its causal evidence joins the
+                        # eventual manual Queue dispatch/future/status flow.
+                        operation_sequence = self.__next_lftp_operation_sequence(file.file_id)
+                        exclude_patterns = self.__transfer_exclude_patterns(
+                            file.file_id,
+                            file.is_dir,
+                            self.__fractional_queue_flow_id(file.file_id, operation_sequence),
+                        )
                         if exclude_patterns:
                             queue_kwargs["exclude_patterns"] = exclude_patterns
+                        exclusions_present = bool(exclude_patterns)
                         source_identity = self.__model_builder.get_remote_resume_source_identity(file.file_id)
                         if not isinstance(source_identity, tuple) or len(source_identity) != 2 or \
                                 type(source_identity[0]) is not int or type(source_identity[1]) is not int:
@@ -6609,7 +7318,6 @@ class Controller:
                                 queue_kwargs["expected_size"] = source_identity[0]
                             if allow_legacy_get_resume:
                                 queue_kwargs["allow_legacy_get_resume"] = True
-                        operation_sequence = self.__next_lftp_operation_sequence(file.file_id)
                         lifecycle_before_queue = self.__download_start_lifecycle_snapshot(file.file_id)
                         dispatch = PendingQueueDispatch(
                             time.monotonic(), file.name, file.path_pair_id, file.is_dir, operation_sequence,
@@ -6638,11 +7346,43 @@ class Controller:
                                     "queue", queue_lftp, file.file_id, operation_sequence,
                                     download_start_lifecycle_before=lifecycle_before_queue):
                                 pending_queue_dispatches.pop(file.file_id, None)
+                                self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                                    "schema": "fractional_mtime_redownload.queue_dispatch.v2",
+                                    "dispatch_mode": "async_future",
+                                    "future_outcome": "backend_rejection",
+                                    "status_acknowledgement": "not_applicable",
+                                    "exclusions_present": exclusions_present,
+                                    "result": "rejected",
+                                    "reason": "backend_shutting_down",
+                                }, flow_id=self.__fractional_queue_flow_id(
+                                    file.file_id, operation_sequence,
+                                ))
                                 _notify_failure(command, "Transfer backend is shutting down", 503, file)
                                 continue
+                            self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                                "schema": "fractional_mtime_redownload.queue_dispatch.v2",
+                                "dispatch_mode": "async_future",
+                                "future_outcome": "pending",
+                                "status_acknowledgement": "pending",
+                                "exclusions_present": exclusions_present,
+                                "result": "submitted",
+                            }, flow_id=self.__fractional_queue_flow_id(
+                                file.file_id, operation_sequence,
+                            ))
                         else:
                             if queue_lftp() is False:
+                                sync_backend_rejected = True
                                 raise LftpError("Transfer backend rejected queue request")
+                            self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                                "schema": "fractional_mtime_redownload.queue_dispatch.v2",
+                                "dispatch_mode": "sync_backend",
+                                "future_outcome": "not_applicable",
+                                "status_acknowledgement": "pending",
+                                "exclusions_present": exclusions_present,
+                                "result": "submitted",
+                            }, flow_id=self.__fractional_queue_flow_id(
+                                file.file_id, operation_sequence,
+                            ))
                         # A successful Queue changes the transfer state even
                         # when the previous idle poll is still within its
                         # cooldown.  Retire that cached deadline so the next
@@ -6714,6 +7454,17 @@ class Controller:
                             file.file_id,
                             lifecycle_before_queue,
                         )
+                        self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                            "schema": "fractional_mtime_redownload.queue_dispatch.v2",
+                            "dispatch_mode": "async_future" if self.__uses_async_lftp_owner() else "sync_backend",
+                            "future_outcome": "backend_rejection" if sync_backend_rejected else "error",
+                            "status_acknowledgement": "not_applicable",
+                            "exclusions_present": exclusions_present,
+                            "result": "rejected",
+                            "reason": "backend_rejected" if sync_backend_rejected else "backend_error",
+                        }, flow_id=self.__fractional_queue_flow_id(
+                            file.file_id, operation_sequence,
+                        ))
                         _notify_failure(command, "Transfer backend error: {}".format(str(e)), 500, file)
                         continue
 

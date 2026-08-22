@@ -4619,5 +4619,58 @@ class ModelUpdater(_ControllerCoreAccess):
             summary_notifier = getattr(controller, "notify_model_summary_changed", None)
             if callable(summary_notifier):
                 summary_notifier()
+
+        # A mirror/directory job owns only its root lifecycle.  Its scanner
+        # tree can nevertheless prove one staging leaf complete while another
+        # child remains active.  Publish those leaves through the controller's
+        # contained no-replace boundary without creating any root completion
+        # marker or waiting for the directory job to retire.
+        leaf_candidates = getattr(model_builder, "get_finalizable_staging_leaf_candidates", None)
+        finalize_child = getattr(controller, "_finalize_staging_child", None)
+        # A queued/running directory mirror can keep unrelated global
+        # reconciliation work unhealthy. Child publication needs only the
+        # exact Path Pair checks below; its scanner identity proof is already
+        # independent of the root's presentation state.
+        if callable(leaf_candidates) and callable(finalize_child):
+            try:
+                candidates = leaf_candidates()
+            except Exception:
+                candidates = ()
+            candidate_file_ids: set[str] = set()
+            if isinstance(candidates, tuple):
+                for root_file_id, relative_path in candidates:
+                    if not isinstance(root_file_id, str) or not isinstance(relative_path, str):
+                        continue
+                    try:
+                        parsed = json.loads(root_file_id)
+                    except (TypeError, ValueError):
+                        parsed = None
+                    root_name = parsed[1] if isinstance(parsed, list) and len(parsed) == 2 and \
+                        isinstance(parsed[0], str) and isinstance(parsed[1], str) else root_file_id
+                    path_pair_id = parsed[0] if isinstance(parsed, list) and len(parsed) == 2 and \
+                        isinstance(parsed[0], str) and isinstance(parsed[1], str) else None
+                    candidate_file_ids.add(ModelFile.build_file_id(root_name + "/" + relative_path, path_pair_id))
+            prune_child_retry = getattr(controller, "_prune_child_finalization_retry_state", None)
+            if callable(prune_child_retry):
+                prune_child_retry(candidate_file_ids)
+            for root_file_id, relative_path in candidates if isinstance(candidates, tuple) else ():
+                if not isinstance(root_file_id, str) or not isinstance(relative_path, str):
+                    continue
+                try:
+                    parsed = json.loads(root_file_id)
+                except (TypeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, list) and len(parsed) == 2 and \
+                        isinstance(parsed[0], str) and isinstance(parsed[1], str):
+                    path_pair_id, root_name = parsed
+                else:
+                    path_pair_id, root_name = None, root_file_id
+                if path_pair_id not in controller._Controller__reconciled_local_path_pair_ids or \
+                        path_pair_id not in controller._Controller__reconciled_remote_path_pair_ids:
+                    continue
+                try:
+                    finalize_child(root_name, relative_path, path_pair_id)
+                except Exception:
+                    controller.logger.debug("Ignoring independent child finalization failure", exc_info=True)
         return full_build_triggered or progressive_delta_applied or authoritative_pair_delta_applied or \
             active_transfer_delta_applied

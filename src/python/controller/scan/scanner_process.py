@@ -21,7 +21,7 @@ from system import SystemFile
 
 
 class _BreadcrumbEmitter(Protocol):
-    def record(self, source: str, message: str, details: object = None, **metadata: object) -> None: ...
+    def record(self, source: str, message: str, details: object = None, **metadata: object) -> str: ...
 
 
 class ScannerError(AppError):

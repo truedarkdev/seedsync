@@ -4940,6 +4940,66 @@ class TestModelUpdater(unittest.TestCase):
         ModelUpdater(controller).update()
         controller._Controller__move_from_staging.assert_called_once()
 
+    def test_active_directory_transfer_dispatches_only_verified_staging_child_finalization(self):
+        remote_root = SystemFile("release", 20, True)
+        remote_root.add_child(SystemFile("complete.bin", 8, False, mtime_ns=1))
+        remote_root.add_child(SystemFile("incomplete.bin", 12, False, mtime_ns=2))
+        local_root = SystemFile("release", 20, True, is_staging=True)
+        local_root.add_child(SystemFile("complete.bin", 8, False, is_staging=True, mtime_ns=1))
+        incomplete = SystemFile("incomplete.bin", 12, False, is_staging=True, mtime_ns=2)
+        incomplete.status_sidecar_ready = True
+        local_root.add_child(incomplete)
+        running = LftpJobStatus(1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "")
+        running.total_transfer_state = LftpJobStatus.TransferState(8, 20, 40, 100, 1)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        builder.set_lftp_statuses([running])
+        live_model = builder.build_model()
+        final_remote = ScannerResult(datetime.now(), [remote_root], scanned_path_pair_ids={None}, is_scan_final=True)
+        final_local = ScannerResult(datetime.now(), [local_root], scanned_path_pair_ids={None}, is_scan_final=True)
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__lftp.status.return_value = [running]
+        controller._finalize_staging_child = MagicMock(return_value=Controller.MoveFromStagingResult.COMPLETED)
+
+        ModelUpdater(controller).update()
+
+        controller._finalize_staging_child.assert_called_once_with("release", "complete.bin", None)
+        self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+
+    def test_queued_directory_mirror_dispatches_verified_completed_child_while_sibling_downloads(self):
+        remote_root = SystemFile("release", 20, True)
+        remote_root.add_child(SystemFile("complete.bin", 8, False, mtime_ns=1))
+        remote_root.add_child(SystemFile("downloading.bin", 12, False, mtime_ns=2))
+        local_root = SystemFile("release", 20, True, is_staging=True)
+        local_root.add_child(SystemFile("complete.bin", 8, False, is_staging=True, mtime_ns=1))
+        downloading = SystemFile("downloading.bin", 12, False, is_staging=True, mtime_ns=2)
+        downloading.status_sidecar_ready = True
+        local_root.add_child(downloading)
+        queued = LftpJobStatus(1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.QUEUED, "release", "")
+        builder = ModelBuilder()
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        builder.set_lftp_statuses([queued])
+        live_model = builder.build_model()
+        final_remote = ScannerResult(datetime.now(), [remote_root], scanned_path_pair_ids={None}, is_scan_final=True)
+        final_local = ScannerResult(datetime.now(), [local_root], scanned_path_pair_ids={None}, is_scan_final=True)
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__lftp.status.return_value = [queued]
+        controller._finalize_staging_child = MagicMock(return_value=Controller.MoveFromStagingResult.COMPLETED)
+
+        ModelUpdater(controller).update()
+
+        controller._finalize_staging_child.assert_called_once_with("release", "complete.bin", None)
+        self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
+
     def test_v092_pending_completion_waits_for_authoritative_local_coverage(self):
         controller = self._make_v092_pending_completion_controller(complete=False)
 
