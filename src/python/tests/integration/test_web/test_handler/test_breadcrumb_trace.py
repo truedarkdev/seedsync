@@ -238,3 +238,129 @@ class TestBreadcrumbTraceHandler(BaseTestWebApp):
         json_dict = json.loads(resp.body.decode("utf-8"))
         self.assertEqual(0, json_dict["entry_count"])
         self.assertEqual("reset", json_dict["window_reset_reason"])
+
+    def test_v1_routes_expose_capabilities_policy_events_and_export(self):
+        self.context.config.general.breadcrumb_trace_enabled = True
+        self.context.breadcrumb_trace.record(
+            "transfer",
+            "started",
+            {"size": 1},
+            category="transfer.remote",
+            level="warning",
+            corr_id="corr-1",
+            flow_id="flow-1",
+            stage="transfer",
+            event_type="state_transition",
+        )
+
+        capabilities = self.test_app.get("/server/breadcrumbs/v1/capabilities")
+        self.assertEqual(200, capabilities.status_int)
+        capabilities_json = json.loads(capabilities.text)
+        self.assertTrue(capabilities_json["query"])
+        self.assertTrue(capabilities_json["export"])
+
+        events = self.test_app.get(
+            "/server/breadcrumbs/v1/events?category_prefix=transfer&correlation_id=corr-1&limit=1"
+        )
+        self.assertEqual(200, events.status_int)
+        events_json = json.loads(events.text)
+        self.assertEqual(1, len(events_json["events"]))
+        self.assertEqual("transfer.remote", events_json["events"][0]["category"])
+        self.assertIn("gaps", events_json)
+
+        exported = self.test_app.get("/server/breadcrumbs/v1/export?source=transfer&limit=1")
+        self.assertEqual(200, exported.status_int)
+        self.assertEqual(1, len(json.loads(exported.text)["events"]))
+        jsonl = self.test_app.get("/server/breadcrumbs/v1/export?source=transfer&format=jsonl&limit=1")
+        self.assertEqual(200, jsonl.status_int)
+        self.assertEqual("application/x-ndjson", jsonl.headers["Content-Type"].split(";")[0])
+        jsonl_records = [json.loads(line) for line in jsonl.text.splitlines()]
+        self.assertEqual("breadcrumb-metadata", jsonl_records[0]["record_type"])
+        self.assertEqual(1, jsonl_records[0]["export_event_count"])
+        self.assertEqual("started", jsonl_records[1]["message"])
+
+        policy = self.test_app.get("/server/breadcrumbs/v1/policy")
+        self.assertEqual(200, policy.status_int)
+        self.assertIn("revision", json.loads(policy.text))
+
+        # New diagnostics surface is explicitly versioned; only get/reset are legacy.
+        alias = self.test_app.get("/server/breadcrumbs/events?limit=1", expect_errors=True)
+        self.assertEqual(404, alias.status_int)
+
+    def test_v1_policy_validate_apply_reset_and_compare_and_swap_conflict(self):
+        candidate = {"policy": {"default": "warning", "rules": {"transfer": "debug"}}}
+        validated = self.test_app.post_json("/server/breadcrumbs/v1/policy/validate", candidate)
+        self.assertEqual(200, validated.status_int)
+        self.assertTrue(json.loads(validated.text)["valid"])
+
+        applied = self.test_app.post_json(
+            "/server/breadcrumbs/v1/policy/apply", {**candidate, "expected_revision": 0}
+        )
+        self.assertEqual(200, applied.status_int)
+        self.assertTrue(json.loads(applied.text)["applied"])
+
+        conflict = self.test_app.post_json(
+            "/server/breadcrumbs/v1/policy/apply", {**candidate, "expected_revision": 0},
+            expect_errors=True,
+        )
+        self.assertEqual(409, conflict.status_int)
+        self.assertTrue(json.loads(conflict.text)["conflict"])
+
+        reset = self.test_app.post_json(
+            "/server/breadcrumbs/v1/policy/reset", {"expected_revision": 1}
+        )
+        self.assertEqual(200, reset.status_int)
+        self.assertTrue(json.loads(reset.text)["applied"])
+
+    def test_v1_clear_and_stream_are_bounded(self):
+        self.context.config.general.breadcrumb_trace_enabled = True
+        self.context.breadcrumb_trace.record("controller", "start", {"n": 1})
+
+        stream = self.test_app.get("/server/breadcrumbs/v1/stream?limit=1")
+        self.assertEqual(200, stream.status_int)
+        self.assertEqual("text/event-stream", stream.headers["Content-Type"].split(";")[0])
+        self.assertIn("event: snapshot", stream.text)
+        self.assertIn('"events"', stream.text)
+
+        cleared = self.test_app.post_json("/server/breadcrumbs/v1/clear", {})
+        self.assertEqual(200, cleared.status_int)
+        self.assertTrue(json.loads(cleared.text)["cleared"])
+
+        invalid = self.test_app.post_json("/server/breadcrumbs/v1/clear", {"unknown": "scope"}, expect_errors=True)
+        self.assertEqual(400, invalid.status_int)
+
+    def test_v1_rejects_unknown_filters_and_page_export_limits(self):
+        invalid = self.test_app.get(
+            "/server/breadcrumbs/v1/events?not_a_filter=1", expect_errors=True
+        )
+        self.assertEqual(400, invalid.status_int)
+
+        invalid_page = self.test_app.get(
+            "/server/breadcrumbs/v1/events?limit=257", expect_errors=True
+        )
+        self.assertEqual(400, invalid_page.status_int)
+
+        invalid_interval = self.test_app.get(
+            "/server/breadcrumbs/v1/stream?follow=true&interval_ms=0", expect_errors=True
+        )
+        self.assertEqual(400, invalid_interval.status_int)
+
+        invalid_export = self.test_app.get(
+            "/server/breadcrumbs/v1/export?limit=2049", expect_errors=True
+        )
+        self.assertEqual(400, invalid_export.status_int)
+
+        invalid_body = self.test_app.post_json(
+            "/server/breadcrumbs/v1/policy/apply", {"policy": []}, expect_errors=True
+        )
+        self.assertEqual(400, invalid_body.status_int)
+
+    def test_all_breadcrumb_routes_require_admin_and_always_auth(self):
+        routes = [
+            route for route in self.web_app.routes
+            if route.rule.startswith("/server/breadcrumbs")
+        ]
+        self.assertGreaterEqual(len(routes), 11)
+        for route in routes:
+            self.assertEqual("admin", route.config.get("required_scope"))
+            self.assertTrue(route.config.get("always_auth"))

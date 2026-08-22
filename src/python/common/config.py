@@ -1,8 +1,9 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import configparser
+import json
 import re
-from typing import Dict
+from typing import Dict, Mapping
 from io import StringIO
 import collections
 import threading
@@ -48,6 +49,82 @@ _LOG_LEVEL_VALUES = frozenset(("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
 _LOG_FORMAT_VALUES = frozenset(("standard", "json"))
 _TRANSFER_PROTOCOL_VALUES = frozenset(("sftp", "ftps"))
 _TRANSFER_BACKEND_VALUES = frozenset(("lftp", "rclone"))
+_BREADCRUMB_POLICY_LEVELS = frozenset(("off", "error", "warning", "info", "debug", "trace"))
+DEFAULT_BREADCRUMB_TRACE_MEMORY_BUDGET_BYTES = 256 * 1024 * 1024
+DEFAULT_BREADCRUMB_TRACE_MAX_ENTRIES = 0
+DEFAULT_BREADCRUMB_TRACE_POLICY = "{}"
+
+
+def parse_breadcrumb_trace_policy(value: object) -> Dict[str, object]:
+    """Decode the persisted breadcrumb policy into the collector's mapping shape.
+
+    JSON is the canonical persisted form.  The compact ``category=level`` form
+    is accepted as a compatibility/convenience form because it is easier to
+    edit in ``settings.cfg`` (``*=warning,scan=trace``).
+    """
+    if not isinstance(value, str):
+        raise ValueError("policy must be a string")
+    serialized = value.strip()
+    if not serialized:
+        raise ValueError("policy is empty")
+
+    candidate: object
+    parsed_json = False
+    try:
+        candidate = json.loads(serialized)
+        parsed_json = True
+    except (TypeError, ValueError):
+        rules: Dict[str, str] = {}
+        default_level = None
+        for item in serialized.split(","):
+            item = item.strip()
+            if not item or "=" not in item:
+                raise ValueError("policy entries must use category=level")
+            category, level = (part.strip() for part in item.split("=", 1))
+            if not category or not level:
+                raise ValueError("policy categories and levels must be non-empty")
+            if category in {"*", "default", "default_level"}:
+                default_level = level
+            else:
+                rules[category] = level
+        candidate = {"default": default_level or "info", "rules": rules}
+
+    if not isinstance(candidate, Mapping):
+        raise ValueError("policy must be a JSON object or category=level list")
+
+    default_level = candidate.get("default", candidate.get("default_level", "info"))
+    if not isinstance(default_level, str) or default_level.strip().lower() not in _BREADCRUMB_POLICY_LEVELS:
+        raise ValueError("policy default level is invalid")
+
+    raw_rules = candidate.get("rules", candidate.get("categories"))
+    if raw_rules is None:
+        raw_rules = {
+            key: item for key, item in candidate.items()
+            if key not in {"default", "default_level", "rules", "categories"}
+        }
+    if not isinstance(raw_rules, Mapping):
+        raise ValueError("policy rules must be an object")
+
+    rules: Dict[str, str] = {}
+    for category, raw_level in raw_rules.items():
+        if not isinstance(category, str) or not category.strip():
+            raise ValueError("policy categories must be non-empty strings")
+        if any(ord(character) < 32 or ord(character) == 127 for character in category):
+            raise ValueError("policy categories must not contain control characters")
+        if isinstance(raw_level, Mapping):
+            raw_level = raw_level.get("level", raw_level.get("value"))
+        if not isinstance(raw_level, str) or raw_level.strip().lower() not in _BREADCRUMB_POLICY_LEVELS:
+            raise ValueError("policy level for {} is invalid".format(category))
+        rules[category.strip()] = raw_level.strip().lower()
+
+    normalized = {
+        "default": default_level.strip().lower(),
+        "rules": dict(sorted(rules.items())),
+    }
+    # Preserve the user's JSON object shape for the collector boundary.  The
+    # collector performs its own normalization/revisioning; this helper's job
+    # is safe validation and decoding of persisted configuration.
+    return dict(candidate) if parsed_json else normalized
 
 
 def _normalize_log_level(config_cls: Any, name: str, value: Any) -> str:
@@ -279,9 +356,44 @@ class Checkers:
         return _checker
 
     @staticmethod
+    def breadcrumb_trace_policy(config_cls: Any, name: str, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ConfigError("Bad config: {}.{} ({}) must be a serialized policy string".format(
+                config_cls.__name__, name, value
+            ))
+        normalized = _reject_control_characters(config_cls, name, value.strip())
+        if not normalized:
+            raise ConfigError("Bad config: {}.{} is empty".format(
+                config_cls.__name__, name
+            ))
+        try:
+            parse_breadcrumb_trace_policy(normalized)
+        except ValueError as error:
+            raise ConfigError("Bad config: {}.{} ({}) is invalid: {}".format(
+                config_cls.__name__, name, value, error
+            ))
+        return normalized
+
+    @staticmethod
     def int_positive(config_cls: Any, name: str, value: int) -> int:
         if value < 1:
             raise ConfigError("Bad config: {}.{} ({}) must be greater than 0".format(
+                config_cls.__name__, name, value
+            ))
+        return value
+
+    @staticmethod
+    def breadcrumb_trace_memory_budget(config_cls: Any, name: str, value: Any) -> int:
+        if type(value) is not int or value < 1:
+            raise ConfigError("Bad config: {}.{} ({}) must be greater than 0".format(
+                config_cls.__name__, name, value
+            ))
+        return value
+
+    @staticmethod
+    def breadcrumb_trace_max_entries(config_cls: Any, name: str, value: Any) -> int:
+        if type(value) is not int or value < 0:
+            raise ConfigError("Bad config: {}.{} ({}) must be zero or greater".format(
                 config_cls.__name__, name, value
             ))
         return value
@@ -484,9 +596,21 @@ class Config(Persist):
         breadcrumb_trace_enabled = PROP("breadcrumb_trace_enabled",
                                         Checkers.bool_value,
                                         Converters.bool)
-        breadcrumb_trace_retention_depth = PROP("breadcrumb_trace_retention_depth",
-                                                Checkers.int_non_negative_max(1024),
-                                                Converters.int)
+        breadcrumb_trace_memory_budget_bytes = PROP(
+            "breadcrumb_trace_memory_budget_bytes",
+            Checkers.breadcrumb_trace_memory_budget,
+            Converters.int,
+        )
+        breadcrumb_trace_max_entries = PROP(
+            "breadcrumb_trace_max_entries",
+            Checkers.breadcrumb_trace_max_entries,
+            Converters.int,
+        )
+        breadcrumb_trace_policy = PROP(
+            "breadcrumb_trace_policy",
+            Checkers.breadcrumb_trace_policy,
+            Converters.null,
+        )
         performance_diagnostics_enabled = PROP("performance_diagnostics_enabled",
                                                Checkers.bool_value,
                                                Converters.bool)
@@ -510,7 +634,9 @@ class Config(Persist):
             self.browser_handover_recovery_version = None
             self.disable_browser_auth = False
             self.breadcrumb_trace_enabled = False
-            self.breadcrumb_trace_retention_depth = 128
+            self.breadcrumb_trace_memory_budget_bytes = DEFAULT_BREADCRUMB_TRACE_MEMORY_BUDGET_BYTES
+            self.breadcrumb_trace_max_entries = DEFAULT_BREADCRUMB_TRACE_MAX_ENTRIES
+            self.breadcrumb_trace_policy = DEFAULT_BREADCRUMB_TRACE_POLICY
             self.performance_diagnostics_enabled = False
             self.performance_diagnostics_retention_depth = 120
             self.performance_diagnostics_sample_interval_seconds = 5
@@ -556,9 +682,28 @@ class Config(Persist):
             if "breadcrumb_trace_enabled" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["breadcrumb_trace_enabled"] = False
-            if "breadcrumb_trace_retention_depth" not in config_dict:
+            if "breadcrumb_trace_memory_budget_bytes" not in config_dict:
                 config_dict = dict(config_dict)
-                config_dict["breadcrumb_trace_retention_depth"] = 128
+                config_dict["breadcrumb_trace_memory_budget_bytes"] = \
+                    DEFAULT_BREADCRUMB_TRACE_MEMORY_BUDGET_BYTES
+            if "breadcrumb_trace_max_entries" not in config_dict:
+                config_dict = dict(config_dict)
+                legacy_depth = config_dict.pop("breadcrumb_trace_retention_depth", None)
+                config_dict["breadcrumb_trace_max_entries"] = (
+                    legacy_depth if legacy_depth is not None else DEFAULT_BREADCRUMB_TRACE_MAX_ENTRIES
+                )
+            else:
+                config_dict = dict(config_dict)
+                config_dict.pop("breadcrumb_trace_retention_depth", None)
+            if "breadcrumb_trace_policy" not in config_dict:
+                config_dict = dict(config_dict)
+                legacy_policy = config_dict.pop("breadcrumb_trace_serialization_policy", None)
+                config_dict["breadcrumb_trace_policy"] = (
+                    legacy_policy if legacy_policy is not None else DEFAULT_BREADCRUMB_TRACE_POLICY
+                )
+            else:
+                config_dict = dict(config_dict)
+                config_dict.pop("breadcrumb_trace_serialization_policy", None)
             if "performance_diagnostics_enabled" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["performance_diagnostics_enabled"] = False

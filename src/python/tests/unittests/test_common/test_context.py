@@ -79,17 +79,34 @@ class TestContext(unittest.TestCase):
         self.assertEqual("controller", snapshot["entries"][0]["source"])
         self.assertEqual("start", snapshot["entries"][0]["message"])
 
-    def test_context_uses_configured_breadcrumb_retention_depth(self):
+    def test_context_forwards_breadcrumb_retention_settings_to_collector(self):
         logger = MagicMock()
         web_access_logger = MagicMock()
         config = MagicMock()
         config.general.breadcrumb_trace_enabled = True
-        config.general.breadcrumb_trace_retention_depth = 64
+        config.general.breadcrumb_trace_memory_budget_bytes = 1024 * 1024
+        config.general.breadcrumb_trace_max_entries = 64
+        config.general.breadcrumb_trace_policy = "*=warning,scan=trace"
         args = Args()
         status = Status()
 
         context = Context(logger, web_access_logger, config, args, status)
         self.assertEqual(64, context.breadcrumb_trace.max_entries)
+        self.assertEqual(1024 * 1024, context.breadcrumb_trace.memory_budget_bytes)
+        self.assertEqual("warning", context.breadcrumb_trace.policy_snapshot()["default"])
+        self.assertEqual("trace", context.breadcrumb_trace.policy_snapshot()["rules"]["scan"])
+
+    def test_context_maps_zero_breadcrumb_max_entries_to_unlimited(self):
+        logger = MagicMock()
+        web_access_logger = MagicMock()
+        config = MagicMock()
+        config.general.breadcrumb_trace_enabled = False
+        config.general.breadcrumb_trace_memory_budget_bytes = 1024 * 1024
+        config.general.breadcrumb_trace_max_entries = 0
+        config.general.breadcrumb_trace_policy = "{}"
+
+        context = Context(logger, web_access_logger, config, Args(), Status())
+        self.assertIsNone(context.breadcrumb_trace.max_entries)
 
     def test_print_to_log_emits_config_and_args(self):
         logger = MagicMock()

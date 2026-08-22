@@ -4,7 +4,10 @@ import queue
 import unittest
 from unittest.mock import patch
 
-from common.breadcrumb_trace import BreadcrumbTraceCollector
+from common.breadcrumb_trace import (
+    DEFAULT_BREADCRUMB_MEMORY_BUDGET_BYTES,
+    BreadcrumbTraceCollector,
+)
 
 
 class TestBreadcrumbTraceCollector(unittest.TestCase):
@@ -633,3 +636,159 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual("remote_scan:aggregate", summary["corr_id"])
         self.assertTrue(all(entry["trace_scope"] == "aggregate" for entry in summary["recent_stage_trail"]))
         self.assertNotIn("flow-1", {entry["corr_id"] for entry in summary["recent_stage_trail"]})
+
+    def test_policy_is_hierarchical_and_most_specific(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=None,
+            policy={
+                "default": "off",
+                "rules": {"*": "error", "transfer": "debug", "transfer.progress": "warning"},
+            },
+        )
+
+        collector.record("transfer", "debug-event", level="debug")
+        collector.record("transfer.progress", "info-event", level="info")
+        collector.record("transfer.progress", "warning-event", level="warning")
+        collector.record("other", "error-event", level="error")
+
+        events = collector.query_events()["events"]
+        self.assertEqual(["debug-event", "warning-event", "error-event"], [event["message"] for event in events])
+        invalid = collector.validate_policy({"default": "not-a-level"})
+        self.assertFalse(invalid["valid"])
+
+    def test_policy_revision_uses_compare_and_swap_and_reset_preserves_evidence(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+        collector.record("controller", "before")
+
+        applied = collector.apply_policy({"default": "debug"}, expected_revision=0)
+        self.assertTrue(applied["applied"])
+        self.assertEqual(1, applied["revision"])
+        conflict = collector.apply_policy({"default": "trace"}, expected_revision=0)
+        self.assertFalse(conflict["applied"])
+        self.assertTrue(conflict["conflict"])
+        reset = collector.reset_policy(expected_revision=1)
+        self.assertTrue(reset["applied"])
+        self.assertEqual(2, reset["revision"])
+        self.assertEqual(1, collector.snapshot()["entry_count"])
+
+    def test_unlimited_count_has_no_artificial_1024_event_cap(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=None)
+
+        for index in range(1100):
+            collector.record("worker", "event-{}".format(index), {"index": index})
+
+        snapshot = collector.snapshot()
+        self.assertIsNone(snapshot["max_entries"])
+        self.assertEqual(1100, snapshot["entry_count"])
+        self.assertLessEqual(snapshot["retained_bytes"], DEFAULT_BREADCRUMB_MEMORY_BUDGET_BYTES)
+
+    def test_memory_budget_and_count_accounting_report_evictions_and_gaps(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=2, memory_budget_bytes=10_000)
+        collector.record("worker", "one", {"value": "a" * 100})
+        collector.record("worker", "two", {"value": "b" * 100})
+        collector.record("worker", "three", {"value": "c" * 100})
+
+        payload = collector.query_events(since_version=0)
+        self.assertEqual(1, payload["accounting"]["evicted_count"])
+        self.assertEqual(2, payload["accounting"]["retained_count"])
+        self.assertTrue(any(gap["reason"] == "evicted" for gap in payload["gaps"]))
+        self.assertLessEqual(payload["retained_bytes"], 10_000)
+
+    def test_scoped_clear_does_not_reset_policy_and_export_is_bounded(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=None)
+        collector.apply_policy({"default": "debug"})
+        collector.record("keep", "keep", {"data": "x" * 100})
+        collector.record("remove", "remove", {"data": "y" * 100}, corr_id="flow-remove")
+
+        cleared = collector.clear({"corr_id": "flow-remove"})
+        self.assertEqual(1, cleared["cleared_count"])
+        self.assertEqual(1, collector.snapshot()["entry_count"])
+        self.assertEqual(1, collector.policy_snapshot()["revision"])
+        exported = collector.export_events(max_bytes=1_000_000)
+        self.assertTrue(exported["export_truncated"] is False)
+        self.assertEqual(1, exported["export_event_count"])
+
+    def test_child_ingress_is_bounded_and_rejections_create_a_gap(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        emitter = collector.create_emitter()
+        emitter.record(None, "huge", {"value": "x" * 20_000})
+        payload = collector.query_events(since_version=0)
+        self.assertEqual([], payload["events"])
+        self.assertTrue(any(gap["reason"] == "ingress_rejected" for gap in payload["gaps"]))
+        self.assertGreater(payload["version"], 0)
+
+    def test_policy_persist_failure_rolls_back_live_revision(self):
+        def fail_persist(policy):
+            raise OSError("no write")
+
+        collector = BreadcrumbTraceCollector(lambda: True, policy_persist=fail_persist)
+        with self.assertRaises(OSError):
+            collector.apply_policy({"default": "debug"}, persist=True)
+        snapshot = collector.policy_snapshot()
+        self.assertEqual(0, snapshot["revision"])
+        self.assertEqual("info", snapshot["default"])
+        self.assertEqual("failed_rolled_back", snapshot["persistence"]["state"])
+
+    def test_deep_query_applies_filter_before_page_limit(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        collector.record("other", "one", category="other")
+        collector.record("target", "two", category="target.deep")
+        events = collector.query_events(category_prefix="target", limit=1)["events"]
+        self.assertEqual(["two"], [event["message"] for event in events])
+
+    def test_retention_prefers_noisy_category_and_keeps_latest_decision(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=3, memory_budget_bytes=100_000)
+        collector.record("noisy", "one", category="noisy")
+        collector.record("noisy", "two", category="noisy")
+        collector.record("decision", "latest", category="decision", event_type="decision")
+        collector.record("quiet", "three", category="quiet")
+
+        payload = collector.query_events()
+        messages = [event["message"] for event in payload["events"]]
+        self.assertNotIn("one", messages)
+        self.assertIn("latest", messages)
+        self.assertEqual(1, payload["accounting"]["categories"]["noisy"]["evicted"])
+        self.assertEqual("overrepresented_unprotected_category_then_oldest",
+                         payload["retention"]["policy"]["eviction"])
+
+    def test_child_policy_revision_is_annotated_and_acknowledged_when_drained(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+        emitter = collector.create_emitter()
+        collector.apply_policy({"default": "debug"})
+        emitter.record("worker", "event")
+        payload = collector.query_events()
+        self.assertEqual(1, payload["events"][0]["worker_policy_revision"])
+        self.assertEqual(1, payload["worker_propagation"]["ack_revision"])
+        self.assertFalse(payload["worker_propagation"]["pending"])
+
+    def test_reset_cursor_equal_to_reset_version_is_durably_detected(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+        collector.record("controller", "before")
+        reset_version = collector.reset()["version"]
+        collector.record("controller", "after")
+        payload = collector.query_events(since_version=reset_version)
+        self.assertTrue(payload["window_reset"])
+        self.assertEqual("reset", payload["window_reset_reason"])
+
+    def test_rollback_advances_policy_epoch_and_old_ack_stays_pending(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True, max_entries=4,
+            policy_persist=lambda policy: (_ for _ in ()).throw(OSError("write")),
+        )
+        emitter = collector.create_emitter()
+        collector.apply_policy({"default": "debug"})
+        emitter.record("worker", "old")
+        with self.assertRaises(OSError):
+            collector.apply_policy({"default": "trace"}, persist=True)
+        payload = collector.query_events()
+        self.assertNotEqual(payload["worker_propagation"]["ack_epoch"], payload["worker_propagation"]["current_epoch"])
+        self.assertTrue(payload["worker_propagation"]["pending"])
+
+    def test_category_accounting_snapshot_aggregates_retained_overflow(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=32, memory_budget_bytes=65536)
+        for index in range(32):
+            collector.record("source", "event-{}".format(index), category="category-{}".format(index))
+        categories = collector.snapshot()["accounting"]["categories"]
+        self.assertLessEqual(len(categories), 17)
+        self.assertIn("__other_categories__", categories)

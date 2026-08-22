@@ -1,12 +1,19 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import logging
+import json
 import copy
 import collections
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 # my libs
-from .config import Config
+from .config import (
+    Config,
+    DEFAULT_BREADCRUMB_TRACE_MEMORY_BUDGET_BYTES,
+    DEFAULT_BREADCRUMB_TRACE_MAX_ENTRIES,
+    DEFAULT_BREADCRUMB_TRACE_POLICY,
+    parse_breadcrumb_trace_policy,
+)
 from .breadcrumb_trace import BreadcrumbTraceCollector
 from .performance_diagnostics import PerformanceDiagnosticsCollector
 from .path_pair import PathPair, PathPairManager
@@ -63,7 +70,10 @@ class Context:
         self.path_pair_manager = path_pair_manager
         self.breadcrumb_trace = breadcrumb_trace if breadcrumb_trace is not None else BreadcrumbTraceCollector(
             self.__breadcrumb_trace_enabled,
-            max_entries=self.__breadcrumb_trace_retention_depth()
+            max_entries=self.__breadcrumb_trace_max_entries(),
+            memory_budget_bytes=self.__breadcrumb_trace_memory_budget_bytes(),
+            policy=self.__breadcrumb_trace_policy(),
+            policy_persist=self.__persist_breadcrumb_trace_policy,
         )
         self.performance_diagnostics = performance_diagnostics if performance_diagnostics is not None else \
             PerformanceDiagnosticsCollector(
@@ -84,12 +94,52 @@ class Context:
         enabled = getattr(general_config, "breadcrumb_trace_enabled", False)
         return enabled if type(enabled) is bool else False
 
-    def __breadcrumb_trace_retention_depth(self) -> int:
+    def __breadcrumb_trace_max_entries(self) -> Optional[int]:
         general_config = getattr(self.config, "general", None)
         if general_config is None:
-            return 128
-        retention_depth = getattr(general_config, "breadcrumb_trace_retention_depth", 128)
-        return retention_depth if type(retention_depth) is int and retention_depth > 0 else 128
+            return None
+        max_entries = getattr(general_config, "breadcrumb_trace_max_entries", DEFAULT_BREADCRUMB_TRACE_MAX_ENTRIES)
+        if type(max_entries) is not int or max_entries < 0:
+            return None
+        return None if max_entries == 0 else max_entries
+
+    def __breadcrumb_trace_memory_budget_bytes(self) -> int:
+        general_config = getattr(self.config, "general", None)
+        if general_config is None:
+            return DEFAULT_BREADCRUMB_TRACE_MEMORY_BUDGET_BYTES
+        budget = getattr(
+            general_config,
+            "breadcrumb_trace_memory_budget_bytes",
+            DEFAULT_BREADCRUMB_TRACE_MEMORY_BUDGET_BYTES,
+        )
+        return budget if type(budget) is int and budget > 0 else DEFAULT_BREADCRUMB_TRACE_MEMORY_BUDGET_BYTES
+
+    def __breadcrumb_trace_policy(self) -> Mapping[str, object]:
+        general_config = getattr(self.config, "general", None)
+        if general_config is None:
+            return parse_breadcrumb_trace_policy(DEFAULT_BREADCRUMB_TRACE_POLICY)
+        serialized = getattr(general_config, "breadcrumb_trace_policy", DEFAULT_BREADCRUMB_TRACE_POLICY)
+        if not isinstance(serialized, str):
+            serialized = DEFAULT_BREADCRUMB_TRACE_POLICY
+        try:
+            return parse_breadcrumb_trace_policy(serialized)
+        except ValueError:
+            # Config loading validates this field.  Keep Context construction
+            # fail-safe for test doubles and legacy callers that bypass Config.
+            return parse_breadcrumb_trace_policy(DEFAULT_BREADCRUMB_TRACE_POLICY)
+
+    def __persist_breadcrumb_trace_policy(self, policy: Mapping[str, object]) -> None:
+        """Persist policy atomically through Config's existing owner/lock."""
+        if not getattr(self.config, "file_path", None):
+            raise RuntimeError("breadcrumb policy persistence is not configured")
+        with self.config.write_lock:
+            previous = self.config.general.breadcrumb_trace_policy
+            try:
+                self.config.general.breadcrumb_trace_policy = json.dumps(policy, separators=(",", ":"), sort_keys=True)
+                self.config.to_file()
+            except Exception:
+                self.config.general.breadcrumb_trace_policy = previous
+                raise
 
     def __performance_diagnostics_enabled(self) -> bool:
         general_config = getattr(self.config, "general", None)

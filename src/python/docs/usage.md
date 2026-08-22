@@ -84,7 +84,8 @@ Breadcrumb trace is a low-overhead, opt-in recent-context recorder for hard-to-d
 It keeps a short bounded window of structured breadcrumbs in memory so operators can see the lead-up to a problem without turning on noisy debug logging.
 
 Enable it in `Settings > General` with `Enable breadcrumb trace recorder`.
-The same section also lets you tune the breadcrumb retention depth if you want a larger or smaller recent window.
+The same section controls its byte budget and optional entry cap. The byte budget is for retained,
+sanitized evidence; child-process ingress has a separate small admission limit.
 
 When you need the recent failure context, read the breadcrumb diagnostics endpoint with an authenticated admin session or an admin-scoped API key:
 
@@ -98,10 +99,22 @@ Use normal logs for long-lived operational history and broad troubleshooting con
 Breadcrumb entries are intentionally bounded and designed to redact common sensitive values.
 They are meant to explain what happened right before a failure, not to act as full command or payload logging or exhaustive secret scrubbing.
 
+### Breadcrumb Trace API v1
+
+The versioned API is admin-only and returns JSON with bounded request and response sizes. The page endpoint caps `limit` at 256 entries and the export endpoint caps it at 2048 entries, regardless of the configured in-memory retention depth. Both preserve the collector's version, reset, truncation, and gap metadata so clients can detect that a cursor must be restarted.
+
+- `GET /server/breadcrumbs/v1/capabilities` describes supported filters and policy operations.
+- `GET /server/breadcrumbs/v1/events` returns a bounded page. Filters include `category`, `category_prefix`, `level`, `correlation_id` (or legacy `corr_id`), `flow_id`, `source`, `stage`, `event_type`, `since_version`, `until_version`, `version`, `start_time_ms`, `end_time_ms`, `order`, and `limit`.
+- `GET /server/breadcrumbs/v1/export` returns a bounded JSON export using the same filters. Add `format=jsonl` for bounded sanitized JSON Lines.
+- `GET /server/breadcrumbs/v1/policy` reads the active retention policy and its persistence/worker-propagation status. Submit a policy object to `POST /server/breadcrumbs/v1/policy/validate`; submit it to `POST /server/breadcrumbs/v1/policy/apply` with optional `expected_revision` and `persist=true` for compare-and-swap updates. `POST /server/breadcrumbs/v1/policy/reset` restores the default policy and accepts the same controls.
+- `POST /server/breadcrumbs/v1/clear` clears retained breadcrumbs. `GET /server/breadcrumbs/v1/stream` emits one bounded snapshot by default; add `follow=true` for bounded replay polling and heartbeat comments. `Last-Event-ID` or `since_version` resumes from a version when it is still available.
+
+Only `/server/breadcrumbs/get` and `/server/breadcrumbs/reset` are compatibility routes. The newer diagnostics surface is v1-only.
+
 ## Performance diagnostics
 
 Performance diagnostics collect a fixed, numeric, bounded resource window locally when enabled with `general.performance_diagnostics_enabled=true`. Disabled mode performs no procfs/cgroup reads or sample retention; enabled collection is bounded by the configured interval and retention depth. The detailed duration aggregates use only fixed in-code metric names. Local scanner attribution adds `local_scan_filesystem_traversal`, `local_scan_managed_extract`, `local_scan_staging_merge`, `local_scan_aggregation`, and `local_scan_progress_publication`; model-update attribution adds `model_update_state_preparation`, `model_update_scan_intake`, `model_update_status_ingestion`, `model_update_builder_sync`, `model_update_lifecycle_maintenance`, and `model_update_build_finalization`. Each reports bounded count, wall time, and (for completed spans) same-thread CPU time. Snapshots also expose numeric `active_stage_counts` and bounded `active_stages` wall-time attribution, plus `active_stage` (global longest stage) and `active_scanner_stage` (scanner-only longest stage). Active CPU fields are intentionally `null` because snapshots can run on a different thread than the scanner. The global in-flight span table is bounded; excess begins are dropped and counted in `duration_spans_dropped` without fairness guarantees across metric families.
 
-Disabling diagnostics stops new collection but deliberately leaves prior numeric history available until reset or restart. Linux container metrics use cgroup v2 files; non-Linux and unavailable procfs/cgroup fields are reported as unknown. If `general.disable_browser_auth=true`, every `/server` route, including these diagnostics endpoints, is open; use that mode only behind appropriate network/proxy isolation.
+Disabling diagnostics stops new collection but deliberately leaves prior numeric history available until reset or restart. Linux container metrics use cgroup v2 files; non-Linux and unavailable procfs/cgroup fields are reported as unknown. Breadcrumb diagnostics remain always-auth admin routes even when `general.disable_browser_auth=true`.
 
 Admin sessions or admin-scoped API keys can read `GET /server/admin/performance-diagnostics/v1`, reset its retained window with `POST /server/admin/performance-diagnostics/v1/reset`, or request the bounded support form at `GET /server/admin/performance-diagnostics/v1/export`. The stable schema is `seedsync.performance-diagnostics.v1`; it contains no application, file, or path-pair identifiers, paths, commands, payloads, or credentials. Session and sequence values are bounded diagnostic cursors. `limit` and `since_sequence` only bound a retained numeric sample window. When diagnostics are enabled, `GET /server/admin/performance-diagnostics/v1/ownership` performs one bounded main-process ownership census; it reports only fixed owner labels and numeric object/byte totals, never file names, paths, keys, values, or credentials. Its detailed object totals are globally deduplicated and capped. Per-owner `graph_node_count` and `graph_shallow_bytes` separately count only `ModelFile`/`SystemFile` nodes through fixed child links, deduplicate within each owner, and may intentionally overlap between owners; `graph_truncated` reports their independent bounds.

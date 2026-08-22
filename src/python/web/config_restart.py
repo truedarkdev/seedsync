@@ -22,6 +22,9 @@ GENERAL_RUNTIME_RECONFIGURE_FIELDS = frozenset((
 GENERAL_RUNTIME_NO_RESTART_FIELDS = frozenset((
     "verbose",
     "exclude_patterns",
+    # The enabled gate has an explicit collector sync hook. Breadcrumb policy,
+    # count, and memory settings are intentionally restart-required until the
+    # collector exposes an equivalent runtime reconfiguration seam.
     "breadcrumb_trace_enabled",
     "performance_diagnostics_enabled",
 ))

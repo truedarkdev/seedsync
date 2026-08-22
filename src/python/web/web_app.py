@@ -235,6 +235,7 @@ class WebApp(bottle.Bottle):
             bool(route.config.get("allow_first_admin_bootstrap", False)),
             bool(route.config.get("allow_bootstrap_proof_exchange", False)),
             bool(route.config.get("allow_browser_api_key_entry", False)),
+            bool(route.config.get("always_auth", False)),
         )
 
     def process(self) -> None:
@@ -263,6 +264,7 @@ class WebApp(bottle.Bottle):
               allow_first_admin_bootstrap: bool = False,
               allow_bootstrap_proof_exchange: bool = False,
               allow_browser_api_key_entry: bool = False,
+              always_auth: bool = False,
               **config: object) -> Callable[..., object]:
         if path is not None and WebApp.__is_server_path(path):
             if required_scope is None:
@@ -278,6 +280,7 @@ class WebApp(bottle.Bottle):
                 "allow_first_admin_bootstrap": allow_first_admin_bootstrap,
                 "allow_bootstrap_proof_exchange": allow_bootstrap_proof_exchange,
                 "allow_browser_api_key_entry": allow_browser_api_key_entry,
+                "always_auth": always_auth,
             }.items():
                 if type(flag_value) is not bool:
                     raise ValueError("{} must be a boolean for /server routes".format(flag_name))
@@ -692,14 +695,17 @@ class WebApp(bottle.Bottle):
         allow_sessionless_ui: bool,
         allow_first_admin_bootstrap: bool,
         allow_bootstrap_proof_exchange: bool,
-        allow_browser_api_key_entry: bool
+        allow_browser_api_key_entry: bool,
+        always_auth: bool,
     ) -> None:
+        browser_auth_disabled = self.__is_browser_auth_disabled() and not always_auth
         # The explicit legacy compatibility switch restores the original
-        # network-trusted SeedSync surface.  Host filtering and route/schema
-        # validation still run before this gate, but credentials must not
-        # narrow access once the mode is enabled (including malformed,
-        # revoked, or insufficient-scope Authorization headers/cookies).
-        if self.__is_browser_auth_disabled():
+        # network-trusted SeedSync surface for unmarked routes. Host filtering
+        # and route/schema validation still run before this gate, but
+        # credentials must not narrow access once the mode is enabled
+        # (including malformed, revoked, or insufficient-scope Authorization
+        # headers/cookies).
+        if browser_auth_disabled:
             if self.__is_unsafe_request() and self.__has_hostile_browser_origin_signal():
                 bottle.abort(403, "Cross-origin browser requests are not allowed")
             return
@@ -708,11 +714,11 @@ class WebApp(bottle.Bottle):
         if token is None:
             has_authorization_header = (
                 WebApp.__has_authorization_header()
-                if self.__is_browser_auth_disabled()
+                if browser_auth_disabled
                 else WebApp.__has_bearer_authorization_header()
             )
             if not has_authorization_header:
-                if self.__is_browser_auth_disabled():
+                if browser_auth_disabled:
                     if allow_bootstrap_proof_exchange and self.__allow_bootstrap_proof_exchange():
                         return
                     if allow_first_admin_bootstrap and self.__allow_first_admin_bootstrap():

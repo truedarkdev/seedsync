@@ -255,7 +255,9 @@ class TestConfig(unittest.TestCase):
             "browser_handover_recovery_version": "2026.04.03",
             "disable_browser_auth": "True",
             "breadcrumb_trace_enabled": "False",
-            "breadcrumb_trace_retention_depth": "128",
+            "breadcrumb_trace_memory_budget_bytes": str(256 * 1024 * 1024),
+            "breadcrumb_trace_max_entries": "128",
+            "breadcrumb_trace_policy": "*=warning,scan=trace",
             "performance_diagnostics_enabled": "True",
             "performance_diagnostics_retention_depth": "64",
             "performance_diagnostics_sample_interval_seconds": "10",
@@ -271,7 +273,9 @@ class TestConfig(unittest.TestCase):
         self.assertEqual("2026.04.03", general.browser_handover_recovery_version)
         self.assertTrue(general.disable_browser_auth)
         self.assertEqual(False, general.breadcrumb_trace_enabled)
-        self.assertEqual(128, general.breadcrumb_trace_retention_depth)
+        self.assertEqual(256 * 1024 * 1024, general.breadcrumb_trace_memory_budget_bytes)
+        self.assertEqual(128, general.breadcrumb_trace_max_entries)
+        self.assertEqual("*=warning,scan=trace", general.breadcrumb_trace_policy)
         self.assertTrue(general.performance_diagnostics_enabled)
         self.assertEqual(64, general.performance_diagnostics_retention_depth)
         self.assertEqual(10, general.performance_diagnostics_sample_interval_seconds)
@@ -289,9 +293,10 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.General, good_dict, "verbose", "SomeString")
         self.check_bad_value_error(Config.General, good_dict, "verbose", "-1")
         self.check_bad_value_error(Config.General, good_dict, "disable_browser_auth", "2")
-        self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "")
-        self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "0")
-        self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "1025")
+        self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_memory_budget_bytes", "")
+        self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_memory_budget_bytes", "0")
+        self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_max_entries", "-1")
+        self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_policy", "not-a-policy")
         self.check_bad_value_error(Config.General, good_dict, "performance_diagnostics_retention_depth", "0")
         self.check_bad_value_error(Config.General, good_dict, "performance_diagnostics_retention_depth", "241")
         self.check_bad_value_error(Config.General, good_dict, "performance_diagnostics_sample_interval_seconds", "0")
@@ -373,25 +378,16 @@ class TestConfig(unittest.TestCase):
             str(error.exception)
         )
 
-    def test_general_breadcrumb_trace_retention_depth_requires_bounded_positive_int(self):
+    def test_general_breadcrumb_trace_retention_settings_allow_unlimited_and_large_values(self):
         general = Config.General()
-        general.breadcrumb_trace_retention_depth = 128
+        general.breadcrumb_trace_memory_budget_bytes = 256 * 1024 * 1024
+        general.breadcrumb_trace_max_entries = 0
+        self.assertEqual(0, general.breadcrumb_trace_max_entries)
 
-        with self.assertRaises(ConfigError) as error:
-            general.breadcrumb_trace_retention_depth = 0
-        self.assertEqual(
-            "Bad config: General.breadcrumb_trace_retention_depth (0) must be greater than 0",
-            str(error.exception)
-        )
+        general.breadcrumb_trace_max_entries = 1000000
+        self.assertEqual(1000000, general.breadcrumb_trace_max_entries)
 
-        with self.assertRaises(ConfigError) as error:
-            general.breadcrumb_trace_retention_depth = 1025
-        self.assertEqual(
-            "Bad config: General.breadcrumb_trace_retention_depth (1025) must not exceed 1024 (FD_SETSIZE limit)",
-            str(error.exception)
-        )
-
-    def test_general_breadcrumb_trace_retention_depth_defaults_to_128(self):
+    def test_general_breadcrumb_trace_defaults_are_memory_bounded_and_count_unlimited(self):
         good_dict = {
             "log_level": "DEBUG",
             "verbose": "False",
@@ -404,7 +400,29 @@ class TestConfig(unittest.TestCase):
         }
 
         general = Config.General.from_dict(good_dict)
-        self.assertEqual(128, general.breadcrumb_trace_retention_depth)
+        self.assertEqual(256 * 1024 * 1024, general.breadcrumb_trace_memory_budget_bytes)
+        self.assertEqual(0, general.breadcrumb_trace_max_entries)
+        self.assertEqual("{}", general.breadcrumb_trace_policy)
+
+    def test_general_breadcrumb_trace_legacy_retention_key_migrates_to_max_entries(self):
+        general = Config.General.from_dict({
+            "log_level": "DEBUG", "verbose": "False", "api_token": "", "allowed_hostname": "",
+            "browser_handover_recovery_version": "", "breadcrumb_trace_enabled": "False",
+            "breadcrumb_trace_retention_depth": "2048", "config_api_redact_remote_details": "True",
+        })
+        self.assertEqual(2048, general.breadcrumb_trace_max_entries)
+        self.assertNotIn("breadcrumb_trace_retention_depth", general.as_dict())
+
+    def test_general_breadcrumb_trace_policy_accepts_serialized_json_and_roundtrips(self):
+        serialized_policy = '{"default":"warning","rules":{"scan":"trace"}}'
+        general = Config.General.from_dict({
+            "log_level": "INFO", "verbose": "False", "api_token": "", "allowed_hostname": "",
+            "browser_handover_recovery_version": "", "breadcrumb_trace_enabled": "False",
+            "breadcrumb_trace_policy": serialized_policy, "config_api_redact_remote_details": "True",
+        })
+        self.assertEqual(serialized_policy, general.breadcrumb_trace_policy)
+        restored = Config.General.from_dict(general.as_dict())
+        self.assertEqual(serialized_policy, restored.breadcrumb_trace_policy)
 
     def test_general_performance_diagnostics_defaults_are_safe(self):
         general = Config.General.from_dict({
@@ -960,7 +978,9 @@ class TestConfig(unittest.TestCase):
             self.assertFalse(config.general.has_property("trusted_browser_bootstrap_remote_addrs"))
             self.assertEqual("2026.04.03", config.general.browser_handover_recovery_version)
             self.assertEqual(False, config.general.breadcrumb_trace_enabled)
-            self.assertEqual(128, config.general.breadcrumb_trace_retention_depth)
+            self.assertEqual(0, config.general.breadcrumb_trace_max_entries)
+            self.assertEqual(256 * 1024 * 1024, config.general.breadcrumb_trace_memory_budget_bytes)
+            self.assertEqual("{}", config.general.breadcrumb_trace_policy)
             self.assertEqual(True, config.general.config_api_redact_remote_details)
 
             self.assertEqual("remote.server.com", config.lftp.remote_address)
@@ -1037,7 +1057,9 @@ class TestConfig(unittest.TestCase):
             config.general.allowed_hostname = ""
             config.general.browser_handover_recovery_version = "2026.04.03"
             config.general.breadcrumb_trace_enabled = False
-            config.general.breadcrumb_trace_retention_depth = 128
+            config.general.breadcrumb_trace_memory_budget_bytes = 256 * 1024 * 1024
+            config.general.breadcrumb_trace_max_entries = 0
+            config.general.breadcrumb_trace_policy = "{}"
             config.general.performance_diagnostics_enabled = False
             config.general.performance_diagnostics_retention_depth = 120
             config.general.performance_diagnostics_sample_interval_seconds = 5
@@ -1088,7 +1110,9 @@ class TestConfig(unittest.TestCase):
             browser_handover_recovery_version = 2026.04.03
             disable_browser_auth = False
             breadcrumb_trace_enabled = False
-            breadcrumb_trace_retention_depth = 128
+            breadcrumb_trace_memory_budget_bytes = 268435456
+            breadcrumb_trace_max_entries = 0
+            breadcrumb_trace_policy = {}
             performance_diagnostics_enabled = False
             performance_diagnostics_retention_depth = 120
             performance_diagnostics_sample_interval_seconds = 5

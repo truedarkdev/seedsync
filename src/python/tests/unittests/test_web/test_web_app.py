@@ -609,6 +609,41 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual("admin", authenticated_admin.text)
         self.assertIn("admin-stream", authenticated_stream.text)
 
+    def test_always_auth_route_enforces_admin_scope_when_browser_auth_is_disabled(self):
+        self.context.config.general.disable_browser_auth = True
+
+        @self.web_app.route(
+            "/server/admin/always-auth",
+            required_scope="admin",
+            always_auth=True,
+        )
+        def _always_auth_admin():
+            return "admin"
+
+        read_secret = self.auth_store.create_api_key("unit-reader", ["read"])["secret"]
+        client = TestApp(self.web_app)
+
+        missing_token = client.get(
+            "/server/admin/always-auth",
+            expect_errors=True,
+        )
+        insufficient_scope = client.get(
+            "/server/admin/always-auth",
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(read_secret)},
+            expect_errors=True,
+        )
+        admin_token = client.get(
+            "/server/admin/always-auth",
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(self.admin_secret)},
+        )
+
+        self.assertEqual(401, missing_token.status_int)
+        self.assertIn("Missing API token", missing_token.text)
+        self.assertEqual(403, insufficient_scope.status_int)
+        self.assertIn("lacks scope", insufficient_scope.text)
+        self.assertEqual(200, admin_token.status_int)
+        self.assertEqual("admin", admin_token.text)
+
     def test_disable_browser_auth_preserves_first_admin_claim_exception(self):
         self.context.config.general.disable_browser_auth = True
         empty_store = ApiKeyStore()
