@@ -139,6 +139,10 @@ function emit(reason, path,    i, existing) {
         emit("pytest-cache", component_path(path, ".pytest_cache"))
         next
     }
+    if (path ~ /^app\/python\/tmp(\/|$)/) {
+        emit("app-local-temp-directory", "app/python/tmp")
+        next
+    }
 
     # Package-manager logs and indexes are build-time artifacts, not runtime
     # state. Keep the inventory strict for both files and retained directories.

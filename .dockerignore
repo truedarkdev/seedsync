@@ -20,6 +20,9 @@ docker-compose*.yml
 .idea
 build
 tmp
+# Repo-local test and diagnostic output is not runtime application source.
+src/python/tmp
+src/python/tmp/**
 src/angular/dist
 src/angular/.angular/cache
 src/python/build
