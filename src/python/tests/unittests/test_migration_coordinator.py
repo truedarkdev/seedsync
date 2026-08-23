@@ -102,6 +102,11 @@ class TestMigrationCoordinator(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_preflight_invokes_read_only_publication_audit(self) -> None:
+        with patch("migration.coordinator.audit_reserved_publications") as audit:
+            MigrationCoordinator(self.root).preflight()
+        audit.assert_called_once_with(self.root)
+
     @staticmethod
     def _tree_bytes(root: Path) -> dict[str, bytes]:
         return {

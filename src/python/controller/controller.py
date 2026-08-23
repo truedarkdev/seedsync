@@ -5997,15 +5997,43 @@ class Controller:
             os.close(fd)
 
     @classmethod
-    def __copy_to_publish_temporary(cls, src: str, destination_parent: str) -> Tuple[str, Optional[str]]:
+    def __copy_to_publish_temporary(
+            cls, src: str, destination_parent: str,
+            mutation_tracker: Optional[_MoveMutationTracker] = None,
+            destination_path: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
         """Copy src to a private destination-side path without following links."""
+        def record_copy_phase(
+                phase: str, operation: str, temporary_path: Optional[str],
+                residue_path: Optional[str] = None,
+        ) -> None:
+            if mutation_tracker is not None:
+                mutation_tracker.record_publication(
+                    phase, operation, "temporary",
+                    source_path=src,
+                    temporary_path=temporary_path,
+                    destination_parent_path=destination_parent,
+                    destination_path=destination_path,
+                    temporary_created=True,
+                    residue_path=residue_path,
+                )
+
         source_stat = os.lstat(src)
         if stat.S_ISDIR(source_stat.st_mode):
             cls.__reject_nested_mounts_or_reparse_points(src)
             temporary_root = tempfile.mkdtemp(prefix=".seedsync-publish-", dir=destination_parent)
             temporary_path = os.path.join(temporary_root, "payload")
+            record_copy_phase(
+                "temporary_reserved", "reserve", temporary_path,
+                residue_path=temporary_root,
+            )
             try:
+                record_copy_phase(
+                    "copy_start", "copy", temporary_path,
+                    residue_path=temporary_root,
+                )
                 shutil.copytree(src, temporary_path, symlinks=True, copy_function=cls.__copy_regular_file_to_temporary)
+                record_copy_phase("copy_complete", "copy", temporary_path)
             except BaseException:
                 shutil.rmtree(temporary_root, ignore_errors=True)
                 raise
@@ -6013,7 +6041,9 @@ class Controller:
 
         fd, temporary_path = tempfile.mkstemp(prefix=".seedsync-publish-", dir=destination_parent)
         os.close(fd)
+        record_copy_phase("temporary_reserved", "reserve", temporary_path)
         try:
+            record_copy_phase("copy_start", "copy", temporary_path)
             if stat.S_ISLNK(source_stat.st_mode):
                 os.unlink(temporary_path)
                 os.symlink(os.readlink(src), temporary_path)
@@ -6021,6 +6051,7 @@ class Controller:
                 cls.__copy_regular_file_to_temporary(src, temporary_path)
             else:
                 raise OSError(errno.ENOTSUP, "unsupported staging source type", src)
+            record_copy_phase("copy_complete", "copy", temporary_path)
         except BaseException:
             try:
                 os.unlink(temporary_path)
@@ -6272,6 +6303,14 @@ class Controller:
                 )
 
         destination_parent = os.path.dirname(dst)
+        if mutation_tracker is not None:
+            mutation_tracker.record_publication(
+                "reserve_start", "reserve", "destination_parent",
+                source_path=src,
+                destination_parent_path=destination_parent,
+                destination_path=dst,
+                temporary_created=False,
+            )
         source_stat = os.lstat(src)
         source_snapshot = cls.__source_tree_snapshot(src)
         source_claim_snapshot = cls.__source_tree_snapshot(src, ignore_root_ctime=True)
@@ -6281,7 +6320,15 @@ class Controller:
         publication_error = False
         try:
             try:
-                temporary_path, temporary_root = cls.__copy_to_publish_temporary(src, destination_parent)
+                if mutation_tracker is None:
+                    temporary_path, temporary_root = cls.__copy_to_publish_temporary(src, destination_parent)
+                else:
+                    temporary_path, temporary_root = cls.__copy_to_publish_temporary(
+                        src,
+                        destination_parent,
+                        mutation_tracker=mutation_tracker,
+                        destination_path=dst,
+                    )
             except BaseException as error:
                 if mutation_tracker is not None:
                     mutation_tracker.record_publication(

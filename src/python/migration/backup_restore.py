@@ -10,12 +10,14 @@ from __future__ import annotations
 import hashlib
 import errno
 import json
+import logging
 import os
 import re
 import shutil
 import stat
 import uuid
 import unicodedata
+from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -45,6 +47,12 @@ MAX_DEPTH = 64
 MAX_COMPONENT_LENGTH = 255
 MAX_RELATIVE_PATH_LENGTH = 4096
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+# Audit runs at startup and must remain bounded even when a same-account actor
+# leaves many otherwise plausible envelopes behind.  The budget covers the
+# declared data bytes plus conservative repeated manifest reads during proof.
+MAX_PUBLICATION_AUDIT_ENVELOPES = 32
+MAX_PUBLICATION_AUDIT_IO_BYTES = MAX_TOTAL_BYTES + (4 * MAX_MANIFEST_BYTES)
+_PUBLICATION_BACKUP_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}-[0-9a-f]{32}$")
 
 _EXCLUDED_TOP_LEVEL_NAMES = frozenset({
     BACKUP_ROOT_NAME,
@@ -62,6 +70,316 @@ _COORDINATOR_TEMP_TARGETS = frozenset({
 
 class BackupRestoreError(RuntimeError):
     """A backup or restore invariant could not be satisfied safely."""
+
+
+_publication_audit_logger = logging.getLogger(__name__)
+
+
+def _publication_audit_record(classification: str, reason: str) -> dict[str, str]:
+    """Return intentionally non-identifying evidence for one retained envelope."""
+    return {"classification": classification, "reason": reason}
+
+
+def _emit_publication_audit(records: Sequence[dict[str, str]]) -> tuple[dict[str, str], ...]:
+    for (classification, reason), count in sorted(
+        Counter((record["classification"], record["reason"]) for record in records).items()
+    ):
+        _publication_audit_logger.warning("migration_publication_audit %s", json.dumps({
+            "classification": classification,
+            "count": count,
+            "event": "migration_publication_audit",
+            "reason": reason,
+        }, sort_keys=True))
+    return tuple(records)
+
+
+def _stream_publication_audit_names(backup_root: Path, config_root: Path) -> tuple[list[str], bool]:
+    """Read at most the bounded transaction namespace without root sorting."""
+    from .coordinator import _open_anchored
+
+    descriptor = _open_anchored(
+        backup_root, config_root,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        names: list[str] = []
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                if not entry.name.startswith(PUBLICATION_TXN_PREFIX):
+                    continue
+                if len(names) >= MAX_PUBLICATION_AUDIT_ENVELOPES:
+                    return names, True
+                names.append(entry.name)
+        return sorted(names), False
+    finally:
+        os.close(descriptor)
+
+
+def _stream_publication_audit_children(
+    directory: Path, config_root: Path, maximum: int,
+) -> tuple[list[str], bool]:
+    """Anchor and bound an envelope layout check before sorting its names."""
+    from .coordinator import _open_anchored
+
+    descriptor = _open_anchored(
+        directory, config_root,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        names: list[str] = []
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                if len(names) >= maximum:
+                    return names, True
+                names.append(entry.name)
+        return sorted(names), False
+    finally:
+        os.close(descriptor)
+
+
+def _publication_audit_entry_total(manifest: Mapping[str, object]) -> int:
+    """Bound future hashing from manifest entries before opening the data tree."""
+    entries = manifest.get("entries")
+    aggregate = manifest.get("aggregate")
+    if not isinstance(entries, list) or len(entries) > MAX_ENTRIES or not isinstance(aggregate, dict):
+        raise ValueError("publication audit manifest has no bounded inventory")
+    files = directories = total = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("publication audit manifest entry is invalid")
+        entry_type = entry.get("type")
+        if entry_type == "dir":
+            directories += 1
+        elif entry_type == "file":
+            size = entry.get("size")
+            if type(size) is not int or cast(int, size) < 0 or cast(int, size) > MAX_FILE_BYTES:
+                raise ValueError("publication audit file size is invalid")
+            files += 1
+            total += cast(int, size)
+            if total > MAX_TOTAL_BYTES:
+                raise ValueError("publication audit data total exceeds its limit")
+        else:
+            raise ValueError("publication audit entry type is invalid")
+    if aggregate != {"entries": len(entries), "files": files, "directories": directories, "total_size": total}:
+        raise ValueError("publication audit aggregate does not bind entries")
+    return total
+
+
+def audit_reserved_publications(config_root: Path) -> tuple[dict[str, str], ...]:
+    """Classify POSIX publication envelopes without changing their recovery state.
+
+    This is deliberately an observation-only startup aid.  The mutation-capable
+    recovery protocol remains restricted to ``create_retained_backup`` during
+    migration apply, where its migration identity and exclusion boundary exist.
+    """
+    if os.name != "posix":
+        return ()
+    try:
+        config_root = canonical_config_root(config_root)
+        _validate_root(config_root)
+        backup_root = config_root / BACKUP_ROOT_NAME
+        if not (backup_root.exists() or backup_root.is_symlink()):
+            return ()
+        root_info = backup_root.lstat()
+        if (
+            stat.S_ISLNK(root_info.st_mode) or _is_reparse(root_info)
+            or not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != os.geteuid() or stat.S_IMODE(root_info.st_mode) & 0o077
+        ):
+            return _emit_publication_audit((_publication_audit_record("retained-ambiguous", "unsafe-backup-root"),))
+        names, namespace_overflow = _stream_publication_audit_names(backup_root, config_root)
+    except (OSError, BackupRestoreError):
+        return _emit_publication_audit((_publication_audit_record("retained-ambiguous", "backup-root-unreadable"),))
+
+    if namespace_overflow:
+        return _emit_publication_audit((
+            _publication_audit_record("retained-ambiguous", "envelope-namespace-count-exceeded"),
+        ))
+
+    pattern = re.compile(r"^{}([0-9a-f]{{32}})$".format(re.escape(PUBLICATION_TXN_PREFIX)))
+    records: list[dict[str, str]] = []
+    remaining_io = MAX_PUBLICATION_AUDIT_IO_BYTES
+    for transaction_name in names:
+        match = pattern.fullmatch(transaction_name)
+        if match is None:
+            if transaction_name.startswith(PUBLICATION_TXN_PREFIX):
+                records.append(_publication_audit_record("retained-foreign", "invalid-envelope-name"))
+            continue
+        generation = match.group(1)
+        transaction = backup_root / transaction_name
+        try:
+            info = transaction.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode) or _is_reparse(info) or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077
+            ):
+                records.append(_publication_audit_record("retained-ambiguous", "unsafe-envelope"))
+                continue
+            transaction_names, transaction_overflow = _stream_publication_audit_children(
+                transaction, config_root, 2,
+            )
+            if transaction_overflow:
+                records.append(_publication_audit_record("retained-ambiguous", "transaction-layout-overflow"))
+                continue
+            temporary_name = ".intent-{}.tmp".format(generation)
+            if PUBLICATION_INTENT_NAME not in transaction_names:
+                allowed = {PUBLICATION_STAGING_NAME, temporary_name}
+                if not set(transaction_names).issubset(allowed):
+                    records.append(_publication_audit_record("retained-ambiguous", "preintent-layout"))
+                    continue
+                for name, expected_directory in (
+                    (temporary_name, False), (PUBLICATION_STAGING_NAME, True),
+                ):
+                    if name not in transaction_names:
+                        continue
+                    child = transaction / name
+                    child_info = child.lstat()
+                    valid = (
+                        (stat.S_ISDIR(child_info.st_mode) if expected_directory else stat.S_ISREG(child_info.st_mode))
+                        and not stat.S_ISLNK(child_info.st_mode) and not _is_reparse(child_info)
+                        and child_info.st_uid == os.geteuid()
+                        and not stat.S_IMODE(child_info.st_mode) & 0o077
+                    )
+                    if not expected_directory:
+                        valid = valid and child_info.st_nlink == 1 and child_info.st_size <= 4096
+                    if not valid:
+                        records.append(_publication_audit_record("retained-ambiguous", "unsafe-preintent-artifact"))
+                        break
+                else:
+                    records.append(_publication_audit_record("retained-ambiguous", "preintent-proof-not-durable"))
+                continue
+
+            intent_path = transaction / PUBLICATION_INTENT_NAME
+            try:
+                payload = _read_private_publication_file(intent_path, config_root, 4096)
+                record = json.loads(payload.decode("utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError, BackupRestoreError):
+                records.append(_publication_audit_record("retained-ambiguous", "intent-unreadable-or-invalid"))
+                continue
+            required = {
+                "publication_version", "backup_id", "destination_name", "staging_name",
+                "transaction_name", "root_identity", "manifest_sha256", "generation",
+            }
+            candidate_name = record.get("backup_id") if isinstance(record, dict) else None
+            if (
+                not isinstance(record, dict) or set(record) != required
+                or record.get("publication_version") != 3 or not isinstance(candidate_name, str)
+                or _PUBLICATION_BACKUP_ID_PATTERN.fullmatch(candidate_name) is None
+                or record.get("destination_name") != candidate_name
+                or record.get("staging_name") != PUBLICATION_STAGING_NAME
+                or record.get("transaction_name") != transaction_name
+                or record.get("root_identity") != list(_validate_root(config_root))
+                or not isinstance(record.get("manifest_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", cast(str, record.get("manifest_sha256"))) is None
+                or record.get("generation") != generation
+            ):
+                records.append(_publication_audit_record("retained-ambiguous", "intent-proof-invalid"))
+                continue
+            staging = transaction / PUBLICATION_STAGING_NAME
+            destination = backup_root / candidate_name
+            staging_exists = staging.exists() or staging.is_symlink()
+            destination_exists = destination.exists() or destination.is_symlink()
+            unsafe = False
+            for directory, exists in ((staging, staging_exists), (destination, destination_exists)):
+                if not exists:
+                    continue
+                directory_info = directory.lstat()
+                if (
+                    stat.S_ISLNK(directory_info.st_mode) or _is_reparse(directory_info)
+                    or not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != os.geteuid()
+                    or stat.S_IMODE(directory_info.st_mode) & 0o077
+                ):
+                    unsafe = True
+            if unsafe:
+                records.append(_publication_audit_record("retained-ambiguous", "unsafe-publication-directory"))
+                continue
+            expected = {PUBLICATION_INTENT_NAME} | ({PUBLICATION_STAGING_NAME} if staging_exists else set())
+            if set(transaction_names) != expected:
+                records.append(_publication_audit_record("retained-ambiguous", "transaction-layout"))
+                continue
+            if staging_exists:
+                staging_names, staging_overflow = _stream_publication_audit_children(
+                    staging, config_root, 2,
+                )
+            else:
+                staging_names, staging_overflow = [], False
+            if destination_exists:
+                destination_names, destination_overflow = _stream_publication_audit_children(
+                    destination, config_root, 2,
+                )
+            else:
+                destination_names, destination_overflow = [], False
+            if staging_overflow or destination_overflow:
+                records.append(_publication_audit_record("retained-ambiguous", "publication-layout-overflow"))
+                continue
+            manifest_path: Path | None = None
+            if not staging_exists and not destination_exists:
+                classification, reason = "cleanup-complete", "cleanup-pending"
+            elif staging_names == ["data", MANIFEST_NAME] and destination_names == []:
+                classification = "reserved" if destination_exists else "intent-only"
+                reason, manifest_path = "recovery-required", staging / MANIFEST_NAME
+            elif staging_names == [MANIFEST_NAME] and destination_names == ["data"]:
+                classification, reason = "data-moved", "recovery-required"
+                manifest_path = staging / MANIFEST_NAME
+            elif staging_names == [] and destination_names == ["data", MANIFEST_NAME]:
+                classification, reason = "committed", "cleanup-required"
+                manifest_path = destination / MANIFEST_NAME
+            else:
+                records.append(_publication_audit_record("retained-ambiguous", "publication-state-ambiguous"))
+                continue
+            if manifest_path is not None:
+                try:
+                    manifest_payload = _read_private_publication_file(
+                        manifest_path, config_root, MAX_MANIFEST_BYTES,
+                    )
+                    manifest = json.loads(manifest_payload.decode("utf-8"))
+                    if (
+                        hashlib.sha256(manifest_payload).hexdigest() != record["manifest_sha256"]
+                        or not isinstance(manifest, dict) or manifest.get("backup_id") != candidate_name
+                        or manifest.get("root_identity") != list(_validate_root(config_root))
+                    ):
+                        raise BackupRestoreError("publication proof is uncertain")
+                    entry_total = _publication_audit_entry_total(manifest)
+                    estimated_io = entry_total + (4 * MAX_MANIFEST_BYTES)
+                    if estimated_io > remaining_io:
+                        records.append(_publication_audit_record("retained-ambiguous", "audit-io-budget-exceeded"))
+                        continue
+                    remaining_io -= estimated_io
+                except ValueError:
+                    records.append(_publication_audit_record("retained-ambiguous", "audit-io-budget-exceeded"))
+                    continue
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, BackupRestoreError):
+                    records.append(_publication_audit_record("retained-ambiguous", "publication-proof-uncertain"))
+                    continue
+            if classification == "data-moved":
+                # The manifest and data are intentionally split across two
+                # trees at this durable transition.  Startup has no mutation
+                # authority to join them, so it must retain rather than claim
+                # a fully proven phase.
+                records.append(_publication_audit_record("retained-ambiguous", "split-tree-proof-unavailable"))
+                continue
+            if classification in ("intent-only", "reserved"):
+                proof_root = staging
+                allow_staging = True
+            elif classification == "committed":
+                proof_root = destination
+                allow_staging = False
+            else:
+                proof_root = None
+                allow_staging = False
+            if proof_root is not None:
+                try:
+                    validate_backup(
+                        proof_root, config_root, _expected_backup_id=candidate_name,
+                        _allow_staging=allow_staging,
+                    )
+                except (OSError, ValueError, json.JSONDecodeError, BackupRestoreError):
+                    records.append(_publication_audit_record("retained-ambiguous", "publication-tree-proof-uncertain"))
+                    continue
+            records.append(_publication_audit_record(classification, reason))
+        except (OSError, BackupRestoreError):
+            records.append(_publication_audit_record("retained-ambiguous", "envelope-unreadable"))
+    return _emit_publication_audit(records)
 
 
 def _bounded_restore_relative(path: Path | PurePosixPath | str, config_root: Path) -> str:

@@ -27,6 +27,7 @@ from .backup_restore import (
     MANIFEST_NAME,
     RESTORE_JOURNAL_NAME,
     _fsync_directory,
+    audit_reserved_publications,
     create_retained_backup,
     resolve_backup,
     restore_backup,
@@ -1591,6 +1592,10 @@ class MigrationCoordinator:
 
     def _preflight_anchored(self) -> MigrationDecision:
         _safe_directory(self.config_dir, self.config_dir)
+        # Startup only records the bounded state of a stranded POSIX
+        # publication envelope.  Repair remains an explicit migration-apply
+        # operation with its runtime exclusion and migration identity.
+        audit_reserved_publications(self.config_dir)
         metadata = self._read_metadata()
         if metadata is not None:
             decision = self._decision_from_metadata(metadata)

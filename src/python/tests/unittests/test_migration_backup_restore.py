@@ -1,5 +1,6 @@
 ﻿import json
 import errno
+import hashlib
 import os
 import socket
 import subprocess
@@ -13,6 +14,7 @@ from unittest.mock import patch
 from common import ServiceExit
 from migration.backup_restore import (
     BackupRestoreError,
+    audit_reserved_publications,
     create_retained_backup,
     infrastructure_exclusions,
     restore_backup,
@@ -344,6 +346,269 @@ class TestMigrationBackupRestore(unittest.TestCase):
         ])
         self.assertEqual([], list(backup_root.glob(".publication-txn-*")))
 
+    @unittest.skipUnless(os.name == "posix", "POSIX publication audit")
+    def test_publication_audit_classifies_crash_phases_without_mutation(self) -> None:
+        class SimulatedHardCrash(BaseException):
+            pass
+
+        expected = {
+            "txn_durable": ("retained-ambiguous", "preintent-proof-not-durable"),
+            "intent_temp_partial": ("retained-ambiguous", "preintent-proof-not-durable"),
+            "intent_temp_durable": ("retained-ambiguous", "preintent-proof-not-durable"),
+            "intent_durable": ("intent-only", "recovery-required"),
+            "reservation_durable": ("reserved", "recovery-required"),
+            "data_durable": ("retained-ambiguous", "split-tree-proof-unavailable"),
+            "manifest_durable": ("committed", "cleanup-required"),
+            "staging_removed": ("committed", "cleanup-required"),
+            "intent_removed": ("retained-ambiguous", "preintent-proof-not-durable"),
+        }
+        for transition, classification in expected.items():
+            with self.subTest(transition=transition), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "a").write_text("retained", encoding="utf-8")
+                with patch(
+                    "migration.backup_restore._rename_directory_noreplace",
+                    side_effect=OSError(errno.EINVAL, "unsupported"),
+                ), patch(
+                    "migration.backup_restore._publication_transition",
+                    side_effect=lambda name: (_ for _ in ()).throw(SimulatedHardCrash())
+                    if name == transition else None,
+                ):
+                    with self.assertRaises(SimulatedHardCrash):
+                        create_retained_backup(
+                            root, migration_id="original-v0.8.6-to-current-v1",
+                            source_schema="original-v0.8.6", target_schema="seedsync-current-v1",
+                        )
+                backup_root = root / "migration-backups"
+                before = sorted((path.relative_to(backup_root).as_posix(), path.lstat().st_mode, path.read_bytes())
+                                for path in backup_root.rglob("*") if path.is_file())
+                audit = audit_reserved_publications(root)
+                after = sorted((path.relative_to(backup_root).as_posix(), path.lstat().st_mode, path.read_bytes())
+                               for path in backup_root.rglob("*") if path.is_file())
+                self.assertEqual(before, after)
+                self.assertIn(
+                    {"classification": classification[0], "reason": classification[1]}, audit,
+                )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX publication audit")
+    def test_publication_audit_retains_adversarial_envelopes_without_mutation(self) -> None:
+        backup_root = self.root / "migration-backups"
+        backup_root.mkdir(mode=0o700)
+        unsafe = backup_root / (".publication-txn-" + "a" * 32)
+        unsafe.symlink_to(self.root, target_is_directory=True)
+        malformed = backup_root / ".publication-txn-not-a-generation"
+        malformed.mkdir(mode=0o700)
+        oversized = backup_root / (".publication-txn-" + "b" * 32)
+        oversized.mkdir(mode=0o700)
+        (oversized / "intent.json").write_bytes(b"x" * 4097)
+        (oversized / "intent.json").chmod(0o600)
+        public = backup_root / (".publication-txn-" + "c" * 32)
+        public.mkdir(mode=0o755)
+        before = sorted((path.relative_to(backup_root).as_posix(), path.is_symlink(), path.lstat().st_mode,
+                         path.read_bytes() if path.is_file() else b"") for path in backup_root.rglob("*"))
+        audit = audit_reserved_publications(self.root)
+        after = sorted((path.relative_to(backup_root).as_posix(), path.is_symlink(), path.lstat().st_mode,
+                        path.read_bytes() if path.is_file() else b"") for path in backup_root.rglob("*"))
+        self.assertEqual(before, after)
+        self.assertEqual({"unsafe-envelope", "invalid-envelope-name", "intent-unreadable-or-invalid"},
+                         {record["reason"] for record in audit})
+
+    @unittest.skipUnless(os.name == "posix", "POSIX publication audit")
+    def test_publication_audit_rejects_unsafe_root_without_listing_and_bounds_work(self) -> None:
+        backup_root = self.root / "migration-backups"
+        backup_root.mkdir(mode=0o755)
+        with patch("migration.backup_restore._list_directory_names", side_effect=AssertionError("listed")):
+            self.assertEqual(
+                ({"classification": "retained-ambiguous", "reason": "unsafe-backup-root"},),
+                audit_reserved_publications(self.root),
+            )
+
+        backup_root.chmod(0o700)
+        for index in range(33):
+            (backup_root / (".publication-txn-" + format(index, "032x"))).mkdir(mode=0o700)
+        before = sorted(path.relative_to(backup_root).as_posix() for path in backup_root.iterdir())
+        audit = audit_reserved_publications(self.root)
+        self.assertEqual(before, sorted(path.relative_to(backup_root).as_posix() for path in backup_root.iterdir()))
+        self.assertEqual(
+            ({"classification": "retained-ambiguous", "reason": "envelope-namespace-count-exceeded"},), audit,
+        )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX publication audit")
+    def test_publication_audit_bounds_large_malformed_transaction_namespace(self) -> None:
+        backup_root = self.root / "migration-backups"
+        backup_root.mkdir(mode=0o700)
+        for index in range(256):
+            (backup_root / (".publication-txn-malformed-" + str(index))).mkdir(mode=0o700)
+        with self.assertLogs("migration.backup_restore", level="WARNING") as logs:
+            audit = audit_reserved_publications(self.root)
+        self.assertEqual(
+            ({"classification": "retained-ambiguous", "reason": "envelope-namespace-count-exceeded"},), audit,
+        )
+        self.assertEqual(1, len(logs.output))
+        self.assertNotIn("malformed", logs.output[0])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX publication audit")
+    def test_publication_audit_bounds_transaction_staging_and_destination_layouts(self) -> None:
+        class SimulatedHardCrash(BaseException):
+            pass
+
+        cases = (
+            ("intent_durable", "transaction", "transaction-layout-overflow"),
+            ("intent_durable", "staging", "publication-layout-overflow"),
+            ("reservation_durable", "destination", "publication-layout-overflow"),
+        )
+        for transition, target, reason in cases:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "a").write_text("retained", encoding="utf-8")
+                with patch(
+                    "migration.backup_restore._rename_directory_noreplace",
+                    side_effect=OSError(errno.EINVAL, "unsupported"),
+                ), patch(
+                    "migration.backup_restore._publication_transition",
+                    side_effect=lambda name: (_ for _ in ()).throw(SimulatedHardCrash())
+                    if name == transition else None,
+                ):
+                    with self.assertRaises(SimulatedHardCrash):
+                        create_retained_backup(
+                            root, migration_id="original-v0.8.6-to-current-v1",
+                            source_schema="original-v0.8.6", target_schema="seedsync-current-v1",
+                        )
+                backup_root = root / "migration-backups"
+                transaction = next(backup_root.glob(".publication-txn-*"))
+                if target == "transaction":
+                    (transaction / "private-layout-overflow").write_text("x", encoding="utf-8")
+                elif target == "staging":
+                    (transaction / "staging" / "private-layout-overflow").write_text("x", encoding="utf-8")
+                else:
+                    destination = next(path for path in backup_root.iterdir() if not path.name.startswith("."))
+                    for index in range(3):
+                        (destination / ("private-layout-overflow-" + str(index))).write_text("x", encoding="utf-8")
+                before = sorted(path.relative_to(backup_root).as_posix() for path in backup_root.rglob("*"))
+                with self.assertLogs("migration.backup_restore", level="WARNING") as logs:
+                    audit = audit_reserved_publications(root)
+                self.assertEqual(before, sorted(path.relative_to(backup_root).as_posix() for path in backup_root.rglob("*")))
+                self.assertEqual(
+                    ({"classification": "retained-ambiguous", "reason": reason},), audit,
+                )
+                self.assertNotIn("private-layout-overflow", "\n".join(logs.output))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX publication audit")
+    def test_publication_audit_invalid_identity_and_tree_proof_never_escape_or_mutate(self) -> None:
+        class SimulatedHardCrash(BaseException):
+            pass
+
+        (self.root / "a").write_text("retained", encoding="utf-8")
+        with patch(
+            "migration.backup_restore._rename_directory_noreplace",
+            side_effect=OSError(errno.EINVAL, "unsupported"),
+        ), patch(
+            "migration.backup_restore._publication_transition",
+            side_effect=lambda name: (_ for _ in ()).throw(SimulatedHardCrash())
+            if name == "intent_durable" else None,
+        ):
+            with self.assertRaises(SimulatedHardCrash):
+                self._create_backup()
+        backup_root = self.root / "migration-backups"
+        transaction = next(backup_root.glob(".publication-txn-*"))
+        intent = transaction / "intent.json"
+        record = json.loads(intent.read_text(encoding="utf-8"))
+        valid_record = dict(record)
+        record["backup_id"] = "../outside"
+        record["destination_name"] = "../outside"
+        intent.write_text(json.dumps(record), encoding="utf-8")
+        intent.chmod(0o600)
+        before = {path.relative_to(backup_root).as_posix(): path.read_bytes()
+                  for path in backup_root.rglob("*") if path.is_file()}
+        with self.assertLogs("migration.backup_restore", level="WARNING") as logs:
+            audit = audit_reserved_publications(self.root)
+        self.assertEqual(before, {path.relative_to(backup_root).as_posix(): path.read_bytes()
+                                  for path in backup_root.rglob("*") if path.is_file()})
+        self.assertIn({"classification": "retained-ambiguous", "reason": "intent-proof-invalid"}, audit)
+        self.assertNotIn("outside", "\n".join(logs.output))
+
+        intent.write_text(json.dumps(valid_record), encoding="utf-8")
+        intent.chmod(0o600)
+        data = transaction / "staging" / "data"
+        (data / "a").unlink()
+        data.rmdir()
+        data.symlink_to(self.root, target_is_directory=True)
+        before = {path.relative_to(backup_root).as_posix(): path.read_bytes()
+                  for path in backup_root.rglob("*") if path.is_file()}
+        audit = audit_reserved_publications(self.root)
+        self.assertEqual(before, {path.relative_to(backup_root).as_posix(): path.read_bytes()
+                                  for path in backup_root.rglob("*") if path.is_file()})
+        self.assertIn(
+            {"classification": "retained-ambiguous", "reason": "publication-tree-proof-uncertain"}, audit,
+        )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX publication audit")
+    def test_publication_audit_io_budget_retains_valid_envelope_without_reading_tree(self) -> None:
+        class SimulatedHardCrash(BaseException):
+            pass
+
+        (self.root / "a").write_text("retained", encoding="utf-8")
+        with patch(
+            "migration.backup_restore._rename_directory_noreplace",
+            side_effect=OSError(errno.EINVAL, "unsupported"),
+        ), patch(
+            "migration.backup_restore._publication_transition",
+            side_effect=lambda name: (_ for _ in ()).throw(SimulatedHardCrash())
+            if name == "intent_durable" else None,
+        ):
+            with self.assertRaises(SimulatedHardCrash):
+                self._create_backup()
+        backup_root = self.root / "migration-backups"
+        before = {path.relative_to(backup_root).as_posix(): path.read_bytes()
+                  for path in backup_root.rglob("*") if path.is_file()}
+        with patch("migration.backup_restore.MAX_PUBLICATION_AUDIT_IO_BYTES", 0):
+            audit = audit_reserved_publications(self.root)
+        self.assertEqual(before, {path.relative_to(backup_root).as_posix(): path.read_bytes()
+                                  for path in backup_root.rglob("*") if path.is_file()})
+        self.assertIn(
+            {"classification": "retained-ambiguous", "reason": "audit-io-budget-exceeded"}, audit,
+        )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX publication audit")
+    def test_publication_audit_entry_totals_bound_multiple_underdeclared_manifests(self) -> None:
+        class SimulatedHardCrash(BaseException):
+            pass
+
+        for declared_total in (0, 1):
+            with self.subTest(declared_total=declared_total), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "a").write_text("retained", encoding="utf-8")
+                with patch(
+                    "migration.backup_restore._rename_directory_noreplace",
+                    side_effect=OSError(errno.EINVAL, "unsupported"),
+                ), patch(
+                    "migration.backup_restore._publication_transition",
+                    side_effect=lambda name: (_ for _ in ()).throw(SimulatedHardCrash())
+                    if name == "intent_durable" else None,
+                ):
+                    with self.assertRaises(SimulatedHardCrash):
+                        create_retained_backup(
+                            root, migration_id="original-v0.8.6-to-current-v1",
+                            source_schema="original-v0.8.6", target_schema="seedsync-current-v1",
+                        )
+                transaction = next((root / "migration-backups").glob(".publication-txn-*"))
+                manifest_path = transaction / "staging" / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["aggregate"]["total_size"] = declared_total
+                payload = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                manifest_path.write_bytes(payload)
+                intent_path = transaction / "intent.json"
+                intent = json.loads(intent_path.read_text(encoding="utf-8"))
+                intent["manifest_sha256"] = hashlib.sha256(payload).hexdigest()
+                intent_path.write_text(json.dumps(intent), encoding="utf-8")
+                intent_path.chmod(0o600)
+                with patch("migration.backup_restore.validate_backup", side_effect=AssertionError("tree read")):
+                    audit = audit_reserved_publications(root)
+                self.assertEqual(
+                    ({"classification": "retained-ambiguous", "reason": "audit-io-budget-exceeded"},), audit,
+                )
+
+
     @unittest.skipUnless(os.name == "posix", "POSIX publication crash matrix")
     def test_reserved_fallback_crash_matrix_converges_after_every_transition(self) -> None:
         class SimulatedHardCrash(BaseException):
@@ -569,6 +834,19 @@ class TestMigrationBackupRestore(unittest.TestCase):
         proof["manifest_sha256"] = "0" * 64
         intent.write_text(json.dumps(proof), encoding="utf-8")
         intent.chmod(0o600)
+
+        before_audit = {
+            path.relative_to(backup_root).as_posix(): path.read_bytes()
+            for path in backup_root.rglob("*") if path.is_file()
+        }
+        audit = audit_reserved_publications(self.root)
+        self.assertEqual(before_audit, {
+            path.relative_to(backup_root).as_posix(): path.read_bytes()
+            for path in backup_root.rglob("*") if path.is_file()
+        })
+        self.assertIn(
+            {"classification": "retained-ambiguous", "reason": "publication-proof-uncertain"}, audit,
+        )
 
         with patch(
             "migration.backup_restore._rename_directory_noreplace",

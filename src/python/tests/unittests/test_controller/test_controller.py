@@ -8104,7 +8104,7 @@ class TestController(unittest.TestCase):
             self.assertFalse(os.path.exists(destination))
             entries = trace.snapshot()["entries"]
             self.assertEqual(
-                ["fallback", "create_temporary", "copy", "publish", "cleanup"],
+                ["fallback", "reserve_start", "create_temporary", "copy", "publish", "cleanup"],
                 [entry["details"]["phase"] for entry in entries],
             )
             publish_details = entries[-2]["details"]
@@ -10815,10 +10815,12 @@ class TestController(unittest.TestCase):
         probe = MagicMock(side_effect=AssertionError("disabled publication probe"))
         tracker = _MoveMutationTracker("sample-file", disabled)
         with patch("controller.controller.os.path.lexists", probe):
-            tracker.record_publication(
-                "destination", "replace", "destination",
-                source_path="source", destination_path="destination",
-            )
+            for phase in ("reserve_start", "temporary_reserved", "copy_start", "copy_complete"):
+                tracker.record_publication(
+                    phase, "copy", "temporary",
+                    source_path="source", temporary_path="temporary",
+                    destination_path="destination",
+                )
         probe.assert_not_called()
         self.assertEqual([], disabled.snapshot()["entries"])
 
@@ -10826,6 +10828,59 @@ class TestController(unittest.TestCase):
         tracker = _MoveMutationTracker("sample-file", enabled)
         tracker.record_publication("destination", "replace", "destination")
         self.assertEqual(1, len(enabled.snapshot()["entries"]))
+
+    def test_fallback_publication_lifecycle_is_ordered_and_path_free_for_file_and_directory(self):
+        variants = (
+            ("sample-file.bin", False),
+            ("sample-directory", True),
+            ("sample-link", None),
+        )
+        for name, is_directory in variants:
+            with self.subTest(name=name):
+                trace = BreadcrumbTraceCollector(lambda: True, max_entries=64)
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    staging = os.path.join(temp_dir, "staging")
+                    final = os.path.join(temp_dir, "final")
+                    os.mkdir(staging)
+                    os.mkdir(final)
+                    source = os.path.join(staging, name)
+                    destination = os.path.join(final, name)
+                    if is_directory:
+                        os.mkdir(source)
+                        Path(os.path.join(source, "example.bin")).write_bytes(b"payload")
+                    elif is_directory is False:
+                        Path(source).write_bytes(b"payload")
+                    else:
+                        try:
+                            os.symlink("target.bin", source)
+                        except (OSError, NotImplementedError) as error:
+                            self.skipTest("symlink fixture unavailable: {}".format(error))
+
+                    tracker = _MoveMutationTracker(name, trace)
+                    with patch.object(
+                            Controller, "_Controller__rename_no_replace",
+                            side_effect=OSError(errno.EINVAL, "unsupported")):
+                        Controller._Controller__publish_staging_no_replace(source, destination, tracker)
+
+                entries = trace.query_events(
+                    corr_id=opaque_trace_correlation(name),
+                    category="final_move.publication",
+                    order="asc",
+                )["events"]
+                phases = [entry["details"]["phase"] for entry in entries]
+                lifecycle = [
+                    "reserve_start", "temporary_reserved", "copy_start", "copy_complete",
+                ]
+                positions = [phases.index(phase) for phase in lifecycle]
+                self.assertEqual(sorted(positions), positions)
+                self.assertEqual("final_move.publication", entries[0]["category"])
+                self.assertEqual("final_move_publication", entries[0]["stage"])
+                self.assertEqual("info", entries[0]["level"])
+                self.assertEqual(opaque_trace_correlation(name), entries[0]["corr_id"])
+                for entry in entries:
+                    self.assertNotIn(name, str(entry))
+                    self.assertNotIn(source, str(entry))
+                    self.assertNotIn(destination, str(entry))
 
     def test_transfer_exclusions_fail_closed_for_unknown_pair_with_retained_scan_snapshot(self):
         base_mtime_ns = 1_786_400_003_000_000_000
