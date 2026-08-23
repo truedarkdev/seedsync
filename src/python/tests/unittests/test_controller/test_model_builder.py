@@ -7953,6 +7953,125 @@ class TestModelBuilder(unittest.TestCase):
                     "visible-state owner: Controller._model_record_visible_state",
                 )
 
+    def test_mixed_root_duplicate_names_keep_stop_scoped_to_path_pair(self):
+        root_name = "sample-directory"
+        final_name = "complete.bin"
+        staging_name = "staging.bin"
+        pair_a = "pair-a"
+        pair_b = "pair-b"
+
+        def root(path_pair_id: str, staging_size: int) -> tuple[SystemFile, SystemFile]:
+            remote_root = SystemFile(root_name, 20, True)
+            remote_root.path_pair_id = path_pair_id
+            remote_root.add_child(SystemFile(final_name, 10, False, mtime_ns=1_000_000_000))
+            remote_root.add_child(SystemFile(staging_name, 10, False, mtime_ns=2_000_000_000))
+            local_root = SystemFile(root_name, 10 + staging_size, True)
+            local_root.path_pair_id = path_pair_id
+            local_root.add_child(SystemFile(final_name, 10, False, mtime_ns=1_000_000_000))
+            local_root.add_child(SystemFile(
+                staging_name,
+                staging_size,
+                False,
+                is_staging=True,
+                mtime_ns=2_000_000_000,
+            ))
+            return remote_root, local_root
+
+        remote_a, partial_a = root(pair_a, 5)
+        remote_b, partial_b = root(pair_b, 5)
+        remote_files = [remote_a, remote_b]
+        partial_local_files = [partial_a, partial_b]
+        complete_a_remote, complete_a_local = root(pair_a, 10)
+        complete_b_remote, complete_b_local = root(pair_b, 10)
+        complete_local_files = [complete_a_local, complete_b_local]
+        pair_a_id = ModelFile.build_file_id(root_name, pair_a)
+        pair_b_id = ModelFile.build_file_id(root_name, pair_b)
+
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={
+                "default": "off",
+                "rules": {
+                    "model.mixed_root": "info",
+                    "model.lifecycle": "info",
+                    "queue.exclusion": "info",
+                },
+            },
+        )
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        self.model_builder.set_remote_files(remote_files)
+        self.model_builder.set_local_files(partial_local_files)
+        self.model_builder.build_model()
+
+        # Publish complete coverage while stopping only pair A by its
+        # canonical root identity.
+        self.model_builder.set_remote_files([complete_a_remote, complete_b_remote])
+        self.model_builder.set_local_files(complete_local_files)
+        self.model_builder.set_stopped_files({pair_a_id})
+        model = self.model_builder.build_model()
+
+        pair_a_root = model.get_file(pair_a_id)
+        pair_b_root = model.get_file(pair_b_id)
+        self.assertTrue(pair_a_root.complete_local_coverage)
+        self.assertTrue(pair_b_root.complete_local_coverage)
+        self.assertTrue(pair_a_root.explicitly_stopped)
+        self.assertFalse(pair_b_root.explicitly_stopped)
+        self.assertEqual("stopped", Controller._model_record_visible_state(pair_a_root))
+        self.assertEqual("downloaded", Controller._model_record_visible_state(pair_b_root))
+
+        entries = self.__trace_entries(collector, include_root_decisions=True)
+        mixed_entries = [
+            entry for entry in entries if entry["message"] == "mixed_root_decision"
+        ]
+        self.assertEqual(7, len(mixed_entries))
+        mixed_by_corr: dict[str, list[dict[str, object]]] = {}
+        for entry in mixed_entries:
+            self.assertEqual("model.mixed_root", entry["category"])
+            self.assertIsNone(entry["file_id"])
+            self.assertIsNone(entry["path_pair_id"])
+            self.assertIsNone(entry["path_pair_name"])
+            self.assertNotIn(root_name, str(entry))
+            self.assertNotIn(final_name, str(entry))
+            self.assertNotIn(staging_name, str(entry))
+            mixed_by_corr.setdefault(entry["corr_id"], []).append(entry)
+        self.assertEqual(2, len(mixed_by_corr))
+        self.assertTrue(all(
+            {entry["details"]["decision_kind"] for entry in corr_entries} ==
+            {"coverage", "promotion"}
+            for corr_entries in mixed_by_corr.values()
+        ))
+        promotions_by_corr = {
+            corr_id: [
+                entry["details"]["reason"] for entry in corr_entries
+                if entry["details"]["decision_kind"] == "promotion"
+            ][-1]
+            for corr_id, corr_entries in mixed_by_corr.items()
+        }
+        self.assertEqual({"complete"}, set(promotions_by_corr.values()))
+
+        root_entries = [
+            entry for entry in entries if entry["message"] == "root_default_decision"
+        ]
+        self.assertTrue(root_entries)
+        for entry in root_entries:
+            self.assertIsNone(entry["file_id"])
+            self.assertIsNone(entry["path_pair_id"])
+            self.assertIsNone(entry["path_pair_name"])
+            self.assertNotIn(root_name, str(entry))
+            self.assertNotIn(final_name, str(entry))
+            self.assertNotIn(staging_name, str(entry))
+        self.assertEqual(
+            {"explicit_stop"},
+            {entry["details"]["reason"] for entry in root_entries
+             if entry["details"]["lifecycle"]["explicit_stop"]},
+        )
+        explicit_stop_entries = [
+            entry for entry in root_entries
+            if entry["details"]["lifecycle"]["explicit_stop"]
+        ]
+        self.assertEqual(1, len(explicit_stop_entries))
+        self.assertIn(explicit_stop_entries[0]["corr_id"], mixed_by_corr)
+
     def test_mixed_root_trace_emits_for_ordinary_default_root(self):
         remote_root = SystemFile("sample-directory", 20, True)
         remote_root.add_child(SystemFile("remote.bin", 20, False))
