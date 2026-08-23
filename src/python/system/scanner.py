@@ -1,13 +1,17 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import os
-import re
 from typing import Callable, List, Optional, Protocol
 from datetime import datetime
 
 # my libs
 from common.error import AppError
 from common.breadcrumb_trace import opaque_trace_correlation
+from common.lftp_status import (
+    MAX_LFTP_PGET_STATUS_BYTES,
+    parse_lftp_pget_status,
+    parse_lftp_pget_status_bytes,
+)
 from .file import SystemFile
 
 
@@ -376,8 +380,11 @@ class SystemScanner:
                 sidecar_present = os.path.isfile(lftp_status_file_path)
                 if sidecar_present:
                     parser_coverage = "known"
-                    with open(lftp_status_file_path, "r") as f:
-                        parsed_size = SystemScanner._lftp_status_file_size(f.read())
+                    with open(lftp_status_file_path, "rb") as f:
+                        parsed_status = parse_lftp_pget_status_bytes(
+                            f.read(MAX_LFTP_PGET_STATUS_BYTES + 1)
+                        )
+                        parsed_size = parsed_status.covered_size if parsed_status is not None else None
                     sidecar_classification = "valid" if parsed_size is not None else "malformed"
                     if parsed_size is not None:
                         file_size = parsed_size
@@ -461,38 +468,5 @@ class SystemScanner:
         :param status:
         :return:
         """
-        size_pattern_m = re.compile(r"^size=(\d+)$")
-        pos_pattern_m = re.compile(r"^\d+\.pos=(\d+)$")
-        limit_pattern_m = re.compile(r"^\d+\.limit=(\d+)$")
-        lines = [s.strip() for s in status.splitlines()]
-        lines = list(filter(None, lines))  # remove blank lines
-        if not lines:
-            return None
-
-        empty_size = 0
-        # First line should be a size
-        result = size_pattern_m.search(lines[0])
-        if not result:
-            return None
-        total_size = int(result.group(1))
-        lines.pop(0)
-        while lines:
-            # There should be pairs of lines
-            if len(lines) < 2:
-                return None
-            result_pos = pos_pattern_m.search(lines[0])
-            result_limit = limit_pattern_m.search(lines[1])
-            if not result_pos or not result_limit:
-                return None
-            pos = int(result_pos.group(1))
-            limit = int(result_limit.group(1))
-            if pos > total_size or limit > total_size or limit < pos:
-                return None
-            empty_size += limit - pos
-            lines.pop(0)
-            lines.pop(0)
-
-        if empty_size > total_size:
-            return None
-
-        return total_size-empty_size
+        parsed_status = parse_lftp_pget_status(status)
+        return parsed_status.covered_size if parsed_status is not None else None

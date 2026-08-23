@@ -23,6 +23,24 @@ _MAX_STREAM_RECORD_BYTES = 64 * 1024
 _MAX_STREAM_NODE_BATCH_SIZE = 64
 _MAX_KNOWN_ROOT_FINGERPRINT_BYTES = 32 * 1024
 _MAX_KNOWN_ROOT_FINGERPRINT_B64_BYTES = 4 * ((_MAX_KNOWN_ROOT_FINGERPRINT_BYTES + 2) // 3)
+_MAX_LFTP_PGET_STATUS_BYTES = 64 * 1024
+_MAX_LFTP_PGET_SEGMENTS = 256
+
+
+def _parse_lftp_decimal(value: str) -> Optional[int]:
+    try:
+        return int(value)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _decode_lftp_status_bytes(status: bytes) -> Optional[str]:
+    if len(status) > _MAX_LFTP_PGET_STATUS_BYTES:
+        return None
+    try:
+        return status.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 class SystemFileDataRequired(TypedDict):
@@ -412,8 +430,12 @@ class SystemScanner:
             lftp_status_file_path = entry.path + SystemScanner.__LFTP_STATUS_FILE_SUFFIX
             parsed_size = None
             if os.path.isfile(lftp_status_file_path):
-                with open(lftp_status_file_path, "r", encoding="utf-8") as f:
-                    parsed_size = SystemScanner._lftp_status_file_size(f.read())
+                with open(lftp_status_file_path, "rb") as f:
+                    decoded_status = _decode_lftp_status_bytes(
+                        f.read(_MAX_LFTP_PGET_STATUS_BYTES + 1)
+                    )
+                    if decoded_status is not None:
+                        parsed_size = SystemScanner._lftp_status_file_size(decoded_status)
                     if parsed_size is not None:
                         file_size = parsed_size
             status_sidecar_ready = parsed_size is not None
@@ -479,36 +501,68 @@ class SystemScanner:
         """
         Returns the real file size as indicated by an lftp status content.
         """
+        try:
+            if len(status.encode("utf-8")) > _MAX_LFTP_PGET_STATUS_BYTES:
+                return None
+        except UnicodeError:
+            return None
         size_pattern_m = re.compile(r"^size=(\d+)$")
-        pos_pattern_m = re.compile(r"^\d+\.pos=(\d+)$")
-        limit_pattern_m = re.compile(r"^\d+\.limit=(\d+)$")
+        pos_pattern_m = re.compile(r"^(\d+)\.pos=(\d+)$")
+        limit_pattern_m = re.compile(r"^(\d+)\.limit=(\d+)$")
         lines = [s.strip() for s in status.splitlines()]
         lines = list(filter(None, lines))  # remove blank lines
         if not lines:
             return None
 
-        empty_size = 0
         # First line should be a size.
-        result = size_pattern_m.search(lines[0])
+        result = size_pattern_m.fullmatch(lines[0])
         if not result:
             return None
-        total_size = int(result.group(1))
+        total_size = _parse_lftp_decimal(result.group(1))
+        if total_size is None:
+            return None
         lines.pop(0)
-        while lines:
-            # There should be pairs of lines.
-            if len(lines) < 2:
+
+        # LFTP may flush a late checkpoint before writing the segment limit.
+        # Only the base position is safe coverage in this form; never use the
+        # declared total as the logical local size.
+        if len(lines) == 1:
+            result_pos = pos_pattern_m.fullmatch(lines[0])
+            if not result_pos:
                 return None
-            result_pos = pos_pattern_m.search(lines[0])
-            result_limit = limit_pattern_m.search(lines[1])
+            segment_index = _parse_lftp_decimal(result_pos.group(1))
+            covered_size = _parse_lftp_decimal(result_pos.group(2))
+            if segment_index != 0 or covered_size is None:
+                return None
+            return covered_size if covered_size <= total_size else None
+
+        if not lines or len(lines) % 2:
+            return None
+        if len(lines) // 2 > _MAX_LFTP_PGET_SEGMENTS:
+            return None
+
+        empty_size = 0
+        ranges: list[tuple[int, int]] = []
+        for index in range(0, len(lines), 2):
+            result_pos = pos_pattern_m.fullmatch(lines[index])
+            result_limit = limit_pattern_m.fullmatch(lines[index + 1])
+            expected_segment = index // 2
             if not result_pos or not result_limit:
                 return None
-            pos = int(result_pos.group(1))
-            limit = int(result_limit.group(1))
+            position_segment = _parse_lftp_decimal(result_pos.group(1))
+            limit_segment = _parse_lftp_decimal(result_limit.group(1))
+            pos = _parse_lftp_decimal(result_pos.group(2))
+            limit = _parse_lftp_decimal(result_limit.group(2))
+            if position_segment != expected_segment or limit_segment != expected_segment or \
+                    pos is None or limit is None:
+                return None
             if pos > total_size or limit > total_size or limit < pos:
                 return None
+            if any(pos < previous_limit and previous_pos < limit
+                   for previous_pos, previous_limit in ranges):
+                return None
+            ranges.append((pos, limit))
             empty_size += limit - pos
-            lines.pop(0)
-            lines.pop(0)
 
         if empty_size > total_size:
             return None

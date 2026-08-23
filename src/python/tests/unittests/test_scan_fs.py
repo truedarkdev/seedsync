@@ -79,6 +79,65 @@ class TestScanFsScript(unittest.TestCase):
         self.assertEqual("beta.bin", nested.children[0].name)
         self.assertEqual(4, nested.children[0].size)
 
+    def test_base_only_lftp_status_uses_conservative_covered_size(self):
+        for covered_size in (0, 5, 10):
+            with self.subTest(covered_size=covered_size):
+                self.assertEqual(
+                    covered_size,
+                    SystemScanner._lftp_status_file_size(
+                        "size=10\n0.pos={}\n".format(covered_size),
+                    ),
+                )
+
+    def test_lftp_status_parser_rejects_oversize_and_257_segments(self):
+        oversize = "size=1\n0.pos=0\n0.limit=1\n" + (" " * (64 * 1024))
+        self.assertIsNone(SystemScanner._lftp_status_file_size(oversize))
+
+        lines = ["size=257"]
+        for index in range(257):
+            lines.extend(("{}.pos={}".format(index, index),
+                          "{}.limit={}".format(index, index + 1)))
+        self.assertIsNone(SystemScanner._lftp_status_file_size("\n".join(lines)))
+
+    def test_lftp_status_parser_rejects_base_only_position_overrun(self):
+        self.assertIsNone(SystemScanner._lftp_status_file_size("size=10\n0.pos=11\n"))
+
+    def test_scan_rejects_oversize_lftp_status_without_trusting_declared_size(self):
+        self._write_file("partial.bin", content=b"partial")
+        self._write_file(
+            "partial.bin.lftp-pget-status",
+            content=("size=1\n0.pos=0\n0.limit=1\n" + (" " * (64 * 1024))).encode(),
+        )
+
+        result = self._run_scan_fs(self.temp_dir, check=True)
+        payload = json.loads(result.stdout)
+        partial = next(file for file in payload if file["name"] == "partial.bin")
+        self.assertEqual(7, partial["size"])
+
+    def test_scan_rejects_crlf_padded_oversize_lftp_status(self):
+        self._write_file("partial.bin", content=b"partial")
+        self._write_file(
+            "partial.bin.lftp-pget-status",
+            content=("size=1\r\n0.pos=0\r\n0.limit=1\r\n" + ("\r\n" * 32760)).encode(),
+        )
+
+        result = self._run_scan_fs(self.temp_dir, check=True)
+        payload = json.loads(result.stdout)
+        partial = next(file for file in payload if file["name"] == "partial.bin")
+        self.assertEqual(7, partial["size"])
+
+    def test_scan_accepts_under_limit_crlf_lftp_status(self):
+        self._write_file("partial.bin", content=b"partial")
+        self._write_file(
+            "partial.bin.lftp-pget-status",
+            content=b"size=7\r\n0.pos=0\r\n0.limit=7\r\n",
+        )
+
+        result = self._run_scan_fs(self.temp_dir, check=True)
+        payload = json.loads(result.stdout)
+        partial = next(file for file in payload if file["name"] == "partial.bin")
+        self.assertEqual(0, partial["size"])
+
     def test_reports_missing_path_as_system_scanner_error(self):
         missing_path = os.path.join(self.temp_dir, "missing")
 

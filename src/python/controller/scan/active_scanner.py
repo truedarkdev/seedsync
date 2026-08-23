@@ -8,6 +8,7 @@ import queue
 
 from .scanner_process import IScanner
 from common import overrides, Constants
+from common.lftp_status import MAX_LFTP_PGET_STATUS_BYTES, parse_lftp_pget_status_bytes
 from system import SystemScanner, SystemScannerError, SystemFile
 from system.scanner import _record_lftp_sidecar_breadcrumb, lftp_sidecar_target_identity
 
@@ -16,6 +17,11 @@ class _StatusFileScanner(SystemScanner):
     @staticmethod
     def status_file_size(content: str) -> Optional[int]:
         return SystemScanner._lftp_status_file_size(content)
+
+    @staticmethod
+    def status_file_bytes(content: bytes) -> Optional[int]:
+        parsed = parse_lftp_pget_status_bytes(content)
+        return parsed.covered_size if parsed is not None else None
 
 
 class ActiveScanner(IScanner):
@@ -125,8 +131,10 @@ class ActiveScanner(IScanner):
                 status_only=False, parser_coverage="unknown", scan_role="active",
             )
             return False
-        with open(status_path, "r") as handle:
-            parsed = _StatusFileScanner.status_file_size(handle.read())
+        with open(status_path, "rb") as handle:
+            parsed = _StatusFileScanner.status_file_bytes(
+                handle.read(MAX_LFTP_PGET_STATUS_BYTES + 1)
+            )
         classification = "valid" if parsed is not None else "malformed"
         _record_lftp_sidecar_breadcrumb(
             self.__breadcrumb_trace,

@@ -117,6 +117,31 @@ class TestLftpQueueCommand(unittest.TestCase):
                 command
             )
 
+    def test_queue_file_preserves_resume_with_base_only_lftp_sidecar(self):
+        for covered_size in (0, 50, 100):
+            with self.subTest(covered_size=covered_size), tempfile.TemporaryDirectory() as local_dir:
+                target = os.path.join(local_dir, "movie.mkv")
+                with open(target, "wb") as handle:
+                    handle.write(b"partial")
+                with open(target + ".lftp-pget-status", "w", encoding="utf-8") as handle:
+                    handle.write("size=100\n0.pos={}\n".format(covered_size))
+
+                lftp = self._make_lftp()
+                lftp.queue(
+                    "movie.mkv",
+                    False,
+                    local_base_dir_path=local_dir,
+                    expected_size=100,
+                )
+
+                command = lftp._Lftp__run_command.call_args[0][0]
+                self.assertEqual(
+                    'queue pget -c "/remote/path/movie.mkv" -o {}'.format(
+                        self._local_destination_argument(local_dir)
+                    ),
+                    command,
+                )
+
     def test_queue_file_rejects_changed_source_with_valid_old_map_before_queueing(self):
         with tempfile.TemporaryDirectory() as local_dir:
             target = os.path.join(local_dir, "movie.mkv.lftp")
@@ -303,6 +328,52 @@ class TestLftpQueueCommand(unittest.TestCase):
             lftp._Lftp__run_command.assert_not_called()
             self.assertTrue(os.path.exists(target + ".lftp-pget-status"))
 
+    def test_queue_file_rejects_oversize_status_sidecar_without_mutating_it(self):
+        with tempfile.TemporaryDirectory() as local_dir:
+            target = os.path.join(local_dir, "movie.mkv")
+            status_path = target + ".lftp-pget-status"
+            with open(target, "wb") as handle:
+                handle.write(b"partial")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                handle.write("size=1\n0.pos=0\n0.limit=1\n")
+                handle.write(" " * (64 * 1024))
+
+            lftp = self._make_lftp()
+            with self.assertRaisesRegex(LftpError, "status sidecar is invalid"):
+                lftp.queue("movie.mkv", False, local_base_dir_path=local_dir)
+            lftp._Lftp__run_command.assert_not_called()
+            self.assertTrue(os.path.exists(status_path))
+
+    def test_queue_file_rejects_crlf_padded_oversize_status_sidecar(self):
+        with tempfile.TemporaryDirectory() as local_dir:
+            target = os.path.join(local_dir, "movie.mkv")
+            status_path = target + ".lftp-pget-status"
+            with open(target, "wb") as handle:
+                handle.write(b"partial")
+            status = "size=1\r\n0.pos=0\r\n0.limit=1\r\n" + ("\r\n" * 32760)
+            with open(status_path, "wb") as handle:
+                handle.write(status.encode("utf-8"))
+
+            lftp = self._make_lftp()
+            with self.assertRaisesRegex(LftpError, "status sidecar is invalid"):
+                lftp.queue("movie.mkv", False, local_base_dir_path=local_dir)
+            lftp._Lftp__run_command.assert_not_called()
+
+    def test_queue_file_accepts_under_limit_crlf_status_sidecar(self):
+        with tempfile.TemporaryDirectory() as local_dir:
+            target = os.path.join(local_dir, "movie.mkv")
+            with open(target, "wb") as handle:
+                handle.write(b"partial")
+            with open(target + ".lftp-pget-status", "wb") as handle:
+                handle.write(b"size=100\r\n0.pos=7\r\n0.limit=100\r\n")
+
+            lftp = self._make_lftp()
+            lftp.queue("movie.mkv", False, local_base_dir_path=local_dir)
+            self.assertIn(
+                'queue pget -c "/remote/path/movie.mkv"',
+                lftp._Lftp__run_command.call_args[0][0],
+            )
+
     def test_queue_file_rejects_stale_status_map_without_mutating_it(self):
         with tempfile.TemporaryDirectory() as local_dir:
             target = os.path.join(local_dir, "movie.mkv")
@@ -318,13 +389,39 @@ class TestLftpQueueCommand(unittest.TestCase):
             lftp._Lftp__run_command.assert_not_called()
             self.assertTrue(os.path.exists(status_path))
 
+    def test_queue_file_rejects_base_only_status_size_mismatch(self):
+        with tempfile.TemporaryDirectory() as local_dir:
+            target = os.path.join(local_dir, "movie.mkv")
+            status_path = target + ".lftp-pget-status"
+            with open(target, "wb") as handle:
+                handle.write(b"partial")
+            with open(status_path, "w", encoding="utf-8") as handle:
+                handle.write("size=99\n0.pos=7\n")
+
+            lftp = self._make_lftp()
+            with self.assertRaisesRegex(LftpError, "status sidecar is stale"):
+                lftp.queue(
+                    "movie.mkv",
+                    False,
+                    local_base_dir_path=local_dir,
+                    expected_size=100,
+                )
+            lftp._Lftp__run_command.assert_not_called()
+            self.assertTrue(os.path.exists(status_path))
+
     def test_queue_file_uses_get_resume_for_unsafe_status_maps(self):
+        too_many_segments = ["size=257"]
+        for index in range(257):
+            too_many_segments.extend(("{}.pos={}".format(index, index),
+                                      "{}.limit={}".format(index, index + 1)))
         status_maps = {
             "size-only": "size=100\n",
             "mismatched-index": "size=100\n0.pos=0\n1.limit=100\n",
             "duplicate-index": "size=100\n0.pos=0\n0.limit=50\n0.pos=50\n0.limit=100\n",
             "out-of-order-index": "size=100\n1.pos=0\n1.limit=100\n",
             "overlapping-ranges": "size=100\n0.pos=0\n0.limit=60\n1.pos=50\n1.limit=90\n",
+            "base-only-overrun": "size=100\n0.pos=101\n",
+            "too-many-segments": "\n".join(too_many_segments),
         }
         for label, status_map in status_maps.items():
             with self.subTest(status_map=label), tempfile.TemporaryDirectory() as local_dir:

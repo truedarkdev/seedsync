@@ -16,6 +16,7 @@ from common import AppError
 from common.breadcrumb_trace import opaque_trace_correlation
 from common.config import Checkers
 from common.exclude_patterns import ExactPathExclusion, partition_transfer_exclusions
+from common.lftp_status import MAX_LFTP_PGET_STATUS_BYTES, parse_lftp_pget_status_bytes
 from common.redaction import redact_sensitive_text
 from .job_status_parser import LftpJobStatus, LftpJobStatusParser, LftpJobStatusParserError
 
@@ -1174,12 +1175,13 @@ class Lftp:
     @staticmethod
     def __pget_status_file_size(status_path: str) -> Optional[int]:
         try:
-            with open(status_path, "r", encoding="utf-8") as handle:
-                first_line = handle.readline().strip()
+            with open(status_path, "rb") as handle:
+                parsed_status = parse_lftp_pget_status_bytes(
+                    handle.read(MAX_LFTP_PGET_STATUS_BYTES + 1)
+                )
         except (OSError, UnicodeError):
             return None
-        match = re.fullmatch(r"size=(\d+)", first_line)
-        return int(match.group(1)) if match is not None else None
+        return parsed_status.total_size if parsed_status is not None else None
 
     @classmethod
     def __allow_legacy_get_resume(cls, local_dir: str, name: str, expected_size: int) -> bool:
@@ -1278,43 +1280,21 @@ class Lftp:
         parser without making queue construction depend on the scanner owner.
         """
         try:
-            with open(status_path, "r", encoding="utf-8") as handle:
-                lines = [line.strip() for line in handle.read().splitlines() if line.strip()]
+            with open(status_path, "rb") as handle:
+                return parse_lftp_pget_status_bytes(
+                    handle.read(MAX_LFTP_PGET_STATUS_BYTES + 1)
+                ) is not None
         except (OSError, UnicodeError):
             return False
-        if not lines:
-            return False
-        size_match = re.fullmatch(r"size=(\d+)", lines.pop(0))
-        if size_match is None or not lines or len(lines) % 2:
-            return False
-        total_size = int(size_match.group(1))
-        empty_size = 0
-        ranges: list[tuple[int, int]] = []
-        for index in range(0, len(lines), 2):
-            pos_match = re.fullmatch(r"(\d+)\.pos=(\d+)", lines[index])
-            limit_match = re.fullmatch(r"(\d+)\.limit=(\d+)", lines[index + 1])
-            if pos_match is None or limit_match is None:
-                return False
-            expected_segment = index // 2
-            if (
-                int(pos_match.group(1)) != expected_segment or
-                int(limit_match.group(1)) != expected_segment
-            ):
-                return False
-            pos = int(pos_match.group(2))
-            limit = int(limit_match.group(2))
-            if pos > total_size or limit > total_size or limit < pos:
-                return False
-            if any(pos < previous_limit and previous_pos < limit
-                   for previous_pos, previous_limit in ranges):
-                return False
-            ranges.append((pos, limit))
-            empty_size += limit - pos
-        return empty_size <= total_size
 
     @classmethod
     def is_valid_pget_status_file(cls, status_path: str) -> bool:
-        """Whether a PGET sidecar has the safe, complete segment-map shape."""
+        """Whether a PGET sidecar is a safe, resumable checkpoint.
+
+        This accepts paired segment maps and conservative base-only maps.
+        Neither form is completion proof; the sidecar remains resume metadata
+        until a later physical scan observes completion without it.
+        """
         return cls.__is_valid_pget_status_file(status_path)
 
     def queue(self,

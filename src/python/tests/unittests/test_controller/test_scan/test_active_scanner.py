@@ -58,6 +58,20 @@ class TestActiveScanner(unittest.TestCase):
         self.assertEqual([], files)
         scanner.logger.warning.assert_not_called()
 
+    def test_scan_ignores_base_only_status_only_partial_when_temp_file_missing(self):
+        scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
+        self.addCleanup(scanner.close)
+        scanner.set_active_files(["download.zip"])
+        scanner.logger = MagicMock()
+
+        with open(os.path.join(self.temp_dir, "download.zip.lftp.lftp-pget-status"), "w") as handle:
+            handle.write("size=4\n0.pos=2\n")
+
+        files = scanner.scan()
+
+        self.assertEqual([], files)
+        scanner.logger.warning.assert_not_called()
+
     def test_scan_ignores_malformed_status_only_partial_when_temp_file_missing(self):
         scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
         self.addCleanup(scanner.close)
@@ -87,6 +101,20 @@ class TestActiveScanner(unittest.TestCase):
         self.assertEqual([], files)
         self.assertEqual(["download.zip"], scanner.pop_malformed_status_only_file_ids())
         self.assertEqual([], scanner.pop_malformed_status_only_file_ids())
+
+    def test_scan_rejects_crlf_padded_oversize_status_only_partial(self):
+        scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
+        self.addCleanup(scanner.close)
+        scanner.set_active_files(["download.zip"])
+        scanner.logger = MagicMock()
+
+        status = "size=4\r\n0.pos=0\r\n0.limit=4\r\n" + ("\r\n" * 32760)
+        with open(os.path.join(self.temp_dir, "download.zip.lftp.lftp-pget-status"), "wb") as handle:
+            handle.write(status.encode("utf-8"))
+
+        self.assertEqual([], scanner.scan())
+        scanner.logger.warning.assert_called_once()
+        self.assertEqual(["download.zip"], scanner.pop_malformed_status_only_file_ids())
 
     def test_status_only_sidecar_breadcrumb_uses_fixed_class_and_role(self):
         scanner = ActiveScanner(self.temp_dir, use_temp_file=True)

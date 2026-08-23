@@ -2,6 +2,8 @@
 
 import unittest
 import logging
+import os
+import tempfile
 from concurrent.futures import Future
 from datetime import datetime, timedelta
 from threading import RLock
@@ -53,6 +55,7 @@ from lftp import LftpJobStatus
 from model.diff import ModelDiff
 from model import Model, ModelFile
 from system import SystemFile
+from system.scanner import SystemScanner
 
 
 class TestModelUpdater(unittest.TestCase):
@@ -6780,6 +6783,231 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__move_from_staging.assert_not_called()
         self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
         self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
+        self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+
+    def test_v092_real_pget_sidecar_parser_keeps_running_completion_pending(self):
+        """A parsed resumable map must not turn a 100% PGET row into a move."""
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=32,
+            policy={
+                "default": "off",
+                "rules": {"lftp.sidecar": "info", "transfer.lftp": "debug"},
+            },
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "pending.bin")
+            with open(target, "wb") as handle:
+                handle.write(b"x" * 9)
+            with open(target + ".lftp-pget-status", "w", encoding="utf-8") as handle:
+                handle.write("size=10\n0.pos=9\n0.limit=10\n")
+
+            transient_target = os.path.join(temp_dir, "transient.bin.lftp")
+            with open(transient_target, "wb") as handle:
+                handle.write(b"x" * 9)
+            with open(transient_target + ".lftp-pget-status", "w", encoding="utf-8") as handle:
+                handle.write("size=10\n0.pos=9\n0.limit=bad\n")
+
+            scanner = SystemScanner(temp_dir)
+            scanner.set_lftp_temp_suffix(".lftp")
+            scanner.set_scan_role("local")
+            scanner.set_breadcrumb_trace(trace)
+            parsed_local = scanner.scan_single("pending.bin")
+            parsed_transient = scanner.scan_single("transient.bin")
+
+        self.assertIsNotNone(parsed_local)
+        self.assertIsNotNone(parsed_transient)
+        assert parsed_local is not None
+        assert parsed_transient is not None
+        self.assertEqual(9, parsed_local.size)
+        self.assertTrue(parsed_local.status_sidecar_ready)
+        self.assertEqual(0, parsed_transient.size)
+        self.assertFalse(parsed_transient.status_sidecar_ready)
+        parsed_local.is_staging = True
+
+        scanner_events = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "lftp_sidecar_classified"
+        ]
+        self.assertEqual(
+            {"valid", "malformed"},
+            {entry["details"]["classification"] for entry in scanner_events},
+        )
+        self.assertEqual(
+            {"known"},
+            {entry["details"]["parser_coverage"] for entry in scanner_events},
+        )
+        self.assertTrue(all(entry["details"]["scan_role"] == "local" for entry in scanner_events))
+        self.assertTrue(all(entry["details"]["status_only"] is False for entry in scanner_events))
+
+        controller = self._make_v092_pending_completion_controller(
+            complete=False, sidecar_ready=True,
+        )
+        controller._Controller__pending_completion_file_names = {("pending.bin", None, None)}
+        controller._Controller__model_builder.set_local_files([parsed_local])
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "pending.bin", "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(10, 10, 100, 100, 0)
+        controller._Controller__model_builder.set_lftp_statuses([running])
+        controller._Controller__last_lftp_statuses = [running]
+        controller._Controller__lftp.last_status_poll_healthy = False
+        controller._Controller__lftp.status.return_value = ([], False)
+        controller._Controller__lftp_status_poll_retry_active = False
+        controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(minutes=1)
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__record_breadcrumb = lambda **kwargs: trace.record(
+            "model_updater", kwargs["message"], kwargs["details"],
+            **{key: value for key, value in kwargs.items() if key not in {"message", "details"}},
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+
+        ModelUpdater(controller).update()
+
+        controller._Controller__move_from_staging.assert_not_called()
+        controller._record_download_completion.assert_not_called()
+        self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
+        self.assertNotIn(
+            ModelFile.build_file_id("pending.bin", None),
+            controller._Controller__persist.stopped_file_names,
+        )
+        self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+        entries = trace.snapshot()["entries"]
+        status_events = [entry for entry in entries if entry["message"] == "lftp_status_poll"]
+        self.assertEqual(1, len(status_events))
+        self.assertEqual("cached_unhealthy", status_events[0]["details"]["outcome"])
+        self.assertEqual(1, status_events[0]["details"]["active_count"])
+        serialized = str(entries)
+        self.assertNotIn("pending.bin", serialized)
+        self.assertNotIn(temp_dir, serialized)
+
+    def test_v092_upstream_base_only_pget_sidecar_is_pending_checkpoint(self):
+        """Base-only late checkpoints should report conservative covered bytes."""
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=32,
+            policy={
+                "default": "off",
+                "rules": {"lftp.sidecar": "info", "transfer.lftp": "debug"},
+            },
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "pending.bin")
+            with open(target, "wb") as handle:
+                handle.write(b"x" * 9)
+            with open(target + ".lftp-pget-status", "w", encoding="utf-8") as handle:
+                handle.write("size=10\n0.pos=9\n")
+
+            scanner = SystemScanner(temp_dir)
+            scanner.set_scan_role("local")
+            scanner.set_breadcrumb_trace(trace)
+            parsed_local = scanner.scan_single("pending.bin")
+
+        self.assertIsNotNone(parsed_local)
+        assert parsed_local is not None
+        sidecar_events = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "lftp_sidecar_classified"
+        ]
+        self.assertEqual(1, len(sidecar_events))
+        # Upstream lftp emits this late-stage base-only form without a limit.
+        # Keep this expectation strict so a parser regression is visible at
+        # the classification boundary instead of being treated as transient.
+        self.assertEqual("valid", sidecar_events[0]["details"]["classification"])
+        self.assertEqual("known", sidecar_events[0]["details"]["parser_coverage"])
+        self.assertEqual(9, parsed_local.size)
+        self.assertTrue(parsed_local.status_sidecar_ready)
+        parsed_local.is_staging = True
+
+        controller = self._make_v092_pending_completion_controller(
+            complete=False, sidecar_ready=True,
+        )
+        controller._Controller__pending_completion_file_names = {("pending.bin", None, None)}
+        controller._Controller__model_builder.set_local_files([parsed_local])
+        pending_file_id = ModelFile.build_file_id("pending.bin", None)
+        model_local = controller._Controller__model_builder._ModelBuilder__local_file(pending_file_id)
+        self.assertIs(model_local, parsed_local)
+        self.assertEqual("pending.bin", model_local.name)
+        self.assertEqual(9, model_local.size)
+        self.assertTrue(model_local.status_sidecar_ready)
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "pending.bin", "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(10, 10, 100, 100, 0)
+        controller._Controller__model_builder.set_lftp_statuses([running])
+        controller._Controller__last_lftp_statuses = [running]
+        controller._Controller__lftp.last_status_poll_healthy = False
+        controller._Controller__lftp.status.return_value = ([], False)
+        controller._Controller__lftp_status_poll_retry_active = False
+        controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(minutes=1)
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__record_breadcrumb = lambda **kwargs: trace.record(
+            "model_updater", kwargs["message"], kwargs["details"],
+            **{key: value for key, value in kwargs.items() if key not in {"message", "details"}},
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+
+        ModelUpdater(controller).update()
+
+        controller._Controller__move_from_staging.assert_not_called()
+        controller._record_download_completion.assert_not_called()
+        self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
+        self.assertNotIn(
+            pending_file_id,
+            controller._Controller__persist.stopped_file_names,
+        )
+        self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+        serialized = str(trace.snapshot()["entries"])
+        self.assertNotIn("pending.bin", serialized)
+        self.assertNotIn(temp_dir, serialized)
+
+    def test_v092_base_only_checkpoint_at_declared_size_remains_pending(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "pending.bin")
+            with open(target, "wb") as handle:
+                handle.write(b"x" * 10)
+            with open(target + ".lftp-pget-status", "w", encoding="utf-8") as handle:
+                handle.write("size=10\n0.pos=10\n")
+
+            scanner = SystemScanner(temp_dir)
+            parsed_local = scanner.scan_single("pending.bin")
+
+        self.assertIsNotNone(parsed_local)
+        assert parsed_local is not None
+        self.assertEqual(10, parsed_local.size)
+        self.assertTrue(parsed_local.status_sidecar_ready)
+        parsed_local.is_staging = True
+
+        controller = self._make_v092_pending_completion_controller(
+            complete=True, sidecar_ready=True,
+        )
+        controller._Controller__pending_completion_file_names = {("pending.bin", None, None)}
+        controller._Controller__model_builder.set_local_files([parsed_local])
+        pending_file_id = ModelFile.build_file_id("pending.bin", None)
+        model_local = controller._Controller__model_builder._ModelBuilder__local_file(pending_file_id)
+        self.assertIs(model_local, parsed_local)
+        self.assertEqual(10, model_local.size)
+        self.assertTrue(model_local.status_sidecar_ready)
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "pending.bin", "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(10, 10, 100, 100, 0)
+        controller._Controller__model_builder.set_lftp_statuses([running])
+        controller._Controller__last_lftp_statuses = [running]
+        controller._Controller__lftp.last_status_poll_healthy = False
+        controller._Controller__lftp.status.return_value = ([], False)
+        controller._Controller__lftp_status_poll_retry_active = False
+        controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(minutes=1)
+
+        ModelUpdater(controller).update()
+
+        controller._Controller__move_from_staging.assert_not_called()
+        controller._record_download_completion.assert_not_called()
+        self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
+        self.assertNotIn(pending_file_id, controller._Controller__persist.stopped_file_names)
         self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
 
     def test_v092_late_terminal_cached_retry_keeps_sidecar_completion_pending(self):

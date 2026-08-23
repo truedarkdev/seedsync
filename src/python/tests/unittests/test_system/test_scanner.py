@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from common.lftp_status import parse_lftp_pget_status_bytes
 from system import SystemScanner, SystemScannerError
 from system.scanner import _record_lftp_sidecar_breadcrumb, lftp_sidecar_target_identity
 
@@ -366,6 +367,48 @@ class TestSystemScanner(unittest.TestCase):
         """)
         self.assertEqual(104792064, size)
 
+    def test_lftp_status_file_size_accepts_base_only_checkpoint_conservatively(self):
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        for covered_size in (0, 5, 10):
+            with self.subTest(covered_size=covered_size):
+                self.assertEqual(
+                    covered_size,
+                    scanner._lftp_status_file_size(
+                        "size=10\n0.pos={}\n".format(covered_size),
+                    ),
+                )
+
+    def test_lftp_status_file_size_rejects_base_only_without_segment_zero(self):
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        self.assertIsNone(scanner._lftp_status_file_size("size=10\n1.pos=5\n"))
+
+    def test_lftp_status_file_size_rejects_base_only_position_overrun(self):
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        self.assertIsNone(scanner._lftp_status_file_size("size=10\n0.pos=11\n"))
+
+    def test_lftp_status_bytes_rejects_invalid_utf8(self):
+        self.assertIsNone(
+            parse_lftp_pget_status_bytes(b"size=10\n0.pos=9\n\xff"),
+        )
+
+    def test_lftp_status_file_size_rejects_oversize_content(self):
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        status = "size=1\n0.pos=0\n0.limit=1\n" + (" " * (64 * 1024))
+        self.assertIsNone(scanner._lftp_status_file_size(status))
+
+    def test_lftp_status_file_size_caps_paired_segments_at_256(self):
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+
+        def status_for(segment_count):
+            lines = ["size={}".format(segment_count)]
+            for index in range(segment_count):
+                lines.extend(("{}.pos={}".format(index, index),
+                              "{}.limit={}".format(index, index + 1)))
+            return "\n".join(lines)
+
+        self.assertEqual(0, scanner._lftp_status_file_size(status_for(256)))
+        self.assertIsNone(scanner._lftp_status_file_size(status_for(257)))
+
     def test_lftp_status_file_size_rejects_malformed_status(self):
         self.setup_default_tree()
         scanner = SystemScanner(TestSystemScanner.temp_dir)
@@ -463,6 +506,45 @@ class TestSystemScanner(unittest.TestCase):
         partial_mkv = scanner.scan_single("partial.mkv")
         self.assertEqual("partial.mkv", partial_mkv.name)
         self.assertEqual(0, partial_mkv.size)
+
+    def test_scan_lftp_partial_file_with_oversize_status_is_conservative(self):
+        tempdir = TestSystemScanner.temp_dir
+        path = os.path.join(tempdir, "partial.mkv")
+        with open(path, "wb") as handle:
+            handle.write(b"partial")
+        with open(path + ".lftp-pget-status", "w", encoding="utf-8") as handle:
+            handle.write("size=7\n0.pos=0\n0.limit=7\n")
+            handle.write(" " * (64 * 1024))
+
+        partial_mkv = SystemScanner(tempdir).scan_single("partial.mkv")
+        self.assertEqual("partial.mkv", partial_mkv.name)
+        self.assertEqual(7, partial_mkv.size)
+        self.assertFalse(partial_mkv.status_sidecar_ready)
+
+    def test_scan_lftp_partial_file_rejects_crlf_padded_oversize_status(self):
+        tempdir = TestSystemScanner.temp_dir
+        path = os.path.join(tempdir, "partial.mkv")
+        with open(path, "wb") as handle:
+            handle.write(b"partial")
+        status = "size=7\r\n0.pos=0\r\n0.limit=7\r\n" + ("\r\n" * 32760)
+        with open(path + ".lftp-pget-status", "wb") as handle:
+            handle.write(status.encode("utf-8"))
+
+        partial_mkv = SystemScanner(tempdir).scan_single("partial.mkv")
+        self.assertEqual(7, partial_mkv.size)
+        self.assertFalse(partial_mkv.status_sidecar_ready)
+
+    def test_scan_lftp_partial_file_accepts_under_limit_crlf_status(self):
+        tempdir = TestSystemScanner.temp_dir
+        path = os.path.join(tempdir, "partial.mkv")
+        with open(path, "wb") as handle:
+            handle.write(b"partial")
+        with open(path + ".lftp-pget-status", "wb") as handle:
+            handle.write(b"size=7\r\n0.pos=0\r\n0.limit=7\r\n")
+
+        partial_mkv = SystemScanner(tempdir).scan_single("partial.mkv")
+        self.assertEqual(0, partial_mkv.size)
+        self.assertTrue(partial_mkv.status_sidecar_ready)
 
     def test_scan_lftp_temp_file(self):
         tempdir = TestSystemScanner.temp_dir
