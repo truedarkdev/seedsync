@@ -292,6 +292,27 @@ class PendingQueueDispatch:
 
 
 @dataclass
+class DeferredQueueIntent:
+    """Controller-owned Queue intent while local collision work settles."""
+
+    command: "Controller.Command"
+    file_id: str
+    path_pair_id: Optional[str]
+    phase: str = "collision"
+    rescan_requested: bool = False
+    # Per-side scanner session/generation baselines captured after collision
+    # cleanup.  Readiness requires later authoritative ScannerResult tokens,
+    # not merely a later process generation or standing reconciliation sets.
+    rescan_generations: Optional[
+        tuple[tuple[str, int], tuple[str, int]]
+    ] = None
+    scoped_rescan_attempts: int = 0
+    stop_marker_at_defer: bool = False
+    stop_requested: bool = False
+    failure_notified: bool = False
+
+
+@dataclass
 class _LftpOperation:
     action: str
     future: Future[object]
@@ -728,6 +749,8 @@ class Controller:
             object.__setattr__(self, "_Controller{}".format(attribute_name), None)
         self.__active_downloading_file_names = []
         self.__active_extracting_file_names = []
+        self.__deferred_queue_intents = {}
+        self.__scan_authority_tokens = {"local": {}, "remote": {}}
         self.__active_scan_force_file_ids = set()
         self.__active_scan_ready_file_ids = set()
         self.__next_active_scan_force_at = None
@@ -795,6 +818,10 @@ class Controller:
         self.__command_flow_sequence = 0
         self.__command_flow_lock = Lock()
         self.__pending_queue_dispatches: Dict[str, PendingQueueDispatch] = {}
+        # Runtime-only Queue intents waiting for collision comparison or a
+        # generation-fenced scoped rescan.  The map is bounded by file id and
+        # is never persisted as transfer intent.
+        self.__deferred_queue_intents: dict[str, DeferredQueueIntent] = {}
         # A dequeued QUEUE command is briefly tracked here while its transport
         # handoff is being decided.  This closes the gap between checking a
         # relocation reservation and registering the durable queue dispatch.
@@ -853,6 +880,9 @@ class Controller:
         self.__path_pair_refresh_completed_generation = 0
         self.__reconciled_local_path_pair_ids: set[str | None] = set()
         self.__reconciled_remote_path_pair_ids: set[str | None] = set()
+        self.__scan_authority_tokens: dict[
+            str, dict[str | None, tuple[str, int]]
+        ] = {"local": {}, "remote": {}}
         self.__path_pair_runtime_error = None
         self.__lftp_reconfigure_lock = Lock()
         self.__lftp_reconfigure_requested = False
@@ -1905,6 +1935,51 @@ class Controller:
         if remote_path_pair_ids is not None:
             self.__reconciled_remote_path_pair_ids = set(remote_path_pair_ids)
 
+    def _record_path_pair_scan_tokens(
+            self, local_result: Optional[object], remote_result: Optional[object],
+    ) -> None:
+        """Retain the latest authoritative result token for each scan side."""
+        tokens = getattr(self, "_Controller__scan_authority_tokens", None)
+        if not isinstance(tokens, dict):
+            tokens = {"local": {}, "remote": {}}
+            self.__scan_authority_tokens = tokens
+
+        def record(side: str, result: Optional[object]) -> None:
+            if result is None or bool(getattr(result, "failed", False)) or \
+                    not bool(getattr(result, "is_scan_final", True)) or \
+                    bool(getattr(result, "unknown_path_pair_ids", set())):
+                return
+            session_token = getattr(result, "session_token", None)
+            generation = getattr(result, "generation", None)
+            if type(session_token) is not str or not session_token or type(generation) is not int:
+                return
+            raw_scanned = getattr(result, "scanned_path_pair_ids", set())
+            raw_completed = getattr(result, "completed_path_pair_ids", set())
+            scanned = raw_scanned if isinstance(raw_scanned, set) else set()
+            completed = raw_completed if isinstance(raw_completed, set) else set()
+            per_pair_tokens = getattr(result, "_scan_authority_tokens_by_pair", None)
+            has_per_pair_tokens = isinstance(per_pair_tokens, dict)
+            side_tokens = tokens.get(side)
+            if not isinstance(side_tokens, dict):
+                side_tokens = {}
+                tokens[side] = side_tokens
+            for pair_id in scanned | completed:
+                if pair_id is None or isinstance(pair_id, str):
+                    if has_per_pair_tokens:
+                        pair_token = per_pair_tokens.get(pair_id)
+                        if not isinstance(pair_token, tuple) or len(pair_token) != 2 or \
+                                type(pair_token[0]) is not str or type(pair_token[1]) is not int:
+                            # An aggregate with explicit per-pair evidence
+                            # must not fall back to its newest drain-wide
+                            # generation for an untouched pair.
+                            continue
+                        side_tokens[pair_id] = pair_token
+                    else:
+                        side_tokens[pair_id] = (session_token, generation)
+
+        record("local", local_result)
+        record("remote", remote_result)
+
     def validate_path_pair_relocation(self, existing: PathPair, updated: PathPair) -> None:
         """Preflight an enabled-pair alias switch without moving user data."""
         if not existing.enabled or existing.local_path == updated.local_path:
@@ -2294,6 +2369,10 @@ class Controller:
     def __apply_path_pair_refresh(self):
         if not self.__cancel_and_settle_collision_claim_for_refresh():
             raise ControllerError("Path-pair refresh deferred until collision comparison claim is restored")
+        for file_id in list(self.__deferred_queue_intents_map()):
+            intent = self.__deferred_queue_intents_map().get(file_id)
+            if self.__retire_deferred_queue_intent(file_id, "path_pair_refresh") and intent is not None:
+                self.__notify_deferred_queue_failure(intent, "path_pair_refresh")
         self.__collision_compare_epoch = getattr(self, "_Controller__collision_compare_epoch", 0) + 1
         runtime_error_before_refresh = self.__path_pair_runtime_error
         # A path-pair refresh starts a new scan generation. Any prior scan
@@ -3655,6 +3734,15 @@ class Controller:
         else:
             self.__command_queue.put(command)
             queue_size = self.__safe_command_queue_size()
+            if command.action == Controller.Command.Action.QUEUE:
+                self.__record_queue_readiness_trace(command.filename, "queue_admission", {
+                    "schema": "queue_readiness.v1",
+                    "phase": "admission",
+                    "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                    "accepted": True,
+                    "queue_depth": queue_size if type(queue_size) is int else 0,
+                    "queue_depth_known": type(queue_size) is int,
+                })
 
         if duplicate_waiter_backpressure:
             self.logger.warning(
@@ -4088,6 +4176,39 @@ class Controller:
             # reconciliation.
             self.logger.debug("Ignoring fractional-mtime Queue breadcrumb failure", exc_info=True)
 
+    def __record_queue_readiness_trace(
+            self, file_id: str, event: str,
+            details: dict[str, object] | Callable[[], dict[str, object]],
+    ) -> None:
+        """Emit identity-free Queue admission/readiness evidence.
+
+        Queue exclusion and future/status breadcrumbs already use the
+        "fractional-mtime:<opaque>" correlation. Keep the admission and
+        dispatch-boundary records on that same correlation so a single
+        bounded query can prove whether a stopped collision was dispatched.
+        No file or path identity is included in this diagnostic stream.
+        """
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        if not _breadcrumb_effectively_enabled(breadcrumb_trace, "queue.readiness", "info"):
+            return
+        try:
+            if callable(details):
+                details = details()
+            breadcrumb_trace.record(
+                "controller",
+                event,
+                details,
+                stage="queue_readiness",
+                event_type="diagnostic",
+                category="queue.readiness",
+                level="info",
+                corr_id="fractional-mtime:{}".format(opaque_trace_correlation(file_id)),
+                trace_scope="flow",
+            )
+        except Exception:
+            # Diagnostics must never alter Queue admission or dispatch.
+            self.logger.debug("Ignoring Queue readiness breadcrumb failure", exc_info=True)
+
     def __fractional_queue_trace_is_enabled(self) -> bool:
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
         return _breadcrumb_effectively_enabled(breadcrumb_trace, "queue.exclusion", "info")
@@ -4362,6 +4483,8 @@ class Controller:
         """
         if not self.__safe_existing_directory(src) or not self.__safe_existing_directory(dst):
             raise OSError(errno.ELOOP, "directory merge encountered unsafe path")
+        owner_file_id = mutation_tracker.file_id if mutation_tracker is not None and \
+            isinstance(mutation_tracker.file_id, str) else None
         self.__reject_nested_mounts_or_reparse_points(src)
         self.__reject_nested_mounts_or_reparse_points(dst)
         claim_before_settle = getattr(self, "_Controller__collision_compare_claim", None)
@@ -4426,7 +4549,8 @@ class Controller:
             if stat.S_ISDIR(source_stat.st_mode) and not stat.S_ISLNK(source_stat.st_mode) and \
                     stat.S_ISDIR(destination_stat.st_mode) and not stat.S_ISLNK(destination_stat.st_mode):
                 nested_merge_succeeded = self.__merge_staging_directory_no_replace(
-                    source_child, destination_child, path_pair_id, required_collision_sources, mutation_tracker
+                    source_child, destination_child, path_pair_id, required_collision_sources,
+                    mutation_tracker,
                 )
                 if required_collision_sources is not None and not nested_merge_succeeded and any(
                         self.__path_is_within(path, source_child)
@@ -4642,7 +4766,7 @@ class Controller:
             if self.__safe_existing_directory(src) and self.__safe_existing_directory(dst):
                 self.__collision_merge_deferred = False
                 if not self.__merge_staging_directory_no_replace(
-                        src, dst, path_pair_id, required_collision_sources, mutation_tracker
+                        src, dst, path_pair_id, required_collision_sources, mutation_tracker,
                 ):
                     if self.__collision_merge_deferred:
                         return Controller.MoveFromStagingResult.DEFERRED
@@ -5435,7 +5559,11 @@ class Controller:
                     )
                 raise
             key = self.__collision_cache_key(source, destination, source_signature, destination_signature)
-            self.__collision_compare_claim = (source, claimed_source, destination, key, sidecar_path, path_pair_id)
+            owner_file_id = mutation_tracker.file_id if mutation_tracker is not None and \
+                isinstance(mutation_tracker.file_id, str) else None
+            self.__collision_compare_claim = (
+                source, claimed_source, destination, key, sidecar_path, path_pair_id, owner_file_id,
+            )
             self.__collision_compare_key = None
             self.__collision_compare_result = None
             self.__collision_compare_cancel_event = Event()
@@ -7342,6 +7470,493 @@ class Controller:
                 ))
         return retired_without_running
 
+    def __deferred_queue_intents_map(self) -> dict[str, DeferredQueueIntent]:
+        intents = getattr(self, "_Controller__deferred_queue_intents", None)
+        if not isinstance(intents, dict):
+            intents = {}
+            self.__deferred_queue_intents = intents
+        if not all(
+                isinstance(file_id, str) and isinstance(intent, DeferredQueueIntent)
+                for file_id, intent in intents.items()
+        ):
+            self.__deferred_queue_intents = {}
+            return self.__deferred_queue_intents
+        return cast(dict[str, DeferredQueueIntent], intents)
+
+    def __queue_scoped_rescan(self, intent: DeferredQueueIntent) -> bool:
+        """Invalidate both sides, then request one targeted scan generation."""
+        if intent.rescan_requested:
+            return intent.rescan_generations is not None
+        pair_id = intent.path_pair_id
+        scan_tokens = getattr(self, "_Controller__scan_authority_tokens", {})
+        if not isinstance(scan_tokens, dict):
+            scan_tokens = {}
+
+        def baseline(side: str, process: object) -> Optional[tuple[str, int]]:
+            session_token = getattr(process, "session_token", None)
+            generation = getattr(process, "generation", None)
+            if type(session_token) is not str or not session_token or type(generation) is not int:
+                return None
+            side_tokens = scan_tokens.get(side)
+            prior = side_tokens.get(pair_id) if isinstance(side_tokens, dict) else None
+            if isinstance(prior, tuple) and len(prior) == 2 and \
+                    type(prior[0]) is str and type(prior[1]) is int and prior[0] == session_token:
+                generation = max(generation, prior[1])
+            return session_token, generation
+
+        local_baseline = baseline("local", self.__local_scan_process)
+        remote_baseline = baseline("remote", self.__remote_scan_process)
+        if local_baseline is None or remote_baseline is None:
+            self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
+                "schema": "queue_readiness.v1",
+                "phase": "rescan_request",
+                "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
+                "outcome": "rejected",
+                "reason": "scoped_rescan_token_unknown",
+                "ready": False,
+            })
+            return False
+        intent.rescan_generations = (
+            local_baseline,
+            remote_baseline,
+        )
+        self.__reconciled_local_path_pair_ids.discard(pair_id)
+        self.__reconciled_remote_path_pair_ids.discard(pair_id)
+        self.__last_local_reconciliation_healthy = False
+        self.__last_remote_reconciliation_healthy = False
+        try:
+            self.__local_scan_process.force_scan(pair_id)
+            self.__remote_scan_process.force_scan(pair_id)
+        except Exception:
+            self.logger.debug("Queue collision scoped rescan request failed", exc_info=True)
+            intent.rescan_generations = None
+            intent.rescan_requested = False
+            intent.phase = "collision"
+            self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
+                "schema": "queue_readiness.v1",
+                "phase": "rescan_request",
+                "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
+                "outcome": "rejected",
+                "reason": "scoped_rescan_request_failed",
+                "ready": False,
+            })
+            return False
+        intent.phase = "rescan"
+        intent.rescan_requested = True
+        intent.scoped_rescan_attempts += 1
+        self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
+            "schema": "queue_readiness.v1",
+            "phase": "rescan_request",
+            "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
+            "outcome": "pending",
+            "reason": "scoped_rescan_requested",
+            "ready": False,
+        })
+        return True
+
+    def __deferred_collision_claim_match(
+            self, intent: DeferredQueueIntent,
+    ) -> Optional[bool]:
+        """Return exact claim ownership, or None when identity is ambiguous."""
+        claim = getattr(self, "_Controller__collision_compare_claim", None)
+        if claim is None:
+            future = getattr(self, "_Controller__collision_compare_future", None)
+            return None if future is not None and not future.done() else False
+        if len(claim) < 4 or not all(isinstance(claim[index], str) for index in (0, 2)):
+            return None
+        claim_path_pair_id = claim[5] if len(claim) > 5 else None
+        # Legacy/unscoped claims cannot be safely attributed to a deferred
+        # intent, including another legacy intent.  Retain them fail-closed.
+        if intent.path_pair_id is None or claim_path_pair_id is None:
+            return None
+        claim_owner_file_id = claim[6] if len(claim) > 6 else None
+        if not isinstance(claim_owner_file_id, str):
+            # Claims created before owner identity was recorded, or claims
+            # assembled without it, are ambiguous when roots overlap.
+            return None
+        if claim_owner_file_id != intent.file_id:
+            return False
+        if claim_path_pair_id != intent.path_pair_id:
+            return False
+        move_name = intent.file_id
+        try:
+            decoded_file_id = json.loads(intent.file_id)
+            if isinstance(decoded_file_id, list) and len(decoded_file_id) == 2 and \
+                    decoded_file_id[0] == intent.path_pair_id and isinstance(decoded_file_id[1], str):
+                move_name = decoded_file_id[1]
+        except (TypeError, ValueError):
+            pass
+        try:
+            resolved = self.__resolve_safe_final_move_paths(
+                move_name, intent.path_pair_id,
+            )
+        except Exception:
+            resolved = None
+        if resolved is not None:
+            source, destination = resolved[2], resolved[3]
+            source_matches = self.__path_is_within(claim[0], source)
+            destination_matches = self.__path_is_within(claim[2], destination)
+            return source_matches and destination_matches
+        return None
+
+    def __cancel_matching_deferred_collision_claim(self, intent: DeferredQueueIntent) -> bool:
+        """Restore only the active claim owned by this deferred Queue file."""
+        claim_match = self.__deferred_collision_claim_match(intent)
+        if claim_match is False:
+            return True
+        if claim_match is None:
+            return False
+        return self.__cancel_and_settle_collision_claim_for_refresh()
+
+    def __retire_deferred_queue_intent(
+            self, file_id: str, reason: str, error_code: int = 409,
+    ) -> bool:
+        """Retire an intent only after its exact active claim is settled."""
+        intents = self.__deferred_queue_intents_map()
+        if file_id not in intents:
+            return True
+        retired = self.__cancel_deferred_queue_intent(file_id, reason, error_code) is not None
+        if not retired:
+            # Keep the entry bounded but terminal: later turns may finish
+            # restoring the claim, never re-admit it to Queue/LFTP.
+            intent = intents.get(file_id)
+            if intent is not None:
+                intent.stop_requested = True
+        return retired
+
+    @staticmethod
+    def __notify_queue_failure_callbacks(
+            command: "Controller.Command", reason: str, error_code: int = 409,
+    ) -> None:
+        """Deliver one terminal Queue failure to each callback on a command."""
+        for callback in list(command.callbacks):
+            try:
+                callback.on_failure("Queue preflight cancelled: {}".format(reason), error_code)
+            except Exception:
+                # A client callback must not prevent claim settlement or the
+                # remaining deferred waiters from being notified.
+                pass
+
+    @staticmethod
+    def __notify_deferred_queue_failure(
+            intent: DeferredQueueIntent, reason: str, error_code: int = 409,
+    ) -> None:
+        """Notify a retired Queue intent exactly once at its caller boundary."""
+        if intent.failure_notified:
+            return
+        intent.failure_notified = True
+        Controller.__notify_queue_failure_callbacks(intent.command, reason, error_code)
+
+    def __queue_scoped_rescan_ready(self, intent: DeferredQueueIntent) -> bool:
+        if not intent.rescan_requested:
+            return False
+        generations = intent.rescan_generations
+        if not isinstance(generations, tuple) or len(generations) != 2 or \
+                any(
+                    not isinstance(token, tuple) or len(token) != 2 or
+                    type(token[0]) is not str or type(token[1]) is not int
+                    for token in generations
+                ):
+            return False
+        scan_tokens = getattr(self, "_Controller__scan_authority_tokens", None)
+        if not isinstance(scan_tokens, dict):
+            return False
+        for side, baseline in zip(("local", "remote"), generations):
+            side_tokens = scan_tokens.get(side)
+            acknowledged = side_tokens.get(intent.path_pair_id) \
+                if isinstance(side_tokens, dict) else None
+            if not isinstance(acknowledged, tuple) or len(acknowledged) != 2 or \
+                    type(acknowledged[0]) is not str or type(acknowledged[1]) is not int or \
+                    acknowledged[0] != baseline[0] or acknowledged[1] <= baseline[1]:
+                return False
+        try:
+            ready = self.is_path_pair_reconciled(intent.path_pair_id)
+        except Exception:
+            ready = False
+        if ready:
+            self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
+                "schema": "queue_readiness.v1",
+                "phase": "rescan_ready",
+                "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
+                "outcome": "ready",
+                "reason": "authoritative_scoped_scan",
+                "ready": True,
+            })
+        return ready
+
+    def __cancel_deferred_queue_intent(
+            self, file_id: str, reason: str, error_code: int = 409,
+    ) -> Optional[DeferredQueueIntent]:
+        intents = self.__deferred_queue_intents_map()
+        intent = intents.get(file_id)
+        if intent is None:
+            return None
+        if reason in ("stopped", "file_missing", "stop_state_unknown"):
+            intent.stop_requested = True
+        if not self.__cancel_matching_deferred_collision_claim(intent):
+            # Keep the intent while its matching claim remains private; the
+            # next Controller turn can retry settlement without releasing a
+            # source/sidecar belonging to another Queue file.
+            return None
+        intents.pop(file_id, None)
+        self.__record_queue_readiness_trace(file_id, "queue_final_decision", {
+            "schema": "queue_readiness.v1",
+            "phase": "final_decision",
+            "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
+            "outcome": "rejected",
+            "reason": reason,
+            "dispatch_attempted": False,
+        })
+        return intent
+
+    def __prepare_deferred_queue_retries(self) -> None:
+        """Put only ready intents back into the normal command flow."""
+        intents = self.__deferred_queue_intents_map()
+        if not intents:
+            return
+        with self.__command_queue.mutex:
+            queued_stops = {
+                command.filename
+                for command in self.__command_queue.queue
+                if command.action == Controller.Command.Action.STOP
+            }
+            queued_commands = {id(command) for command in self.__command_queue.queue}
+        for file_id, intent in list(intents.items()):
+            if intent.stop_requested:
+                # Restoration may complete on a later turn, but this intent
+                # is terminal for Queue admission and must never re-enqueue.
+                if self.__retire_deferred_queue_intent(file_id, "stopped"):
+                    self.__notify_deferred_queue_failure(intent, "stopped")
+                continue
+            try:
+                deferred_file = self.__model.get_file(intent.command.filename)
+            except ModelError:
+                if self.__retire_deferred_queue_intent(file_id, "file_missing", 404):
+                    self.__notify_deferred_queue_failure(intent, "file_missing", 404)
+                continue
+            if file_id in queued_stops or intent.command.filename in queued_stops:
+                continue
+            try:
+                if self.__is_explicitly_stopped(deferred_file.full_path, intent.path_pair_id) and \
+                        not intent.stop_marker_at_defer:
+                    if self.__retire_deferred_queue_intent(file_id, "stopped"):
+                        self.__notify_deferred_queue_failure(intent, "stopped")
+                    continue
+            except Exception:
+                if self.__retire_deferred_queue_intent(file_id, "stop_state_unknown"):
+                    self.__notify_deferred_queue_failure(intent, "stop_state_unknown")
+                continue
+            if intent.phase == "collision":
+                future = getattr(self, "_Controller__collision_compare_future", None)
+                if future is not None and not future.done():
+                    continue
+            elif intent.phase == "rescan" and not self.__queue_scoped_rescan_ready(intent):
+                continue
+            if id(intent.command) in queued_commands:
+                continue
+            self.__command_queue.put(intent.command)
+
+    def __queue_preflight_intent_with_stop_state(
+            self, file: ModelFile, command: "Controller.Command",
+            intent: Optional[DeferredQueueIntent],
+    ) -> tuple[DeferredQueueIntent, bool]:
+        """Create a candidate intent, fencing an unavailable stop read."""
+        if intent is not None:
+            return intent, False
+        try:
+            stop_marker = self.__is_explicitly_stopped(file.full_path, file.path_pair_id)
+        except Exception:
+            candidate = DeferredQueueIntent(
+                command, file.file_id, file.path_pair_id,
+            )
+            candidate.stop_requested = True
+            self.__deferred_queue_intents_map()[file.file_id] = candidate
+            self.logger.warning(
+                "Queue collision preflight stop-state lookup failed",
+                exc_info=True,
+            )
+            return candidate, True
+        return DeferredQueueIntent(
+            command, file.file_id, file.path_pair_id,
+            stop_marker_at_defer=stop_marker,
+        ), False
+
+    def __queue_collision_preflight(
+            self, file: ModelFile, command: "Controller.Command",
+            intent: Optional[DeferredQueueIntent],
+    ) -> tuple[str, str, Optional[DeferredQueueIntent]]:
+        """Settle a stopped-root collision before exclusions or LFTP."""
+        active_claim = getattr(self, "_Controller__collision_compare_claim", None)
+        claim_match: Optional[bool] = False
+        if active_claim is not None:
+            candidate_intent, stop_state_unknown = self.__queue_preflight_intent_with_stop_state(
+                file, command, intent,
+            )
+            if stop_state_unknown:
+                return "reject", "stop_state_unknown", candidate_intent
+            claim_match = self.__deferred_collision_claim_match(candidate_intent)
+            if claim_match is None:
+                return "reject", "collision_claim_identity_unknown", candidate_intent
+            if claim_match:
+                intent = candidate_intent
+        elif getattr(self, "_Controller__collision_compare_future", None) is not None:
+            # A future without its owner claim is stale/ambiguous; never
+            # admit Queue against that unknown collision worker state.
+            return "reject", "collision_claim_identity_unknown", intent
+        if intent is not None and intent.phase == "rescan":
+            rescan_ready = self.__queue_scoped_rescan_ready(intent)
+            if not rescan_ready:
+                return "deferred", "scoped_rescan_pending", intent
+            # A ready scan cannot authorize admission while the exact active
+            # claim is still private.  Re-enter collision settlement first;
+            # equal cleanup will request a new post-cleanup scan fence.
+            if claim_match is True and (
+                    getattr(self, "_Controller__collision_compare_claim", None) is not None or
+                    getattr(self, "_Controller__collision_compare_future", None) is not None
+            ):
+                intent.phase = "collision"
+        # A completed byte comparison still owns its claim until the normal
+        # Controller-side merge helper retires it.  Do that before trusting a
+        # model snapshot: a scan can briefly report no collision while the
+        # claim is still private, and dispatching in that window would bypass
+        # the required equal-cleanup/rescan boundary.
+        if intent is not None and intent.phase == "collision" and claim_match is True:
+            claim = getattr(self, "_Controller__collision_compare_claim", None)
+            future = getattr(self, "_Controller__collision_compare_future", None)
+            if claim is not None or future is not None:
+                if future is not None and not future.done():
+                    self.__record_queue_readiness_trace(file.file_id, "queue_preflight_outcome", {
+                        "schema": "queue_readiness.v1",
+                        "phase": "preflight",
+                        "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                        "outcome": "deferred",
+                        "reason": "comparison_pending",
+                    })
+                    return "deferred", "comparison_pending", intent
+                try:
+                    settled_result = self.__move_from_staging(
+                        file.full_path, file.path_pair_id, require_collision_proof=True,
+                    )
+                except Exception:
+                    self.logger.warning("Queue collision claim settlement failed", exc_info=True)
+                    return "reject", "collision_preflight_error", intent
+                settled_name = getattr(settled_result, "name", "unknown").lower()
+                if settled_result in (
+                        Controller.MoveFromStagingResult.COMPLETED,
+                        Controller.MoveFromStagingResult.ALREADY_COMPLETED,
+                ):
+                    if not self.__queue_scoped_rescan(intent):
+                        return "reject", "scoped_rescan_request_failed", intent
+                    return "deferred", "collision_equal_scoped_rescan", intent
+                if settled_result == Controller.MoveFromStagingResult.DEFERRED:
+                    future = getattr(self, "_Controller__collision_compare_future", None)
+                    if future is not None:
+                        self.__record_queue_readiness_trace(file.file_id, "queue_preflight_outcome", {
+                            "schema": "queue_readiness.v1",
+                            "phase": "preflight",
+                            "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                            "outcome": "deferred",
+                            "reason": "comparison_pending",
+                        })
+                        return "deferred", "comparison_pending", intent
+                    return "reject", "collision_deferred_terminal", intent
+                self.__record_queue_readiness_trace(file.file_id, "queue_preflight_outcome", {
+                    "schema": "queue_readiness.v1",
+                    "phase": "preflight",
+                    "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                    "outcome": "rejected",
+                    "reason": "collision_{}".format(settled_name),
+                })
+                return "reject", "collision_{}".format(settled_name), intent
+        try:
+            unresolved = self.__model_builder.has_unresolved_staging_collision(file.file_id)
+            terminalizable_ids = self.__model_builder.get_terminalizable_staging_collision_file_ids()
+            if type(unresolved) is not bool or not isinstance(terminalizable_ids, (set, frozenset)):
+                raise TypeError("collision authority unavailable")
+        except Exception:
+            return "reject", "collision_authority_unknown", intent
+        if not unresolved:
+            if intent is not None and intent.phase == "collision":
+                if intent.scoped_rescan_attempts >= 1:
+                    return "reject", "collision_authority_stale", intent
+                if not self.__queue_scoped_rescan(intent):
+                    return "reject", "scoped_rescan_request_failed", intent
+                return "deferred", "collision_state_rescan_required", intent
+            self.__record_queue_readiness_trace(file.file_id, "queue_preflight_outcome", {
+                "schema": "queue_readiness.v1",
+                "phase": "preflight",
+                "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                "outcome": "clear",
+                "reason": "no_unresolved_collision",
+            })
+            return "clear", "no_unresolved_collision", intent
+        if intent is None:
+            intent, stop_state_unknown = self.__queue_preflight_intent_with_stop_state(
+                file, command, None,
+            )
+            if stop_state_unknown:
+                return "reject", "stop_state_unknown", intent
+        try:
+            active_compare = self._has_active_collision_comparison(file.full_path, file.path_pair_id)
+        except Exception:
+            active_compare = False
+        future = getattr(self, "_Controller__collision_compare_future", None)
+        if active_compare and future is not None and not future.done():
+            intent.phase = "collision"
+            self.__record_queue_readiness_trace(file.file_id, "queue_preflight_outcome", {
+                "schema": "queue_readiness.v1",
+                "phase": "preflight",
+                "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                "outcome": "deferred",
+                "reason": "comparison_pending",
+            })
+            return "deferred", "comparison_pending", intent
+        if file.file_id not in terminalizable_ids:
+            if intent is not None and intent.scoped_rescan_attempts >= 1:
+                return "reject", "collision_not_terminalizable", intent
+            if not self.__queue_scoped_rescan(intent):
+                return "reject", "scoped_rescan_request_failed", intent
+            return "deferred", "collision_scan_not_terminalizable", intent
+        try:
+            move_result = self.__move_from_staging(
+                file.full_path, file.path_pair_id, require_collision_proof=True,
+            )
+        except Exception:
+            self.logger.warning("Queue collision preflight failed", exc_info=True)
+            return "reject", "collision_preflight_error", intent
+        result_name = getattr(move_result, "name", "unknown").lower()
+        if move_result in (
+                Controller.MoveFromStagingResult.COMPLETED,
+                Controller.MoveFromStagingResult.ALREADY_COMPLETED,
+        ):
+            if not self.__queue_scoped_rescan(intent):
+                return "reject", "scoped_rescan_request_failed", intent
+            return "deferred", "collision_equal_scoped_rescan", intent
+        if move_result == Controller.MoveFromStagingResult.DEFERRED:
+            future = getattr(self, "_Controller__collision_compare_future", None)
+            # Keep a completed claim in the collision phase until the next
+            # Controller turn settles it through the existing merge helper;
+            # rescan must not observe a claim that has not yet been retired.
+            if future is not None:
+                intent.phase = "collision"
+                self.__record_queue_readiness_trace(file.file_id, "queue_preflight_outcome", {
+                    "schema": "queue_readiness.v1",
+                    "phase": "preflight",
+                    "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                    "outcome": "deferred",
+                    "reason": "comparison_pending",
+                })
+                return "deferred", "comparison_pending", intent
+            return "reject", "collision_deferred_terminal", intent
+        self.__record_queue_readiness_trace(file.file_id, "queue_preflight_outcome", {
+            "schema": "queue_readiness.v1",
+            "phase": "preflight",
+            "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+            "outcome": "rejected",
+            "reason": "collision_{}".format(result_name),
+        })
+        return "reject", "collision_{}".format(result_name), intent
+
     def __set_active_scanner_files(
         self, active_files: list[tuple[str, Optional[str], Optional[str]]]
     ) -> None:
@@ -7381,6 +7996,13 @@ class Controller:
                             _error_code: int = 400,
                             _file: Optional[ModelFile] = None):
             self.logger.warning("Command failed. {}".format(_msg))
+            if _command.action == Controller.Command.Action.QUEUE and _file is not None:
+                deferred_intent = self.__deferred_queue_intents_map().get(_file.file_id)
+                if deferred_intent is not None and deferred_intent.command is _command:
+                    # The outer command boundary owns this failure when
+                    # exact claim settlement is still pending.  Mark it so a
+                    # later restoration turn cannot notify the same waiter.
+                    deferred_intent.failure_notified = True
             self.__record_command_breadcrumb(
                 command=_command,
                 message="command_failed",
@@ -7402,6 +8024,7 @@ class Controller:
         # accepted identities until their authoritative lifecycle is observed
         # (or bounded reconciliation expires an unobserved acknowledgement).
         self.__reconcile_queue_dispatch_pending()
+        self.__prepare_deferred_queue_retries()
         pending_queue_dispatches = self.__queue_dispatch_pending()
         stopped_queue_lifecycle_ids: set[str] = set()
         while not self.__command_queue.empty():
@@ -7465,10 +8088,67 @@ class Controller:
                     ModelFile.State.QUEUED,
                     ModelFile.State.DOWNLOADING,
                 )
-                stopped_marked = self.__is_explicitly_stopped(file.full_path, file.path_pair_id)
+                deferred_queue_intent = self.__deferred_queue_intents_map().get(file.file_id)
+                try:
+                    stopped_marked = self.__is_explicitly_stopped(file.full_path, file.path_pair_id)
+                except Exception:
+                    # A stop marker lookup is part of Queue admission
+                    # authority.  If it is unavailable, create a bounded
+                    # terminal intent when needed so an exact active claim
+                    # can be restored before this command is rejected.
+                    self.logger.warning(
+                        "Queue stop-state lookup failed; rejecting admission safely",
+                        exc_info=True,
+                    )
+                    if deferred_queue_intent is None:
+                        deferred_queue_intent = DeferredQueueIntent(
+                            command, file.file_id, file.path_pair_id,
+                        )
+                        self.__deferred_queue_intents_map()[file.file_id] = deferred_queue_intent
+                    elif command is not deferred_queue_intent.command:
+                        deferred_queue_intent.command.callbacks.extend(command.callbacks)
+                        command = deferred_queue_intent.command
+                    deferred_queue_intent.stop_requested = True
+                    retired = self.__retire_deferred_queue_intent(
+                        file.file_id, "stop_state_unknown",
+                    )
+                    if retired:
+                        self.__notify_deferred_queue_failure(
+                            deferred_queue_intent, "stop_state_unknown",
+                        )
+                    else:
+                        _notify_failure(
+                            command,
+                            "Queue stop state is unavailable; Queue was rejected",
+                            409,
+                            file,
+                        )
+                    continue
                 stop_boundary = file.file_id in stopped_queue_lifecycle_ids or stopped_marked
                 if stop_boundary:
                     pending_queue_dispatches.pop(file.file_id, None)
+                if deferred_queue_intent is not None and command is not deferred_queue_intent.command:
+                    # A duplicate Queue waiter inherits the one bounded
+                    # preflight intent; it must never start a second compare,
+                    # rescan, or LFTP admission.
+                    if deferred_queue_intent.failure_notified:
+                        Controller.__notify_queue_failure_callbacks(
+                            command,
+                            "preflight was already rejected",
+                        )
+                    else:
+                        deferred_queue_intent.command.callbacks.extend(command.callbacks)
+                    if getattr(command, "origin", "manual") != "auto_queue":
+                        deferred_queue_intent.command.origin = command.origin
+                    self.__record_queue_readiness_trace(file.file_id, "queue_final_decision", {
+                        "schema": "queue_readiness.v1",
+                        "phase": "final_decision",
+                        "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                        "outcome": "deferred",
+                        "reason": "duplicate_waiter_coalesced",
+                        "dispatch_attempted": False,
+                    })
+                    continue
                 pending_dispatch = pending_queue_dispatches.get(file.file_id)
                 pending_timeout = max(
                     1, getattr(self, "_Controller__lftp_status_cache_max_age_seconds", 3)
@@ -7477,7 +8157,74 @@ class Controller:
                     time.monotonic() - pending_dispatch.accepted_at_monotonic >= pending_timeout
                 )
                 already_dispatched = pending_dispatch is not None and not retry_after_ambiguity
+                collision_observed = False
+                collision_terminalizable = False
+                collision_observation = "not_applicable"
+                try:
+                    collision_observed = bool(
+                        self.__model_builder.has_unresolved_staging_collision(file.file_id)
+                    )
+                    terminalizable_ids = self.__model_builder.get_terminalizable_staging_collision_file_ids()
+                    collision_terminalizable = file.file_id in terminalizable_ids
+                    collision_observation = "present" if collision_observed else "absent"
+                except Exception:
+                    collision_observation = "unknown"
+                self.__record_queue_readiness_trace(file.file_id, "queue_model_boundary", {
+                    "schema": "queue_readiness.v1",
+                    "phase": "model_boundary",
+                    "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                    "is_dir": file.is_dir,
+                    "explicit_stop": stopped_marked,
+                    "stop_boundary": stop_boundary,
+                    "already_active": already_active,
+                    "already_dispatched": already_dispatched,
+                    "retry_after_ambiguity": retry_after_ambiguity,
+                    "collision_observation": collision_observation,
+                    "collision_unresolved": collision_observed,
+                    "collision_terminalizable": collision_terminalizable,
+                    "remote_available": file.remote_size is not None,
+                    "transferable_remote_content": file.remote_has_transferable_content,
+                })
                 if (already_active and not stop_boundary and not retry_after_ambiguity) or already_dispatched:
+                    if deferred_queue_intent is None and (
+                            getattr(self, "_Controller__collision_compare_claim", None) is not None or
+                            getattr(self, "_Controller__collision_compare_future", None) is not None
+                    ):
+                        candidate_intent = DeferredQueueIntent(
+                            command,
+                            file.file_id,
+                            file.path_pair_id,
+                            stop_marker_at_defer=stopped_marked,
+                        )
+                        claim_match = self.__deferred_collision_claim_match(candidate_intent)
+                        if claim_match is not False:
+                            # Preserve an exact or ambiguous owner claim as a
+                            # terminal intent; only a known different owner
+                            # may pass through this idempotent no-op branch.
+                            deferred_queue_intent = candidate_intent
+                            self.__deferred_queue_intents_map()[file.file_id] = candidate_intent
+                    retired = self.__retire_deferred_queue_intent(file.file_id, "idempotent_queue")
+                    if not retired:
+                        # An idempotent Queue must not clear Stop or report
+                        # success while its exact collision claim remains
+                        # private.  The retained terminal intent owns any
+                        # later settlement retry; this boundary owns the
+                        # single immediate failure notification.
+                        self.__record_queue_readiness_trace(file.file_id, "queue_final_decision", {
+                            "schema": "queue_readiness.v1",
+                            "phase": "final_decision",
+                            "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                            "outcome": "rejected",
+                            "reason": "idempotent_claim_settlement_pending",
+                            "dispatch_attempted": False,
+                        })
+                        _notify_failure(
+                            command,
+                            "Queue collision cleanup is still pending; Queue was rejected",
+                            409,
+                            file,
+                        )
+                        continue
                     Controller.__clear_persist_key(
                         self.__persist.stopped_file_names,
                         file.name,
@@ -7503,6 +8250,7 @@ class Controller:
                         file=file,
                     )
                 elif file.remote_size is None:
+                    self.__retire_deferred_queue_intent(file.file_id, "remote_unavailable")
                     self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
                         "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                         "dispatch_mode": "not_dispatched",
@@ -7514,6 +8262,7 @@ class Controller:
                     _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404, file)
                     continue
                 elif not file.remote_has_transferable_content:
+                    self.__retire_deferred_queue_intent(file.file_id, "remote_content_unavailable")
                     self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
                         "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                         "dispatch_mode": "not_dispatched",
@@ -7536,6 +8285,7 @@ class Controller:
                 elif file.is_dir and command.origin != "auto_queue" and not self.is_path_pair_reconciled(
                         file.path_pair_id
                 ):
+                    self.__retire_deferred_queue_intent(file.file_id, "local_readiness_unavailable")
                     self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
                         "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                         "dispatch_mode": "not_dispatched",
@@ -7552,6 +8302,7 @@ class Controller:
                     )
                     continue
                 elif file.is_dir and file.full_path != file.name:
+                    self.__retire_deferred_queue_intent(file.file_id, "directory_root_invalid")
                     _notify_failure(
                         command,
                         "Queue supports directory roots only; queue the containing directory",
@@ -7560,6 +8311,34 @@ class Controller:
                     )
                     continue
                 else:
+                    preflight_outcome, preflight_reason, deferred_queue_intent = self.__queue_collision_preflight(
+                        file, command, deferred_queue_intent,
+                    )
+                    if preflight_outcome == "deferred":
+                        self.__deferred_queue_intents_map()[file.file_id] = cast(
+                            DeferredQueueIntent, deferred_queue_intent,
+                        )
+                        self.__record_queue_readiness_trace(file.file_id, "queue_final_decision", {
+                            "schema": "queue_readiness.v1",
+                            "phase": "final_decision",
+                            "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                            "outcome": "deferred",
+                            "reason": preflight_reason,
+                            "dispatch_attempted": False,
+                        })
+                        continue
+                    if preflight_outcome == "reject":
+                        self.__retire_deferred_queue_intent(file.file_id, preflight_reason)
+                        self.__record_queue_readiness_trace(file.file_id, "queue_final_decision", {
+                            "schema": "queue_readiness.v1",
+                            "phase": "final_decision",
+                            "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                            "outcome": "rejected",
+                            "reason": preflight_reason,
+                            "dispatch_attempted": False,
+                        })
+                        _notify_failure(command, "Queue preflight is not safe", 409, file)
+                        continue
                     operation_sequence = None
                     lifecycle_before_queue = None
                     sync_backend_rejected = False
@@ -7568,7 +8347,42 @@ class Controller:
                         path_pair = self.__get_path_pair(file.path_pair_id)
                         local_base_dir_path = self.__get_staging_path(file.path_pair_id if path_pair else None)
                         relative_path = self.__canonical_relative_transfer_path(file)
-                        stopped_marked = self.__is_explicitly_stopped(file.full_path, file.path_pair_id)
+                        try:
+                            stopped_marked = self.__is_explicitly_stopped(file.full_path, file.path_pair_id)
+                        except Exception:
+                            # Recheck the stop boundary immediately before
+                            # exclusion/LFTP admission.  An unavailable
+                            # result is terminal for this Queue attempt; use
+                            # the same exact-claim settlement path as the
+                            # initial admission check.
+                            self.logger.warning(
+                                "Queue final stop-state lookup failed; rejecting admission safely",
+                                exc_info=True,
+                            )
+                            if deferred_queue_intent is None:
+                                deferred_queue_intent = DeferredQueueIntent(
+                                    command, file.file_id, file.path_pair_id,
+                                )
+                                self.__deferred_queue_intents_map()[file.file_id] = deferred_queue_intent
+                            elif command is not deferred_queue_intent.command:
+                                deferred_queue_intent.command.callbacks.extend(command.callbacks)
+                                command = deferred_queue_intent.command
+                            deferred_queue_intent.stop_requested = True
+                            retired = self.__retire_deferred_queue_intent(
+                                file.file_id, "stop_state_unknown",
+                            )
+                            if retired:
+                                self.__notify_deferred_queue_failure(
+                                    deferred_queue_intent, "stop_state_unknown",
+                                )
+                            else:
+                                _notify_failure(
+                                    command,
+                                    "Queue stop state is unavailable; Queue was rejected",
+                                    409,
+                                    file,
+                                )
+                            continue
                         self.__log_stop_resume_trace(
                             "queue_after_stop" if stopped_marked else "queue_fresh",
                             file.file_id,
@@ -7618,6 +8432,23 @@ class Controller:
                         # is deliberately local: Queue HTTP acknowledgement
                         # must not wait for the LFTP prompt.
                         pending_queue_dispatches[file.file_id] = dispatch
+                        self.__record_queue_readiness_trace(file.file_id, "queue_dispatch_boundary", {
+                            "schema": "queue_readiness.v1",
+                            "phase": "dispatch_boundary",
+                            "origin": (
+                                "auto_queue"
+                                if getattr(command, "origin", "manual") == "auto_queue"
+                                else "manual"
+                            ),
+                            "dispatch_attempted": True,
+                            "dispatch_mode": "async" if self.__uses_async_lftp_owner() else "sync",
+                            "operation_sequence_present": type(operation_sequence) is int,
+                            "explicit_stop": stopped_marked,
+                            "collision_observation": collision_observation,
+                            "collision_unresolved": collision_observed,
+                            "collision_terminalizable": collision_terminalizable,
+                            "exclusions_present": exclusions_present,
+                        })
                         def queue_lftp(
                                 file_name: str = relative_path,
                                 is_dir: bool = file.is_dir,
@@ -7637,6 +8468,7 @@ class Controller:
                                     "queue", queue_lftp, file.file_id, operation_sequence,
                                     download_start_lifecycle_before=lifecycle_before_queue):
                                 pending_queue_dispatches.pop(file.file_id, None)
+                                self.__retire_deferred_queue_intent(file.file_id, "backend_shutting_down")
                                 self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
                                     "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                                     "dispatch_mode": "async_future",
@@ -7723,6 +8555,15 @@ class Controller:
                             self.__advance_transfer_lifecycle(file.file_id)
                             getattr(self, "_Controller__current_process_final_publication_file_ids", set()).discard(file.file_id)
                             self._sync_final_move_succeeded_files_to_model()
+                        self.__retire_deferred_queue_intent(file.file_id, "queue_dispatched")
+                        self.__record_queue_readiness_trace(file.file_id, "queue_final_decision", {
+                            "schema": "queue_readiness.v1",
+                            "phase": "final_decision",
+                            "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                            "outcome": "dispatched",
+                            "reason": "preflight_clear",
+                            "dispatch_attempted": True,
+                        })
                         self.__record_command_breadcrumb(
                             command=command,
                             message="command_dispatched",
@@ -7734,6 +8575,7 @@ class Controller:
                             file=file,
                         )
                     except (LftpError, RcloneTransferError) as e:
+                        self.__retire_deferred_queue_intent(file.file_id, "backend_error")
                         dispatch = pending_queue_dispatches.get(file.file_id)
                         if (
                             dispatch is not None
@@ -7761,6 +8603,9 @@ class Controller:
 
             elif command.action == Controller.Command.Action.STOP:
                 pending_stop = file.file_id in pending_queue_dispatches
+                deferred_stop_intent = self.__deferred_queue_intents_map().get(file.file_id)
+                if deferred_stop_intent is not None:
+                    pending_stop = True
                 if not pending_stop and file.state not in (
                     ModelFile.State.DOWNLOADING,
                     ModelFile.State.QUEUED,
@@ -7770,6 +8615,48 @@ class Controller:
                         "File '{}' is not Queued or Downloading".format(command.filename),
                         409,
                         file
+                    )
+                    continue
+                if deferred_stop_intent is not None and file.file_id not in pending_queue_dispatches:
+                    self.__persist.stopped_file_names.add(file.file_id)
+                    stopped_queue_lifecycle_ids.add(file.file_id)
+                    self.__suppress_download_start_lifecycle(file.file_id)
+                    deferred_stop_intent.stop_requested = True
+                    cancelled_deferred_intent = self.__retire_deferred_queue_intent(
+                        file.file_id, "stopped",
+                    )
+                    if not cancelled_deferred_intent:
+                        _notify_failure(
+                            command,
+                            "Queue stop is waiting for collision cleanup",
+                            409,
+                            file,
+                        )
+                        continue
+                    self.__notify_deferred_queue_failure(
+                        deferred_stop_intent, "stopped",
+                    )
+                    self.__record_command_breadcrumb(
+                        command=command,
+                        message="command_dispatched",
+                        details={
+                            "command": "STOP",
+                            "mode": "deferred_queue_cancel",
+                        },
+                        file=file,
+                    )
+                    self.__validate_process.clear(file.file_id)
+                    for callback in command.callbacks:
+                        callback.on_success()
+                    self.__record_command_breadcrumb(
+                        command=command,
+                        message="command_finished",
+                        details={
+                            "command": "STOP",
+                            "lifecycle_phase": "dispatch",
+                            "completion": "accepted",
+                        },
+                        file=file,
                     )
                     continue
                 active_scan_stop_ready = file.file_id in getattr(

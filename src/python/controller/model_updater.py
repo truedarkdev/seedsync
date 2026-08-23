@@ -1133,7 +1133,7 @@ class _ProgressiveScanAccumulator:
             )
             root_shape_trace["visible_root_count"] = len(visible)
             self.__last_root_shape_trace = root_shape_trace
-        return ScannerResult(
+        result = ScannerResult(
             latest.timestamp,
             list(visible.values()),
             malformed_status_only_file_ids=sorted(set(malformed)),
@@ -1152,6 +1152,10 @@ class _ProgressiveScanAccumulator:
             terminal_failure_path_pair_ids=terminal_failure_path_pair_ids,
             error_message=error_message,
             generation=newest_generation,
+            # The aggregate is the result consumed by ModelUpdater's
+            # authority-token recorder. Preserve the process session fence
+            # across aggregation so a real scoped scan can be acknowledged.
+            session_token=self.__session_token,
             # Legacy snapshots are aggregated internally but must retain
             # their source publication mode so a normal full scan cannot
             # permanently opt the controller into progressive joint mode.
@@ -1163,6 +1167,17 @@ class _ProgressiveScanAccumulator:
                 bool(getattr(event, "is_targeted_scan", False)) for event in accepted
             ),
         )
+        # ``generation`` is an aggregate display value for compatibility,
+        # but a mixed drain may complete pairs from different generations.
+        # Keep the exact authority token for each completed pair on this
+        # runtime result so Queue fencing cannot advance an untouched pair.
+        result._scan_authority_tokens_by_pair = {
+            pair_id: (self.__session_token, generation)
+            for pair_id in completed
+            for generation in (self.__active_generation.get(pair_id),)
+            if isinstance(self.__session_token, str) and type(generation) is int
+        }
+        return result
 
     def snapshot(self) -> dict[tuple[Optional[str], str], SystemFile]:
         return self.snapshot_for_pairs(None)
@@ -1631,7 +1646,10 @@ def _ensure_progressive_scan_state(
         accumulator = _ProgressiveScanAccumulator()
         setattr(controller, state_name, accumulator)
         setattr(controller, "_Controller__progressive_{}_scan_state_eager".format(side), eager)
-    if bind_current_session:
+    if bind_current_session and isinstance(
+            getattr(controller, "_Controller__{}_scan_process".format(side), None),
+            ScannerProcess,
+    ):
         # A move can begin before this process emits its first result. Bind its
         # identity now so a replacement cannot later inherit a fence captured
         # for the old scanner session.
@@ -3456,6 +3474,9 @@ class ModelUpdater(_ControllerCoreAccess):
             recorder = getattr(controller, "_record_path_pair_reconciliation", None)
             if callable(recorder):
                 recorder(local_reconciled_ids, remote_reconciled_ids)
+            token_recorder = getattr(controller, "_record_path_pair_scan_tokens", None)
+            if callable(token_recorder):
+                token_recorder(latest_local_scan, latest_remote_scan)
         # Status identities scope active scanner roots.  Publish them to the
         # builder first so a same-tick active result cannot create an unscoped
         # alias beside an already-scoped model root.
