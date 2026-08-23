@@ -41,7 +41,7 @@ from common.performance_diagnostics import (
 from common.exclude_patterns import ExactPathExclusion
 from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation
 from common.path_pair import PathPair
-from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
+from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import IModelListener, Model, ModelDiff, ModelError, ModelFile
 from system import SystemFile
 from transfer import RcloneTransferError
@@ -1191,6 +1191,37 @@ class TestController(unittest.TestCase):
         )
         self.assertEqual("password", controller._Controller__ssh_password)
         self.assertEqual("password", controller._Controller__transfer_password)
+
+    def test_constructor_wires_lftp_trace_through_queue_sidecar_validation(self):
+        context = self._make_startup_context(local_path="/local")
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        context.breadcrumb_trace.create_emitter.return_value = trace
+
+        backend = Lftp.__new__(Lftp)
+        backend.logger = MagicMock()
+        backend._Lftp__job_status_parser = MagicMock()
+        backend._Lftp__path_pairs_by_id = {}
+        backend._Lftp__base_remote_dir_path = "/remote"
+        backend._Lftp__base_local_dir_path = "/local"
+        backend._Lftp__run_command = MagicMock(return_value="")
+        backend._Lftp__pending_error = None
+        backend._Lftp__last_command_timed_out = False
+        backend._Lftp__last_status_poll_healthy = True
+        backend._Lftp__breadcrumb_trace = None
+
+        with patch("controller.controller.create_transfer_backend", return_value=backend):
+            Controller(context, ControllerPersist())
+
+        with tempfile.TemporaryDirectory() as local_dir:
+            backend.queue("sample.bin", False, local_base_dir_path=local_dir)
+
+        trace.record.assert_called_once()
+        self.assertEqual(
+            "missing",
+            trace.record.call_args.args[2]["classification"],
+        )
+        trace.is_effectively_enabled.assert_called_once_with("lftp.sidecar", "info")
 
     @patch("controller.controller.create_transfer_backend")
     def test_constructor_uses_rclone_backend_factory_when_selected(self, mock_create_transfer_backend):
@@ -2909,6 +2940,61 @@ class TestController(unittest.TestCase):
         self.assertEqual("adopt", changed["scan_authority"]["outcome"])
         self.assertEqual(1, changed["scan_authority"]["effective_local_reconciliation_after_count"])
         self.assertIs(changed, self.controller.get_model_summary(max_age_seconds=60))
+
+    def test_scan_authority_publication_id_is_monotonic_and_summary_aligned(self):
+        self.controller._Controller__model.version = 4
+        self.controller._Controller__model.iter_files.return_value = []
+        self.controller._Controller__model_builder.local_library_inventory_snapshot.return_value = (0, {})
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset()
+
+        first = self.controller._publish_scan_authority_snapshot({
+            "outcome": "no_op",
+            "reason": "joint_not_final",
+            "unknown_overlay_after_count": 1,
+        })
+        first_summary = self.controller.get_model_summary()
+        second = self.controller._publish_scan_authority_snapshot({
+            "outcome": "adopt",
+            "reason": "source_buckets_adopted",
+            "unknown_overlay_after_count": 0,
+        })
+        second_summary = self.controller.get_model_summary()
+
+        self.assertEqual(1, first["publication_id"])
+        self.assertEqual(2, second["publication_id"])
+        self.assertEqual(
+            first["publication_id"], first_summary["scan_authority"]["publication_id"],
+        )
+        self.assertEqual(
+            second["publication_id"], second_summary["scan_authority"]["publication_id"],
+        )
+        self.assertEqual(4, second_summary["scan_authority"]["model_version"])
+        self.assertEqual(0, second_summary["scan_authority"]["unknown_overlay_after_count"])
+
+    def test_model_summary_cache_refreshes_identity_without_semantic_invalidation(self):
+        self.controller._Controller__model.version = 4
+        self.controller._Controller__model.iter_files.return_value = []
+        self.controller._Controller__model_builder.local_library_inventory_snapshot.return_value = (0, {})
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset()
+
+        self.controller._publish_scan_authority_snapshot({
+            "outcome": "no_op",
+            "reason": "joint_not_final",
+            "unknown_overlay_after_count": 0,
+        })
+        initial = self.controller.get_model_summary(max_age_seconds=60)
+        first_publication_id = initial["scan_authority"]["publication_id"]
+
+        self.controller._publish_scan_authority_snapshot({
+            "outcome": "no_op",
+            "reason": "joint_not_final",
+            "unknown_overlay_after_count": 0,
+        })
+        refreshed = self.controller.get_model_summary(max_age_seconds=60)
+
+        self.assertIs(initial, refreshed)
+        self.assertGreater(refreshed["scan_authority"]["publication_id"], first_publication_id)
+        self.assertEqual("joint_not_final", refreshed["scan_authority"]["reason"])
 
     @patch("controller.controller.ScannerProcess")
     def test_refresh_path_pairs_rebuilds_runtime_state_and_forces_rescan(self, scanner_process_cls):
@@ -13245,6 +13331,93 @@ class TestController(unittest.TestCase):
         self.assertEqual(222, payload["sidecar"]["mtime"])
         self.assertNotIn("local_base_dir_path", str(payload))
         self.assertNotIn("remote_base_dir_path", str(payload))
+
+    def test_transfer_stop_breadcrumb_success_and_queue_clear_are_opaque(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"transfer.stop": "info"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+
+        self.controller._Controller__record_transfer_stop_breadcrumb(
+            "private-file-id",
+            source="stop",
+            marker_before=False,
+            marker_after=True,
+            backend_outcome="success",
+            marker_observed=True,
+            operation_sequence=7,
+            rejection_reason="none",
+        )
+        self.controller._Controller__record_transfer_stop_breadcrumb(
+            "private-file-id",
+            source="queue",
+            marker_before=True,
+            marker_after=False,
+            backend_outcome="pending",
+            marker_observed=False,
+            operation_sequence=8,
+            rejection_reason="none",
+            message="transfer_stop_queue_marker_clear",
+        )
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(2, len(entries))
+        self.assertEqual(
+            ["stop", "queue"],
+            [entry["details"]["transition_source"] for entry in entries],
+        )
+        self.assertEqual("transfer_stop.v1", entries[0]["details"]["schema"])
+        self.assertEqual("info", entries[0]["level"])
+        self.assertNotIn("private-file-id", str(entries))
+        self.assertNotIn("transfer-stop:private-file-id", str(entries))
+
+    def test_transfer_stop_breadcrumb_failed_rollback_is_warning(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"transfer.stop": "warning"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+
+        self.controller._Controller__record_transfer_stop_breadcrumb(
+            "private-file-id",
+            source="rollback",
+            marker_before=True,
+            marker_after=False,
+            backend_outcome="rejected",
+            marker_observed=False,
+            operation_sequence=9,
+            rejection_reason="backend_rejected",
+            message="transfer_stop_marker_rollback",
+        )
+
+        entry = trace.snapshot()["entries"][0]
+        self.assertEqual("warning", entry["level"])
+        self.assertEqual("rollback", entry["details"]["transition_source"])
+        self.assertEqual("rejected", entry["details"]["backend_outcome"])
+        self.assertEqual("backend_rejected", entry["details"]["rejection_reason"])
+        self.assertNotIn("private-file-id", str(entry))
+
+    def test_transfer_stop_breadcrumb_gate_precedes_correlation(self):
+        class DisabledTrace:
+            def is_effectively_enabled(self, category, level="info"):
+                return False
+
+        self.controller._Controller__context.breadcrumb_trace = DisabledTrace()
+        with patch(
+            "controller.controller.opaque_trace_correlation",
+            side_effect=AssertionError("disabled Stop trace built correlation"),
+        ):
+            self.controller._Controller__record_transfer_stop_breadcrumb(
+                "private-file-id",
+                source="stop",
+                marker_before=False,
+                marker_after=True,
+                backend_outcome="pending",
+                operation_sequence=1,
+            )
 
     def test_recover_interrupted_downloads_records_boundary_breadcrumb(self):
         self.controller._Controller__persist.downloaded_file_names = set()

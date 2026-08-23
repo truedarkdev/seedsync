@@ -9,6 +9,7 @@ import queue
 from .scanner_process import IScanner
 from common import overrides, Constants
 from system import SystemScanner, SystemScannerError, SystemFile
+from system.scanner import _record_lftp_sidecar_breadcrumb, lftp_sidecar_target_identity
 
 
 class _StatusFileScanner(SystemScanner):
@@ -26,6 +27,8 @@ class ActiveScanner(IScanner):
     """
     def __init__(self, local_path: str, use_temp_file: bool = False):
         self.__scanner = SystemScanner(local_path)
+        self.__scanner.set_scan_role("active")
+        self.__breadcrumb_trace: object = None
         self.__use_temp_file = use_temp_file
         if use_temp_file:
             self.__scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
@@ -38,6 +41,11 @@ class ActiveScanner(IScanner):
     @overrides(IScanner)
     def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild(self.__class__.__name__)
+
+    def set_breadcrumb_trace(self, breadcrumb_trace: object) -> None:
+        """Forward the worker-local emitter to the scanner implementation."""
+        self.__breadcrumb_trace = breadcrumb_trace
+        self.__scanner.set_breadcrumb_trace(breadcrumb_trace)
 
     def set_active_files(self, file_names: List[str]) -> None:
         """
@@ -90,14 +98,40 @@ class ActiveScanner(IScanner):
 
     def __is_status_only_partial(self, file_name: str) -> Optional[bool]:
         if not self.__use_temp_file:
+            _record_lftp_sidecar_breadcrumb(
+                self.__breadcrumb_trace,
+                "unknown",
+                lambda: lftp_sidecar_target_identity(self.__scanner.path_to_scan, file_name),
+                status_only=None, parser_coverage="unknown", scan_role="active",
+            )
             return False
 
         base_path = os.path.join(self.__scanner.path_to_scan, file_name)
         temp_path = base_path + Constants.LFTP_TEMP_FILE_SUFFIX
         if os.path.exists(base_path) or os.path.exists(temp_path):
+            _record_lftp_sidecar_breadcrumb(
+                self.__breadcrumb_trace,
+                "unknown",
+                lambda: lftp_sidecar_target_identity(self.__scanner.path_to_scan, file_name),
+                status_only=False, parser_coverage="unknown", scan_role="active",
+            )
             return False
         status_path = temp_path + ".lftp-pget-status"
         if not os.path.isfile(status_path):
+            _record_lftp_sidecar_breadcrumb(
+                self.__breadcrumb_trace,
+                "absent",
+                lambda: lftp_sidecar_target_identity(self.__scanner.path_to_scan, file_name),
+                status_only=False, parser_coverage="unknown", scan_role="active",
+            )
             return False
         with open(status_path, "r") as handle:
-            return True if _StatusFileScanner.status_file_size(handle.read()) is not None else None
+            parsed = _StatusFileScanner.status_file_size(handle.read())
+        classification = "valid" if parsed is not None else "malformed"
+        _record_lftp_sidecar_breadcrumb(
+            self.__breadcrumb_trace,
+            classification,
+            lambda: lftp_sidecar_target_identity(self.__scanner.path_to_scan, file_name),
+            status_only=True, parser_coverage="known", scan_role="active",
+        )
+        return True if parsed is not None else None

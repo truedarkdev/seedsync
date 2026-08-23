@@ -4,11 +4,13 @@ import threading
 import unittest
 import shutil
 import tempfile
+import os
 from unittest.mock import MagicMock, patch
 
 from controller.scan import (
     MultiPathLocalScanner,
     MultiPathRemoteScanner,
+    LocalScanner,
     RemoteScanLease,
     RemoteScanner,
     ScannerError,
@@ -557,6 +559,33 @@ class TestMultiPathRemoteScanner(unittest.TestCase):
 
 
 class TestMultiPathLocalScanner(unittest.TestCase):
+    def test_lftp_sidecar_forwarding_distinguishes_same_basename_across_roots(self):
+        root = tempfile.mkdtemp(prefix="test-multipath-local-sidecar-")
+        self.addCleanup(shutil.rmtree, root)
+        movies = os.path.join(root, "movies")
+        tv = os.path.join(root, "tv")
+        os.mkdir(movies)
+        os.mkdir(tv)
+        for path in (movies, tv):
+            with open(os.path.join(path, "same.zip.lftp"), "wb") as handle:
+                handle.write(b"partial")
+            with open(os.path.join(path, "same.zip.lftp.lftp-pget-status"), "w") as handle:
+                handle.write("size=100\n0.pos=30\n0.limit=100\n")
+
+        scanner = MultiPathLocalScanner([
+            LocalScanner(movies, use_temp_file=True, path_pair_id="movies"),
+            LocalScanner(tv, use_temp_file=True, path_pair_id="tv"),
+        ])
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner.set_breadcrumb_trace(trace)
+
+        self.assertEqual(2, len(scanner.scan()))
+        events = [call for call in trace.record.call_args_list if call.args[1] == "lftp_sidecar_classified"]
+        self.assertEqual(2, len(events))
+        self.assertEqual({"local"}, {event.args[2]["scan_role"] for event in events})
+        self.assertEqual(2, len({event.kwargs["corr_id"] for event in events}))
+
     def test_bounded_scheduler_runs_pairs_after_first_four_complete(self):
         release = threading.Event()
         started = [threading.Event() for _ in range(6)]

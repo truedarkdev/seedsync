@@ -166,6 +166,9 @@ class ModelBuilder:
     __QUEUE_EXCLUSION_TRACE_SCHEMA = "fractional_mtime_redownload.queue_exclusion.v2"
     __MODEL_PRESENTATION_TRACE_SCHEMA = "model_builder.model_presentation.v1"
     __MODEL_PRESENTATION_TRACE_COUNT_MAX = 256
+    __MIXED_ROOT_TRACE_CATEGORY = "model.mixed_root"
+    __MIXED_ROOT_TRACE_SCHEMA = "model_builder.mixed_root.v1"
+    __MIXED_ROOT_TRACE_COUNT_MAX = 4096
 
     def __init__(self):
         self.logger = logging.getLogger("ModelBuilder")
@@ -807,6 +810,300 @@ class ModelBuilder:
         if model_file.state == ModelFile.State.DOWNLOADED and model_file.final_move_succeeded:
             return "move_succeeded"
         return ModelBuilder.__state_category(model_file)
+
+    def __is_mixed_root_trace_enabled(self) -> bool:
+        """Read the mixed-root category gate before diagnostic tree work."""
+        try:
+            return _breadcrumb_effectively_enabled(
+                self.__stop_resume_trace_breadcrumb,
+                self.__MIXED_ROOT_TRACE_CATEGORY,
+                "info",
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def __mixed_root_type_relation(
+            left: Optional[SystemFile], right: Optional[SystemFile],
+    ) -> str:
+        if left is None or right is None:
+            return "unknown"
+        return "match" if left.is_dir == right.is_dir else "mismatch"
+
+    @staticmethod
+    def __mixed_root_size_relation(
+            remote: Optional[SystemFile], local: Optional[SystemFile],
+    ) -> str:
+        if remote is None or local is None or remote.is_dir != local.is_dir:
+            return "unknown"
+        if local.size < remote.size:
+            return "local_smaller"
+        if local.size > remote.size:
+            return "local_larger"
+        return "equal"
+
+    @staticmethod
+    def __mixed_root_coverage_counts(
+            remote_file: Optional[SystemFile], local_file: Optional[SystemFile],
+    ) -> dict[str, int]:
+        """Aggregate mixed-root evidence without retaining child identities."""
+        counts = {
+            "matched": 0,
+            "missing": 0,
+            "partial": 0,
+            "extra_staging": 0,
+            "collision": 0,
+            # Internal-only marker; it is removed before the breadcrumb is
+            # constructed so the public aggregate remains strictly bounded.
+            "_unmatched_collision": 0,
+        }
+
+        def increment(key: str, amount: int = 1) -> None:
+            counts[key] = min(
+                ModelBuilder.__MIXED_ROOT_TRACE_COUNT_MAX,
+                counts[key] + amount,
+            )
+
+        def visit_unmatched_local(candidate: Optional[SystemFile]) -> None:
+            if candidate is None:
+                return
+            if candidate.has_staging_collision:
+                increment("collision")
+                increment("_unmatched_collision")
+            if candidate.is_staging:
+                # Count staging nodes, not only leaves, so an empty staging
+                # directory remains observable as an unmatched extra.
+                increment("extra_staging")
+            for child in candidate.iter_children():
+                visit_unmatched_local(child)
+
+        def visit(
+                remote: Optional[SystemFile], local: Optional[SystemFile],
+        ) -> None:
+            if remote is None:
+                visit_unmatched_local(local)
+                return
+            if local is None:
+                if remote.is_dir:
+                    for child in remote.iter_children():
+                        visit(child, None)
+                else:
+                    increment("missing")
+                return
+            if remote.is_dir != local.is_dir:
+                if remote.is_dir:
+                    for child in remote.iter_children():
+                        visit(child, None)
+                else:
+                    increment("partial")
+                visit_unmatched_local(local)
+                return
+            if not remote.is_dir:
+                if local.size >= remote.size:
+                    increment("matched")
+                else:
+                    increment("partial")
+                return
+
+            remote_children = {child.name: child for child in remote.iter_children()}
+            local_children = {child.name: child for child in local.iter_children()}
+            for child in remote_children.values():
+                visit(child, local_children.get(child.name))
+            for name, child in local_children.items():
+                if name not in remote_children:
+                    visit_unmatched_local(child)
+
+        visit(remote_file, local_file)
+        return counts
+
+    def __mixed_root_freshness(
+            self,
+            remote: Optional[SystemFile],
+            local: Optional[SystemFile],
+            status: Optional[LftpJobStatus] = None,
+    ) -> dict[str, object]:
+        path_pair_id = remote.path_pair_id if remote is not None else \
+            local.path_pair_id if local is not None else \
+            getattr(status, "path_pair_id", None) if status is not None else None
+        inventory = self.__local_library_inventory_by_pair.get(path_pair_id)
+        inventory_state = getattr(inventory, "state", None)
+        return {
+            "scan": "unknown" if local is None else
+                "staging" if local.is_staging else "authoritative",
+            "inventory": inventory_state if isinstance(inventory_state, str) else "unknown",
+            "scope": "path_pair" if path_pair_id is not None else "unknown",
+        }
+
+    def __mixed_root_type_relations(
+            self,
+            remote: Optional[SystemFile],
+            local: Optional[SystemFile],
+            status: Optional[LftpJobStatus],
+    ) -> dict[str, str]:
+        status_is_dir: Optional[bool] = None
+        if status is not None:
+            try:
+                status_is_dir = status.type == LftpJobStatus.Type.MIRROR
+            except (AttributeError, TypeError):
+                status_is_dir = None
+        return {
+            "root_local": self.__mixed_root_type_relation(remote, local),
+            "root_status": "unknown" if remote is None or status_is_dir is None else
+                "match" if remote.is_dir == status_is_dir else "mismatch",
+            "local_status": "unknown" if local is None or status_is_dir is None else
+                "match" if local.is_dir == status_is_dir else "mismatch",
+        }
+
+    def __mixed_root_reason(
+            self,
+            decision_kind: str,
+            outcome: bool,
+            remote: Optional[SystemFile],
+            local: Optional[SystemFile],
+            status: Optional[LftpJobStatus],
+            counts: dict[str, int],
+            type_relations: dict[str, str],
+            promotion_reason: Optional[str] = None,
+            unmatched_collision: bool = False,
+    ) -> str:
+        if decision_kind == "promotion" and not outcome and promotion_reason is not None and \
+                promotion_reason.startswith("queued"):
+            return promotion_reason
+        if decision_kind == "promotion" and not outcome and promotion_reason == "explicit_stop":
+            return promotion_reason
+        if remote is None:
+            return "remote_absent"
+        if local is None:
+            return "local_absent"
+        if any(value == "mismatch" for value in type_relations.values()):
+            return "type_mismatch"
+        if unmatched_collision:
+            return "unmatched_collision"
+        if counts["collision"]:
+            return "collision"
+        if counts["partial"]:
+            return "partial"
+        if counts["missing"]:
+            return "missing"
+        if counts["extra_staging"]:
+            return "extra_staging"
+        if outcome:
+            return "complete"
+        if decision_kind == "promotion" and promotion_reason is not None:
+            return promotion_reason
+        if status is not None and decision_kind == "promotion":
+            return "promotion_rejected"
+        return "coverage_incomplete"
+
+    def __record_mixed_root_decision(
+            self,
+            file_id: str,
+            decision_kind: str,
+            outcome: bool,
+            remote: Optional[SystemFile],
+            local: Optional[SystemFile],
+            status: Optional[LftpJobStatus],
+            promotion_reason: Optional[str] = None,
+    ) -> None:
+        """Emit one bounded aggregate mixed-root decision when useful."""
+        if not self.__is_mixed_root_trace_enabled():
+            return
+        try:
+            counts = self.__mixed_root_coverage_counts(remote, local)
+            unmatched_collision = counts.pop("_unmatched_collision", 0) > 0
+            type_relations = self.__mixed_root_type_relations(remote, local, status)
+            if decision_kind == "promotion" and not outcome and promotion_reason == "queued":
+                status_state = getattr(status, "state", None) if status is not None else None
+                promotion_reason = "queued_status" if status_state == LftpJobStatus.State.QUEUED \
+                    else "queued_without_status" if status is None else "queued"
+            reason = self.__mixed_root_reason(
+                decision_kind,
+                outcome,
+                remote,
+                local,
+                status,
+                counts,
+                type_relations,
+                promotion_reason,
+                unmatched_collision,
+            )
+            stage = "mixed_root_{}".format(decision_kind)
+            correlation = opaque_trace_correlation(file_id)
+            freshness = self.__mixed_root_freshness(remote, local, status)
+            path_pair_id = remote.path_pair_id if remote is not None else \
+                local.path_pair_id if local is not None else \
+                getattr(status, "path_pair_id", None) if status is not None else None
+            inventory = self.__local_library_inventory_by_pair.get(path_pair_id)
+            details: dict[str, object] = {
+                "schema": self.__MIXED_ROOT_TRACE_SCHEMA,
+                "version": 1,
+                "decision_kind": decision_kind,
+                "outcome": "accepted" if outcome else "rejected",
+                "reason": reason,
+                "presence": {
+                    "root": remote is not None,
+                    "local": local is not None,
+                    "status": status is not None,
+                },
+                "type_relation": type_relations,
+                "freshness": freshness,
+                "counts": counts,
+                "size_relation": self.__mixed_root_size_relation(remote, local),
+                "scope": freshness["scope"],
+                "versions": {
+                    "model": "unknown",
+                    "inventory": self.__local_library_inventory_revision
+                    if inventory is not None else "unknown",
+                    "cycle": self.__stop_resume_trace_cycle_id
+                    if self.__stop_resume_trace_cycle_id is not None else "unknown",
+                },
+            }
+            # Context/version fields are useful evidence but must not turn a
+            # stable decision into a new event on every scan cycle.
+            decision_signature = json.dumps({
+                "decision_kind": decision_kind,
+                "outcome": details["outcome"],
+                "reason": reason,
+                "presence": details["presence"],
+                "type_relation": type_relations,
+                "counts": counts,
+                "size_relation": details["size_relation"],
+            }, sort_keys=True, separators=(",", ":"))
+            signature_key = ("mixed-root:" + correlation, stage)
+            previous = self.__stop_resume_trace_last_signatures.get(signature_key)
+            unchanged_retained = previous == "retained:" + decision_signature
+            changed_result = previous is not None and not unchanged_retained
+            if outcome and not changed_result:
+                self.__remember_trace_signature(signature_key, decision_signature, True)
+                return
+
+            breadcrumb = self.__stop_resume_trace_breadcrumb
+            if breadcrumb is None or not callable(getattr(breadcrumb, "record", None)):
+                self.__remember_trace_signature(signature_key, decision_signature, True)
+                return
+            record_outcome = breadcrumb.record(
+                "model_builder",
+                "mixed_root_decision",
+                details,
+                stage=stage,
+                event_type="diagnostic",
+                category=self.__MIXED_ROOT_TRACE_CATEGORY,
+                level="info",
+                corr_id=correlation,
+                trace_scope="aggregate",
+                # Include the opaque root and stage so a different root or
+                # decision stage cannot coalesce this evidence accidentally.
+                _coalesce_key=opaque_trace_correlation(
+                    "{}|{}|{}".format(correlation, stage, decision_signature),
+                ),
+            )
+            self.__remember_trace_signature(
+                signature_key,
+                decision_signature,
+                record_outcome == "retained",
+            )
+        except Exception:
+            self.logger.debug("Ignoring mixed-root breadcrumb failure", exc_info=True)
 
     def __record_model_presentation_anomaly(self, model_file: ModelFile) -> None:
         """Emit identity-free evidence for a raw/visible or root/child split."""
@@ -4622,9 +4919,19 @@ class ModelBuilder:
             model_file.explicitly_stopped = is_stopped
             # Presentation proof requires each remote leaf; lifecycle state
             # retains its separate staging-root size fallback.
+            mixed_root_trace_enabled = self.__is_mixed_root_trace_enabled()
             model_file.complete_local_coverage = self.__directory_leaves_cover_remote_for_presentation(
                 remote, local
             )
+            if mixed_root_trace_enabled:
+                self.__record_mixed_root_decision(
+                    file_id,
+                    "coverage",
+                    model_file.complete_local_coverage,
+                    remote,
+                    local,
+                    status,
+                )
             path_pair_id = remote.path_pair_id if remote and remote.path_pair_id is not None else \
                 local.path_pair_id if local else status.path_pair_id if status else None
             path_pair_name = remote.path_pair_name if remote and remote.path_pair_name is not None else \
@@ -5354,6 +5661,8 @@ class ModelBuilder:
         arbitration_source: str,
     ) -> Tuple[bool, str]:
         incomplete_children = False
+        mixed_root_trace_enabled = self.__is_mixed_root_trace_enabled()
+        initial_root_state = model_file.state
 
         if model_file.state == ModelFile.State.DOWNLOADING and \
                 self.__local_file_proves_download_completion(local, remote) and \
@@ -5474,6 +5783,33 @@ class ModelBuilder:
                         model_file.state = ModelFile.State.DOWNLOADED
                     else:
                         incomplete_children = True
+
+        if mixed_root_trace_enabled and initial_root_state in (
+                ModelFile.State.DEFAULT,
+                ModelFile.State.DOWNLOADING,
+                ModelFile.State.QUEUED,
+        ):
+            promotion_reason = None
+            if model_file.state != ModelFile.State.DOWNLOADED:
+                if is_stopped:
+                    promotion_reason = "explicit_stop"
+                elif initial_root_state == ModelFile.State.QUEUED:
+                    promotion_reason = "queued"
+                elif model_file.is_dir and incomplete_children:
+                    promotion_reason = "child_incomplete"
+                elif initial_root_state == ModelFile.State.DOWNLOADING:
+                    promotion_reason = "completion_unproven"
+                else:
+                    promotion_reason = "not_eligible"
+            self.__record_mixed_root_decision(
+                file_id,
+                "promotion",
+                model_file.state == ModelFile.State.DOWNLOADED,
+                remote,
+                local,
+                status,
+                promotion_reason,
+            )
 
         return incomplete_children, arbitration_source
 

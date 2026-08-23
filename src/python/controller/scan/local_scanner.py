@@ -37,6 +37,7 @@ class LocalScanner(IScanner):
         self.__local_path = local_path
         self.__staging_path = staging_path
         self.__scanner = SystemScanner(local_path)
+        self.__scanner.set_scan_role("local")
         if use_temp_file:
             self.__scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
         self.__staging_scanner = None
@@ -44,6 +45,7 @@ class LocalScanner(IScanner):
                 self.__is_valid_scan_path(staging_path) and \
                 self.__normalize_path(staging_path) != self.__normalize_path(local_path):
             self.__staging_scanner = SystemScanner(staging_path)
+            self.__staging_scanner.set_scan_role("local")
             if use_temp_file:
                 self.__staging_scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
         self.logger = logging.getLogger("LocalScanner")
@@ -53,6 +55,12 @@ class LocalScanner(IScanner):
         self.__path_pair_name = path_pair_name
         self.__progress_callback: Optional[ScanProgressCallback] = None
         self.__performance_diagnostics = performance_diagnostics
+
+    def set_breadcrumb_trace(self, breadcrumb_trace: object) -> None:
+        """Forward the worker-local emitter to all owned system scanners."""
+        self.__scanner.set_breadcrumb_trace(breadcrumb_trace)
+        if self.__staging_scanner is not None:
+            self.__staging_scanner.set_breadcrumb_trace(breadcrumb_trace)
 
     @property
     def path_pair_id(self) -> Optional[str]:

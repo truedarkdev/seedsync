@@ -10,6 +10,7 @@ from .scanner_process import IScanner
 from common import overrides, Constants
 from model import ModelFile
 from system import SystemFile, SystemScanner, SystemScannerError
+from system.scanner import _record_lftp_sidecar_breadcrumb, lftp_sidecar_target_identity
 
 
 class _StatusFileScanner(SystemScanner):
@@ -26,10 +27,13 @@ class MultiPathActiveScanner(IScanner):
     def __init__(self, path_pair_paths: Dict[str, str], use_temp_file: bool = False):
         self.logger = logging.getLogger("MultiPathActiveScanner")
         self.__use_temp_file = use_temp_file
+        self.__breadcrumb_trace: object = None
         self.__scanners = {
             path_pair_id: SystemScanner(local_path)
             for path_pair_id, local_path in path_pair_paths.items()
         }
+        for scanner in self.__scanners.values():
+            scanner.set_scan_role("multipath_active")
         if use_temp_file:
             for scanner in self.__scanners.values():
                 scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
@@ -41,6 +45,12 @@ class MultiPathActiveScanner(IScanner):
     @overrides(IScanner)
     def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("MultiPathActiveScanner")
+
+    def set_breadcrumb_trace(self, breadcrumb_trace: object) -> None:
+        """Forward the worker-local emitter to every path-pair scanner."""
+        self.__breadcrumb_trace = breadcrumb_trace
+        for scanner in self.__scanners.values():
+            scanner.set_breadcrumb_trace(breadcrumb_trace)
 
     def set_active_files(self, files: List[Tuple[str, Optional[str], Optional[str]]]) -> None:
         """
@@ -107,14 +117,40 @@ class MultiPathActiveScanner(IScanner):
             path_pair_id: Optional[str]
     ) -> Optional[bool]:
         if not self.__use_temp_file:
+            _record_lftp_sidecar_breadcrumb(
+                self.__breadcrumb_trace,
+                "unknown",
+                lambda: lftp_sidecar_target_identity(scanner.path_to_scan, file_name),
+                status_only=None, parser_coverage="unknown", scan_role="multipath_active",
+            )
             return False
 
         base_path = os.path.join(scanner.path_to_scan, file_name)
         temp_path = base_path + Constants.LFTP_TEMP_FILE_SUFFIX
         if os.path.exists(base_path) or os.path.exists(temp_path):
+            _record_lftp_sidecar_breadcrumb(
+                self.__breadcrumb_trace,
+                "unknown",
+                lambda: lftp_sidecar_target_identity(scanner.path_to_scan, file_name),
+                status_only=False, parser_coverage="unknown", scan_role="multipath_active",
+            )
             return False
         status_path = temp_path + ".lftp-pget-status"
         if not os.path.isfile(status_path):
+            _record_lftp_sidecar_breadcrumb(
+                self.__breadcrumb_trace,
+                "absent",
+                lambda: lftp_sidecar_target_identity(scanner.path_to_scan, file_name),
+                status_only=False, parser_coverage="unknown", scan_role="multipath_active",
+            )
             return False
         with open(status_path, "r") as handle:
-            return True if _StatusFileScanner.status_file_size(handle.read()) is not None else None
+            parsed = _StatusFileScanner.status_file_size(handle.read())
+        classification = "valid" if parsed is not None else "malformed"
+        _record_lftp_sidecar_breadcrumb(
+            self.__breadcrumb_trace,
+            classification,
+            lambda: lftp_sidecar_target_identity(scanner.path_to_scan, file_name),
+            status_only=True, parser_coverage="known", scan_role="multipath_active",
+        )
+        return True if parsed is not None else None

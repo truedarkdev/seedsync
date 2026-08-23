@@ -7,11 +7,12 @@ import tempfile
 import unittest
 from threading import Thread
 from datetime import datetime
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from system import SystemScanner, SystemScannerError
+from system.scanner import _record_lftp_sidecar_breadcrumb, lftp_sidecar_target_identity
 
 
 def my_mkdir(*args):
@@ -781,6 +782,106 @@ class TestSystemScanner(unittest.TestCase):
         self.assertEqual("déģķ", folder.name)
         self.assertEqual("dőÀ", file.name)
         self.assertEqual(128, file.size)
+
+    def test_lftp_sidecar_breadcrumb_is_gated_and_contains_no_runtime_identity(self):
+        my_touch(4, "download.zip.lftp")
+        with open(os.path.join(TestSystemScanner.temp_dir, "download.zip.lftp.lftp-pget-status"), "w") as handle:
+            handle.write("size=100\n0.pos=30\n0.limit=100\n")
+
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = False
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        scanner.set_lftp_temp_suffix(".lftp")
+        scanner.set_scan_role("active")
+        scanner.set_breadcrumb_trace(trace)
+        with patch("system.scanner.opaque_trace_correlation", side_effect=AssertionError("gate missed")), \
+                patch("system.scanner.lftp_sidecar_target_identity", side_effect=AssertionError("identity built")):
+            result = scanner.scan_single("download.zip")
+
+        self.assertEqual(30, result.size)
+        trace.record.assert_not_called()
+
+    def test_lftp_sidecar_breadcrumb_classifies_valid_malformed_and_absent(self):
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        scanner.set_breadcrumb_trace(trace)
+        scanner.set_scan_role("local")
+
+        my_touch(4, "valid.lftp")
+        with open(os.path.join(TestSystemScanner.temp_dir, "valid.lftp.lftp-pget-status"), "w") as handle:
+            handle.write("size=100\n0.pos=30\n0.limit=100\n")
+        my_touch(4, "malformed.lftp")
+        with open(os.path.join(TestSystemScanner.temp_dir, "malformed.lftp.lftp-pget-status"), "w") as handle:
+            handle.write("size=-2\n0.pos=0\n")
+        my_touch(4, "absent.lftp")
+
+        scanner.set_lftp_temp_suffix(".lftp")
+        scanner.scan_single("valid")
+        scanner.scan_single("malformed")
+        scanner.scan_single("absent")
+
+        events = [call for call in trace.record.call_args_list if call.args[1] == "lftp_sidecar_classified"]
+        self.assertEqual({"valid", "malformed", "absent"}, {
+            call.args[2]["classification"] for call in events
+        })
+        for event in events:
+            details = event.args[2]
+            self.assertEqual(False, details["status_only"])
+            self.assertIn(details["parser_coverage"], {"known", "unknown"})
+            self.assertEqual("local", details["scan_role"])
+            self.assertNotIn(TestSystemScanner.temp_dir, repr(event))
+
+    def test_lftp_sidecar_does_not_emit_absent_for_ordinary_files(self):
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        scanner.set_breadcrumb_trace(trace)
+        for name in ("ordinary-a.txt", "ordinary-b.bin", "ordinary-c.mkv"):
+            my_touch(4, name)
+
+        scanner.scan()
+
+        events = [call for call in trace.record.call_args_list if call.args[1] == "lftp_sidecar_classified"]
+        self.assertEqual([], events)
+
+    def test_lftp_sidecar_emits_absent_for_temp_target_without_sidecar(self):
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        scanner.set_lftp_temp_suffix(".lftp")
+        scanner.set_breadcrumb_trace(trace)
+        my_touch(4, "missing-status.lftp")
+
+        scanner.scan()
+
+        events = [call for call in trace.record.call_args_list if call.args[1] == "lftp_sidecar_classified"]
+        self.assertEqual(1, len(events))
+        self.assertEqual("absent", events[0].args[2]["classification"])
+
+    def test_lftp_sidecar_state_transitions_keep_target_corr_id_but_split_coalescing(self):
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        target = lftp_sidecar_target_identity(TestSystemScanner.temp_dir, "download.zip")
+
+        _record_lftp_sidecar_breadcrumb(
+            trace, "valid", target, status_only=False, parser_coverage="known", scan_role="local",
+        )
+        _record_lftp_sidecar_breadcrumb(
+            trace, "malformed", target, status_only=False, parser_coverage="known", scan_role="local",
+        )
+
+        events = [call for call in trace.record.call_args_list if call.args[1] == "lftp_sidecar_classified"]
+        self.assertEqual(2, len(events))
+        self.assertEqual(events[0].kwargs["corr_id"], events[1].kwargs["corr_id"])
+        self.assertNotEqual(events[0].kwargs["_coalesce_key"], events[1].kwargs["_coalesce_key"])
+
+    def test_lftp_sidecar_target_identity_distinguishes_roots_with_same_basename(self):
+        first = lftp_sidecar_target_identity(os.path.join(TestSystemScanner.temp_dir, "movies"), "same.zip")
+        second = lftp_sidecar_target_identity(os.path.join(TestSystemScanner.temp_dir, "tv"), "same.zip")
+        self.assertNotEqual(first, second)
+        self.assertNotIn(TestSystemScanner.temp_dir, first)
+        self.assertNotIn(TestSystemScanner.temp_dir, second)
 
     def test_scan_file_with_latin_chars(self):
         tempdir = TestSystemScanner.temp_dir

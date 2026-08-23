@@ -13,6 +13,7 @@ import pexpect
 
 # my libs
 from common import AppError
+from common.breadcrumb_trace import opaque_trace_correlation
 from common.config import Checkers
 from common.exclude_patterns import ExactPathExclusion, partition_transfer_exclusions
 from common.redaction import redact_sensitive_text
@@ -23,9 +24,94 @@ from .job_status_parser import LftpJobStatus, LftpJobStatusParser, LftpJobStatus
 MAX_CONSECUTIVE_STATUS_ERRORS = 10
 MAX_KILL_MATCH_ATTEMPTS = 20
 STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS = 1.0
+LFTP_STATUS_POLL_FAILURE_REASONS = frozenset({
+    "timeout", "eof", "command_error", "parser_error", "unhealthy_snapshot",
+})
+LFTP_SIDECAR_TRACE_CATEGORY = "lftp.sidecar"
+LFTP_SIDECAR_TRACE_SCHEMA = "lftp.sidecar.v1"
+LFTP_SIDECAR_TRACE_CLASSIFICATIONS = frozenset({
+    "missing", "valid", "unsafe", "orphan", "ambiguous", "stale", "malformed",
+})
 redact_credentials = redact_sensitive_text
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+
+
+def _breadcrumb_effectively_enabled(trace: object, category: str, level: str) -> bool:
+    if trace is None:
+        return False
+    enabled = getattr(trace, "is_enabled", None)
+    if callable(enabled):
+        try:
+            if not bool(enabled()):
+                return False
+        except Exception:
+            return False
+    gate = getattr(trace, "is_effectively_enabled", None)
+    if callable(gate):
+        try:
+            return bool(gate(category, level))
+        except Exception:
+            return False
+    return True
+
+
+def _record_lftp_sidecar_breadcrumb(
+        breadcrumb_trace: object,
+        classification: str,
+        target_identity: object,
+        *,
+        target_presence: str = "unknown",
+        sidecar_presence: str = "unknown",
+        sidecar_size: str = "unknown",
+) -> None:
+    """Record one bounded queue-sidecar decision without runtime identities."""
+    if classification not in LFTP_SIDECAR_TRACE_CLASSIFICATIONS:
+        return
+    level = "warning" if classification in {
+        "unsafe", "orphan", "ambiguous", "stale", "malformed",
+    } else "info"
+    if not _breadcrumb_effectively_enabled(breadcrumb_trace, LFTP_SIDECAR_TRACE_CATEGORY, level):
+        return
+    try:
+        recorder = getattr(breadcrumb_trace, "record", None)
+        if not callable(recorder):
+            return
+        coverage = {
+            "target": target_presence if target_presence in ("known", "unknown") else "unknown",
+            "sidecar": sidecar_presence if sidecar_presence in ("known", "unknown") else "unknown",
+            "sidecar_size": sidecar_size if sidecar_size in ("known", "unknown") else "unknown",
+        }
+        coalesce_key = opaque_trace_correlation(
+            "lftp.sidecar|{}|{}|{}|{}|{}".format(
+                target_identity,
+                classification,
+                coverage["target"],
+                coverage["sidecar"],
+                coverage["sidecar_size"],
+            ),
+        )
+        recorder(
+            "lftp",
+            "lftp_sidecar_classified",
+            {
+                "schema": LFTP_SIDECAR_TRACE_SCHEMA,
+                "classification": classification,
+                "coverage": coverage,
+            },
+            stage="lftp_sidecar_validation",
+            event_type="diagnostic",
+            category=LFTP_SIDECAR_TRACE_CATEGORY,
+            level=level,
+            corr_id=opaque_trace_correlation(
+                "lftp.sidecar|{}".format(target_identity),
+            ),
+            _coalesce_key=coalesce_key,
+            trace_scope="flow",
+        )
+    except Exception:
+        # Breadcrumb diagnostics must never alter Queue admission.
+        return
 
 
 class _PathPair(Protocol):
@@ -149,7 +235,11 @@ class Lftp:
         self.__path_pairs_by_id: Dict[str, Dict[str, str]] = {}
         self.__last_command_timed_out = False
         self.__last_status_poll_healthy = True
+        # Per-poll diagnostic classification only; it is not transfer
+        # authority, a cache, or a persisted lifecycle marker.
+        self.__last_status_poll_failure_reason: Optional[str] = None
         self.__status_poll_needs_connection_grace = False
+        self.__breadcrumb_trace: object = None
 
         self.__log_command_output = False
         self.__pending_error = None
@@ -354,6 +444,10 @@ class Lftp:
         self.logger = base_logger.getChild("Lftp")
         self.__job_status_parser.set_base_logger(self.logger)
 
+    def set_breadcrumb_trace(self, breadcrumb_trace: object) -> None:
+        """Set the shared emitter used for bounded Queue sidecar diagnostics."""
+        self.__breadcrumb_trace = breadcrumb_trace
+
     def set_base_remote_dir_path(self, base_remote_dir_path: str):
         self.__base_remote_dir_path = base_remote_dir_path
 
@@ -467,12 +561,14 @@ class Lftp:
             except pexpect.exceptions.TIMEOUT:
                 if status_poll:
                     self.__last_command_timed_out = True
+                    self.__last_status_poll_failure_reason = "timeout"
                     self.logger.warning("Lftp timeout exception")
                     return ""
                 raise
             except pexpect.exceptions.EOF:
                 if status_poll:
                     self.__last_command_timed_out = True
+                    self.__last_status_poll_failure_reason = "eof"
                     self.logger.error("Lftp process died unexpectedly (EOF) while sending status command")
                     return ""
                 raise
@@ -495,20 +591,24 @@ class Lftp:
                                 time.sleep(0.01)
                             except pexpect.exceptions.EOF:
                                 self.__last_command_timed_out = True
+                                self.__last_status_poll_failure_reason = "eof"
                                 self.logger.error("Lftp process died unexpectedly (EOF)")
                                 raise LftpError("Lftp process terminated: {}".format(
                                     self.__normalize_output(self.__decode_spawn_output(self.__process.before))
                                 ))
                     except pexpect.exceptions.ExceptionPexpect as exc:
                         self.__last_command_timed_out = True
+                        self.__last_status_poll_failure_reason = "command_error"
                         self.logger.warning("Ignoring status poll failure: {}".format(exc))
                         return ""
                     except OSError as exc:
                         self.__last_command_timed_out = True
+                        self.__last_status_poll_failure_reason = "command_error"
                         self.logger.warning("Ignoring status poll failure: {}".format(exc))
                         return ""
                     if not prompt_reached:
                         self.__last_command_timed_out = True
+                        self.__last_status_poll_failure_reason = "timeout"
                 else:
                     try:
                         self.__process.expect(self.__expect_pattern, timeout=timeout_seconds)
@@ -545,6 +645,7 @@ class Lftp:
                     pass
                 except pexpect.exceptions.EOF:
                     self.__last_command_timed_out = True
+                    self.__last_status_poll_failure_reason = "eof"
                     self.logger.error("Lftp process died unexpectedly (EOF) during status poll recovery")
                     raise LftpError("Lftp process terminated during status poll recovery")
                 finally:
@@ -566,6 +667,8 @@ class Lftp:
                         self.logger.warning("Lftp timeout exception")
                     pass
                 except pexpect.exceptions.EOF:
+                    if status_poll:
+                        self.__last_status_poll_failure_reason = "eof"
                     self.logger.error("Lftp process died unexpectedly (EOF) during error recovery")
                     raise LftpError("Lftp process terminated during error recovery")
                 finally:
@@ -766,6 +869,12 @@ class Lftp:
         return self.__last_status_poll_healthy
 
     @property
+    def last_status_poll_failure_reason(self) -> Optional[str]:
+        """Return the fixed safe category for the most recent status poll."""
+        reason = getattr(self, "_Lftp__last_status_poll_failure_reason", None)
+        return reason if reason in LFTP_STATUS_POLL_FAILURE_REASONS else None
+
+    @property
     def sftp_connect_program(self) -> str:
         return self.__get(Lftp.__SET_SFTP_CONNECT_PROGRAM)
 
@@ -779,23 +888,28 @@ class Lftp:
         parsing failed but the error is still within the tolerated threshold.
         :return:
         """
+        self.__last_status_poll_failure_reason = None
         try:
             out = self.__run_command("jobs -v", timeout_seconds=0, require_prompt_ready=False, status_poll=True)  # type: ignore[arg-type]
         except pexpect.exceptions.TIMEOUT:
             self.__consecutive_status_errors = 0
             self.__last_command_timed_out = True
+            self.__last_status_poll_failure_reason = "timeout"
             self.__last_status_poll_healthy = False
             self.logger.warning("Lftp timeout exception")
             return []
         except pexpect.exceptions.EOF:
             self.__consecutive_status_errors = 0
             self.__last_command_timed_out = True
+            self.__last_status_poll_failure_reason = "eof"
             self.__last_status_poll_healthy = False
             self.logger.error("Lftp process died unexpectedly (EOF) during status poll")
             return []
         except LftpError as exc:
             self.__consecutive_status_errors = 0
             self.__last_command_timed_out = True
+            if self.__last_status_poll_failure_reason not in {"eof", "timeout"}:
+                self.__last_status_poll_failure_reason = "command_error"
             self.__last_status_poll_healthy = False
             self.logger.warning("Ignoring status poll failure: {}".format(exc))
             return []
@@ -807,6 +921,7 @@ class Lftp:
             self.__last_status_poll_healthy = not timed_out
         except LftpJobStatusParserError:
             self.__consecutive_status_errors += 1
+            self.__last_status_poll_failure_reason = "parser_error"
             self.__last_status_poll_healthy = False
             if self.__consecutive_status_errors < MAX_CONSECUTIVE_STATUS_ERRORS:
                 self.logger.warning(f"Ignoring status error (count={self.__consecutive_status_errors})")
@@ -830,6 +945,7 @@ class Lftp:
                 self.__last_status_poll_healthy = not self.__last_command_timed_out
             except LftpJobStatusParserError:
                 self.__consecutive_status_errors += 1
+                self.__last_status_poll_failure_reason = "parser_error"
                 self.__last_status_poll_healthy = False
                 if self.__consecutive_status_errors < MAX_CONSECUTIVE_STATUS_ERRORS:
                     self.logger.warning(f"Ignoring status error (count={self.__consecutive_status_errors})")
@@ -837,6 +953,8 @@ class Lftp:
                     raise
             if statuses is not None:
                 self.__annotate_status_path_pairs(statuses)
+        if not self.__last_status_poll_healthy and self.__last_status_poll_failure_reason is None:
+            self.__last_status_poll_failure_reason = "unhealthy_snapshot"
         return statuses
 
     def __annotate_status_path_pairs(self, statuses: List[LftpJobStatus]):
@@ -897,6 +1015,7 @@ class Lftp:
     @classmethod
     def __file_resume_artifacts(
             cls, local_dir: str, name: str, expected_size: Optional[int] = None,
+            breadcrumb_trace: object = None,
     ) -> tuple[bool, bool]:
         """Return (one target exists, it has a valid matching pget map).
 
@@ -908,32 +1027,56 @@ class Lftp:
         through to get -c.
         """
         local_root, target_paths = cls.__file_artifact_paths(local_dir, name)
+        target_identity = "{}|{}".format(local_dir, name)
+
+        def record(
+                classification: str,
+                *,
+                target_presence: str = "unknown",
+                sidecar_presence: str = "unknown",
+                sidecar_size: str = "unknown",
+        ) -> None:
+            _record_lftp_sidecar_breadcrumb(
+                breadcrumb_trace,
+                classification,
+                target_identity,
+                target_presence=target_presence,
+                sidecar_presence=sidecar_presence,
+                sidecar_size=sidecar_size,
+            )
+
         targets: list[tuple[str, Optional[str]]] = []
         status_paths: list[str] = []
         for target_path, status_path in target_paths:
             if not cls.__is_lexically_and_really_contained(target_path, local_root):
+                record("unsafe")
                 raise LftpError("LFTP queue target is outside the local directory")
             status_paths.append(status_path)
             if not cls.__is_lexically_and_really_contained(status_path, local_root):
                 # The only ordinary reason a derived sibling escapes the
                 # resolved root is that it is a link/reparse point. Do not
                 # follow it or downgrade it to a get resume.
+                record("unsafe")
                 raise LftpError("LFTP queue status sidecar is unsafe; use Delete Local before Queue")
             try:
                 target_info = os.stat(target_path, follow_symlinks=False)
             except FileNotFoundError:
                 continue
             except OSError as error:
+                record("unsafe")
                 raise LftpError("LFTP queue target is unsafe; use Delete Local before Queue") from error
             if cls.__is_link_or_reparse(target_path, target_info):
+                record("unsafe", target_presence="known")
                 raise LftpError("LFTP queue target must be a regular file")
             if not stat.S_ISREG(target_info.st_mode):
+                record("unsafe", target_presence="known")
                 raise LftpError("LFTP queue target must be a regular file")
             try:
                 status_info = os.stat(status_path, follow_symlinks=False)
             except FileNotFoundError:
                 status_path = None
             except OSError as error:
+                record("unsafe", target_presence="known")
                 raise LftpError("LFTP queue status sidecar is unsafe; use Delete Local before Queue") from error
             targets.append((target_path, status_path))
 
@@ -945,28 +1088,38 @@ class Lftp:
             except FileNotFoundError:
                 continue
             except OSError as error:
+                record("unsafe")
                 raise LftpError("LFTP queue status sidecar is unsafe; use Delete Local before Queue") from error
+            record("orphan", target_presence="known", sidecar_presence="known")
             raise LftpError("LFTP queue status sidecar is an orphan; use Delete Local before Queue")
 
         if not targets:
+            record("missing", target_presence="known", sidecar_presence="known")
             return False, False
         if len(targets) != 1:
+            record("ambiguous", target_presence="known", sidecar_presence="known")
             raise LftpError("LFTP queue has ambiguous local partial artifacts; use Delete Local before Queue")
 
         _, status_path = targets[0]
         if status_path is None:
+            record("valid", target_presence="known", sidecar_presence="known")
             return True, False
         try:
             status_info = os.stat(status_path, follow_symlinks=False)
         except OSError as error:
+            record("unsafe", target_presence="known", sidecar_presence="unknown")
             raise LftpError("LFTP queue status sidecar is unsafe; use Delete Local before Queue") from error
         if cls.__is_link_or_reparse(status_path, status_info) or not stat.S_ISREG(status_info.st_mode):
+            record("unsafe", target_presence="known", sidecar_presence="known")
             raise LftpError("LFTP queue status sidecar is unsafe; use Delete Local before Queue")
         if not cls.__is_valid_pget_status_file(status_path):
+            record("malformed", target_presence="known", sidecar_presence="known")
             raise LftpError("LFTP queue status sidecar is invalid; use Delete Local before Queue")
         if type(expected_size) is int and expected_size >= 0 and \
                 cls.__pget_status_file_size(status_path) != expected_size:
+            record("stale", target_presence="known", sidecar_presence="known", sidecar_size="unknown")
             raise LftpError("LFTP queue status sidecar is stale; use Delete Local before Queue")
+        record("valid", target_presence="known", sidecar_presence="known", sidecar_size="known")
         return True, True
 
     @classmethod
@@ -1191,6 +1344,7 @@ class Lftp:
         if not is_dir:
             has_existing_target, has_valid_pget_map = self.__file_resume_artifacts(
                 local_dir, name, expected_size if allow_resume else None,
+                getattr(self, "_Lftp__breadcrumb_trace", None),
             )
         legacy_get_resume = False
         if allow_legacy_get_resume:

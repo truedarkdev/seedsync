@@ -16,6 +16,7 @@ import pytest
 
 from tests.utils import TestUtils, requires_live_ssh
 from common import ConfigError
+from common.breadcrumb_trace import BreadcrumbTraceCollector
 from lftp import Lftp, LftpJobStatus, LftpError, LftpJobStatusParser, LftpJobStatusParserError
 
 
@@ -169,6 +170,103 @@ class TestLftp(unittest.TestCase):
             "queue command: %s",
             "queue pget -c \"/remote/movies/dup\" -o \"/local/movies/\""
         )
+
+    def test_queue_sidecar_breadcrumb_classifies_missing_and_is_gated(self):
+        lftp = self._build_test_lftp()
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        lftp.set_breadcrumb_trace(trace)
+        with tempfile.TemporaryDirectory() as local_dir:
+            lftp.queue("private-name.bin", False, local_base_dir_path=local_dir)
+
+        trace.is_effectively_enabled.assert_called_once_with("lftp.sidecar", "info")
+        trace.record.assert_called_once()
+        details = trace.record.call_args.args[2]
+        self.assertEqual("missing", details["classification"])
+        self.assertNotIn("private-name.bin", repr(trace.record.call_args))
+        self.assertNotEqual("private-name.bin", trace.record.call_args.kwargs["corr_id"])
+
+    def test_queue_sidecar_breadcrumb_classifies_rejection_and_valid_artifact(self):
+        lftp = self._build_test_lftp()
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        lftp.set_breadcrumb_trace(trace)
+        with tempfile.TemporaryDirectory() as local_dir:
+            target = os.path.join(local_dir, "sample.bin.lftp")
+            with open(target, "wb") as handle:
+                handle.write(b"partial")
+            with open(target + ".lftp-pget-status", "w") as handle:
+                handle.write("size=4\n0.pos=0\n0.limit=4\n")
+            lftp.queue("sample.bin", False, local_base_dir_path=local_dir)
+            self.assertEqual("valid", trace.record.call_args.args[2]["classification"])
+
+            trace.record.reset_mock()
+            with open(target + ".lftp-pget-status", "w") as handle:
+                handle.write("size=-2\n0.pos=0\n")
+            with self.assertRaises(LftpError):
+                lftp.queue("sample.bin", False, local_base_dir_path=local_dir)
+            self.assertEqual("malformed", trace.record.call_args.args[2]["classification"])
+
+    def test_queue_sidecar_breadcrumb_disabled_preserves_dispatch(self):
+        lftp = self._build_test_lftp()
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = False
+        lftp.set_breadcrumb_trace(trace)
+        with tempfile.TemporaryDirectory() as local_dir:
+            lftp.queue("sample.bin", False, local_base_dir_path=local_dir)
+
+        trace.record.assert_not_called()
+        lftp._Lftp__run_command.assert_called_once()
+
+    def test_queue_sidecar_breadcrumb_coalesces_across_interleaved_poll_event(self):
+        lftp = self._build_test_lftp()
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        lftp.set_breadcrumb_trace(trace)
+
+        with tempfile.TemporaryDirectory() as local_dir:
+            lftp.queue("sample.bin", False, local_base_dir_path=local_dir)
+            trace.record(
+                "lftp",
+                "lftp_poll_snapshot",
+                {"coverage": "unknown"},
+                category="transfer.lftp",
+                level="info",
+            )
+            lftp.queue("sample.bin", False, local_base_dir_path=local_dir)
+
+        sidecar_events = [
+            event for event in trace.snapshot()["entries"]
+            if event["category"] == "lftp.sidecar"
+        ]
+        self.assertEqual(1, len(sidecar_events))
+        self.assertEqual("missing", sidecar_events[0]["details"]["classification"])
+        self.assertEqual(2, sidecar_events[0]["repeat_count"])
+
+    def test_queue_sidecar_breadcrumb_keeps_valid_coverage_transition(self):
+        lftp = self._build_test_lftp()
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        lftp.set_breadcrumb_trace(trace)
+
+        with tempfile.TemporaryDirectory() as local_dir:
+            target = os.path.join(local_dir, "sample.bin")
+            with open(target, "wb") as handle:
+                handle.write(b"partial")
+            lftp.queue("sample.bin", False, local_base_dir_path=local_dir)
+
+            with open(target + ".lftp-pget-status", "w") as handle:
+                handle.write("size=4\n0.pos=0\n0.limit=4\n")
+            lftp.queue("sample.bin", False, local_base_dir_path=local_dir)
+
+        sidecar_events = [
+            event for event in trace.snapshot()["entries"]
+            if event["category"] == "lftp.sidecar"
+        ]
+        self.assertEqual(2, len(sidecar_events))
+        self.assertEqual(
+            ["unknown", "known"],
+            [event["details"]["coverage"]["sidecar_size"] for event in sidecar_events],
+        )
+        self.assertEqual([1, 1], [event["repeat_count"] for event in sidecar_events])
 
     def test_queue_dir_uses_override_paths(self):
         lftp = self._build_test_lftp()
@@ -359,6 +457,7 @@ class TestLftp(unittest.TestCase):
 
         self.assertEqual([], statuses)
         self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("timeout", lftp.last_status_poll_failure_reason)
         self.assertTrue(lftp._Lftp__last_command_timed_out)
         self.assertEqual(7, lftp._Lftp__process.delaybeforesend)
         lftp._Lftp__process.send.assert_called_once_with("jobs -v\n")
@@ -372,6 +471,7 @@ class TestLftp(unittest.TestCase):
 
         self.assertEqual([], statuses)
         self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("eof", lftp.last_status_poll_failure_reason)
         self.assertTrue(lftp._Lftp__last_command_timed_out)
         self.assertEqual(7, lftp._Lftp__process.delaybeforesend)
         lftp._Lftp__process.send.assert_called_once_with("jobs -v\n")
@@ -386,6 +486,7 @@ class TestLftp(unittest.TestCase):
 
         self.assertEqual([], statuses)
         self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("command_error", lftp.last_status_poll_failure_reason)
         self.assertTrue(lftp._Lftp__last_command_timed_out)
         lftp.logger.warning.assert_called_once()
         lftp._Lftp__run_command.assert_called_once_with(
@@ -394,6 +495,33 @@ class TestLftp(unittest.TestCase):
             require_prompt_ready=False,
             status_poll=True
         )
+
+    def test_status_poll_failure_reason_defaults_to_safe_unhealthy_snapshot(self):
+        lftp = self._build_status_poll_test_lftp()
+
+        def unhealthy_snapshot(*args, **kwargs):
+            lftp._Lftp__last_command_timed_out = True
+            return ""
+
+        lftp._Lftp__run_command = MagicMock(side_effect=unhealthy_snapshot)
+
+        self.assertEqual([], lftp.status())
+        self.assertEqual("unhealthy_snapshot", lftp.last_status_poll_failure_reason)
+
+    def test_status_error_recovery_eof_keeps_eof_category_and_success_resets_it(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__process.before = b"get: Access failed"
+        lftp._Lftp__process.expect.side_effect = [None, pexpect.exceptions.EOF("eof")]
+
+        self.assertEqual([], lftp.status())
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("eof", lftp.last_status_poll_failure_reason)
+
+        lftp._Lftp__last_command_timed_out = False
+        lftp._Lftp__run_command = MagicMock(return_value="")
+        self.assertEqual([], lftp.status())
+        self.assertTrue(lftp.last_status_poll_healthy)
+        self.assertIsNone(lftp.last_status_poll_failure_reason)
 
     def test_status_marks_poll_unhealthy_when_queue_command_echo_leaks_into_snapshot(self):
         lftp = self._build_status_poll_test_lftp()
@@ -406,6 +534,7 @@ class TestLftp(unittest.TestCase):
 
         self.assertIsNone(statuses)
         self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("parser_error", lftp.last_status_poll_failure_reason)
         self.assertEqual(1, lftp._Lftp__consecutive_status_errors)
 
     def test_status_marks_poll_unhealthy_when_jobs_command_echo_interleaves_with_progress(self):
@@ -426,6 +555,7 @@ class TestLftp(unittest.TestCase):
 
         self.assertIsNone(statuses)
         self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("parser_error", lftp.last_status_poll_failure_reason)
         self.assertEqual(1, lftp._Lftp__consecutive_status_errors)
 
     def test_status_marks_poll_unhealthy_when_jobs_command_raises_exception_pexpect(self):
@@ -436,6 +566,7 @@ class TestLftp(unittest.TestCase):
 
         self.assertEqual([], statuses)
         self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("command_error", lftp.last_status_poll_failure_reason)
         self.assertTrue(lftp._Lftp__last_command_timed_out)
         self.assertEqual(7, lftp._Lftp__process.delaybeforesend)
         self.assertEqual(11, lftp._Lftp__process.delayafterread)
@@ -452,6 +583,7 @@ class TestLftp(unittest.TestCase):
 
         self.assertEqual([], statuses)
         self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("command_error", lftp.last_status_poll_failure_reason)
         self.assertTrue(lftp._Lftp__last_command_timed_out)
         self.assertEqual(7, lftp._Lftp__process.delaybeforesend)
         self.assertEqual(11, lftp._Lftp__process.delayafterread)
@@ -947,6 +1079,11 @@ class TestLftp(unittest.TestCase):
     def setUp(self):
         unit_only_methods = {
             "test_queue_uses_override_paths",
+            "test_queue_sidecar_breadcrumb_classifies_missing_and_is_gated",
+            "test_queue_sidecar_breadcrumb_classifies_rejection_and_valid_artifact",
+            "test_queue_sidecar_breadcrumb_disabled_preserves_dispatch",
+            "test_queue_sidecar_breadcrumb_coalesces_across_interleaved_poll_event",
+            "test_queue_sidecar_breadcrumb_keeps_valid_coverage_transition",
             "test_kill_matches_duplicate_names_by_remote_path",
             "test_set_skips_prompt_readiness_probe",
             "test_status_annotates_path_pairs_from_job_paths",

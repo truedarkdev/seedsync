@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import MagicMock
 
 from model import ModelFile
 from controller.scan import LocalScanner, ScannerError, ScannerProcess
@@ -23,6 +24,23 @@ class TestLocalScanner(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir)
+
+    def test_lftp_sidecar_breadcrumb_forwarding_uses_local_role(self):
+        scanner = LocalScanner(self.temp_dir, use_temp_file=True, path_pair_id="pair")
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner.set_breadcrumb_trace(trace)
+        with open(os.path.join(self.temp_dir, "download.zip.lftp"), "wb") as handle:
+            handle.write(b"partial")
+        with open(os.path.join(self.temp_dir, "download.zip.lftp.lftp-pget-status"), "w") as handle:
+            handle.write("size=100\n0.pos=30\n0.limit=100\n")
+
+        files = scanner.scan()
+
+        self.assertEqual(1, len(files))
+        events = [call for call in trace.record.call_args_list if call.args[1] == "lftp_sidecar_classified"]
+        self.assertEqual(1, len(events))
+        self.assertEqual("local", events[0].args[2]["scan_role"])
 
     def test_progressive_scan_publishes_manifest_and_roots_without_full_snapshot(self):
         os.mkdir(os.path.join(self.temp_dir, "root-a"))

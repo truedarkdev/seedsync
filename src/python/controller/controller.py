@@ -95,6 +95,69 @@ def _breadcrumb_effectively_enabled(trace: object, category: str, level: str = "
     return True
 
 
+_SCAN_AUTHORITY_DIAGNOSTIC_ONLY_KEYS = frozenset({
+    "publication_id",
+    "model_version",
+    "local_scan_generation",
+    "remote_scan_generation",
+})
+
+
+def _scan_authority_semantic_snapshot(snapshot: object) -> dict[str, object]:
+    """Exclude per-publication diagnostic identity from semantic comparisons."""
+    if not isinstance(snapshot, dict):
+        return {}
+    return {
+        key: value for key, value in snapshot.items()
+        if key not in _SCAN_AUTHORITY_DIAGNOSTIC_ONLY_KEYS
+    }
+
+
+def _fractional_queue_trace_enabled(controller: object) -> bool:
+    """Read the optional Queue trace hook without requiring a full Controller."""
+    checker = getattr(controller, "_Controller__fractional_queue_trace_is_enabled", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
+def _record_fractional_queue_trace(
+        controller: object, file_id: str, event: str,
+        details: dict[str, object] | Callable[[], dict[str, object]],
+        flow_id: Optional[str] = None,
+) -> None:
+    """Route optional Queue trace evidence through a callable compatibility hook."""
+    recorder = getattr(controller, "_Controller__record_fractional_queue_trace", None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(file_id, event, details, flow_id=flow_id)
+    except Exception:
+        logger = getattr(controller, "logger", None)
+        if logger is not None:
+            try:
+                logger.debug("Ignoring fractional-mtime Queue breadcrumb failure", exc_info=True)
+            except Exception:
+                pass
+
+
+def _fractional_queue_flow_id(
+        controller: object, file_id: str, operation_sequence: object,
+) -> Optional[str]:
+    """Read the optional Queue flow hook without requiring a full Controller."""
+    factory = getattr(controller, "_Controller__fractional_queue_flow_id", None)
+    if not callable(factory):
+        return None
+    try:
+        result = factory(file_id, operation_sequence)
+    except Exception:
+        return None
+    return result if isinstance(result, str) else None
+
+
 def _final_move_errno_class(error: Optional[BaseException]) -> str:
     """Normalize publication failures without retaining platform text."""
     if error is None:
@@ -320,6 +383,18 @@ class _LftpOperation:
     operation_sequence: int = 0
     pending_dispatch: Optional[PendingQueueDispatch] = None
     download_start_lifecycle_before: Optional[DownloadStartLifecycleEntry] = None
+
+
+_LFTP_STATUS_AUTHORITY_COUNT_LIMIT = 32
+
+_TRANSFER_STOP_TRACE_CATEGORY = "transfer.stop"
+_TRANSFER_STOP_TRACE_SCHEMA = "transfer_stop.v1"
+_TRANSFER_STOP_TRACE_SOURCES = frozenset({"stop", "queue", "rollback"})
+_TRANSFER_STOP_TRACE_OUTCOMES = frozenset({"pending", "success", "error", "rejected"})
+_TRANSFER_STOP_TRACE_REASONS = frozenset({
+    "none", "backend_error", "backend_rejected", "executor_unavailable",
+    "stale_operation", "marker_not_observed",
+})
 
 
 _COLLISION_COMPARE_MAX_BYTES = 16 * 1024 * 1024 * 1024
@@ -581,9 +656,9 @@ class Controller:
     ) -> str | list[str | ExactPathExclusion]:
         configured_patterns = Controller.__get_exclude_patterns(self)
         patterns = parse_exclude_patterns(configured_patterns)
-        trace_enabled = self.__fractional_queue_trace_is_enabled()
+        trace_enabled = _fractional_queue_trace_enabled(self)
         if not is_dir:
-            self.__record_fractional_queue_trace(file_id, "queue_exclusion_serialization", lambda: {
+            _record_fractional_queue_trace(self, file_id, "queue_exclusion_serialization", lambda: {
                 "schema": "fractional_mtime_redownload.queue_exclusion_serialization.v2",
                 "configured_patterns_present": bool(patterns),
                 "exact_leaf_candidates_present": False,
@@ -609,7 +684,7 @@ class Controller:
             if exact_path not in trusted_patterns:
                 trusted_patterns.append(exact_path)
         if not trusted_patterns:
-            self.__record_fractional_queue_trace(file_id, "queue_exclusion_serialization", lambda: {
+            _record_fractional_queue_trace(self, file_id, "queue_exclusion_serialization", lambda: {
                 "schema": "fractional_mtime_redownload.queue_exclusion_serialization.v2",
                 "configured_patterns_present": bool(patterns),
                 "exact_leaf_candidates_present": bool(trusted_paths),
@@ -620,7 +695,7 @@ class Controller:
             }, flow_id=flow_id)
             return configured_patterns
         result = [*patterns, *trusted_patterns]
-        self.__record_fractional_queue_trace(file_id, "queue_exclusion_serialization", lambda: {
+        _record_fractional_queue_trace(self, file_id, "queue_exclusion_serialization", lambda: {
             "schema": "fractional_mtime_redownload.queue_exclusion_serialization.v2",
             "configured_patterns_present": bool(patterns),
             "exact_leaf_candidates_present": bool(trusted_paths),
@@ -846,7 +921,14 @@ class Controller:
         self.__model_summary_cache_at = 0.0
         self.__model_summary_cache_inventory_revision = -1
         self.__model_summary_cache_unknown_local_path_pair_ids: frozenset[Optional[str]] = frozenset()
+        # Monotonic diagnostic identity for the standing scan-authority
+        # publication.  This is deliberately separate from scanner result
+        # sequence numbers, which identify collector activity rather than the
+        # authority snapshot exposed by the model summary.
+        self.__scan_authority_publication_id = 0
         self.__scan_authority_snapshot: dict[str, object] = {
+            "publication_id": 0,
+            "model_version": 0,
             "final": False,
             "full": False,
             "scanned_pair_count": 0,
@@ -952,6 +1034,9 @@ class Controller:
         try:
             self.__lftp = create_transfer_backend(lftp_cfg, self.__transfer_password, self.__ssh_password)
             self.__lftp.set_base_logger(self.logger)
+            breadcrumb_setter = getattr(self.__lftp, "set_breadcrumb_trace", None)
+            if callable(breadcrumb_setter):
+                breadcrumb_setter(self.__context.breadcrumb_trace.create_emitter())
             self.__lftp.set_base_remote_dir_path(self.__legacy_remote_path)
             self.__lftp.set_base_local_dir_path(self.__staging_path)
             self.__configure_lftp()
@@ -1253,7 +1338,80 @@ class Controller:
         with self.__download_start_lock:
             self.__download_start_state[file_id] = previous
 
+    def __record_transfer_stop_breadcrumb(
+            self,
+            file_id: Optional[str],
+            *,
+            source: str,
+            marker_before: bool,
+            marker_after: bool,
+            backend_outcome: str,
+            marker_observed: Optional[bool] = None,
+            operation_sequence: Optional[int] = None,
+            rejection_reason: str = "none",
+            message: str = "transfer_stop_transition",
+    ) -> None:
+        """Record identity-free Stop/Queue marker ordering evidence."""
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        level = "warning" if source == "rollback" else "info"
+        if not _breadcrumb_effectively_enabled(
+                breadcrumb_trace, _TRANSFER_STOP_TRACE_CATEGORY, level,
+        ):
+            return
+        if source not in _TRANSFER_STOP_TRACE_SOURCES or \
+                backend_outcome not in _TRANSFER_STOP_TRACE_OUTCOMES or \
+                rejection_reason not in _TRANSFER_STOP_TRACE_REASONS:
+            return
+        try:
+            # Correlation and all diagnostic payload work stay behind the
+            # complete category/level gate.  The file identity is never
+            # passed to the collector; only a process-local opaque digest is.
+            operation_correlation = None
+            if isinstance(file_id, str):
+                correlation_seed = file_id
+                if type(operation_sequence) is int and operation_sequence > 0:
+                    correlation_seed = "{}:{}".format(file_id, operation_sequence)
+                    operation_correlation = opaque_trace_correlation(correlation_seed)
+                else:
+                    operation_correlation = opaque_trace_correlation(correlation_seed)
+            details = {
+                "schema": _TRANSFER_STOP_TRACE_SCHEMA,
+                "transition_source": source,
+                "marker_before": bool(marker_before),
+                "marker_after": bool(marker_after),
+                "backend_outcome": backend_outcome,
+                "marker_observed": (
+                    marker_observed if isinstance(marker_observed, bool) else None
+                ),
+                "operation_correlation": operation_correlation,
+                "operation_sequence": (
+                    operation_sequence
+                    if type(operation_sequence) is int and operation_sequence > 0
+                    else None
+                ),
+                "rejection_reason": rejection_reason,
+            }
+            self.__record_breadcrumb(
+                stage="transfer_stop",
+                message=message,
+                details=details,
+                event_type="state_transition",
+                corr_id=(
+                    "transfer-stop:{}".format(operation_correlation)
+                    if operation_correlation is not None
+                    else "transfer-stop:aggregate"
+                ),
+                trace_scope="flow" if operation_correlation is not None else "aggregate",
+                category=_TRANSFER_STOP_TRACE_CATEGORY,
+                level=level,
+            )
+        except Exception:
+            # Diagnostics must never affect marker/lifecycle or backend work.
+            self.logger.debug("Ignoring transfer Stop breadcrumb failure", exc_info=True)
+
     def __drain_lftp_operations(self) -> None:
+        record_fractional_queue_trace = _record_fractional_queue_trace
+        fractional_queue_flow_id = _fractional_queue_flow_id
         operations = getattr(self, "_Controller__lftp_operations", [])
         failed_operation_sequences = getattr(
             self, "_Controller__lftp_failed_operation_sequences", None
@@ -1278,8 +1436,44 @@ class Controller:
                 future_outcome = "error"
                 self.logger.warning("Asynchronous lftp %s failed: %s", operation.action, exc)
             operation_file_id = getattr(operation, "file_id", None)
+            if operation.action in ("queue", "stop") and operation_file_id is not None:
+                marker_observed = operation_file_id in self.__persist.stopped_file_names
+                if operation.action == "stop":
+                    self.__record_transfer_stop_breadcrumb(
+                        operation_file_id,
+                        source="stop",
+                        marker_before=marker_observed,
+                        marker_after=marker_observed,
+                        backend_outcome=(
+                            "success" if future_outcome == "accepted" else future_outcome
+                        ),
+                        marker_observed=marker_observed,
+                        operation_sequence=getattr(operation, "operation_sequence", None),
+                        rejection_reason=(
+                            "none" if future_outcome == "accepted" else
+                            ("backend_rejected" if future_outcome == "rejected" else "backend_error")
+                        ),
+                        message="transfer_stop_backend_outcome",
+                    )
+                elif marker_observed:
+                    self.__record_transfer_stop_breadcrumb(
+                        operation_file_id,
+                        source="queue",
+                        marker_before=True,
+                        marker_after=True,
+                        backend_outcome=(
+                            "success" if future_outcome == "accepted" else future_outcome
+                        ),
+                        marker_observed=True,
+                        operation_sequence=getattr(operation, "operation_sequence", None),
+                        rejection_reason=(
+                            "none" if future_outcome == "accepted" else
+                            ("backend_rejected" if future_outcome == "rejected" else "backend_error")
+                        ),
+                        message="transfer_stop_queue_backend_outcome",
+                    )
             if operation.action == "queue" and operation_file_id is not None:
-                self.__record_fractional_queue_trace(operation_file_id, "queue_future_outcome", lambda: {
+                record_fractional_queue_trace(self, operation_file_id, "queue_future_outcome", lambda: {
                     "schema": "fractional_mtime_redownload.queue_future.v2",
                     "dispatch_mode": "async_future",
                     "future_outcome": "success" if future_outcome == "accepted" else (
@@ -1287,8 +1481,8 @@ class Controller:
                     ),
                     "status_acknowledgement": "not_observed" if not failed else "not_applicable",
                     "result": "accepted" if not failed else "rejected",
-                }, flow_id=self.__fractional_queue_flow_id(
-                    operation_file_id, operation.operation_sequence,
+                }, flow_id=fractional_queue_flow_id(
+                    self, operation_file_id, operation.operation_sequence,
                 ))
             if (
                 failed
@@ -1327,6 +1521,7 @@ class Controller:
                     getattr(operation, "download_start_lifecycle_before", None),
                 )
             elif operation.action == "stop" and operation.file_id is not None:
+                marker_before_rollback = operation.file_id in self.__persist.stopped_file_names
                 self.__persist.stopped_file_names.discard(operation.file_id)
                 predecessor_failed = (
                     operation.pending_dispatch is not None
@@ -1339,6 +1534,19 @@ class Controller:
                 self.__restore_failed_stop_lifecycle(
                     operation.file_id,
                     getattr(operation, "download_start_lifecycle_before", None),
+                )
+                self.__record_transfer_stop_breadcrumb(
+                    operation.file_id,
+                    source="rollback",
+                    marker_before=marker_before_rollback,
+                    marker_after=operation.file_id in self.__persist.stopped_file_names,
+                    backend_outcome=future_outcome,
+                    marker_observed=operation.file_id in self.__persist.stopped_file_names,
+                    operation_sequence=getattr(operation, "operation_sequence", None),
+                    rejection_reason=(
+                        "backend_rejected" if future_outcome == "rejected" else "backend_error"
+                    ),
+                    message="transfer_stop_marker_rollback",
                 )
             elif operation.action == "reconfigure":
                 self.__restore_lftp_reconfigure_request()
@@ -1370,6 +1578,71 @@ class Controller:
             # applies its normal bounded retry cadence to this snapshot.
             self.logger.warning("Asynchronous lftp status poll failed: %s", exc)
             return (list(getattr(self, "_Controller__last_lftp_statuses", None) or []), False)
+
+    def _lftp_status_authority_context(self, poll_due: bool) -> dict[str, object]:
+        """Return bounded, identity-free Queue/LFTP poll authority context."""
+        status_future = getattr(self, "_Controller__lftp_status_future", None)
+        if status_future is None:
+            status_future_state = "none"
+        else:
+            try:
+                status_future_state = "done" if status_future.done() is True else "pending"
+            except Exception:
+                # A future that cannot report completion is still not a safe
+                # basis for claiming that the status poll completed.
+                status_future_state = "pending"
+
+        pending_dispatch_count = 0
+        lftp_queue_operation_pending_count = 0
+        lftp_queue_operation_done_count = 0
+
+        def collect_counts() -> None:
+            nonlocal pending_dispatch_count
+            nonlocal lftp_queue_operation_pending_count
+            nonlocal lftp_queue_operation_done_count
+            pending_dispatches = getattr(self, "_Controller__pending_queue_dispatches", None)
+            if isinstance(pending_dispatches, dict):
+                for dispatch in pending_dispatches.values():
+                    if isinstance(dispatch, PendingQueueDispatch):
+                        pending_dispatch_count += 1
+                        if pending_dispatch_count >= _LFTP_STATUS_AUTHORITY_COUNT_LIMIT:
+                            break
+
+            operations = getattr(self, "_Controller__lftp_operations", None)
+            if not isinstance(operations, list):
+                return
+            for operation in operations:
+                if getattr(operation, "action", None) != "queue":
+                    continue
+                future = getattr(operation, "future", None)
+                try:
+                    completed = future is not None and future.done() is True
+                except Exception:
+                    completed = False
+                if completed:
+                    if lftp_queue_operation_done_count < _LFTP_STATUS_AUTHORITY_COUNT_LIMIT:
+                        lftp_queue_operation_done_count += 1
+                elif lftp_queue_operation_pending_count < _LFTP_STATUS_AUTHORITY_COUNT_LIMIT:
+                    lftp_queue_operation_pending_count += 1
+                if (
+                    lftp_queue_operation_pending_count >= _LFTP_STATUS_AUTHORITY_COUNT_LIMIT
+                    and lftp_queue_operation_done_count >= _LFTP_STATUS_AUTHORITY_COUNT_LIMIT
+                ):
+                    break
+
+        work_state_lock = getattr(self, "_Controller__work_state_lock", None)
+        if work_state_lock is None:
+            collect_counts()
+        else:
+            with work_state_lock:
+                collect_counts()
+        return {
+            "poll_due": bool(poll_due),
+            "status_future_state": status_future_state,
+            "queue_dispatch_pending_count": pending_dispatch_count,
+            "lftp_queue_operation_pending_count": lftp_queue_operation_pending_count,
+            "lftp_queue_operation_done_count": lftp_queue_operation_done_count,
+        }
 
     def _lftp_statuses_with_pending_dispatches(
             self, statuses: list[LftpJobStatus]
@@ -3142,6 +3415,37 @@ class Controller:
                 "_global_model_version": self.__model.version,
             }
 
+    def _publish_scan_authority_snapshot(self, snapshot: dict[str, object]) -> dict[str, object]:
+        """Atomically publish the diagnostic scan-authority identity.
+
+        The updater calls this after source adoption and the unknown overlay
+        have settled.  Keeping the identity and model version assignment under
+        the model lock makes a summary read either the prior authority
+        snapshot or this complete publication, never a mixed projection.
+        """
+        with self.__model_lock:
+            previous_id = getattr(self, "_Controller__scan_authority_publication_id", 0)
+            if type(previous_id) is not int or previous_id < 0:
+                previous_id = 0
+            previous_snapshot = getattr(self, "_Controller__scan_authority_snapshot", {})
+            if isinstance(previous_snapshot, dict):
+                snapshot_id = previous_snapshot.get("publication_id")
+                if type(snapshot_id) is int and snapshot_id > previous_id:
+                    previous_id = snapshot_id
+            publication_id = previous_id + 1
+            model_version = getattr(self.__model, "version", None)
+            if type(model_version) is not int or model_version < 0:
+                model_version = previous_snapshot.get("model_version", 0) \
+                    if isinstance(previous_snapshot, dict) else 0
+            if type(model_version) is not int or model_version < 0:
+                model_version = 0
+            published = dict(snapshot)
+            published["publication_id"] = publication_id
+            published["model_version"] = model_version
+            self.__scan_authority_publication_id = publication_id
+            self.__scan_authority_snapshot = published
+            return dict(published)
+
     def get_model_summary(self, max_age_seconds: float = 0.0) -> dict[str, object]:
         """Return compact root-only counts; deliberately no file tree records."""
         with self.__model_lock:
@@ -3167,6 +3471,9 @@ class Controller:
             scan_authority_snapshot = getattr(self, "_Controller__scan_authority_snapshot", {})
             if not isinstance(scan_authority_snapshot, dict):
                 scan_authority_snapshot = {}
+            scan_authority_semantic_snapshot = _scan_authority_semantic_snapshot(
+                scan_authority_snapshot
+            )
             if (
                 max_age_seconds > 0 and isinstance(cached_summary, dict)
                 and cached_summary.get("model_version") == self.__model.version
@@ -3174,9 +3481,18 @@ class Controller:
                 and getattr(
                     self, "_Controller__model_summary_cache_unknown_local_path_pair_ids", frozenset()
                 ) == unknown_local_path_pair_ids
-                and getattr(self, "_Controller__model_summary_cache_scan_authority_snapshot", {}) == scan_authority_snapshot
+                and getattr(
+                    self, "_Controller__model_summary_cache_scan_authority_snapshot", {}
+                ) == scan_authority_semantic_snapshot
                 and now - cached_at < max_age_seconds
             ):
+                # Keep the cached projection current for diagnostics-only
+                # publication identity changes without rebuilding or
+                # invalidating the semantic summary.
+                cached_summary["scan_authority"] = dict(scan_authority_snapshot)
+                self.__model_summary_cache_scan_authority_snapshot = dict(
+                    scan_authority_semantic_snapshot
+                )
                 return cached_summary
             summaries: dict[str, dict[str, object]] = {}
 
@@ -3268,7 +3584,9 @@ class Controller:
             self.__model_summary_cache_at = now
             self.__model_summary_cache_inventory_revision = inventory_revision
             self.__model_summary_cache_unknown_local_path_pair_ids = unknown_local_path_pair_ids
-            self.__model_summary_cache_scan_authority_snapshot = dict(scan_authority_snapshot)
+            self.__model_summary_cache_scan_authority_snapshot = dict(
+                scan_authority_semantic_snapshot
+            )
             return summary
 
     def notify_model_summary_changed(self) -> None:
@@ -7248,7 +7566,7 @@ class Controller:
                     exclude_patterns = self.__transfer_exclude_patterns(
                         file_id,
                         is_dir,
-                        self.__fractional_queue_flow_id(file_id, operation_sequence),
+                        _fractional_queue_flow_id(self, file_id, operation_sequence),
                     )
                     if exclude_patterns:
                         queue_kwargs["exclude_patterns"] = exclude_patterns
@@ -7294,49 +7612,49 @@ class Controller:
                                 file_name,
                                 staging_path,
                             )
-                            self.__record_fractional_queue_trace(file_id, "startup_recovery_queue_dispatch", lambda: {
+                            _record_fractional_queue_trace(self, file_id, "startup_recovery_queue_dispatch", lambda: {
                                 "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
                                 "dispatch_mode": "async_future",
                                 "future_outcome": "backend_rejection",
                                 "status_acknowledgement": "not_applicable",
                                 "result": "rejected",
                                 "reason": "backend_shutting_down",
-                            }, flow_id=self.__fractional_queue_flow_id(file_id, operation_sequence))
+                            }, flow_id=_fractional_queue_flow_id(self, file_id, operation_sequence))
                             continue
-                        self.__record_fractional_queue_trace(file_id, "startup_recovery_queue_dispatch", lambda: {
+                        _record_fractional_queue_trace(self, file_id, "startup_recovery_queue_dispatch", lambda: {
                             "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
                             "dispatch_mode": "async_future",
                             "future_outcome": "pending",
                             "status_acknowledgement": "pending",
                             "result": "submitted",
-                        }, flow_id=self.__fractional_queue_flow_id(file_id, operation_sequence))
+                        }, flow_id=_fractional_queue_flow_id(self, file_id, operation_sequence))
                     else:
                         if queue_lftp() is False:
-                            self.__record_fractional_queue_trace(file_id, "startup_recovery_queue_dispatch", lambda: {
+                            _record_fractional_queue_trace(self, file_id, "startup_recovery_queue_dispatch", lambda: {
                                 "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
                                 "dispatch_mode": "sync_backend",
                                 "future_outcome": "backend_rejection",
                                 "status_acknowledgement": "not_applicable",
                                 "result": "rejected",
-                            }, flow_id=self.__fractional_queue_flow_id(file_id, operation_sequence))
+                            }, flow_id=_fractional_queue_flow_id(self, file_id, operation_sequence))
                             continue
-                        self.__record_fractional_queue_trace(file_id, "startup_recovery_queue_dispatch", lambda: {
+                        _record_fractional_queue_trace(self, file_id, "startup_recovery_queue_dispatch", lambda: {
                             "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
                             "dispatch_mode": "sync_backend",
                             "future_outcome": "not_applicable",
                             "status_acknowledgement": "pending",
                             "result": "submitted",
-                        }, flow_id=self.__fractional_queue_flow_id(file_id, operation_sequence))
+                        }, flow_id=_fractional_queue_flow_id(self, file_id, operation_sequence))
                     self.logger.info("Recovered interrupted download '%s' from '%s'", file_name, staging_path)
                 except (LftpError, RcloneTransferError) as error:
-                    self.__record_fractional_queue_trace(file_id, "startup_recovery_queue_dispatch", lambda: {
+                    _record_fractional_queue_trace(self, file_id, "startup_recovery_queue_dispatch", lambda: {
                         "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
                         "dispatch_mode": "async_future" if self.__uses_async_lftp_owner() else "sync_backend",
                         "future_outcome": "error",
                         "status_acknowledgement": "not_applicable",
                         "result": "rejected",
                         "reason": "backend_error",
-                    }, flow_id=self.__fractional_queue_flow_id(file_id, operation_sequence))
+                    }, flow_id=_fractional_queue_flow_id(self, file_id, operation_sequence))
                     self.logger.warning(
                         "Failed to recover interrupted download '%s' from '%s': %s",
                         file_name,
@@ -7381,6 +7699,8 @@ class Controller:
         confirmation: only a RUNNING status may commit resume provenance or
         start-lifecycle effects.
         """
+        record_fractional_queue_trace = _record_fractional_queue_trace
+        fractional_queue_flow_id = _fractional_queue_flow_id
         pending = self.__queue_dispatch_pending()
         statuses_by_file_id = {
             status.file_id: status for status in statuses if isinstance(status, LftpJobStatus)
@@ -7394,13 +7714,13 @@ class Controller:
             if file_id in active_file_ids:
                 dispatch = pending[file_id]
                 if status is not None and status.state == LftpJobStatus.State.QUEUED:
-                    self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+                    record_fractional_queue_trace(self, file_id, "queue_status_ack", lambda: {
                         "schema": "fractional_mtime_redownload.queue_status_ack.v2",
                         "status_acknowledgement": "queued",
                         "future_outcome": "not_observed",
                         "result": "pending",
-                    }, flow_id=self.__fractional_queue_flow_id(
-                        file_id, dispatch.operation_sequence,
+                    }, flow_id=fractional_queue_flow_id(
+                        self, file_id, dispatch.operation_sequence,
                     ))
                     # A raw QUEUED row is only acknowledgement that the
                     # backend accepted the operation.  Keep the accepted
@@ -7412,14 +7732,14 @@ class Controller:
                     if status is None or status.state != LftpJobStatus.State.RUNNING or status.type not in (
                             LftpJobStatus.Type.GET, LftpJobStatus.Type.PGET,
                     ):
-                        self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+                        record_fractional_queue_trace(self, file_id, "queue_status_ack", lambda: {
                             "schema": "fractional_mtime_redownload.queue_status_ack.v2",
                             "status_acknowledgement": "ambiguous",
                             "future_outcome": "not_observed",
                             "result": "pending",
                             "reason": "running_identity_unproven",
-                        }, flow_id=self.__fractional_queue_flow_id(
-                            file_id, dispatch.operation_sequence,
+                        }, flow_id=fractional_queue_flow_id(
+                            self, file_id, dispatch.operation_sequence,
                         ))
                         # A queued status has not reset an old map yet. Keep
                         # this existing dispatch until a running GET/PGET is
@@ -7434,13 +7754,13 @@ class Controller:
                 # A fresh healthy transport snapshot has made the accepted
                 # lifecycle authoritative. The model's active-state guard now
                 # owns duplicate suppression.
-                self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+                record_fractional_queue_trace(self, file_id, "queue_status_ack", lambda: {
                     "schema": "fractional_mtime_redownload.queue_status_ack.v2",
                     "status_acknowledgement": "running",
                     "future_outcome": "not_observed",
                     "result": "accepted",
-                }, flow_id=self.__fractional_queue_flow_id(
-                    file_id, dispatch.operation_sequence,
+                }, flow_id=fractional_queue_flow_id(
+                    self, file_id, dispatch.operation_sequence,
                 ))
                 del pending[file_id]
                 continue
@@ -7449,14 +7769,14 @@ class Controller:
                 # The snapshot is not idle, so an absent job remains
                 # ambiguous until its next authoritative reconciliation.
                 dispatch = pending[file_id]
-                self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+                record_fractional_queue_trace(self, file_id, "queue_status_ack", lambda: {
                     "schema": "fractional_mtime_redownload.queue_status_ack.v2",
                     "status_acknowledgement": "ambiguous",
                     "future_outcome": "not_observed",
                     "result": "pending",
                     "reason": "other_active_work",
-                }, flow_id=self.__fractional_queue_flow_id(
-                    file_id, dispatch.operation_sequence,
+                }, flow_id=fractional_queue_flow_id(
+                    self, file_id, dispatch.operation_sequence,
                 ))
                 continue
             dispatch = pending[file_id]
@@ -7468,13 +7788,13 @@ class Controller:
             if matching_queue_operations:
                 operation = matching_queue_operations[-1]
                 if not operation.future.done():
-                    self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+                    record_fractional_queue_trace(self, file_id, "queue_status_ack", lambda: {
                         "schema": "fractional_mtime_redownload.queue_status_ack.v2",
                         "status_acknowledgement": "future_pending",
                         "future_outcome": "pending",
                         "result": "pending",
-                    }, flow_id=self.__fractional_queue_flow_id(
-                        file_id, dispatch.operation_sequence,
+                    }, flow_id=fractional_queue_flow_id(
+                        self, file_id, dispatch.operation_sequence,
                     ))
                     continue
                 future_outcome = "success"
@@ -7486,13 +7806,13 @@ class Controller:
                 if not accepted and future_outcome != "error":
                     future_outcome = "backend_rejection"
                 if not accepted:
-                    self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+                    record_fractional_queue_trace(self, file_id, "queue_status_ack", lambda: {
                         "schema": "fractional_mtime_redownload.queue_status_ack.v2",
                         "status_acknowledgement": "rejected",
                         "future_outcome": future_outcome,
                         "result": "rejected",
-                    }, flow_id=self.__fractional_queue_flow_id(
-                        file_id, dispatch.operation_sequence,
+                    }, flow_id=fractional_queue_flow_id(
+                        self, file_id, dispatch.operation_sequence,
                     ))
                     # Let the ordinary queue failure path restore its command
                     # lifecycle, but never let its stale intent become a
@@ -7500,13 +7820,13 @@ class Controller:
                     del pending[file_id]
                     continue
             del pending[file_id]
-            self.__record_fractional_queue_trace(file_id, "queue_status_ack", lambda: {
+            record_fractional_queue_trace(self, file_id, "queue_status_ack", lambda: {
                 "schema": "fractional_mtime_redownload.queue_status_ack.v2",
                 "status_acknowledgement": "idle_completion",
                 "future_outcome": future_outcome if matching_queue_operations else "not_observed",
                 "result": "accepted",
-            }, flow_id=self.__fractional_queue_flow_id(
-                file_id, dispatch.operation_sequence,
+            }, flow_id=fractional_queue_flow_id(
+                self, file_id, dispatch.operation_sequence,
             ))
             if not self.__is_explicitly_stopped(dispatch.name, dispatch.path_pair_id):
                 retired_without_running.add((
@@ -8277,7 +8597,21 @@ class Controller:
                         file.name,
                         file.path_pair_id
                     )
-                    self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                    self.__record_transfer_stop_breadcrumb(
+                        file.file_id,
+                        source="queue",
+                        marker_before=stopped_marked,
+                        marker_after=self.__has_persist_key(
+                            self.__persist.stopped_file_names,
+                            file.name,
+                            file.path_pair_id,
+                        ),
+                        backend_outcome="success",
+                        marker_observed=False,
+                        rejection_reason="none",
+                        message="transfer_stop_queue_marker_clear",
+                    )
+                    _record_fractional_queue_trace(self, file.file_id, "queue_dispatch", lambda: {
                         "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                         "dispatch_mode": "idempotent_noop",
                         "future_outcome": "not_applicable",
@@ -8298,7 +8632,7 @@ class Controller:
                     )
                 elif file.remote_size is None:
                     self.__retire_deferred_queue_intent(file.file_id, "remote_unavailable")
-                    self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                    _record_fractional_queue_trace(self, file.file_id, "queue_dispatch", lambda: {
                         "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                         "dispatch_mode": "not_dispatched",
                         "future_outcome": "not_applicable",
@@ -8310,7 +8644,7 @@ class Controller:
                     continue
                 elif not file.remote_has_transferable_content:
                     self.__retire_deferred_queue_intent(file.file_id, "remote_content_unavailable")
-                    self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                    _record_fractional_queue_trace(self, file.file_id, "queue_dispatch", lambda: {
                         "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                         "dispatch_mode": "not_dispatched",
                         "future_outcome": "not_applicable",
@@ -8333,7 +8667,7 @@ class Controller:
                         file.path_pair_id
                 ):
                     self.__retire_deferred_queue_intent(file.file_id, "local_readiness_unavailable")
-                    self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                    _record_fractional_queue_trace(self, file.file_id, "queue_dispatch", lambda: {
                         "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                         "dispatch_mode": "not_dispatched",
                         "future_outcome": "not_applicable",
@@ -8449,7 +8783,7 @@ class Controller:
                         exclude_patterns = self.__transfer_exclude_patterns(
                             file.file_id,
                             file.is_dir,
-                            self.__fractional_queue_flow_id(file.file_id, operation_sequence),
+                            _fractional_queue_flow_id(self, file.file_id, operation_sequence),
                         )
                         if exclude_patterns:
                             queue_kwargs["exclude_patterns"] = exclude_patterns
@@ -8516,7 +8850,7 @@ class Controller:
                                     download_start_lifecycle_before=lifecycle_before_queue):
                                 pending_queue_dispatches.pop(file.file_id, None)
                                 self.__retire_deferred_queue_intent(file.file_id, "backend_shutting_down")
-                                self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                                _record_fractional_queue_trace(self, file.file_id, "queue_dispatch", lambda: {
                                     "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                                     "dispatch_mode": "async_future",
                                     "future_outcome": "backend_rejection",
@@ -8524,33 +8858,55 @@ class Controller:
                                     "exclusions_present": exclusions_present,
                                     "result": "rejected",
                                     "reason": "backend_shutting_down",
-                                }, flow_id=self.__fractional_queue_flow_id(
+                                }, flow_id=_fractional_queue_flow_id(self,
                                     file.file_id, operation_sequence,
                                 ))
+                                self.__record_transfer_stop_breadcrumb(
+                                    file.file_id,
+                                    source="queue",
+                                    marker_before=stopped_marked,
+                                    marker_after=stopped_marked,
+                                    backend_outcome="rejected",
+                                    marker_observed=stopped_marked,
+                                    operation_sequence=operation_sequence,
+                                    rejection_reason="executor_unavailable",
+                                    message="transfer_stop_queue_backend_outcome",
+                                )
                                 _notify_failure(command, "Transfer backend is shutting down", 503, file)
                                 continue
-                            self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                            _record_fractional_queue_trace(self, file.file_id, "queue_dispatch", lambda: {
                                 "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                                 "dispatch_mode": "async_future",
                                 "future_outcome": "pending",
                                 "status_acknowledgement": "pending",
                                 "exclusions_present": exclusions_present,
                                 "result": "submitted",
-                            }, flow_id=self.__fractional_queue_flow_id(
+                            }, flow_id=_fractional_queue_flow_id(self,
                                 file.file_id, operation_sequence,
                             ))
+                            self.__record_transfer_stop_breadcrumb(
+                                file.file_id,
+                                source="queue",
+                                marker_before=stopped_marked,
+                                marker_after=stopped_marked,
+                                backend_outcome="pending",
+                                marker_observed=stopped_marked,
+                                operation_sequence=operation_sequence,
+                                rejection_reason="none",
+                                message="transfer_stop_queue_backend_outcome",
+                            )
                         else:
                             if queue_lftp() is False:
                                 sync_backend_rejected = True
                                 raise LftpError("Transfer backend rejected queue request")
-                            self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                            _record_fractional_queue_trace(self, file.file_id, "queue_dispatch", lambda: {
                                 "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                                 "dispatch_mode": "sync_backend",
                                 "future_outcome": "not_applicable",
                                 "status_acknowledgement": "pending",
                                 "exclusions_present": exclusions_present,
                                 "result": "submitted",
-                            }, flow_id=self.__fractional_queue_flow_id(
+                            }, flow_id=_fractional_queue_flow_id(self,
                                 file.file_id, operation_sequence,
                             ))
                         # A successful Queue changes the transfer state even
@@ -8595,6 +8951,27 @@ class Controller:
                             file.full_path,
                             file.path_pair_id
                         )
+                        self.__record_transfer_stop_breadcrumb(
+                            file.file_id,
+                            source="queue",
+                            marker_before=stopped_marked,
+                            marker_after=self.__has_persist_key(
+                                self.__persist.stopped_file_names,
+                                file.full_path,
+                                file.path_pair_id,
+                            ),
+                            backend_outcome=(
+                                "pending" if self.__uses_async_lftp_owner() else "success"
+                            ),
+                            marker_observed=self.__has_persist_key(
+                                self.__persist.stopped_file_names,
+                                file.full_path,
+                                file.path_pair_id,
+                            ),
+                            operation_sequence=operation_sequence,
+                            rejection_reason="none",
+                            message="transfer_stop_queue_marker_clear",
+                        )
                         if is_new_transfer_lifecycle:
                             # A genuinely new queue invalidates all final-move
                             # identity from the prior transfer lifecycle.
@@ -8634,7 +9011,7 @@ class Controller:
                             file.file_id,
                             lifecycle_before_queue,
                         )
-                        self.__record_fractional_queue_trace(file.file_id, "queue_dispatch", lambda: {
+                        _record_fractional_queue_trace(self, file.file_id, "queue_dispatch", lambda: {
                             "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                             "dispatch_mode": "async_future" if self.__uses_async_lftp_owner() else "sync_backend",
                             "future_outcome": "backend_rejection" if sync_backend_rejected else "error",
@@ -8642,7 +9019,7 @@ class Controller:
                             "exclusions_present": exclusions_present,
                             "result": "rejected",
                             "reason": "backend_rejected" if sync_backend_rejected else "backend_error",
-                        }, flow_id=self.__fractional_queue_flow_id(
+                        }, flow_id=_fractional_queue_flow_id(self,
                             file.file_id, operation_sequence,
                         ))
                         _notify_failure(command, "Transfer backend error: {}".format(str(e)), 500, file)
@@ -8665,6 +9042,7 @@ class Controller:
                     )
                     continue
                 if deferred_stop_intent is not None and file.file_id not in pending_queue_dispatches:
+                    marker_before_stop = file.file_id in self.__persist.stopped_file_names
                     self.__persist.stopped_file_names.add(file.file_id)
                     stopped_queue_lifecycle_ids.add(file.file_id)
                     self.__suppress_download_start_lifecycle(file.file_id)
@@ -8691,6 +9069,16 @@ class Controller:
                             "mode": "deferred_queue_cancel",
                         },
                         file=file,
+                    )
+                    self.__record_transfer_stop_breadcrumb(
+                        file.file_id,
+                        source="stop",
+                        marker_before=marker_before_stop,
+                        marker_after=True,
+                        backend_outcome="success",
+                        marker_observed=True,
+                        rejection_reason="none",
+                        message="transfer_stop_marker_transition",
                     )
                     self.__validate_process.clear(file.file_id)
                     for callback in command.callbacks:
@@ -8777,8 +9165,30 @@ class Controller:
                                 file.file_id,
                                 lifecycle_before_stop,
                             )
+                            self.__record_transfer_stop_breadcrumb(
+                                file.file_id,
+                                source="rollback",
+                                marker_before=True,
+                                marker_after=file.file_id in self.__persist.stopped_file_names,
+                                backend_outcome="rejected",
+                                marker_observed=file.file_id in self.__persist.stopped_file_names,
+                                operation_sequence=operation_sequence,
+                                rejection_reason="executor_unavailable",
+                                message="transfer_stop_marker_rollback",
+                            )
                             _notify_failure(command, "Transfer backend is shutting down", 503, file)
                             continue
+                        self.__record_transfer_stop_breadcrumb(
+                            file.file_id,
+                            source="stop",
+                            marker_before=stopped_marked,
+                            marker_after=True,
+                            backend_outcome="pending",
+                            marker_observed=True,
+                            operation_sequence=operation_sequence,
+                            rejection_reason="none",
+                            message="transfer_stop_marker_transition",
+                        )
                     else:
                         killed = kill_lftp()
                         if not killed:
@@ -8789,6 +9199,17 @@ class Controller:
                                 file.file_id,
                                 lifecycle_before_stop,
                             )
+                            self.__record_transfer_stop_breadcrumb(
+                                file.file_id,
+                                source="rollback",
+                                marker_before=True,
+                                marker_after=file.file_id in self.__persist.stopped_file_names,
+                                backend_outcome="rejected",
+                                marker_observed=file.file_id in self.__persist.stopped_file_names,
+                                operation_sequence=operation_sequence,
+                                rejection_reason="backend_rejected",
+                                message="transfer_stop_marker_rollback",
+                            )
                             _notify_failure(
                                 command,
                                 "File '{}' could not be stopped".format(command.filename),
@@ -8796,6 +9217,17 @@ class Controller:
                                 file
                             )
                             continue
+                        self.__record_transfer_stop_breadcrumb(
+                            file.file_id,
+                            source="stop",
+                            marker_before=stopped_marked,
+                            marker_after=True,
+                            backend_outcome="success",
+                            marker_observed=True,
+                            operation_sequence=operation_sequence,
+                            rejection_reason="none",
+                            message="transfer_stop_marker_transition",
+                        )
                     # Force the next model refresh to observe the post-stop lftp state
                     # instead of reusing the pre-stop running snapshot for one more cycle.
                     self.__next_lftp_status_poll_at = None

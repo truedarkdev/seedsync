@@ -15,6 +15,7 @@ from controller.persist_keys import KEY_SEP
 from controller.model_updater import (
     ModelUpdater,
     _breadcrumb_effectively_enabled,
+    _record_lftp_status_breadcrumb,
     _ProgressiveScanAccumulator,
     _JointProgressiveReconciler,
     _filter_progressive_remote_state,
@@ -520,6 +521,268 @@ class TestModelUpdater(unittest.TestCase):
                 "raw_local_reconciliation_before_count": details["raw_local_reconciliation_before_count"],
             },
         )
+
+    def test_scan_authority_event_matches_standing_summary_identity_and_versions(self):
+        remote = ScannerResult(
+            datetime.now(), [SystemFile("private-remote-root", 1)],
+            scanned_path_pair_ids={"private-pair"},
+            completed_path_pair_ids={"private-pair"},
+            is_progress=True, is_scan_final=True, is_full_snapshot=True,
+            session_token="private-remote-session",
+            generation=7,
+        )
+        local = ScannerResult(
+            datetime.now(), [SystemFile("private-local-root", 1)],
+            scanned_path_pair_ids={"private-pair"},
+            completed_path_pair_ids={"private-pair"},
+            is_progress=True, is_scan_final=True, is_full_snapshot=True,
+            session_token="private-local-session",
+            generation=8,
+        )
+        remote.files[0].path_pair_id = "private-pair"
+        local.files[0].path_pair_id = "private-pair"
+        controller, model_builder = self._make_progressive_update_controller(
+            remote, local, authoritative=False,
+        )
+        controller._Controller__path_pairs_by_id = {"private-pair": MagicMock()}
+        controller._Controller__model.version = 11
+        controller._Controller__model.iter_files.return_value = []
+        model_builder.local_library_inventory_snapshot.return_value = (0, {})
+        model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset()
+        controller._model_scope_id = Controller._model_scope_id
+        controller.get_model_summary = Controller.get_model_summary.__get__(controller, Controller)
+        controller._Controller__record_breadcrumb = MagicMock()
+
+        ModelUpdater(controller).update()
+
+        authority_call = next(
+            call for call in controller._Controller__record_breadcrumb.call_args_list
+            if call.kwargs.get("message") == "scan_authority"
+        )
+        details = authority_call.kwargs["details"]
+        summary = controller.get_model_summary()
+        summary_snapshot = summary["scan_authority"]
+        self.assertEqual("scan.authority", authority_call.kwargs["category"])
+        self.assertEqual(summary_snapshot["publication_id"], details["publication_id"])
+        self.assertEqual(summary_snapshot["model_version"], details["model_version"])
+        self.assertEqual(
+            summary_snapshot["local_scan_generation"], details["local_scan_generation"],
+        )
+        self.assertEqual(
+            summary_snapshot["remote_scan_generation"], details["remote_scan_generation"],
+        )
+        self.assertEqual(11, summary["model_version"])
+        for private_value in (
+            "private-remote-root", "private-local-root", "private-pair",
+            "private-remote-session", "private-local-session",
+        ):
+            self.assertNotIn(private_value, str({"details": details, "summary": summary}))
+
+    def test_scan_authority_event_is_category_gated_before_payload_emission(self):
+        remote = ScannerResult(
+            datetime.now(), [SystemFile("private-root", 1)],
+            scanned_path_pair_ids={"private-pair"},
+        )
+        controller, _ = self._make_progressive_update_controller(remote)
+
+        class CategoryGate:
+            def is_effectively_enabled(self, category, level="info"):
+                return category != "scan.authority"
+
+        controller._Controller__context.breadcrumb_trace = CategoryGate()
+        controller._Controller__record_breadcrumb = MagicMock()
+
+        ModelUpdater(controller).update()
+
+        authority_calls = [
+            call for call in controller._Controller__record_breadcrumb.call_args_list
+            if call.kwargs.get("message") == "scan_authority"
+        ]
+        self.assertEqual([], authority_calls)
+        self.assertNotIn(
+            "publication_id",
+            str([
+                call.kwargs.get("details")
+                for call in controller._Controller__record_breadcrumb.call_args_list
+            ]),
+        )
+
+    def test_scan_authority_identity_only_repeat_does_not_notify_summary_but_transition_does(self):
+        first_remote = ScannerResult(
+            datetime.now(), [SystemFile("root", 1)],
+            scanned_path_pair_ids={"pair"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            first_remote, local_scan=None, authoritative=True,
+        )
+        controller._Controller__record_breadcrumb = MagicMock()
+        controller.notify_model_summary_changed = MagicMock()
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        self.assertEqual(1, controller.notify_model_summary_changed.call_count)
+        first_publication_id = controller._Controller__scan_authority_snapshot["publication_id"]
+
+        controller.notify_model_summary_changed.reset_mock()
+        updater.update()
+        self.assertEqual(0, controller.notify_model_summary_changed.call_count)
+        second_publication_id = controller._Controller__scan_authority_snapshot["publication_id"]
+        self.assertGreater(second_publication_id, first_publication_id)
+
+        transitioned_remote = ScannerResult(
+            datetime.now(), [SystemFile("root", 1)],
+            scanned_path_pair_ids={"pair"},
+            unknown_path_pair_ids={"pair"},
+        )
+        controller._Controller__remote_scan_process.pop_latest_result.return_value = transitioned_remote
+        updater.update()
+        self.assertEqual(1, controller.notify_model_summary_changed.call_count)
+
+    def test_scan_authority_retains_absent_side_generation_from_prior_publication(self):
+        pair_id = "private-pair"
+
+        def scan_file(name):
+            file = SystemFile(name, 1)
+            file.path_pair_id = pair_id
+            return file
+
+        first_remote = ScannerResult(
+            datetime.now(), [scan_file("private-remote-root")],
+            scanned_path_pair_ids={pair_id}, completed_path_pair_ids={pair_id},
+            generation=7, is_progress=True, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id},
+            session_token="private-remote-session",
+        )
+        first_local = ScannerResult(
+            datetime.now(), [scan_file("private-local-root")],
+            scanned_path_pair_ids={pair_id}, completed_path_pair_ids={pair_id},
+            generation=8, is_progress=True, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id},
+            session_token="private-local-session",
+        )
+        second_remote = ScannerResult(
+            datetime.now(), [scan_file("private-remote-root-new")],
+            scanned_path_pair_ids={pair_id}, completed_path_pair_ids={pair_id},
+            generation=9, is_progress=True, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id},
+            session_token="private-remote-session",
+        )
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False,
+        )
+        controller._Controller__path_pairs_by_id = {pair_id: MagicMock()}
+        controller._Controller__remote_scan_process = self._progressive_process(
+            "private-remote-session", [[first_remote], [second_remote]],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            "private-local-session", [[first_local], []],
+        )
+        controller._Controller__model.version = 11
+        controller._Controller__model.iter_files.return_value = []
+        model_builder.local_library_inventory_snapshot.return_value = (0, {})
+        model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset()
+        controller._model_scope_id = Controller._model_scope_id
+        controller.get_model_summary = Controller.get_model_summary.__get__(controller, Controller)
+        controller._Controller__record_breadcrumb = MagicMock()
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        updater.update()
+
+        authority_calls = [
+            call for call in controller._Controller__record_breadcrumb.call_args_list
+            if call.kwargs.get("message") == "scan_authority"
+        ]
+        self.assertEqual(2, len(authority_calls))
+        second_details = authority_calls[-1].kwargs["details"]
+        second_summary = controller.get_model_summary()["scan_authority"]
+        self.assertEqual(8, second_summary["local_scan_generation"])
+        self.assertEqual(9, second_summary["remote_scan_generation"])
+        self.assertEqual(8, second_details["local_scan_generation"])
+        self.assertEqual(9, second_details["remote_scan_generation"])
+        self.assertEqual(
+            second_summary["publication_id"], second_details["publication_id"],
+        )
+        for private_value in (
+            "private-remote-root", "private-local-root", "private-pair",
+            "private-remote-session", "private-local-session",
+        ):
+            self.assertNotIn(private_value, str({"details": second_details, "summary": second_summary}))
+
+    def test_scan_authority_clears_absent_side_generation_after_session_reset(self):
+        pair_id = "private-pair"
+
+        def scan_file(name):
+            file = SystemFile(name, 1)
+            file.path_pair_id = pair_id
+            return file
+
+        first_remote = ScannerResult(
+            datetime.now(), [scan_file("private-remote-root")],
+            scanned_path_pair_ids={pair_id}, completed_path_pair_ids={pair_id},
+            generation=7, is_progress=True, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id},
+            session_token="private-remote-session",
+        )
+        first_local = ScannerResult(
+            datetime.now(), [scan_file("private-local-root")],
+            scanned_path_pair_ids={pair_id}, completed_path_pair_ids={pair_id},
+            generation=8, is_progress=True, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id},
+            session_token="private-local-session",
+        )
+        second_remote = ScannerResult(
+            datetime.now(), [scan_file("private-remote-root-new")],
+            scanned_path_pair_ids={pair_id}, completed_path_pair_ids={pair_id},
+            generation=9, is_progress=True, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id},
+            session_token="private-remote-session",
+        )
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False,
+        )
+        controller._Controller__path_pairs_by_id = {pair_id: MagicMock()}
+        controller._Controller__remote_scan_process = self._progressive_process(
+            "private-remote-session", [[first_remote], [second_remote]],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            "private-local-session", [[first_local], []],
+        )
+        controller._Controller__model.version = 11
+        controller._Controller__model.iter_files.return_value = []
+        model_builder.local_library_inventory_snapshot.return_value = (0, {})
+        model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset()
+        controller._model_scope_id = Controller._model_scope_id
+        controller.get_model_summary = Controller.get_model_summary.__get__(controller, Controller)
+        controller._Controller__record_breadcrumb = MagicMock()
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        controller._Controller__local_scan_process._ScannerProcess__session_token = (
+            "private-new-local-session"
+        )
+        updater.update()
+
+        authority_calls = [
+            call for call in controller._Controller__record_breadcrumb.call_args_list
+            if call.kwargs.get("message") == "scan_authority"
+        ]
+        self.assertEqual(2, len(authority_calls))
+        second_details = authority_calls[-1].kwargs["details"]
+        second_summary = controller.get_model_summary()["scan_authority"]
+        self.assertTrue(controller._Controller__progressive_local_scan_session_changed)
+        self.assertEqual(0, second_summary["local_scan_generation"])
+        self.assertEqual(9, second_summary["remote_scan_generation"])
+        self.assertEqual(0, second_details["local_scan_generation"])
+        self.assertEqual(9, second_details["remote_scan_generation"])
+        self.assertEqual(
+            second_summary["publication_id"], second_details["publication_id"],
+        )
+        for private_value in (
+            "private-remote-root", "private-local-root", "private-pair",
+            "private-remote-session", "private-local-session", "private-new-local-session",
+        ):
+            self.assertNotIn(private_value, str({"details": second_details, "summary": second_summary}))
 
     def test_scan_result_category_gate_skips_payload_and_correlation_work(self):
         remote = ScannerResult(
@@ -5258,6 +5521,275 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertEqual([], trace.snapshot()["entries"])
 
+    def test_lftp_status_breadcrumb_category_gate_precedes_status_inspection(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp": "off"}},
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__record_breadcrumb=MagicMock(),
+            _lftp_status_authority_context=MagicMock(
+                side_effect=AssertionError("disabled trace must not inspect authority state")
+            ),
+            logger=MagicMock(),
+        )
+
+        class ExplodingStatuses:
+            def __len__(self):
+                raise AssertionError("disabled trace must not inspect status objects")
+
+        _record_lftp_status_breadcrumb(
+            controller,
+            ExplodingStatuses(),
+            source="fresh_healthy",
+            fresh=True,
+            healthy=True,
+            poll_due=True,
+        )
+
+        controller._Controller__record_breadcrumb.assert_not_called()
+        controller._lftp_status_authority_context.assert_not_called()
+        self.assertEqual([], trace.snapshot()["entries"])
+
+    def test_lftp_status_authority_context_distinguishes_pending_done_and_idle(self):
+        controller = Controller.__new__(Controller)
+        controller._Controller__work_state_lock = RLock()
+        pending_status_future = Future()
+        pending_queue_future = Future()
+        done_queue_future = Future()
+        done_queue_future.set_result(True)
+        controller._Controller__lftp_status_future = pending_status_future
+        controller._Controller__pending_queue_dispatches = {
+            "private-file-id": PendingQueueDispatch(0.0, "private-name"),
+        }
+        controller._Controller__lftp_operations = [
+            _LftpOperation("queue", pending_queue_future),
+            _LftpOperation("queue", done_queue_future),
+            _LftpOperation("stop", pending_queue_future),
+        ]
+
+        pending_context = controller._lftp_status_authority_context(True)
+        self.assertEqual(
+            {
+                "poll_due": True,
+                "status_future_state": "pending",
+                "queue_dispatch_pending_count": 1,
+                "lftp_queue_operation_pending_count": 1,
+                "lftp_queue_operation_done_count": 1,
+            },
+            pending_context,
+        )
+
+        pending_status_future.set_result(([], True))
+        done_context = controller._lftp_status_authority_context(True)
+        self.assertEqual("done", done_context["status_future_state"])
+
+        controller._Controller__lftp_status_future = None
+        controller._Controller__pending_queue_dispatches = {}
+        controller._Controller__lftp_operations = []
+        idle_context = controller._lftp_status_authority_context(False)
+        self.assertEqual(
+            {
+                "poll_due": False,
+                "status_future_state": "none",
+                "queue_dispatch_pending_count": 0,
+                "lftp_queue_operation_pending_count": 0,
+                "lftp_queue_operation_done_count": 0,
+            },
+            idle_context,
+        )
+
+    def test_lftp_status_authority_context_bounds_counts_and_omits_identity(self):
+        controller = Controller.__new__(Controller)
+        controller._Controller__work_state_lock = RLock()
+        controller._Controller__lftp_status_future = None
+        controller._Controller__pending_queue_dispatches = {
+            "private-file-{}".format(index): PendingQueueDispatch(0.0, "private-name-{}".format(index))
+            for index in range(40)
+        }
+        pending_futures = [Future() for _ in range(40)]
+        done_futures = [Future() for _ in range(40)]
+        for future in done_futures:
+            future.set_result(True)
+        controller._Controller__lftp_operations = [
+            *[_LftpOperation("queue", future) for future in pending_futures],
+            *[_LftpOperation("queue", future) for future in done_futures],
+        ]
+
+        context = controller._lftp_status_authority_context(True)
+        self.assertEqual(32, context["queue_dispatch_pending_count"])
+        self.assertEqual(32, context["lftp_queue_operation_pending_count"])
+        self.assertEqual(32, context["lftp_queue_operation_done_count"])
+        self.assertNotIn("private-file", str(context))
+        self.assertNotIn("private-name", str(context))
+
+    def test_lftp_status_breadcrumb_includes_controller_authority_context(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp": "debug"}},
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__record_breadcrumb=lambda **kwargs: trace.record(
+                "model_updater", kwargs["message"], kwargs["details"],
+                **{key: value for key, value in kwargs.items() if key not in {"message", "details"}},
+            ),
+            _lftp_status_authority_context=lambda poll_due: {
+                "poll_due": poll_due,
+                "status_future_state": "done",
+                "queue_dispatch_pending_count": 1,
+                "lftp_queue_operation_pending_count": 2,
+                "lftp_queue_operation_done_count": 3,
+            },
+            _Controller__lftp=SimpleNamespace(backend_name="lftp"),
+            _Controller__last_lftp_statuses=[],
+            _Controller__lftp_status_cache_expires_at=None,
+            _Controller__lftp_status_poll_retry_active=False,
+            _Controller__lftp_idle_status_authoritative=True,
+            logger=MagicMock(),
+        )
+
+        _record_lftp_status_breadcrumb(
+            controller,
+            [],
+            source="cached_idle",
+            fresh=False,
+            healthy=True,
+            poll_due=False,
+        )
+
+        details = trace.snapshot()["entries"][0]["details"]
+        self.assertEqual(False, details["poll_due"])
+        self.assertEqual("done", details["status_future_state"])
+        self.assertEqual(1, details["queue_dispatch_pending_count"])
+        self.assertEqual(2, details["lftp_queue_operation_pending_count"])
+        self.assertEqual(3, details["lftp_queue_operation_done_count"])
+
+    def test_lftp_status_breadcrumb_cached_retry_uses_warning_policy_level(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp": "warning"}},
+        )
+
+        controller, _ = self._make_progressive_update_controller(None, local_scan=None)
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__record_breadcrumb = lambda **kwargs: trace.record(
+            "model_updater", kwargs["message"], kwargs["details"],
+            **{key: value for key, value in kwargs.items() if key not in {"message", "details"}},
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+        controller._Controller__lftp.last_status_poll_healthy = False
+        controller._Controller__last_lftp_statuses = [LftpJobStatus(
+            1,
+            LftpJobStatus.Type.PGET,
+            LftpJobStatus.State.RUNNING,
+            "private-fixture-name",
+            "",
+        )]
+        controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
+        controller._Controller__lftp_status_poll_retry_active = True
+
+        ModelUpdater(controller).update()
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(1, len(entries))
+        self.assertEqual("cached_retry", entries[0]["details"]["outcome"])
+        self.assertEqual("warning", entries[0]["level"])
+
+    def test_lftp_status_breadcrumb_omits_rclone_backend(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "trace"},
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__record_breadcrumb=MagicMock(),
+            _Controller__lftp=SimpleNamespace(backend_name="rclone"),
+            logger=MagicMock(),
+        )
+
+        _record_lftp_status_breadcrumb(
+            controller,
+            [],
+            source="fresh_healthy",
+            fresh=True,
+            healthy=True,
+        )
+
+        controller._Controller__record_breadcrumb.assert_not_called()
+        self.assertEqual([], trace.snapshot()["entries"])
+
+    def test_lftp_status_breadcrumb_records_gated_outcomes_without_identity(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=16,
+            policy={"default": "off", "rules": {"transfer.lftp": "debug"}},
+        )
+
+        def record_breadcrumb(**kwargs):
+            payload = dict(kwargs)
+            message = payload.pop("message")
+            details = payload.pop("details")
+            trace.record("model_updater", message, details, **payload)
+
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__record_breadcrumb=record_breadcrumb,
+            _Controller__last_lftp_statuses=[],
+            _Controller__lftp_status_cache_expires_at=None,
+            _Controller__lftp_status_poll_retry_active=False,
+            _Controller__lftp_idle_status_authoritative=False,
+            logger=MagicMock(),
+        )
+        private_status = LftpJobStatus(
+            1,
+            LftpJobStatus.Type.PGET,
+            LftpJobStatus.State.RUNNING,
+            "private-fixture-name",
+            "/private/fixture/path",
+        )
+
+        for source, fresh, healthy, statuses, reason in (
+            ("fresh_healthy", True, True, [private_status], None),
+            ("fresh_healthy", True, True, [], None),
+            ("inflight_empty", False, False, [], None),
+            ("cached_unhealthy", False, False, [private_status], "timeout"),
+            ("error_empty", True, False, [], "parser_error"),
+        ):
+            _record_lftp_status_breadcrumb(
+                controller,
+                statuses,
+                source=source,
+                fresh=fresh,
+                healthy=healthy,
+                failure_reason=reason,
+            )
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(5, len(entries))
+        self.assertEqual(
+            ["fresh_healthy", "fresh_healthy_empty", "inflight", "cached_unhealthy", "error_empty"],
+            [entry["details"]["outcome"] for entry in entries],
+        )
+        self.assertEqual(
+            ["debug", "debug", "debug", "warning", "warning"],
+            [entry["level"] for entry in entries],
+        )
+        self.assertEqual([1, 0, 0, 1, 0], [entry["details"]["status_count"] for entry in entries])
+        self.assertEqual([1, 0, 0, 1, 0], [entry["details"]["active_count"] for entry in entries])
+        self.assertEqual("timeout", entries[3]["details"]["failure_reason"])
+        self.assertEqual("parser_error", entries[4]["details"]["failure_reason"])
+        self.assertTrue(all(entry["category"] == "transfer.lftp" for entry in entries))
+        self.assertTrue(all(entry["corr_id"].startswith("lftp:") for entry in entries))
+        serialized = str(entries)
+        self.assertNotIn("private-fixture-name", serialized)
+        self.assertNotIn("/private/fixture/path", serialized)
+
     def test_replaced_progressive_sessions_ignore_stale_rows_until_new_partial_evidence(self):
         def process(session_token, results):
             scanner_process = ScannerProcess(
@@ -6914,6 +7446,268 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("completion_gate_candidate", entries[0]["message"])
         self.assertEqual(details, entries[0]["details"])
         self.assertNotIn("private-file-id", str(entries))
+
+    def test_lftp_completion_retirement_breadcrumb_records_pending_and_no_retirement(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        active_entry = ("sample-movie.mkv", "path-pair-a", "Path Pair A")
+        controller = self._make_lftp_completion_controller({active_entry})
+        controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+        updater = ModelUpdater(controller)
+
+        updater._handle_lftp_completion_detection(
+            [],
+            True,
+            lftp_status_poll_authoritative=True,
+            lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True,
+            lftp_status_source="fresh_healthy",
+        )
+        controller._Controller__prev_downloading_file_names = {active_entry}
+        updater._handle_lftp_completion_detection(
+            [active_entry],
+            True,
+            lftp_status_poll_authoritative=True,
+            lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True,
+            lftp_status_source="fresh_healthy",
+        )
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(
+            ["completion_pending_registered", "completion_retirement_not_detected"],
+            [entry["message"] for entry in entries],
+        )
+        pending, active = entries
+        self.assertEqual(
+            {
+                "poll_eligible": True,
+                "poll_fresh": True,
+                "poll_healthy": True,
+                "poll_source": "fresh_healthy",
+                "previous_active": True,
+                "current_active": False,
+                "decision": "pending",
+                "reason": "lftp_job_finished",
+                "marker_observed": False,
+                "local_scan_forced": True,
+                "registration_source": "lftp_job_finished",
+            },
+            pending["details"],
+        )
+        self.assertEqual("no_retirement", active["details"]["decision"])
+        self.assertEqual("still_active", active["details"]["reason"])
+        self.assertTrue(active["details"]["current_active"])
+        self.assertFalse(active["details"]["local_scan_forced"])
+        self.assertNotIn("sample-movie.mkv", str(entries))
+        self.assertNotIn("path-pair-a", str(entries))
+        self.assertNotIn("Path Pair A", str(entries))
+        self.assertTrue(all(entry["corr_id"].startswith("completion:") for entry in entries))
+
+    def test_lftp_completion_retirement_breadcrumb_records_unhealthy_and_inflight_blocks(self):
+        for source, fresh in (("unhealthy_empty", True), ("inflight_empty", False)):
+            with self.subTest(source=source):
+                trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+                entry = ("sample-blocked.mkv", "path-pair-a", "Path Pair A")
+                controller = self._make_lftp_completion_controller({entry})
+                controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+
+                ModelUpdater(controller)._handle_lftp_completion_detection(
+                    [],
+                    False,
+                    lftp_status_poll_authoritative=False,
+                    lftp_status_snapshot_fresh=fresh,
+                    lftp_status_poll_healthy=False,
+                    lftp_status_source=source,
+                )
+
+                entries = trace.snapshot()["entries"]
+                self.assertEqual(1, len(entries))
+                self.assertEqual("completion_retirement_blocked", entries[0]["message"])
+                self.assertEqual(
+                    {
+                        "poll_eligible": False,
+                        "poll_fresh": fresh,
+                        "poll_healthy": False,
+                        "poll_source": source,
+                        "previous_active": True,
+                        "current_active": False,
+                        "decision": "blocked",
+                        "reason": "completion_detection_not_authoritative",
+                        "marker_observed": False,
+                        "local_scan_forced": False,
+                    },
+                    entries[0]["details"],
+                )
+                self.assertNotIn("sample-blocked.mkv", str(entries))
+                self.assertNotIn("path-pair-a", str(entries))
+                self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+                controller._Controller__local_scan_process.force_scan.assert_not_called()
+
+    def test_lftp_completion_retirement_breadcrumb_records_explicit_stop_exclusion(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        entry = ("sample-stopped.mkv", "path-pair-a", "Path Pair A")
+        controller = self._make_lftp_completion_controller({entry})
+        controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+        controller._Controller__is_explicitly_stopped.return_value = True
+
+        ModelUpdater(controller)._handle_lftp_completion_detection(
+            [],
+            True,
+            lftp_status_poll_authoritative=True,
+            lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True,
+            lftp_status_source="fresh_healthy",
+        )
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(1, len(entries))
+        self.assertEqual("completion_retirement_excluded", entries[0]["message"])
+        self.assertEqual("excluded", entries[0]["details"]["decision"])
+        self.assertEqual("explicit_stop", entries[0]["details"]["reason"])
+        self.assertFalse(entries[0]["details"]["local_scan_forced"])
+        self.assertNotIn("sample-stopped.mkv", str(entries))
+        self.assertNotIn("path-pair-a", str(entries))
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        controller._Controller__local_scan_process.force_scan.assert_not_called()
+
+    def test_lftp_completion_retirement_breadcrumb_respects_category_gate_and_privacy(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"completion.gate": "off"}},
+        )
+        entry = ("sample-gated.mkv", "path-pair-a", "Path Pair A")
+        controller = self._make_lftp_completion_controller({entry})
+        controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+
+        ModelUpdater(controller)._handle_lftp_completion_detection(
+            [],
+            True,
+            lftp_status_poll_authoritative=True,
+            lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True,
+            lftp_status_source="fresh_healthy",
+        )
+
+        self.assertEqual([], trace.snapshot()["entries"])
+        self.assertEqual(
+            {entry}, controller._Controller__pending_completion_file_names,
+        )
+        controller._Controller__local_scan_process.force_scan.assert_called_once_with("path-pair-a")
+
+    def test_lftp_completion_detection_mixed_legacy_and_pair_entries_are_total_ordered(self):
+        entries = {
+            ("same-name.mkv", None, None),
+            ("same-name.mkv", "path-pair-a", "Path Pair A"),
+        }
+
+        with self.subTest(decision="no_retirement_and_dedupe"):
+            trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+            controller = self._make_lftp_completion_controller(entries)
+            controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+            updater = ModelUpdater(controller)
+
+            updater._handle_lftp_completion_detection(
+                list(entries), True,
+                lftp_status_poll_authoritative=True,
+                lftp_status_snapshot_fresh=True,
+                lftp_status_poll_healthy=True,
+                lftp_status_source="fresh_healthy",
+            )
+            # The second identical tick is a diagnostic duplicate only.
+            updater._handle_lftp_completion_detection(
+                list(entries), True,
+                lftp_status_poll_authoritative=True,
+                lftp_status_snapshot_fresh=True,
+                lftp_status_poll_healthy=True,
+                lftp_status_source="fresh_healthy",
+            )
+
+            trace_entries = trace.snapshot()["entries"]
+            self.assertEqual(2, len(trace_entries))
+            self.assertTrue(all(
+                entry["message"] == "completion_retirement_not_detected"
+                for entry in trace_entries
+            ))
+            self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+            controller._Controller__local_scan_process.force_scan.assert_not_called()
+
+        with self.subTest(decision="blocked"):
+            trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+            controller = self._make_lftp_completion_controller(entries)
+            controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+
+            ModelUpdater(controller)._handle_lftp_completion_detection(
+                [], False,
+                lftp_status_poll_authoritative=False,
+                lftp_status_snapshot_fresh=False,
+                lftp_status_poll_healthy=False,
+                lftp_status_source="inflight_empty",
+            )
+
+            trace_entries = trace.snapshot()["entries"]
+            self.assertEqual(2, len(trace_entries))
+            self.assertTrue(all(
+                entry["message"] == "completion_retirement_blocked"
+                for entry in trace_entries
+            ))
+            self.assertEqual(entries, controller._Controller__prev_downloading_file_names)
+            self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+            controller._Controller__local_scan_process.force_scan.assert_not_called()
+
+        with self.subTest(decision="explicit_stop_exclusion"):
+            trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+            controller = self._make_lftp_completion_controller(entries)
+            controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+            controller._Controller__is_explicitly_stopped.side_effect = (
+                lambda name, path_pair_id: path_pair_id is None
+            )
+
+            ModelUpdater(controller)._handle_lftp_completion_detection(
+                [], True,
+                lftp_status_poll_authoritative=True,
+                lftp_status_snapshot_fresh=True,
+                lftp_status_poll_healthy=True,
+                lftp_status_source="fresh_healthy",
+            )
+
+            trace_entries = trace.snapshot()["entries"]
+            self.assertEqual(
+                {"completion_retirement_excluded", "completion_pending_registered"},
+                {entry["message"] for entry in trace_entries},
+            )
+            self.assertEqual(
+                {("same-name.mkv", "path-pair-a", "Path Pair A")},
+                controller._Controller__pending_completion_file_names,
+            )
+            controller._Controller__local_scan_process.force_scan.assert_called_once_with(
+                "path-pair-a"
+            )
+
+        with self.subTest(decision="pending_registration"):
+            trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+            controller = self._make_lftp_completion_controller(entries)
+            controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+
+            ModelUpdater(controller)._handle_lftp_completion_detection(
+                [], True,
+                lftp_status_poll_authoritative=True,
+                lftp_status_snapshot_fresh=True,
+                lftp_status_poll_healthy=True,
+                lftp_status_source="fresh_healthy",
+            )
+
+            trace_entries = trace.snapshot()["entries"]
+            self.assertEqual(2, len(trace_entries))
+            self.assertTrue(all(
+                entry["message"] == "completion_pending_registered"
+                for entry in trace_entries
+            ))
+            self.assertEqual(entries, controller._Controller__pending_completion_file_names)
+            self.assertEqual(
+                [call()],
+                controller._Controller__local_scan_process.force_scan.call_args_list,
+            )
 
     def test_handle_lftp_completion_detection_skips_when_detection_is_not_ready(self):
         previous_entry = ("movie.mkv", "movies", "Movies")

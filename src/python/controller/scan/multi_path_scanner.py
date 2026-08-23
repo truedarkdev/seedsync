@@ -98,6 +98,13 @@ class MultiPathLocalScanner(IScanner):
         for scanner in self.__scanners:
             scanner.set_base_logger(self.logger)
 
+    def set_breadcrumb_trace(self, breadcrumb_trace: object) -> None:
+        """Forward the worker-local emitter to every local path-pair scanner."""
+        for scanner in self.__scanners:
+            setter = getattr(scanner, "set_breadcrumb_trace", None)
+            if callable(setter):
+                setter(breadcrumb_trace)
+
     @overrides(IScanner)
     def set_progress_callback(self, callback: Optional[ScanProgressCallback]) -> None:
         self.__progress_callback = callback

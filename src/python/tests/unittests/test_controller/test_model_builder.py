@@ -9,6 +9,7 @@ import time
 import unittest
 import json
 from pathlib import Path
+from typing import Optional
 from unittest.mock import MagicMock, patch
 from datetime import datetime
 from threading import RLock
@@ -147,7 +148,23 @@ class TestModelBuilder(unittest.TestCase):
 
     def __enable_trace(self, enabled: bool = True, max_entries: int = 128) -> BreadcrumbTraceCollector:
         self.__trace_enabled = [enabled]
-        collector = BreadcrumbTraceCollector(lambda: self.__trace_enabled[0], max_entries=max_entries)
+        collector = BreadcrumbTraceCollector(
+            lambda: self.__trace_enabled[0],
+            max_entries=max_entries,
+            policy={"default": "info", "rules": {"model.mixed_root": "off"}},
+        )
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        return collector
+
+    def __enable_mixed_root_trace(
+            self, enabled: bool = True, max_entries: int = 128,
+    ) -> BreadcrumbTraceCollector:
+        self.__trace_enabled = [enabled]
+        collector = BreadcrumbTraceCollector(
+            lambda: self.__trace_enabled[0],
+            max_entries=max_entries,
+            policy={"default": "off", "rules": {"model.mixed_root": "info"}},
+        )
         self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
         return collector
 
@@ -7605,7 +7622,10 @@ class TestModelBuilder(unittest.TestCase):
         root = model.get_file("sample-directory")
 
         self.assertEqual(ModelFile.State.DEFAULT, root.state)
-        entries = self.__trace_entries(collector, include_root_decisions=True)
+        entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "root_default_decision"
+        ]
         self.assertEqual(1, len(entries))
         entry = entries[0]
         self.assertEqual("root_default_decision", entry["message"])
@@ -7614,7 +7634,10 @@ class TestModelBuilder(unittest.TestCase):
         self.assertTrue(entry["corr_id"])
         self.assertNotIn("sample-directory", str(entry))
         self.assertNotIn("remote.bin", str(entry))
-        self.assertEqual(1, len(collector.snapshot(corr_id=entry["corr_id"])["entries"]))
+        self.assertEqual(1, len([
+            candidate for candidate in collector.snapshot(corr_id=entry["corr_id"])["entries"]
+            if candidate["message"] == "root_default_decision"
+        ]))
         details = entry["details"]
         self.assertEqual("model_builder.root_default_decision.v2", details["schema"])
         self.assertEqual("presentation_coverage_incomplete", details["reason"])
@@ -7703,7 +7726,10 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(entry["file_id"])
         self.assertIsNone(entry["path_pair_id"])
         self.assertNotIn("sample-file", str(entry))
-        self.assertEqual(1, len(collector.snapshot(corr_id=entry["corr_id"])["entries"]))
+        self.assertEqual(1, len([
+            candidate for candidate in collector.snapshot(corr_id=entry["corr_id"])["entries"]
+            if candidate["message"] == "root_default_decision"
+        ]))
         self.assertEqual("explicit_stop", entry["details"]["reason"])
         self.assertTrue(entry["details"]["coverage"]["presentation"])
         self.assertTrue(entry["details"]["lifecycle"]["explicit_stop"])
@@ -7743,7 +7769,10 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.request_rebuild()
         self.model_builder.build_model()
 
-        self.assertEqual(1, len(self.__trace_entries(collector, include_root_decisions=True)))
+        self.assertEqual(1, len([
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "root_default_decision"
+        ]))
 
     def test_root_default_trace_disabled_produces_no_event(self):
         remote_root = SystemFile("sample-directory", 20, True)
@@ -7783,6 +7812,406 @@ class TestModelBuilder(unittest.TestCase):
             model = self.model_builder.build_model()
 
         self.assertEqual(ModelFile.State.DEFAULT, model.get_file("sample-directory").state)
+
+    def test_mixed_root_trace_emits_for_ordinary_default_root(self):
+        remote_root = SystemFile("sample-directory", 20, True)
+        remote_root.add_child(SystemFile("remote.bin", 20, False))
+        local_root = SystemFile("sample-directory", 10, True)
+        local_root.add_child(SystemFile("remote.bin", 10, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        collector = self.__enable_mixed_root_trace()
+
+        model = self.model_builder.build_model()
+
+        entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "mixed_root_decision"
+        ]
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("sample-directory").state)
+        self.assertEqual({"coverage", "promotion"}, {
+            entry["details"]["decision_kind"] for entry in entries
+        })
+        self.assertTrue(all(entry["category"] == "model.mixed_root" for entry in entries))
+        self.assertTrue(all(
+            entry["details"]["outcome"] == "rejected" for entry in entries
+        ))
+        coverage = next(
+            entry for entry in entries
+            if entry["details"]["decision_kind"] == "coverage"
+        )
+        self.assertEqual("partial", coverage["details"]["reason"])
+        self.assertEqual(1, coverage["details"]["counts"]["partial"])
+        self.assertEqual(1, len([
+            entry for entry in collector.snapshot(corr_id=coverage["corr_id"])["entries"]
+            if entry["stage"] == coverage["stage"]
+        ]))
+
+    def test_mixed_root_trace_disabled_category_short_circuits_added_traversal(self):
+        remote_root = SystemFile("sample-directory", 20, True)
+        remote_root.add_child(SystemFile("remote.bin", 20, False))
+        local_root = SystemFile("sample-directory", 10, True)
+        local_root.add_child(SystemFile("remote.bin", 10, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"model.mixed_root": "off"}},
+        )
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+
+        with patch.object(
+                ModelBuilder,
+                "_ModelBuilder__mixed_root_coverage_counts",
+                side_effect=AssertionError("disabled mixed-root trace traversed"),
+        ), patch(
+                "controller.model_builder.opaque_trace_correlation",
+                side_effect=AssertionError("disabled mixed-root trace correlated"),
+        ):
+            model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("sample-directory").state)
+        self.assertEqual([], self.__trace_entries(collector, include_root_decisions=True))
+
+    def test_mixed_root_trace_preserves_coverage_and_promotion_behavior(self):
+        def build_case(local_root: Optional[SystemFile], stopped: bool, traced: bool):
+            builder = ModelBuilder()
+            remote_root = SystemFile("sample-directory", 20, True)
+            remote_root.add_child(SystemFile("remote.bin", 20, False))
+            builder.set_remote_files([remote_root])
+            if local_root is not None:
+                builder.set_local_files([local_root])
+            if stopped:
+                builder.set_stopped_files({"sample-directory"})
+            collector = None
+            if traced:
+                collector = BreadcrumbTraceCollector(
+                    lambda: True,
+                    policy={"default": "off", "rules": {"model.mixed_root": "info"}},
+                )
+                builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+            model = builder.build_model()
+            root = model.get_file("sample-directory")
+            return root.state, root.complete_local_coverage, collector
+
+        cases = [
+            (SystemFile("sample-directory", 10, True), False),
+            (SystemFile("sample-directory", 20, True), False),
+            (SystemFile("sample-directory", 20, True), True),
+        ]
+        cases[0][0].add_child(SystemFile("remote.bin", 10, False))
+        collision_child = SystemFile("remote.bin", 20, False, is_staging=True)
+        collision_child.has_staging_collision = True
+        cases[1][0].add_child(collision_child)
+        cases[2][0].add_child(SystemFile("remote.bin", 20, False))
+        for local_root, stopped in cases:
+            with self.subTest(stopped=stopped):
+                baseline = build_case(local_root, stopped, False)
+                traced = build_case(local_root, stopped, True)
+                self.assertEqual(baseline[:2], traced[:2])
+
+    def test_mixed_root_trace_reason_change_emits_and_identical_result_dedupes(self):
+        remote_root = SystemFile("sample-directory", 20, True)
+        remote_root.add_child(SystemFile("remote.bin", 20, False))
+        partial_root = SystemFile("sample-directory", 10, True)
+        partial_root.add_child(SystemFile("remote.bin", 10, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([partial_root])
+        collector = self.__enable_mixed_root_trace()
+
+        self.model_builder.build_model()
+        first = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "mixed_root_decision"
+        ]
+        self.model_builder.request_rebuild()
+        self.model_builder.build_model()
+        same = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "mixed_root_decision"
+        ]
+        self.assertEqual(len(first), len(same))
+
+        self.model_builder.set_local_files([])
+        self.model_builder.build_model()
+        changed = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "mixed_root_decision"
+        ]
+        self.assertEqual(len(first) * 2, len(changed))
+        self.assertIn("local_absent", {
+            entry["details"]["reason"] for entry in changed[len(first):]
+        })
+
+    def test_mixed_root_trace_is_private_and_output_bounded(self):
+        remote_root = SystemFile("private-root", 320, True)
+        local_root = SystemFile("private-root", 288, True, is_staging=True)
+        for index in range(32):
+            remote_root.add_child(SystemFile("private-remote-{}.bin".format(index), 10, False))
+            local_root.add_child(SystemFile("private-remote-{}.bin".format(index), 9, False, is_staging=True))
+        remote_root.path_pair_id = "private-pair"
+        local_root.path_pair_id = "private-pair"
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        collector = self.__enable_mixed_root_trace()
+
+        self.model_builder.build_model()
+        entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "mixed_root_decision"
+        ]
+        self.assertTrue(entries)
+        for entry in entries:
+            self.assertIsNone(entry["file_id"])
+            self.assertIsNone(entry["path_pair_id"])
+            self.assertNotIn("private-root", str(entry))
+            self.assertNotIn("private-remote", str(entry))
+            self.assertLess(len(json.dumps(entry)), 4096)
+            self.assertEqual(
+                "model_builder.mixed_root.v1",
+                entry["details"]["schema"],
+            )
+            self.assertEqual(
+                {"matched", "missing", "partial", "extra_staging", "collision"},
+                set(entry["details"]["counts"]),
+            )
+            self.assertEqual(32, entry["details"]["counts"]["partial"])
+
+    def test_mixed_root_trace_reports_queued_status_and_recent_transfer_rejections(self):
+        def build_with_status(status: LftpJobStatus, with_remote: bool):
+            builder = ModelBuilder()
+            if with_remote:
+                remote_root = SystemFile("queued-root", 20, True)
+                remote_root.add_child(SystemFile("queued.bin", 20, False))
+                builder.set_remote_files([remote_root])
+            builder.set_lftp_statuses([status])
+            collector = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "off", "rules": {"model.mixed_root": "info"}},
+            )
+            builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+            builder.build_model()
+            return [
+                entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+                if entry["message"] == "mixed_root_decision"
+            ]
+
+        queued_status = LftpJobStatus(
+            7,
+            LftpJobStatus.Type.MIRROR,
+            LftpJobStatus.State.QUEUED,
+            "queued-root",
+            "",
+        )
+        queued_entries = build_with_status(queued_status, True)
+        queued_promotion = next(
+            entry for entry in queued_entries
+            if entry["details"]["decision_kind"] == "promotion"
+        )
+        self.assertEqual("rejected", queued_promotion["details"]["outcome"])
+        self.assertEqual("queued_status", queued_promotion["details"]["reason"])
+
+        running_status = LftpJobStatus(
+            9,
+            LftpJobStatus.Type.MIRROR,
+            LftpJobStatus.State.RUNNING,
+            "queued-root",
+            "",
+        )
+        running_status.total_transfer_state = LftpJobStatus.TransferState(5, 20, 25, 10, 2)
+        running_entries = build_with_status(running_status, True)
+        running_promotion = next(
+            entry for entry in running_entries
+            if entry["details"]["decision_kind"] == "promotion"
+        )
+        self.assertEqual("rejected", running_promotion["details"]["outcome"])
+        self.assertEqual("local_absent", running_promotion["details"]["reason"])
+
+        status_only = LftpJobStatus(
+            8,
+            LftpJobStatus.Type.PGET,
+            LftpJobStatus.State.QUEUED,
+            "status-only-root",
+            "",
+        )
+        status_only_entries = build_with_status(status_only, False)
+        status_only_promotion = next(
+            entry for entry in status_only_entries
+            if entry["details"]["decision_kind"] == "promotion"
+        )
+        self.assertEqual("queued_status", status_only_promotion["details"]["reason"])
+        self.assertFalse(status_only_promotion["details"]["presence"]["root"])
+        self.assertTrue(status_only_promotion["details"]["presence"]["status"])
+
+        builder = ModelBuilder()
+        remote_file = SystemFile("recent-root.bin", 100, False)
+        local_file = SystemFile("recent-root.bin", 10, False)
+        builder.set_remote_files([remote_file])
+        builder.set_local_files([local_file])
+        builder._ModelBuilder__recent_live_transfer_snapshots["recent-root.bin"] = \
+            _RecentLiveTransferSnapshot(
+                root_file_id="recent-root.bin",
+                size_local=25,
+                percent_local=25,
+                speed=10,
+                eta=8,
+            )
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"model.mixed_root": "info"}},
+        )
+        builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        builder.build_model()
+        recent_promotions = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "mixed_root_decision" and
+            entry["details"]["decision_kind"] == "promotion"
+        ]
+        self.assertEqual(1, len(recent_promotions))
+        self.assertEqual("partial", recent_promotions[0]["details"]["reason"])
+
+        marker_builder = ModelBuilder()
+        marker_remote = SystemFile("marker-root", 20, True)
+        marker_remote.add_child(SystemFile("marker.bin", 20, False))
+        marker_local = SystemFile("marker-root", 10, True)
+        marker_local.add_child(SystemFile("marker.bin", 10, False))
+        marker_builder.set_remote_files([marker_remote])
+        marker_builder.set_local_files([marker_local])
+        marker_builder.set_downloaded_files({"marker-root"})
+        marker_collector = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"model.mixed_root": "info"}},
+        )
+        marker_builder.set_stop_resume_trace_breadcrumb(marker_collector.create_emitter())
+        marker_model = marker_builder.build_model()
+        marker_root = marker_model.get_file("marker-root")
+        self.assertEqual(ModelFile.State.DEFAULT, marker_root.state)
+        marker_promotions = [
+            entry for entry in self.__trace_entries(marker_collector, include_root_decisions=True)
+            if entry["message"] == "mixed_root_decision" and
+            entry["details"]["decision_kind"] == "promotion"
+        ]
+        self.assertEqual(1, len(marker_promotions))
+        self.assertEqual("partial", marker_promotions[0]["details"]["reason"])
+
+    def test_mixed_root_trace_counts_unmatched_staging_nodes_and_collisions(self):
+        for collision, expected_reason in ((False, "extra_staging"), (True, "unmatched_collision")):
+            with self.subTest(collision=collision):
+                remote_root = SystemFile("known-root", 10, True)
+                remote_root.add_child(SystemFile("known.bin", 10, False))
+                local_root = SystemFile("known-root", 10, True)
+                local_root.add_child(SystemFile("known.bin", 10, False))
+                extra = SystemFile("empty-staging", 0, True, is_staging=True)
+                extra.has_staging_collision = collision
+                local_root.add_child(extra)
+                self.model_builder.set_remote_files([remote_root])
+                self.model_builder.set_local_files([local_root])
+                collector = self.__enable_mixed_root_trace()
+
+                self.model_builder.build_model()
+                promotions = [
+                    entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+                    if entry["message"] == "mixed_root_decision" and
+                    entry["details"]["decision_kind"] == "promotion"
+                ]
+                self.assertEqual(1, len(promotions))
+                details = promotions[0]["details"]
+                self.assertEqual(expected_reason, details["reason"])
+                self.assertEqual(1, details["counts"]["extra_staging"])
+                self.assertEqual(1 if collision else 0, details["counts"]["collision"])
+                self.model_builder.clear()
+
+    def test_mixed_root_trace_fail_open_preserves_baseline_behavior(self):
+        def build(traced: bool):
+            builder = ModelBuilder()
+            remote_root = SystemFile("failure-root", 20, True)
+            remote_root.add_child(SystemFile("failure.bin", 20, False))
+            local_root = SystemFile("failure-root", 10, True)
+            local_root.add_child(SystemFile("failure.bin", 10, False))
+            builder.set_remote_files([remote_root])
+            builder.set_local_files([local_root])
+            if traced:
+                collector = BreadcrumbTraceCollector(
+                    lambda: True,
+                    policy={"default": "off", "rules": {"model.mixed_root": "info"}},
+                )
+                builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+            model = builder.build_model()
+            root = model.get_file("failure-root")
+            return root.state, root.complete_local_coverage
+
+        baseline = build(False)
+        diagnostic_failures = (
+            "_ModelBuilder__mixed_root_coverage_counts",
+            "_ModelBuilder__mixed_root_type_relations",
+            "_ModelBuilder__mixed_root_freshness",
+            "_ModelBuilder__mixed_root_size_relation",
+        )
+        for method_name in diagnostic_failures:
+            with self.subTest(method=method_name):
+                builder = ModelBuilder()
+                remote_root = SystemFile("failure-root", 20, True)
+                remote_root.add_child(SystemFile("failure.bin", 20, False))
+                local_root = SystemFile("failure-root", 10, True)
+                local_root.add_child(SystemFile("failure.bin", 10, False))
+                builder.set_remote_files([remote_root])
+                builder.set_local_files([local_root])
+                collector = BreadcrumbTraceCollector(
+                    lambda: True,
+                    policy={"default": "off", "rules": {"model.mixed_root": "info"}},
+                )
+                builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+                with patch.object(
+                        builder,
+                        method_name,
+                        side_effect=RuntimeError("diagnostic input exploded"),
+                ):
+                    model = builder.build_model()
+                root = model.get_file("failure-root")
+                self.assertEqual(baseline, (root.state, root.complete_local_coverage))
+
+        with self.subTest(kind="correlation"):
+            builder = ModelBuilder()
+            remote_root = SystemFile("failure-root", 20, True)
+            remote_root.add_child(SystemFile("failure.bin", 20, False))
+            local_root = SystemFile("failure-root", 10, True)
+            local_root.add_child(SystemFile("failure.bin", 10, False))
+            builder.set_remote_files([remote_root])
+            builder.set_local_files([local_root])
+            collector = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "off", "rules": {"model.mixed_root": "info"}},
+            )
+            builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+            with patch(
+                    "controller.model_builder.opaque_trace_correlation",
+                    side_effect=RuntimeError("correlation input exploded"),
+            ):
+                model = builder.build_model()
+            root = model.get_file("failure-root")
+            self.assertEqual(baseline, (root.state, root.complete_local_coverage))
+
+        class FailingEmitter:
+            @staticmethod
+            def is_effectively_enabled(category, level="info"):
+                return category == "model.mixed_root"
+
+            @staticmethod
+            def record(*args, **kwargs):
+                raise RuntimeError("breadcrumb output exploded")
+
+        with self.subTest(kind="record"):
+            builder = ModelBuilder()
+            remote_root = SystemFile("failure-root", 20, True)
+            remote_root.add_child(SystemFile("failure.bin", 20, False))
+            local_root = SystemFile("failure-root", 10, True)
+            local_root.add_child(SystemFile("failure.bin", 10, False))
+            builder.set_remote_files([remote_root])
+            builder.set_local_files([local_root])
+            builder.set_stop_resume_trace_breadcrumb(FailingEmitter())
+            model = builder.build_model()
+            root = model.get_file("failure-root")
+            self.assertEqual(baseline, (root.state, root.complete_local_coverage))
 
     def test_persist_trace_verbosity_gate_skips_signature_and_correlation_work(self):
         class VerbosityGate:
@@ -7934,7 +8363,10 @@ class TestModelBuilder(unittest.TestCase):
             ModelFile.build_file_id("backup.zip", "homeserver"),
             ModelFile.build_file_id("backup.zip", "laptop"),
         }
-        self.assertEqual(expected_ids, {entry["file_id"] for entry in entries})
+        arbitration_entries = [
+            entry for entry in entries if entry["message"] == "stop_resume_trace"
+        ]
+        self.assertEqual(expected_ids, {entry["file_id"] for entry in arbitration_entries})
         self.assertEqual(expected_ids, set(model.get_file_ids()))
 
     def test_trace_changed_context_is_retained_and_unchanged_cycles_coalesce(self):
@@ -7955,18 +8387,30 @@ class TestModelBuilder(unittest.TestCase):
 
         recent_model = self.model_builder.build_model()
         self.model_builder.finish_stop_resume_trace_cycle(recent_model, True)
-        first_count = len(self.__trace_entries(collector))
+        first_count = len([
+            entry for entry in self.__trace_entries(collector)
+            if entry["message"] == "stop_resume_trace"
+        ])
         self.assertEqual(1, first_count)
         self.model_builder.begin_stop_resume_trace_cycle(7)
         self.model_builder.finish_stop_resume_trace_cycle(recent_model, False)
-        self.assertEqual(first_count + 1, len(self.__trace_entries(collector)))
+        self.assertEqual(first_count + 1, len([
+            entry for entry in self.__trace_entries(collector)
+            if entry["message"] == "stop_resume_trace"
+        ]))
         self.model_builder.begin_stop_resume_trace_cycle(8)
         self.model_builder.finish_stop_resume_trace_cycle(recent_model, False)
-        self.assertEqual(first_count + 1, len(self.__trace_entries(collector)))
+        self.assertEqual(first_count + 1, len([
+            entry for entry in self.__trace_entries(collector)
+            if entry["message"] == "stop_resume_trace"
+        ]))
         self.model_builder.begin_stop_resume_trace_cycle(9)
         self.model_builder.set_stop_resume_trace_cycle_context({"lftp_status_source": "fresh_healthy"})
         self.model_builder.finish_stop_resume_trace_cycle(recent_model, False)
-        self.assertEqual(first_count + 2, len(self.__trace_entries(collector)))
+        self.assertEqual(first_count + 2, len([
+            entry for entry in self.__trace_entries(collector)
+            if entry["message"] == "stop_resume_trace"
+        ]))
 
     def test_no_rebuild_trace_queries_only_runtime_candidates(self):
         remote_files = [SystemFile("idle-{}.bin".format(index), 1000, False) for index in range(500)]
@@ -8003,17 +8447,26 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.begin_stop_resume_trace_cycle(20)
         model = self.model_builder.build_model()
         self.model_builder.finish_stop_resume_trace_cycle(model, True)
-        self.assertEqual(1, len(self.__trace_entries(collector)))
+        self.assertEqual(1, len([
+            entry for entry in self.__trace_entries(collector)
+            if entry["message"] == "stop_resume_trace"
+        ]))
 
         self.model_builder.begin_stop_resume_trace_cycle(21)
         self.model_builder.finish_stop_resume_trace_cycle(model, False)
-        self.assertEqual(2, len(self.__trace_entries(collector)))
+        self.assertEqual(2, len([
+            entry for entry in self.__trace_entries(collector)
+            if entry["message"] == "stop_resume_trace"
+        ]))
 
         self.model_builder.begin_stop_resume_trace_cycle(22)
         self.model_builder.request_rebuild()
         rebuilt_model = self.model_builder.build_model()
         self.model_builder.finish_stop_resume_trace_cycle(rebuilt_model, True)
-        self.assertEqual(2, len(self.__trace_entries(collector)))
+        self.assertEqual(2, len([
+            entry for entry in self.__trace_entries(collector)
+            if entry["message"] == "stop_resume_trace"
+        ]))
 
     def test_trace_signature_cache_is_bounded_and_clearable(self):
         collector = self.__enable_trace()

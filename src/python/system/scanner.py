@@ -2,11 +2,12 @@
 
 import os
 import re
-from typing import List, Optional, Protocol
+from typing import Callable, List, Optional, Protocol
 from datetime import datetime
 
 # my libs
 from common.error import AppError
+from common.breadcrumb_trace import opaque_trace_correlation
 from .file import SystemFile
 
 
@@ -40,6 +41,110 @@ class PseudoDirEntry:
         return self._stat
 
 
+LFTP_SIDECAR_TRACE_CATEGORY = "lftp.sidecar"
+LFTP_SIDECAR_TRACE_SCHEMA = "lftp.sidecar.v1"
+LFTP_SIDECAR_TRACE_CLASSIFICATIONS = frozenset({
+    "absent", "valid", "malformed", "unknown",
+})
+LFTP_SIDECAR_TRACE_COVERAGE = frozenset({"known", "unknown"})
+LFTP_SIDECAR_TRACE_ROLES = frozenset({
+    "system", "local", "active", "multipath_active", "unknown",
+})
+
+
+def _breadcrumb_effectively_enabled(trace: object, category: str, level: str = "info") -> bool:
+    """Check the cheap gate before constructing any sidecar evidence."""
+    if trace is None:
+        return False
+    gate = getattr(trace, "is_effectively_enabled", None)
+    if callable(gate):
+        try:
+            return bool(gate(category, level))
+        except Exception:
+            return False
+    enabled = getattr(trace, "is_enabled", None)
+    if callable(enabled):
+        try:
+            return bool(enabled())
+        except Exception:
+            return False
+    return False
+
+
+def lftp_sidecar_target_identity(scan_root: object, target_name: object) -> str:
+    """Return one opaque identity for a root-relative sidecar target."""
+    try:
+        root = os.path.normcase(os.path.abspath(os.path.normpath(os.fspath(scan_root))))
+        name = os.fsdecode(os.fspath(target_name))
+        canonical = "lftp.sidecar.target.v1|{}|{}".format(root, name)
+    except (TypeError, ValueError, OSError):
+        canonical = "lftp.sidecar.target.v1|unknown"
+    return opaque_trace_correlation(canonical)
+
+
+def _record_lftp_sidecar_breadcrumb(
+        breadcrumb_trace: object,
+        classification: str,
+        target_identity: object | Callable[[], str],
+        *,
+        status_only: Optional[bool],
+        parser_coverage: str,
+        scan_role: str,
+) -> None:
+    """Emit one privacy-safe, bounded scanner-side sidecar classification."""
+    if classification not in LFTP_SIDECAR_TRACE_CLASSIFICATIONS:
+        classification = "unknown"
+    if parser_coverage not in LFTP_SIDECAR_TRACE_COVERAGE:
+        parser_coverage = "unknown"
+    if scan_role not in LFTP_SIDECAR_TRACE_ROLES:
+        scan_role = "unknown"
+    if type(status_only) is not bool:
+        status_only = None
+
+    # The gate deliberately precedes the opaque correlation construction and
+    # all diagnostic-only payload work.  The emitter is best-effort: a broken
+    # tracer must never change scan behavior.
+    if not _breadcrumb_effectively_enabled(breadcrumb_trace, LFTP_SIDECAR_TRACE_CATEGORY, "info"):
+        return
+    try:
+        recorder = getattr(breadcrumb_trace, "record", None)
+        if not callable(recorder):
+            return
+        if callable(target_identity):
+            target_identity = target_identity()
+        if not isinstance(target_identity, str):
+            target_identity = "unknown"
+        coalesce_key = opaque_trace_correlation(
+            "lftp.sidecar.state|{}|{}|{}|{}|{}".format(
+                target_identity,
+                classification,
+                "unknown" if status_only is None else str(status_only).lower(),
+                parser_coverage,
+                scan_role,
+            ),
+        )
+        recorder(
+            "system_scanner",
+            "lftp_sidecar_classified",
+            {
+                "schema": LFTP_SIDECAR_TRACE_SCHEMA,
+                "classification": classification,
+                "status_only": status_only,
+                "parser_coverage": parser_coverage,
+                "scan_role": scan_role,
+            },
+            stage="lftp_sidecar_scan",
+            event_type="diagnostic",
+            category=LFTP_SIDECAR_TRACE_CATEGORY,
+            level="info",
+            corr_id=target_identity,
+            trace_scope="flow",
+            _coalesce_key=coalesce_key,
+        )
+    except Exception:
+        return
+
+
 class SystemScanner:
     """
     Scans system to generate list of files and sizes
@@ -56,6 +161,16 @@ class SystemScanner:
         self.exclude_suffixes: list[str] = [SystemScanner.__LFTP_STATUS_FILE_SUFFIX]
         self.__lftp_temp_file_suffix: str | None = None
         self.__scan_had_errors = False
+        self.__breadcrumb_trace: object = None
+        self.__scan_role = "system"
+
+    def set_breadcrumb_trace(self, breadcrumb_trace: object) -> None:
+        """Set the worker-local sidecar breadcrumb emitter."""
+        self.__breadcrumb_trace = breadcrumb_trace
+
+    def set_scan_role(self, scan_role: str) -> None:
+        """Set the fixed scanner role included in sidecar breadcrumbs."""
+        self.__scan_role = scan_role if scan_role in LFTP_SIDECAR_TRACE_ROLES else "unknown"
 
     def add_exclude_prefix(self, prefix: str):
         """
@@ -246,11 +361,49 @@ class SystemScanner:
             # status to get the real file size
             lftp_status_file_path = entry.path + SystemScanner.__LFTP_STATUS_FILE_SUFFIX
             parsed_size = None
-            if os.path.isfile(lftp_status_file_path):
-                with open(lftp_status_file_path, "r") as f:
-                    parsed_size = SystemScanner._lftp_status_file_size(f.read())
+            sidecar_classification: Optional[str] = None
+            parser_coverage = "unknown"
+
+            def target_identity() -> str:
+                target_identity_name = entry.name
+                temp_suffix = self.__lftp_temp_file_suffix
+                if temp_suffix is not None and target_identity_name != temp_suffix and \
+                        target_identity_name.endswith(temp_suffix):
+                    target_identity_name = target_identity_name[:-len(temp_suffix)]
+                return lftp_sidecar_target_identity(self.path_to_scan, target_identity_name)
+
+            try:
+                sidecar_present = os.path.isfile(lftp_status_file_path)
+                if sidecar_present:
+                    parser_coverage = "known"
+                    with open(lftp_status_file_path, "r") as f:
+                        parsed_size = SystemScanner._lftp_status_file_size(f.read())
+                    sidecar_classification = "valid" if parsed_size is not None else "malformed"
                     if parsed_size is not None:
                         file_size = parsed_size
+                elif self.__lftp_temp_file_suffix is not None and \
+                        entry.path.endswith(self.__lftp_temp_file_suffix):
+                    sidecar_classification = "absent"
+            except (OSError, UnicodeError, ValueError, OverflowError):
+                sidecar_classification = "unknown"
+                _record_lftp_sidecar_breadcrumb(
+                    self.__breadcrumb_trace,
+                    sidecar_classification,
+                    target_identity,
+                    status_only=False,
+                    parser_coverage=parser_coverage,
+                    scan_role=self.__scan_role,
+                )
+                raise
+            if sidecar_classification is not None:
+                _record_lftp_sidecar_breadcrumb(
+                    self.__breadcrumb_trace,
+                    sidecar_classification,
+                    target_identity,
+                    status_only=False,
+                    parser_coverage=parser_coverage,
+                    scan_role=self.__scan_role,
+                )
             status_sidecar_ready = parsed_size is not None
             if self.__lftp_temp_file_suffix is not None and \
                     entry.path.endswith(self.__lftp_temp_file_suffix) and \

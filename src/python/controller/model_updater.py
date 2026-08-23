@@ -49,7 +49,10 @@ from common.performance_diagnostics import (
     MODEL_REBUILD_REASON_MOVE_RETRY_DUE,
     MODEL_REBUILD_REASON_TERMINALIZABLE_COLLISION,
 )
-from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
+from lftp import (
+    Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError,
+    LFTP_STATUS_POLL_FAILURE_REASONS,
+)
 from model import Model, ModelDiff, ModelDiffUtil, ModelError, ModelFile
 from system import SystemFile
 from transfer import RcloneTransferBackend
@@ -68,6 +71,39 @@ if TYPE_CHECKING:
 
 
 _ACTIVE_LFTP_STATUS_POLL_INTERVAL = timedelta(milliseconds=100)
+_COMPLETION_GATE_LFTP_SOURCES = frozenset({
+    "cached_error", "cached_idle", "cached_inflight", "cached_retry",
+    "cached_unhealthy", "error_empty", "fresh_healthy", "fresh_unhealthy",
+    "inflight_empty", "retry_empty", "unhealthy_empty",
+})
+_SCAN_AUTHORITY_DIAGNOSTIC_ONLY_KEYS = frozenset({
+    "publication_id",
+    "model_version",
+    "local_scan_generation",
+    "remote_scan_generation",
+})
+
+
+def _scan_authority_semantic_snapshot(snapshot: object) -> dict[str, object]:
+    """Exclude per-publication diagnostic identity from semantic comparisons."""
+    if not isinstance(snapshot, dict):
+        return {}
+    return {
+        key: value for key, value in snapshot.items()
+        if key not in _SCAN_AUTHORITY_DIAGNOSTIC_ONLY_KEYS
+    }
+
+
+def _completion_optional_sort_key(value: Optional[str]) -> tuple[int, str]:
+    """Provide a total order for optional Path Pair fields."""
+    return (0, "") if value is None else (1, value)
+
+
+def _completion_entry_sort_key(
+        entry: tuple[str, Optional[str], Optional[str]],
+) -> tuple[tuple[int, str], ...]:
+    """Sort completion targets without comparing None to string values."""
+    return tuple(_completion_optional_sort_key(value) for value in entry)
 
 
 def _breadcrumb_effectively_enabled(
@@ -112,6 +148,139 @@ def _controller_breadcrumb_effectively_enabled(
     return _breadcrumb_effectively_enabled(
         getattr(context, "breadcrumb_trace", None), category, level,
     )
+
+
+_LFTP_STATUS_TRACE_CATEGORY = "transfer.lftp"
+_LFTP_STATUS_TRACE_STAGE = "lftp_status"
+_LFTP_STATUS_TRACE_SCHEMA = "lftp_status_authority.v1"
+_LFTP_STATUS_TRACE_CORRELATION = "lftp-status-aggregate"
+_LFTP_STATUS_TRACE_WARNING_OUTCOMES = frozenset({
+    "fresh_unhealthy", "unhealthy_empty", "cached_unhealthy",
+    "cached_error", "error_empty", "cached_retry", "retry_empty",
+})
+
+
+def _lftp_status_poll_failure_reason(
+        backend: object, error: Optional[BaseException] = None,
+) -> Optional[str]:
+    """Return a fixed, non-identifying reason for a failed status poll."""
+    backend_reason = getattr(backend, "last_status_poll_failure_reason", None)
+    if backend_reason in LFTP_STATUS_POLL_FAILURE_REASONS:
+        return backend_reason
+    if isinstance(error, LftpJobStatusParserError):
+        return "parser_error"
+    if isinstance(error, LftpError):
+        return "command_error"
+    if error is not None:
+        return "command_error"
+    return "unhealthy_snapshot"
+
+
+def _lftp_status_trace_level(source: str, healthy: bool) -> str:
+    """Select the policy level using only the completed source category."""
+    if source in {"cached_inflight", "inflight_empty"}:
+        return "debug"
+    return "warning" if source in _LFTP_STATUS_TRACE_WARNING_OUTCOMES or not healthy else "debug"
+
+
+def _record_lftp_status_breadcrumb(
+        controller: object,
+        statuses: Sequence[object],
+        *,
+        source: str,
+        fresh: bool,
+        healthy: bool,
+        poll_due: Optional[bool] = None,
+        failure_reason: Optional[str] = None,
+        poll_error: Optional[BaseException] = None,
+) -> None:
+    """Record one gated aggregate for the completed LFTP authority choice."""
+    backend = getattr(controller, "_Controller__lftp", None)
+    if getattr(backend, "backend_name", "lftp") == "rclone":
+        return
+    level = _lftp_status_trace_level(source, healthy)
+    if not _controller_breadcrumb_effectively_enabled(
+            controller, _LFTP_STATUS_TRACE_CATEGORY, level,
+    ):
+        return
+    recorder = getattr(controller, "_Controller__record_breadcrumb", None)
+    if not callable(recorder):
+        return
+    try:
+        # Keep all diagnostic-only work after the category/level gate.  The
+        # status objects may carry names and paths, so only enum cardinality
+        # is inspected and no status identity is retained or exported.
+        status_count = len(statuses)
+        active_states = (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING)
+        active_count = sum(
+            1 for status in statuses if getattr(status, "state", None) in active_states
+        )
+        if source in {"cached_inflight", "inflight_empty"}:
+            outcome = "inflight"
+        elif source == "fresh_healthy":
+            outcome = "fresh_healthy_empty" if status_count == 0 else "fresh_healthy"
+        else:
+            outcome = source
+        if failure_reason is None:
+            if outcome == "inflight":
+                failure_reason = "inflight"
+            elif outcome in {"cached_retry", "retry_empty"}:
+                failure_reason = "retry_pending"
+            elif not healthy:
+                failure_reason = _lftp_status_poll_failure_reason(
+                    backend, poll_error,
+                )
+        last_statuses = getattr(controller, "_Controller__last_lftp_statuses", None)
+        cache_expires_at = getattr(controller, "_Controller__lftp_status_cache_expires_at", None)
+        retry_active = getattr(controller, "_Controller__lftp_status_poll_retry_active", False)
+        idle_authoritative = getattr(controller, "_Controller__lftp_idle_status_authoritative", False)
+        details = {
+            "schema": _LFTP_STATUS_TRACE_SCHEMA,
+            "outcome": outcome,
+            "source": source,
+            "fresh": bool(fresh),
+            "healthy": bool(healthy),
+            "status_count": status_count,
+            "active_count": active_count,
+            "cache_present": bool(last_statuses) or cache_expires_at is not None,
+            "retry_active": retry_active is True,
+            "idle_authoritative": idle_authoritative is True,
+            "failure_reason": failure_reason,
+        }
+        if poll_due is not None:
+            authority_context = {
+                "poll_due": bool(poll_due),
+                "status_future_state": "none",
+                "queue_dispatch_pending_count": 0,
+                "lftp_queue_operation_pending_count": 0,
+                "lftp_queue_operation_done_count": 0,
+            }
+            authority_context_builder = getattr(
+                controller, "_lftp_status_authority_context", None,
+            )
+            if callable(authority_context_builder):
+                candidate_context = authority_context_builder(bool(poll_due))
+                if isinstance(candidate_context, dict):
+                    authority_context.update(candidate_context)
+            details.update(authority_context)
+        corr_id = "lftp:{}".format(opaque_trace_correlation(_LFTP_STATUS_TRACE_CORRELATION))
+        recorder(
+            stage=_LFTP_STATUS_TRACE_STAGE,
+            message="lftp_status_poll",
+            details=details,
+            event_type="state_transition",
+            category=_LFTP_STATUS_TRACE_CATEGORY,
+            level=level,
+            corr_id=corr_id,
+            trace_scope="flow",
+        )
+    except Exception:
+        logger = getattr(controller, "logger", None)
+        if logger is not None:
+            try:
+                logger.debug("Ignoring LFTP status breadcrumb failure", exc_info=True)
+            except Exception:
+                pass
 
 
 _CHILD_FINALIZATION_TRACE_CATEGORY = "finalization.child"
@@ -2255,15 +2424,107 @@ class ModelUpdater(_ControllerCoreAccess):
         current_downloading_file_names: list[tuple[str, str | None, str | None]],
         should_process_completion_detection: bool,
         retired_queue_dispatches: set[tuple[str, Optional[str], Optional[str]]] | None = None,
+        *,
+        lftp_status_poll_authoritative: Optional[bool] = None,
+        lftp_status_snapshot_fresh: Optional[bool] = None,
+        lftp_status_poll_healthy: Optional[bool] = None,
+        lftp_status_source: Optional[str] = None,
     ) -> None:
-        if not should_process_completion_detection:
-            return
-
         controller = self._controller
         current_downloading_file_names_set = set(current_downloading_file_names)
-        just_completed_file_names = (
-            controller._Controller__prev_downloading_file_names - current_downloading_file_names_set
+        previous_downloading_file_names = controller._Controller__prev_downloading_file_names
+        completion_trace_enabled = self._completion_gate_trace_enabled()
+        poll_authoritative = bool(
+            should_process_completion_detection
+            if lftp_status_poll_authoritative is None
+            else lftp_status_poll_authoritative
         )
+        poll_snapshot_fresh = bool(
+            True if lftp_status_snapshot_fresh is None else lftp_status_snapshot_fresh
+        )
+        poll_healthy = bool(
+            should_process_completion_detection
+            if lftp_status_poll_healthy is None
+            else lftp_status_poll_healthy
+        )
+        poll_source = (
+            lftp_status_source
+            if lftp_status_source in _COMPLETION_GATE_LFTP_SOURCES
+            else "unknown"
+        )
+
+        def record_decision(
+                entry: tuple[str, Optional[str], Optional[str]],
+                message: str,
+                *,
+                decision: str,
+                reason: str,
+                local_scan_forced: bool,
+        ) -> None:
+            # Gate before file-id/correlation and payload work. The existing
+            # completion.gate helper owns opaque correlation, bounded dedupe,
+            # and tracer-failure isolation.
+            if not completion_trace_enabled:
+                return
+            name, path_pair_id, _ = entry
+            file_id = ModelFile.build_file_id(name, path_pair_id)
+            marker_observed = False
+            marker_checker = getattr(controller, "_Controller__is_explicitly_stopped", None)
+            if callable(marker_checker):
+                try:
+                    marker_observed = bool(marker_checker(name, path_pair_id))
+                except Exception:
+                    marker_observed = False
+            details = {
+                # Avoid the collector's credential-key redaction token while
+                # retaining the completion poll authority signal.
+                "poll_eligible": poll_authoritative,
+                "poll_fresh": poll_snapshot_fresh,
+                "poll_healthy": poll_healthy,
+                "poll_source": poll_source,
+                "previous_active": entry in previous_downloading_file_names,
+                "current_active": entry in current_downloading_file_names_set,
+                "decision": decision,
+                "reason": reason,
+                "marker_observed": marker_observed,
+                "local_scan_forced": local_scan_forced,
+            }
+            if decision == "pending":
+                details["registration_source"] = "lftp_job_finished"
+            self._record_completion_gate_breadcrumb(
+                file_id,
+                message,
+                details,
+            )
+
+        if not should_process_completion_detection or not poll_authoritative:
+            # Retain the existing early return and state behavior, but expose
+            # why an observed retirement could not be considered authoritative.
+            blocked_file_names = previous_downloading_file_names - current_downloading_file_names_set
+            if retired_queue_dispatches:
+                blocked_file_names.update(retired_queue_dispatches)
+            for entry in sorted(blocked_file_names, key=_completion_entry_sort_key):
+                record_decision(
+                    entry,
+                    "completion_retirement_blocked",
+                    decision="blocked",
+                    reason="completion_detection_not_authoritative",
+                    local_scan_forced=False,
+                )
+            return
+
+        just_completed_file_names = previous_downloading_file_names - current_downloading_file_names_set
+        for entry in sorted(
+                previous_downloading_file_names & current_downloading_file_names_set,
+                key=_completion_entry_sort_key,
+        ):
+            record_decision(
+                entry,
+                "completion_retirement_not_detected",
+                decision="no_retirement",
+                reason="still_active",
+                local_scan_forced=False,
+            )
         # A prompt-accepted GET can finish before LFTP emits its first RUNNING
         # row. Controller has already reconciled the absent queue intent
         # against a fresh healthy idle snapshot; feed that exact identity into
@@ -2272,15 +2533,25 @@ class ModelUpdater(_ControllerCoreAccess):
         # physical staging proof gate any move below.
         if retired_queue_dispatches:
             just_completed_file_names.update(retired_queue_dispatches)
-        just_completed_file_names = {
+        explicitly_stopped_file_names = {
             file_name for file_name in just_completed_file_names
-            if not controller._Controller__is_explicitly_stopped(file_name[0], file_name[1])
+            if controller._Controller__is_explicitly_stopped(file_name[0], file_name[1])
         }
+        for entry in sorted(explicitly_stopped_file_names, key=_completion_entry_sort_key):
+            record_decision(
+                entry,
+                "completion_retirement_excluded",
+                decision="excluded",
+                reason="explicit_stop",
+                local_scan_forced=False,
+            )
+        just_completed_file_names -= explicitly_stopped_file_names
         if just_completed_file_names:
             completed_path_pair_ids: set[Optional[str]] = set()
             completed_file_ids: set[str] = set()
-            completion_trace_enabled = self._completion_gate_trace_enabled()
-            for name, path_pair_id, _ in just_completed_file_names:
+            for name, path_pair_id, path_pair_name in sorted(
+                    just_completed_file_names, key=_completion_entry_sort_key,
+            ):
                 file_id = ModelFile.build_file_id(name, path_pair_id)
                 completed_file_ids.add(file_id)
                 completed_path_pair_ids.add(path_pair_id)
@@ -2289,15 +2560,13 @@ class ModelUpdater(_ControllerCoreAccess):
                         file_id
                     )
                 )
-                if completion_trace_enabled:
-                    self._record_completion_gate_breadcrumb(
-                        file_id,
-                        "completion_pending_registered",
-                        {
-                            "registration_source": "lftp_job_finished",
-                            "local_scan_forced": True,
-                        },
-                    )
+                record_decision(
+                    (name, path_pair_id, path_pair_name),
+                    "completion_pending_registered",
+                    decision="pending",
+                    reason="lftp_job_finished",
+                    local_scan_forced=True,
+                )
             controller._Controller__pending_completion_file_names.update(just_completed_file_names)
             controller._Controller__model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids(
                 completed_file_ids,
@@ -2305,7 +2574,9 @@ class ModelUpdater(_ControllerCoreAccess):
             if None in completed_path_pair_ids:
                 controller._Controller__local_scan_process.force_scan()
             else:
-                for path_pair_id in sorted(completed_path_pair_ids):
+                for path_pair_id in sorted(
+                        completed_path_pair_ids, key=_completion_optional_sort_key,
+                ):
                     controller._Controller__local_scan_process.force_scan(path_pair_id)
         controller._Controller__prev_downloading_file_names = current_downloading_file_names_set
 
@@ -2768,6 +3039,7 @@ class ModelUpdater(_ControllerCoreAccess):
             value for value in unknown_overlay_before_ids
             if value is None or isinstance(value, str)
         }
+        progressive_unknown_after_event = set(progressive_unknown_before_event)
         if progressive_mode and joint_reconciler is not None:
             # Standing authority is already represented by the builder after
             # a progressive final publication.  Do not walk every retained
@@ -2802,13 +3074,6 @@ class ModelUpdater(_ControllerCoreAccess):
                 record_joint_root_shape_boundary(
                     "reconcile_delta_output", joint_local_files, joint_remote_files,
                 )
-            unknown_snapshotter = getattr(model_builder, "unknown_local_path_pair_ids_snapshot", None)
-            if callable(unknown_snapshotter):
-                progressive_unknown_before_event = {
-                    value for value in aggregate_snapshot_ids(unknown_snapshotter)
-                    if value is None or isinstance(value, str)
-                }
-
         def scan_final_relevant(side: str, result: Optional[ScannerResult]) -> bool:
             """Return whether this side has a complete, authoritative view.
 
@@ -3005,6 +3270,7 @@ class ModelUpdater(_ControllerCoreAccess):
         lftp_status_poll_healthy = True
         lftp_status_snapshot_fresh = True
         lftp_status_source = "fresh_healthy"
+        lftp_status_poll_error: Optional[BaseException] = None
         recovering_from_unhealthy_poll = False
         now = datetime.now()
         current_lftp_status_poll_healthy = getattr(controller._Controller__lftp, "last_status_poll_healthy", True)
@@ -3097,6 +3363,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 controller.logger.warning("Caught transfer backend error: {}".format(str(e)))
                 lftp_statuses = []
                 lftp_status_poll_healthy = False
+                lftp_status_poll_error = e
                 controller._Controller__lftp_status_poll_retry_active = True
                 controller._Controller__lftp_idle_status_authoritative = False
                 poll_finished_at = datetime.now()
@@ -3128,6 +3395,15 @@ class ModelUpdater(_ControllerCoreAccess):
             status for status in lftp_statuses
             if status.file_id not in controller._Controller__malformed_status_only_file_ids
         ]
+        _record_lftp_status_breadcrumb(
+            controller,
+            lftp_statuses,
+            source=lftp_status_source,
+            fresh=lftp_status_snapshot_fresh,
+            healthy=lftp_status_poll_healthy,
+            poll_due=lftp_status_poll_due,
+            poll_error=lftp_status_poll_error,
+        )
         # Render Queue intent for this already-started tick before the fresh
         # reconciliation below transfers an absent fast GET to completion
         # ownership. The synthetic row is display-only; all reconciliation and
@@ -3166,6 +3442,10 @@ class ModelUpdater(_ControllerCoreAccess):
             current_downloading_file_names,
             lftp_status_poll_healthy or bool(lftp_statuses),
             retired_queue_dispatches,
+            lftp_status_poll_authoritative=lftp_status_poll_healthy or bool(lftp_statuses),
+            lftp_status_snapshot_fresh=lftp_status_snapshot_fresh,
+            lftp_status_poll_healthy=lftp_status_poll_healthy,
+            lftp_status_source=lftp_status_source,
         )
         controller._Controller__active_downloading_file_names = current_downloading_file_names
         if controller._Controller__malformed_status_only_file_ids != previous_malformed_status_only_file_ids:
@@ -5279,6 +5559,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     progressive_unknown_before_event.union(joint_unknown_local_ids)
                 overlay.difference_update(local_noop_inventory_completion_ids)
                 unknown_overlay_changed = overlay != progressive_unknown_before_event
+                progressive_unknown_after_event = set(overlay)
                 setter_unknown_local(overlay)
 
         # Emit one bounded authority decision after source adoption and the
@@ -5322,10 +5603,18 @@ class ModelUpdater(_ControllerCoreAccess):
                     if latest_local_scan is not None else set()
                 ) if value is None or isinstance(value, str)
             }
-            unknown_snapshotter = getattr(model_builder, "unknown_local_path_pair_ids_snapshot", None)
-            unknown_overlay_after_ids = aggregate_snapshot_ids(unknown_snapshotter)
-            if not callable(unknown_snapshotter):
-                unknown_overlay_after_ids = set(unknown_overlay_current_ids)
+            if progressive_mode:
+                # The progressive setter above is the authority for this
+                # update.  Re-reading the builder here is diagnostic-only and
+                # can observe a different test-double snapshot (or a racing
+                # publication), turning an identity-only refresh into a
+                # semantic authority change.
+                unknown_overlay_after_ids = set(progressive_unknown_after_event)
+            else:
+                unknown_snapshotter = getattr(model_builder, "unknown_local_path_pair_ids_snapshot", None)
+                unknown_overlay_after_ids = aggregate_snapshot_ids(unknown_snapshotter)
+                if not callable(unknown_snapshotter):
+                    unknown_overlay_after_ids = set(unknown_overlay_current_ids)
             unknown_overlay_after_ids = {
                 value for value in unknown_overlay_after_ids
                 if value is None or isinstance(value, str)
@@ -5409,7 +5698,34 @@ class ModelUpdater(_ControllerCoreAccess):
             staged_pair_count = authoritative_pair_delta_staged_count
             adopted_pair_count = staged_pair_count if progressive_source_buckets_adopted \
                 or authoritative_pair_delta_applied else 0
+
+            def standing_scan_generation(
+                    side: str, result: Optional[ScannerResult],
+            ) -> int:
+                """Use the retained side authority when this tick has no row."""
+                if result is not None:
+                    generation = scan_generation(result)
+                    return generation if generation >= 0 else 0
+                if bool(getattr(
+                        controller,
+                        "_Controller__progressive_{}_scan_session_changed".format(side),
+                        False,
+                )):
+                    # A replacement session invalidates the prior side
+                    # authority even when its first result has not arrived.
+                    return 0
+                prior_generation = previous_scan_authority_snapshot.get(
+                    "{}_scan_generation".format(side), 0,
+                )
+                return prior_generation if type(prior_generation) is int and prior_generation >= 0 else 0
+
             standing_snapshot = {
+                # These fields are filled at the publication boundary below.
+                # Scanner generations are safe aggregate versions; they are
+                # not collector sequence numbers and do not expose scope or
+                # file identities.
+                "local_scan_generation": standing_scan_generation("local", latest_local_scan),
+                "remote_scan_generation": standing_scan_generation("remote", latest_remote_scan),
                 "final": bool(joint_reconciliation_final),
                 "full": bool(local_full and remote_full),
                 "scanned_pair_count": local_scanned_pair_count + remote_scanned_pair_count,
@@ -5432,9 +5748,60 @@ class ModelUpdater(_ControllerCoreAccess):
                 "pair_delta_allowed": pair_delta_authorized,
                 "pair_delta_fallback": pair_delta_fallback,
             }
-            controller._Controller__scan_authority_snapshot = standing_snapshot
+            snapshot_publisher = getattr(controller, "_publish_scan_authority_snapshot", None)
+            if callable(snapshot_publisher):
+                standing_snapshot = snapshot_publisher(standing_snapshot)
+            else:
+                # Keep the narrow test/compatibility controller boundary
+                # atomic as well when it does not expose the concrete helper.
+                model_lock = getattr(controller, "_Controller__model_lock", None)
+                if model_lock is None:
+                    model_lock_context = None
+                else:
+                    model_lock_context = model_lock
+                if model_lock_context is None:
+                    previous_id = getattr(
+                        controller, "_Controller__scan_authority_publication_id", 0,
+                    )
+                    if type(previous_id) is not int or previous_id < 0:
+                        previous_id = 0
+                    publication_id = previous_id + 1
+                    model_version = getattr(model, "version", 0)
+                    if type(model_version) is not int or model_version < 0:
+                        model_version = 0
+                    standing_snapshot.update({
+                        "publication_id": publication_id,
+                        "model_version": model_version,
+                    })
+                    controller._Controller__scan_authority_publication_id = publication_id
+                    controller._Controller__scan_authority_snapshot = dict(standing_snapshot)
+                else:
+                    with model_lock_context:
+                        previous_id = getattr(
+                            controller, "_Controller__scan_authority_publication_id", 0,
+                        )
+                        if type(previous_id) is not int or previous_id < 0:
+                            previous_id = 0
+                        previous_snapshot = getattr(
+                            controller, "_Controller__scan_authority_snapshot", {},
+                        )
+                        if isinstance(previous_snapshot, dict):
+                            snapshot_id = previous_snapshot.get("publication_id")
+                            if type(snapshot_id) is int and snapshot_id > previous_id:
+                                previous_id = snapshot_id
+                        publication_id = previous_id + 1
+                        model_version = getattr(model, "version", 0)
+                        if type(model_version) is not int or model_version < 0:
+                            model_version = 0
+                        standing_snapshot.update({
+                            "publication_id": publication_id,
+                            "model_version": model_version,
+                        })
+                        controller._Controller__scan_authority_publication_id = publication_id
+                        controller._Controller__scan_authority_snapshot = dict(standing_snapshot)
             scan_authority_snapshot_changed = (
-                standing_snapshot != previous_scan_authority_snapshot
+                _scan_authority_semantic_snapshot(standing_snapshot)
+                != _scan_authority_semantic_snapshot(previous_scan_authority_snapshot)
             )
             if scan_authority_trace_enabled:
                 event_details = {
@@ -5475,6 +5842,10 @@ class ModelUpdater(_ControllerCoreAccess):
                     "raw_local_reconciliation_before_count": len(local_reconciled_before_ids),
                     "raw_local_reconciliation_after_count": len(local_reconciled_after_ids),
                     "effective_local_reconciliation_after_count": len(effective_local_reconciled_after_ids),
+                    "publication_id": standing_snapshot["publication_id"],
+                    "model_version": standing_snapshot["model_version"],
+                    "local_scan_generation": standing_snapshot["local_scan_generation"],
+                    "remote_scan_generation": standing_snapshot["remote_scan_generation"],
                 }
                 try:
                     authority_parts = []
@@ -5699,6 +6070,25 @@ class ModelUpdater(_ControllerCoreAccess):
                 ) or (
                     result_level == "warning" and child_trace_warning_enabled
                 ):
+                    result_reason = _CHILD_FINALIZATION_RESULT_REASONS[result_name]
+                    if result_name == "deferred":
+                        # The controller deliberately returns the same
+                        # deferred result for explicit root/child Stop and
+                        # bounded retry deferral.  Additive diagnostics may
+                        # distinguish those authorities after the gate while
+                        # leaving the finalization decision untouched.
+                        stop_checker = getattr(
+                            controller, "_Controller__is_explicitly_stopped", None,
+                        )
+                        if callable(stop_checker):
+                            try:
+                                child_name = root_name.rstrip("/\\") + "/" + relative_path
+                                if bool(stop_checker(root_name, path_pair_id)):
+                                    result_reason = "explicit_stop_root"
+                                elif bool(stop_checker(child_name, path_pair_id)):
+                                    result_reason = "explicit_stop_child"
+                            except Exception:
+                                pass
                     if child_trace_identity is None:
                         child_trace_identity = _child_finalization_trace_identity(
                             root_name, relative_path, path_pair_id,
@@ -5710,7 +6100,7 @@ class ModelUpdater(_ControllerCoreAccess):
                             "schema": _CHILD_FINALIZATION_TRACE_SCHEMA,
                             "phase": "dispatch",
                             "outcome": result_name,
-                            "reason": _CHILD_FINALIZATION_RESULT_REASONS[result_name],
+                            "reason": result_reason,
                             "attempt_failure": result_level == "warning",
                         },
                         level=result_level,

@@ -158,3 +158,26 @@ class TestMultiPathActiveScanner(unittest.TestCase):
             [ModelFile.build_file_id("download.zip", "movies")],
             scanner.pop_malformed_status_only_file_ids()
         )
+
+    def test_status_only_sidecar_breadcrumb_is_forwarded_to_each_path_pair(self):
+        scanner = MultiPathActiveScanner({"movies": self.movies_dir, "tv": self.tv_dir}, use_temp_file=True)
+        self.addCleanup(scanner.close)
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner.set_breadcrumb_trace(trace)
+        scanner._MultiPathActiveScanner__active_files = [
+            ("download.zip", "movies", "Movies"),
+        ]
+
+        with open(os.path.join(self.movies_dir, "download.zip.lftp.lftp-pget-status"), "w") as handle:
+            handle.write("size=4\n0.pos=0\n0.limit=4\n")
+
+        self.assertEqual([], scanner.scan())
+        events = [call for call in trace.record.call_args_list if call.args[1] == "lftp_sidecar_classified"]
+        self.assertEqual(1, len(events))
+        details = events[0].args[2]
+        self.assertEqual("valid", details["classification"])
+        self.assertTrue(details["status_only"])
+        self.assertEqual("known", details["parser_coverage"])
+        self.assertEqual("multipath_active", details["scan_role"])
+        self.assertNotIn(self.temp_dir, repr(events[0]))
