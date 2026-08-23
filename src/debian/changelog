@@ -1,3 +1,24 @@
+seedsync (0.9.3) stable; urgency=low
+
+  * Fixed Queue, Stop, Delete Local, and Delete Remote for files inside
+    directories so they act on the selected file rather than a same-named file
+  * Fixed interrupted nested downloads so valid partial files can resume after
+    restart without creating a duplicate directory transfer; unsafe recovery
+    data remains unqueued
+  * Fixed directory downloads so each verified file can complete and move
+    independently while retaining its Downloaded status and timestamp
+  * Made active, queued, stopped, and completed transfer status more reliable
+    for nested and mixed directory transfers
+  * Added optional Breadcrumb diagnostics for targeted troubleshooting;
+    disabled Breadcrumbs, categories, and verbosity levels avoid their normal
+    work
+  * Improved recovery after an upgrade when a prior browser handover was
+    discarded or expired
+  * Improved remote scanning efficiency and dashboard responsiveness under
+    larger Path Pair workloads
+
+ -- Johan Rosén <johan.rosen.91@gmail.com>  Sun, 23 Aug 2026 00:00:00 +0200
+
 seedsync (0.9.2) stable; urgency=low
 
   * Fixed downloads that could show 99% complete even though only some files or
@@ -12,6 +33,12 @@ seedsync (0.9.2) stable; urgency=low
     a clearer layout that adapts to desktop and smaller screens
   * Fixed Docker containers that could hang while stopping or restarting during
     an active remote scan
+  * Kept Queue completion visible while the transfer settles and made Smart
+    Status clearer for active downloads and current API-key activity
+  * Made AutoQueue include new remote files in existing directory transfers
+    and prevented needless re-downloads from sub-second timestamp differences
+  * Rejected echoed LFTP commands that could be mistaken for transfer status
+    and kept Docker runtime images free of development-only build artifacts
 
  -- Johan Rosén <johan.rosen.91@gmail.com>  Sat, 15 Aug 2026 00:49:37 +0200
 
