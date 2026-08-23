@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from lftp import Lftp, LftpError
+from lftp import Lftp, LftpError, LftpJobStatus
 from common.exclude_patterns import ExactPathExclusion
 
 
@@ -379,9 +379,60 @@ class TestLftpQueueCommand(unittest.TestCase):
     def test_queue_file_rejects_path_identity_traversal_or_separator(self):
         with tempfile.TemporaryDirectory() as local_dir:
             lftp = self._make_lftp()
-            for name in ("../outside.mkv", "nested/outside.mkv", r"nested\outside.mkv", ".", ".."):
+            for name in ("../outside.mkv", r"nested\outside.mkv", ".", ".."):
                 with self.subTest(name=name), self.assertRaises(LftpError):
                     lftp.queue(name, False, local_base_dir_path=local_dir)
+
+    def test_queue_file_preserves_safe_nested_relative_target_and_sidecar(self):
+        with tempfile.TemporaryDirectory() as local_dir:
+            lftp = self._make_lftp()
+            name = "release/nested/movie.mkv"
+
+            lftp.queue(name, False, local_base_dir_path=local_dir)
+
+            local_target = os.path.join(local_dir, "release", "nested", "movie.mkv")
+            command = lftp._Lftp__run_command.call_args.args[0]
+            self.assertIn('"/remote/path/release/nested/movie.mkv"', command)
+            self.assertIn(Lftp._Lftp__quote_command_argument(local_target), command)
+            with open(local_target + ".lftp-pget-status", "w", encoding="utf-8") as handle:
+                handle.write("size=10\n0.pos=0\n0.limit=10\n")
+            self.assertEqual(
+                (local_target + ".lftp-pget-status",),
+                Lftp.get_safe_file_artifact_delete_paths(local_dir, name),
+            )
+
+    def test_status_path_pair_annotation_uses_remote_relative_identity(self):
+        lftp = self._make_lftp()
+        lftp._Lftp__path_pairs_by_id = {
+            "pair-a": {"name": "Pair A", "remote_path": "/remote/a", "local_path": "/local/a"},
+        }
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "movie.mkv", "",
+            remote_path="/remote/a/release/nested/movie.mkv",
+            local_path="/local/a/release/nested/movie.mkv",
+        )
+
+        lftp._Lftp__annotate_status_path_pairs([status])
+
+        self.assertEqual("release{}nested{}movie.mkv".format(os.sep, os.sep), status.name)
+
+    def test_status_path_pair_annotation_accepts_recovery_staging_path_for_unique_remote_pair(self):
+        lftp = self._make_lftp()
+        lftp._Lftp__path_pairs_by_id = {
+            "pair-a": {"name": "Pair A", "remote_path": "/remote/a", "local_path": "/library/a"},
+        }
+        # Parsed PGET jobs begin with the basename.  Recovery queues their
+        # target below the separate staging root, outside ``local_path``.
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "unsafe-sibling.bin", "",
+            remote_path="/remote/a/release/unsafe-sibling.bin",
+            local_path="/staging/a/release/unsafe-sibling.bin",
+        )
+
+        lftp._Lftp__annotate_status_path_pairs([status])
+
+        self.assertEqual("pair-a", status.path_pair_id)
+        self.assertEqual("release{}unsafe-sibling.bin".format(os.sep), status.name)
 
     def test_queue_file_rejects_absolute_path_identity(self):
         with tempfile.TemporaryDirectory() as local_dir:

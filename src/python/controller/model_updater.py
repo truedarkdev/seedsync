@@ -60,6 +60,7 @@ from .controller_persist import ControllerPersist
 from .extract import ExtractCompletedResult, ExtractFailedResult, ExtractProcess, ExtractStatus
 from .model_builder import ModelBuilder
 from .scan import ScannerProcess, ScannerResult
+from .scan.scanner_process import _record_root_shape_breadcrumb
 from .validate import ValidateProcess
 
 if TYPE_CHECKING:
@@ -435,6 +436,7 @@ class _ProgressiveScanAccumulator:
         self.__last_touched_keys: set[tuple[Optional[str], str]] = set()
         self.__last_final_comparison_proven_pairs: set[Optional[str]] = set()
         self.__last_scan_marker_trace: tuple[dict[str, object], ...] = ()
+        self.__last_root_shape_trace: Optional[dict[str, int]] = None
         self.__move_invalidations_by_root: dict[
             tuple[Optional[str], str], dict[int, tuple[int, str]]
         ] = {}
@@ -466,6 +468,7 @@ class _ProgressiveScanAccumulator:
         self.__session_has_progressive_evidence = False
         self.__last_touched_keys.clear()
         self.__last_final_comparison_proven_pairs.clear()
+        self.__last_root_shape_trace = None
         self.__move_invalidations_by_root.clear()
 
     @property
@@ -762,6 +765,10 @@ class _ProgressiveScanAccumulator:
         """Return the most recent gated marker provenance for the scan boundary."""
         return tuple(dict(details) for details in self.__last_scan_marker_trace)
 
+    def root_shape_trace(self) -> dict[str, int]:
+        """Return bounded admission/protection counts from the latest gated apply."""
+        return dict(self.__last_root_shape_trace or {})
+
     def apply(
             self,
             events: Sequence[ScannerResult],
@@ -769,10 +776,25 @@ class _ProgressiveScanAccumulator:
             *,
             scan_marker_trace_enabled: bool = False,
             scan_marker_session_reset: bool = False,
+            root_shape_trace_enabled: bool = False,
     ) -> Optional[ScannerResult]:
         self.__last_touched_keys = set()
         self.__last_final_comparison_proven_pairs = set()
         self.__last_scan_marker_trace = ()
+        root_shape_trace: Optional[dict[str, int]] = None
+        if root_shape_trace_enabled:
+            root_shape_trace = {
+                "incoming_event_count": len(events),
+                "admitted_event_count": 0,
+                "full_snapshot_event_count": 0,
+                "stale_rejected_event_count": 0,
+                "protected_root_count": 0,
+                "working_root_count_pre_full_snapshot_clear": 0,
+                "working_root_count_post_full_snapshot_clear": 0,
+                "committed_root_count": 0,
+                "visible_root_count": 0,
+            }
+        self.__last_root_shape_trace = None
         if not events:
             return None
         if self.__session_token is None:
@@ -794,8 +816,13 @@ class _ProgressiveScanAccumulator:
                 event for event in events
                 if getattr(event, "session_token", None) == self.__session_token
             ]
+            if root_shape_trace is not None:
+                root_shape_trace["admitted_event_count"] = len(events)
             if not events:
+                self.__last_root_shape_trace = root_shape_trace
                 return None
+        elif root_shape_trace is not None:
+            root_shape_trace["admitted_event_count"] = len(events)
         # Generations are owned by path pair, not by an entire queue drain.
         # A targeted refresh of A can validly overtake a queued full snapshot
         # for untouched B; the per-pair comparison inside the event loop
@@ -803,6 +830,7 @@ class _ProgressiveScanAccumulator:
         accepted = list(events)
         newest_generation = max((int(getattr(event, "generation", 0)) for event in accepted), default=0)
         if not accepted:
+            self.__last_root_shape_trace = root_shape_trace
             return None
         had_progress_event = any(getattr(event, "is_progress", False) for event in accepted)
         accepted = [
@@ -811,7 +839,12 @@ class _ProgressiveScanAccumulator:
         ]
         accepted = [event for event in accepted if event is not None]
         if not accepted:
+            self.__last_root_shape_trace = root_shape_trace
             return None
+        if root_shape_trace is not None:
+            root_shape_trace["full_snapshot_event_count"] = sum(
+                bool(getattr(event, "is_full_snapshot", False)) for event in accepted
+            )
         configured_ids = {
             pair_id for pair_id in (configured_path_pair_ids or set())
             if isinstance(pair_id, str)
@@ -835,6 +868,7 @@ class _ProgressiveScanAccumulator:
         completed: set[Optional[str]] = set()
         touched: set[Optional[str]] = set()
         for event in accepted:
+            event_stale_rejected = False
             malformed.extend(event.malformed_status_only_file_ids)
             managed.extend(event.managed_extract_file_ids)
             generation = int(getattr(event, "generation", 0))
@@ -864,8 +898,11 @@ class _ProgressiveScanAccumulator:
                             for captured_generation, status in entries.values()
                     ):
                         protected_root_names.add(root_name)
+                if root_shape_trace is not None:
+                    root_shape_trace["protected_root_count"] += len(protected_root_names)
                 previous_generation = self.__active_generation.get(pair_id, -1)
                 if generation < previous_generation:
+                    event_stale_rejected = True
                     continue
                 if generation > previous_generation:
                     self.__active_generation[pair_id] = generation
@@ -934,12 +971,16 @@ class _ProgressiveScanAccumulator:
                     # The final aggregate is lossless even when intermediate
                     # queue events were dropped. Rebuild this pair from it;
                     # failed generations never carry this flag.
+                    if root_shape_trace is not None:
+                        root_shape_trace["working_root_count_pre_full_snapshot_clear"] += len(working)
                     working.clear()
                     for root_name in protected_root_names:
                         previous_file = previous_committed.get(root_name)
                         if previous_file is not None:
                             working[root_name] = previous_file
                             self.__authoritative_by_pair.setdefault(pair_id, {})[root_name] = previous_file
+                    if root_shape_trace is not None:
+                        root_shape_trace["working_root_count_post_full_snapshot_clear"] += len(working)
                 manifest = getattr(event, "root_names", None)
                 if manifest is not None:
                     self.__manifests.setdefault(generation, {})[pair_id] = set(manifest)
@@ -1049,7 +1090,16 @@ class _ProgressiveScanAccumulator:
                         if not entries:
                             self.__move_invalidations_by_root.pop(key, None)
 
+            if event_stale_rejected and root_shape_trace is not None:
+                root_shape_trace["stale_rejected_event_count"] += 1
+
         if not had_progress_event and not touched and not failed and not completed:
+            if root_shape_trace is not None:
+                root_shape_trace["committed_root_count"] = sum(
+                    len(files) for files in self.__committed_by_pair.values()
+                )
+                root_shape_trace["visible_root_count"] = root_shape_trace["committed_root_count"]
+                self.__last_root_shape_trace = root_shape_trace
             return None
         visible: dict[tuple[Optional[str], str], SystemFile] = {
             (pair_id, name): file
@@ -1077,6 +1127,12 @@ class _ProgressiveScanAccumulator:
             if self.__active_generation.get(path_pair_id) == generation
             and path_pair_id in published_incomplete
         }.difference(self.__recoverable_incomplete_pairs)
+        if root_shape_trace is not None:
+            root_shape_trace["committed_root_count"] = sum(
+                len(files) for files in self.__committed_by_pair.values()
+            )
+            root_shape_trace["visible_root_count"] = len(visible)
+            self.__last_root_shape_trace = root_shape_trace
         return ScannerResult(
             latest.timestamp,
             list(visible.values()),
@@ -1604,6 +1660,9 @@ def _pop_scan_updates(controller: "Controller", side: str, process: object) -> O
         trace_enabled = _breadcrumb_effectively_enabled(
             breadcrumb_trace, "scan.lifecycle", "info",
         )
+        root_shape_trace_enabled = _breadcrumb_effectively_enabled(
+            breadcrumb_trace, "scan.root_shape", "info",
+        )
         scan_marker_trace_enabled = _breadcrumb_effectively_enabled(
             breadcrumb_trace, _SCAN_MARKER_TRACE_CATEGORY, "info",
         )
@@ -1632,12 +1691,52 @@ def _pop_scan_updates(controller: "Controller", side: str, process: object) -> O
         configured_path_pair_ids = (
             set(path_pairs_by_id) if isinstance(path_pairs_by_id, dict) else None
         )
+        if root_shape_trace_enabled and events:
+            event_generations = [
+                int(getattr(event, "generation", 0)) for event in events
+                if isinstance(getattr(event, "generation", None), int)
+            ]
+            incoming_files = [
+                file for event in events for file in getattr(event, "files", ())
+            ]
+            _record_root_shape_breadcrumb(
+                breadcrumb_trace,
+                incoming_files,
+                any(bool(getattr(event, "is_scan_final", False)) for event in events),
+                "progressive",
+                "model_updater",
+                scanner_side=side,
+                generation=max(event_generations, default=0),
+                session_token=session_token,
+                progressive=True,
+                phase="accumulator_ingress",
+                flow_id="scan-accumulator:{}".format(side),
+            )
         result = accumulator.apply(
             events,
             configured_path_pair_ids,
             scan_marker_trace_enabled=scan_marker_trace_enabled,
             scan_marker_session_reset=session_changed,
+            root_shape_trace_enabled=root_shape_trace_enabled,
         )
+        if root_shape_trace_enabled and events:
+            result_files = list(getattr(result, "files", ())) if result is not None else []
+            raw_result_generation = getattr(result, "generation", 0) if result is not None else 0
+            result_generation = raw_result_generation if type(raw_result_generation) is int else 0
+            _record_root_shape_breadcrumb(
+                breadcrumb_trace,
+                result_files,
+                bool(getattr(result, "is_scan_final", False)) if result is not None else False,
+                "progressive",
+                "model_updater",
+                scanner_side=side,
+                generation=result_generation,
+                session_token=session_token,
+                progressive=True,
+                phase="accumulator_commit",
+                flow_id="scan-accumulator:{}".format(side),
+                extra_details=accumulator.root_shape_trace(),
+            )
         if scan_marker_trace_enabled:
             # The accumulator may reject every queued row as stale.  Emit the
             # gated provenance here so that rejection remains observable even
@@ -2103,6 +2202,36 @@ class ModelUpdater(_ControllerCoreAccess):
             stale.add(marker)
         return stale
 
+    @classmethod
+    def _has_unmatched_canonical_marker(
+            cls,
+            markers: set[str],
+            active_model_ids: set[str],
+            pending_ids: set[str],
+            path_pair_ids: set[str],
+    ) -> bool:
+        """Whether lifecycle cleanup needs a descendant identity census."""
+        return any(
+            (normalized_marker := cls._normalize_scoped_persist_key(marker, path_pair_ids)) is not None and
+            normalized_marker not in active_model_ids and normalized_marker not in pending_ids
+            for marker in markers
+        )
+
+    @staticmethod
+    def _rendered_descendant_file_ids(model: Model) -> set[str]:
+        """Collect the current candidate's descendants in one bounded walk."""
+        descendant_ids: set[str] = set()
+        frontier = [
+            child
+            for root_file_id in model.get_file_ids()
+            for child in model.get_file(root_file_id).get_children()
+        ]
+        while frontier:
+            file = frontier.pop()
+            descendant_ids.add(file.file_id)
+            frontier.extend(file.get_children())
+        return descendant_ids
+
     def _handle_lftp_completion_detection(
         self,
         current_downloading_file_names: list[tuple[str, str | None, str | None]],
@@ -2564,6 +2693,54 @@ class ModelUpdater(_ControllerCoreAccess):
         joint_unknown_local_ids: set[Optional[str]] = set()
         joint_remote_excluded_keys: set[tuple[Optional[str], str]] = set()
         progressive_joint_delta_keys: set[tuple[Optional[str], str]] = set()
+        joint_root_shape_trace_enabled = progressive_mode and _controller_breadcrumb_effectively_enabled(
+            controller, "scan.root_shape", "info",
+        )
+
+        def record_joint_root_shape_boundary(
+                phase: str, local_roots: object, remote_roots: object,
+        ) -> None:
+            """Emit topology-only reconciler input/output evidence after the gate."""
+            if not joint_root_shape_trace_enabled:
+                return
+            def roots_from(value: object) -> list[SystemFile]:
+                if isinstance(value, dict):
+                    values = value.values()
+                elif isinstance(value, (list, tuple, set, frozenset)):
+                    values = value
+                else:
+                    values = ()
+                return [file for file in values if isinstance(file, SystemFile)]
+            local_files = roots_from(local_roots)
+            remote_files = roots_from(remote_roots)
+            raw_generations = [
+                getattr(result, "generation", 0)
+                for result in (latest_local_scan, latest_remote_scan)
+                if result is not None and type(getattr(result, "generation", 0)) is int
+            ]
+            session = next(
+                (
+                    getattr(result, "session_token", None)
+                    for result in (latest_remote_scan, latest_local_scan)
+                    if isinstance(getattr(result, "session_token", None), str)
+                ),
+                None,
+            )
+            for scanner_side, files in (("local", local_files), ("remote", remote_files)):
+                _record_root_shape_breadcrumb(
+                    getattr(getattr(controller, "_Controller__context", None), "breadcrumb_trace", None),
+                    files,
+                    phase.endswith("output"),
+                    "joint_reconciler",
+                    "model_updater",
+                    scanner_side=scanner_side,
+                    generation=max(raw_generations, default=0),
+                    session_token=session,
+                    progressive=True,
+                    phase=phase,
+                    flow_id="joint-reconciler:{}".format(scanner_side),
+                )
+
         unknown_overlay_changed = False
         # The reconciler owns uncertainty.  The builder only retains its
         # published safety overlay, which may shrink only with source-bucket
@@ -2596,10 +2773,16 @@ class ModelUpdater(_ControllerCoreAccess):
                     enabled_pair_ids = {None}
                 progressive_joint_delta_keys = side_touched_keys("local", latest_local_scan) \
                     | side_touched_keys("remote", latest_remote_scan)
+                record_joint_root_shape_boundary(
+                    "reconcile_delta_input", local_snapshot, remote_snapshot,
+                )
                 joint_local_files, joint_remote_files, joint_unknown_local_ids = joint_reconciler.reconcile_delta(
                     local_snapshot, local_authority, local_incomplete, local_completed,
                     remote_snapshot, remote_authority, remote_incomplete, remote_completed,
                     enabled_pair_ids, progressive_joint_delta_keys, joint_remote_excluded_keys,
+                )
+                record_joint_root_shape_boundary(
+                    "reconcile_delta_output", joint_local_files, joint_remote_files,
                 )
             unknown_snapshotter = getattr(model_builder, "unknown_local_path_pair_ids_snapshot", None)
             if callable(unknown_snapshotter):
@@ -2689,6 +2872,9 @@ class ModelUpdater(_ControllerCoreAccess):
                 local_noop_inventory_completion_ids = completed_ids
         if progressive_mode and joint_reconciler is not None and joint_reconciliation_final and \
                 progressive_final_publication_required:
+            record_joint_root_shape_boundary(
+                "reconcile_final_input", local_snapshot, remote_snapshot,
+            )
             if scoped_final_pair_ids:
                 joint_local_files, joint_remote_files, joint_unknown_local_ids = joint_reconciler.reconcile_pairs(
                     local_snapshot, local_authority, local_incomplete, local_completed,
@@ -2701,6 +2887,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     remote_snapshot, remote_authority, remote_incomplete, remote_completed,
                     enabled_pair_ids, joint_remote_excluded_keys,
                 )
+            record_joint_root_shape_boundary(
+                "reconcile_final_output", joint_local_files, joint_remote_files,
+            )
         progressive_joint_first_partial_publication = (
             progressive_mode
             and not joint_reconciliation_final
@@ -3497,7 +3686,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     continue
                 if collision_file.state == ModelFile.State.MOVE_FAILED or \
                         controller._Controller__is_explicitly_stopped(
-                            collision_file.name,
+                            collision_file.full_path,
                             collision_file.path_pair_id,
                         ):
                     continue
@@ -4326,7 +4515,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         except ModelError:
                             continue
                         if controller._Controller__is_explicitly_stopped(
-                                pending_file.name,
+                                pending_file.full_path,
                                 pending_file.path_pair_id,
                         ) or pending_file_id in live_lftp_file_ids or \
                                 controller._has_active_collision_comparison(
@@ -4492,7 +4681,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     completion_candidate = new_file is not None and old_file is not None and \
                         new_file.file_id in pending_completion_file_ids()
                     explicitly_stopped = completion_candidate and controller._Controller__is_explicitly_stopped(
-                        new_file.name,
+                        new_file.full_path,
                         new_file.path_pair_id,
                     )
                     if completion_candidate and explicitly_stopped:
@@ -4607,7 +4796,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         # discarded above, but that must not let the ordinary
                         # DOWNLOADED diff path resurrect an automatic move.
                         if controller._Controller__is_explicitly_stopped(
-                                new_file.name, new_file.path_pair_id,
+                                new_file.full_path, new_file.path_pair_id,
                         ):
                             continue
                         move_result = run_reserved_automatic_move(new_file)
@@ -4671,7 +4860,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     # for a completion whose first move was deferred until a
                     # quiet no-diff model build.
                     if controller._Controller__is_explicitly_stopped(
-                            pending_file.name, pending_file.path_pair_id,
+                            pending_file.full_path, pending_file.path_pair_id,
                     ):
                         discard_pending_completion_file(file_id)
                         continue
@@ -4766,6 +4955,19 @@ class ModelUpdater(_ControllerCoreAccess):
                             getattr(latest_local_scan, "completed_path_pair_ids", set())
                         )
                     pending_ids = pending_completion_file_ids()
+                    lifecycle_marker_ids = set(persist.downloaded_file_names)
+                    lifecycle_marker_ids.update(getattr(persist, "downloaded_timestamps", {}))
+                    lifecycle_marker_ids.update(persist.final_move_succeeded_file_names)
+                    lifecycle_active_model_ids = active_model_ids
+                    if self._has_unmatched_canonical_marker(
+                            lifecycle_marker_ids,
+                            active_model_ids,
+                            pending_ids,
+                            enabled_path_pair_ids,
+                    ):
+                        lifecycle_active_model_ids = active_model_ids.union(
+                            self._rendered_descendant_file_ids(new_model)
+                        )
                     stale_move_failure_ids = {
                         file_id for file_id in persist.move_failure_counts
                         if file_id in self._safe_stale_marker_ids(
@@ -4792,7 +4994,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         })
                     remove_downloaded_file_names = self._safe_stale_marker_ids(
                         set(persist.downloaded_file_names),
-                        active_model_ids,
+                        lifecycle_active_model_ids,
                         active_model_names,
                         pending_ids,
                         enabled_path_pair_ids,
@@ -4825,7 +5027,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     downloaded_timestamps = getattr(persist, "downloaded_timestamps", {})
                     stale_downloaded_timestamp_ids = self._safe_stale_marker_ids(
                         set(downloaded_timestamps),
-                        active_model_ids,
+                        lifecycle_active_model_ids,
                         active_model_names,
                         pending_ids,
                         enabled_path_pair_ids,
@@ -4856,7 +5058,7 @@ class ModelUpdater(_ControllerCoreAccess):
 
                     stale_final_move_succeeded_file_names = self._safe_stale_marker_ids(
                         set(persist.final_move_succeeded_file_names),
-                        active_model_ids,
+                        lifecycle_active_model_ids,
                         active_model_names,
                         pending_ids,
                         enabled_path_pair_ids,

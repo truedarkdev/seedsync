@@ -15,7 +15,7 @@ from threading import RLock
 from types import SimpleNamespace
 
 from system import SystemFile
-from lftp import LftpJobStatus, LftpJobStatusParser
+from lftp import Lftp, LftpJobStatus, LftpJobStatusParser
 from model import ModelError, ModelFile, Model
 from controller import Controller, ModelBuilder
 from controller.scan import LocalScanner
@@ -3468,6 +3468,184 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(60, m_a.download_progress)
         self.assertEqual(60, m_a_ch["aa"].download_progress)
 
+    def test_nested_canonical_pget_status_updates_owning_child_without_orphan_root(self):
+        path_pair_id = "pair-a"
+        remote_root = SystemFile("release", 100, True)
+        remote_nested = SystemFile("nested", 100, True)
+        remote_nested.add_child(SystemFile("episode.bin", 100, False))
+        remote_root.add_child(remote_nested)
+        remote_root.path_pair_id = path_pair_id
+        local_root = SystemFile("release", 40, True, is_staging=True)
+        local_nested = SystemFile("nested", 40, True, is_staging=True)
+        local_nested.add_child(SystemFile("episode.bin", 40, False, is_staging=True))
+        local_root.add_child(local_nested)
+        local_root.path_pair_id = path_pair_id
+        status = LftpJobStatus(
+            3, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "release/nested/episode.bin", "",
+        )
+        status.path_pair_id = path_pair_id
+        status.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 500, 3)
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_lftp_statuses([status])
+
+        model = self.model_builder.build_model()
+        root_file_id = ModelFile.build_file_id("release", path_pair_id)
+        self.assertEqual({root_file_id}, model.get_file_ids())
+        release = model.get_file(root_file_id)
+        nested = {child.name: child for child in release.get_children()}["nested"]
+        episode = nested.get_children()[0]
+        self.assertEqual(ModelFile.State.DOWNLOADING, episode.state)
+        self.assertEqual(40, episode.transferred_size)
+        self.assertEqual(40, episode.download_progress)
+        self.assertEqual(500, episode.downloading_speed)
+        self.assertEqual(3, episode.eta)
+
+    def test_nested_canonical_queued_status_updates_owning_child_without_orphan_root(self):
+        path_pair_id = "pair-a"
+        for status_type in (LftpJobStatus.Type.PGET, LftpJobStatus.Type.GET):
+            with self.subTest(status_type=status_type):
+                remote_root = SystemFile("release", 100, True)
+                remote_nested = SystemFile("nested", 100, True)
+                remote_nested.add_child(SystemFile("episode.bin", 100, False))
+                remote_root.add_child(remote_nested)
+                remote_root.path_pair_id = path_pair_id
+                status = LftpJobStatus(
+                    3, status_type, LftpJobStatus.State.QUEUED,
+                    "release/nested/episode.bin", "",
+                )
+                status.path_pair_id = path_pair_id
+
+                self.model_builder.clear()
+                self.model_builder.set_remote_files([remote_root])
+                self.model_builder.set_lftp_statuses([status])
+
+                model = self.model_builder.build_model()
+                root_file_id = ModelFile.build_file_id("release", path_pair_id)
+                self.assertEqual({root_file_id}, model.get_file_ids())
+                episode = next(child for child in next(
+                    child for child in model.get_file(root_file_id).get_children() if child.name == "nested"
+                ).get_children() if child.name == "episode.bin")
+                self.assertEqual(ModelFile.State.QUEUED, episode.state)
+                self.assertTrue(episode.is_stoppable)
+
+    def test_recovery_pget_status_projects_onto_nested_child_without_orphan_root(self):
+        path_pair_id = "pair-a"
+        remote_root = SystemFile("release", 100, True)
+        remote_root.add_child(SystemFile("unsafe-sibling.bin", 100, False))
+        remote_root.path_pair_id = path_pair_id
+        # LFTP parses a running recovery PGET as a basename and records the
+        # staging output path.  Its unique remote pair maps that exact leaf
+        # back to the canonical relative identity before ModelBuilder sees it.
+        status = LftpJobStatus(
+            3, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "unsafe-sibling.bin", "",
+            remote_path="/remote/a/release/unsafe-sibling.bin",
+            local_path="/staging/a/release/unsafe-sibling.bin",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 500, 3)
+        lftp = Lftp.__new__(Lftp)
+        lftp._Lftp__path_pairs_by_id = {
+            path_pair_id: {"name": "Pair A", "remote_path": "/remote/a", "local_path": "/library/a"},
+        }
+        lftp._Lftp__annotate_status_path_pairs([status])
+
+        self.assertEqual(ModelFile.build_file_id("release/unsafe-sibling.bin", path_pair_id), status.file_id)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_lftp_statuses([status])
+
+        model = self.model_builder.build_model()
+        root_file_id = ModelFile.build_file_id("release", path_pair_id)
+        self.assertEqual({root_file_id}, model.get_file_ids())
+        child = model.get_file(root_file_id).get_children()[0]
+        self.assertEqual("unsafe-sibling.bin", child.name)
+        self.assertEqual(ModelFile.State.DOWNLOADING, child.state)
+        self.assertEqual(40, child.download_progress)
+
+    def test_recovery_active_leaf_and_pget_status_project_onto_remote_child_without_orphan_root(self):
+        path_pair_id = "pair-a"
+        remote_root = SystemFile("release", 100, True)
+        remote_root.add_child(SystemFile("unsafe-sibling.bin", 100, False))
+        remote_root.path_pair_id = path_pair_id
+        # ActiveScanner reports the recovered staging leaf as its canonical
+        # relative path rather than as a directory tree.
+        active_leaf = SystemFile("release/unsafe-sibling.bin", 2, False)
+        active_leaf.path_pair_id = path_pair_id
+        status = LftpJobStatus(
+            3, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "release/unsafe-sibling.bin", "",
+        )
+        status.path_pair_id = path_pair_id
+        status.total_transfer_state = LftpJobStatus.TransferState(2, 100, 2, 3072, 3)
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_active_files([active_leaf])
+        self.model_builder.set_lftp_statuses([status])
+
+        model = self.model_builder.build_model()
+        root_file_id = ModelFile.build_file_id("release", path_pair_id)
+        self.assertEqual({root_file_id}, model.get_file_ids())
+        child = model.get_file(root_file_id).get_children()[0]
+        self.assertEqual("unsafe-sibling.bin", child.name)
+        self.assertTrue(child.remote_present)
+        self.assertTrue(child.local_present)
+        self.assertEqual(ModelFile.State.DOWNLOADING, child.state)
+        self.assertEqual(2, child.download_progress)
+        self.assertEqual(3072, child.downloading_speed)
+
+    def test_unmatched_canonical_active_leaf_remains_a_separate_root(self):
+        path_pair_id = "pair-a"
+        remote_root = SystemFile("release", 100, True)
+        remote_root.add_child(SystemFile("remote.bin", 100, False))
+        remote_root.path_pair_id = path_pair_id
+        active_leaf = SystemFile("release/unsafe-sibling.bin", 2, False)
+        active_leaf.path_pair_id = path_pair_id
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_active_files([active_leaf])
+
+        model = self.model_builder.build_model()
+        self.assertEqual({
+            ModelFile.build_file_id("release", path_pair_id),
+            ModelFile.build_file_id("release/unsafe-sibling.bin", path_pair_id),
+        }, model.get_file_ids())
+
+    def test_nested_canonical_get_fallback_updates_child_without_orphan_root(self):
+        path_pair_id = "pair-a"
+        remote_root = SystemFile("release", 100, True)
+        remote_nested = SystemFile("nested", 100, True)
+        remote_nested.add_child(SystemFile("episode.bin", 100, False))
+        remote_root.add_child(remote_nested)
+        remote_root.path_pair_id = path_pair_id
+        local_root = SystemFile("release", 40, True, is_staging=True)
+        local_nested = SystemFile("nested", 40, True, is_staging=True)
+        local_nested.add_child(SystemFile("episode.bin", 40, False, is_staging=True))
+        local_root.add_child(local_nested)
+        local_root.path_pair_id = path_pair_id
+        # A malformed PGET sidecar is parsed as the safe single-stream GET
+        # fallback while retaining its canonical nested identity.
+        status = LftpJobStatus(
+            3, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "release/nested/episode.bin", "",
+        )
+        status.path_pair_id = path_pair_id
+        status.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 500, 3)
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_lftp_statuses([status])
+
+        model = self.model_builder.build_model()
+        root_file_id = ModelFile.build_file_id("release", path_pair_id)
+        self.assertEqual({root_file_id}, model.get_file_ids())
+        episode = next(child for child in next(
+            child for child in model.get_file(root_file_id).get_children() if child.name == "nested"
+        ).get_children() if child.name == "episode.bin")
+        self.assertEqual(ModelFile.State.DOWNLOADING, episode.state)
+        self.assertEqual(40, episode.download_progress)
+
     def test_build_download_progress_fractional_percent_local(self):
         self.model_builder.clear()
         self.model_builder.set_remote_files([SystemFile("a", 100, False)])
@@ -6037,6 +6215,63 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DOWNLOADED, m_aaa.state)
         m_ab = m_a_ch["ab"]
         self.assertEqual(ModelFile.State.DOWNLOADED, m_ab.state)
+
+    def test_nested_child_persisted_completion_survives_active_sibling_rebuild(self):
+        path_pair_id = "pair-a"
+        remote_root = SystemFile("release", 20, True)
+        remote_nested = SystemFile("nested", 10, True)
+        remote_nested.add_child(SystemFile("finished.bin", 10, False))
+        remote_root.add_child(remote_nested)
+        remote_root.add_child(SystemFile("active.bin", 10, False))
+        remote_root.path_pair_id = path_pair_id
+
+        # The active staging view has retired the finished child after its
+        # successful final move, while the sibling remains incomplete.
+        local_root = SystemFile("release", 5, True, is_staging=True)
+        local_root.add_child(SystemFile("active.bin", 5, False, is_staging=True))
+        local_root.path_pair_id = path_pair_id
+        finished_id = ModelFile.build_file_id(os.path.join("release", "nested", "finished.bin"), path_pair_id)
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_downloaded_files({finished_id})
+        self.model_builder.set_downloaded_timestamps({finished_id: 1_786_400_000.0})
+        self.model_builder.set_final_move_succeeded_files({finished_id})
+
+        model = self.model_builder.build_model()
+        release = model.get_file(ModelFile.build_file_id("release", path_pair_id))
+        release_children = {child.name: child for child in release.get_children()}
+        nested = release_children["nested"]
+        finished = nested.get_children()[0]
+
+        self.assertEqual(ModelFile.State.DEFAULT, release.state)
+        self.assertEqual(ModelFile.State.DEFAULT, release_children["active.bin"].state)
+        self.assertEqual(ModelFile.State.DOWNLOADED, finished.state)
+        self.assertTrue(finished.final_move_succeeded)
+        self.assertEqual(1_786_400_000.0, finished.downloaded_timestamp.timestamp())
+
+        # A fresh builder receives the same ControllerPersist-owned overlays
+        # after restart and must reconstruct the same child presentation.
+        restarted_remote_root = SystemFile("release", 20, True)
+        restarted_nested = SystemFile("nested", 10, True)
+        restarted_nested.add_child(SystemFile("finished.bin", 10, False))
+        restarted_remote_root.add_child(restarted_nested)
+        restarted_remote_root.add_child(SystemFile("active.bin", 10, False))
+        restarted_remote_root.path_pair_id = path_pair_id
+        restarted_local_root = SystemFile("release", 5, True, is_staging=True)
+        restarted_local_root.add_child(SystemFile("active.bin", 5, False, is_staging=True))
+        restarted_local_root.path_pair_id = path_pair_id
+        rebuilt = ModelBuilder()
+        rebuilt.set_remote_files([restarted_remote_root])
+        rebuilt.set_local_files([restarted_local_root])
+        rebuilt.set_downloaded_files({finished_id})
+        rebuilt.set_downloaded_timestamps({finished_id: 1_786_400_000.0})
+        rebuilt.set_final_move_succeeded_files({finished_id})
+        rebuilt_release = rebuilt.build_model().get_file(ModelFile.build_file_id("release", path_pair_id))
+        rebuilt_nested = {child.name: child for child in rebuilt_release.get_children()}["nested"]
+        rebuilt_finished = rebuilt_nested.get_children()[0]
+        self.assertEqual(ModelFile.State.DOWNLOADED, rebuilt_finished.state)
+        self.assertTrue(rebuilt_finished.final_move_succeeded)
 
     def test_mixed_directory_recent_snapshot_survives_status_gap_with_partial_staging(self):
         self.__set_mixed_directory_sources()

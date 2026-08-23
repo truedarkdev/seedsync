@@ -954,6 +954,45 @@ class TestModelUpdater(unittest.TestCase):
             full_snapshot_path_pair_ids={pair_id},
         )
 
+    def test_progressive_accumulator_root_shape_trace_is_empty_when_disabled(self):
+        accumulator = _ProgressiveScanAccumulator()
+        self.assertEqual({}, accumulator.root_shape_trace())
+
+        accumulator.apply([
+            self._local_full_snapshot([SystemFile("sample-root", 1)], 1),
+        ], root_shape_trace_enabled=False)
+
+        self.assertEqual({}, accumulator.root_shape_trace())
+
+    def test_progressive_accumulator_root_shape_trace_counts_admission_and_protection(self):
+        accumulator = _ProgressiveScanAccumulator()
+        initial = self._local_full_snapshot([SystemFile("protected-root", 1)], 1)
+        initial.session_token = "session-a"
+        accumulator.apply([initial])
+        accumulator.begin_root_invalidation("pair", "protected-root", 2)
+
+        current = self._local_full_snapshot([SystemFile("fresh-root", 2)], 2)
+        stale = self._local_full_snapshot([SystemFile("stale-root", 3)], 1)
+        current.session_token = "session-a"
+        stale.session_token = "session-a"
+        rejected_session = self._local_full_snapshot([SystemFile("rejected-root", 4)], 3)
+        rejected_session.session_token = "session-b"
+        accumulator.apply(
+            [current, stale, rejected_session],
+            root_shape_trace_enabled=True,
+        )
+
+        trace = accumulator.root_shape_trace()
+        self.assertEqual(3, trace["incoming_event_count"])
+        self.assertEqual(2, trace["admitted_event_count"])
+        self.assertEqual(2, trace["full_snapshot_event_count"])
+        self.assertEqual(1, trace["stale_rejected_event_count"])
+        self.assertGreaterEqual(trace["protected_root_count"], 1)
+        self.assertGreaterEqual(trace["working_root_count_pre_full_snapshot_clear"], 1)
+        self.assertGreaterEqual(trace["working_root_count_post_full_snapshot_clear"], 1)
+        self.assertEqual(2, trace["committed_root_count"])
+        self.assertEqual(2, trace["visible_root_count"])
+
     def test_progressive_accumulator_invalidates_mixed_pre_move_generations_per_root(self):
         accumulator = _ProgressiveScanAccumulator()
         accumulator.apply([self._local_full_snapshot(
@@ -4302,6 +4341,121 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(set(), persist.final_move_succeeded_file_names)
         builder.build_model.assert_not_called()
 
+    def test_pair_final_keeps_rendered_nested_lifecycle_markers_after_settled_rebuild(self):
+        path_pair_id = "pair-a"
+        remote_root = SystemFile("release", 10, True)
+        remote_nested = SystemFile("nested", 10, True)
+        remote_nested.add_child(SystemFile("completed.bin", 10, False))
+        remote_root.add_child(remote_nested)
+        remote_root.path_pair_id = path_pair_id
+        local_root = SystemFile("release", 10, True)
+        local_nested = SystemFile("nested", 10, True)
+        local_nested.add_child(SystemFile("completed.bin", 10, False))
+        local_root.add_child(local_nested)
+        local_root.path_pair_id = path_pair_id
+        child_id = ModelFile.build_file_id("release/nested/completed.bin", path_pair_id)
+
+        builder = ModelBuilder()
+        builder.set_local_files([local_root])
+        builder.set_remote_files([remote_root])
+        live_model = builder.build_model()
+        final_local = ScannerResult(
+            datetime.now(), [local_root], scanned_path_pair_ids={path_pair_id},
+            is_progress=True, completed_path_pair_ids={path_pair_id}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={path_pair_id},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [remote_root], scanned_path_pair_ids={path_pair_id},
+            is_progress=True, completed_path_pair_ids={path_pair_id}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={path_pair_id},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {path_pair_id: MagicMock()}
+        controller._reserve_move_attempt = MagicMock(return_value=False)
+        persist = controller._Controller__persist
+        persist.downloaded_file_names = {child_id}
+        persist.downloaded_timestamps = {child_id: 1.0}
+        persist.final_move_succeeded_file_names = {child_id}
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual({child_id}, persist.downloaded_file_names)
+        self.assertEqual({child_id: 1.0}, persist.downloaded_timestamps)
+        self.assertEqual({child_id}, persist.final_move_succeeded_file_names)
+
+        # A fresh ModelBuilder simulates the post-restart persisted rebuild:
+        # the descendant is not a model root, but remains rendered beneath it.
+        fresh_remote_root = SystemFile("release", 10, True)
+        fresh_remote_nested = SystemFile("nested", 10, True)
+        fresh_remote_nested.add_child(SystemFile("completed.bin", 10, False))
+        fresh_remote_root.add_child(fresh_remote_nested)
+        fresh_remote_root.path_pair_id = path_pair_id
+        fresh_local_root = SystemFile("release", 10, True)
+        fresh_local_nested = SystemFile("nested", 10, True)
+        fresh_local_nested.add_child(SystemFile("completed.bin", 10, False))
+        fresh_local_root.add_child(fresh_local_nested)
+        fresh_local_root.path_pair_id = path_pair_id
+        fresh_builder = ModelBuilder()
+        fresh_builder.set_local_files([fresh_local_root])
+        fresh_builder.set_remote_files([fresh_remote_root])
+        fresh_model = fresh_builder.build_model()
+        fresh_final_local = ScannerResult(
+            datetime.now(), [fresh_local_root], scanned_path_pair_ids={path_pair_id},
+            is_progress=True, completed_path_pair_ids={path_pair_id}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={path_pair_id},
+        )
+        fresh_final_remote = ScannerResult(
+            datetime.now(), [fresh_remote_root], scanned_path_pair_ids={path_pair_id},
+            is_progress=True, completed_path_pair_ids={path_pair_id}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={path_pair_id},
+        )
+        fresh_controller, _ = self._make_progressive_update_controller(
+            fresh_final_remote, local_scan=fresh_final_local,
+            model_builder=fresh_builder, model=fresh_model,
+        )
+        fresh_controller._Controller__persist = persist
+        fresh_controller._Controller__path_pairs_by_id = {path_pair_id: MagicMock()}
+        fresh_controller._reserve_move_attempt = MagicMock(return_value=False)
+
+        ModelUpdater(fresh_controller).update()
+
+        self.assertEqual({child_id}, persist.downloaded_file_names)
+        self.assertEqual({child_id: 1.0}, persist.downloaded_timestamps)
+        self.assertEqual({child_id}, persist.final_move_succeeded_file_names)
+
+    def test_pair_final_removes_absent_nested_lifecycle_markers(self):
+        path_pair_id = "pair-a"
+        root = SystemFile("release", 10, True)
+        root.add_child(SystemFile("present.bin", 10, False))
+        root.path_pair_id = path_pair_id
+        absent_child_id = ModelFile.build_file_id("release/nested/missing.bin", path_pair_id)
+        builder = ModelBuilder()
+        builder.set_local_files([root])
+        builder.set_remote_files([root])
+        live_model = builder.build_model()
+        final = ScannerResult(
+            datetime.now(), [root], scanned_path_pair_ids={path_pair_id},
+            is_progress=True, completed_path_pair_ids={path_pair_id}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={path_pair_id},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final, local_scan=final, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {path_pair_id: MagicMock()}
+        controller._reserve_move_attempt = MagicMock(return_value=False)
+        persist = controller._Controller__persist
+        persist.downloaded_file_names = {absent_child_id}
+        persist.downloaded_timestamps = {absent_child_id: 1.0}
+        persist.final_move_succeeded_file_names = {absent_child_id}
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(set(), persist.downloaded_file_names)
+        self.assertEqual({}, persist.downloaded_timestamps)
+        self.assertEqual(set(), persist.final_move_succeeded_file_names)
+
     def test_pair_candidate_removal_prunes_its_canonical_persisted_markers(self):
         old = SystemFile("old.bin", 10, False)
         old.path_pair_id = "pair-a"
@@ -6184,6 +6338,59 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(set(), controller._Controller__pending_completion_file_names)
         self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
         self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
+
+    def test_v092_nested_pending_completion_stop_uses_canonical_full_path(self):
+        path_pair_id = "pair-a"
+        full_path = "release/nested/pending.bin"
+        child_id = ModelFile.build_file_id(full_path, path_pair_id)
+        controller = self._make_v092_pending_completion_controller(path_pair_id=path_pair_id)
+        old_root = ModelFile("release", True)
+        old_root.path_pair_id = path_pair_id
+        old_nested = ModelFile("nested", True)
+        old_child = ModelFile("pending.bin", False)
+        old_child.path_pair_id = path_pair_id
+        old_child.remote_size = 10
+        old_child.local_size = 9
+        old_nested.add_child(old_child)
+        old_root.add_child(old_nested)
+        new_root = ModelFile("release", True)
+        new_root.path_pair_id = path_pair_id
+        new_nested = ModelFile("nested", True)
+        new_child = ModelFile("pending.bin", False)
+        new_child.path_pair_id = path_pair_id
+        new_child.remote_size = 10
+        new_child.local_size = 10
+        new_child.state = ModelFile.State.DOWNLOADED
+        new_nested.add_child(new_child)
+        new_root.add_child(new_nested)
+        self.assertEqual(child_id, new_child.file_id)
+        controller._Controller__pending_completion_file_names = {
+            (full_path, path_pair_id, None),
+        }
+        controller._Controller__prev_downloading_file_names = set()
+        controller._Controller__is_explicitly_stopped = MagicMock(
+            side_effect=lambda name, pair_id: (name, pair_id) == (full_path, path_pair_id),
+        )
+        controller._reserve_move_attempt = MagicMock(return_value=True)
+        controller._release_move_attempt = MagicMock()
+        controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED,
+        )
+        # Model roots own publication, while the update decision is made from
+        # the exact nested ModelFile reported by the recursive diff.
+        controller._Controller__model.update_file = MagicMock()
+
+        with patch(
+                "controller.model_updater.ModelDiffUtil.diff_models",
+                return_value=[ModelDiff(ModelDiff.Change.UPDATED, old_child, new_child)],
+        ):
+            ModelUpdater(controller).update()
+
+        controller._Controller__is_explicitly_stopped.assert_any_call(full_path, path_pair_id)
+        controller._Controller__move_from_staging.assert_not_called()
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        self.assertNotIn(child_id, controller._Controller__persist.downloaded_file_names)
+        self.assertNotIn(child_id, controller._Controller__persist.final_move_succeeded_file_names)
 
     def test_v092_stop_cancels_pending_completion_before_downloaded_diff_can_finalize(self):
         controller = self._make_v092_pending_completion_controller()

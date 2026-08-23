@@ -543,6 +543,32 @@ describe("Testing view file service", () => {
         expect(latestFile.remoteSize).toBe(0);
     }));
 
+    it("should keep an active recovery transfer visible when remote content metadata is pending", fakeAsync(() => {
+        const model = Immutable.Map<string, ModelFile>().set("recovery-child", new ModelFile({
+            name: "recovery-child",
+            state: ModelFile.State.DOWNLOADING,
+            local_size: 2,
+            remote_size: null,
+            transferred_size: 2,
+            download_progress: 2,
+            downloading_speed: 3072,
+            remote_present: false,
+            local_present: true,
+            remote_has_transferable_content: false,
+        }));
+        mockModelService._files.next(model);
+        tick();
+
+        let latestFile: ViewFile = null;
+        viewService.files.subscribe(list => latestFile = list.get(0));
+        tick();
+
+        expect(latestFile.status).toBe(ViewFile.Status.DOWNLOADING);
+        expect(latestFile.visibleStatus).toBe(ViewFile.Status.DOWNLOADING);
+        expect(latestFile.percentDownloaded).toBe(2);
+        expect(latestFile.downloadingSpeed).toBe(3072);
+    }));
+
     it("should treat local-only default files as complete", fakeAsync(() => {
         const model = Immutable.Map<string, ModelFile>().set("a", new ModelFile({
             name: "a",

@@ -68,6 +68,12 @@ class LftpJobStatus:
     @property
     def name(self) -> str: return self.__name
 
+    @name.setter
+    def name(self, name: str):
+        if not isinstance(name, str) or not name:
+            raise TypeError
+        self.__name = name
+
     @property
     def remote_path(self) -> Optional[str]: return self.__remote_path
 

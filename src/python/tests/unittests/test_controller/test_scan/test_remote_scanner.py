@@ -12,12 +12,14 @@ import shutil
 import shlex
 
 from controller.scan import RemoteScanLease, RemoteScanner, ScannerError
+from controller.scan.scanner_process import _record_root_shape_breadcrumb
 from ssh import Sshcp, SshcpError
 from common import Localization, escape_remote_path_for_shell
 from common.performance_diagnostics import (
     DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION,
     DURATION_REMOTE_SCAN_STREAM_PARSING,
 )
+from system import SystemFile
 
 
 class TestRemoteScanner(unittest.TestCase):
@@ -203,6 +205,94 @@ class TestRemoteScanner(unittest.TestCase):
             "SEEDSYNC_SCAN_V2\t{}\n".format(json.dumps(record, separators=(",", ":"))).encode()
             for record in records
         )
+
+    def test_root_shape_disabled_gate_avoids_tree_payload_work(self):
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = False
+
+        class ExplodingRoot:
+            @property
+            def is_dir(self):
+                raise AssertionError("disabled root-shape gate traversed a root")
+
+            def iter_children(self):
+                raise AssertionError("disabled root-shape gate traversed children")
+
+        _record_root_shape_breadcrumb(trace, [ExplodingRoot()], False, "v2", "remote_scanner")
+
+        trace.record.assert_not_called()
+
+    def test_root_shape_enabled_payload_contains_only_fixed_shape_fields(self):
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        root = SystemFile("release", 3, is_dir=True)
+        root.add_child(SystemFile("one", 1))
+        root.add_child(SystemFile("two", 2))
+
+        _record_root_shape_breadcrumb(trace, [root], True, "v2", "remote_scanner")
+
+        trace.record.assert_called_once()
+        details = trace.record.call_args.args[2]
+        self.assertEqual({
+            "schema", "stage", "scanner_side", "generation", "session_digest",
+            "progressive", "phase", "pair_count", "unassigned_root_count",
+            "explicit_path_pair_count", "root_count", "directory_root_count",
+            "direct_child_count", "total_child_count", "max_depth", "root_shape_digest",
+            "root_shape_truncated", "root_fingerprints", "root_fingerprint_truncated",
+            "is_final", "protocol_mode",
+        }, set(details))
+        self.assertEqual("scan.root_shape.v1", details["schema"])
+        self.assertEqual("remote_scanner_stream", details["stage"])
+        self.assertEqual(1, details["root_count"])
+        self.assertEqual(1, details["directory_root_count"])
+        self.assertEqual(2, details["direct_child_count"])
+        self.assertTrue(details["is_final"])
+        self.assertEqual("v2", details["protocol_mode"])
+
+    def test_streamed_directory_root_records_root_shape_before_progress(self):
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner.set_breadcrumb_trace(trace)
+        records = [
+            {"type": "manifest_begin", "count": 1},
+            {"type": "manifest_names", "names": ["release"]},
+            {"type": "manifest_end"},
+            {"type": "root_begin", "id": 0, "name": "release"},
+            {"type": "root_nodes", "root": 0, "nodes": [
+                {"id": 0, "parent": None, "file": {"name": "release", "size": 3, "is_dir": True}},
+                {"id": 1, "parent": 0, "file": {"name": "one", "size": 1, "is_dir": False}},
+                {"id": 2, "parent": 0, "file": {"name": "two", "size": 2, "is_dir": False}},
+            ]},
+            {"type": "root_end", "id": 0, "nodes": 3},
+            {"type": "complete"},
+        ]
+        stream = b"".join(
+            "SEEDSYNC_SCAN_V2\t{}\n".format(json.dumps(record, separators=(",", ":"))).encode()
+            for record in records
+        )
+        self.mock_ssh.shell_stream = MagicMock(side_effect=lambda command, on_chunk: (on_chunk(stream), b"")[-1])
+        scanner.set_progress_callback(lambda *args: None)
+
+        result = scanner.scan()
+
+        self.assertEqual(["release"], [root.name for root in result])
+        root_shape_calls = [
+            call for call in trace.record.call_args_list
+            if call.kwargs.get("category") == "scan.root_shape"
+        ]
+        self.assertTrue(root_shape_calls)
+        details = root_shape_calls[0].args[2]
+        self.assertEqual(1, details["root_count"])
+        self.assertEqual(1, details["directory_root_count"])
+        self.assertEqual(2, details["direct_child_count"])
+        self.assertFalse(details["is_final"])
+        self.assertEqual("v2", details["protocol_mode"])
 
     def test_correctly_initializes_ssh(self):
         self.ssh_args = {}

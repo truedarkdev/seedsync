@@ -102,6 +102,35 @@ class TestControllerHandler(BaseTestWebApp):
         command = self.controller.queue_command.call_args.args[0]
         self.assertEqual("movie-id", command.filename)
 
+    def test_nested_serialized_file_id_resolves_for_manual_actions(self):
+        def side_effect(command: Controller.Command):
+            command.callbacks[0].on_success()
+
+        child_id = '["movies","release/nested/episode.bin"]'
+        self.controller.get_model_file_command_identities.side_effect = None
+        self.controller.get_model_file_command_identities.return_value = (
+            (child_id, "episode.bin", "movies"),
+        )
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+        encoded_name = quote(quote("episode.bin", safe=""), safe="")
+        encoded_id = quote(child_id, safe="")
+        requests = (
+            (Controller.Command.Action.QUEUE, "post", "queue"),
+            (Controller.Command.Action.STOP, "post", "stop"),
+            (Controller.Command.Action.DELETE_LOCAL, "delete", "delete_local"),
+            (Controller.Command.Action.DELETE_REMOTE, "delete", "delete_remote"),
+        )
+
+        for action, method, endpoint in requests:
+            with self.subTest(action=action):
+                response = getattr(self.test_app, method)(
+                    "/server/command/{}/{}?file_id={}".format(endpoint, encoded_name, encoded_id)
+                )
+                self.assertEqual(200, response.status_code)
+                command = self.controller.queue_command.call_args.args[0]
+                self.assertEqual(action, command.action)
+                self.assertEqual(child_id, command.filename)
+
     def test_queue_resolution_accepts_unique_name_without_identity(self):
         def side_effect(cmd: Controller.Command):
             cmd.callbacks[0].on_success()

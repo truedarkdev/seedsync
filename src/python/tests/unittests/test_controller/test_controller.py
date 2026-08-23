@@ -17,7 +17,7 @@ from unittest.mock import ANY, MagicMock, mock_open, patch
 from types import SimpleNamespace
 
 from controller import AutoQueue, AutoQueuePersist, Controller, ControllerPersist, ModelBuilder
-from controller.model_updater import ModelUpdater
+from controller.model_updater import ModelUpdater, _ProgressiveScanAccumulator
 from controller.extract import ExtractRequest, ExtractStatus
 from controller.validate import ValidateProcess
 from controller.scan import MultiPathActiveScanner, ScannerProcess, ScannerResult
@@ -5578,6 +5578,88 @@ class TestController(unittest.TestCase):
         )
         self.assertEqual("eligible", self.controller._Controller__download_start_state[file.file_id].state)
 
+    def test_process_commands_queue_uses_nested_pair_relative_path(self):
+        root = ModelFile("release", True)
+        file = ModelFile("movie.mkv", False)
+        root.add_child(file)
+        file.path_pair_id = "movies"
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+        }
+        self.controller._Controller__path_pair_staging_paths = {"movies": "/local/movies/incomplete"}
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            "release/movie.mkv", False,
+            remote_base_dir_path="/remote/movies", local_base_dir_path="/local/movies/incomplete",
+        )
+
+    def test_process_commands_resolve_serialized_nested_child_ids_for_all_manual_actions(self):
+        def install_nested_child(state, *, local_size=None, remote_size=10, stoppable=False):
+            self.setUp()
+            root = ModelFile("release", True)
+            root.path_pair_id = "movies"
+            nested = ModelFile("nested", True)
+            nested.path_pair_id = "movies"
+            child = ModelFile("episode.bin", False)
+            child.path_pair_id = "movies"
+            child.state = state
+            child.local_size = local_size
+            child.remote_size = remote_size
+            child.is_stoppable = stoppable
+            root.add_child(nested)
+            nested.add_child(child)
+            model = Model()
+            model.set_base_logger(self.controller.logger)
+            model.add_file(root)
+            self.controller._Controller__model = model
+            self.controller._Controller__model_lock = threading.RLock()
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+            }
+            self.controller._Controller__path_pair_staging_paths = {
+                "movies": "/local/movies/incomplete"
+            }
+            return child
+
+        with self.subTest(action="queue"):
+            child = install_nested_child(ModelFile.State.DEFAULT)
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, child.file_id))
+            self.controller._Controller__process_commands()
+            self.controller._Controller__lftp.queue.assert_called_once_with(
+                "release/nested/episode.bin", False,
+                remote_base_dir_path="/remote/movies", local_base_dir_path="/local/movies/incomplete",
+            )
+
+        with self.subTest(action="stop"):
+            child = install_nested_child(ModelFile.State.DOWNLOADING, stoppable=True)
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, child.file_id))
+            self.controller._Controller__process_commands()
+            self.controller._Controller__lftp.kill.assert_called_once_with(
+                "release/nested/episode.bin", path_pair_id="movies",
+                remote_path="/remote/movies/release/nested/episode.bin",
+                local_path=os.path.join("/local/movies/incomplete", "release", "nested"),
+            )
+
+        with self.subTest(action="delete_local"):
+            child = install_nested_child(ModelFile.State.DEFAULT, local_size=10)
+            self.controller._Controller__queue_delete_local_process = MagicMock()
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.DELETE_LOCAL, child.file_id))
+            self.controller._Controller__process_commands()
+            self.controller._Controller__queue_delete_local_process.assert_called_once()
+            self.assertEqual(child.file_id, self.controller._Controller__queue_delete_local_process.call_args.args[0].file_id)
+
+        with self.subTest(action="delete_remote"):
+            child = install_nested_child(ModelFile.State.DEFAULT)
+            with patch("controller.controller.DeleteRemoteProcess") as delete_remote_process:
+                self.controller.queue_command(Controller.Command(Controller.Command.Action.DELETE_REMOTE, child.file_id))
+                self.controller._Controller__process_commands()
+            self.assertEqual("release/nested/episode.bin", delete_remote_process.call_args.kwargs["file_name"])
+
     def test_process_commands_queue_rejects_empty_remote_directory_but_allows_zero_byte_file(self):
         empty_dir = ModelFile("empty-dir", True)
         empty_dir.remote_size = 0
@@ -6320,6 +6402,28 @@ class TestController(unittest.TestCase):
         )
         self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
 
+    def test_process_commands_stop_uses_nested_pget_paths(self):
+        root = ModelFile("release", True)
+        file = ModelFile("movie.mkv", False)
+        root.add_child(file)
+        file.path_pair_id = "movies"
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+        }
+        self.controller._Controller__path_pair_staging_paths = {"movies": "/local/movies/incomplete"}
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.kill.assert_called_once_with(
+            file.full_path, path_pair_id="movies",
+            remote_path="/remote/movies/release/movie.mkv",
+            local_path=os.path.join("/local/movies/incomplete", "release"),
+        )
+
     def test_process_commands_failed_queue_does_not_arm_download_start(self):
         file = ModelFile("dup", False)
         file.remote_size = 10
@@ -6632,6 +6736,24 @@ class TestController(unittest.TestCase):
         self.assertEqual(file.file_id, event_file.file_id)
         self.assertIsNot(file, event_file)
         self.assertEqual(0, self.controller._Controller__command_queue.qsize())
+
+    def test_process_commands_delete_remote_uses_nested_relative_path(self):
+        root = ModelFile("release", True)
+        file = ModelFile("movie.mkv", False)
+        root.add_child(file)
+        file.path_pair_id = "movies"
+        file.remote_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+        }
+
+        with patch("controller.controller.DeleteRemoteProcess") as delete_remote_process:
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id))
+            self.controller._Controller__process_commands()
+
+        self.assertEqual("release/movie.mkv", delete_remote_process.call_args.kwargs["file_name"])
 
     def test_process_commands_delete_remote_defers_when_delete_cap_reached(self):
         file = ModelFile("dup", False)
@@ -6997,6 +7119,31 @@ class TestController(unittest.TestCase):
         self.assertEqual("eligible", self.controller._Controller__download_start_state[file.file_id].state)
         completed_file = remote_delete_listener.call_args.args[0]
         self.assertEqual(file.file_id, completed_file.file_id)
+
+    def test_cleanup_commands_delete_remote_clears_nested_downloaded_marker(self):
+        root = ModelFile("release", True)
+        file = ModelFile("movie.mkv", False)
+        root.add_child(file)
+        file.path_pair_id = "movies"
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADED
+        command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id)
+        process = MagicMock()
+        process.name = "DeleteRemoteProcess"
+        process.is_alive.return_value = False
+        process.propagate_exception.return_value = None
+        self.controller._Controller__persist.downloaded_file_names = {file.file_id}
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(
+                command=command, file_id=file.file_id, file_name=file.full_path,
+                process=process, post_callback=MagicMock(), await_completion=False,
+                event_file=copy.deepcopy(file),
+            )
+        ]
+
+        self.controller._Controller__cleanup_commands()
+
+        self.assertNotIn(file.file_id, self.controller._Controller__persist.downloaded_file_names)
 
     def test_cleanup_commands_delete_local_times_out_stale_processes(self):
         file = ModelFile("dup", False)
@@ -8043,9 +8190,27 @@ class TestController(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(final_root, "release", "incomplete.bin")))
             self.assertNotIn("release", self.controller._Controller__persist.final_move_succeeded_file_names)
             self.assertNotIn("release", self.controller._Controller__persist.downloaded_file_names)
+            child_id = ModelFile.build_file_id("release/complete.bin", None)
+            self.assertIn(child_id, self.controller._Controller__persist.downloaded_file_names)
+            self.assertIn(child_id, self.controller._Controller__persist.downloaded_timestamps)
+            self.assertIn(child_id, self.controller._Controller__persist.final_move_succeeded_file_names)
+            self.controller._Controller__model_builder.set_downloaded_files.assert_called_with(
+                self.controller._Controller__persist.downloaded_file_names,
+            )
 
     def test_directory_child_finalization_rechecks_parent_stop_before_move(self):
         self.controller._Controller__is_explicitly_stopped = MagicMock(return_value=True)
+        self.controller._Controller__move_from_staging = MagicMock()
+
+        result = self.controller._finalize_staging_child("release", "complete.bin")
+
+        self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result)
+        self.controller._Controller__move_from_staging.assert_not_called()
+
+    def test_directory_child_finalization_honors_exact_child_stop_before_move(self):
+        self.controller._Controller__is_explicitly_stopped = MagicMock(
+            side_effect=lambda name, _pair: name == "release/complete.bin",
+        )
         self.controller._Controller__move_from_staging = MagicMock()
 
         result = self.controller._finalize_staging_child("release", "complete.bin")
@@ -11561,6 +11726,98 @@ class TestController(unittest.TestCase):
             remote_base_dir_path="/remote/tv",
             local_base_dir_path="/local/tv/incomplete"
         )
+
+    def test_recover_interrupted_downloads_requeues_nested_pget_partial(self):
+        with tempfile.TemporaryDirectory() as staging_root:
+            nested = os.path.join(staging_root, "release", "season")
+            os.makedirs(nested)
+            Path(os.path.join(nested, "movie.mkv.lftp")).write_bytes(b"partial")
+            Path(os.path.join(nested, "movie.mkv.lftp.lftp-pget-status")).write_text(
+                "size=10\n0.pos=0\n0.limit=10\n", encoding="utf-8",
+            )
+            remote_root = SystemFile("release", 10, True)
+            remote_season = SystemFile("season", 10, True)
+            remote_child = SystemFile("movie.mkv", 10, False)
+            remote_season.add_child(remote_child)
+            remote_root.add_child(remote_season)
+            remote_root.path_pair_id = "movies"
+            self.controller._Controller__persist.downloaded_file_names = set()
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+            }
+            self.controller._Controller__path_pair_staging_paths = {"movies": staging_root}
+
+            self.controller._Controller__recover_interrupted_downloads([remote_root])
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            "release/season/movie.mkv", False,
+            remote_base_dir_path="/remote/movies", local_base_dir_path=ANY,
+        )
+
+    def test_recover_interrupted_downloads_requeues_nested_direct_pget_target(self):
+        with tempfile.TemporaryDirectory() as staging_root:
+            nested = os.path.join(staging_root, "release", "season")
+            os.makedirs(nested)
+            Path(os.path.join(nested, "movie.mkv")).write_bytes(b"partial")
+            Path(os.path.join(nested, "movie.mkv.lftp-pget-status")).write_text(
+                "size=10\n0.pos=0\n0.limit=10\n", encoding="utf-8",
+            )
+            remote_root = SystemFile("release", 10, True)
+            remote_season = SystemFile("season", 10, True)
+            remote_child = SystemFile("movie.mkv", 10, False)
+            remote_season.add_child(remote_child); remote_root.add_child(remote_season)
+            remote_root.path_pair_id = "movies"
+            self.controller._Controller__persist.downloaded_file_names = set()
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+            }
+            self.controller._Controller__path_pair_staging_paths = {"movies": staging_root}
+
+            self.controller._Controller__recover_interrupted_downloads([remote_root])
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            "release/season/movie.mkv", False,
+            remote_base_dir_path="/remote/movies", local_base_dir_path=ANY,
+        )
+
+    def test_recover_interrupted_downloads_keeps_nested_no_sidecar_partial_with_parent_mirror(self):
+        with tempfile.TemporaryDirectory() as staging_root:
+            release_path = os.path.join(staging_root, "release", "season")
+            os.makedirs(release_path)
+            Path(os.path.join(release_path, "movie.mkv.lftp")).write_bytes(b"partial")
+            remote_root = SystemFile("release", 10, True)
+            remote_root.path_pair_id = "movies"
+            self.controller._Controller__persist.downloaded_file_names = set()
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+            }
+            self.controller._Controller__path_pair_staging_paths = {"movies": staging_root}
+
+            self.controller._Controller__recover_interrupted_downloads([remote_root])
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            "release", True, remote_base_dir_path="/remote/movies", local_base_dir_path=ANY,
+        )
+
+    def test_recover_interrupted_downloads_does_not_mirror_nested_invalid_pget_sidecar(self):
+        with tempfile.TemporaryDirectory() as staging_root:
+            release_path = os.path.join(staging_root, "release")
+            os.makedirs(release_path)
+            Path(os.path.join(release_path, "movie.mkv.lftp")).write_bytes(b"partial")
+            Path(os.path.join(release_path, "movie.mkv.lftp.lftp-pget-status")).write_text(
+                "invalid", encoding="utf-8",
+            )
+            remote_root = SystemFile("release", 10, True)
+            remote_root.path_pair_id = "movies"
+            self.controller._Controller__persist.downloaded_file_names = set()
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+            }
+            self.controller._Controller__path_pair_staging_paths = {"movies": staging_root}
+
+            self.controller._Controller__recover_interrupted_downloads([remote_root])
+
+        self.controller._Controller__lftp.queue.assert_not_called()
 
     def test_recover_interrupted_downloads_queues_path_pair_directory(self):
         self.controller._Controller__persist.downloaded_file_names = set()

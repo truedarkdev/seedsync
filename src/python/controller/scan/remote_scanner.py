@@ -17,7 +17,12 @@ from collections.abc import Callable
 from typing import List, Optional, cast
 import shlex
 
-from .scanner_process import IScanner, ScannerError, ScanProgressCallback
+from .scanner_process import (
+    IScanner,
+    ScannerError,
+    ScanProgressCallback,
+    _record_root_shape_breadcrumb,
+)
 from common import overrides, Localization, escape_remote_path_for_shell
 from ssh import Sshcp, SshcpError, TRANSIENT_ERROR_PATTERNS
 from ssh.sshcp import Sshcp as _SshcpTransport
@@ -321,6 +326,7 @@ class RemoteScanner(IScanner):
         self.__progress_callback: Optional[ScanProgressCallback] = None
         self.__progress_callback_supports_fingerprints = False
         self.__accepted_root_fingerprints: dict[str, str] = {}
+        self.__breadcrumb_trace: object = None
 
         # Append scan script name to remote path if not there already
         if self.__is_valid_local_script_path(self.__local_path_to_scan_script) and \
@@ -344,6 +350,7 @@ class RemoteScanner(IScanner):
     def __getstate__(self) -> dict[str, object]:
         state = self.__dict__.copy()
         state["_RemoteScanner__performance_diagnostics"] = None
+        state["_RemoteScanner__breadcrumb_trace"] = None
         return state
 
     def apply_recycled_state(self, state: object) -> None:
@@ -361,6 +368,20 @@ class RemoteScanner(IScanner):
     def set_performance_diagnostics(self, diagnostics: object) -> None:
         self.__performance_diagnostics = diagnostics
         self.__ssh.set_performance_diagnostics(diagnostics)
+
+    def set_breadcrumb_trace(self, breadcrumb_trace: object) -> None:
+        """Set the worker-local emitter used for bounded scan diagnostics."""
+        self.__breadcrumb_trace = breadcrumb_trace
+
+    def __record_root_shape(self, roots: List[SystemFile], is_final: bool,
+                            protocol_mode: str) -> None:
+        _record_root_shape_breadcrumb(
+            self.__breadcrumb_trace,
+            roots,
+            is_final,
+            protocol_mode,
+            "remote_scanner",
+        )
 
     def generation_ssh_reuse_key(self) -> Optional[tuple[object, ...]]:
         """Return a stable connection identity for one generation only."""
@@ -442,6 +463,11 @@ class RemoteScanner(IScanner):
         batch = list(pending_roots)
         pending_roots.clear()
         state["pending_roots_started_at"] = None
+        self.__record_root_shape(
+            batch,
+            False,
+            str(state.get("protocol_mode", "v2")),
+        )
         self.__publish_progress(batch, self.__path_pair_id, self.__path_pair_name, None, False)
 
     def __flush_pending_unchanged_progress(self, state: dict[str, object]) -> None:
@@ -563,6 +589,7 @@ class RemoteScanner(IScanner):
                     "pending_roots_started_at": None,
                     "pending_unchanged_root_fingerprints": {},
                     "dialect": None,
+                    "protocol_mode": "v2",
                 }
 
             stream_state = new_stream_state()
@@ -782,6 +809,7 @@ class RemoteScanner(IScanner):
                         if not isinstance(item, dict):
                             raise TypeError("scan entries must be objects")
                         remote_files.append(decode_system_file(cast(dict[str, object], item)))
+                    self.__record_root_shape(remote_files, False, "legacy")
                     self.__publish_progress(
                         [], self.__path_pair_id, self.__path_pair_name,
                         {file.name for file in remote_files}, False
@@ -790,6 +818,7 @@ class RemoteScanner(IScanner):
                         remote_files, self.__path_pair_id, self.__path_pair_name,
                         None, False
                     )
+                    self.__record_root_shape(remote_files, True, "legacy")
                     self.__publish_progress(
                         [], self.__path_pair_id, self.__path_pair_name,
                         None, True
@@ -799,6 +828,7 @@ class RemoteScanner(IScanner):
                     # has returned successfully and validated its exit status.
                     self.__flush_pending_root_progress(stream_state)
                     self.__flush_pending_unchanged_progress(stream_state)
+                    self.__record_root_shape(stream_files, True, stream_protocol_mode)
                     self.__publish_progress(
                         [], self.__path_pair_id, self.__path_pair_name,
                         None, True
@@ -851,6 +881,7 @@ class RemoteScanner(IScanner):
                         getattr(SystemFile, "from_dict"),
                     )
                     remote_files.append(decode_system_file(cast(dict[str, object], item)))
+                self.__record_root_shape(remote_files, True, "legacy")
         except (json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError) as err:
             self.logger.error("JSON decode error: {}\n{}".format(str(err), out))
             raise ScannerError(
@@ -937,6 +968,7 @@ class RemoteScanner(IScanner):
                 raise TypeError("invalid or duplicate scan root")
             remote_files.extend(batch)
             emitted_root_names.update(batch_names)
+            self.__record_root_shape(batch, False, "v2")
             self.__publish_progress(batch, self.__path_pair_id, self.__path_pair_name, None, False)
         elif record_type == "root_begin":
             root_id = record.get("id")
@@ -1017,6 +1049,7 @@ class RemoteScanner(IScanner):
             if not state.get("defer_complete", False):
                 self.__flush_pending_root_progress(state)
                 self.__flush_pending_unchanged_progress(state)
+                self.__record_root_shape(remote_files, True, "v2")
                 self.__publish_progress([], self.__path_pair_id, self.__path_pair_name, None, True)
         else:
             raise TypeError("unknown scan stream record")
@@ -1074,6 +1107,7 @@ class RemoteScanner(IScanner):
             "pending_roots_started_at": None,
             "pending_unchanged_root_fingerprints": {},
             "dialect": None,
+            "protocol_mode": "v2",
         }
         for raw_line in output.splitlines(keepends=True):
             is_v2_record = raw_line.startswith(b"SEEDSYNC_SCAN_V2\t")
@@ -1087,6 +1121,7 @@ class RemoteScanner(IScanner):
             raise TypeError("incomplete scan stream")
         self.__flush_pending_root_progress(state)
         self.__flush_pending_unchanged_progress(state)
+        self.__record_root_shape(remote_files, True, "v2")
         self.__publish_progress([], self.__path_pair_id, self.__path_pair_name, None, True)
         return remote_files
 

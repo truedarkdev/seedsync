@@ -106,6 +106,132 @@ ScanProgressCallback = Callable[
 ]
 
 
+_ROOT_SHAPE_TRACE_CATEGORY = "scan.root_shape"
+_ROOT_SHAPE_TRACE_SCHEMA = "scan.root_shape.v1"
+_ROOT_SHAPE_TRACE_STAGE = "remote_scanner_stream"
+_ROOT_SHAPE_TRACE_SIGNATURE_LIMIT = 4096
+_ROOT_SHAPE_TRACE_FINGERPRINT_LIMIT = 64
+
+
+def _build_root_shape_details(
+        roots: List[SystemFile], is_final: bool, protocol_mode: str,
+        *, scanner_side: str = "unknown", generation: int = 0,
+        session_token: object = None, progressive: bool = False,
+        phase: str = "unknown",
+) -> dict[str, object]:
+    """Build the bounded, topology-only root-shape breadcrumb payload."""
+    directory_root_count = 0
+    direct_child_count = 0
+    total_child_count = 0
+    max_depth = 0
+    shape_tokens: list[str] = []
+    pair_ids: set[object] = set()
+    unassigned_root_count = 0
+    explicit_pair_ids: set[object] = set()
+    root_fingerprints: list[str] = []
+    for root in roots:
+        path_pair_id = getattr(root, "path_pair_id", None)
+        pair_ids.add(path_pair_id)
+        if path_pair_id is None:
+            unassigned_root_count += 1
+        else:
+            explicit_pair_ids.add(path_pair_id)
+        if root.is_dir:
+            directory_root_count += 1
+        root_tokens: Optional[list[str]] = [] if len(root_fingerprints) < _ROOT_SHAPE_TRACE_FINGERPRINT_LIMIT else None
+        stack: list[tuple[SystemFile, int]] = [(root, 0)]
+        while stack:
+            current, depth = stack.pop()
+            max_depth = max(max_depth, depth)
+            children = list(current.iter_children())
+            child_count = len(children)
+            total_child_count += child_count
+            if depth == 0:
+                direct_child_count += child_count
+            if len(shape_tokens) < _ROOT_SHAPE_TRACE_SIGNATURE_LIMIT:
+                shape_tokens.append("{}:{}".format(int(bool(current.is_dir)), child_count))
+            elif len(shape_tokens) == _ROOT_SHAPE_TRACE_SIGNATURE_LIMIT:
+                shape_tokens.append("truncated")
+            if root_tokens is not None:
+                if len(root_tokens) < _ROOT_SHAPE_TRACE_SIGNATURE_LIMIT:
+                    root_tokens.append("{}:{}".format(int(bool(current.is_dir)), child_count))
+                elif len(root_tokens) == _ROOT_SHAPE_TRACE_SIGNATURE_LIMIT:
+                    root_tokens.append("truncated")
+            stack.extend((child, depth + 1) for child in reversed(children))
+        if root_tokens is not None:
+            root_fingerprints.append(opaque_trace_correlation(
+                "{}|{}|{}".format(
+                    getattr(root, "path_pair_id", None),
+                    getattr(root, "name", ""),
+                    "|".join(root_tokens),
+                ),
+            ))
+    return {
+        "schema": _ROOT_SHAPE_TRACE_SCHEMA,
+        "stage": _ROOT_SHAPE_TRACE_STAGE,
+        "scanner_side": scanner_side,
+        "generation": generation if type(generation) is int else 0,
+        "session_digest": trace_session_digest(session_token),
+        "progressive": bool(progressive),
+        "phase": phase,
+        "pair_count": len(pair_ids),
+        "unassigned_root_count": unassigned_root_count,
+        "explicit_path_pair_count": len(explicit_pair_ids),
+        "root_count": len(roots),
+        "directory_root_count": directory_root_count,
+        "direct_child_count": direct_child_count,
+        "total_child_count": total_child_count,
+        "max_depth": max_depth,
+        "root_shape_digest": opaque_trace_correlation("|".join(shape_tokens)),
+        "root_shape_truncated": len(shape_tokens) > _ROOT_SHAPE_TRACE_SIGNATURE_LIMIT,
+        "root_fingerprints": sorted(root_fingerprints),
+        "root_fingerprint_truncated": len(roots) > _ROOT_SHAPE_TRACE_FINGERPRINT_LIMIT,
+        "is_final": is_final,
+        "protocol_mode": protocol_mode,
+    }
+
+
+def _record_root_shape_breadcrumb(
+        breadcrumb_trace: object, roots: List[SystemFile], is_final: bool,
+        protocol_mode: str, source: str, *, scanner_side: str = "unknown",
+        generation: int = 0, session_token: object = None,
+        progressive: bool = False, phase: str = "unknown", flow_id: object = None,
+        extra_details: Optional[dict[str, object]] = None,
+) -> None:
+    """Record root shape only after the category gate admits the work."""
+    if not _breadcrumb_effectively_enabled(breadcrumb_trace, _ROOT_SHAPE_TRACE_CATEGORY, "info"):
+        return
+    try:
+        details = _build_root_shape_details(
+            roots, is_final, protocol_mode, scanner_side=scanner_side,
+            generation=generation, session_token=session_token,
+            progressive=progressive, phase=phase,
+        )
+        if extra_details:
+            details.update(extra_details)
+        recorder = getattr(breadcrumb_trace, "record", None)
+        if callable(recorder):
+            root_shape_digest = details["root_shape_digest"]
+            corr_id = opaque_trace_correlation(
+                "scan.root_shape|{}|{}".format(source, root_shape_digest),
+            )
+            recorder(
+                source,
+                "root_shape",
+                details,
+                stage=_ROOT_SHAPE_TRACE_STAGE,
+                event_type="diagnostic",
+                trace_scope="aggregate",
+                category=_ROOT_SHAPE_TRACE_CATEGORY,
+                level="info",
+                corr_id=corr_id,
+                flow_id=(opaque_trace_correlation(flow_id) if isinstance(flow_id, str) else None),
+            )
+    except Exception:
+        # Breadcrumb diagnostics must never alter scan behavior.
+        return
+
+
 class ScannerResult:
     """
     Results of a system scan
@@ -364,6 +490,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
         logger = root_logger.getChild("{}ScanRun".format(scanner.__class__.__name__))
 
     setter = getattr(scanner, "set_scan_target_path_pair_ids", None)
+    breadcrumb_setter = getattr(scanner, "set_breadcrumb_trace", None)
     duration_recorder = FixedDurationRecorder(performance_diagnostics_enabled)
     diagnostics_setter = getattr(scanner, "set_performance_diagnostics", None)
     if callable(diagnostics_setter):
@@ -389,6 +516,13 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
         for system_file in files:
             system_file.path_pair_id = path_pair_id
             system_file.path_pair_name = path_pair_name
+        if _scanner_side(scanner) in ("local", "remote") and files:
+            _record_root_shape_breadcrumb(
+                breadcrumb_trace, files, complete, "unknown", "scanner_process",
+                scanner_side=_scanner_side(scanner), generation=generation,
+                session_token=session_token, progressive=True,
+                phase="scanner_process_progress", flow_id=flow_id,
+            )
         progress_files_by_pair.setdefault(path_pair_id, []).extend(files)
         if unchanged_root_fingerprints:
             unchanged_root_fingerprints_by_pair.setdefault(path_pair_id, {}).update(unchanged_root_fingerprints)
@@ -432,6 +566,8 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
     outcome: tuple[str, object | None] = ("success", None)
     try:
         scanner.set_base_logger(logger)
+        if callable(breadcrumb_setter):
+            breadcrumb_setter(breadcrumb_trace)
         scanner.set_progress_callback(publish_progress)
         if callable(setter):
             setter(scan_target_path_pair_ids)
@@ -458,6 +594,13 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                 duration_aggregates=duration_recorder.snapshot(),
                 duration_aggregate_token=(session_token, generation, performance_diagnostics_generation),
             )
+            if _scanner_side(scanner) in ("local", "remote"):
+                _record_root_shape_breadcrumb(
+                    breadcrumb_trace, files, True, "unknown", "scanner_process",
+                    scanner_side=_scanner_side(scanner), generation=generation,
+                    session_token=session_token, progressive=progress_emitted,
+                    phase="scanner_process_return", flow_id=flow_id,
+                )
             _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_completed",
                                     lambda: {"file_count": len(files),
                                              "targeted": scan_target_path_pair_ids is not None,
@@ -534,6 +677,8 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
         outcome = ("fatal", ExceptionWrapper(error))
     finally:
         scanner.set_progress_callback(None)
+        if callable(breadcrumb_setter):
+            breadcrumb_setter(None)
         if callable(diagnostics_setter):
             diagnostics_setter(None)
         if callable(setter):
@@ -793,6 +938,9 @@ class ScannerProcess:
         with self.__scan_admission_lock:
             self.__apply_pending_accepted_root_fingerprints()
             setter = getattr(self.__scanner, "set_scan_target_path_pair_ids", None)
+            breadcrumb_setter = getattr(self.__scanner, "set_breadcrumb_trace", None)
+            if callable(breadcrumb_setter):
+                breadcrumb_setter(self.__breadcrumb_trace)
             if callable(setter):
                 setter(scan_target_path_pair_ids)
         self.__scan_generation += 1
@@ -811,6 +959,13 @@ class ScannerProcess:
             progress_files_by_pair.setdefault(path_pair_id, []).extend(files)
             if unchanged_root_fingerprints:
                 unchanged_root_fingerprints_by_pair.setdefault(path_pair_id, {}).update(unchanged_root_fingerprints)
+            if _scanner_side(self.__scanner) in ("local", "remote") and files:
+                _record_root_shape_breadcrumb(
+                    self.__breadcrumb_trace, files, complete, "unknown", "scanner_process",
+                    scanner_side=_scanner_side(self.__scanner), generation=self.__scan_generation,
+                    session_token=self.__session_token, progressive=True,
+                    phase="scanner_process_progress", flow_id=flow_id,
+                )
             assert self.__queue is not None
             self.__publish_result(ScannerResult(
                 datetime.now(), files,
@@ -857,6 +1012,13 @@ class ScannerProcess:
                                     is_targeted_scan=scan_target_path_pair_ids is not None,
                                     session_token=self.__session_token,
                                     unchanged_root_fingerprints_by_pair=unchanged_root_fingerprints_by_pair)
+            if _scanner_side(self.__scanner) in ("local", "remote"):
+                _record_root_shape_breadcrumb(
+                    self.__breadcrumb_trace, files, True, "unknown", "scanner_process",
+                    scanner_side=_scanner_side(self.__scanner), generation=self.__scan_generation,
+                    session_token=self.__session_token, progressive=progress_emitted,
+                    phase="scanner_process_return", flow_id=flow_id,
+                )
             self.__record_breadcrumb("scan_completed", lambda: {
                     "file_count": len(files), "targeted": scan_target_path_pair_ids is not None,
                     "scanner_side": _scanner_side(self.__scanner),
@@ -903,6 +1065,8 @@ class ScannerProcess:
             self.__inline_scan_active.clear()
             self.__inline_scan_target_path_pair_ids = None
             self.__scanner.set_progress_callback(None)
+            if callable(breadcrumb_setter):
+                breadcrumb_setter(None)
             if callable(setter):
                 setter(None)
         assert self.__queue is not None

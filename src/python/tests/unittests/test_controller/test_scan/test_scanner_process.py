@@ -29,7 +29,7 @@ from controller import IScanner, ScannerProcess, ScannerError
 from controller.scan import MultiPathRemoteScanner, RemoteScanner
 from controller.scan.scanner_process import (
     ScannerResult, _ScannerQueueReleaseMarker, _create_scanner_worker, _publish_bounded_result,
-    _record_scan_breadcrumb, _run_scanner_once,
+    _build_root_shape_details, _record_root_shape_breadcrumb, _record_scan_breadcrumb, _run_scanner_once,
 )
 from controller.extract import ExtractProcess
 from system import SystemFile
@@ -556,6 +556,73 @@ class TestScannerProcess(unittest.TestCase):
         entry = enabled.snapshot()["entries"][0]
         self.assertEqual("scanner_process", entry["category"])
         self.assertEqual("scan_started", entry["message"])
+
+    def test_root_shape_breadcrumb_gate_skips_tree_walk_when_disabled(self):
+        root = SimpleNamespace(
+            is_dir=True,
+            path_pair_id="private-pair-id",
+            iter_children=MagicMock(side_effect=AssertionError("disabled root walk")),
+        )
+        disabled = BreadcrumbTraceCollector(
+            lambda: True, max_entries=16, policy={"default": "off"},
+        )
+        _record_root_shape_breadcrumb(
+            disabled.create_emitter(), [root], True, "progressive", "test",
+        )
+        root.iter_children.assert_not_called()
+        self.assertEqual([], disabled.snapshot()["entries"])
+
+    def test_root_shape_breadcrumb_contains_only_bounded_topology_fields(self):
+        root = SystemFile("private-root", 0, True)
+        root.path_pair_id = "private-pair"
+        root.add_child(SystemFile("private-child", 1, False))
+        nested = SystemFile("private-nested", 0, True)
+        nested.add_child(SystemFile("private-leaf", 1, False))
+        root.add_child(nested)
+        details = _build_root_shape_details(
+            [root], True, "progressive", scanner_side="remote", generation=7,
+            session_token="private-session", progressive=True, phase="test",
+        )
+        self.assertEqual(1, details["pair_count"])
+        self.assertEqual(0, details["unassigned_root_count"])
+        self.assertEqual(1, details["explicit_path_pair_count"])
+        self.assertEqual(1, details["root_count"])
+        self.assertEqual(1, details["directory_root_count"])
+        self.assertEqual(3, details["total_child_count"])
+        self.assertEqual(2, details["max_depth"])
+        self.assertRegex(details["root_shape_digest"], r"^[0-9a-f]{16}$")
+        self.assertEqual(1, len(details["root_fingerprints"]))
+        self.assertRegex(details["root_fingerprints"][0], r"^[0-9a-f]{16}$")
+        self.assertNotIn("private-root", repr(details))
+        self.assertNotIn("private-child", repr(details))
+        self.assertNotIn("private-session", repr(details))
+
+    def test_local_scanner_process_emits_root_shape_breadcrumb(self):
+        class LocalShapeScanner(DummyScanner):
+            def scan(self):
+                root = SystemFile("local-root", 0, True)
+                root.add_child(SystemFile("local-child", 1, False))
+                return [root]
+
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.process = ScannerProcess(
+            scanner=LocalShapeScanner(),
+            interval_in_ms=0,
+            verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        self.process.run_loop()
+        entries = []
+        deadline = time.monotonic() + 1
+        while not entries and time.monotonic() < deadline:
+            entries = [
+                entry for entry in collector.snapshot()["entries"]
+                if entry["category"] == "scan.root_shape"
+            ]
+            if not entries:
+                time.sleep(0.001)
+        self.assertTrue(entries)
+        self.assertEqual("local", entries[-1]["details"]["scanner_side"])
 
     def test_spawned_remote_duration_aggregates_reach_parent_collector(self):
         self._scan_run_patcher.stop()

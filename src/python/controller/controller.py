@@ -2707,21 +2707,37 @@ class Controller:
         return model_files
 
     def get_model_file_command_identities(self) -> tuple[ModelFileCommandIdentity, ...]:
-        """Return immutable root identities needed to resolve commands.
+        """Return immutable rendered identities needed to resolve commands.
 
         Unlike :meth:`get_model_files`, this API never copies a ``ModelFile``
-        or traverses its children.  The tuple is replaced only after an
-        authoritative model publication, so each read sees one coherent root
-        snapshot without retaining model references.
+        tree.  The tuple is replaced only after an authoritative model
+        publication, so each HTTP read sees one coherent snapshot without
+        retaining model references.
         """
         return getattr(self, "_Controller__model_file_command_identities", ())
 
     def _refresh_model_file_command_identities_locked(self) -> None:
-        """Publish a root identity snapshot while the model lock is held."""
-        self.__model_file_command_identities = tuple(
-            (file.file_id, file.name, file.path_pair_id)
-            for file in self.__model.iter_files_by_id()
-        )
+        """Publish all rendered command identities while the model lock is held."""
+        identities: list[ModelFileCommandIdentity] = []
+        frontier = list(self.__model.iter_files_by_id())
+        while frontier:
+            file = frontier.pop()
+            identities.append((file.file_id, file.name, file.path_pair_id))
+            frontier.extend(file.get_children())
+        self.__model_file_command_identities = tuple(identities)
+
+    def __get_command_model_file(self, file_id: str) -> ModelFile:
+        """Resolve a root directly, or an exact rendered descendant for commands."""
+        try:
+            return self.__model.get_file(file_id)
+        except ModelError:
+            frontier = list(self.__model.iter_files_by_id())
+            while frontier:
+                file = frontier.pop()
+                if file.file_id == file_id:
+                    return file
+                frontier.extend(file.get_children())
+        raise ModelError("File does not exist in the model")
 
     def _get_model_root_references(self) -> List[ModelFile]:
         """Shallow, controller-internal root snapshot for same-process consumers.
@@ -3205,7 +3221,7 @@ class Controller:
         """
         if not isinstance(file, ModelFile) or not file.is_dir or \
                 file.state != ModelFile.State.DEFAULT or \
-                self.__is_explicitly_stopped(file.name, file.path_pair_id):
+                self.__is_explicitly_stopped(file.full_path, file.path_pair_id):
             return False
         pending_completion = getattr(self, "_Controller__pending_completion_file_names", set())
         if not any(
@@ -3787,6 +3803,18 @@ class Controller:
                 return self.__path_pair_staging_paths.get(path_pair_id, self.__build_staging_path(path_pair.local_path))
             return self.__path_pair_staging_paths.get(path_pair_id)
         return self.__staging_path
+
+    @staticmethod
+    def __canonical_relative_transfer_path(file: ModelFile) -> str:
+        """Return the model hierarchy as a safe, portable pair-relative path."""
+        full_path = file.full_path
+        if not isinstance(full_path, str) or not full_path or os.path.isabs(full_path) or \
+                os.path.splitdrive(full_path)[0]:
+            raise LftpError("Model file path must be relative")
+        parts = full_path.replace("\\", "/").split("/")
+        if any(not part or part in (".", "..") for part in parts):
+            raise LftpError("Model file path must be a safe relative path")
+        return "/".join(parts)
 
     def __build_extract_request(self, file: ModelFile) -> Optional[ExtractRequest]:
         path_pair = self.__get_path_pair(file.path_pair_id)
@@ -6357,7 +6385,8 @@ class Controller:
         max_failures = getattr(self, "_Controller__MAX_MOVE_FAILURES", 4)
         if type(max_failures) is not int:
             max_failures = 4
-        if self.__is_explicitly_stopped(root_name, path_pair_id):
+        if self.__is_explicitly_stopped(root_name, path_pair_id) or \
+                self.__is_explicitly_stopped(child_name, path_pair_id):
             return Controller.MoveFromStagingResult.DEFERRED
         if self.__child_final_move_failure_counts.get(child_file_id, 0) >= max_failures:
             return Controller.MoveFromStagingResult.DEFERRED
@@ -6368,7 +6397,8 @@ class Controller:
             return Controller.MoveFromStagingResult.DEFERRED
         result = Controller.MoveFromStagingResult.FAILED
         try:
-            if self.__is_explicitly_stopped(root_name, path_pair_id):
+            if self.__is_explicitly_stopped(root_name, path_pair_id) or \
+                    self.__is_explicitly_stopped(child_name, path_pair_id):
                 result = Controller.MoveFromStagingResult.DEFERRED
                 resolved = None
             else:
@@ -6410,6 +6440,16 @@ class Controller:
                           Controller.MoveFromStagingResult.ALREADY_COMPLETED):
                 self.__child_final_move_failure_counts.pop(child_file_id, None)
                 self.__child_final_move_retry_due.pop(child_file_id, None)
+                child_file = ModelFile(child_name, False)
+                child_file.path_pair_id = path_pair_id
+                self._record_download_completion(child_file)
+                self.__persist.downloaded_file_names.add(child_file_id)
+                self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
+                if result == Controller.MoveFromStagingResult.COMPLETED:
+                    self.__persist.final_move_succeeded_file_names.add(child_file_id)
+                    self._mark_successful_final_move_handoff(child_file_id)
+                    self._mark_current_process_final_publication(child_file_id)
+                self._sync_final_move_succeeded_files_to_model()
             elif result in (Controller.MoveFromStagingResult.FAILED,
                             Controller.MoveFromStagingResult.CONFLICT):
                 count = min(max_failures,
@@ -6541,20 +6581,22 @@ class Controller:
         path_pair = self.__get_path_pair(file.path_pair_id)
         final_path = path_pair.local_path if path_pair is not None else self.__legacy_local_path
         staging_path = self.__get_staging_path(file.path_pair_id if path_pair is not None else None)
-        final_target = os.path.join(final_path, file.name)
+        relative_path = self.__canonical_relative_transfer_path(file)
+        local_name = os.path.join(*relative_path.split("/"))
+        final_target = os.path.join(final_path, local_name)
 
         if os.path.exists(final_target) or not staging_path:
-            return final_path, file.name
+            return final_path, local_name
 
-        staging_target = os.path.join(staging_path, file.name)
+        staging_target = os.path.join(staging_path, local_name)
         if os.path.exists(staging_target):
-            return staging_path, file.name
+            return staging_path, local_name
 
-        staging_target = os.path.join(staging_path, file.name + Constants.LFTP_TEMP_FILE_SUFFIX)
+        staging_target = os.path.join(staging_path, local_name + Constants.LFTP_TEMP_FILE_SUFFIX)
         if os.path.exists(staging_target):
-            return staging_path, file.name + Constants.LFTP_TEMP_FILE_SUFFIX
+            return staging_path, local_name + Constants.LFTP_TEMP_FILE_SUFFIX
 
-        return final_path, file.name
+        return final_path, local_name
 
     def __has_ambiguous_split_local_target(self, file: ModelFile) -> bool:
         """Whether deleting one root could discard final split-root content."""
@@ -6563,8 +6605,9 @@ class Controller:
         staging_root = self.__get_staging_path(file.path_pair_id if path_pair is not None else None)
         if not final_root or not staging_root:
             return False
-        final_target = Controller.__safe_final_move_candidate(final_root, file.name)
-        staging_target = Controller.__safe_final_move_candidate(staging_root, file.name)
+        local_name = os.path.join(*self.__canonical_relative_transfer_path(file).split("/"))
+        final_target = Controller.__safe_final_move_candidate(final_root, local_name)
+        staging_target = Controller.__safe_final_move_candidate(staging_root, local_name)
         if final_target is None or staging_target is None:
             return True
         try:
@@ -6600,7 +6643,7 @@ class Controller:
                 not current_status_authority:
             return "Final move reset requires current transfer status"
         if file.file_id in self.__model_builder.get_unresolved_staging_collision_file_ids() or \
-                self._has_active_collision_comparison(file.name, file.path_pair_id):
+                self._has_active_collision_comparison(file.full_path, file.path_pair_id):
             return "Final move reset is blocked by unresolved staging work"
 
         if file.file_id in self.__path_pair_busy_file_ids_locked(
@@ -6805,8 +6848,8 @@ class Controller:
             return False
         if file.state != ModelFile.State.DEFAULT:
             return False
-        if self.__is_previously_downloaded(file.name, file.path_pair_id) or \
-                self.__is_explicitly_stopped(file.name, file.path_pair_id):
+        if self.__is_previously_downloaded(file.full_path, file.path_pair_id) or \
+                self.__is_explicitly_stopped(file.full_path, file.path_pair_id):
             return False
         if file.file_id in self.__persist.extracted_file_names:
             return False
@@ -6850,14 +6893,27 @@ class Controller:
         staging_path = self.__get_staging_path(file.path_pair_id)
         if not isinstance(staging_path, str) or not staging_path or not os.path.exists(staging_path):
             return (), None
-        return Lftp.get_safe_file_artifact_delete_paths(staging_path, file.name), staging_path
+        return Lftp.get_safe_file_artifact_delete_paths(
+            staging_path, self.__canonical_relative_transfer_path(file),
+        ), staging_path
 
     def __recover_interrupted_downloads(self, remote_files: list[SystemFile]) -> None:
         self.__startup_recovery_done = True
         suffix = Constants.LFTP_TEMP_FILE_SUFFIX
         remote_files_by_pair: dict[Optional[str], dict[str, SystemFile]] = {}
+        def add_remote_file(remote_file: SystemFile, relative_path: str, path_pair_id: Optional[str]) -> None:
+            remote_files_by_pair.setdefault(path_pair_id, {})[relative_path] = remote_file
+            iter_children = getattr(remote_file, "iter_children", None)
+            if remote_file.is_dir and callable(iter_children):
+                for child in iter_children():
+                    add_remote_file(child, relative_path + "/" + child.name, path_pair_id)
+
         for remote_file in remote_files:
-            remote_files_by_pair.setdefault(getattr(remote_file, "path_pair_id", None), {})[remote_file.name] = remote_file
+            add_remote_file(
+                remote_file,
+                remote_file.name,
+                getattr(remote_file, "path_pair_id", None),
+            )
 
         staging_roots = self.__path_pair_staging_paths or {None: self.__staging_path}
         for path_pair_id, staging_path in staging_roots.items():
@@ -6866,6 +6922,32 @@ class Controller:
             except OSError as error:
                 self.logger.warning("Failed to inspect staging path '%s': %s", staging_path, error)
                 continue
+
+            # Root entries retain the historical directory-MIRROR recovery
+            # behavior.  Add only nested pget temporary files: an exact
+            # recursive remote-file match is still required below, and the
+            # safe-entry check validates every path component before use.
+            try:
+                for current_root, _directories, files in os.walk(staging_path, followlinks=False):
+                    relative_root = os.path.relpath(current_root, staging_path)
+                    if relative_root in (".", ""):
+                        continue
+                    for filename in files:
+                        relative_file = os.path.join(relative_root, filename).replace(os.sep, "/")
+                        if filename.endswith(suffix):
+                            sidecar_path = self.__safe_recovery_staging_entry(
+                                staging_path, relative_file + ".lftp-pget-status", False,
+                            )
+                            if sidecar_path is not None and Lftp.is_valid_pget_status_file(sidecar_path):
+                                staging_entries.append(relative_file)
+                        else:
+                            sidecar_path = self.__safe_recovery_staging_entry(
+                                staging_path, relative_file + ".lftp-pget-status", False,
+                            )
+                            if sidecar_path is not None and Lftp.is_valid_pget_status_file(sidecar_path):
+                                staging_entries.append(relative_file)
+            except OSError:
+                pass
 
             remote_files_for_pair = remote_files_by_pair.get(path_pair_id, {})
             for entry in staging_entries:
@@ -6885,44 +6967,70 @@ class Controller:
                         staging_path, entry, True)) is not None:
                     entry_path = directory_path
                     try:
-                        has_temp_children = any(
-                            child.endswith(suffix)
-                            for child in os.listdir(entry_path)
-                        )
+                        directory_children = os.listdir(entry_path)
+                        has_temp_children = any(child.endswith(suffix) for child in directory_children)
+                        # A nested PGET writes a matching sidecar beside its
+                        # ``.lftp`` target.  Its presence, even if an
+                        # interrupted write leaves the map invalid, means an
+                        # ancestor MIRROR would flatten it at the staging
+                        # root.  Only a valid map permits standalone resume.
+                        has_nested_pget_sidecar = False
+                        for nested_root, _nested_dirs, nested_files in os.walk(entry_path, followlinks=False):
+                            nested_relative_root = os.path.relpath(nested_root, staging_path)
+                            for child in nested_files:
+                                if not child.endswith(suffix):
+                                    continue
+                                has_temp_children = True
+                                sidecar_relative = os.path.join(
+                                    nested_relative_root, child + ".lftp-pget-status",
+                                ).replace(os.sep, "/")
+                                if self.__safe_recovery_staging_entry(
+                                        staging_path, sidecar_relative, False) is not None:
+                                    has_nested_pget_sidecar = True
+                                    break
+                            if has_nested_pget_sidecar:
+                                break
                     except OSError:
                         continue
-                    if not has_temp_children:
+                    if not has_temp_children or has_nested_pget_sidecar:
                         continue
                     file_name = entry
                     is_dir = True
                 else:
+                    direct_sidecar = self.__safe_recovery_staging_entry(
+                        staging_path, entry + ".lftp-pget-status", False,
+                    )
+                    if direct_sidecar is not None and Lftp.is_valid_pget_status_file(direct_sidecar):
+                        file_name = entry
+                        is_dir = False
+                    else:
                     # v0.9.2 could leave a direct sidecarless get target.
                     # Discover it only when the persisted confirmed-start
                     # evidence already satisfies the legacy migration gate and
                     # its physical shape is one bounded regular partial. Any
                     # map or second target remains fail-closed.
-                    if entry_path is None:
-                        continue
-                    remote_file = remote_files_for_pair.get(entry)
-                    file_id = ModelFile.build_file_id(entry, path_pair_id)
-                    source_identity = self.__resume_source_identity(remote_file) if remote_file is not None else None
-                    if remote_file is None or not self.__allow_legacy_file_resume(
-                            file_id, False, source_identity,
-                    ) or any(candidate in staging_entries for candidate in (
-                        entry + suffix,
-                        entry + ".lftp-pget-status",
-                        entry + suffix + ".lftp-pget-status",
-                    )):
-                        continue
-                    try:
-                        entry_stat = os.lstat(entry_path)
-                    except OSError:
-                        continue
-                    if not stat.S_ISREG(entry_stat.st_mode) or \
-                            entry_stat.st_size > source_identity[0]:
-                        continue
-                    file_name = entry
-                    is_dir = False
+                        if entry_path is None:
+                            continue
+                        remote_file = remote_files_for_pair.get(entry)
+                        file_id = ModelFile.build_file_id(entry, path_pair_id)
+                        source_identity = self.__resume_source_identity(remote_file) if remote_file is not None else None
+                        if remote_file is None or not self.__allow_legacy_file_resume(
+                                file_id, False, source_identity,
+                        ) or any(candidate in staging_entries for candidate in (
+                            entry + suffix,
+                            entry + ".lftp-pget-status",
+                            entry + suffix + ".lftp-pget-status",
+                        )):
+                            continue
+                        try:
+                            entry_stat = os.lstat(entry_path)
+                        except OSError:
+                            continue
+                        if not stat.S_ISREG(entry_stat.st_mode) or \
+                                entry_stat.st_size > source_identity[0]:
+                            continue
+                        file_name = entry
+                        is_dir = False
 
                 remote_file = remote_files_for_pair.get(file_name)
                 if remote_file is None or \
@@ -7161,6 +7269,7 @@ class Controller:
                 ))
                 del pending[file_id]
                 continue
+
             if active_file_ids:
                 # The snapshot is not idle, so an absent job remains
                 # ambiguous until its next authoritative reconciliation.
@@ -7299,7 +7408,7 @@ class Controller:
             command = self.__command_queue.get()
             self.logger.info("Received command {} for file {}".format(str(command.action), command.filename))
             try:
-                file = self.__model.get_file(command.filename)
+                file = self.__get_command_model_file(command.filename)
             except ModelError:
                 self.__record_command_breadcrumb(
                     command=command,
@@ -7347,7 +7456,7 @@ class Controller:
                 # DOWNLOADING), and identity must remain file-id/path-pair
                 # aware rather than falling back to a name match.
                 try:
-                    file = self.__model.get_file(command.filename)
+                    file = self.__get_command_model_file(command.filename)
                 except ModelError:
                     _notify_failure(command, "File '{}' not found".format(command.filename), 404)
                     continue
@@ -7356,7 +7465,7 @@ class Controller:
                     ModelFile.State.QUEUED,
                     ModelFile.State.DOWNLOADING,
                 )
-                stopped_marked = self.__is_explicitly_stopped(file.name, file.path_pair_id)
+                stopped_marked = self.__is_explicitly_stopped(file.full_path, file.path_pair_id)
                 stop_boundary = file.file_id in stopped_queue_lifecycle_ids or stopped_marked
                 if stop_boundary:
                     pending_queue_dispatches.pop(file.file_id, None)
@@ -7442,6 +7551,14 @@ class Controller:
                         file,
                     )
                     continue
+                elif file.is_dir and file.full_path != file.name:
+                    _notify_failure(
+                        command,
+                        "Queue supports directory roots only; queue the containing directory",
+                        409,
+                        file,
+                    )
+                    continue
                 else:
                     operation_sequence = None
                     lifecycle_before_queue = None
@@ -7450,7 +7567,8 @@ class Controller:
                     try:
                         path_pair = self.__get_path_pair(file.path_pair_id)
                         local_base_dir_path = self.__get_staging_path(file.path_pair_id if path_pair else None)
-                        stopped_marked = self.__is_explicitly_stopped(file.name, file.path_pair_id)
+                        relative_path = self.__canonical_relative_transfer_path(file)
+                        stopped_marked = self.__is_explicitly_stopped(file.full_path, file.path_pair_id)
                         self.__log_stop_resume_trace(
                             "queue_after_stop" if stopped_marked else "queue_fresh",
                             file.file_id,
@@ -7493,7 +7611,7 @@ class Controller:
                                 queue_kwargs["allow_legacy_get_resume"] = True
                         lifecycle_before_queue = self.__download_start_lifecycle_snapshot(file.file_id)
                         dispatch = PendingQueueDispatch(
-                            time.monotonic(), file.name, file.path_pair_id, file.is_dir, operation_sequence,
+                            time.monotonic(), file.full_path, file.path_pair_id, file.is_dir, operation_sequence,
                             source_identity if not allow_resume else None,
                         )
                         # Install the visible intent before submitting. This
@@ -7501,7 +7619,7 @@ class Controller:
                         # must not wait for the LFTP prompt.
                         pending_queue_dispatches[file.file_id] = dispatch
                         def queue_lftp(
-                                file_name: str = file.name,
+                                file_name: str = relative_path,
                                 is_dir: bool = file.is_dir,
                                 remote_base_dir_path: Optional[str] = path_pair.remote_path if path_pair else None,
                                 local_base_dir_path: Optional[str] = local_base_dir_path,
@@ -7589,13 +7707,13 @@ class Controller:
                             })
                             self.__arm_download_start_lifecycle(
                                 file.file_id,
-                                file.name,
+                                file.full_path,
                                 file.path_pair_id,
                                 is_resume=stopped_marked,
                             )
                         Controller.__clear_persist_key(
                             self.__persist.stopped_file_names,
-                            file.name,
+                            file.full_path,
                             file.path_pair_id
                         )
                         if is_new_transfer_lifecycle:
@@ -7672,8 +7790,16 @@ class Controller:
                     local_base_dir_path = self.__get_staging_path(file.path_pair_id if path_pair else None)
                     if path_pair is not None:
                         assert file.path_pair_id is not None
-                        remote_path = "/".join([path_pair.remote_path.rstrip("/"), file.name])
-                        local_path = self.__path_pair_staging_paths.get(file.path_pair_id, path_pair.local_path)
+                        relative_path = self.__canonical_relative_transfer_path(file)
+                        remote_path = "/".join([path_pair.remote_path.rstrip("/"), relative_path])
+                        local_root = self.__path_pair_staging_paths.get(file.path_pair_id, path_pair.local_path)
+                        # PGET records its active target as ``<file>.lftp``.
+                        # Filter nested jobs by their containing staging
+                        # directory; the exact remote path and canonical
+                        # status identity still select the requested file.
+                        local_path = local_root if "/" not in relative_path else os.path.join(
+                            local_root, *relative_path.split("/")[:-1],
+                        )
                     stopped_marked = file.file_id in self.__persist.stopped_file_names
                     lifecycle_before_stop = self.__download_start_lifecycle_snapshot(file.file_id)
                     self.__log_stop_resume_trace(
@@ -7694,7 +7820,7 @@ class Controller:
                     self.__suppress_download_start_lifecycle(file.file_id)
                     operation_sequence = self.__next_lftp_operation_sequence(file.file_id)
                     def kill_lftp(
-                            file_name: str = file.name,
+                            file_name: str = file.full_path,
                             path_pair_id: Optional[str] = file.path_pair_id,
                             remote_path: Optional[str] = remote_path,
                             local_path: Optional[str] = local_path,
@@ -8079,7 +8205,7 @@ class Controller:
                         and datetime.now() <= status_cache_expires_at
                     )
                     collision_claim = self._has_active_collision_comparison(
-                        file.name, file.path_pair_id,
+                        file.full_path, file.path_pair_id,
                     )
                     collision_future = getattr(self, "_Controller__collision_compare_future", None)
                     collision_comparison_in_flight = collision_claim and (
@@ -8094,7 +8220,7 @@ class Controller:
                         and bool(self.is_path_pair_reconciled(file.path_pair_id))
                         and current_status_authority
                         and file.file_id not in active_file_ids
-                        and not self.__is_explicitly_stopped(file.name, file.path_pair_id)
+                        and not self.__is_explicitly_stopped(file.full_path, file.path_pair_id)
                         and not collision_comparison_in_flight
                     )
                 else:
@@ -8108,12 +8234,12 @@ class Controller:
                 try:
                     if has_unresolved_collision:
                         result = self.__move_from_staging(
-                            file.name,
+                            file.full_path,
                             file.path_pair_id,
                             require_collision_proof=True,
                         )
                     else:
-                        result = self.__move_from_staging(file.name, file.path_pair_id)
+                        result = self.__move_from_staging(file.full_path, file.path_pair_id)
                     if result in (
                         Controller.MoveFromStagingResult.COMPLETED,
                         Controller.MoveFromStagingResult.ALREADY_COMPLETED,
@@ -8214,7 +8340,7 @@ class Controller:
                         remote_port=Controller.__runtime_int_or_default(config.lftp.remote_port, 22),
                         remote_path=path_pair.remote_path if (path_pair := self.__get_path_pair(file.path_pair_id))
                         else self.__legacy_remote_path,
-                        file_name=file.name
+                        file_name=self.__canonical_relative_transfer_path(file)
                     )
                     process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
                     post_callback = self.__remote_scan_process.force_scan
@@ -8590,7 +8716,7 @@ class Controller:
                                 if event_file is not None:
                                     Controller.__clear_persist_key(
                                         self.__persist.downloaded_file_names,
-                                        event_file.name,
+                                        event_file.full_path,
                                         event_file.path_pair_id,
                                     )
                                     self.__model_builder.set_downloaded_files(

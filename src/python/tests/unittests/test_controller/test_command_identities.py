@@ -14,11 +14,13 @@ class TestControllerCommandIdentities(unittest.TestCase):
         controller._Controller__model_lock = threading.RLock()
         return controller
 
-    def test_returns_immutable_root_metadata_without_copying_children(self):
+    def test_returns_immutable_rendered_metadata_without_copying_children(self):
         root = ModelFile("release", True)
         root.path_pair_id = "movies"
         for index in range(2000):
-            root.add_child(ModelFile("episode-{}.mkv".format(index), False))
+            child = ModelFile("episode-{}.mkv".format(index), False)
+            child.path_pair_id = "movies"
+            root.add_child(child)
 
         model = Model()
         model.add_file(root)
@@ -28,7 +30,12 @@ class TestControllerCommandIdentities(unittest.TestCase):
             controller._refresh_model_file_command_identities_locked()
             identities = controller.get_model_file_command_identities()
 
-        self.assertEqual(((root.file_id, root.name, root.path_pair_id),), identities)
+        self.assertEqual(2001, len(identities))
+        self.assertIn((root.file_id, root.name, root.path_pair_id), identities)
+        self.assertIn((
+            ModelFile.build_file_id("release/episode-0.mkv", "movies"),
+            "episode-0.mkv", "movies",
+        ), identities)
         self.assertIsInstance(identities, tuple)
         self.assertIsInstance(identities[0], tuple)
 

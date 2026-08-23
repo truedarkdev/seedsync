@@ -2155,6 +2155,32 @@ class TestLftpPromptClassification(unittest.TestCase):
         self.assertEqual(2, lftp._Lftp__process.send.call_count)
 
 class TestLftpKillPathMatching(unittest.TestCase):
+    def test_kill_matches_nested_pget_temp_target_by_containing_staging_directory(self):
+        lftp = TestLftp._build_test_lftp()
+        status = LftpJobStatus(
+            job_id=12,
+            job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING,
+            name="release/nested/movie.mkv",
+            flags="-c",
+            remote_path="/remote/downloads/release/nested/movie.mkv",
+            local_path="/downloads/incomplete/release/nested/movie.mkv.lftp"
+        )
+        lftp.status = MagicMock(return_value=[status])
+
+        killed = lftp.kill(
+            "release/nested/movie.mkv",
+            remote_path="/remote/downloads/release/nested/movie.mkv",
+            local_path="/downloads/incomplete/release/nested",
+        )
+
+        self.assertTrue(killed)
+        lftp._Lftp__run_command.assert_called_once_with(
+            "kill 12",
+            require_prompt_ready=False,
+            low_latency=True,
+        )
+
     def test_kill_matches_running_pget_job_by_staging_root(self):
         lftp = TestLftp._build_test_lftp()
         status = LftpJobStatus(

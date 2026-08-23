@@ -50,6 +50,7 @@ from common.performance_diagnostics import (
     MODEL_BUILDER_INVALIDATION_VALIDATION_STATUSES,
 )
 from .extract import ExtractStatus, Extract
+from .scan.scanner_process import _record_root_shape_breadcrumb
 from .validate import ValidateStatus
 
 
@@ -1298,6 +1299,70 @@ class ModelBuilder:
     @staticmethod
     def __root_file_id(name: str, path_pair_id: Optional[str]) -> str:
         return ModelFile.build_file_id(name, path_pair_id)
+
+    def __nested_lftp_status_root_file_id(
+            self,
+            status: LftpJobStatus,
+            remote_files: Optional[dict[str, SystemFile]] = None,
+    ) -> Optional[str]:
+        """Return the one remote directory owning an exact nested PGET status.
+
+        LFTP can report a PGET subject by canonical root-relative name rather
+        than by the directory job's root.  Accept only a slash-delimited path
+        that resolves to one known remote leaf in the same Path Pair; all
+        ambiguous or malformed identities remain ordinary status-only roots.
+        """
+        if status.type not in (LftpJobStatus.Type.PGET, LftpJobStatus.Type.GET) or "/" not in status.name or \
+                "\\" in status.name:
+            return None
+        parts = status.name.split("/")
+        if any(not part for part in parts):
+            return None
+        candidates: list[str] = []
+        for root_file_id, remote_root in (remote_files or self.__remote_files()).items():
+            if not remote_root.is_dir or remote_root.name != parts[0] or \
+                    remote_root.path_pair_id != status.path_pair_id:
+                continue
+            child = remote_root
+            for part in parts[1:]:
+                child = next((candidate for candidate in child.iter_children() if candidate.name == part), None)
+                if child is None:
+                    break
+            if child is not None and not child.is_dir:
+                candidates.append(root_file_id)
+        return candidates[0] if len(candidates) == 1 else None
+
+    def __nested_active_file_root_file_id(
+            self,
+            active_file: SystemFile,
+            remote_files: Optional[dict[str, SystemFile]] = None,
+    ) -> Optional[str]:
+        """Return the remote root owning one canonical active-scan leaf.
+
+        Recovery can hand ActiveScanner a leaf as a canonical root-relative
+        name.  It is still staging evidence for that exact rendered child,
+        not a second local-only model root.  Resolve only exact, safe leaf
+        identities in the same Path Pair; all other active roots retain their
+        existing rendering behavior.
+        """
+        if active_file.is_dir or "/" not in active_file.name or "\\" in active_file.name:
+            return None
+        parts = active_file.name.split("/")
+        if any(not part for part in parts):
+            return None
+        candidates: list[str] = []
+        for root_file_id, remote_root in (remote_files or self.__remote_files()).items():
+            if not remote_root.is_dir or remote_root.name != parts[0] or \
+                    remote_root.path_pair_id != active_file.path_pair_id:
+                continue
+            child = remote_root
+            for part in parts[1:]:
+                child = next((candidate for candidate in child.iter_children() if candidate.name == part), None)
+                if child is None:
+                    break
+            if child is not None and not child.is_dir:
+                candidates.append(root_file_id)
+        return candidates[0] if len(candidates) == 1 else None
 
     @staticmethod
     def __model_file_matches_persisted_name(model_file: ModelFile, persisted_names: Optional[set[str]]) -> bool:
@@ -3398,6 +3463,11 @@ class ModelBuilder:
 
         effective_local_files = self.__local_files()
         for file_id, active_file in self.__active_files.items():
+            # A recovery-produced active PGET leaf has a canonical descendant
+            # identity. It is inserted while building that remote root below,
+            # rather than being published as a separate local-only root.
+            if self.__nested_active_file_root_file_id(active_file) is not None:
+                continue
             existing_file = effective_local_files.get(file_id)
             remote_file = self.__remote_file(file_id)
             if existing_file is not None and remote_file is not None and \
@@ -3436,12 +3506,45 @@ class ModelBuilder:
     def set_remote_files(self, remote_files: List[SystemFile]) -> None:
         started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_REMOTE_FILES)
         try:
+            breadcrumb = self.__stop_resume_trace_breadcrumb
+            root_shape_trace_enabled = _breadcrumb_effectively_enabled(
+                breadcrumb, "scan.root_shape", "info",
+            )
+            if root_shape_trace_enabled:
+                _record_root_shape_breadcrumb(
+                    breadcrumb,
+                    remote_files,
+                    True,
+                    "model_builder",
+                    "model_builder",
+                    scanner_side="remote",
+                    progressive=True,
+                    phase="model_builder_remote_input",
+                    flow_id="model-builder:remote",
+                )
             next_remote_files = self.__bucket_files(remote_files)
             # Invalidate the cache
             if next_remote_files != self.__remote_files_by_pair:
                 self.__remote_files_by_pair = next_remote_files
                 self.__refresh_source_name_counts()
                 self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_REMOTE_FILES)
+            if root_shape_trace_enabled:
+                committed_remote_files = [
+                    file
+                    for files_by_id in next_remote_files.values()
+                    for file in files_by_id.values()
+                ]
+                _record_root_shape_breadcrumb(
+                    breadcrumb,
+                    committed_remote_files,
+                    True,
+                    "model_builder",
+                    "model_builder",
+                    scanner_side="remote",
+                    progressive=True,
+                    phase="model_builder_remote_committed",
+                    flow_id="model-builder:remote",
+                )
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_REMOTE_FILES, started_at)
 
@@ -3809,6 +3912,22 @@ class ModelBuilder:
         pair_id = pair_build.path_pair_id
         previous_local = self.__local_files_by_pair.get(pair_id, {})
         previous_remote = self.__remote_files_by_pair.get(pair_id, {})
+        breadcrumb = self.__stop_resume_trace_breadcrumb
+        root_shape_trace_enabled = _breadcrumb_effectively_enabled(
+            breadcrumb, "scan.root_shape", "info",
+        )
+        if root_shape_trace_enabled:
+            _record_root_shape_breadcrumb(
+                breadcrumb,
+                list(previous_remote.values()),
+                True,
+                "model_builder_pair",
+                "model_builder",
+                scanner_side="remote",
+                progressive=True,
+                phase="model_builder_pair_adoption_input",
+                flow_id="model-builder:remote-pair",
+            )
         old_sources = {
             file_id: previous_local.get(file_id) or previous_remote.get(file_id)
             for file_id in set(previous_local).union(previous_remote)
@@ -3843,6 +3962,18 @@ class ModelBuilder:
         for file_id in affected_ids:
             self.__update_status_only_name_count(file_id)
             self.__update_active_only_name_count(file_id)
+        if root_shape_trace_enabled:
+            _record_root_shape_breadcrumb(
+                breadcrumb,
+                list(self.__remote_files_by_pair.get(pair_id, {}).values()),
+                True,
+                "model_builder_pair",
+                "model_builder",
+                scanner_side="remote",
+                progressive=True,
+                phase="model_builder_pair_adoption_committed",
+                flow_id="model-builder:remote-pair",
+            )
 
     def has_pending_active_transfer_delta(self) -> bool:
         """Cheap hot-path gate; does not inspect model roots or source maps."""
@@ -4439,7 +4570,9 @@ class ModelBuilder:
         all_file_ids: set[str] = set(effective_local_files).union(remote_files)
         source_file_ids: set[str] = set(effective_local_files).union(remote_files)
         for status_file_id in self.__lftp_statuses.keys():
-            if status_file_id not in source_file_ids:
+            status = self.__lftp_statuses[status_file_id]
+            if status_file_id not in source_file_ids and \
+                    self.__nested_lftp_status_root_file_id(status, remote_files) is None:
                 all_file_ids.add(status_file_id)
 
         # A legacy name-only extraction marker cannot identify one of two
@@ -4886,6 +5019,13 @@ class ModelBuilder:
 
                 # add it to the parent right away so we can access the full path
                 _model_file.add_child(_child_model_file)
+                # ActiveScanner can report one recovery PGET leaf as a
+                # canonical root-relative SystemFile. Once this traversal has
+                # established the exact remote child identity, use that
+                # staging source here instead of publishing it as another
+                # root. Existing scanned local children remain authoritative.
+                if _local_child is None:
+                    _local_child = self.__active_files.get(_child_model_file.file_id)
                 seen_file_ids.add(_child_model_file.file_id)
                 _child_is_stopped = _child_model_file.file_id in self.__stopped_files
                 _child_model_file.explicitly_stopped = _child_is_stopped
@@ -4907,7 +5047,22 @@ class ModelBuilder:
                 _child_current_transfer_state: Optional[_TransferState] = None
                 _child_recent_transfer_state: Optional[_TransferState] = None
                 _child_arbitration_source = "scan_only"
-                if _status and _status.state == LftpJobStatus.State.RUNNING and \
+                _child_status = self.__lftp_statuses.get(_child_model_file.file_id)
+                _child_live_status: Optional[LftpJobStatus] = None
+                if _child_status is not None and _child_status.state == LftpJobStatus.State.RUNNING and \
+                        _child_status.type in (LftpJobStatus.Type.PGET, LftpJobStatus.Type.GET) and \
+                        not self.__is_stopped_file(_child_status.file_id, _root_remote, _root_local, _child_status) and \
+                        not _child_is_stopped:
+                    _child_live_status = _child_status
+                    _child_current_transfer_state = self.__transfer_state(_child_status.total_transfer_state)
+                    _child_arbitration_source = "canonical_child_status"
+                elif _child_status is not None and _child_status.state == LftpJobStatus.State.QUEUED and \
+                        _child_status.type in (LftpJobStatus.Type.PGET, LftpJobStatus.Type.GET) and _status is None and \
+                        not self.__is_stopped_file(_child_status.file_id, _root_remote, _root_local, _child_status) and \
+                        not _child_is_stopped:
+                    _child_live_status = _child_status
+                    _child_arbitration_source = "canonical_child_queued_status"
+                elif _status and _status.state == LftpJobStatus.State.RUNNING and \
                         not self.__is_stopped_file(_status.file_id, _root_remote, _root_local, _status) and \
                         not _child_is_stopped:
                     # Transfer states are in root-relative paths.
@@ -4917,8 +5072,9 @@ class ModelBuilder:
                             _child_current_transfer_state = self.__transfer_state(active_state)
                             break
                     if _child_current_transfer_state is not None:
+                        _child_live_status = _status
                         _child_arbitration_source = "live_status"
-                if _child_current_transfer_state is None and _status is None:
+                if _child_current_transfer_state is None and _status is None and _child_status is None:
                     _child_recent_transfer_state = self.__get_recent_live_transfer_state(
                         _child_model_file.file_id,
                         _remote_child,
@@ -4934,6 +5090,9 @@ class ModelBuilder:
                     _child_model_file.state = ModelFile.State.DOWNLOADING
                 elif _child_recent_transfer_state:
                     _child_model_file.state = ModelFile.State.DOWNLOADING
+                elif _child_status is not None and _child_live_status is _child_status and \
+                        _child_status.state == LftpJobStatus.State.QUEUED and _status is None:
+                    _child_model_file.state = ModelFile.State.QUEUED
                 elif _remote_child and _local_child is not None and \
                         self.__is_authoritative_local_file(_local_child) and \
                         _local_child.size >= _remote_child.size:
@@ -4955,14 +5114,26 @@ class ModelBuilder:
                     _child_current_transfer_state if _child_current_transfer_state is not None
                     else _child_recent_transfer_state,
                     _child_current_transfer_state is not None,
-                    status.file_id if status is not None else None,
+                    _child_live_status.file_id if _child_live_status is not None else None,
                     live_transferred_file_ids,
                 )
+                # A successful child finalization persists an exact child
+                # identity before its staging entry is retired.  The raw
+                # child view can subsequently contain only the active
+                # sibling tree, so preserve that completed leaf's lifecycle
+                # presentation without promoting its parent directory.
+                _child_model_file.final_move_succeeded = (
+                    _child_model_file.file_id in self.__final_move_succeeded_files
+                )
+                if not _child_model_file.is_dir and \
+                        _child_model_file.state == ModelFile.State.DEFAULT and \
+                        _child_model_file.file_id in (self.__downloaded_files or set()):
+                    _child_model_file.state = ModelFile.State.DOWNLOADED
                 _child_model_file.is_stoppable = self.__is_stoppable_model_file(
                     _child_model_file,
                     _local_child,
                     _child_current_transfer_state,
-                    _status,
+                    _child_live_status,
                 )
                 if self.__is_stop_resume_trace_enabled():
                     self.__trace_target_arbitration(
@@ -4974,7 +5145,7 @@ class ModelBuilder:
                         _local_child,
                         _child_model_file.file_id in self.__active_file_ids,
                         ModelBuilder.__summarize_local_freshness(_local_child),
-                        _status,
+                        _child_live_status,
                         _child_current_transfer_state,
                         _child_arbitration_source
                     )

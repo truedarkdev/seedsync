@@ -308,6 +308,13 @@ class MultiPathRemoteScanner(IScanner):
             if callable(setter):
                 setter(diagnostics)
 
+    def set_breadcrumb_trace(self, breadcrumb_trace: object) -> None:
+        """Propagate the worker-local breadcrumb emitter to remote members."""
+        for scanner in self.__scanners:
+            setter = getattr(scanner, "set_breadcrumb_trace", None)
+            if callable(setter):
+                setter(breadcrumb_trace)
+
     @overrides(IScanner)
     def scanned_path_pair_ids(self) -> set[str | None]:
         if self.__scan_target_path_pair_ids is not None:

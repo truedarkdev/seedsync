@@ -489,7 +489,12 @@ export class ViewFileService {
         if (transferredSize == null) {
             transferredSize = localSize;
         }
-        const isLocalOnly: boolean = localPresent && !remoteHasTransferableContent;
+        // A live transfer state is authoritative presentation evidence even
+        // while a recovery-side scan has not yet supplied remote-content
+        // metadata for that exact row.  Do not let the Local Only fallback
+        // hide an active Queue or Downloading status.
+        const isLocalOnly: boolean = localPresent && !remoteHasTransferableContent &&
+            ![ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING].includes(modelFile.state);
         if (isLocalOnly) {
             transferredSize = localSize;
         }

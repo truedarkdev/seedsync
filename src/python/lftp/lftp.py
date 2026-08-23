@@ -851,12 +851,26 @@ class Lftp:
                 pair_id for pair_id, pair in self.__path_pairs_by_id.items()
                 if Lftp.__path_is_within(status.local_path, pair["local_path"])
             }
-            if len(remote_matches) != 1 or remote_matches != local_matches:
+            # Recovery resumes individual leaves beneath the staging root,
+            # which is intentionally outside the final local Path Pair.
+            # A unique remote match still supplies an exact pair-relative
+            # identity in that case.  Retain the existing rejection when the
+            # local path resolves to another configured pair.
+            if len(remote_matches) != 1 or (local_matches and remote_matches != local_matches):
                 continue
             pair_id = next(iter(remote_matches))
             pair = self.__path_pairs_by_id[pair_id]
             status.path_pair_id = pair_id
             status.path_pair_name = pair["name"]
+            # Job output names only the basename.  Once a status is proven to
+            # belong to one Path Pair, its remote path supplies the canonical
+            # pair-relative identity used by the model and controller.
+            relative_path = os.path.relpath(
+                Lftp.__normalize_path(status.remote_path),
+                Lftp.__normalize_path(pair["remote_path"]),
+            )
+            if relative_path not in ("", ".") and not relative_path.startswith(".." + os.sep):
+                status.name = relative_path
 
     @staticmethod
     def __path_is_within(path: Optional[str], root: str) -> bool:
@@ -997,9 +1011,10 @@ class Lftp:
     @classmethod
     def __file_artifact_paths(cls, local_dir: str, name: str) -> tuple[str, tuple[tuple[str, str], ...]]:
         local_root = os.path.abspath(os.path.normpath(local_dir))
+        local_name = os.path.join(*name.split("/"))
         targets = (
-            os.path.join(local_root, name),
-            os.path.join(local_root, name + cls.__LFTP_TEMP_FILE_SUFFIX),
+            os.path.join(local_root, local_name),
+            os.path.join(local_root, local_name + cls.__LFTP_TEMP_FILE_SUFFIX),
         )
         return local_root, tuple((target, target + cls.__PGET_STATUS_FILE_SUFFIX) for target in targets)
 
@@ -1025,10 +1040,11 @@ class Lftp:
         if type(expected_size) is not int or expected_size < 0:
             raise LftpError("Legacy resume requires a valid remote size")
         local_root = os.path.abspath(os.path.normpath(local_dir))
+        local_name = os.path.join(*name.split("/"))
         targets: list[os.stat_result] = []
         for target_path in (
-                os.path.join(local_root, name),
-                os.path.join(local_root, name + cls.__LFTP_TEMP_FILE_SUFFIX),
+                os.path.join(local_root, local_name),
+                os.path.join(local_root, local_name + cls.__LFTP_TEMP_FILE_SUFFIX),
         ):
             status_path = target_path + cls.__PGET_STATUS_FILE_SUFFIX
             if not cls.__is_lexically_and_really_contained(target_path, local_root) or \
@@ -1092,13 +1108,12 @@ class Lftp:
         if (
             not isinstance(name, str)
             or not name
-            or name in {".", ".."}
             or os.path.isabs(name)
             or os.path.splitdrive(name)[0]
-            or "/" in name
             or "\\" in name
+            or any(part in {"", ".", ".."} for part in name.split("/"))
         ):
-            raise LftpError("LFTP queue name must be a single file or directory name")
+            raise LftpError("LFTP queue name must be a safe relative path")
 
     @staticmethod
     def __is_valid_pget_status_file(status_path: str) -> bool:
@@ -1143,6 +1158,11 @@ class Lftp:
             ranges.append((pos, limit))
             empty_size += limit - pos
         return empty_size <= total_size
+
+    @classmethod
+    def is_valid_pget_status_file(cls, status_path: str) -> bool:
+        """Whether a PGET sidecar has the safe, complete segment-map shape."""
+        return cls.__is_valid_pget_status_file(status_path)
 
     def queue(self,
               name: str,
@@ -1223,9 +1243,18 @@ class Lftp:
         if is_dir:
             parts.append(Lftp.__quote_command_argument("{local_dir}/".format(local_dir=local_dir)))
         else:
+            local_destination = "{local_dir}/".format(local_dir=local_dir)
+            if "/" in name:
+                local_destination = os.path.join(local_dir, *name.split("/"))
+                if not self.__is_lexically_and_really_contained(local_destination, local_dir):
+                    raise LftpError("LFTP queue target is outside the local directory")
+                try:
+                    os.makedirs(os.path.dirname(local_destination), exist_ok=True)
+                except OSError as error:
+                    raise LftpError("LFTP queue target directory is unsafe") from error
             parts.extend([
                 "-o",
-                Lftp.__quote_command_argument("{local_dir}/".format(local_dir=local_dir)),
+                Lftp.__quote_command_argument(local_destination),
             ])
         command = " ".join(parts)
         self.logger.debug("queue command: %s", command)
