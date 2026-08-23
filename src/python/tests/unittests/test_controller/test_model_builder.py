@@ -7813,6 +7813,146 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual(ModelFile.State.DEFAULT, model.get_file("sample-directory").state)
 
+    def test_mixed_root_decision_matrix_preserves_downloaded_stopped_boundary(self):
+        """Reproduce split-root coverage, collision, and explicit-stop outcomes."""
+        root_name = "opaque-root"
+        final_name = "opaque-final"
+        staging_name = "opaque-staging"
+        collision_name = "opaque-collision"
+        remote_root = SystemFile(root_name, 20, True)
+        remote_root.add_child(SystemFile(final_name, 10, False, mtime_ns=1_000_000_000))
+        remote_root.add_child(SystemFile(staging_name, 10, False, mtime_ns=2_000_000_000))
+
+        def local_tree(staging_size: int, collision: bool = False) -> SystemFile:
+            local_root = SystemFile(root_name, 10 + staging_size, True)
+            local_root.add_child(SystemFile(final_name, 10, False, mtime_ns=1_000_000_000))
+            local_root.add_child(SystemFile(
+                staging_name,
+                staging_size,
+                False,
+                is_staging=True,
+                mtime_ns=2_000_000_000,
+            ))
+            if collision:
+                local_root.has_staging_collision = True
+                collision_root = SystemFile(collision_name, 0, True, is_staging=True)
+                collision_root.has_staging_collision = True
+                local_root.add_child(collision_root)
+            return local_root
+
+        def build_case(case: str):
+            builder = ModelBuilder()
+            collector = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "off", "rules": {"model.mixed_root": "info"}},
+            )
+            builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+            builder.set_remote_files([remote_root])
+
+            # Accepted decisions are intentionally coalesced on their first
+            # observation.  Prime non-partial cases with a rejected build so
+            # the changed accepted decision is retained as evidence.
+            if case == "partial":
+                builder.set_local_files([local_tree(5)])
+            else:
+                builder.set_local_files([local_tree(5)])
+                builder.build_model()
+                builder.set_local_files([local_tree(10, collision=case == "collision")])
+                if case == "explicit_stop":
+                    builder.set_stopped_files({root_name})
+
+            model = builder.build_model()
+            root = model.get_file(root_name)
+            entries = [
+                entry for entry in self.__trace_entries(
+                    collector,
+                    include_root_decisions=True,
+                )
+                if entry["message"] == "mixed_root_decision"
+            ]
+            return root, entries
+
+        expected = {
+            "partial": {
+                "coverage": ("rejected", "partial"),
+                "promotion": ("rejected", "partial"),
+                "visible": "stopped",
+                "model_state": ModelFile.State.DEFAULT,
+                "coverage_complete": False,
+                "explicit_stop": False,
+            },
+            "complete": {
+                "coverage": ("accepted", "complete"),
+                "promotion": ("accepted", "complete"),
+                "visible": "downloaded",
+                "model_state": ModelFile.State.DOWNLOADED,
+                "coverage_complete": True,
+                "explicit_stop": False,
+            },
+            "collision": {
+                "coverage": ("rejected", "unmatched_collision"),
+                "promotion": ("rejected", "unmatched_collision"),
+                "visible": "stopped",
+                "model_state": ModelFile.State.DEFAULT,
+                "coverage_complete": False,
+                "explicit_stop": False,
+            },
+            "explicit_stop": {
+                "coverage": ("accepted", "complete"),
+                "promotion": ("accepted", "complete"),
+                "visible": "stopped",
+                "model_state": ModelFile.State.DOWNLOADED,
+                "coverage_complete": True,
+                "explicit_stop": True,
+            },
+        }
+
+        for case, assertions in expected.items():
+            with self.subTest(case=case):
+                root, entries = build_case(case)
+                self.assertTrue(entries)
+                for entry in entries:
+                    self.assertEqual("model.mixed_root", entry["category"])
+                    self.assertIsNone(entry["file_id"])
+                    self.assertIsNone(entry["path_pair_id"])
+                    self.assertIsNone(entry["path_pair_name"])
+                    self.assertNotIn("opaque-", str(entry))
+                    details = entry["details"]
+                    self.assertEqual("model_builder.mixed_root.v1", details["schema"])
+                    self.assertEqual(
+                        {"matched", "missing", "partial", "extra_staging", "collision"},
+                        set(details["counts"]),
+                    )
+                    self.assertEqual(
+                        {"root": True, "local": True, "status": False},
+                        details["presence"],
+                    )
+
+                latest = {}
+                for entry in entries:
+                    latest[entry["details"]["decision_kind"]] = entry["details"]
+                self.assertEqual({"coverage", "promotion"}, set(latest))
+                for decision_kind in ("coverage", "promotion"):
+                    details = latest[decision_kind]
+                    outcome, reason = assertions[decision_kind]
+                    self.assertEqual(outcome, details["outcome"])
+                    self.assertEqual(reason, details["reason"])
+                if case == "collision":
+                    self.assertEqual(1, latest["coverage"]["counts"]["collision"])
+                    self.assertEqual(1, latest["coverage"]["counts"]["extra_staging"])
+
+                self.assertEqual(assertions["model_state"], root.state)
+                self.assertEqual(assertions["coverage_complete"], root.complete_local_coverage)
+                self.assertEqual(assertions["explicit_stop"], root.explicitly_stopped)
+                # This is the decisive no-Stop regression boundary.  The
+                # web-visible owner must not turn accepted completion into
+                # Stopped; explicit Stop is the only accepted-case override.
+                self.assertEqual(
+                    assertions["visible"],
+                    Controller._model_record_visible_state(root),
+                    "visible-state owner: Controller._model_record_visible_state",
+                )
+
     def test_mixed_root_trace_emits_for_ordinary_default_root(self):
         remote_root = SystemFile("sample-directory", 20, True)
         remote_root.add_child(SystemFile("remote.bin", 20, False))

@@ -2776,12 +2776,15 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__lftp.last_status_poll_healthy = True
         return controller, model_builder
 
-    def _make_v092_pending_completion_controller(self, *, complete=True, path_pair_id=None):
+    def _make_v092_pending_completion_controller(
+            self, *, complete=True, path_pair_id=None, sidecar_ready=False,
+    ):
         """Create a retired-LFTP pending root without relying on a model diff."""
         remote = SystemFile("pending.bin", 10, False, mtime_ns=1)
         local = SystemFile(
             "pending.bin", 10 if complete else 9, False, is_staging=True, mtime_ns=1,
         )
+        local.status_sidecar_ready = sidecar_ready
         remote.path_pair_id = path_pair_id
         local.path_pair_id = path_pair_id
         running = LftpJobStatus(
@@ -5699,6 +5702,11 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(1, len(entries))
         self.assertEqual("cached_retry", entries[0]["details"]["outcome"])
         self.assertEqual("warning", entries[0]["level"])
+        details = entries[0]["details"]
+        self.assertEqual("cached_retry", details["source"])
+        self.assertFalse(details["fresh"])
+        self.assertFalse(details["healthy"])
+        self.assertTrue(details["retry_active"])
 
     def test_lftp_status_breadcrumb_omits_rclone_backend(self):
         trace = BreadcrumbTraceCollector(
@@ -6773,6 +6781,80 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
         self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
         self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+
+    def test_v092_late_terminal_cached_retry_keeps_sidecar_completion_pending(self):
+        """Keep a late, ambiguous PGET terminal from finalizing staged data."""
+        path_pair_id = "pair-b"
+        controller = self._make_v092_pending_completion_controller(
+            path_pair_id=path_pair_id, sidecar_ready=True,
+        )
+        pending_entry = ("pending.bin", path_pair_id, None)
+        controller._Controller__pending_completion_file_names = {pending_entry}
+
+        # A status row without a Path Pair is intentionally ambiguous with the
+        # scoped pending source.  Its complete transfer counters do not prove
+        # physical completion while the valid PGET sidecar remains present.
+        cached_running = LftpJobStatus(
+            9, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "pending.bin", "",
+        )
+        cached_running.total_transfer_state = LftpJobStatus.TransferState(
+            10, 10, 100, 100, 0,
+        )
+        controller._Controller__last_lftp_statuses = [cached_running]
+        controller._Controller__lftp.last_status_poll_healthy = False
+        controller._Controller__lftp.status.return_value = ([], False)
+        controller._Controller__lftp_status_poll_retry_active = False
+        controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(minutes=1)
+
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=16,
+            policy={"default": "off", "rules": {"transfer.lftp": "debug"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__record_breadcrumb = lambda **kwargs: trace.record(
+            "model_updater", kwargs["message"], kwargs["details"],
+            **{key: value for key, value in kwargs.items() if key not in {"message", "details"}},
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+
+            # The retry interval serves the same cached row without polling;
+            # preserve the ambiguous active authority for this second tick.
+            controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(minutes=1)
+            ModelUpdater(controller).update()
+
+        controller._Controller__move_from_staging.assert_not_called()
+        controller._record_download_completion.assert_not_called()
+        controller._complete_download_start_lifecycle.assert_not_called()
+        controller._mark_successful_final_move_handoff.assert_not_called()
+        controller._mark_current_process_final_publication.assert_not_called()
+        controller.clear_extracted_marker.assert_not_called()
+        self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
+        self.assertNotIn(
+            ModelFile.build_file_id("pending.bin", path_pair_id),
+            controller._Controller__persist.stopped_file_names,
+        )
+        self.assertIn(pending_entry, controller._Controller__pending_completion_file_names)
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(
+            ["cached_unhealthy", "cached_retry"],
+            [entry["details"]["outcome"] for entry in entries],
+        )
+        for entry in entries:
+            details = entry["details"]
+            self.assertFalse(details["fresh"])
+            self.assertFalse(details["healthy"])
+            self.assertTrue(details["retry_active"])
+            self.assertEqual(1, details["active_count"])
+        serialized = str(entries)
+        self.assertNotIn("pending.bin", serialized)
+        self.assertNotIn(path_pair_id, serialized)
 
     def test_v092_scoped_pending_completion_defers_for_unscoped_same_name_active_status(self):
         for job_type in (LftpJobStatus.Type.GET, LftpJobStatus.Type.PGET):

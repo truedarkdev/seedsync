@@ -234,6 +234,12 @@ def _record_lftp_status_breadcrumb(
         cache_expires_at = getattr(controller, "_Controller__lftp_status_cache_expires_at", None)
         retry_active = getattr(controller, "_Controller__lftp_status_poll_retry_active", False)
         idle_authoritative = getattr(controller, "_Controller__lftp_idle_status_authoritative", False)
+        if source == "cached_retry" and retry_active is True:
+            # A cached row served while the failed-poll retry is active is
+            # diagnostic evidence of an unhealthy poll. Keep this correction
+            # scoped to the breadcrumb; transfer/completion logic continues to
+            # use the original poll-health value below.
+            healthy = False
         details = {
             "schema": _LFTP_STATUS_TRACE_SCHEMA,
             "outcome": outcome,
