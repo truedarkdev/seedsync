@@ -15,6 +15,8 @@ import bottle
 from bottle import HTTPResponse
 
 from common import BreadcrumbTraceCollector, PerformanceDiagnosticsCollector, overrides
+from common.breadcrumb_trace import opaque_trace_correlation
+from common.root_progress_trace import duration_bucket, root_progress_tracer
 from common.performance_diagnostics import (
     DURATION_MODEL_SCOPED_SERIALIZATION,
     DURATION_MODEL_SCOPED_SSE_EMISSION,
@@ -245,7 +247,10 @@ class ModelApiHandler(IHandler):
                 except Exception:
                     pass
 
-    def __json_response(self, payload: object, status: int = 200, *, summary: bool = False) -> HTTPResponse:
+    def __json_response(
+            self, payload: object, status: int = 200, *, summary: bool = False,
+            scope_id: Optional[str] = None,
+    ) -> HTTPResponse:
         metric = DURATION_MODEL_SUMMARY_SERIALIZATION if summary else DURATION_MODEL_SCOPED_SERIALIZATION
         counter = "model_summary_serializations" if summary else "model_page_serializations"
         diagnostics = self.__performance_diagnostics
@@ -254,12 +259,66 @@ class ModelApiHandler(IHandler):
                 diagnostics.increment(counter)
             except Exception:
                 pass
-        body = self.__record_duration(metric, lambda: json.dumps(payload))
+        progress_trace = root_progress_tracer(self.__breadcrumb_trace)
+        progress_started_ns: Optional[int] = None
+        serialization_start_admitted = False
+        payload_model_version = payload.get("model_version") if isinstance(payload, dict) else None
+        payload_global_model_version = payload.get("_global_model_version") if isinstance(payload, dict) else None
+        transport_payload = payload
+        if isinstance(payload, dict) and "_global_model_version" in payload:
+            transport_payload = dict(payload)
+            transport_payload.pop("_global_model_version", None)
+        if scope_id is not None and progress_trace is not None and progress_trace.enabled("debug"):
+            if progress_trace.record(
+                    scope_id,
+                    "serialization_start",
+                    {
+                        "scope_digest": opaque_trace_correlation(scope_id),
+                        "model_version": payload_global_model_version if type(payload_global_model_version) is int else None,
+                        "scope_version": payload_model_version if type(payload_model_version) is int else None,
+                        "publication": "scoped",
+                        "event": "model-page",
+                        "outcome": "started",
+                        "reason": "page_json_serialization",
+                    },
+            ):
+                serialization_start_admitted = True
+
+        def serialize_json() -> str:
+            nonlocal progress_started_ns
+            if serialization_start_admitted:
+                progress_started_ns = time.monotonic_ns()
+            return json.dumps(transport_payload)
+
+        body = self.__record_duration(metric, serialize_json)
+        if progress_started_ns is not None and progress_trace is not None:
+            duration_ms = max(0, int((time.monotonic_ns() - progress_started_ns) / 1_000_000))
+            records = payload.get("records") if isinstance(payload, dict) else None
+            model_version = payload_model_version
+            progress_trace.record(
+                scope_id,
+                "serialization_end",
+                {
+                    "scope_digest": opaque_trace_correlation(scope_id),
+                    "model_version": payload_global_model_version if type(payload_global_model_version) is int else None,
+                    "scope_version": model_version if type(model_version) is int else None,
+                    "publication": "scoped",
+                    "event": "model-page",
+                    "root_count": payload.get("total") if isinstance(payload, dict) and type(payload.get("total")) is int else 0,
+                    "page_count": len(records) if isinstance(records, list) else 0,
+                    "record_count": len(records) if isinstance(records, list) else 0,
+                    "outcome": "error" if isinstance(payload, dict) and payload.get("error") else "completed",
+                    "reason": "cursor_reset" if isinstance(payload, dict) and payload.get("error") == "cursor_reset_required" else "page_json_serialized",
+                    "duration_ms": duration_ms,
+                    "duration_bucket": duration_bucket(duration_ms),
+                },
+            )
         return HTTPResponse(body=body, status=status, headers={"Content-Type": "application/json"})
 
     def __sse(
         self, publication: str, event: str, payload: dict[str, object], version: Optional[int] = None,
         global_model_version: Optional[int] = None,
+        scope_id: Optional[str] = None,
     ) -> str:
         serialization_metric = DURATION_MODEL_SUMMARY_SERIALIZATION if publication == "summary" \
             else DURATION_MODEL_SCOPED_SERIALIZATION
@@ -268,12 +327,58 @@ class ModelApiHandler(IHandler):
         counter = "model_summary_sse_emissions" if publication == "summary" else "model_scoped_sse_emissions"
 
         def format_event() -> str:
+            nonlocal progress_started_ns
+            if serialization_start_admitted:
+                progress_started_ns = time.monotonic_ns()
             event_id = "id: {}\n".format(version) if version is not None else ""
             return "{}event: {}\ndata: {}\n\n".format(
                 event_id, event, json.dumps(payload, separators=(",", ":"))
             )
 
+        progress_trace = root_progress_tracer(self.__breadcrumb_trace)
+        scoped = publication == "scoped"
+        progress_identity = scope_id if scoped else "summary"
+        progress_started_ns: Optional[int] = None
+        serialization_start_admitted = False
+        scoped_version = version if scoped and isinstance(version, int) else None
+        captured_global_version = (
+            global_model_version if scoped and isinstance(global_model_version, int)
+            else version if not scoped and isinstance(version, int) else None
+        )
+        if (not scoped or scope_id is not None) and progress_trace is not None and progress_trace.enabled("debug"):
+            if progress_trace.record(
+                    progress_identity,
+                    "serialization_start",
+                    {
+                        "scope_digest": opaque_trace_correlation(progress_identity),
+                        "publication": "scoped" if scoped else "summary",
+                        "model_version": captured_global_version,
+                        "scope_version": scoped_version,
+                        "event": event,
+                        "outcome": "started",
+                        "reason": "sse_json_serialization",
+                    },
+            ):
+                serialization_start_admitted = True
         rendered = self.__record_duration(serialization_metric, format_event)
+        if progress_started_ns is not None and progress_trace is not None:
+            duration_ms = max(0, int((time.monotonic_ns() - progress_started_ns) / 1_000_000))
+            progress_trace.record(
+                progress_identity,
+                "serialization_end",
+                {
+                    "scope_digest": opaque_trace_correlation(progress_identity),
+                    "model_version": captured_global_version,
+                    "scope_version": scoped_version,
+                    "publication": "scoped" if scoped else "summary",
+                    "event": event,
+                    "outcome": "completed",
+                    "reason": "sse_json_serialized",
+                    "duration_ms": duration_ms,
+                    "duration_bucket": duration_bucket(duration_ms),
+                },
+            )
+        emission_started_ns = time.monotonic_ns()
 
         def publish() -> str:
             diagnostics = self.__performance_diagnostics
@@ -285,25 +390,48 @@ class ModelApiHandler(IHandler):
             trace = self.__breadcrumb_trace
             if trace is not None:
                 try:
-                    if not trace.is_effectively_enabled("model_api", "info"):
-                        return rendered
                     global_version = version if publication == "summary" else global_model_version
-                    if not isinstance(global_version, int):
-                        return rendered
-                    correlation = "model_version:{}".format(global_version)
-                    details = {"model_version": global_version}
-                    if publication == "scoped" and isinstance(version, int):
-                        details["scope_version"] = version
-                    trace.record(
-                        "model_api",
-                        "model_summary_sse_published" if publication == "summary" else "model_scoped_sse_published",
-                        details,
-                        stage="model_publication",
-                        event_type="state_transition",
-                        corr_id=correlation,
-                        flow_id=correlation,
-                        trace_scope="aggregate",
-                    )
+                    if trace.is_effectively_enabled("model_api", "info") and isinstance(global_version, int):
+                        correlation = "model_version:{}".format(global_version)
+                        details = {"model_version": global_version}
+                        if publication == "scoped" and isinstance(version, int):
+                            details["scope_version"] = version
+                        trace.record(
+                            "model_api",
+                            "model_summary_sse_published" if publication == "summary" else "model_scoped_sse_published",
+                            details,
+                            stage="model_publication",
+                            event_type="state_transition",
+                            corr_id=correlation,
+                            flow_id=correlation,
+                            trace_scope="aggregate",
+                        )
+                except Exception:
+                    pass
+            progress_trace = root_progress_tracer(trace)
+            if progress_trace is not None and progress_trace.enabled("debug"):
+                try:
+                    captured_global_version = version if publication == "summary" and isinstance(version, int) else global_model_version
+                    if not isinstance(captured_global_version, int):
+                        captured_global_version = None
+                    if not scoped or scope_id is not None:
+                        progress_trace.record(
+                            progress_identity,
+                            "sse",
+                            {
+                            "scope_digest": opaque_trace_correlation(progress_identity),
+                            "model_version": captured_global_version,
+                            "scope_version": version if scoped and isinstance(version, int) else None,
+                            "publication": "scoped" if scoped else "summary",
+                            "event": event,
+                            "outcome": "emitted",
+                            "reason": "sse_write",
+                            "duration_ms": max(0, int((time.monotonic_ns() - emission_started_ns) / 1_000_000)),
+                            "duration_bucket": duration_bucket(
+                                max(0, int((time.monotonic_ns() - emission_started_ns) / 1_000_000))
+                            ),
+                            },
+                        )
                 except Exception:
                     pass
             return rendered
@@ -443,7 +571,7 @@ class ModelApiHandler(IHandler):
         except ModelPageCursorError:
             return {"error": "invalid_model_cursor"}
         return self.__public_page(
-            page, query_signature, preserve_global_model_version=preserve_global_model_version,
+            page, query_signature, preserve_global_model_version=True,
         )
 
     def __handle_summary(self) -> HTTPResponse:
@@ -508,16 +636,19 @@ class ModelApiHandler(IHandler):
     def __handle_roots(self, path_pair_id: str) -> HTTPResponse:
         scope_id = self.__validate_scope_id(path_pair_id)
         page = self.__get_page(scope_id, None)
-        return self.__json_response(
-            page, 409 if page.get("error") == "cursor_reset_required" else 400 if page.get("error") else 200
+        response = self.__json_response(
+            page, 409 if page.get("error") == "cursor_reset_required" else 400 if page.get("error") else 200,
+            scope_id=scope_id,
         )
+        return response
 
     def __handle_children(self, path_pair_id: str) -> HTTPResponse:
         scope_id = self.__validate_scope_id(path_pair_id)
         parent_file_id = self.__read_parent_file_id()
         page = self.__get_page(scope_id, parent_file_id)
         return self.__json_response(
-            page, 409 if page.get("error") == "cursor_reset_required" else 400 if page.get("error") else 200
+            page, 409 if page.get("error") == "cursor_reset_required" else 400 if page.get("error") else 200,
+            scope_id=scope_id,
         )
 
     def __handle_stream(self, path_pair_id: str) -> Iterator[str]:
@@ -531,7 +662,10 @@ class ModelApiHandler(IHandler):
         )
         if page.get("error"):
             listener.close()
-            return self.__json_response(page, 409 if page.get("error") == "cursor_reset_required" else 400)
+            return self.__json_response(
+                page, 409 if page.get("error") == "cursor_reset_required" else 400,
+                scope_id=scope_id,
+            )
         reconnect_id = bottle.request.get_header("Last-Event-ID", "").strip()
         bottle.response.content_type = "text/event-stream"
         bottle.response.cache_control = "no-cache"
@@ -544,6 +678,7 @@ class ModelApiHandler(IHandler):
                 yield self.__sse(
                     "scoped", "model-page", page, version if isinstance(version, int) else None,
                     global_model_version if isinstance(global_model_version, int) else None,
+                    scope_id,
                 )
                 if reconnect_id:
                     yield self.__sse(
@@ -551,6 +686,7 @@ class ModelApiHandler(IHandler):
                         {"model_version": version, "reason": "replay_unavailable"},
                         version if isinstance(version, int) else None,
                         global_model_version if isinstance(global_model_version, int) else None,
+                        scope_id,
                     )
                 while True:
                     event = listener.take_next_event()
@@ -579,6 +715,7 @@ class ModelApiHandler(IHandler):
                             event,
                             event_version if isinstance(event_version, int) else None,
                             event_global_model_version,
+                            scope_id,
                         )
                         last_keepalive_at = time.monotonic()
                     elif time.monotonic() - last_keepalive_at >= self._KEEPALIVE_INTERVAL_SECONDS:

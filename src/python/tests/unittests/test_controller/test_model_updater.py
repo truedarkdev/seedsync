@@ -5735,6 +5735,41 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__record_breadcrumb.assert_not_called()
         self.assertEqual([], trace.snapshot()["entries"])
 
+    def test_root_progress_status_trace_covers_rclone_without_legacy_lftp_breadcrumb(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"model.progress": "debug", "transfer.lftp": "off"}},
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__record_breadcrumb=MagicMock(),
+            _Controller__lftp=SimpleNamespace(backend_name="rclone"),
+            logger=MagicMock(),
+        )
+        status = LftpJobStatus(
+            1,
+            LftpJobStatus.Type.PGET,
+            LftpJobStatus.State.RUNNING,
+            "private-fixture-name",
+            "/private/fixture/path",
+        )
+
+        _record_lftp_status_breadcrumb(
+            controller,
+            [status],
+            source="fresh_healthy",
+            fresh=True,
+            healthy=True,
+        )
+
+        controller._Controller__record_breadcrumb.assert_not_called()
+        entries = trace.snapshot(category="model.progress")["entries"]
+        self.assertEqual(1, len(entries))
+        self.assertEqual("status", entries[0]["stage"].replace("root_progress_", ""))
+        self.assertNotIn("private-fixture-name", str(entries))
+        self.assertNotIn("/private/fixture/path", str(entries))
+
     def test_lftp_status_breadcrumb_records_gated_outcomes_without_identity(self):
         trace = BreadcrumbTraceCollector(
             lambda: True,

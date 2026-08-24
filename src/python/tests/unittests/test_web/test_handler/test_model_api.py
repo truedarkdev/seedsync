@@ -131,6 +131,101 @@ class TestModelApi(unittest.TestCase):
         self.assertEqual(0, record.call_count)
         self.assertEqual([], breadcrumbs.snapshot()["entries"])
 
+    def test_model_progress_is_independent_and_uses_explicit_scope_and_event(self):
+        breadcrumbs = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=16,
+            policy={"default": "off", "rules": {"model.progress": "debug", "model_api": "off"}},
+        )
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=breadcrumbs)
+        handler._ModelApiHandler__sse(
+            "scoped", "model-invalidate", {"path_pair_id": "must-not-be-read"},
+            3, 8, "known-pair",
+        )
+        handler._ModelApiHandler__sse(
+            "scoped", "model-reset", {}, 4, 9, "known-pair",
+        )
+        handler._ModelApiHandler__sse(
+            "summary", "model-summary", {"path_pair_id": "must-not-be-read"}, 10, None,
+        )
+
+        progress_entries = breadcrumbs.snapshot(category="model.progress")["entries"]
+        self.assertTrue(progress_entries)
+        self.assertTrue(all(entry["category"] == "model.progress" for entry in progress_entries))
+        events = {entry["details"].get("event") for entry in progress_entries}
+        self.assertIn("model-invalidate", events)
+        self.assertIn("model-reset", events)
+        self.assertIn("model-summary", events)
+        invalidate_sse = next(
+            entry for entry in progress_entries
+            if entry["stage"] == "root_progress_sse"
+            and entry["details"].get("event") == "model-invalidate"
+        )
+        reset_serialization = next(
+            entry for entry in progress_entries
+            if entry["stage"] == "root_progress_serialization_end"
+            and entry["details"].get("event") == "model-reset"
+        )
+        self.assertEqual(8, invalidate_sse["details"]["model_version"])
+        self.assertEqual(3, invalidate_sse["details"]["scope_version"])
+        self.assertEqual(9, reset_serialization["details"]["model_version"])
+        self.assertEqual(4, reset_serialization["details"]["scope_version"])
+        self.assertNotIn("must-not-be-read", str(progress_entries))
+        self.assertEqual([], breadcrumbs.snapshot(category="model_api")["entries"])
+
+    def test_sse_serialization_timer_starts_after_start_admission(self):
+        breadcrumbs = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        calls = []
+
+        class FakeProgressTrace:
+            def enabled(self, level):
+                return True
+
+            def record(self, identity, stage, details):
+                calls.append((stage, monotonic.call_count, dict(details)))
+                return True
+
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=breadcrumbs)
+        with patch("web.handler.model_api.root_progress_tracer", return_value=FakeProgressTrace()), \
+                patch("web.handler.model_api.time.monotonic_ns", side_effect=[100, 101, 102, 103]) as monotonic:
+            rendered = handler._ModelApiHandler__sse(
+                "scoped", "model-page", {}, 3, 8, "known-pair",
+            )
+
+        self.assertIn("event: model-page", rendered)
+        self.assertEqual("serialization_start", calls[0][0])
+        self.assertEqual(0, calls[0][1])
+        serialization_end = next(call for call in calls if call[0] == "serialization_end")
+        self.assertEqual(0, serialization_end[2]["duration_ms"])
+        self.assertEqual(8, serialization_end[2]["model_version"])
+        self.assertEqual(3, serialization_end[2]["scope_version"])
+
+    def test_json_scoped_serialization_uses_global_and_scope_versions(self):
+        breadcrumbs = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=breadcrumbs)
+        response = handler._ModelApiHandler__json_response(
+            {
+                "model_version": 3,
+                "_global_model_version": 8,
+                "total": 0,
+                "records": [],
+            },
+            scope_id="known-pair",
+        )
+
+        body = response.body.decode("utf-8") if isinstance(response.body, bytes) else response.body
+        self.assertNotIn("_global_model_version", body)
+        entries = breadcrumbs.snapshot(category="model.progress")["entries"]
+        self.assertEqual(2, len(entries))
+        self.assertEqual(8, entries[0]["details"]["model_version"])
+        self.assertEqual(3, entries[0]["details"]["scope_version"])
+        self.assertEqual(8, entries[1]["details"]["model_version"])
+        self.assertEqual(3, entries[1]["details"]["scope_version"])
+
     def test_scoped_sse_correlates_to_global_version_without_exposing_scope_identity(self):
         breadcrumbs = BreadcrumbTraceCollector(lambda: True, max_entries=8)
         self.model.add_file(self._file("root-a", "pair-a"))

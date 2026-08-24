@@ -13,6 +13,7 @@ import json
 import logging
 import time
 from collections import OrderedDict
+from itertools import islice
 from types import SimpleNamespace
 from threading import Lock, RLock
 from datetime import datetime, timedelta
@@ -20,6 +21,13 @@ from typing import Callable, Optional, Sequence, TYPE_CHECKING, cast
 
 from common import Context, PathPair
 from common.breadcrumb_trace import opaque_trace_correlation, trace_session_digest
+from common.root_progress_trace import (
+    eta_bucket,
+    percent_bucket,
+    root_progress_tracer,
+    scalar_percent,
+    speed_bucket,
+)
 from scan_fs import stream_root_fingerprint
 from common.performance_diagnostics import (
     CANDIDATE_LIFECYCLE_FALLBACK_REASON_EXCEPTION,
@@ -194,7 +202,13 @@ def _record_lftp_status_breadcrumb(
         failure_reason: Optional[str] = None,
         poll_error: Optional[BaseException] = None,
 ) -> None:
-    """Record one gated aggregate for the completed LFTP authority choice."""
+    """Record normalized progress, then the legacy LFTP authority breadcrumb."""
+    model = getattr(controller, "_Controller__model", None)
+    model_version = getattr(model, "version", None)
+    _record_root_progress_status(
+        controller, statuses, source=source,
+        model_version=model_version if type(model_version) is int else None,
+    )
     backend = getattr(controller, "_Controller__lftp", None)
     if getattr(backend, "backend_name", "lftp") == "rclone":
         return
@@ -287,6 +301,47 @@ def _record_lftp_status_breadcrumb(
                 logger.debug("Ignoring LFTP status breadcrumb failure", exc_info=True)
             except Exception:
                 pass
+
+
+def _record_root_progress_status(
+        controller: object,
+        statuses: Sequence[object],
+        *,
+        source: str,
+        model_version: Optional[int],
+) -> None:
+    """Trace normalized scalar transfer progress after the complete policy gate."""
+    context = getattr(controller, "_Controller__context", None)
+    tracer = root_progress_tracer(getattr(context, "breadcrumb_trace", None))
+    if tracer is None or not tracer.enabled("debug"):
+        return
+    # Status objects can carry names, paths, and raw transfer sizes.  Only
+    # inspect the bounded active subset after the model.progress gate passes;
+    # every exported field is an enum, digest, bucket, or scalar percentage.
+    for status in islice(statuses, 128):
+        state = getattr(getattr(status, "state", None), "name", None)
+        status_type = getattr(getattr(status, "type", None), "name", None)
+        transfer = getattr(status, "total_transfer_state", None)
+        percent = scalar_percent(getattr(transfer, "percent_local", None))
+        details: dict[str, object] = {
+            "status_source": source,
+            "status_state": state.lower() if isinstance(state, str) else "unknown",
+            "status_type": status_type.lower() if isinstance(status_type, str) else "unknown",
+            "progress_percent": percent,
+            "percent_bucket": percent_bucket(getattr(transfer, "percent_local", None)),
+            "speed_bucket": speed_bucket(getattr(transfer, "speed", None)),
+            "eta_bucket": eta_bucket(getattr(transfer, "eta", None)),
+            "model_version": model_version,
+            "scope_digest": opaque_trace_correlation(getattr(status, "path_pair_id", None)),
+            "outcome": "active" if details_state_is_active(status) else "queued",
+            "reason": "normalized_status",
+        }
+        tracer.record(getattr(status, "file_id", None), "status", details)
+
+
+def details_state_is_active(status: object) -> bool:
+    state = getattr(status, "state", None)
+    return state in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING)
 
 
 _CHILD_FINALIZATION_TRACE_CATEGORY = "finalization.child"
@@ -2168,6 +2223,29 @@ class ModelUpdater(_ControllerCoreAccess):
             logger = getattr(self._controller, "logger", None)
             if logger is not None:
                 logger.debug("Ignoring completion-gate breadcrumb failure", exc_info=True)
+
+    def _record_root_progress_decision(
+            self, identity: object, *, outcome: str, reason: str,
+            decision: str, target_count: int = 0,
+    ) -> None:
+        """Record one deduplicated active-delta/full-build decision."""
+        context = getattr(self._controller, "_Controller__context", None)
+        tracer = root_progress_tracer(getattr(context, "breadcrumb_trace", None))
+        if tracer is None or not tracer.enabled("debug"):
+            return
+        model = getattr(self._controller, "_Controller__model", None)
+        model_version = getattr(model, "version", None)
+        tracer.record(
+            identity,
+            "decision",
+            {
+                "decision": decision,
+                "outcome": outcome,
+                "reason": reason,
+                "target_count": max(0, min(target_count, 128)),
+                "model_version": model_version if type(model_version) is int else None,
+            },
+        )
 
     def begin_final_move_local_root_invalidation(
             self, root_name: str, path_pair_id: Optional[str], generation: int,
@@ -4315,7 +4393,9 @@ class ModelUpdater(_ControllerCoreAccess):
         # completion, extraction, validation, or ambiguous status condition
         # returns no ids here and retains the ordinary full-build path.
         active_transfer_delta_applied = False
+        active_transfer_delta_adopted = False
         active_transfer_delta_rejected = False
+        active_delta_selection_rejected = False
         active_delta_selector = getattr(model_builder, "active_transfer_delta_file_ids", None)
         active_delta_pending = getattr(model_builder, "has_pending_active_transfer_delta", None)
         active_delta_builder = getattr(model_builder, "build_active_transfer_roots", None)
@@ -4335,19 +4415,21 @@ class ModelUpdater(_ControllerCoreAccess):
             if isinstance(candidate_file_ids, set) and candidate_file_ids and all(
                     isinstance(file_id, str) for file_id in candidate_file_ids):
                 active_delta_file_ids = candidate_file_ids
-            elif self._completion_gate_trace_enabled():
-                delta_diagnostics = getattr(model_builder, "active_transfer_delta_diagnostics", None)
-                details = delta_diagnostics() if callable(delta_diagnostics) else {}
-                controller._Controller__record_breadcrumb(
-                    stage="model_delta",
-                    message="active_transfer_delta_rejected",
-                    details=details,
-                    event_type="diagnostic",
-                    category="completion.gate",
-                    level="info",
-                    corr_id="model_update:aggregate",
-                    trace_scope="aggregate",
-                )
+            else:
+                active_delta_selection_rejected = True
+                if self._completion_gate_trace_enabled():
+                    delta_diagnostics = getattr(model_builder, "active_transfer_delta_diagnostics", None)
+                    details = delta_diagnostics() if callable(delta_diagnostics) else {}
+                    controller._Controller__record_breadcrumb(
+                        stage="model_delta",
+                        message="active_transfer_delta_rejected",
+                        details=details,
+                        event_type="diagnostic",
+                        category="completion.gate",
+                        level="info",
+                        corr_id="model_update:aggregate",
+                        trace_scope="aggregate",
+                    )
         if active_delta_file_ids is not None:
             try:
                 partial_build = active_delta_builder(active_delta_file_ids)
@@ -4409,6 +4491,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     # otherwise the unchanged status would force a needless
                     # full rebuild next tick.
                     active_delta_adopter(model, active_delta_file_ids, partial_build)
+                    active_transfer_delta_adopted = True
             if diagnostics is not None:
                 try:
                     diagnostics.increment("active_transfer_delta_root_visits", len(active_delta_file_ids))
@@ -4431,6 +4514,58 @@ class ModelUpdater(_ControllerCoreAccess):
                     {"build_ran": False, "reason": "no_model_build"},
                 )
         global_full_build_triggered = full_build_triggered and not candidate_lifecycle_triggered
+        # Emit the decision only after selection, authorization, adoption, and
+        # the final build predicate have settled.  A selected delta is not yet
+        # an active-delta outcome: it can still be rejected and fall back to a
+        # full build.
+        decision_ids = sorted(active_delta_file_ids or set())[:128]
+        if candidate_lifecycle_triggered:
+            self._record_root_progress_decision(
+                "model-update",
+                outcome="authoritative_pair_candidate",
+                reason="candidate_authorized",
+                decision="active_delta_or_full_build",
+                target_count=1,
+            )
+        elif active_transfer_delta_adopted:
+            for decision_id in decision_ids or ["model-update"]:
+                self._record_root_progress_decision(
+                    decision_id,
+                    outcome="active_delta",
+                    reason="adopted",
+                    decision="active_delta_or_full_build",
+                    target_count=len(decision_ids),
+                )
+        elif full_build_triggered:
+            if active_transfer_delta_rejected:
+                build_reason = "active_delta_authorization_rejected"
+            elif active_delta_selection_rejected:
+                build_reason = "active_delta_selector_rejected"
+            else:
+                build_reason = "pending_changes"
+            for decision_id in decision_ids or ["model-update"]:
+                self._record_root_progress_decision(
+                    decision_id,
+                    outcome="full_build",
+                    reason=build_reason,
+                    decision="active_delta_or_full_build",
+                    target_count=len(decision_ids),
+                )
+        elif active_transfer_delta_rejected or active_delta_selection_rejected:
+            self._record_root_progress_decision(
+                "model-update",
+                outcome="rejected",
+                reason=("active_delta_authorization_rejected"
+                        if active_transfer_delta_rejected else "active_delta_selector_rejected"),
+                decision="active_delta_or_full_build",
+            )
+        else:
+            self._record_root_progress_decision(
+                "model-update",
+                outcome="cached",
+                reason="no_pending_changes",
+                decision="active_delta_or_full_build",
+            )
         lifecycle_publication_subject_ids: set[str] = set()
         lifecycle_publication_build_kind = "none"
         if full_build_triggered:

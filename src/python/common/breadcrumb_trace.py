@@ -416,6 +416,11 @@ class BreadcrumbTraceCollector:
     def version(self) -> int:
         return self.__version
 
+    def trace_generation(self) -> int:
+        """Return the retention generation for producer-side dedupe state."""
+        with self.__lock:
+            return self.__reset_generation
+
     @property
     def memory_budget_bytes(self) -> int:
         return self.__memory_budget_bytes
