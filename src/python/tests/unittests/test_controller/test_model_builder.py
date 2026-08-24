@@ -748,6 +748,122 @@ class TestModelBuilder(unittest.TestCase):
         self.assertTrue(self.model_builder.has_changes())
         self.assertIsNone(self.model_builder.build_active_progress_overlays(live_model.get_file_ids()))
 
+    def test_direct_progress_overlay_accepts_deep_counter_mtime_churn_and_rejects_identity_changes(self):
+        def active_tree(
+                leaf_size: int, leaf_mtime_ns: int, *, sidecar_ready: bool = True,
+                collision: bool = False, extra_child: bool = False,
+        ) -> SystemFile:
+            root = SystemFile("active", 20 + leaf_size, True, mtime_ns=100)
+            nested = SystemFile("nested", 20 + leaf_size, True, mtime_ns=200)
+            leaf = SystemFile("payload.bin", leaf_size, False, mtime_ns=leaf_mtime_ns)
+            leaf.status_sidecar_ready = sidecar_ready
+            leaf.has_staging_collision = collision
+            nested.add_child(leaf)
+            if extra_child:
+                nested.add_child(SystemFile("new.bin", 1, False, mtime_ns=300))
+            root.add_child(nested)
+            return root
+
+        def running_status(size_local: int) -> LftpJobStatus:
+            status = LftpJobStatus(
+                1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "active", "",
+            )
+            status.total_transfer_state = LftpJobStatus.TransferState(
+                size_local, 100, size_local, 10, 8,
+            )
+            return status
+
+        remote = active_tree(100, 1)
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_lftp_statuses([running_status(20)])
+        self.model_builder.set_active_files([active_tree(10, 1)])
+        live_model = self.model_builder.build_model()
+
+        self.model_builder.set_lftp_statuses([running_status(21)])
+        self.model_builder.set_active_files([active_tree(11, 2)])
+        overlays = self.model_builder.build_active_progress_overlays(live_model.get_file_ids())
+
+        self.assertIsNotNone(overlays)
+        self.assertEqual("accepted", self.model_builder.active_progress_overlay_admission_outcome())
+        self.model_builder.adopt_active_progress_overlays(live_model)
+        self.assertTrue(self.model_builder.has_changes())
+        self.assertEqual(
+            [MODEL_BUILDER_INVALIDATION_ACTIVE_FILES],
+            self.model_builder.active_transfer_delta_diagnostics()["invalidation_reasons"],
+        )
+
+        file_builder = ModelBuilder()
+        file_builder.set_remote_files([SystemFile("active", 100, False)])
+        file_status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "active", "",
+        )
+        file_status.total_transfer_state = LftpJobStatus.TransferState(20, 100, 20, 10, 8)
+        file_builder.set_lftp_statuses([file_status])
+        file_builder.set_active_files([SystemFile("active", 10, False, mtime_ns=1)])
+        file_model = file_builder.build_model()
+        file_status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "active", "",
+        )
+        file_status.total_transfer_state = LftpJobStatus.TransferState(21, 100, 21, 10, 8)
+        file_builder.set_lftp_statuses([file_status])
+        file_builder.set_active_files([SystemFile("active", 11, False, mtime_ns=2)])
+
+        self.assertIsNotNone(file_builder.build_active_progress_overlays(file_model.get_file_ids()))
+        file_builder.adopt_active_progress_overlays(file_model)
+        self.assertTrue(file_builder.has_changes())
+        self.assertEqual(
+            [MODEL_BUILDER_INVALIDATION_ACTIVE_FILES],
+            file_builder.active_transfer_delta_diagnostics()["invalidation_reasons"],
+        )
+
+        barrier_builder = ModelBuilder()
+        barrier_builder.set_remote_files([active_tree(100, 1)])
+        barrier_builder.set_lftp_statuses([running_status(20)])
+        barrier_builder.set_active_files([active_tree(10, 1)])
+        barrier_model = barrier_builder.build_model()
+        barrier_builder.set_lftp_statuses([running_status(21)])
+        barrier_builder.set_active_files([active_tree(11, 2, extra_child=True)])
+        self.assertIsNone(barrier_builder.build_active_progress_overlays(barrier_model.get_file_ids()))
+        barrier_builder.set_lftp_statuses([running_status(22)])
+        barrier_builder.set_active_files([active_tree(12, 3, extra_child=True)])
+        self.assertIsNone(barrier_builder.build_active_progress_overlays(barrier_model.get_file_ids()))
+        self.assertEqual("invalidation_scan", barrier_builder.active_progress_overlay_admission_outcome())
+        barrier_model = barrier_builder.build_model()
+        barrier_builder.set_lftp_statuses([running_status(23)])
+        barrier_builder.set_active_files([active_tree(13, 4, extra_child=True)])
+        self.assertIsNotNone(barrier_builder.build_active_progress_overlays(barrier_model.get_file_ids()))
+
+        discovery_builder = ModelBuilder()
+        discovery_builder.set_remote_files([active_tree(100, 1)])
+        discovery_builder.set_lftp_statuses([running_status(20)])
+        discovery_builder.set_active_files([])
+        discovery_model = discovery_builder.build_model()
+        discovery_builder.set_lftp_statuses([running_status(21)])
+        discovery_builder.set_active_files([active_tree(11, 2)])
+        self.assertIsNone(discovery_builder.build_active_progress_overlays(discovery_model.get_file_ids()))
+        discovery_builder.set_lftp_statuses([running_status(22)])
+        discovery_builder.set_active_files([active_tree(12, 3)])
+        self.assertIsNone(discovery_builder.build_active_progress_overlays(discovery_model.get_file_ids()))
+        self.assertEqual("invalidation_scan", discovery_builder.active_progress_overlay_admission_outcome())
+
+        for case, kwargs in (
+                ("sidecar", {"sidecar_ready": False}),
+                ("collision", {"collision": True}),
+                ("topology", {"extra_child": True}),
+        ):
+            with self.subTest(case=case):
+                builder = ModelBuilder()
+                builder.set_remote_files([active_tree(100, 1)])
+                builder.set_lftp_statuses([running_status(20)])
+                builder.set_active_files([active_tree(10, 1)])
+                model = builder.build_model()
+                builder.set_lftp_statuses([running_status(21)])
+                builder.set_active_files([active_tree(11, 2, **kwargs)])
+
+                self.assertIsNone(builder.build_active_progress_overlays(model.get_file_ids()))
+                self.assertNotEqual("accepted", builder.active_progress_overlay_admission_outcome())
+                self.assertTrue(builder.has_changes())
+
     def test_active_progress_overlay_rejects_mixed_pending_active_root(self):
         self.model_builder.set_remote_files([
             SystemFile("active.bin", 100, False), SystemFile("unrelated.bin", 100, False),

@@ -6563,8 +6563,81 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertEqual(26, live_model.active_progress_overlay("root").transferred_size)
         self.assertEqual(25, live_model.get_file("root").transferred_size)
+        self.assertTrue(builder.has_changes())
+        builder.build_model.assert_not_called()
+
+    def test_deep_active_scan_counter_mtime_churn_keeps_direct_publish_and_defers_tree_build(self):
+        def active_tree(
+                leaf_size: int, leaf_mtime_ns: int, *, extra_child: bool = False,
+        ) -> SystemFile:
+            root = SystemFile("root", 20 + leaf_size, True, mtime_ns=100)
+            nested = SystemFile("nested", 20 + leaf_size, True, mtime_ns=200)
+            nested.add_child(SystemFile("payload.bin", leaf_size, False, mtime_ns=leaf_mtime_ns))
+            if extra_child:
+                nested.add_child(SystemFile("new.bin", 1, False, mtime_ns=300))
+            root.add_child(nested)
+            return root
+
+        builder = ModelBuilder()
+        builder.set_remote_files([active_tree(100, 1)])
+        initial = LftpJobStatus(
+            1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "",
+        )
+        initial.total_transfer_state = LftpJobStatus.TransferState(20, 100, 20, 10, 8)
+        builder.set_lftp_statuses([initial])
+        builder.set_active_files([active_tree(10, 1)])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        progressed = LftpJobStatus(
+            1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "",
+        )
+        progressed.total_transfer_state = LftpJobStatus.TransferState(21, 100, 21, 11, 7)
+        next_progressed = LftpJobStatus(
+            1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "",
+        )
+        next_progressed.total_transfer_state = LftpJobStatus.TransferState(22, 100, 22, 12, 6)
+        terminal_progressed = LftpJobStatus(
+            1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "",
+        )
+        terminal_progressed.total_transfer_state = LftpJobStatus.TransferState(23, 100, 23, 13, 5)
+        controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(datetime.now(), [active_tree(11, 2)]),
+            ScannerResult(datetime.now(), [active_tree(12, 3)]),
+            ScannerResult(datetime.now(), [active_tree(13, 4, extra_child=True)]),
+        ]
+        controller._Controller__lftp.status.side_effect = [
+            [progressed], [next_progressed], [terminal_progressed],
+        ]
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(21, live_model.active_progress_overlay("root").transferred_size)
+        self.assertEqual(20, live_model.get_file("root").transferred_size)
+        self.assertTrue(builder.has_changes())
+        builder.build_model.assert_not_called()
+
+        controller._Controller__next_lftp_status_poll_at = None
+        ModelUpdater(controller).update()
+
+        self.assertEqual(22, live_model.active_progress_overlay("root").transferred_size)
+        self.assertTrue(builder.has_changes())
+        builder.build_model.assert_not_called()
+
+        controller._Controller__next_lftp_status_poll_at = None
+        ModelUpdater(controller).update()
+
+        self.assertIsNone(live_model.active_progress_overlay("root"))
+        self.assertEqual(23, live_model.get_file("root").transferred_size)
         self.assertFalse(builder.has_changes())
         builder.build_model.assert_not_called()
+        self.assertEqual(
+            {"payload.bin", "new.bin"},
+            {child.name for child in live_model.get_file("root").get_children()[0].get_children()},
+        )
 
     def test_timestamp_overlay_reconciliation_recovers_active_lftp_delta(self):
         builder = ModelBuilder()

@@ -5132,10 +5132,13 @@ class ModelUpdater(_ControllerCoreAccess):
 
         candidate_lifecycle_triggered = authoritative_pair_candidate is not None
         defer_nonfresh_active_only_inputs = active_transfer_delta_rejected and callable(active_delta_pending) and \
-            bool(active_delta_pending())
+            bool(active_delta_pending()) and not bool(
+                getattr(controller, "_Controller__pending_completion_file_names", set())
+            ) and not bool(getattr(controller, "_Controller__pending_queue_dispatches", {}))
         full_build_triggered = candidate_lifecycle_triggered or (
             model_builder.has_changes() and (not progressive_delta_eligible or active_transfer_delta_rejected) and \
-            not authoritative_pair_delta_applied and not defer_nonfresh_active_only_inputs
+            not authoritative_pair_delta_applied and not defer_nonfresh_active_only_inputs and \
+            not active_progress_overlay_applied
         )
         completion_trace_enabled = self._completion_gate_trace_enabled()
         if not full_build_triggered and completion_trace_enabled:

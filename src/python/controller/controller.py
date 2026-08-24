@@ -1668,7 +1668,7 @@ class Controller:
         self.__lftp_status_future = None
         completed_correlation = getattr(self, "_Controller__lftp_status_future_correlation", None)
         self.__lftp_status_future_correlation = None
-        submitted_epoch = self.__lftp_status_future_publication_epoch
+        submitted_epoch = getattr(self, "_Controller__lftp_status_future_publication_epoch", None)
         self.__lftp_status_future_publication_epoch = None
         with self.__model_lock:
             if submitted_epoch is None:

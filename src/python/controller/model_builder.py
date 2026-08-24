@@ -264,6 +264,8 @@ class ModelBuilder:
         # classification separate from a normal active-scan invalidation.
         self.__active_progress_equivalent_root_file_ids: set[str] = set()
         self.__direct_progress_equivalent_root_file_ids: set[str] = set()
+        self.__direct_progress_deferred_active_scan_root_file_ids: set[str] = set()
+        self.__direct_progress_active_scan_blocked = False
         self.__lftp_regressed_root_file_ids: set[str] = set()
         self.__source_name_counts: dict[str, int] = {}
         # Global rendering hides local roots that collide by configured local
@@ -3523,8 +3525,17 @@ class ModelBuilder:
                         previous_active_files, next_active_files, touched_file_ids,
                 ):
                     self.__direct_progress_equivalent_root_file_ids = set(touched_file_ids)
+                    self.__direct_progress_deferred_active_scan_root_file_ids = {
+                        file_id for file_id in touched_file_ids
+                        if self.__active_root_has_descendant_progress_or_mtime_change(
+                            previous_active_files[file_id], next_active_files[file_id],
+                        )
+                    }
                 else:
+                    if touched_file_ids:
+                        self.__direct_progress_active_scan_blocked = True
                     self.__direct_progress_equivalent_root_file_ids.clear()
+                    self.__direct_progress_deferred_active_scan_root_file_ids.clear()
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_ACTIVE_FILES, started_at)
 
@@ -3569,14 +3580,45 @@ class ModelBuilder:
     def __active_root_identity_matches_except_progress_and_mtime(
             previous: SystemFile, current: SystemFile,
     ) -> bool:
-        return (
+        if not (
             previous.name == current.name and previous.is_dir == current.is_dir and
             previous.timestamp_created == current.timestamp_created and
             previous.path_pair_id == current.path_pair_id and previous.path_pair_name == current.path_pair_name and
             previous.is_staging == current.is_staging and
             previous.has_staging_collision == current.has_staging_collision and
-            previous.status_sidecar_ready == current.status_sidecar_ready and
-            list(previous.iter_children()) == list(current.iter_children())
+            previous.status_sidecar_ready == current.status_sidecar_ready
+        ):
+            return False
+
+        previous_children = tuple(previous.iter_children())
+        current_children = tuple(current.iter_children())
+        return len(previous_children) == len(current_children) and all(
+            ModelBuilder.__active_root_identity_matches_except_progress_and_mtime(
+                previous_child, current_child,
+            )
+            for previous_child, current_child in zip(previous_children, current_children)
+        )
+
+    @staticmethod
+    def __active_root_has_descendant_progress_or_mtime_change(
+            previous: SystemFile, current: SystemFile,
+    ) -> bool:
+        if previous.size != current.size or \
+                previous.timestamp_modified != current.timestamp_modified or \
+                previous.mtime_ns != current.mtime_ns:
+            return True
+        previous_children = tuple(previous.iter_children())
+        current_children = tuple(current.iter_children())
+        if len(previous_children) != len(current_children):
+            return False
+        return any(
+            previous_child.size != current_child.size or
+            previous_child.timestamp_modified != current_child.timestamp_modified or
+            previous_child.mtime_ns != current_child.mtime_ns or
+            ModelBuilder.__active_root_has_descendant_progress_or_mtime_change(
+                previous_child, current_child,
+            )
+            for previous_child, current_child in zip(previous_children, current_children)
         )
 
     def __active_files_are_direct_progress_equivalent(
@@ -4334,6 +4376,11 @@ class ModelBuilder:
         )) if self.__pending_invalidation_tokens else set()
         self.__lftp_regressed_root_file_ids.intersection_update(self.__lftp_touched_root_file_ids)
         self.__cached_model = applied_model if not self.__pending_invalidation_tokens else None
+        if not any(
+                reason == MODEL_BUILDER_INVALIDATION_ACTIVE_FILES
+                for reason, _ in self.__pending_invalidation_tokens.values()
+        ):
+            self.__direct_progress_active_scan_blocked = False
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
 
@@ -4503,6 +4550,10 @@ class ModelBuilder:
         def reject(outcome: str) -> None:
             self.__active_progress_overlay_admission_outcome = outcome
 
+        if self.__direct_progress_active_scan_blocked:
+            reject("invalidation_scan")
+            return None
+
         direct_active_input = self.__invalidation_reasons == {
             MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
             MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
@@ -4609,14 +4660,46 @@ class ModelBuilder:
 
     def adopt_active_progress_overlays(self, applied_model: Optional[Model] = None) -> None:
         """Commit only the consumed status invalidation after projection."""
-        if applied_model is not None:
+        preserve_active_scan = MODEL_BUILDER_INVALIDATION_ACTIVE_FILES in self.__invalidation_reasons and \
+            bool(self.__direct_progress_deferred_active_scan_root_file_ids)
+        if applied_model is not None and not preserve_active_scan:
             self.__cached_model = applied_model
-        self.__invalidation_reasons.clear()
-        self.__pending_invalidation_tokens.clear()
+        if preserve_active_scan:
+            # The root-only projection consumes the LFTP status snapshot, but
+            # it does not render the active scan tree. Keep the active scan
+            # dirty so a later topology/lifecycle change still reaches the
+            # authoritative reconciliation path. Coalesce repeated active
+            # cadence tokens: the latest scan supersedes earlier counter/mtime
+            # observations while the source remains in the same safe shape.
+            remaining_tokens = {
+                token: event for token, event in self.__pending_invalidation_tokens.items()
+                if event[0] != MODEL_BUILDER_INVALIDATION_LFTP_STATUSES
+            }
+            active_tokens = {
+                token: event for token, event in remaining_tokens.items()
+                if event[0] == MODEL_BUILDER_INVALIDATION_ACTIVE_FILES
+            }
+            if active_tokens:
+                latest_active_token = max(active_tokens)
+                remaining_tokens = {
+                    token: event for token, event in remaining_tokens.items()
+                    if event[0] != MODEL_BUILDER_INVALIDATION_ACTIVE_FILES
+                } | {
+                    latest_active_token: active_tokens[latest_active_token],
+                }
+            self.__pending_invalidation_tokens = remaining_tokens
+            self.__invalidation_reasons = {
+                reason for reason, _ in remaining_tokens.values()
+            }
+        else:
+            self.__invalidation_reasons.clear()
+            self.__pending_invalidation_tokens.clear()
         self.__lftp_touched_root_file_ids.clear()
-        self.__active_touched_root_file_ids.clear()
         self.__active_progress_equivalent_root_file_ids.clear()
-        self.__direct_progress_equivalent_root_file_ids.clear()
+        if not preserve_active_scan:
+            self.__active_touched_root_file_ids.clear()
+            self.__direct_progress_equivalent_root_file_ids.clear()
+            self.__direct_progress_deferred_active_scan_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
 
     def unknown_local_path_pair_ids_snapshot(self) -> frozenset[Optional[str]]:
@@ -5151,6 +5234,8 @@ class ModelBuilder:
         self.__final_move_succeeded_files.clear()
         self.__suppressed_ambiguous_extracted_file_names.clear()
         self.__stop_resume_trace_last_signatures.clear()
+        self.__direct_progress_deferred_active_scan_root_file_ids.clear()
+        self.__direct_progress_active_scan_blocked = False
         self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_CLEAR)
         self.__cached_unresolved_staging_collision_file_ids.clear()
         self.__cached_terminalizable_staging_collision_file_ids.clear()
@@ -5193,6 +5278,8 @@ class ModelBuilder:
         if self.__cached_model is built_model:
             self.__cached_model = applied_model
             self.__pending_invalidation_tokens.clear()
+            self.__direct_progress_deferred_active_scan_root_file_ids.clear()
+            self.__direct_progress_active_scan_blocked = False
             self.__active_transfer_delta_selector_failure = None
             self.__active_transfer_delta_status_missing_match = None
             return
@@ -5206,6 +5293,8 @@ class ModelBuilder:
         self.__lftp_touched_root_file_ids.clear()
         self.__active_touched_root_file_ids.clear()
         self.__active_progress_equivalent_root_file_ids.clear()
+        self.__direct_progress_deferred_active_scan_root_file_ids.clear()
+        self.__direct_progress_active_scan_blocked = False
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
@@ -5250,6 +5339,8 @@ class ModelBuilder:
         self.__lftp_touched_root_file_ids.clear()
         self.__active_touched_root_file_ids.clear()
         self.__active_progress_equivalent_root_file_ids.clear()
+        self.__direct_progress_deferred_active_scan_root_file_ids.clear()
+        self.__direct_progress_active_scan_blocked = False
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
@@ -5563,6 +5654,8 @@ class ModelBuilder:
         self.__pending_invalidation_tokens.clear()
         self.__lftp_touched_root_file_ids.clear()
         self.__active_touched_root_file_ids.clear()
+        self.__direct_progress_deferred_active_scan_root_file_ids.clear()
+        self.__direct_progress_active_scan_blocked = False
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
