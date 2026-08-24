@@ -687,12 +687,16 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
 
         collector.record_active_delta_rejection(
             "root-progress:0123456789abcdef", 8, "active_delta_selector_rejected",
-            {"rejection_categories": ["status", "/private/path", "authority", "status"]},
+            {
+                "rejection_categories": ["status", "/private/path", "authority", "status"],
+                "selector_failure": "/private/selector-failure",
+            },
         )
         summary = collector.snapshot()["active_delta_rejection_summary"]
         self.assertEqual("active_delta_selector_rejected", summary["reason"])
         self.assertEqual(["status", "authority"], summary["diagnostics"]["rejection_categories"])
         self.assertNotIn("/private/path", str(summary))
+        self.assertNotIn("/private/selector-failure", str(summary))
 
     def test_scoped_clear_matches_active_delta_rejection_summary_metadata(self):
         collector = BreadcrumbTraceCollector(
@@ -717,6 +721,21 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
                 "root-progress:0123456789abcdef", 1, reason, {},
             ))
         self.assertIsNone(collector.snapshot()["active_delta_rejection_summary"])
+
+    def test_active_delta_rejection_summary_retains_allowlisted_selector_failure(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+
+        self.assertTrue(collector.record_active_delta_rejection(
+            "root-progress:0123456789abcdef", 1, "active_delta_selector_rejected",
+            {"selector_failure": "unknown_root"},
+        ))
+
+        self.assertEqual(
+            "unknown_root",
+            collector.snapshot()["active_delta_rejection_summary"]["diagnostics"]["selector_failure"],
+        )
 
         collector.record_active_delta_authorization_rejection(
             "root-progress:0123456789abcdef", 7, {},

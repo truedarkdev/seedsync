@@ -354,6 +354,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertTrue(self.model_builder.authorize_authoritative_pair_delta(
             lambda file_id: file_id in live_model.get_file_ids(), pair_build,
         ))
+        self.model_builder._ModelBuilder__active_transfer_delta_selector_failure = "unknown_root"
         live_model.remove_file(ModelFile.build_file_id("old.bin", "pair-a"))
         live_model.add_file(pair_build.model.get_file(ModelFile.build_file_id("new.bin", "pair-a")))
         self.model_builder.adopt_authoritative_pair_delta(live_model, pair_build)
@@ -372,6 +373,7 @@ class TestModelBuilder(unittest.TestCase):
             set(self.model_builder._ModelBuilder__remote_files_by_pair["pair-b"]),
         )
         self.assertFalse(self.model_builder.has_changes())
+        self.assertIsNone(self.model_builder.active_transfer_delta_diagnostics()["selector_failure"])
 
     def test_authoritative_pair_build_adopts_cross_pair_duplicate_basename(self):
         diagnostics = PerformanceDiagnosticsCollector(lambda: True)
@@ -641,6 +643,9 @@ class TestModelBuilder(unittest.TestCase):
         )
         self.model_builder.set_lftp_statuses([unknown])
         self.assertIsNone(self.model_builder.active_transfer_delta_file_ids(live_model.get_file_ids()))
+        self.assertEqual(
+            "unknown_root", self.model_builder.active_transfer_delta_diagnostics()["selector_failure"],
+        )
 
     def test_active_transfer_delta_publishes_single_stopped_root_without_full_rebuild(self):
         self.model_builder.set_remote_files([SystemFile("active.bin", 100, False)])
@@ -884,6 +889,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(self.model_builder.active_transfer_delta_file_ids(live_model.get_file_ids()))
         diagnostics = self.model_builder.active_transfer_delta_diagnostics()
         self.assertEqual(["status", "ambiguity"], diagnostics["rejection_categories"])
+        self.assertEqual("ambiguous_global_visibility", diagnostics["selector_failure"])
         self.assertNotIn("release.bin", str(diagnostics["rejection_categories"]))
 
     def test_active_transfer_delta_diagnostics_ignores_unrelated_extraction_marker(self):
@@ -911,6 +917,39 @@ class TestModelBuilder(unittest.TestCase):
         categories = self.model_builder.active_transfer_delta_diagnostics()["rejection_categories"]
         self.assertIn("status", categories)
         self.assertNotIn("ambiguity", categories)
+        self.assertEqual(
+            "invalid_invalidation_scope",
+            self.model_builder.active_transfer_delta_diagnostics()["selector_failure"],
+        )
+
+    def test_active_delta_selector_failure_clears_at_finalization_boundaries(self):
+        marker_name = "_ModelBuilder__active_transfer_delta_selector_failure"
+        self.model_builder.set_remote_files([SystemFile("root.bin", 100, False)])
+        self.model_builder.build_model()
+
+        setattr(self.model_builder, marker_name, "unknown_root")
+        self.model_builder.request_rebuild()
+        self.model_builder.build_model()
+        self.assertIsNone(self.model_builder.active_transfer_delta_diagnostics()["selector_failure"])
+
+        setattr(self.model_builder, marker_name, "unknown_root")
+        self.model_builder.clear()
+        self.assertIsNone(self.model_builder.active_transfer_delta_diagnostics()["selector_failure"])
+
+    def test_active_delta_selector_failure_clears_after_delta_adoption(self):
+        marker_name = "_ModelBuilder__active_transfer_delta_selector_failure"
+        self.model_builder.set_remote_files([SystemFile("root.bin", 100, False)])
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root.bin", "")
+        self.model_builder.set_lftp_statuses([status])
+        root_ids = self.model_builder.active_transfer_delta_file_ids(live_model.get_file_ids())
+        assert root_ids is not None
+        partial = self.model_builder.build_active_transfer_roots(root_ids)
+
+        setattr(self.model_builder, marker_name, "unknown_root")
+        self.model_builder.adopt_active_transfer_delta(live_model, root_ids, partial)
+
+        self.assertIsNone(self.model_builder.active_transfer_delta_diagnostics()["selector_failure"])
 
     def test_active_transfer_delta_selector_does_not_walk_effective_source_maps(self):
         self.model_builder.set_remote_files([SystemFile("root.bin", 100, False)])

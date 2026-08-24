@@ -60,6 +60,11 @@ from .validate import ValidateStatus
 _ACTIVE_TRANSFER_DELTA_REJECTION_CATEGORY_ORDER = (
     "scan", "lifecycle", "status", "root_identity", "ambiguity", "authority", "overlay", "unknown",
 )
+_ACTIVE_TRANSFER_DELTA_SELECTOR_FAILURES = frozenset({
+    "invalid_invalidation_scope", "no_selected_roots", "unknown_root", "lftp_regressed",
+    "active_root_not_selected", "status_missing", "status_file_id_mismatch",
+    "status_not_queued_or_running", "ambiguous_global_visibility",
+})
 _ACTIVE_TRANSFER_DELTA_INVALIDATION_CATEGORIES = {
     MODEL_BUILDER_INVALIDATION_LOCAL_FILES: "scan",
     MODEL_BUILDER_INVALIDATION_REMOTE_FILES: "scan",
@@ -241,6 +246,7 @@ class ModelBuilder:
         # been applied.  This deliberately fails closed: a new setter must be
         # explicitly classified before it can participate in a partial build.
         self.__invalidation_reasons: set[str] = set()
+        self.__active_transfer_delta_selector_failure: Optional[str] = None
         self.__next_invalidation_token = 0
         self.__pending_invalidation_tokens: dict[
             int, tuple[str, Optional[frozenset[str]]]
@@ -4181,6 +4187,7 @@ class ModelBuilder:
         )) if self.__pending_invalidation_tokens else set()
         self.__lftp_regressed_root_file_ids.intersection_update(self.__lftp_touched_root_file_ids)
         self.__cached_model = applied_model if not self.__pending_invalidation_tokens else None
+        self.__active_transfer_delta_selector_failure = None
 
     def commit_authoritative_pair_sources_for_full_rebuild(
             self, pair_build: _AuthoritativePairBuild,
@@ -4378,6 +4385,7 @@ class ModelBuilder:
                 category for category in _ACTIVE_TRANSFER_DELTA_REJECTION_CATEGORY_ORDER
                 if category in categories
             ],
+            "selector_failure": self.__active_transfer_delta_selector_failure,
             "lftp_touched_count": len(self.__lftp_touched_root_file_ids),
             "active_touched_count": len(self.__active_touched_root_file_ids),
             "lftp_regressed_count": len(self.__lftp_regressed_root_file_ids),
@@ -4399,6 +4407,12 @@ class ModelBuilder:
         normal full model build.  In particular, this method never grants
         partial authority to remove a root.
         """
+        self.__active_transfer_delta_selector_failure = None
+
+        def reject(reason: str) -> None:
+            self.__active_transfer_delta_selector_failure = reason
+            return None
+
         if not self.__invalidation_reasons.issubset({
                 MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
                 MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
@@ -4414,7 +4428,7 @@ class ModelBuilder:
                 MODEL_BUILDER_INVALIDATION_DOWNLOADED_FILES,
                 MODEL_BUILDER_INVALIDATION_DOWNLOADED_TIMESTAMPS,
         }):
-            return None
+            return reject("invalid_invalidation_scope")
         file_ids = set(self.__lftp_touched_root_file_ids)
         file_ids.update(self.__active_touched_root_file_ids)
         file_ids.update(
@@ -4435,25 +4449,30 @@ class ModelBuilder:
                 roots_known = False
         else:
             roots_known = file_ids.issubset(known_root_file_ids)
-        if not file_ids or not roots_known:
-            return None
+        if not file_ids:
+            return reject("no_selected_roots")
+        if not roots_known:
+            return reject("unknown_root")
         stopped_file_ids = {
             file_id for file_id in file_ids if file_id in self.__stopped_files
         }
         if self.__lftp_regressed_root_file_ids.intersection(file_ids).difference(stopped_file_ids):
-            return None
+            return reject("lftp_regressed")
         if not self.__active_touched_root_file_ids.issubset(file_ids):
-            return None
+            return reject("active_root_not_selected")
         if MODEL_BUILDER_INVALIDATION_LFTP_STATUSES in self.__invalidation_reasons:
             for file_id in self.__lftp_touched_root_file_ids:
                 status = self.__lftp_statuses.get(file_id)
                 if status is None and file_id in stopped_file_ids:
                     continue
-                if status is None or status.file_id != file_id or status.state not in (
-                        LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING):
-                    return None
+                if status is None:
+                    return reject("status_missing")
+                if status.file_id != file_id:
+                    return reject("status_file_id_mismatch")
+                if status.state not in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING):
+                    return reject("status_not_queued_or_running")
         if not self.__active_transfer_delta_global_state_is_safe(file_ids):
-            return None
+            return reject("ambiguous_global_visibility")
         return file_ids
 
     def __active_transfer_delta_global_state_is_safe(self, root_file_ids: Set[str]) -> bool:
@@ -4773,6 +4792,7 @@ class ModelBuilder:
             self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_VALIDATION_STATUSES)
 
     def clear(self) -> None:
+        self.__active_transfer_delta_selector_failure = None
         self.__local_files_by_pair.clear()
         self.__replace_local_library_inventory({})
         self.__active_files.clear()
@@ -4841,6 +4861,7 @@ class ModelBuilder:
         if self.__cached_model is built_model:
             self.__cached_model = applied_model
             self.__pending_invalidation_tokens.clear()
+            self.__active_transfer_delta_selector_failure = None
             return
         if not self.__pending_invalidation_tokens or not applied_invalidation_tokens:
             return
@@ -4852,6 +4873,7 @@ class ModelBuilder:
         self.__lftp_touched_root_file_ids.clear()
         self.__active_touched_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
+        self.__active_transfer_delta_selector_failure = None
 
     def authorize_active_transfer_delta(
             self, known_root_file_ids: Set[str] | Callable[[str], bool], root_file_ids: Set[str],
@@ -4893,6 +4915,7 @@ class ModelBuilder:
         self.__lftp_touched_root_file_ids.clear()
         self.__active_touched_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
+        self.__active_transfer_delta_selector_failure = None
 
     def build_model(self) -> Model:
         if self.__cached_model is not None:
@@ -5196,6 +5219,7 @@ class ModelBuilder:
         self.__lftp_touched_root_file_ids.clear()
         self.__active_touched_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
+        self.__active_transfer_delta_selector_failure = None
         return model
 
     def __resolve_root_transfer_state(

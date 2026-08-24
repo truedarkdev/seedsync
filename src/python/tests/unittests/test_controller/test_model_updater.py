@@ -7428,6 +7428,7 @@ class TestModelUpdater(unittest.TestCase):
         summary = trace.snapshot()["active_delta_rejection_summary"]
         self.assertEqual("active_delta_selector_rejected", summary["reason"])
         self.assertEqual(["status", "ambiguity"], summary["diagnostics"]["rejection_categories"])
+        self.assertEqual("ambiguous_global_visibility", summary["diagnostics"]["selector_failure"])
         self.assertNotIn("private-release.bin", str(summary))
 
     def test_disabled_progress_trace_skips_selector_diagnostics_snapshot(self):

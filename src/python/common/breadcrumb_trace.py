@@ -317,6 +317,11 @@ class BreadcrumbTraceCollector:
     __ACTIVE_DELTA_REJECTION_CATEGORY_ORDER = (
         "scan", "lifecycle", "status", "root_identity", "ambiguity", "authority", "overlay", "unknown",
     )
+    __ACTIVE_DELTA_SELECTOR_FAILURES = frozenset({
+        "invalid_invalidation_scope", "no_selected_roots", "unknown_root", "lftp_regressed",
+        "active_root_not_selected", "status_missing", "status_file_id_mismatch",
+        "status_not_queued_or_running", "ambiguous_global_visibility",
+    })
 
     def __init__(
         self,
@@ -985,6 +990,9 @@ class BreadcrumbTraceCollector:
                 category for category in cls.__ACTIVE_DELTA_REJECTION_CATEGORY_ORDER
                 if category in category_set
             ]
+        selector_failure = diagnostics.get("selector_failure")
+        if type(selector_failure) is str and selector_failure in cls.__ACTIVE_DELTA_SELECTOR_FAILURES:
+            result["selector_failure"] = selector_failure
         for key in cls.__ACTIVE_DELTA_DIAGNOSTIC_COUNT_KEYS:
             value = diagnostics.get(key)
             if type(value) is int and value >= 0:
