@@ -4225,6 +4225,8 @@ class TestController(unittest.TestCase):
             setattr(self.controller._Controller__persist, attr, {stale_key})
         self.controller._Controller__last_remote_reconciliation_healthy = True
         self.controller._Controller__last_local_reconciliation_healthy = True
+        self.controller._Controller__active_scan_lftp_roots_awaiting = {"stale-root"}
+        self.controller._Controller__active_scan_lftp_roots_seen = {"stale-root"}
         self.controller._Controller__refresh_path_pair_runtime_state = MagicMock()
         self.controller._Controller__model_builder.has_changes.return_value = True
         self.controller._Controller__model_builder.build_model.return_value = MagicMock()
@@ -4235,6 +4237,21 @@ class TestController(unittest.TestCase):
         self.controller._Controller__apply_path_pair_refresh()
         self.assertFalse(self.controller._Controller__last_remote_reconciliation_healthy)
         self.assertFalse(self.controller._Controller__last_local_reconciliation_healthy)
+        self.assertEqual(set(), self.controller._Controller__active_scan_lftp_roots_awaiting)
+        self.assertEqual(set(), self.controller._Controller__active_scan_lftp_roots_seen)
+
+        # The new scan runtime must not let a root retained by the old runtime
+        # wake an otherwise authoritative idle poller.
+        self.controller._Controller__lftp.status.reset_mock()
+        self.controller._Controller__lftp_idle_status_authoritative = True
+        self.controller._Controller__next_lftp_status_poll_at = None
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("stale-root", 1, False)],
+        )
+        self.controller._Controller__update_model()
+        self.controller._Controller__lftp.status.assert_not_called()
 
         self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
         self.controller._Controller__local_scan_process.pop_latest_result.return_value = None

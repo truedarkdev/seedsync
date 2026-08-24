@@ -831,6 +831,8 @@ class Controller:
         self.__next_active_scan_force_at = None
         self.__prev_downloading_file_names = set()
         self.__pending_completion_file_names = set()
+        self.__active_scan_lftp_roots_awaiting = set()
+        self.__active_scan_lftp_roots_seen = set()
         self.__pending_completion_progress_floors = {}
         self.__collision_compare_lock = Lock()
         self.__collision_compare_executor = None
@@ -2656,6 +2658,8 @@ class Controller:
         self.__reconciled_local_path_pair_ids = set()
         self.__reconciled_remote_path_pair_ids = set()
         self.__current_process_final_publication_file_ids = set()
+        self.__active_scan_lftp_roots_awaiting = set()
+        self.__active_scan_lftp_roots_seen = set()
         self.__begin_local_inventory_runtime_generation(
             self.__path_pairs_by_id, self.__path_pair_staging_paths,
             self.__path_pairs_by_id, self.__path_pair_staging_paths,
@@ -2787,6 +2791,8 @@ class Controller:
         self.__reconciled_local_path_pair_ids = set()
         self.__reconciled_remote_path_pair_ids = set()
         self.__current_process_final_publication_file_ids = set()
+        self.__active_scan_lftp_roots_awaiting = set()
+        self.__active_scan_lftp_roots_seen = set()
         self.__begin_local_inventory_runtime_generation(
             self.__path_pairs_by_id, self.__path_pair_staging_paths,
             self.__path_pairs_by_id, self.__path_pair_staging_paths,

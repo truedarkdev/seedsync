@@ -256,7 +256,7 @@ def _active_delta_poll_decision_diagnostics(
     next_poll_present = getattr(controller, "_Controller__next_lftp_status_poll_at", None) is not None
     if poll_due:
         reason = poll_due_reason if poll_due_reason in {
-            "no_idle_authority", "cadence_due", "unhealthy_cached_status",
+            "no_idle_authority", "cadence_due", "unhealthy_cached_status", "active_scan_lftp_transition",
         } else "unhealthy_cached_status"
         decision = {"poll_due_reason": reason}
     else:
@@ -2276,6 +2276,8 @@ class _ControllerCoreAccess:
     _Controller__next_active_scan_force_at: Optional[datetime]
     _Controller__prev_downloading_file_names: set[tuple[str, Optional[str], Optional[str]]]
     _Controller__pending_completion_file_names: set[tuple[str, Optional[str], Optional[str]]]
+    _Controller__active_scan_lftp_roots_awaiting: set[str]
+    _Controller__active_scan_lftp_roots_seen: set[str]
     _Controller__pending_completion_progress_floors: dict[str, tuple[Optional[int], Optional[int]]]
     _Controller__successful_final_move_handoff_file_ids: set[str]
     _Controller__move_retry_due: dict[str, datetime]
@@ -3131,6 +3133,10 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__prev_downloading_file_names = set()
         if not hasattr(controller, "_Controller__pending_completion_file_names"):
             controller._Controller__pending_completion_file_names = set()
+        if not hasattr(controller, "_Controller__active_scan_lftp_roots_awaiting"):
+            controller._Controller__active_scan_lftp_roots_awaiting = set()
+        if not hasattr(controller, "_Controller__active_scan_lftp_roots_seen"):
+            controller._Controller__active_scan_lftp_roots_seen = set()
         if not hasattr(controller, "_Controller__pending_completion_progress_floors"):
             controller._Controller__pending_completion_progress_floors = {}
         if not hasattr(controller, "_Controller__successful_final_move_handoff_file_ids"):
@@ -3200,6 +3206,8 @@ class ModelUpdater(_ControllerCoreAccess):
         if getattr(controller, "_Controller__progressive_scan_session_changed", False):
             controller._Controller__progressive_joint_authoritative = False
             controller._Controller__progressive_joint_first_publication = False
+            controller._Controller__active_scan_lftp_roots_awaiting.clear()
+            controller._Controller__active_scan_lftp_roots_seen.clear()
         joint_reconciler = getattr(controller, "_Controller__progressive_joint_reconciler", None)
         if progressive_mode and not isinstance(joint_reconciler, _JointProgressiveReconciler):
             joint_reconciler = _JointProgressiveReconciler()
@@ -3558,6 +3566,51 @@ class ModelUpdater(_ControllerCoreAccess):
         recovering_from_unhealthy_poll = False
         now = datetime.now()
         current_lftp_status_poll_healthy = getattr(controller._Controller__lftp, "last_status_poll_healthy", True)
+        # Capture the controller's active LFTP identity before a fresh empty
+        # status can retire it below. The active scanner also receives
+        # extracting and pending-completion roots, so only this bounded
+        # handoff can later authorize a delayed scan to wake an idle poller.
+        pre_poll_active_lftp_file_ids = {
+            ModelFile.build_file_id(file_name, path_pair_id)
+            for file_name, path_pair_id, _ in (
+                list(controller._Controller__active_downloading_file_names) +
+                list(controller._Controller__prev_downloading_file_names)
+            )
+        }
+        pre_poll_active_lftp_file_ids.update({
+            status.file_id
+            for status in (controller._Controller__last_lftp_statuses or [])
+            if status.state in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING)
+        })
+        active_scan_awaiting_lftp_file_ids: set[str] = set()
+        if latest_active_scan is not None and not bool(getattr(latest_active_scan, "failed", False)):
+            active_scan_file_ids = {
+                ModelFile.build_file_id(
+                    active_file.name, getattr(active_file, "path_pair_id", None),
+                )
+                for active_file in getattr(latest_active_scan, "files", ())
+                if isinstance(getattr(active_file, "name", None), str)
+            }
+            active_scan_awaiting_lftp_file_ids = active_scan_file_ids.intersection(
+                controller._Controller__active_scan_lftp_roots_awaiting,
+            )
+            if not active_scan_awaiting_lftp_file_ids:
+                controller._Controller__active_scan_lftp_roots_awaiting.clear()
+                controller._Controller__active_scan_lftp_roots_seen.clear()
+        new_active_scan_lftp_file_ids = active_scan_awaiting_lftp_file_ids.difference(
+            controller._Controller__active_scan_lftp_roots_seen,
+        )
+        if active_scan_awaiting_lftp_file_ids:
+            controller._Controller__active_scan_lftp_roots_seen.intersection_update(
+                active_scan_awaiting_lftp_file_ids,
+            )
+        active_scan_poll_wakeup = (
+            bool(new_active_scan_lftp_file_ids)
+            and controller._Controller__lftp_idle_status_authoritative
+            and not controller._Controller__lftp_status_poll_retry_active
+        )
+        if active_scan_poll_wakeup:
+            controller._Controller__active_scan_lftp_roots_seen.update(active_scan_awaiting_lftp_file_ids)
         lftp_status_poll_due = (
             (
                 controller._Controller__next_lftp_status_poll_at is None
@@ -3572,8 +3625,11 @@ class ModelUpdater(_ControllerCoreAccess):
                 and not current_lftp_status_poll_healthy
                 and not controller._Controller__lftp_status_poll_retry_active
             )
+            or active_scan_poll_wakeup
         )
-        if controller._Controller__next_lftp_status_poll_at is None and \
+        if active_scan_poll_wakeup:
+            poll_due_reason = "active_scan_lftp_transition"
+        elif controller._Controller__next_lftp_status_poll_at is None and \
                 not controller._Controller__lftp_idle_status_authoritative:
             poll_due_reason = "no_idle_authority"
         elif controller._Controller__next_lftp_status_poll_at is not None and \
@@ -3638,6 +3694,11 @@ class ModelUpdater(_ControllerCoreAccess):
                     controller._Controller__next_lftp_status_poll_at = (
                         poll_finished_at + _ACTIVE_LFTP_STATUS_POLL_INTERVAL if active_transfer else None
                     )
+                    if not lftp_statuses and pre_poll_active_lftp_file_ids:
+                        controller._Controller__active_scan_lftp_roots_awaiting = set(
+                            pre_poll_active_lftp_file_ids,
+                        )
+                        controller._Controller__active_scan_lftp_roots_seen.clear()
                     lftp_status_source = "fresh_healthy"
                 else:
                     controller._Controller__lftp_idle_status_authoritative = False

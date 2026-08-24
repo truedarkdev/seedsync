@@ -351,7 +351,7 @@ class BreadcrumbTraceCollector:
         "builder_active_touched_count_bucket", "builder_lftp_touched_count_bucket",
     })
     __ACTIVE_DELTA_POLL_DUE_REASONS = frozenset({
-        "no_idle_authority", "cadence_due", "unhealthy_cached_status",
+        "no_idle_authority", "cadence_due", "unhealthy_cached_status", "active_scan_lftp_transition",
     })
     __ACTIVE_DELTA_POLL_SUPPRESSED_REASONS = frozenset({
         "cached_status", "idle_authoritative", "retry_backoff",

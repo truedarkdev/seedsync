@@ -18,6 +18,7 @@ from controller.model_updater import (
     ModelUpdater,
     _breadcrumb_effectively_enabled,
     _active_delta_rejection_correlation_identity,
+    _active_delta_poll_decision_diagnostics,
     _active_delta_status_match_evidence,
     _active_delta_status_missing_provenance,
     _record_active_delta_rejection_summary,
@@ -7482,7 +7483,16 @@ class TestModelUpdater(unittest.TestCase):
         }, diagnostics["status_missing_provenance"]["poll_decision"])
         self.assertNotIn("active.bin", str(summary))
 
-    def test_cached_idle_status_missing_retains_pre_poll_active_scan_decision(self):
+    def _establish_delayed_active_scan_handoff(self, controller, updater, statuses):
+        """Poll active, then empty, without restoring controller download state."""
+        controller._Controller__lftp.status.side_effect = [statuses, []]
+        updater.update()
+        controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+        updater.update()
+        controller._Controller__lftp.status.side_effect = None
+        self.assertTrue(controller._Controller__lftp_idle_status_authoritative)
+
+    def test_active_scan_root_wakes_cached_idle_status_poll_and_admits_active_delta(self):
         builder = ModelBuilder()
         root = SystemFile("active.bin", 100, False)
         builder.set_remote_files([root])
@@ -7495,24 +7505,178 @@ class TestModelUpdater(unittest.TestCase):
         )
         controller._Controller__context.breadcrumb_trace = trace
 
-        ModelUpdater(controller).update()
-        self.assertTrue(controller._Controller__lftp_idle_status_authoritative)
-        builder.set_lftp_statuses([LftpJobStatus(
+        status = LftpJobStatus(
             1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
-        )])
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        updater = ModelUpdater(controller)
+        self._establish_delayed_active_scan_handoff(controller, updater, [status])
+        controller._Controller__lftp.status.return_value = [status]
         controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
             datetime.now(), [SystemFile("active.bin", 100, False)],
         )
 
-        ModelUpdater(controller).update()
+        updater.update()
 
-        summary = trace.snapshot()["active_delta_rejection_summary"]
-        self.assertEqual("status_missing", summary["diagnostics"]["selector_failure"])
-        decision = summary["diagnostics"]["status_missing_provenance"]["poll_decision"]
-        self.assertEqual("idle_authoritative", decision["poll_suppressed_reason"])
-        self.assertTrue(decision["idle_authoritative"])
-        self.assertEqual("0", decision["last_status_count_bucket"])
-        self.assertEqual("1", decision["active_scan_result_root_count_bucket"])
+        self.assertEqual(3, controller._Controller__lftp.status.call_count)
+        self.assertEqual(25, live_model.get_file("active.bin").transferred_size)
+        self.assertFalse(controller._Controller__lftp_idle_status_authoritative)
+        self.assertIsNotNone(controller._Controller__next_lftp_status_poll_at)
+        # A later status-missing rejection must retain the handoff reason
+        # without exposing the scanned root identity.
+        status_missing = _active_delta_status_missing_provenance(
+            controller,
+            source="fresh_healthy",
+            fresh=True,
+            healthy=True,
+            poll_error=None,
+            raw_count=0,
+            filtered_count=0,
+            active_scan_root_present=True,
+            poll_decision=_active_delta_poll_decision_diagnostics(
+                controller, builder,
+                controller._Controller__active_scan_process.pop_latest_result.return_value,
+                poll_due=True,
+                poll_due_reason="active_scan_lftp_transition",
+            ),
+        )
+        self.assertEqual(
+            "active_scan_lftp_transition",
+            status_missing["poll_decision"]["poll_due_reason"],
+        )
+
+    def test_cached_idle_tick_without_active_scan_does_not_wake_status_poll(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("active.bin", 100, False)])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=builder.build_model(),
+        )
+
+        updater = ModelUpdater(controller)
+        updater.update()
+        updater.update()
+
+        self.assertEqual(1, controller._Controller__lftp.status.call_count)
+        self.assertTrue(controller._Controller__lftp_idle_status_authoritative)
+
+    def test_active_scan_wakeup_respects_status_poll_retry_backoff(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("active.bin", 100, False)])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=builder.build_model(),
+        )
+        updater = ModelUpdater(controller)
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        self._establish_delayed_active_scan_handoff(controller, updater, [running])
+        controller._Controller__lftp_status_poll_retry_active = True
+        controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(minutes=1)
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("active.bin", 100, False)],
+        )
+
+        updater.update()
+
+        self.assertEqual(2, controller._Controller__lftp.status.call_count)
+        self.assertTrue(controller._Controller__lftp_status_poll_retry_active)
+
+    def test_active_scan_wakeup_keeps_inflight_status_poll_nonblocking(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("active.bin", 100, False)])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=builder.build_model(),
+        )
+        updater = ModelUpdater(controller)
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        self._establish_delayed_active_scan_handoff(controller, updater, [running])
+        controller._get_lftp_status_snapshot = MagicMock(return_value=None)
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("active.bin", 100, False)],
+        )
+
+        updater.update()
+
+        controller._get_lftp_status_snapshot.assert_called_once_with()
+        self.assertEqual(2, controller._Controller__lftp.status.call_count)
+        self.assertFalse(controller._Controller__lftp_idle_status_authoritative)
+        self.assertIsNone(controller._Controller__next_lftp_status_poll_at)
+
+    def test_identical_active_scan_does_not_repeat_idle_wakeup_after_empty_poll(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("active.bin", 100, False)])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=builder.build_model(),
+        )
+        updater = ModelUpdater(controller)
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        self._establish_delayed_active_scan_handoff(controller, updater, [running])
+        active_scan = ScannerResult(datetime.now(), [SystemFile("active.bin", 100, False)])
+        controller._Controller__active_scan_process.pop_latest_result.return_value = active_scan
+
+        updater.update()
+
+        self.assertEqual(3, controller._Controller__lftp.status.call_count)
+        self.assertTrue(controller._Controller__lftp_idle_status_authoritative)
+        updater.update()
+
+        self.assertEqual(3, controller._Controller__lftp.status.call_count)
+
+    def test_extract_or_pending_completion_active_scan_does_not_wake_idle_poll(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("active.bin", 100, False)])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=builder.build_model(),
+        )
+        updater = ModelUpdater(controller)
+        updater.update()
+        controller._Controller__active_extracting_file_names = [("active.bin", None, None)]
+        controller._Controller__pending_completion_file_names = {("active.bin", None, None)}
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("active.bin", 100, False)],
+        )
+
+        updater.update()
+
+        self.assertEqual(1, controller._Controller__lftp.status.call_count)
+
+    def test_active_scan_latch_prunes_removed_roots_before_reappearance(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([
+            SystemFile("first.bin", 100, False), SystemFile("second.bin", 100, False),
+        ])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=builder.build_model(),
+        )
+        updater = ModelUpdater(controller)
+        first = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "first.bin", "",
+        )
+        second = LftpJobStatus(
+            2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "second.bin", "",
+        )
+        self._establish_delayed_active_scan_handoff(controller, updater, [first, second])
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("first.bin", 100, False), SystemFile("second.bin", 100, False)],
+        )
+        updater.update()
+        self.assertEqual(3, controller._Controller__lftp.status.call_count)
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("second.bin", 100, False)],
+        )
+        updater.update()
+        self.assertEqual(3, controller._Controller__lftp.status.call_count)
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("first.bin", 100, False), SystemFile("second.bin", 100, False)],
+        )
+
+        updater.update()
+
+        self.assertEqual(4, controller._Controller__lftp.status.call_count)
 
     def test_active_delta_status_missing_summary_marks_healthy_cached_retry(self):
         builder = ModelBuilder()
