@@ -14,7 +14,7 @@ import time
 # my libs
 from system import SystemFile
 from lftp import LftpJobStatus
-from model import ModelFile, Model, ModelError
+from model import ActiveProgressOverlay, ModelFile, Model, ModelError
 from common.breadcrumb_trace import BreadcrumbTraceEmitter, opaque_trace_correlation
 from common.performance_diagnostics import (
     COUNTER_PAIR_SAFETY_REJECT_CROSS_PAIR_TOUCH,
@@ -4406,6 +4406,73 @@ class ModelBuilder:
                 MODEL_BUILDER_INVALIDATION_DOWNLOADED_TIMESTAMPS,
             })
         )
+
+    def build_active_progress_overlays(
+            self, known_root_file_ids: Set[str] | Callable[[str], bool],
+    ) -> Optional[dict[str, ActiveProgressOverlay]]:
+        """Build a root-only live-progress projection without walking trees.
+
+        Only a healthy, running canonical LFTP root is admitted.  Scans,
+        lifecycle overlays, stopped state, missing/retired status, and active
+        scanner changes retain the existing full/partial rebuild path.
+        """
+        if self.__invalidation_reasons != {MODEL_BUILDER_INVALIDATION_LFTP_STATUSES}:
+            return None
+        root_ids = set(self.__lftp_touched_root_file_ids)
+        if not root_ids or self.__lftp_regressed_root_file_ids.intersection(root_ids):
+            return None
+        if callable(known_root_file_ids):
+            try:
+                if not all(known_root_file_ids(file_id) for file_id in root_ids):
+                    return None
+            except Exception:
+                return None
+        elif not root_ids.issubset(known_root_file_ids):
+            return None
+        if not self.__active_transfer_delta_global_state_is_safe(root_ids):
+            return None
+        overlays: dict[str, ActiveProgressOverlay] = {}
+        for file_id in root_ids:
+            status = self.__lftp_statuses.get(file_id)
+            remote = self.__remote_file(file_id)
+            local = self.__local_file(file_id)
+            if status is None or status.file_id != file_id or \
+                    status.state != LftpJobStatus.State.RUNNING or \
+                    self.__is_stopped_file(file_id, remote, local, status):
+                return None
+            # The status total is LFTP's root counter.  It is the only value
+            # this slice projects: no child/ancestor aggregation is inferred.
+            try:
+                source = self.__transfer_state(status.total_transfer_state)
+                _, previous = self.__resolve_recent_live_transfer_snapshot(file_id, status.file_id)
+                current = self.__combine_split_root_transfer_state(
+                    source, remote, local, previous, status.id, status.type,
+                )
+                current = self.__coalesce_retained_stopped_transfer_state(
+                    file_id, status.file_id, remote, local, current, source,
+                    status.id, status.type,
+                )
+            except (ModelError, TypeError, ValueError):
+                return None
+            progress = self.__normalize_download_progress(current.percent_local)
+            if current.size_local is None and progress is None:
+                return None
+            self.__store_recent_live_transfer_snapshot(
+                file_id, status.file_id, current, source, status.id,
+            )
+            overlays[file_id] = ActiveProgressOverlay(
+                progress, current.size_local, current.speed, current.eta,
+            )
+        return overlays
+
+    def adopt_active_progress_overlays(self, applied_model: Optional[Model] = None) -> None:
+        """Commit only the consumed status invalidation after projection."""
+        if applied_model is not None:
+            self.__cached_model = applied_model
+        self.__invalidation_reasons.clear()
+        self.__pending_invalidation_tokens.clear()
+        self.__lftp_touched_root_file_ids.clear()
+        self.__lftp_regressed_root_file_ids.clear()
 
     def unknown_local_path_pair_ids_snapshot(self) -> frozenset[Optional[str]]:
         """Return the derived unknown-pair overlay without transferring ownership."""

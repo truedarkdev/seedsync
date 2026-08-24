@@ -4851,6 +4851,37 @@ class ModelUpdater(_ControllerCoreAccess):
         _record_progress_lineage(
             controller, lftp_status_poll_correlation, "pre_active_delta",
         )
+        # Root-total LFTP progress has a deliberately narrower publication
+        # path than the historical active-root rebuild.  The builder admits
+        # only healthy, running canonical statuses and never derives child or
+        # ancestor values; the Model atomically replaces immutable overlay
+        # values and wakes scoped listeners without touching legacy streams.
+        active_progress_overlay_applied = False
+        overlay_builder = getattr(model_builder, "build_active_progress_overlays", None)
+        overlay_adopter = getattr(model_builder, "adopt_active_progress_overlays", None)
+        if lftp_status_poll_healthy and lftp_status_snapshot_fresh and \
+                lftp_status_source == "fresh_healthy" and callable(overlay_builder) and \
+                callable(overlay_adopter):
+            try:
+                with controller._Controller__model_lock:
+                    overlay_values = overlay_builder(lambda file_id: file_id in model.get_file_ids())
+                    if isinstance(overlay_values, dict):
+                        merged_overlays = model.active_progress_overlays_snapshot()
+                        merged_overlays.update(overlay_values)
+                        changed = model.replace_active_progress_overlays(
+                            merged_overlays, set(overlay_values),
+                        )
+                        overlay_adopter(model)
+                        active_progress_overlay_applied = True
+                        if changed:
+                            refresh_identities = getattr(
+                                controller, "_refresh_model_file_command_identities_locked", None,
+                            )
+                            if callable(refresh_identities):
+                                refresh_identities()
+            except Exception:
+                # The established active delta remains the fail-closed path.
+                active_progress_overlay_applied = False
         active_transfer_delta_applied = False
         active_transfer_delta_adopted = False
         active_transfer_delta_rejected = False
@@ -4862,7 +4893,7 @@ class ModelUpdater(_ControllerCoreAccess):
         active_delta_adopter = getattr(model_builder, "adopt_active_transfer_delta", None)
         active_delta_file_ids: Optional[set[str]] = None
         selector_rejection_diagnostics: object = {}
-        if authoritative_pair_candidate is None and callable(active_delta_pending) and bool(active_delta_pending()) and \
+        if not active_progress_overlay_applied and authoritative_pair_candidate is None and callable(active_delta_pending) and bool(active_delta_pending()) and \
                 callable(active_delta_selector) and callable(active_delta_builder) and \
                 callable(active_delta_authorizer) and callable(active_delta_adopter):
             try:
@@ -6103,6 +6134,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         model_builder, authoritative_pair_build, pair_fallback_committer,
                         record_candidate_lifecycle_fallback,
                 ), controller._Controller__model_lock:
+                    controller._Controller__model.clear_active_progress_overlays()
                     controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
                     pair_adopter(
                         controller._Controller__model,
@@ -6173,6 +6205,7 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp
         if global_full_build_triggered:
             with controller._Controller__model_lock:
+                controller._Controller__model.clear_active_progress_overlays()
                 controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
                 model_builder.adopt_applied_model(
                     new_model,

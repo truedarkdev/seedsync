@@ -3225,8 +3225,8 @@ class Controller:
     def _model_state_name(file: ModelFile) -> str:
         return file.state.name.lower()
 
-    @classmethod
-    def _model_file_page_record(cls, file: ModelFile) -> dict[str, object]:
+    @staticmethod
+    def _model_file_page_record(file: ModelFile) -> dict[str, object]:
         """Build one JSON-ready, shallow model record while the model is locked.
 
         Do not copy the ModelFile and, in particular, do not walk descendants
@@ -3236,7 +3236,7 @@ class Controller:
         return {
             "name": file.name,
             "is_dir": file.is_dir,
-            "state": cls._model_state_name(file),
+            "state": Controller._model_state_name(file),
             "remote_size": file.remote_size,
             "local_size": file.local_size,
             "remote_present": file.remote_present,
@@ -3271,6 +3271,19 @@ class Controller:
             "child_count": child_count,
             "has_children": child_count > 0,
         }
+
+    def _model_file_page_record_with_overlay(self, file: ModelFile) -> dict[str, object]:
+        record = self._model_file_page_record(file)
+        overlay = self.__model.active_progress_overlay(file.file_id)
+        if overlay is not None:
+            record.update({
+                "state": "downloading",
+                "download_progress": overlay.download_progress,
+                "transferred_size": overlay.transferred_size,
+                "downloading_speed": overlay.downloading_speed,
+                "eta": overlay.eta,
+            })
+        return record
 
     @staticmethod
     def _model_record_visible_state(file: ModelFile) -> str:
@@ -3442,7 +3455,7 @@ class Controller:
             "parent_file_id": parent_file_id,
             "limit": limit,
             "total": total,
-            "records": [self._model_file_page_record(file) for file in page_files],
+            "records": [self._model_file_page_record_with_overlay(file) for file in page_files],
             # The handler turns this identity/version pair into an opaque
             # cursor; keeping it primitive here lets the controller stay HTTP
             # agnostic and makes atomic setup reusable by SSE.
@@ -3513,7 +3526,7 @@ class Controller:
                     removed_root_ids.append(root_id)
                     continue
                 if root.path_pair_id == expected_path_pair_id:
-                    records.append(self._model_file_page_record(root))
+                    records.append(self._model_file_page_record_with_overlay(root))
                 else:
                     removed_root_ids.append(root_id)
             return {

@@ -650,6 +650,45 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(200, live_model.get_file("retained.bin").remote_size)
         self.assertNotEqual(old_active, new_active)
 
+    def test_active_progress_overlay_projects_running_root_without_rebuilding_tree(self):
+        active = SystemFile("active.bin", 100, False)
+        self.model_builder.set_remote_files([active])
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        self.model_builder.set_lftp_statuses([status])
+
+        overlays = self.model_builder.build_active_progress_overlays(live_model.get_file_ids())
+
+        self.assertIsNotNone(overlays)
+        assert overlays is not None
+        self.assertEqual(25, overlays["active.bin"].download_progress)
+        self.assertEqual(25, overlays["active.bin"].transferred_size)
+        self.assertEqual(10, overlays["active.bin"].downloading_speed)
+        self.assertTrue(live_model.replace_active_progress_overlays(overlays, set(overlays)))
+        self.assertEqual(25, live_model.active_progress_overlay("active.bin").transferred_size)
+        self.assertIsNone(live_model.get_file("active.bin").transferred_size)
+        self.model_builder.adopt_active_progress_overlays(live_model)
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_active_progress_overlay_rejects_status_retirement_and_active_scan_input(self):
+        active = SystemFile("active.bin", 100, False)
+        self.model_builder.set_remote_files([active])
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        self.model_builder.set_lftp_statuses([status])
+        self.model_builder.set_active_files([SystemFile("active.bin", 25, False)])
+
+        self.assertIsNone(self.model_builder.build_active_progress_overlays(live_model.get_file_ids()))
+        self.model_builder.set_active_files([])
+        self.model_builder.set_lftp_statuses([])
+        self.assertIsNone(self.model_builder.build_active_progress_overlays(live_model.get_file_ids()))
+
     def test_active_transfer_delta_selected_tree_matches_full_build_and_keeps_ownership(self):
         remote_root = SystemFile("selected", 100, True)
         remote_root.path_pair_id = "pair-a"

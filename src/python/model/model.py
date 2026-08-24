@@ -3,6 +3,7 @@
 import logging
 from abc import ABC, abstractmethod
 from bisect import insort
+from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, Iterator, Optional, Set
 from threading import Lock
 
@@ -16,6 +17,15 @@ class ModelError(AppError):
     Exception indicating a model error
     """
     pass
+
+
+@dataclass(frozen=True)
+class ActiveProgressOverlay:
+    """Immutable, live-only presentation facts for one canonical root."""
+    download_progress: Optional[int]
+    transferred_size: Optional[int]
+    downloading_speed: Optional[int]
+    eta: Optional[int]
 
 
 class IModelListener(ABC):
@@ -72,6 +82,9 @@ class Model:
         # matches the replacement roots' persisted timestamp snapshot.
         self.__downloaded_timestamp_overlay_generation = 0
         self.__version_publication_callback: Optional[Callable[[int, int], None]] = None
+        # Authoritative scans own ModelFile topology and lifecycle state.  This
+        # copy-on-write map owns only fresh LFTP presentation values.
+        self.__active_progress_overlays: Dict[str, ActiveProgressOverlay] = {}
 
     @property
     def version(self) -> int:
@@ -208,6 +221,42 @@ class Model:
     ) -> None:
         """Set one transient, best-effort callback before listener dispatch."""
         self.__version_publication_callback = callback if callable(callback) else None
+
+    def active_progress_overlay(self, file_id: str) -> Optional[ActiveProgressOverlay]:
+        return self.__active_progress_overlays.get(file_id)
+
+    def active_progress_overlays_snapshot(self) -> Dict[str, ActiveProgressOverlay]:
+        """Return a value snapshot for an atomic replacement transaction."""
+        return dict(self.__active_progress_overlays)
+
+    def clear_active_progress_overlays(self) -> None:
+        """Discard live-only values at an authoritative rebuild boundary."""
+        self.__active_progress_overlays = {}
+
+    def replace_active_progress_overlays(
+            self, overlays: Dict[str, ActiveProgressOverlay], changed_root_ids: Set[str],
+    ) -> set[str]:
+        """Atomically replace live-only progress and notify scoped readers.
+
+        This intentionally does not call the legacy ``file_updated`` listener
+        contract: those listeners retain ModelFile references and require an
+        immutable tree replacement. Scoped listeners receive only versions.
+        """
+        normalized = {
+            file_id: overlay for file_id, overlay in overlays.items()
+            if isinstance(file_id, str) and isinstance(overlay, ActiveProgressOverlay)
+        }
+        changed = {
+            file_id for file_id in changed_root_ids
+            if file_id in self.__files_by_id and
+            self.__active_progress_overlays.get(file_id) != normalized.get(file_id)
+        }
+        self.__active_progress_overlays = normalized
+        for file_id in sorted(changed):
+            file = self.__files_by_id[file_id]
+            global_version, scope_version = self.__advance_version(file)
+            self.__notify_versioned_change(file, global_version, scope_version)
+        return changed
 
     def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("Model")

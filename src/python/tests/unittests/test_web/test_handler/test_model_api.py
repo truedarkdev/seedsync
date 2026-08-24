@@ -14,7 +14,7 @@ from common.performance_diagnostics import PerformanceDiagnosticsCollector
 from controller import Controller
 from controller.controller import MODEL_LEGACY_SCOPE_ID
 from controller.model_builder import ModelBuilder
-from model import Model, ModelFile
+from model import ActiveProgressOverlay, Model, ModelFile
 from system import SystemFile
 from web.handler.model_api import ModelApiHandler, ScopedModelListener, SummaryModelListener
 from web.web_app import WebApp
@@ -1050,6 +1050,21 @@ class TestModelApi(unittest.TestCase):
         ))
         self.assertFalse(record["explicitly_stopped"])
         self.assertFalse(record["complete_local_coverage"])
+
+    def test_scoped_page_resolves_immutable_active_progress_overlay(self):
+        file = self._file("sample", "pair-a")
+        file.remote_size = 100
+        self.model.add_file(file)
+        self.model.replace_active_progress_overlays(
+            {file.file_id: ActiveProgressOverlay(25, 25, 10, 8)}, {file.file_id},
+        )
+
+        page = self.client.get("/server/model/v1/pairs/pair-a/roots").json
+
+        self.assertEqual("downloading", page["records"][0]["state"])
+        self.assertEqual(25, page["records"][0]["download_progress"])
+        self.assertEqual(25, page["records"][0]["transferred_size"])
+        self.assertIsNone(self.model.get_file(file.file_id).transferred_size)
 
     def test_visible_state_uses_display_union_then_raw_progress_fallback(self):
         mixed = self._file("mixed", "pair-a")
