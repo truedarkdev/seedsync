@@ -371,6 +371,9 @@ class TestRootProgressTrace(unittest.TestCase):
             self.assertFalse(disabled.record_progress_lineage(
                 "lftp-poll:0123456789abcdef", "status_submit", {"outcome": "private-name"},
             ))
+        disabled_health = disabled.snapshot()["progress_lineage_health"]
+        self.assertFalse(disabled_health["enabled"])
+        self.assertEqual(0, disabled_health["attempt_count"])
 
         trace = self._trace()
         correlation = "lftp-poll:0123456789abcdef"
@@ -413,6 +416,31 @@ class TestRootProgressTrace(unittest.TestCase):
         self.assertFalse(trace.record_progress_lineage(
             "lftp-poll:fedcba9876543210", "status_submit", BrokenDetails(),
         ))
+
+    def test_progress_lineage_health_is_fixed_and_survives_clear(self):
+        trace = self._trace()
+        correlation = "lftp-poll:0123456789abcdef"
+        self.assertTrue(trace.record_progress_lineage(correlation, "status_submit"))
+        self.assertFalse(trace.record_progress_lineage("not-opaque", "status_start"))
+        self.assertFalse(trace.record_progress_lineage(correlation, "not-a-phase"))
+        self.assertFalse(trace.record_progress_lineage_for_model_version(
+            99, "scoped_stream_emit", {"scope_version": 1},
+        ))
+        trace.clear(category="model.progress")
+
+        health = trace.snapshot()["progress_lineage_health"]
+        self.assertTrue(health["enabled"])
+        self.assertEqual(4, health["attempt_count"])
+        self.assertEqual(1, health["phase_calls"]["status_submit"])
+        self.assertEqual(1, health["phase_accepted"]["status_submit"])
+        self.assertEqual(1, health["reject_counts"]["invalid_correlation"])
+        self.assertEqual(1, health["reject_counts"]["invalid_phase"])
+        self.assertEqual(1, health["reject_counts"]["unmapped_model_version"])
+        self.assertEqual(1, health["spans_created"])
+        self.assertEqual(0, health["spans_evicted"])
+        self.assertEqual(1, health["lineage_resets"])
+        self.assertEqual([], trace.snapshot()["progress_lineage"]["spans"])
+        self.assertNotIn(correlation, str(health))
 
     def test_active_delta_lineage_phase_order_and_unreached_tails_are_bounded(self):
         trace = self._trace()

@@ -495,6 +495,39 @@ class TestController(unittest.TestCase):
                          [step["phase"] for step in old["steps"]])
         self.assertFalse(any(span["correlation"] == "lftp-poll:fedcba9876543210" for span in spans))
 
+    def test_async_lftp_poll_lineage_health_counts_two_completed_polls(self):
+        self.controller._Controller__lftp.backend_name = "lftp"
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.status.return_value = []
+
+        observed = []
+        for _ in range(2):
+            self.assertIsNone(self.controller._get_lftp_status_snapshot())
+            correlation = self.controller._Controller__lftp_status_poll_correlation
+            deadline = time.monotonic() + 1
+            snapshot = None
+            while snapshot is None and time.monotonic() < deadline:
+                snapshot = self.controller._get_lftp_status_snapshot()
+                if snapshot is None:
+                    time.sleep(0.01)
+            self.assertEqual(([], True), snapshot)
+            observed.append(correlation)
+            self.assertEqual(correlation, self.controller._take_lftp_status_poll_correlation())
+
+        health = trace.snapshot()["progress_lineage_health"]
+        self.assertEqual(2, len(trace.snapshot()["progress_lineage"]["spans"]))
+        for phase in ("status_submit", "status_start", "status_finish"):
+            self.assertEqual(2, health["phase_calls"][phase])
+            self.assertEqual(2, health["phase_accepted"][phase])
+        self.assertEqual(2, health["spans_created"])
+        self.assertEqual(0, health["spans_evicted"])
+        self.assertEqual(0, health["lineage_resets"])
+        self.assertNotEqual(*observed)
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
     def test_async_queue_invalidates_completed_pre_queue_status_before_post_queue_poll(self):
         class TrackingFuture(Future):
             def __init__(self):

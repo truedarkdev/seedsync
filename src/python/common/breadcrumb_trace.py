@@ -568,6 +568,12 @@ class BreadcrumbTraceCollector:
             "latest_by_representation": {},
         }
         self.__progress_lineage: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+        # Unlike the spans, these fixed counters survive an evidence clear so
+        # a post-cleanup snapshot can still say whether the target lifecycle
+        # reached this collector.  Allocate the maps only on the first
+        # enabled lineage write.
+        self.__progress_lineage_health: Optional[Dict[str, Any]] = None
+        self.__progress_lineage_reset_count = 0
         self.__policy: Dict[str, Any] = cast(Dict[str, Any], policy_result["policy"])
         self.__effective_policy = _EffectiveBreadcrumbPolicy.from_policy(self.__policy)
         self.__policy_revision = 0
@@ -714,13 +720,19 @@ class BreadcrumbTraceCollector:
         """
         if not self.is_effectively_enabled("model.progress", "debug"):
             return False
+        health = self.__progress_lineage_health_for_write()
+        health["attempt_count"] += 1
         if not isinstance(correlation, str) or not correlation.startswith("lftp-poll:") or \
                 len(correlation) != len("lftp-poll:") + 16:
+            health["reject_counts"]["invalid_correlation"] += 1
             return False
         if not isinstance(phase, str) or phase not in self.__PROGRESS_LINEAGE_PHASES:
+            health["reject_counts"]["invalid_phase"] += 1
             return False
+        health["phase_calls"][phase] += 1
         suffix = correlation[len("lftp-poll:"):]
         if any(character not in "0123456789abcdef" for character in suffix):
+            health["reject_counts"]["invalid_correlation"] += 1
             return False
         safe: Dict[str, Any] = {}
         try:
@@ -737,6 +749,7 @@ class BreadcrumbTraceCollector:
                     elif isinstance(value, str) and value in self.__PROGRESS_LINEAGE_ENUMS.get(key, frozenset()):
                         safe[key] = value
         except Exception:
+            health["reject_counts"]["details_error"] += 1
             return False
         step = {"phase": phase, "monotonic_ms": time.monotonic_ns() // 1_000_000, "details": safe}
         with self.__lock:
@@ -744,6 +757,7 @@ class BreadcrumbTraceCollector:
             if span is None:
                 span = {"correlation": correlation, "steps": []}
                 self.__progress_lineage[correlation] = span
+                health["spans_created"] += 1
             else:
                 self.__progress_lineage.move_to_end(correlation)
             steps = span["steps"]
@@ -755,6 +769,7 @@ class BreadcrumbTraceCollector:
                     stream_step["details"].update(safe)
                     stream_step["details"]["scoped_stream_count_bucket"] = self.__progress_lineage_count_bucket(count)
                     stream_step["monotonic_ms"] = step["monotonic_ms"]
+                    health["phase_accepted"][phase] += 1
                     return True
             if phase == "model_mutation" and safe.get("outcome") == "mutated" and \
                     type(safe.get("model_version")) is int:
@@ -767,6 +782,7 @@ class BreadcrumbTraceCollector:
                             2_147_483_647,
                             int(span.get("mutation_ranges_omitted_count", 0)) + 1,
                         )
+                        health["reject_counts"]["mutation_range_truncated"] += 1
                         return False
                     ranges.append([version, version])
                 else:
@@ -781,6 +797,7 @@ class BreadcrumbTraceCollector:
                         sum((end - start) + 1 for start, end in ranges)
                     )
                     mutation_step["monotonic_ms"] = step["monotonic_ms"]
+                    health["phase_accepted"][phase] += 1
                     return True
                 safe["model_version_first"] = version
                 safe["model_version_last"] = version
@@ -793,6 +810,8 @@ class BreadcrumbTraceCollector:
                 step["details"]["scoped_stream_count_bucket"] = "1"
             while len(self.__progress_lineage) > self.__PROGRESS_LINEAGE_MAX_SPANS:
                 self.__progress_lineage.popitem(last=False)
+                health["spans_evicted"] += 1
+            health["phase_accepted"][phase] += 1
         return True
 
     def record_progress_lineage_for_model_version(
@@ -806,6 +825,10 @@ class BreadcrumbTraceCollector:
                                 if any(start <= model_version <= end
                                        for start, end in span.get("mutation_version_ranges", ()))), None)
             if correlation is None:
+                health = self.__progress_lineage_health_for_write()
+                health["attempt_count"] += 1
+                health["phase_calls"]["scoped_stream_emit"] += 1
+                health["reject_counts"]["unmapped_model_version"] += 1
                 return False
             return self.__record_progress_lineage_locked(correlation, phase, details)
 
@@ -839,6 +862,51 @@ class BreadcrumbTraceCollector:
             "spans": copy.deepcopy(list(self.__progress_lineage.values())),
         }
 
+    def __progress_lineage_health_for_write(self) -> Dict[str, Any]:
+        """Lazily allocate fixed admission accounting after the debug gate."""
+        health = self.__progress_lineage_health
+        if health is None:
+            health = {
+                "schema": "model_progress_lineage_health.v1",
+                "attempt_count": 0,
+                "phase_calls": {phase: 0 for phase in self.__PROGRESS_LINEAGE_PHASES},
+                "phase_accepted": {phase: 0 for phase in self.__PROGRESS_LINEAGE_PHASES},
+                "reject_counts": {
+                    "invalid_correlation": 0,
+                    "invalid_phase": 0,
+                    "details_error": 0,
+                    "mutation_range_truncated": 0,
+                    "unmapped_model_version": 0,
+                },
+                "spans_created": 0,
+                "spans_evicted": 0,
+            }
+            self.__progress_lineage_health = health
+        return health
+
+    def __progress_lineage_health_snapshot(self) -> Dict[str, Any]:
+        health = self.__progress_lineage_health
+        if health is None:
+            health = {
+                "schema": "model_progress_lineage_health.v1",
+                "attempt_count": 0,
+                "phase_calls": {phase: 0 for phase in self.__PROGRESS_LINEAGE_PHASES},
+                "phase_accepted": {phase: 0 for phase in self.__PROGRESS_LINEAGE_PHASES},
+                "reject_counts": {
+                    "invalid_correlation": 0,
+                    "invalid_phase": 0,
+                    "details_error": 0,
+                    "mutation_range_truncated": 0,
+                    "unmapped_model_version": 0,
+                },
+                "spans_created": 0,
+                "spans_evicted": 0,
+            }
+        snapshot = copy.deepcopy(health)
+        snapshot["enabled"] = self.is_effectively_enabled("model.progress", "debug")
+        snapshot["lineage_resets"] = self.__progress_lineage_reset_count
+        return snapshot
+
     def __reset_root_progress_health_locked(self) -> None:
         self.__root_progress_health = {
             "schema": "model_root_progress_health.v1",
@@ -856,6 +924,9 @@ class BreadcrumbTraceCollector:
             "latest_by_representation": {},
         }
         self.__progress_lineage.clear()
+        self.__progress_lineage_reset_count = min(
+            self.__ROOT_PROGRESS_HEALTH_MAX_COUNTER, self.__progress_lineage_reset_count + 1,
+        )
 
     @staticmethod
     def __clear_scope_includes_root_progress(clear_filters: Mapping[str, Any]) -> bool:
@@ -2097,6 +2168,7 @@ class BreadcrumbTraceCollector:
             "failure_summary": self.__build_failure_summary(all_entries),
             "root_progress_health": self.__root_progress_health_snapshot(),
             "progress_lineage": self.__progress_lineage_snapshot(),
+            "progress_lineage_health": self.__progress_lineage_health_snapshot(),
             "active_delta_rejection_summary": copy.deepcopy(
                 self.__latest_active_delta_rejection_summary
             ),

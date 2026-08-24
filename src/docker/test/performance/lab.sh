@@ -1263,6 +1263,7 @@ PY
     --run-manifest "$ARTIFACT_DIR/run-manifest.json" \
     --binding "$binding" \
     --image-identity-digest "$image_identity_digest" \
+    --breadcrumbs-before-cleanup-output "$phase_dir/breadcrumbs-before-cleanup.json" \
     --output "$output"
   local status=$?
   set -e

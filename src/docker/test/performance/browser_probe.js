@@ -847,6 +847,7 @@ async function main() {
   const bindingPath = parseOption(argv, '--binding');
   const imageIdentityDigest = parseOption(argv, '--image-identity-digest');
   const outputPath = parseOption(argv, '--output');
+  const breadcrumbsBeforeCleanupPath = parseOption(argv, '--breadcrumbs-before-cleanup-output');
   if (!label || !baseUrl || !manifestPath || !outputPath) {
     throw new Error('usage: browser_probe.js --label <label> --base-url <url> --manifest <path> --output <path>');
   }
@@ -935,7 +936,11 @@ async function main() {
     await traverseTargetRows(page, target, timeoutMs);
     const targetId = await readTargetId(page, target.name, timeoutMs, target);
     target.file_id_present = Boolean(targetId);
-    await exerciseActions(page, target, targetId, timeoutMs, evidence, modelStreamPath);
+    await exerciseActions(page, target, targetId, timeoutMs, evidence, modelStreamPath, async () => {
+      await captureBreadcrumbsBeforeCleanup(
+        baseUrl, apiToken, breadcrumbsBeforeCleanupPath, timeoutMs,
+      );
+    });
     const timeline = await page.evaluate(() => window.__seedSyncPerfTimeline?.snapshot?.() || {});
     evidence.samples.event_source_receive = sanitizeTimelinePaths(timeline.eventSourceReceive);
     evidence.samples.event_source_apply = sanitizeTimelinePaths(timeline.eventSourceApply);
@@ -2302,7 +2307,7 @@ async function cleanupTarget(page, target, targetId, timeoutMs, evidence, record
   return cleanupLegacyTarget(page, target, targetId, timeoutMs, evidence, record);
 }
 
-async function exerciseActions(page, target, targetId, timeoutMs, evidence, scopedPath) {
+async function exerciseActions(page, target, targetId, timeoutMs, evidence, scopedPath, captureBeforeCleanup) {
   const actions = evidence.actions;
   const legacy = target.kind !== 'directory';
   const cleanupRecord = {name: 'cleanup', measured: false, required: false, attempted: false,
@@ -2365,11 +2370,48 @@ async function exerciseActions(page, target, targetId, timeoutMs, evidence, scop
       ));
     }
   } finally {
+    // This must remain before Stop/Delete Local cleanup: the poll lineage is
+    // intentionally about the active target, while cleanup creates a later
+    // idle status that is not causal evidence for the observed cadence gap.
+    if (typeof captureBeforeCleanup === 'function') {
+      try { await captureBeforeCleanup(); }
+      catch (error) { boundedPush(evidence.errors, errorRecord('breadcrumbs-before-cleanup', error), MAX_ERRORS); }
+    }
     if (cleanupRecord.required) {
       await cleanupTarget(page, target, targetId, timeoutMs, evidence, cleanupRecord);
       evidence.cleanup = cleanupRecord;
       actions.push(cleanupRecord);
     }
+  }
+}
+
+async function captureBreadcrumbsBeforeCleanup(baseUrl, apiToken, outputPath, timeoutMs) {
+  if (!outputPath) return;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1, Math.min(timeoutMs, 20_000)));
+  try {
+    const response = await fetch(new URL('/server/breadcrumbs/get?limit=1', baseUrl), {
+      headers: {Authorization: `Bearer ${apiToken}`}, cache: 'no-store', signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`breadcrumbs snapshot returned HTTP ${response.status}`);
+    const payload = await response.json();
+    // Persist only the bounded, privacy-filtered diagnostic subtrees needed
+    // to explain an active gap; never copy ordinary breadcrumb entries.
+    const snapshot = {
+      schema: 'seedsync.performance-lab.progress-lineage-capture.v1',
+      version: Number.isInteger(payload?.version) ? payload.version : null,
+      reset_generation: Number.isInteger(payload?.reset_generation) ? payload.reset_generation : null,
+      last_reset_reason: typeof payload?.last_reset_reason === 'string' ? payload.last_reset_reason : null,
+      progress_lineage: payload?.progress_lineage || null,
+      progress_lineage_health: payload?.progress_lineage_health || null,
+      root_progress_health: payload?.root_progress_health || null,
+    };
+    const destination = path.resolve(outputPath);
+    fs.mkdirSync(path.dirname(destination), {recursive: true});
+    fs.writeFileSync(destination, `${JSON.stringify(snapshot, null, 2)}\n`, {encoding: 'utf8', mode: 0o600});
+    try { fs.chmodSync(destination, 0o600); } catch (_) { /* best effort */ }
+  } finally {
+    clearTimeout(timer);
   }
 }
 

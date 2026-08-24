@@ -1384,6 +1384,20 @@ def test_readme_documents_mixed_profile_through_browser_and_cpu_gate():
     assert "remote-helper" in readme
 
 
+def test_browser_probe_captures_bounded_lineage_before_cleanup():
+    lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    browser_source = (PERF_DIR / "browser_probe.js").read_text(encoding="utf-8")
+    assert "--breadcrumbs-before-cleanup-output" in lab_source
+    assert '"$phase_dir/breadcrumbs-before-cleanup.json"' in lab_source
+    assert "captureBreadcrumbsBeforeCleanup" in browser_source
+    assert "/server/breadcrumbs/get?limit=1" in browser_source
+    assert "progress_lineage_health" in browser_source
+    assert "ordinary breadcrumb entries" in browser_source
+    capture = browser_source.index("await captureBeforeCleanup()")
+    cleanup = browser_source.index("await cleanupTarget(", capture)
+    assert capture < cleanup
+
+
 def test_compose_uses_isolated_default_network_with_optional_external_overlay():
     compose_source = (PERF_DIR / "compose.yml").read_text(encoding="utf-8")
     external_source = (PERF_DIR / "compose.external-network.yml").read_text(encoding="utf-8")
