@@ -720,6 +720,27 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(queued_builder.build_active_progress_overlays(queued_model.get_file_ids()))
         self.assertEqual("status_shape", queued_builder.active_progress_overlay_admission_outcome())
 
+    def test_active_progress_overlay_classifies_non_lftp_invalidation_categories(self):
+        cases = (
+            (lambda builder: builder.set_remote_files([SystemFile("scan.bin", 1, False)]), "invalidation_scan"),
+            (lambda builder: builder.set_stopped_files({"stopped.bin"}), "invalidation_lifecycle"),
+            (lambda builder: builder.set_downloaded_timestamps({"overlay.bin": 1.0}), "invalidation_overlay"),
+            (lambda builder: builder.request_rebuild(), "invalidation_authority"),
+            (lambda builder: builder.set_unknown_local_path_pair_ids({"pair-a"}), "invalidation_unknown"),
+        )
+        for configure, expected in cases:
+            with self.subTest(expected=expected):
+                builder = ModelBuilder()
+                configure(builder)
+                self.assertIsNone(builder.build_active_progress_overlays(set()))
+                self.assertEqual(expected, builder.active_progress_overlay_admission_outcome())
+
+        mixed = ModelBuilder()
+        mixed.set_remote_files([SystemFile("scan.bin", 1, False)])
+        mixed.set_stopped_files({"stopped.bin"})
+        self.assertIsNone(mixed.build_active_progress_overlays(set()))
+        self.assertEqual("invalidation_mixed", mixed.active_progress_overlay_admission_outcome())
+
     def test_active_progress_overlay_reports_global_safety_without_identifiers(self):
         first = SystemFile("same.bin", 100, False)
         first.path_pair_id = "pair-a"

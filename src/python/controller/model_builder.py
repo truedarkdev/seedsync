@@ -4421,7 +4421,31 @@ class ModelBuilder:
             self.__active_progress_overlay_admission_outcome = outcome
 
         if self.__invalidation_reasons != {MODEL_BUILDER_INVALIDATION_LFTP_STATUSES}:
-            reject("invalidation_scope")
+            non_lftp_reasons = self.__invalidation_reasons.difference({
+                MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
+            })
+            generic_categories = {
+                _ACTIVE_TRANSFER_DELTA_INVALIDATION_CATEGORIES.get(reason)
+                for reason in non_lftp_reasons
+            }
+            generic_categories.discard(None)
+            # ``status`` is intentionally not promoted here: only LFTP status
+            # has root-total authority; active-scan status remains a mixed
+            # source and must not look like a safe LFTP admission reason.
+            category_outcomes = {
+                "scan": "invalidation_scan",
+                "lifecycle": "invalidation_lifecycle",
+                "overlay": "invalidation_overlay",
+                "authority": "invalidation_authority",
+                "unknown": "invalidation_unknown",
+            }
+            if non_lftp_reasons and len(generic_categories) == 1 and \
+                    next(iter(generic_categories)) in category_outcomes:
+                reject(category_outcomes[next(iter(generic_categories))])
+            elif non_lftp_reasons:
+                reject("invalidation_mixed")
+            else:
+                reject("invalidation_scope")
             return None
         root_ids = set(self.__lftp_touched_root_file_ids)
         if not root_ids or self.__lftp_regressed_root_file_ids.intersection(root_ids):

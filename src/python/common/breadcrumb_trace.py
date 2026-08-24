@@ -472,6 +472,8 @@ class BreadcrumbTraceCollector:
         "overlay_admission": frozenset({
             "poll_gate", "unavailable", "invalidation_scope", "roots",
             "unknown_root", "global_safety", "status_shape", "accepted", "exception",
+            "invalidation_scan", "invalidation_lifecycle", "invalidation_overlay",
+            "invalidation_authority", "invalidation_unknown", "invalidation_mixed",
         }),
         "source": frozenset({
             "fresh_healthy", "fresh_unhealthy", "cached_retry", "cached_idle",
