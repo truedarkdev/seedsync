@@ -751,6 +751,12 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
                     "raw_status_match": True, "filtered_status_match": False,
                     "failure_reason": "timeout", "future_state": True,
                     "private_path": "/private/path", "poll_source_bad_type": True,
+                    "poll_decision": {
+                        "idle_authoritative": True, "next_poll_present": False,
+                        "last_status_count_bucket": "0",
+                        "poll_suppressed_reason": "idle_authoritative",
+                        "private_file_id": "private",
+                    },
                 },
             },
         )
@@ -763,6 +769,10 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertNotIn("private_path", provenance)
         self.assertEqual("timeout", provenance["failure_reason"])
         self.assertNotIn("future_state", provenance)
+        self.assertEqual({
+            "idle_authoritative": True, "next_poll_present": False,
+            "last_status_count_bucket": "0", "poll_suppressed_reason": "idle_authoritative",
+        }, provenance["poll_decision"])
 
         collector.record_active_delta_authorization_rejection(
             "root-progress:0123456789abcdef", 7, {},

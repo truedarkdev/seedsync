@@ -326,7 +326,7 @@ class BreadcrumbTraceCollector:
         "poll_source", "fresh", "healthy", "failure_reason", "raw_count_bucket",
         "filtered_count_bucket", "active_scan_root_present", "raw_status_match",
         "filtered_status_match", "canonical_match", "file_id_match", "pair_match",
-        "retry_active", "future_state",
+        "retry_active", "future_state", "poll_decision",
     })
     __ACTIVE_DELTA_STATUS_PROVENANCE_BOOL_KEYS = frozenset({
         "fresh", "healthy", "active_scan_root_present", "raw_status_match",
@@ -343,6 +343,19 @@ class BreadcrumbTraceCollector:
     })
     __ACTIVE_DELTA_STATUS_FUTURE_STATES = frozenset({"none", "pending", "done"})
     __ACTIVE_DELTA_STATUS_COUNT_BUCKETS = frozenset({"0", "1", "2-4", "5+"})
+    __ACTIVE_DELTA_POLL_DECISION_BOOL_KEYS = frozenset({
+        "idle_authoritative", "next_poll_present", "builder_pending_active_delta",
+    })
+    __ACTIVE_DELTA_POLL_DECISION_BUCKET_KEYS = frozenset({
+        "last_status_count_bucket", "active_scan_result_root_count_bucket",
+        "builder_active_touched_count_bucket", "builder_lftp_touched_count_bucket",
+    })
+    __ACTIVE_DELTA_POLL_DUE_REASONS = frozenset({
+        "no_idle_authority", "cadence_due", "unhealthy_cached_status",
+    })
+    __ACTIVE_DELTA_POLL_SUPPRESSED_REASONS = frozenset({
+        "cached_status", "idle_authoritative", "retry_backoff",
+    })
 
     def __init__(
         self,
@@ -1032,6 +1045,23 @@ class BreadcrumbTraceCollector:
                         type(value) is str and value in cls.__ACTIVE_DELTA_STATUS_COUNT_BUCKETS:
                     safe_provenance[key] = value
             if safe_provenance:
+                poll_decision = status_missing_provenance.get("poll_decision")
+                if isinstance(poll_decision, Mapping):
+                    safe_decision: Dict[str, Any] = {}
+                    for key, value in poll_decision.items():
+                        if key in cls.__ACTIVE_DELTA_POLL_DECISION_BOOL_KEYS and type(value) is bool:
+                            safe_decision[key] = value
+                        elif key in cls.__ACTIVE_DELTA_POLL_DECISION_BUCKET_KEYS and \
+                                type(value) is str and value in cls.__ACTIVE_DELTA_STATUS_COUNT_BUCKETS:
+                            safe_decision[key] = value
+                        elif key == "poll_due_reason" and type(value) is str and \
+                                value in cls.__ACTIVE_DELTA_POLL_DUE_REASONS:
+                            safe_decision[key] = value
+                        elif key == "poll_suppressed_reason" and type(value) is str and \
+                                value in cls.__ACTIVE_DELTA_POLL_SUPPRESSED_REASONS:
+                            safe_decision[key] = value
+                    if safe_decision:
+                        safe_provenance["poll_decision"] = safe_decision
                 result["status_missing_provenance"] = safe_provenance
         for key in cls.__ACTIVE_DELTA_DIAGNOSTIC_COUNT_KEYS:
             value = diagnostics.get(key)

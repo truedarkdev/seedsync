@@ -210,7 +210,7 @@ def _active_delta_status_match_evidence(
 def _active_delta_status_missing_provenance(
         controller: object, *, source: object, fresh: object, healthy: object,
         poll_error: Optional[BaseException], raw_count: int, filtered_count: int,
-        active_scan_root_present: bool,
+        active_scan_root_present: bool, poll_decision: Optional[Mapping[str, object]] = None,
 ) -> dict[str, object]:
     """Project this tick's status intake to fixed scalar rejection evidence."""
     result: dict[str, object] = {
@@ -237,6 +237,46 @@ def _active_delta_status_missing_provenance(
             result["future_state"] = "done" if status_future.done() is True else "pending"
         except Exception:
             result["future_state"] = "pending"
+    if isinstance(poll_decision, Mapping):
+        result["poll_decision"] = dict(poll_decision)
+    return result
+
+
+def _active_delta_poll_decision_diagnostics(
+        controller: object, model_builder: object, latest_active_scan: object,
+        *, poll_due: bool, poll_due_reason: Optional[str] = None,
+) -> dict[str, object]:
+    """Capture fixed pre-scan poll inputs only after the model.progress gate."""
+    last_statuses = getattr(controller, "_Controller__last_lftp_statuses", ()) or ()
+    try:
+        active_scan_count = len(getattr(latest_active_scan, "files", ()) or ())
+    except TypeError:
+        active_scan_count = 0
+    idle_authoritative = bool(getattr(controller, "_Controller__lftp_idle_status_authoritative", False))
+    next_poll_present = getattr(controller, "_Controller__next_lftp_status_poll_at", None) is not None
+    if poll_due:
+        reason = poll_due_reason if poll_due_reason in {
+            "no_idle_authority", "cadence_due", "unhealthy_cached_status",
+        } else "unhealthy_cached_status"
+        decision = {"poll_due_reason": reason}
+    else:
+        reason = "cached_status" if last_statuses else "idle_authoritative" if idle_authoritative else "retry_backoff"
+        decision = {"poll_suppressed_reason": reason}
+    result: dict[str, object] = {
+        "idle_authoritative": idle_authoritative,
+        "next_poll_present": next_poll_present,
+        "last_status_count_bucket": _active_delta_status_count_bucket(len(last_statuses)),
+        "active_scan_result_root_count_bucket": _active_delta_status_count_bucket(active_scan_count),
+    }
+    result.update(decision)
+    reader = getattr(model_builder, "active_transfer_delta_poll_decision_diagnostics", None)
+    if callable(reader):
+        try:
+            candidate = reader()
+            if isinstance(candidate, Mapping):
+                result.update(candidate)
+        except Exception:
+            pass
     return result
 
 
@@ -3514,6 +3554,7 @@ class ModelUpdater(_ControllerCoreAccess):
         lftp_status_snapshot_fresh = True
         lftp_status_source = "fresh_healthy"
         lftp_status_poll_error: Optional[BaseException] = None
+        poll_decision_diagnostics: dict[str, object] = {}
         recovering_from_unhealthy_poll = False
         now = datetime.now()
         current_lftp_status_poll_healthy = getattr(controller._Controller__lftp, "last_status_poll_healthy", True)
@@ -3532,6 +3573,22 @@ class ModelUpdater(_ControllerCoreAccess):
                 and not controller._Controller__lftp_status_poll_retry_active
             )
         )
+        if controller._Controller__next_lftp_status_poll_at is None and \
+                not controller._Controller__lftp_idle_status_authoritative:
+            poll_due_reason = "no_idle_authority"
+        elif controller._Controller__next_lftp_status_poll_at is not None and \
+                now >= controller._Controller__next_lftp_status_poll_at:
+            poll_due_reason = "cadence_due"
+        else:
+            poll_due_reason = "unhealthy_cached_status"
+        # Snapshot the decision inputs before a fresh poll can change cache,
+        # idle authority, retry state, or its next cadence.  This remains
+        # diagnostic-only and is built only under the existing debug gate.
+        if _active_delta_rejection_trace_enabled(controller):
+            poll_decision_diagnostics = _active_delta_poll_decision_diagnostics(
+                controller, model_builder, latest_active_scan, poll_due=lftp_status_poll_due,
+                poll_due_reason=poll_due_reason,
+            )
         if not lftp_status_poll_due:
             lftp_status_snapshot_fresh = False
             if controller._Controller__last_lftp_statuses:
@@ -4601,6 +4658,7 @@ class ModelUpdater(_ControllerCoreAccess):
                                     active_scan_root_present=bool(
                                         latest_active_scan is not None and latest_active_scan.files
                                     ),
+                                    poll_decision=poll_decision_diagnostics,
                                 ),
                             )
             except Exception:

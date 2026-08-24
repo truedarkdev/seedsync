@@ -4411,6 +4411,22 @@ class ModelBuilder:
             result["status_missing_provenance"] = provenance
         return result
 
+    def active_transfer_delta_poll_decision_diagnostics(self) -> dict[str, object]:
+        """Return bounded pre-scan active-delta inputs for an opt-in poll trace."""
+        return {
+            "builder_pending_active_delta": self.has_pending_active_transfer_delta(),
+            "builder_active_touched_count_bucket": self.__active_delta_count_bucket(
+                len(self.__active_touched_root_file_ids),
+            ),
+            "builder_lftp_touched_count_bucket": self.__active_delta_count_bucket(
+                len(self.__lftp_touched_root_file_ids),
+            ),
+        }
+
+    @staticmethod
+    def __active_delta_count_bucket(count: int) -> str:
+        return "0" if count < 1 else "1" if count == 1 else "2-4" if count <= 4 else "5+"
+
     def active_transfer_delta_file_ids(
             self, known_root_file_ids: Set[str] | Callable[[str], bool], *,
             status_match_evidence: Optional[Callable[[str, Optional[str]], Mapping[str, object]]] = None,

@@ -7463,8 +7463,56 @@ class TestModelUpdater(unittest.TestCase):
             "filtered_status_match": False, "canonical_match": False,
             "file_id_match": False, "pair_match": False, "retry_active": False,
             "future_state": "none",
+            "poll_decision": {
+                "idle_authoritative": False, "next_poll_present": False,
+                "last_status_count_bucket": "0", "active_scan_result_root_count_bucket": "0",
+                "builder_pending_active_delta": True,
+                "builder_active_touched_count_bucket": "0",
+                "builder_lftp_touched_count_bucket": "1",
+                "poll_due_reason": "no_idle_authority",
+            },
         }, diagnostics["status_missing_provenance"])
+        self.assertEqual({
+            "idle_authoritative": False, "next_poll_present": False,
+            "last_status_count_bucket": "0", "active_scan_result_root_count_bucket": "0",
+            "builder_pending_active_delta": True,
+            "builder_active_touched_count_bucket": "0",
+            "builder_lftp_touched_count_bucket": "1",
+            "poll_due_reason": "no_idle_authority",
+        }, diagnostics["status_missing_provenance"]["poll_decision"])
         self.assertNotIn("active.bin", str(summary))
+
+    def test_cached_idle_status_missing_retains_pre_poll_active_scan_decision(self):
+        builder = ModelBuilder()
+        root = SystemFile("active.bin", 100, False)
+        builder.set_remote_files([root])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+
+        ModelUpdater(controller).update()
+        self.assertTrue(controller._Controller__lftp_idle_status_authoritative)
+        builder.set_lftp_statuses([LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )])
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("active.bin", 100, False)],
+        )
+
+        ModelUpdater(controller).update()
+
+        summary = trace.snapshot()["active_delta_rejection_summary"]
+        self.assertEqual("status_missing", summary["diagnostics"]["selector_failure"])
+        decision = summary["diagnostics"]["status_missing_provenance"]["poll_decision"]
+        self.assertEqual("idle_authoritative", decision["poll_suppressed_reason"])
+        self.assertTrue(decision["idle_authoritative"])
+        self.assertEqual("0", decision["last_status_count_bucket"])
+        self.assertEqual("1", decision["active_scan_result_root_count_bucket"])
 
     def test_active_delta_status_missing_summary_marks_healthy_cached_retry(self):
         builder = ModelBuilder()
