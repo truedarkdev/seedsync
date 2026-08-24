@@ -87,6 +87,10 @@ def seed_config(config_dir: Path, api_token: str, pairs: int = 6, breadcrumb_mod
     if not remote_address.strip():
         raise ValueError("remote_address must be nonblank")
     breadcrumb_enabled = "True" if breadcrumb_mode == "on" else "False"
+    breadcrumb_policy = (
+        '{"rules":{"model.progress":"debug"}}'
+        if breadcrumb_mode == "on" else "{}"
+    )
     diagnostics_enabled = "True" if diagnostics_mode == "on" else "False"
     config_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -139,6 +143,7 @@ allowed_hostname =
 browser_handover_recovery_version =
 disable_browser_auth = False
 breadcrumb_trace_enabled = {breadcrumb_enabled}
+breadcrumb_trace_policy = {breadcrumb_policy}
 breadcrumb_trace_retention_depth = 128
 performance_diagnostics_enabled = {diagnostics_enabled}
 performance_diagnostics_retention_depth = 120

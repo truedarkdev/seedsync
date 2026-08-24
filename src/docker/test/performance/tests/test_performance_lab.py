@@ -47,6 +47,7 @@ from generate_fixture import (
 )
 import sanitize_docker_state
 from seed_config import CADENCE_RATE_LIMIT_BYTES_PER_SECOND, seed_config
+from common.breadcrumb_trace import BreadcrumbTraceCollector
 from common.config import Config
 from web.auth_store import ApiKeyStore, _verify_secret
 
@@ -1459,6 +1460,32 @@ def test_seeded_api_key_uses_current_store_hash_format(tmp_path):
     assert config.notifications.delete_complete is True
     persisted = json.loads((config_dir / "controller.persist").read_text(encoding="utf-8"))
     assert len(persisted["move_failure_counts"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("breadcrumb_mode", "expected_enabled", "expected_policy"),
+    [
+        ("on", True, {"rules": {"model.progress": "debug"}}),
+        ("off", False, {}),
+    ],
+)
+def test_seed_config_breadcrumb_mode_seeds_exact_trace_policy(
+    tmp_path, breadcrumb_mode, expected_enabled, expected_policy,
+):
+    config_dir = tmp_path / "config"
+    seed_config(config_dir, "local-test-token", pairs=2, breadcrumb_mode=breadcrumb_mode)
+
+    config = Config.from_file(str(config_dir / "settings.cfg"))
+    assert config.general.breadcrumb_trace_enabled is expected_enabled
+    policy = json.loads(config.general.breadcrumb_trace_policy)
+    assert policy == expected_policy
+
+    collector = BreadcrumbTraceCollector(
+        lambda: config.general.breadcrumb_trace_enabled,
+        policy=policy,
+    )
+    assert collector.is_effectively_enabled("model.progress", "debug") is expected_enabled
+    assert collector.is_effectively_enabled("transfer.lftp", "debug") is False
 
 
 def test_seed_config_accepts_unique_remote_address(tmp_path):
