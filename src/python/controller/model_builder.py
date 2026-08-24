@@ -263,6 +263,7 @@ class ModelBuilder:
         # LFTP remains the authoritative running counter.  Keep that narrow
         # classification separate from a normal active-scan invalidation.
         self.__active_progress_equivalent_root_file_ids: set[str] = set()
+        self.__direct_progress_equivalent_root_file_ids: set[str] = set()
         self.__lftp_regressed_root_file_ids: set[str] = set()
         self.__source_name_counts: dict[str, int] = {}
         # Global rendering hides local roots that collide by configured local
@@ -3518,6 +3519,12 @@ class ModelBuilder:
                         MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
                         touched_active_root_file_ids=touched_file_ids,
                     )
+                if self.__active_files_are_direct_progress_equivalent(
+                        previous_active_files, next_active_files, touched_file_ids,
+                ):
+                    self.__direct_progress_equivalent_root_file_ids = set(touched_file_ids)
+                else:
+                    self.__direct_progress_equivalent_root_file_ids.clear()
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_ACTIVE_FILES, started_at)
 
@@ -3555,6 +3562,34 @@ class ModelBuilder:
             if previous is None or current is None or status is None or \
                     status.file_id != file_id or status.state != LftpJobStatus.State.RUNNING or \
                     not self.__active_root_identity_matches_except_progress(previous, current):
+                return False
+        return True
+
+    @staticmethod
+    def __active_root_identity_matches_except_progress_and_mtime(
+            previous: SystemFile, current: SystemFile,
+    ) -> bool:
+        return (
+            previous.name == current.name and previous.is_dir == current.is_dir and
+            previous.timestamp_created == current.timestamp_created and
+            previous.path_pair_id == current.path_pair_id and previous.path_pair_name == current.path_pair_name and
+            previous.is_staging == current.is_staging and
+            previous.has_staging_collision == current.has_staging_collision and
+            previous.status_sidecar_ready == current.status_sidecar_ready and
+            list(previous.iter_children()) == list(current.iter_children())
+        )
+
+    def __active_files_are_direct_progress_equivalent(
+            self, previous_files: dict[str, SystemFile], next_files: dict[str, SystemFile],
+            touched_file_ids: set[str],
+    ) -> bool:
+        if not touched_file_ids or touched_file_ids != self.__lftp_touched_root_file_ids:
+            return False
+        for file_id in touched_file_ids:
+            previous, current, status = previous_files.get(file_id), next_files.get(file_id), self.__lftp_statuses.get(file_id)
+            if previous is None or current is None or status is None or status.file_id != file_id or \
+                    status.state != LftpJobStatus.State.RUNNING or not \
+                    self.__active_root_identity_matches_except_progress_and_mtime(previous, current):
                 return False
         return True
 
@@ -4468,7 +4503,12 @@ class ModelBuilder:
         def reject(outcome: str) -> None:
             self.__active_progress_overlay_admission_outcome = outcome
 
-        if self.__invalidation_reasons != {MODEL_BUILDER_INVALIDATION_LFTP_STATUSES}:
+        direct_active_input = self.__invalidation_reasons == {
+            MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
+            MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
+        } and self.__direct_progress_equivalent_root_file_ids == self.__lftp_touched_root_file_ids and \
+            self.__active_touched_root_file_ids == self.__lftp_touched_root_file_ids
+        if self.__invalidation_reasons != {MODEL_BUILDER_INVALIDATION_LFTP_STATUSES} and not direct_active_input:
             non_lftp_reasons = self.__invalidation_reasons.difference({
                 MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
             })
@@ -4513,7 +4553,8 @@ class ModelBuilder:
         if not self.__active_transfer_delta_global_state_is_safe(root_ids):
             reject("global_safety")
             return None
-        if self.__active_progress_equivalent_root_file_ids != self.__lftp_touched_root_file_ids:
+        if not direct_active_input and \
+                self.__active_progress_equivalent_root_file_ids != self.__lftp_touched_root_file_ids:
             reject("invalidation_scope")
             return None
         overlays: dict[str, ActiveProgressOverlay] = {}
@@ -4575,6 +4616,7 @@ class ModelBuilder:
         self.__lftp_touched_root_file_ids.clear()
         self.__active_touched_root_file_ids.clear()
         self.__active_progress_equivalent_root_file_ids.clear()
+        self.__direct_progress_equivalent_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
 
     def unknown_local_path_pair_ids_snapshot(self) -> frozenset[Optional[str]]:

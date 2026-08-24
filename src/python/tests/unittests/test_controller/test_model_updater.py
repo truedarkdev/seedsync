@@ -3594,7 +3594,8 @@ class TestModelUpdater(unittest.TestCase):
         )
         self.assertEqual(
             [
-                "status_consume", "pre_active_delta", "active_delta_selector",
+                "status_consume", "pre_active_delta", "active_progress_overlay_admission",
+                "direct_root_counter_publish", "active_delta_selector",
                 "active_delta_builder", "active_delta_authorization", "active_delta_adoption",
                 "model_mutation", "updater_decision",
             ],
@@ -3616,7 +3617,8 @@ class TestModelUpdater(unittest.TestCase):
         phases = self._lineage_phases(trace)
         self.assertEqual(
             [
-                "status_consume", "pre_active_delta", "active_delta_selector",
+                "status_consume", "pre_active_delta", "active_progress_overlay_admission",
+                "direct_root_counter_publish", "active_delta_selector",
                 "updater_decision", "model_mutation",
             ],
             phases,
@@ -3624,6 +3626,45 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotIn("active_delta_builder", phases)
         self.assertNotIn("active_delta_authorization", phases)
         self.assertNotIn("active_delta_adoption", phases)
+
+    def test_nonfresh_status_keeps_pending_active_delta_dirty_without_selection_or_adoption(self):
+        controller, builder, _ = self._make_active_delta_lineage_fixture()
+        status = controller._Controller__lftp.status.return_value[0]
+        builder.set_lftp_statuses([status])
+        self.assertTrue(builder.has_pending_active_transfer_delta())
+        self.assertTrue(builder.has_changes())
+
+        # A completed but nonfresh cache is not evidence for active-delta
+        # selection.  It must remain pending until a fresh healthy poll arrives.
+        controller._Controller__last_lftp_statuses = [status]
+        controller._get_lftp_status_snapshot = MagicMock(return_value=None)
+        controller._Controller__lftp_idle_status_authoritative = False
+        controller._Controller__active_scan_lftp_roots_awaiting = set()
+        controller._Controller__active_scan_lftp_roots_seen = set()
+
+        selector = MagicMock(wraps=builder.active_transfer_delta_file_ids)
+        builder.active_transfer_delta_file_ids = selector
+        delta_builder = MagicMock(wraps=builder.build_active_transfer_roots)
+        builder.build_active_transfer_roots = delta_builder
+        authorizer = MagicMock(wraps=builder.authorize_active_transfer_delta)
+        builder.authorize_active_transfer_delta = authorizer
+        adopter = MagicMock(wraps=builder.adopt_active_transfer_delta)
+        builder.adopt_active_transfer_delta = adopter
+        base_builder = MagicMock(wraps=builder.build_model)
+        builder.build_model = base_builder
+        model_update = MagicMock(wraps=controller._Controller__model.update_file)
+        controller._Controller__model.update_file = model_update
+
+        ModelUpdater(controller).update()
+
+        selector.assert_not_called()
+        delta_builder.assert_not_called()
+        authorizer.assert_not_called()
+        adopter.assert_not_called()
+        base_builder.assert_not_called()
+        model_update.assert_not_called()
+        self.assertTrue(builder.has_pending_active_transfer_delta())
+        self.assertTrue(builder.has_changes())
 
     def test_active_delta_lineage_builder_exception_stops_before_authorization(self):
         controller, builder, trace = self._make_active_delta_lineage_fixture()
@@ -3634,8 +3675,9 @@ class TestModelUpdater(unittest.TestCase):
         phases = self._lineage_phases(trace)
         self.assertEqual(
             [
-                "status_consume", "pre_active_delta", "active_delta_selector",
-                "active_delta_builder", "updater_decision", "model_mutation",
+                "status_consume", "pre_active_delta", "active_progress_overlay_admission",
+                "direct_root_counter_publish", "active_delta_selector",
+                "active_delta_builder", "updater_decision",
             ],
             phases,
         )
@@ -3651,9 +3693,9 @@ class TestModelUpdater(unittest.TestCase):
         phases = self._lineage_phases(trace)
         self.assertEqual(
             [
-                "status_consume", "pre_active_delta", "active_delta_selector",
+                "status_consume", "pre_active_delta", "active_progress_overlay_admission",
+                "direct_root_counter_publish", "active_delta_selector",
                 "active_delta_builder", "active_delta_authorization", "updater_decision",
-                "model_mutation",
             ],
             phases,
         )
@@ -3677,7 +3719,8 @@ class TestModelUpdater(unittest.TestCase):
         phases = self._lineage_phases(trace)
         self.assertEqual(
             [
-                "status_consume", "pre_active_delta", "active_delta_selector",
+                "status_consume", "pre_active_delta", "active_progress_overlay_admission",
+                "direct_root_counter_publish", "active_delta_selector",
                 "active_delta_builder", "active_delta_authorization", "updater_decision",
                 "model_mutation",
             ],
@@ -6405,10 +6448,100 @@ class TestModelUpdater(unittest.TestCase):
         self.assertFalse(builder.has_changes())
         builder.build_model.assert_not_called()
 
+    def test_direct_root_counter_publish_lineage_records_accepted_and_rejected_outcomes(self):
+        def run_publish(*, change_lifecycle_epoch):
+            builder = ModelBuilder()
+            builder.set_remote_files([SystemFile("root", 100, False)])
+            initial = LftpJobStatus(
+                1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "root", "",
+            )
+            initial.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+            builder.set_lftp_statuses([initial])
+            builder.set_active_files([SystemFile("root", 25, False)])
+            live_model = builder.build_model()
+            controller, _ = self._make_progressive_update_controller(
+                None, local_scan=None, model_builder=builder, model=live_model,
+            )
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "off", "rules": {"model.progress": "debug"}},
+            )
+            controller._Controller__context.breadcrumb_trace = trace
+            controller._Controller__progress_publication_epoch = 1
+            controller._take_lftp_status_poll_correlation = MagicMock(
+                return_value="lftp-poll:0123456789abcdef",
+            )
+            status = LftpJobStatus(
+                1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "root", "",
+            )
+            status.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 11, 7)
+            controller._Controller__lftp.status.return_value = [status]
+            controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+                datetime.now(), [SystemFile("root", 26, False, time_modified=datetime.now())],
+            )
+            if change_lifecycle_epoch:
+                original_publish = live_model.publish_active_lftp_root_counters
+
+                def publish_and_change_epoch(*args, **kwargs):
+                    controller._Controller__progress_publication_epoch = 2
+                    return original_publish(*args, **kwargs)
+
+                live_model.publish_active_lftp_root_counters = publish_and_change_epoch
+
+            ModelUpdater(controller).update()
+            span = trace.snapshot()["progress_lineage"]["spans"][0]
+            direct = next(
+                step for step in span["steps"]
+                if step["phase"] == "direct_root_counter_publish"
+            )
+            return direct
+
+        accepted = run_publish(change_lifecycle_epoch=False)
+        rejected = run_publish(change_lifecycle_epoch=True)
+        self.assertEqual("accepted", accepted["details"]["outcome"])
+        self.assertEqual("lifecycle_epoch", rejected["details"]["outcome"])
+        for step in (accepted, rejected):
+            self.assertIn(step["details"]["lock_wait_duration_bucket"], {
+                "0-4", "5-19", "20-99", "100-499", "500-1999", "2000+",
+            })
+            self.assertIn(step["details"]["publish_duration_bucket"], {
+                "0-4", "5-19", "20-99", "100-499", "500-1999", "2000+",
+            })
+            self.assertNotIn("root", str(step["details"]))
+
+    def test_direct_root_counter_rejected_status_snapshots_leave_builder_dirty(self):
+        for snapshot in ([], [
+                LftpJobStatus(1, LftpJobStatus.Type.GET, LftpJobStatus.State.QUEUED, "root", ""),
+        ], [
+                LftpJobStatus(1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "root", ""),
+                LftpJobStatus(2, LftpJobStatus.Type.GET, LftpJobStatus.State.QUEUED, "other", ""),
+        ]):
+            with self.subTest(status_count=len(snapshot)):
+                builder = ModelBuilder()
+                builder.set_remote_files([SystemFile("root", 100, False)])
+                initial = LftpJobStatus(1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "root", "")
+                initial.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+                builder.set_lftp_statuses([initial])
+                builder.set_active_files([SystemFile("root", 25, False)])
+                model = builder.build_model()
+                controller, _ = self._make_progressive_update_controller(
+                    None, local_scan=None, model_builder=builder, model=model,
+                )
+                original_adopt = builder.adopt_active_progress_overlays
+                builder.adopt_active_progress_overlays = MagicMock(wraps=original_adopt)
+                for status in snapshot:
+                    if status.state == LftpJobStatus.State.RUNNING:
+                        status.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 11, 7)
+                controller._Controller__lftp.status.return_value = snapshot
+
+                ModelUpdater(controller).update()
+
+                builder.adopt_active_progress_overlays.assert_not_called()
+
     def test_same_tick_active_scan_progress_uses_projection_without_tree_build(self):
         builder = ModelBuilder()
         builder.set_remote_files([SystemFile("root", 100, False)])
-        initial = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "")
+        initial = LftpJobStatus(1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "root", "")
         initial.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
         builder.set_lftp_statuses([initial])
         builder.set_active_files([SystemFile("root", 25, False)])
@@ -6416,9 +6549,11 @@ class TestModelUpdater(unittest.TestCase):
         controller, _ = self._make_progressive_update_controller(
             None, local_scan=None, model_builder=builder, model=live_model,
         )
-        active_scan = ScannerResult(datetime.now(), [SystemFile("root", 26, False)])
+        active_scan = ScannerResult(
+            datetime.now(), [SystemFile("root", 26, False, time_modified=datetime.now())],
+        )
         controller._Controller__active_scan_process.pop_latest_result.return_value = active_scan
-        progressed = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "")
+        progressed = LftpJobStatus(1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "root", "")
         progressed.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 11, 7)
         controller._Controller__lftp.status.return_value = [progressed]
         original_build = builder.build_model

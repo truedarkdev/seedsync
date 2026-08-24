@@ -748,6 +748,24 @@ class TestModelBuilder(unittest.TestCase):
         self.assertTrue(self.model_builder.has_changes())
         self.assertIsNone(self.model_builder.build_active_progress_overlays(live_model.get_file_ids()))
 
+    def test_active_progress_overlay_rejects_mixed_pending_active_root(self):
+        self.model_builder.set_remote_files([
+            SystemFile("active.bin", 100, False), SystemFile("unrelated.bin", 100, False),
+        ])
+        initial = LftpJobStatus(1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        initial.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        self.model_builder.set_lftp_statuses([initial])
+        self.model_builder.set_active_files([SystemFile("active.bin", 25, False)])
+        live_model = self.model_builder.build_model()
+        progressed = LftpJobStatus(1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        progressed.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 11, 7)
+        self.model_builder.set_lftp_statuses([progressed])
+        self.model_builder.set_active_files([
+            SystemFile("active.bin", 26, False), SystemFile("unrelated.bin", 1, False),
+        ])
+
+        self.assertIsNone(self.model_builder.build_active_progress_overlays(live_model.get_file_ids()))
+
     def test_active_progress_overlay_rejects_display_union_projection(self):
         remote = SystemFile("active.bin", 100, False)
         self.model_builder.set_remote_files([remote])

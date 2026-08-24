@@ -455,12 +455,14 @@ class BreadcrumbTraceCollector:
         "status_submit", "status_start", "status_finish", "status_consume",
         "pre_active_delta", "active_delta_selector", "active_delta_builder",
         "active_delta_authorization", "active_delta_adoption", "updater_decision",
-        "active_progress_overlay_admission", "model_mutation", "scoped_stream_emit",
+        "active_progress_overlay_admission", "direct_root_counter_publish",
+        "model_mutation", "scoped_stream_emit",
     })
     __PROGRESS_LINEAGE_DETAIL_KEYS = frozenset({
         "outcome", "source", "fresh", "healthy", "status_count_bucket",
         "active_count_bucket", "queue_age_bucket", "lock_wait_bucket",
-        "duration_bucket", "decision", "build_kind", "model_version",
+        "lock_wait_duration_bucket", "publish_duration_bucket", "duration_bucket",
+        "decision", "build_kind", "model_version",
         "scope_version", "model_version_first", "model_version_last",
         "mutation_count_bucket", "scoped_stream_count_bucket",
         "selected_pair_duration_bucket", "global_copy_duration_bucket",
@@ -468,7 +470,14 @@ class BreadcrumbTraceCollector:
         "controller_cycle_duration_bucket", "overlay_admission",
     })
     __PROGRESS_LINEAGE_ENUMS = {
-        "outcome": frozenset({"ok", "exception", "mutated", "unchanged"}),
+        "outcome": frozenset({
+            "ok", "exception", "mutated", "unchanged", "accepted", "poll_gate",
+            "unavailable", "job_identity", "lifecycle_epoch", "root_authority",
+            "counter_shape", "scan_topology", "scan_lifecycle", "invalidation_scan", "invalidation_lifecycle",
+            "invalidation_overlay", "invalidation_authority", "invalidation_unknown",
+            "invalidation_mixed", "invalidation_scope", "roots", "unknown_root",
+            "global_safety", "status_shape",
+        }),
         "overlay_admission": frozenset({
             "poll_gate", "unavailable", "invalidation_scope", "roots",
             "unknown_root", "global_safety", "status_shape", "accepted", "exception",
@@ -484,7 +493,9 @@ class BreadcrumbTraceCollector:
         "active_count_bucket": frozenset({"0", "1", "2-4", "5+"}),
         "queue_age_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
         "lock_wait_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
+        "lock_wait_duration_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
         "duration_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
+        "publish_duration_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
         "decision": frozenset({"full_build", "active_delta", "cached"}),
         "build_kind": frozenset({"candidate", "full", "none"}),
         "selected_pair_duration_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),

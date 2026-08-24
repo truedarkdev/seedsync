@@ -452,6 +452,67 @@ class TestRootProgressTrace(unittest.TestCase):
         self.assertEqual([], trace.snapshot()["progress_lineage"]["spans"])
         self.assertNotIn(correlation, str(health))
 
+    def test_direct_root_counter_publish_lineage_is_allowlisted_and_bounded(self):
+        trace = self._trace()
+        correlation = "lftp-poll:0123456789abcdef"
+
+        self.assertTrue(trace.record_progress_lineage(
+            correlation, "direct_root_counter_publish", {
+                "outcome": "accepted",
+                "lock_wait_duration_bucket": "0-4",
+                "publish_duration_bucket": "5-19",
+                "file_name": "private-name.mkv",
+                "raw_counter": "/private/path",
+            },
+        ))
+        self.assertTrue(trace.record_progress_lineage(
+            correlation, "direct_root_counter_publish", {
+                "outcome": "root_authority",
+                "lock_wait_duration_bucket": "20-99",
+                "publish_duration_bucket": "100-499",
+                "error": "private rejection detail",
+            },
+        ))
+        steps = trace.snapshot()["progress_lineage"]["spans"][0]["steps"]
+        self.assertEqual(
+            ["direct_root_counter_publish", "direct_root_counter_publish"],
+            [step["phase"] for step in steps],
+        )
+        self.assertEqual(
+            {
+                "outcome": "accepted",
+                "lock_wait_duration_bucket": "0-4",
+                "publish_duration_bucket": "5-19",
+            },
+            steps[0]["details"],
+        )
+        self.assertEqual(
+            {
+                "outcome": "root_authority",
+                "lock_wait_duration_bucket": "20-99",
+                "publish_duration_bucket": "100-499",
+            },
+            steps[1]["details"],
+        )
+        self.assertNotIn("private-name.mkv", str(steps))
+        self.assertNotIn("/private/path", str(steps))
+
+        bounded_trace = self._trace()
+        bounded_correlation = "lftp-poll:fedcba9876543210"
+        for index in range(13):
+            self.assertTrue(bounded_trace.record_progress_lineage(
+                bounded_correlation,
+                "direct_root_counter_publish",
+                {"outcome": "accepted", "publish_duration_bucket": "0-4"},
+            ))
+        bounded_span = bounded_trace.snapshot()["progress_lineage"]["spans"][0]
+        self.assertEqual(bounded_correlation, bounded_span["correlation"])
+        self.assertEqual(12, len(bounded_span["steps"]))
+        self.assertTrue(all(
+            step["phase"] == "direct_root_counter_publish"
+            for step in bounded_span["steps"]
+        ))
+
     def test_active_delta_lineage_phase_order_and_unreached_tails_are_bounded(self):
         trace = self._trace()
         correlation = "lftp-poll:0123456789abcdef"

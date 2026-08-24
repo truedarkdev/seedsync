@@ -875,6 +875,7 @@ class Controller:
         self.__lftp_failed_operation_sequences: set[tuple[str, int]] = set()
         self.__lftp_status_future: Optional[Future[object]] = None
         self.__lftp_status_future_correlation: Optional[str] = None
+        self.__lftp_status_future_publication_epoch: Optional[int] = None
 
     def __init__(self,
                  context: Context,
@@ -919,6 +920,7 @@ class Controller:
         # Lock for the model. Listeners may re-enter controller model access
         # while the model updater is mutating the model, so this must be reentrant.
         self.__model_lock = RLock()
+        self.__progress_publication_epoch = 0
         # Immutable root identity snapshot for command resolution.  Readers
         # return this tuple without taking the model lock; the model updater
         # replaces it atomically after each authoritative publication.
@@ -1653,16 +1655,28 @@ class Controller:
                     if callable(record_lineage):
                         record_lineage(correlation, "status_finish", {"outcome": "exception"})
                     raise
+            with self.__model_lock:
+                submission_epoch = getattr(self, "_Controller__progress_publication_epoch", 0)
             if not self.__submit_lftp_operation("status", poll):
                 self.__lftp_status_poll_correlation = None
                 return None
             self.__lftp_status_future_correlation = correlation if isinstance(correlation, str) else None
+            self.__lftp_status_future_publication_epoch = submission_epoch
             return None
         if not future.done():
             return None
         self.__lftp_status_future = None
         completed_correlation = getattr(self, "_Controller__lftp_status_future_correlation", None)
         self.__lftp_status_future_correlation = None
+        submitted_epoch = self.__lftp_status_future_publication_epoch
+        self.__lftp_status_future_publication_epoch = None
+        with self.__model_lock:
+            if submitted_epoch is None:
+                submitted_epoch = getattr(self, "_Controller__progress_publication_epoch", 0)
+            epoch_matches = submitted_epoch == getattr(self, "_Controller__progress_publication_epoch", 0)
+        if not epoch_matches:
+            self.__lftp_status_poll_correlation = None
+            return None
         if completed_correlation != getattr(self, "_Controller__lftp_status_poll_correlation", None):
             # The reference may have been retired by Queue/reconfigure. The
             # snapshot remains useful, but it must not consume a newer token.
@@ -2268,6 +2282,12 @@ class Controller:
         )
 
     def __advance_transfer_lifecycle(self, file_id: str) -> None:
+        # A lifecycle transition revokes every transient counter immediately;
+        # the model diff remains the authoritative backstop for all roots.
+        with self.__model_lock:
+            self.__model.clear_active_progress_overlays()
+            self.__progress_publication_epoch = getattr(self, "_Controller__progress_publication_epoch", 0) + 1
+            self.__retire_lftp_status_future_locked()
         if not hasattr(self, "_Controller__transfer_lifecycle_epochs"):
             self.__transfer_lifecycle_epochs = {}
         self.__transfer_lifecycle_epochs[file_id] = self.__transfer_lifecycle_epochs.get(file_id, 0) + 1
@@ -2290,6 +2310,16 @@ class Controller:
             if belongs(child_id):
                 counts.pop(child_id, None)
                 due.pop(child_id, None)
+
+    def __retire_lftp_status_future_locked(self) -> None:
+        """Invalidate the one in-flight status snapshot at a fence boundary."""
+        future = getattr(self, "_Controller__lftp_status_future", None)
+        if future is not None:
+            future.cancel()
+        self.__lftp_status_future = None
+        self.__lftp_status_future_correlation = None
+        self.__lftp_status_future_publication_epoch = None
+        self.__lftp_status_poll_correlation = None
 
     def _record_path_pair_reconciliation(
             self,
@@ -2556,6 +2586,10 @@ class Controller:
             raise ControllerError(self.__path_pair_runtime_error)
 
     def request_lftp_reconfigure(self):
+        with self.__model_lock:
+            self.__model.clear_active_progress_overlays()
+            self.__progress_publication_epoch = getattr(self, "_Controller__progress_publication_epoch", 0) + 1
+            self.__retire_lftp_status_future_locked()
         with self.__lftp_reconfigure_lock:
             self.__lftp_reconfigure_requested = True
         self.__lftp_status_poll_correlation = None
@@ -2738,6 +2772,10 @@ class Controller:
             updater.sync_persist_to_all_builders()
 
     def __apply_path_pair_refresh(self):
+        with self.__model_lock:
+            self.__model.clear_active_progress_overlays()
+            self.__progress_publication_epoch = getattr(self, "_Controller__progress_publication_epoch", 0) + 1
+            self.__retire_lftp_status_future_locked()
         if not self.__cancel_and_settle_collision_claim_for_refresh():
             raise ControllerError("Path-pair refresh deferred until collision comparison claim is restored")
         for file_id in list(self.__deferred_queue_intents_map()):
@@ -3107,6 +3145,10 @@ class Controller:
 
     def exit(self):
         self.logger.debug("Exiting controller")
+        with self.__model_lock:
+            self.__model.clear_active_progress_overlays()
+            self.__progress_publication_epoch = getattr(self, "_Controller__progress_publication_epoch", 0) + 1
+            self.__retire_lftp_status_future_locked()
         self.__shutdown_collision_compare_worker()
         if self.__started or getattr(self, "_Controller__startup_failed", False):
             try:
@@ -9480,6 +9522,7 @@ class Controller:
                         )
                     # Force the next model refresh to observe the post-stop lftp state
                     # instead of reusing the pre-stop running snapshot for one more cycle.
+                    self.__advance_transfer_lifecycle(file.file_id)
                     self.__next_lftp_status_poll_at = None
                     self.__lftp_idle_status_authoritative = False
                     self.__record_command_breadcrumb(

@@ -85,6 +85,9 @@ class Model:
         # Authoritative scans own ModelFile topology and lifecycle state.  This
         # copy-on-write map owns only fresh LFTP presentation values.
         self.__active_progress_overlays: Dict[str, ActiveProgressOverlay] = {}
+        # Kept with the live-only values so a later status can never be
+        # mistaken for a continuation of a cleared LFTP job.
+        self.__active_progress_overlay_job_identities: Dict[str, tuple[int, str]] = {}
 
     @property
     def version(self) -> int:
@@ -233,6 +236,7 @@ class Model:
         """Discard live-only values and publish each affected root's base state."""
         removed_file_ids = set(self.__active_progress_overlays)
         self.__active_progress_overlays = {}
+        self.__active_progress_overlay_job_identities = {}
         for file_id in sorted(removed_file_ids):
             file = self.__files_by_id.get(file_id)
             if file is None:
@@ -259,11 +263,65 @@ class Model:
             self.__active_progress_overlays.get(file_id) != normalized.get(file_id)
         }
         self.__active_progress_overlays = normalized
+        self.__active_progress_overlay_job_identities = {}
         for file_id in sorted(changed):
             file = self.__files_by_id[file_id]
             global_version, scope_version = self.__advance_version(file)
             self.__notify_versioned_change(file, global_version, scope_version)
         return changed
+
+    def publish_active_lftp_root_counters(
+            self, overlays: Dict[str, ActiveProgressOverlay],
+            job_identities: Dict[str, tuple[int, str]],
+            lifecycle_epoch_matches: Callable[[str], bool],
+    ) -> tuple[set[str], str]:
+        """Publish fresh LFTP counters only onto already-authoritative roots.
+
+        This is intentionally narrower than general overlay replacement.  It
+        cannot establish download state, actions, topology, or display-union
+        values; a failed admission clears the projection and leaves those
+        concerns to the normal model reconciliation path.
+        """
+        normalized: dict[str, ActiveProgressOverlay] = {}
+        normalized_identities: dict[str, tuple[int, str]] = {}
+        for file_id, overlay in overlays.items():
+            identity = job_identities.get(file_id)
+            file = self.__files_by_id.get(file_id)
+            if not isinstance(file_id, str) or not isinstance(overlay, ActiveProgressOverlay) or \
+                    not isinstance(identity, tuple) or len(identity) != 2 or \
+                    type(identity[0]) is not int or not isinstance(identity[1], str) or \
+                    identity[0] < 0 or not identity[1] or file is None:
+                self.clear_active_progress_overlays()
+                return set(), "job_identity"
+            if not callable(lifecycle_epoch_matches) or not lifecycle_epoch_matches(file_id):
+                self.clear_active_progress_overlays()
+                return set(), "lifecycle_epoch"
+            previous_identity = self.__active_progress_overlay_job_identities.get(file_id)
+            if previous_identity is not None and previous_identity != identity:
+                return set(), "job_identity"
+            if file.state != ModelFile.State.DOWNLOADING or not file.is_stoppable or \
+                    file.explicitly_stopped or file.display_size_total is not None or \
+                    file.display_transferred_size is not None:
+                self.clear_active_progress_overlays()
+                return set(), "root_authority"
+            normalized[file_id] = overlay
+            normalized_identities[file_id] = identity
+
+        changed_root_ids = set(self.__active_progress_overlays).union(normalized)
+        changed = {
+            file_id for file_id in changed_root_ids
+            if self.__active_progress_overlays.get(file_id) != normalized.get(file_id) or
+            self.__active_progress_overlay_job_identities.get(file_id) != normalized_identities.get(file_id)
+        }
+        self.__active_progress_overlays = normalized
+        self.__active_progress_overlay_job_identities = normalized_identities
+        for file_id in sorted(changed):
+            file = self.__files_by_id.get(file_id)
+            if file is None:
+                continue
+            global_version, scope_version = self.__advance_version(file)
+            self.__notify_versioned_change(file, global_version, scope_version)
+        return changed, "accepted"
 
     def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("Model")

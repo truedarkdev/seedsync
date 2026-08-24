@@ -150,6 +150,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp_status_poll_retry_seconds = 1
         self.controller._Controller__lftp_status_cache_expires_at = None
         self.controller._Controller__lftp_status_cache_max_age_seconds = 3
+        self.controller._Controller__lftp_status_future_correlation = None
+        self.controller._Controller__lftp_status_future_publication_epoch = None
         self.controller._Controller__startup_recovery_done = False
         self.controller._Controller__memory_monitor = MagicMock()
         self.controller._Controller__started = False
@@ -566,6 +568,168 @@ class TestController(unittest.TestCase):
         self.assertEqual(1, self.controller._Controller__lftp.status.call_count)
         self.assertEqual(0, stale_status.result_calls)
         self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+    def _assert_async_lftp_status_fence(self, transition):
+        """A fenced status result cannot cross a controller lifecycle boundary."""
+        class TrackingFuture(Future):
+            def __init__(self):
+                super().__init__()
+                self.result_calls = 0
+
+            def result(self, timeout=None):
+                self.result_calls += 1
+                return super().result(timeout)
+
+        class DeferredExecutor:
+            def __init__(self):
+                self.submissions = []
+
+            def submit(self, operation):
+                future = TrackingFuture()
+                self.submissions.append((operation, future))
+                return future
+
+            def run_next(self):
+                operation, future = self.submissions.pop(0)
+                try:
+                    future.set_result(operation())
+                except BaseException as error:
+                    future.set_exception(error)
+                return future
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        stale = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "stale.bin", "",
+        )
+        fresh = LftpJobStatus(
+            2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "fresh.bin", "",
+        )
+        executor = DeferredExecutor()
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__lftp.status.side_effect = [[stale], [fresh]]
+        self.controller._Controller__lftp_executor = executor
+        self.addCleanup(executor.shutdown)
+
+        # Submit the old poll, then make it look like a running worker so a
+        # lifecycle fence cannot cancel the future itself before it completes.
+        self.assertIsNone(self.controller._get_lftp_status_snapshot())
+        self.assertEqual(1, len(executor.submissions))
+        stale_future = executor.submissions[0][1]
+        self.assertTrue(stale_future.set_running_or_notify_cancel())
+
+        transition()
+        # Complete the old worker after the transition.  Its result is now
+        # done, but the controller no longer retains the future reference.
+        executor.run_next()
+
+        # The completed pre-transition result is no longer visible to the
+        # accessor used by ModelUpdater; it must submit a post-transition poll.
+        self.assertIsNone(self.controller._get_lftp_status_snapshot())
+        self.assertEqual(1, len(executor.submissions))
+        self.assertEqual(0, stale_future.result_calls)
+
+        fresh_future = executor.submissions[0][1]
+        self.assertTrue(fresh_future.set_running_or_notify_cancel())
+        self.assertIsNone(self.controller._get_lftp_status_snapshot())
+        executor.run_next()
+        self.assertEqual(([fresh], True), self.controller._get_lftp_status_snapshot())
+
+    def test_async_lftp_status_reconfigure_fence_drops_completed_pre_transition_result(self):
+        self._assert_async_lftp_status_fence(self.controller.request_lftp_reconfigure)
+
+    def test_async_lftp_status_path_pair_refresh_fence_drops_completed_pre_transition_result(self):
+        self.controller._Controller__started = False
+        self.controller._Controller__cancel_and_settle_collision_claim_for_refresh = MagicMock(
+            return_value=True,
+        )
+        self.controller._Controller__refresh_path_pair_runtime_state = MagicMock()
+        self.controller._Controller__clear_path_pair_runtime_error = MagicMock()
+
+        self._assert_async_lftp_status_fence(
+            lambda: self.controller._Controller__apply_path_pair_refresh()
+        )
+
+    def test_async_lftp_status_shutdown_fence_drops_completed_pre_transition_result(self):
+        self.controller._Controller__started = False
+        self._assert_async_lftp_status_fence(self.controller.exit)
+
+    def test_async_stop_discards_pre_stop_status_before_fresh_post_stop_poll(self):
+        class TrackingFuture(Future):
+            def __init__(self):
+                super().__init__()
+                self.result_calls = 0
+
+            def result(self, timeout=None):
+                self.result_calls += 1
+                return super().result(timeout)
+
+        class DeferredExecutor:
+            def __init__(self):
+                self.submissions = []
+
+            def submit(self, operation):
+                future = TrackingFuture()
+                self.submissions.append((operation, future))
+                return future
+
+            def run_next(self):
+                operation, future = self.submissions.pop(0)
+                try:
+                    future.set_result(operation())
+                except BaseException as error:
+                    future.set_exception(error)
+                return future
+
+            def shutdown(self, **_kwargs):
+                pass
+
+        file = ModelFile("stop-me.mkv", False)
+        file.remote_size = 100
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        model.add_file(file)
+        self.controller._Controller__model = model
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__lftp.kill.return_value = True
+        stale = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file.name, "",
+        )
+        executor = DeferredExecutor()
+        self.controller._Controller__lftp.status.side_effect = [[stale], []]
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__lftp_executor = executor
+        self.addCleanup(executor.shutdown)
+
+        self.assertIsNone(self.controller._get_lftp_status_snapshot())
+        stale_future = executor.submissions[0][1]
+        self.assertTrue(stale_future.set_running_or_notify_cancel())
+
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.STOP, file.file_id)
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        callback.on_success.assert_called_once_with()
+        self.assertIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
+        self.assertIsNone(self.controller._Controller__lftp_status_future)
+
+        # Let the old worker finish after Stop acceptance; its result must not
+        # be consumed by the next model-updater status read.
+        executor.run_next()
+        self.assertEqual(0, stale_future.result_calls)
+        self.assertIsNone(self.controller._get_lftp_status_snapshot())
+
+        # The accepted Stop operation is queued ahead of the replacement poll.
+        executor.run_next()
+        self.assertIsNone(self.controller._get_lftp_status_snapshot())
+        executor.run_next()
+        self.assertEqual(([], True), self.controller._get_lftp_status_snapshot())
 
     def test_async_lftp_status_future_failure_becomes_bounded_unhealthy_snapshot(self):
         self.controller._Controller__lftp.backend_name = "lftp"

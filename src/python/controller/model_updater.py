@@ -62,7 +62,7 @@ from lftp import (
     Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError,
     LFTP_STATUS_POLL_FAILURE_REASONS,
 )
-from model import Model, ModelDiff, ModelDiffUtil, ModelError, ModelFile
+from model import ActiveProgressOverlay, Model, ModelDiff, ModelDiffUtil, ModelError, ModelFile
 from system import SystemFile
 from transfer import RcloneTransferBackend
 
@@ -3704,6 +3704,12 @@ class ModelUpdater(_ControllerCoreAccess):
         lftp_status_poll_error: Optional[BaseException] = None
         lftp_status_poll_correlation: Optional[str] = None
         lftp_status_snapshot_completed = False
+        # Fence a status request at submission time.  A Queue/Stop/reconfigure
+        # can complete while an async owner is still obtaining this snapshot.
+        with controller._Controller__model_lock:
+            lftp_status_publication_epoch = getattr(
+                controller, "_Controller__progress_publication_epoch", 0,
+            )
         poll_decision_diagnostics: dict[str, object] = {}
         recovering_from_unhealthy_poll = False
         now = datetime.now()
@@ -4857,52 +4863,93 @@ class ModelUpdater(_ControllerCoreAccess):
         # ancestor values; the Model atomically replaces immutable overlay
         # values and wakes scoped listeners without touching legacy streams.
         active_progress_overlay_applied = False
-        overlay_builder = getattr(model_builder, "build_active_progress_overlays", None)
         overlay_adopter = getattr(model_builder, "adopt_active_progress_overlays", None)
-        overlay_outcome_reader = getattr(model_builder, "active_progress_overlay_admission_outcome", None)
         overlay_admission_outcome = "poll_gate"
+        direct_publish_timing: dict[str, object] = {}
         if lftp_status_poll_healthy and lftp_status_snapshot_fresh and \
-                lftp_status_source == "fresh_healthy" and callable(overlay_builder) and \
-                callable(overlay_adopter):
+                lftp_status_source == "fresh_healthy" and callable(overlay_adopter):
             try:
+                overlay_lock_started_ns = time.monotonic_ns()
                 with controller._Controller__model_lock:
-                    overlay_values = overlay_builder(
-                        lambda file_id: file_id in model.get_file_ids(),
-                        lambda file_id: (
-                            model.get_file(file_id).display_size_total is None and
-                            model.get_file(file_id).display_transferred_size is None
-                        ),
+                    direct_publish_timing["lock_wait_duration_bucket"] = _progress_lineage_duration_bucket(
+                        (time.monotonic_ns() - overlay_lock_started_ns) // 1_000_000,
                     )
-                    if callable(overlay_outcome_reader):
-                        reported_outcome = overlay_outcome_reader()
-                        if isinstance(reported_outcome, str):
-                            overlay_admission_outcome = reported_outcome
-                    if isinstance(overlay_values, dict):
-                        changed = model.replace_active_progress_overlays(
-                            overlay_values, set(model.active_progress_overlays_snapshot()).union(overlay_values),
+                    direct_overlays: dict[str, ActiveProgressOverlay] = {}
+                    job_identities: dict[str, tuple[int, str]] = {}
+                    direct_publish_started_ns = time.monotonic_ns()
+                    direct_outcome = "status_shape"
+                    overlay_builder = getattr(model_builder, "build_active_progress_overlays", None)
+                    if lftp_statuses and all(status.state == LftpJobStatus.State.RUNNING for status in lftp_statuses) and \
+                            callable(overlay_builder):
+                        overlay_values = overlay_builder(
+                            lambda file_id: file_id in model.get_file_ids(),
+                            lambda file_id: model.get_file(file_id).display_size_total is None and
+                            model.get_file(file_id).display_transferred_size is None,
                         )
-                        overlay_adopter(model)
+                        outcome_reader = getattr(model_builder, "active_progress_overlay_admission_outcome", None)
+                        direct_outcome = outcome_reader() if callable(outcome_reader) else "status_shape"
+                        if isinstance(overlay_values, dict) and direct_outcome == "accepted":
+                            direct_overlays = overlay_values
+                        else:
+                            direct_overlays = {}
+                    if direct_outcome == "accepted":
+                        for status in lftp_statuses:
+                            if status.state != LftpJobStatus.State.RUNNING:
+                                continue
+                            state = status.total_transfer_state
+                            if type(status.id) is not int or status.id < 0 or \
+                                    not isinstance(status.type.value, str) or \
+                                    type(state.size_local) is not int or state.size_local < 0 or \
+                                    (state.percent_local is not None and
+                                     (type(state.percent_local) is not int or not 0 <= state.percent_local <= 100)) or \
+                                    (state.speed is not None and (type(state.speed) is not int or state.speed < 0)) or \
+                                    (state.eta is not None and (type(state.eta) is not int or state.eta < 0)):
+                                direct_outcome = "counter_shape"
+                                break
+                            job_identities[status.file_id] = (status.id, status.type.value)
+                    if direct_outcome != "accepted":
+                        model.clear_active_progress_overlays()
+                        changed = set()
+                    else:
+                        changed, direct_outcome = model.publish_active_lftp_root_counters(
+                            direct_overlays, job_identities,
+                            lambda file_id: getattr(
+                                controller, "_Controller__progress_publication_epoch", 0,
+                            ) == lftp_status_publication_epoch,
+                        )
+                    direct_publish_timing["publish_duration_bucket"] = _progress_lineage_duration_bucket(
+                        (time.monotonic_ns() - direct_publish_started_ns) // 1_000_000,
+                    )
+                    overlay_admission_outcome = direct_outcome
+                    if direct_outcome == "accepted":
                         active_progress_overlay_applied = True
-                        if changed:
-                            refresh_identities = getattr(
-                                controller, "_refresh_model_file_command_identities_locked", None,
-                            )
-                            if callable(refresh_identities):
-                                refresh_identities()
+                        overlay_adopter(model)
+                    if changed:
+                        refresh_identities = getattr(
+                            controller, "_refresh_model_file_command_identities_locked", None,
+                        )
+                        if callable(refresh_identities):
+                            refresh_identities()
             except Exception:
                 # The established active delta remains the fail-closed path.
                 active_progress_overlay_applied = False
                 overlay_admission_outcome = "exception"
-        elif not callable(overlay_builder) or not callable(overlay_adopter):
+        elif not callable(overlay_adopter):
             overlay_admission_outcome = "unavailable"
         if _controller_breadcrumb_effectively_enabled(controller, "model.progress", "debug"):
             _record_progress_lineage(
                 controller, lftp_status_poll_correlation, "active_progress_overlay_admission",
                 {"overlay_admission": overlay_admission_outcome},
             )
+            _record_progress_lineage(
+                controller, lftp_status_poll_correlation, "direct_root_counter_publish",
+                {"outcome": overlay_admission_outcome, **direct_publish_timing},
+            )
         active_transfer_delta_applied = False
         active_transfer_delta_adopted = False
-        active_transfer_delta_rejected = False
+        active_transfer_delta_rejected = overlay_admission_outcome in {"lifecycle_epoch", "job_identity"} or \
+            not (lftp_status_poll_healthy and lftp_status_snapshot_fresh and
+                 lftp_status_source == "fresh_healthy")
         active_delta_selection_rejected = False
         active_delta_selector = getattr(model_builder, "active_transfer_delta_file_ids", None)
         active_delta_pending = getattr(model_builder, "has_pending_active_transfer_delta", None)
@@ -4911,7 +4958,7 @@ class ModelUpdater(_ControllerCoreAccess):
         active_delta_adopter = getattr(model_builder, "adopt_active_transfer_delta", None)
         active_delta_file_ids: Optional[set[str]] = None
         selector_rejection_diagnostics: object = {}
-        if not active_progress_overlay_applied and authoritative_pair_candidate is None and callable(active_delta_pending) and bool(active_delta_pending()) and \
+        if not active_progress_overlay_applied and not active_transfer_delta_rejected and authoritative_pair_candidate is None and callable(active_delta_pending) and bool(active_delta_pending()) and \
                 callable(active_delta_selector) and callable(active_delta_builder) and \
                 callable(active_delta_authorizer) and callable(active_delta_adopter):
             try:
@@ -5084,9 +5131,11 @@ class ModelUpdater(_ControllerCoreAccess):
                     pass
 
         candidate_lifecycle_triggered = authoritative_pair_candidate is not None
+        defer_nonfresh_active_only_inputs = active_transfer_delta_rejected and callable(active_delta_pending) and \
+            bool(active_delta_pending())
         full_build_triggered = candidate_lifecycle_triggered or (
             model_builder.has_changes() and (not progressive_delta_eligible or active_transfer_delta_rejected) and \
-            not authoritative_pair_delta_applied
+            not authoritative_pair_delta_applied and not defer_nonfresh_active_only_inputs
         )
         completion_trace_enabled = self._completion_gate_trace_enabled()
         if not full_build_triggered and completion_trace_enabled:

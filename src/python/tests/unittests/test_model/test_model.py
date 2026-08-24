@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import MagicMock, call
 
 from common import BreadcrumbTraceCollector, overrides
-from model import Model, ModelFile, IModelListener, ModelError
+from model import ActiveProgressOverlay, Model, ModelFile, IModelListener, ModelError
 
 
 class DummyModelListener(IModelListener):
@@ -24,6 +24,60 @@ class DummyModelListener(IModelListener):
 
 
 class TestLftpModel(unittest.TestCase):
+    def test_lftp_root_counter_publish_rejects_stale_lifecycle_and_clears_projection(self):
+        file = ModelFile("active", False)
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        self.model.add_file(file)
+        overlay = ActiveProgressOverlay(25, 25, 10, 8)
+        changed, outcome = self.model.publish_active_lftp_root_counters(
+            {file.file_id: overlay}, {file.file_id: (1, "get")}, lambda _: True,
+        )
+        self.assertEqual(({file.file_id}, "accepted"), (changed, outcome))
+        changed, outcome = self.model.publish_active_lftp_root_counters(
+            {file.file_id: overlay}, {file.file_id: (1, "get")}, lambda _: False,
+        )
+        self.assertEqual((set(), "lifecycle_epoch"), (changed, outcome))
+        self.assertIsNone(self.model.active_progress_overlay(file.file_id))
+
+    def test_lftp_root_counter_publish_preserves_lifecycle_state_and_rejects_display_union(self):
+        file = ModelFile("active", False)
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        self.model.add_file(file)
+        changed, outcome = self.model.publish_active_lftp_root_counters(
+            {file.file_id: ActiveProgressOverlay(25, 25, 10, 8)},
+            {file.file_id: (1, "get")}, lambda _: True,
+        )
+        self.assertEqual(({file.file_id}, "accepted"), (changed, outcome))
+        self.assertEqual(ModelFile.State.DOWNLOADING, self.model.get_file(file.file_id).state)
+        file.display_size_total = 100
+        changed, outcome = self.model.publish_active_lftp_root_counters(
+            {file.file_id: ActiveProgressOverlay(26, 26, 10, 8)},
+            {file.file_id: (1, "get")}, lambda _: True,
+        )
+        self.assertEqual((set(), "root_authority"), (changed, outcome))
+        self.assertIsNone(self.model.active_progress_overlay(file.file_id))
+
+    def test_lftp_root_counter_publish_rejects_late_old_job_after_new_job(self):
+        file = ModelFile("active", False)
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        self.model.add_file(file)
+        first = ActiveProgressOverlay(25, 25, 10, 8)
+        second = ActiveProgressOverlay(50, 50, 11, 7)
+        self.assertEqual(( {file.file_id}, "accepted"), self.model.publish_active_lftp_root_counters(
+            {file.file_id: first}, {file.file_id: (1, "get")}, lambda _: True,
+        ))
+        self.model.clear_active_progress_overlays()
+        self.assertEqual(({file.file_id}, "accepted"), self.model.publish_active_lftp_root_counters(
+            {file.file_id: second}, {file.file_id: (2, "get")}, lambda _: True,
+        ))
+        self.assertEqual((set(), "job_identity"), self.model.publish_active_lftp_root_counters(
+            {file.file_id: first}, {file.file_id: (1, "get")}, lambda _: True,
+        ))
+        self.assertEqual(second, self.model.active_progress_overlay(file.file_id))
+
     def test_version_callbacks_keep_captured_versions_across_reentrant_listener_mutation(self):
         first = ModelFile("first", False)
         second = ModelFile("second", False)

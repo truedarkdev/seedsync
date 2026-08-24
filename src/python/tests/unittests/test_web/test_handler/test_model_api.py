@@ -1057,9 +1057,11 @@ class TestModelApi(unittest.TestCase):
         file.state = ModelFile.State.DOWNLOADING
         file.is_stoppable = True
         self.model.add_file(file)
-        self.model.replace_active_progress_overlays(
-            {file.file_id: ActiveProgressOverlay(25, 25, 10, 8)}, {file.file_id},
+        changed, outcome = self.model.publish_active_lftp_root_counters(
+            {file.file_id: ActiveProgressOverlay(25, 25, 10, 8)},
+            {file.file_id: (1, "get")}, lambda _: True,
         )
+        self.assertEqual(({file.file_id}, "accepted"), (changed, outcome))
 
         page = self.client.get("/server/model/v1/pairs/pair-a/roots").json
 
