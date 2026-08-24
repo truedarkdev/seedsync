@@ -660,18 +660,8 @@ class TestModelBuilder(unittest.TestCase):
         status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
         self.model_builder.set_lftp_statuses([status])
 
-        overlays = self.model_builder.build_active_progress_overlays(live_model.get_file_ids())
-
-        self.assertIsNotNone(overlays)
-        assert overlays is not None
-        self.assertEqual(25, overlays["active.bin"].download_progress)
-        self.assertEqual(25, overlays["active.bin"].transferred_size)
-        self.assertEqual(10, overlays["active.bin"].downloading_speed)
-        self.assertTrue(live_model.replace_active_progress_overlays(overlays, set(overlays)))
-        self.assertEqual(25, live_model.active_progress_overlay("active.bin").transferred_size)
-        self.assertIsNone(live_model.get_file("active.bin").transferred_size)
-        self.model_builder.adopt_active_progress_overlays(live_model)
-        self.assertFalse(self.model_builder.has_changes())
+        self.assertIsNone(self.model_builder.build_active_progress_overlays(live_model.get_file_ids()))
+        self.assertEqual("invalidation_scope", self.model_builder.active_progress_overlay_admission_outcome())
 
     def test_active_progress_overlay_rejects_status_retirement_and_active_scan_input(self):
         active = SystemFile("active.bin", 100, False)
@@ -718,7 +708,63 @@ class TestModelBuilder(unittest.TestCase):
         )
         queued_builder.set_lftp_statuses([queued])
         self.assertIsNone(queued_builder.build_active_progress_overlays(queued_model.get_file_ids()))
-        self.assertEqual("status_shape", queued_builder.active_progress_overlay_admission_outcome())
+        self.assertEqual("invalidation_scope", queued_builder.active_progress_overlay_admission_outcome())
+
+    def test_active_progress_overlay_accepts_same_tick_root_counter_scan_change(self):
+        remote = SystemFile("active.bin", 100, False)
+        self.model_builder.set_remote_files([remote])
+        initial = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        initial.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        self.model_builder.set_lftp_statuses([initial])
+        self.model_builder.set_active_files([SystemFile("active.bin", 25, False)])
+        live_model = self.model_builder.build_model()
+
+        progressed = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        progressed.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 11, 7)
+        self.model_builder.set_lftp_statuses([progressed])
+        self.model_builder.set_active_files([SystemFile("active.bin", 26, False)])
+
+        overlays = self.model_builder.build_active_progress_overlays(live_model.get_file_ids())
+        self.assertIsNotNone(overlays)
+        assert overlays is not None
+        self.assertEqual(26, overlays["active.bin"].transferred_size)
+
+    def test_active_progress_overlay_rejects_same_tick_active_tree_change(self):
+        remote = SystemFile("active", 100, True)
+        self.model_builder.set_remote_files([remote])
+        initial = LftpJobStatus(1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "active", "")
+        initial.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        self.model_builder.set_lftp_statuses([initial])
+        self.model_builder.set_active_files([SystemFile("active", 25, True)])
+        live_model = self.model_builder.build_model()
+
+        progressed = LftpJobStatus(1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "active", "")
+        progressed.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 11, 7)
+        changed_tree = SystemFile("active", 26, True)
+        changed_tree.add_child(SystemFile("new-child", 1, False))
+        self.model_builder.set_lftp_statuses([progressed])
+        self.model_builder.set_active_files([changed_tree])
+
+        self.assertTrue(self.model_builder.has_changes())
+        self.assertIsNone(self.model_builder.build_active_progress_overlays(live_model.get_file_ids()))
+
+    def test_active_progress_overlay_rejects_display_union_projection(self):
+        remote = SystemFile("active.bin", 100, False)
+        self.model_builder.set_remote_files([remote])
+        initial = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        initial.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        self.model_builder.set_lftp_statuses([initial])
+        self.model_builder.set_active_files([SystemFile("active.bin", 25, False)])
+        live_model = self.model_builder.build_model()
+        progressed = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        progressed.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 11, 7)
+        self.model_builder.set_lftp_statuses([progressed])
+        self.model_builder.set_active_files([SystemFile("active.bin", 26, False)])
+
+        self.assertIsNone(self.model_builder.build_active_progress_overlays(
+            live_model.get_file_ids(), lambda _: False,
+        ))
+        self.assertEqual("invalidation_overlay", self.model_builder.active_progress_overlay_admission_outcome())
 
     def test_active_progress_overlay_classifies_non_lftp_invalidation_categories(self):
         cases = (

@@ -4866,16 +4866,20 @@ class ModelUpdater(_ControllerCoreAccess):
                 callable(overlay_adopter):
             try:
                 with controller._Controller__model_lock:
-                    overlay_values = overlay_builder(lambda file_id: file_id in model.get_file_ids())
+                    overlay_values = overlay_builder(
+                        lambda file_id: file_id in model.get_file_ids(),
+                        lambda file_id: (
+                            model.get_file(file_id).display_size_total is None and
+                            model.get_file(file_id).display_transferred_size is None
+                        ),
+                    )
                     if callable(overlay_outcome_reader):
                         reported_outcome = overlay_outcome_reader()
                         if isinstance(reported_outcome, str):
                             overlay_admission_outcome = reported_outcome
                     if isinstance(overlay_values, dict):
-                        merged_overlays = model.active_progress_overlays_snapshot()
-                        merged_overlays.update(overlay_values)
                         changed = model.replace_active_progress_overlays(
-                            merged_overlays, set(overlay_values),
+                            overlay_values, set(model.active_progress_overlays_snapshot()).union(overlay_values),
                         )
                         overlay_adopter(model)
                         active_progress_overlay_applied = True

@@ -230,8 +230,15 @@ class Model:
         return dict(self.__active_progress_overlays)
 
     def clear_active_progress_overlays(self) -> None:
-        """Discard live-only values at an authoritative rebuild boundary."""
+        """Discard live-only values and publish each affected root's base state."""
+        removed_file_ids = set(self.__active_progress_overlays)
         self.__active_progress_overlays = {}
+        for file_id in sorted(removed_file_ids):
+            file = self.__files_by_id.get(file_id)
+            if file is None:
+                continue
+            global_version, scope_version = self.__advance_version(file)
+            self.__notify_versioned_change(file, global_version, scope_version)
 
     def replace_active_progress_overlays(
             self, overlays: Dict[str, ActiveProgressOverlay], changed_root_ids: Set[str],
@@ -298,6 +305,7 @@ class Model:
         :param file:
         :return:
         """
+        self.clear_active_progress_overlays()
         self.logger.debug("LftpModel: Adding file '{}'".format(self.__format_file_for_log(file)))
         file_id = file.file_id
         if file_id in self.__files_by_id:
@@ -330,6 +338,7 @@ class Model:
         :param filename:
         :return:
         """
+        self.clear_active_progress_overlays()
         file_id = self.__resolve_file_id(filename)
         file = self.__files_by_id[file_id]
         self.logger.debug("LftpModel: Removing file '{}'".format(self.__format_file_for_log(file)))
@@ -351,6 +360,7 @@ class Model:
         :param file:
         :return:
         """
+        self.clear_active_progress_overlays()
         self.logger.debug("LftpModel: Updating file '{}'".format(self.__format_file_for_log(file)))
         file_id = file.file_id
         if file_id not in self.__files_by_id:

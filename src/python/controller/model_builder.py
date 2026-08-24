@@ -259,6 +259,10 @@ class ModelBuilder:
         ] = {}
         self.__lftp_touched_root_file_ids: set[str] = set()
         self.__active_touched_root_file_ids: set[str] = set()
+        # A same-tick active scan may advance only the root byte counter while
+        # LFTP remains the authoritative running counter.  Keep that narrow
+        # classification separate from a normal active-scan invalidation.
+        self.__active_progress_equivalent_root_file_ids: set[str] = set()
         self.__lftp_regressed_root_file_ids: set[str] = set()
         self.__source_name_counts: dict[str, int] = {}
         # Global rendering hides local roots that collide by configured local
@@ -3504,12 +3508,55 @@ class ModelBuilder:
                 }
                 for file_id in touched_file_ids:
                     self.__update_active_only_name_count(file_id)
-                self.__invalidate_cache(
-                    MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
-                    touched_active_root_file_ids=touched_file_ids,
-                )
+                if self.__active_files_are_progress_equivalent(
+                        previous_active_files, next_active_files, touched_file_ids,
+                ):
+                    self.__active_progress_equivalent_root_file_ids = set(touched_file_ids)
+                else:
+                    self.__active_progress_equivalent_root_file_ids.clear()
+                    self.__invalidate_cache(
+                        MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
+                        touched_active_root_file_ids=touched_file_ids,
+                    )
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_ACTIVE_FILES, started_at)
+
+    @staticmethod
+    def __active_root_identity_matches_except_progress(
+            previous: SystemFile, current: SystemFile,
+    ) -> bool:
+        """Accept only a root byte-counter change; all tree facts stay exact."""
+        return (
+            previous.name == current.name and
+            previous.is_dir == current.is_dir and
+            previous.timestamp_created == current.timestamp_created and
+            previous.timestamp_modified == current.timestamp_modified and
+            previous.mtime_ns == current.mtime_ns and
+            previous.path_pair_id == current.path_pair_id and
+            previous.path_pair_name == current.path_pair_name and
+            previous.is_staging == current.is_staging and
+            previous.has_staging_collision == current.has_staging_collision and
+            previous.status_sidecar_ready == current.status_sidecar_ready and
+            list(previous.iter_children()) == list(current.iter_children())
+        )
+
+    def __active_files_are_progress_equivalent(
+            self,
+            previous_files: dict[str, SystemFile], next_files: dict[str, SystemFile],
+            touched_file_ids: set[str],
+    ) -> bool:
+        """Prove active input cannot alter the cached topology/lifecycle base."""
+        if not touched_file_ids or touched_file_ids != self.__lftp_touched_root_file_ids:
+            return False
+        for file_id in touched_file_ids:
+            previous = previous_files.get(file_id)
+            current = next_files.get(file_id)
+            status = self.__lftp_statuses.get(file_id)
+            if previous is None or current is None or status is None or \
+                    status.file_id != file_id or status.state != LftpJobStatus.State.RUNNING or \
+                    not self.__active_root_identity_matches_except_progress(previous, current):
+                return False
+        return True
 
     def evict_active_file_ids(self, file_ids: Set[str]) -> None:
         """Drop exact active-scan roots during a completed move handoff."""
@@ -4410,6 +4457,7 @@ class ModelBuilder:
 
     def build_active_progress_overlays(
             self, known_root_file_ids: Set[str] | Callable[[str], bool],
+            display_transfer_safe: Optional[Callable[[str], bool]] = None,
     ) -> Optional[dict[str, ActiveProgressOverlay]]:
         """Build a root-only live-progress projection without walking trees.
 
@@ -4465,8 +4513,19 @@ class ModelBuilder:
         if not self.__active_transfer_delta_global_state_is_safe(root_ids):
             reject("global_safety")
             return None
+        if self.__active_progress_equivalent_root_file_ids != self.__lftp_touched_root_file_ids:
+            reject("invalidation_scope")
+            return None
         overlays: dict[str, ActiveProgressOverlay] = {}
         for file_id in root_ids:
+            if display_transfer_safe is not None:
+                try:
+                    if not display_transfer_safe(file_id):
+                        reject("invalidation_overlay")
+                        return None
+                except Exception:
+                    reject("invalidation_overlay")
+                    return None
             status = self.__lftp_statuses.get(file_id)
             remote = self.__remote_file(file_id)
             local = self.__local_file(file_id)
@@ -4514,6 +4573,8 @@ class ModelBuilder:
         self.__invalidation_reasons.clear()
         self.__pending_invalidation_tokens.clear()
         self.__lftp_touched_root_file_ids.clear()
+        self.__active_touched_root_file_ids.clear()
+        self.__active_progress_equivalent_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
 
     def unknown_local_path_pair_ids_snapshot(self) -> frozenset[Optional[str]]:
@@ -5102,6 +5163,7 @@ class ModelBuilder:
         self.__pending_invalidation_tokens.clear()
         self.__lftp_touched_root_file_ids.clear()
         self.__active_touched_root_file_ids.clear()
+        self.__active_progress_equivalent_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
@@ -5145,6 +5207,7 @@ class ModelBuilder:
         self.__pending_invalidation_tokens.clear()
         self.__lftp_touched_root_file_ids.clear()
         self.__active_touched_root_file_ids.clear()
+        self.__active_progress_equivalent_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None

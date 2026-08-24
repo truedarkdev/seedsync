@@ -5,7 +5,7 @@ from wsgiref.util import setup_testing_defaults
 from threading import RLock, Timer
 from types import SimpleNamespace
 from urllib.parse import quote
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from webtest import TestApp
 
@@ -1054,6 +1054,8 @@ class TestModelApi(unittest.TestCase):
     def test_scoped_page_resolves_immutable_active_progress_overlay(self):
         file = self._file("sample", "pair-a")
         file.remote_size = 100
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
         self.model.add_file(file)
         self.model.replace_active_progress_overlays(
             {file.file_id: ActiveProgressOverlay(25, 25, 10, 8)}, {file.file_id},
@@ -1064,7 +1066,51 @@ class TestModelApi(unittest.TestCase):
         self.assertEqual("downloading", page["records"][0]["state"])
         self.assertEqual(25, page["records"][0]["download_progress"])
         self.assertEqual(25, page["records"][0]["transferred_size"])
+        self.assertTrue(page["records"][0]["is_stoppable"])
         self.assertIsNone(self.model.get_file(file.file_id).transferred_size)
+        summary = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
+        self.assertEqual(25, summary["transferred_size"])
+        self.assertEqual(10, summary["downloading_speed"])
+        self.assertEqual(1, summary["active_count"])
+        listener = MagicMock()
+        self.model.add_listener(listener)
+        before_clear_version = self.model.version
+        self.model.replace_active_progress_overlays({}, {file.file_id})
+        self.assertIsNone(self.model.active_progress_overlay(file.file_id))
+        self.assertEqual(before_clear_version + 1, self.model.version)
+        listener.model_version_published.assert_called_once_with(
+            self.model.scope_version("pair-a"), self.model.version, "pair-a", file.file_id,
+        )
+        # A normal lifecycle publication owns the root again and cannot retain
+        # a former running projection.
+        self.model.update_file(file)
+        self.assertIsNone(self.model.active_progress_overlay(file.file_id))
+
+    def test_clearing_multi_root_projection_publishes_each_base_root(self):
+        first = self._file("first", "pair-a")
+        second = self._file("second", "pair-a")
+        for file in (first, second):
+            file.remote_size = 100
+            file.state = ModelFile.State.DOWNLOADING
+            self.model.add_file(file)
+        self.model.replace_active_progress_overlays(
+            {
+                first.file_id: ActiveProgressOverlay(25, 25, 10, 8),
+                second.file_id: ActiveProgressOverlay(30, 30, 11, 7),
+            },
+            {first.file_id, second.file_id},
+        )
+        listener = MagicMock()
+        self.model.add_listener(listener)
+        before_version = self.model.version
+
+        self.model.clear_active_progress_overlays()
+
+        self.assertEqual({}, self.model.active_progress_overlays_snapshot())
+        self.assertEqual(before_version + 2, self.model.version)
+        self.assertEqual(2, listener.model_version_published.call_count)
+        published_ids = {call.args[3] for call in listener.model_version_published.call_args_list}
+        self.assertEqual({first.file_id, second.file_id}, published_ids)
 
     def test_visible_state_uses_display_union_then_raw_progress_fallback(self):
         mixed = self._file("mixed", "pair-a")

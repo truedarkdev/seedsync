@@ -48,6 +48,30 @@ class TestActiveScanner(unittest.TestCase):
         # ModelBuilder owns the staging interpretation at the handoff.
         self.assertFalse(files[0].is_staging)
 
+    def test_advancing_temp_file_and_sidecar_change_active_scan_mtime(self):
+        scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
+        self.addCleanup(scanner.close)
+        scanner.set_active_files(["download.zip"])
+        temp_path = os.path.join(self.temp_dir, "download.zip.lftp")
+        sidecar_path = temp_path + ".lftp-pget-status"
+        with open(temp_path, "wb") as handle:
+            handle.write(b"a" * 25)
+        with open(sidecar_path, "w") as handle:
+            handle.write("size=100\n0.pos=25\n0.limit=100\n")
+        first = scanner.scan()[0]
+
+        with open(temp_path, "ab") as handle:
+            handle.write(b"b")
+        stat = os.stat(temp_path)
+        os.utime(temp_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        with open(sidecar_path, "w") as handle:
+            handle.write("size=100\n0.pos=26\n0.limit=100\n")
+        second = scanner.scan()[0]
+
+        self.assertEqual((25, 26), (first.size, second.size))
+        self.assertNotEqual(first.mtime_ns, second.mtime_ns)
+        self.assertNotEqual(first.timestamp_modified, second.timestamp_modified)
+
     def test_scan_ignores_status_only_partial_when_temp_file_missing(self):
         scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
         self.addCleanup(scanner.close)

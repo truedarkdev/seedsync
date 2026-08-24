@@ -6405,6 +6405,32 @@ class TestModelUpdater(unittest.TestCase):
         self.assertFalse(builder.has_changes())
         builder.build_model.assert_not_called()
 
+    def test_same_tick_active_scan_progress_uses_projection_without_tree_build(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("root", 100, False)])
+        initial = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "")
+        initial.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        builder.set_lftp_statuses([initial])
+        builder.set_active_files([SystemFile("root", 25, False)])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        active_scan = ScannerResult(datetime.now(), [SystemFile("root", 26, False)])
+        controller._Controller__active_scan_process.pop_latest_result.return_value = active_scan
+        progressed = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "")
+        progressed.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 11, 7)
+        controller._Controller__lftp.status.return_value = [progressed]
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(26, live_model.active_progress_overlay("root").transferred_size)
+        self.assertEqual(25, live_model.get_file("root").transferred_size)
+        self.assertFalse(builder.has_changes())
+        builder.build_model.assert_not_called()
+
     def test_timestamp_overlay_reconciliation_recovers_active_lftp_delta(self):
         builder = ModelBuilder()
         builder.set_remote_files([SystemFile("root", 100, False)])

@@ -3274,16 +3274,29 @@ class Controller:
 
     def _model_file_page_record_with_overlay(self, file: ModelFile) -> dict[str, object]:
         record = self._model_file_page_record(file)
-        overlay = self.__model.active_progress_overlay(file.file_id)
-        if overlay is not None:
-            record.update({
-                "state": "downloading",
-                "download_progress": overlay.download_progress,
-                "transferred_size": overlay.transferred_size,
-                "downloading_speed": overlay.downloading_speed,
-                "eta": overlay.eta,
-            })
+        record.update(self._model_file_progress_presentation(file))
         return record
+
+    def _model_file_progress_presentation(self, file: ModelFile) -> dict[str, object]:
+        """Return the one live-progress projection shared by pages and summaries.
+
+        LFTP counters supplement a previously established ModelFile state; they
+        never manufacture Queue/Stop capabilities or a lifecycle state.
+        """
+        overlay = self.__model.active_progress_overlay(file.file_id)
+        if overlay is None:
+            return {
+                "download_progress": file.download_progress,
+                "transferred_size": file.transferred_size,
+                "downloading_speed": file.downloading_speed,
+                "eta": file.eta,
+            }
+        return {
+            "download_progress": overlay.download_progress,
+            "transferred_size": overlay.transferred_size,
+            "downloading_speed": overlay.downloading_speed,
+            "eta": overlay.eta,
+        }
 
     @staticmethod
     def _model_record_visible_state(file: ModelFile) -> str:
@@ -3667,6 +3680,7 @@ class Controller:
             for file in self.__model.iter_files():
                 scope_id = self._model_scope_id(file.path_pair_id)
                 summary = summary_for(scope_id)
+                presentation = self._model_file_progress_presentation(file)
                 if summary["path_pair_name"] is None and file.path_pair_name is not None:
                     summary["path_pair_name"] = file.path_pair_name
                 summary["root_count"] = int(summary["root_count"]) + 1
@@ -3674,7 +3688,7 @@ class Controller:
                 # remote size still contribute state counts, but not byte
                 # totals. Completion prefers transferred bytes, then local.
                 display_total = file.display_size_total if file.display_size_total is not None else file.remote_size
-                display_completed = file.display_transferred_size if file.display_transferred_size is not None else file.transferred_size
+                display_completed = file.display_transferred_size if file.display_transferred_size is not None else presentation["transferred_size"]
                 if display_total is not None and display_total > 0:
                     completed_bytes = display_completed
                     if completed_bytes is None:
@@ -3691,15 +3705,17 @@ class Controller:
                 visible_state_counts[visible_state] = visible_state_counts.get(visible_state, 0) + 1
                 if file.state == ModelFile.State.DOWNLOADING:
                     summary["active_count"] = int(summary["active_count"]) + 1
-                    summary["downloading_speed"] = int(summary["downloading_speed"]) + (file.downloading_speed or 0)
+                    speed = presentation["downloading_speed"]
+                    summary["downloading_speed"] = int(summary["downloading_speed"]) + (speed if isinstance(speed, int) else 0)
                     if file.remote_size is not None:
                         summary["remaining_bytes"] = int(summary["remaining_bytes"]) + max(
-                            0, file.remote_size - (file.transferred_size or 0)
+                            0, file.remote_size - (presentation["transferred_size"] or 0)
                         )
-                    if file.eta is not None:
+                    eta = presentation["eta"]
+                    if isinstance(eta, int):
                         current_eta = summary["active_eta_seconds_max"]
                         summary["active_eta_seconds_max"] = max(
-                            current_eta if isinstance(current_eta, int) else 0, file.eta
+                            current_eta if isinstance(current_eta, int) else 0, eta
                         )
                 elif file.state == ModelFile.State.QUEUED:
                     summary["queued_count"] = int(summary["queued_count"]) + 1
