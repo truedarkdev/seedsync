@@ -857,6 +857,9 @@ class Controller:
         self.__lftp_status_poll_retry_seconds = 1
         self.__lftp_status_cache_expires_at = None
         self.__lftp_status_poll_retry_active = False
+        # Diagnostic-only lineage for the current PTY status poll.  It is
+        # intentionally ephemeral and never participates in transfer state.
+        self.__lftp_status_poll_correlation = None
         self.__active_command_processes = []
         self.__startup_recovery_done = False
         self.__reported_dead_workers = set()
@@ -1109,6 +1112,9 @@ class Controller:
         ))
         self.__lftp_status_cache_expires_at = None
         self.__lftp_status_poll_retry_active = False
+        # Diagnostic-only lineage for the current PTY status poll.  It is
+        # intentionally ephemeral and never participates in transfer state.
+        self.__lftp_status_poll_correlation = None
         self.__lftp_executor = None
         self.__lftp_executor_closing = False
         self.__lftp_operations = []
@@ -1292,6 +1298,7 @@ class Controller:
                 # ordering, but abandon the reference so the next updater poll
                 # submits an authoritative post-Queue status behind this job.
                 self.__lftp_status_future = None
+                self.__lftp_status_poll_correlation = None
                 self.__next_lftp_status_poll_at = None
                 self.__lftp_idle_status_authoritative = False
         return True
@@ -1553,20 +1560,62 @@ class Controller:
             elif operation.action == "reconfigure":
                 self.__restore_lftp_reconfigure_request()
             self.__next_lftp_status_poll_at = None
+            self.__lftp_status_poll_correlation = None
             self.__lftp_idle_status_authoritative = False
         self.__lftp_operations = remaining
 
+    def __lftp_status_lineage_enabled(self) -> bool:
+        """Check diagnostic policy before creating a poll correlation."""
+        trace = getattr(getattr(self, "_Controller__context", None), "breadcrumb_trace", None)
+        return any(
+            _breadcrumb_effectively_enabled(trace, category, level)
+            for category, level in (
+                ("transfer.lftp", "debug"),
+                ("transfer.lftp", "warning"),
+                ("completion.gate", "info"),
+            )
+        )
+
+    def __begin_lftp_status_poll_lineage(self) -> None:
+        """Start one bounded, opaque lineage for a submitted PTY status poll."""
+        if getattr(self.__lftp, "backend_name", "lftp") == "rclone":
+            self.__lftp_status_poll_correlation = None
+            return
+        if not self.__lftp_status_lineage_enabled():
+            self.__lftp_status_poll_correlation = None
+            return
+        self.__lftp_status_poll_correlation = "lftp-poll:{}".format(secrets.token_hex(8))
+
+    def _take_lftp_status_poll_correlation(self) -> Optional[str]:
+        """Consume the current diagnostic-only status poll lineage."""
+        correlation = getattr(self, "_Controller__lftp_status_poll_correlation", None)
+        self.__lftp_status_poll_correlation = None
+        return correlation if isinstance(correlation, str) and correlation else None
+
     def _get_lftp_status_snapshot(self) -> Optional[tuple[list[LftpJobStatus], bool]]:
         """Return a completed snapshot, or None while the one PTY poll is in flight."""
+        begin_lineage = getattr(self, "_Controller__begin_lftp_status_poll_lineage", None)
         if not self.__uses_async_lftp_owner():
-            statuses = self.__lftp.status()
+            if callable(begin_lineage):
+                begin_lineage()
+            try:
+                statuses = self.__lftp.status()
+            except Exception:
+                # A failed synchronous poll has no completed snapshot for the
+                # updater to consume, so do not let its lineage leak into a
+                # later cached tick.
+                self.__lftp_status_poll_correlation = None
+                raise
             return (list(statuses or []), bool(getattr(self.__lftp, "last_status_poll_healthy", True)))
         future = getattr(self, "_Controller__lftp_status_future", None)
         if future is None:
+            if callable(begin_lineage):
+                begin_lineage()
             def poll() -> tuple[list[LftpJobStatus], bool]:
                 statuses = self.__lftp.status()
                 return (list(statuses or []), bool(getattr(self.__lftp, "last_status_poll_healthy", True)))
             if not self.__submit_lftp_operation("status", poll):
+                self.__lftp_status_poll_correlation = None
                 return None
             return None
         if not future.done():
@@ -2463,6 +2512,7 @@ class Controller:
     def request_lftp_reconfigure(self):
         with self.__lftp_reconfigure_lock:
             self.__lftp_reconfigure_requested = True
+        self.__lftp_status_poll_correlation = None
         self.__lftp_idle_status_authoritative = False
         self.__next_lftp_status_poll_at = None
         self.wake_process()
@@ -2728,6 +2778,7 @@ class Controller:
                 self.__local_scan_process.force_scan()
                 self.__remote_scan_process.force_scan()
                 self.__next_lftp_status_poll_at = None
+                self.__lftp_status_poll_correlation = None
                 self.__lftp_idle_status_authoritative = False
                 old_active_scan_process_stopped = stop_process(old_active_scan_process)
                 stop_process(old_local_scan_process)

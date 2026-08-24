@@ -406,8 +406,12 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__lftp.status.side_effect = blocking_status
         self.assertIsNone(self.controller._get_lftp_status_snapshot())
+        poll_correlation = self.controller._Controller__lftp_status_poll_correlation
+        self.assertIsNotNone(poll_correlation)
+        self.assertRegex(poll_correlation, r"^lftp-poll:[0-9a-f]{16}$")
         self.assertTrue(started.wait(1))
         self.assertIsNone(self.controller._get_lftp_status_snapshot())
+        self.assertEqual(poll_correlation, self.controller._Controller__lftp_status_poll_correlation)
         self.assertEqual(1, self.controller._Controller__lftp.status.call_count)
         observed_generation = self.controller.process_wake_generation()
         release.set()
@@ -418,6 +422,9 @@ class TestController(unittest.TestCase):
             if snapshot is None:
                 time.sleep(0.01)
         self.assertEqual(([status], True), snapshot)
+        self.assertEqual(poll_correlation, self.controller._Controller__lftp_status_poll_correlation)
+        self.assertEqual(poll_correlation, self.controller._take_lftp_status_poll_correlation())
+        self.assertIsNone(self.controller._take_lftp_status_poll_correlation())
         self.assertTrue(self.controller.wait_for_process_wake(observed_generation, 1))
         self.controller._Controller__lftp_executor.shutdown(wait=True)
 

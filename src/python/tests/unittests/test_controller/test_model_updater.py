@@ -5854,6 +5854,183 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotIn("private-fixture-name", serialized)
         self.assertNotIn("/private/fixture/path", serialized)
 
+    def test_lftp_poll_lineage_links_status_inlet_to_completion_decision(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=16,
+            policy={
+                "default": "off",
+                "rules": {"transfer.lftp": "debug", "completion.gate": "info"},
+            },
+        )
+        active_entry = ("sample-transfer.bin", None, None)
+        controller = self._make_lftp_completion_controller({active_entry})
+        controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+        controller._Controller__record_breadcrumb = lambda **kwargs: trace.record(
+            "model_updater", kwargs["message"], kwargs["details"],
+            **{key: value for key, value in kwargs.items() if key not in {"message", "details"}},
+        )
+        poll_correlation = "lftp-poll:0123456789abcdef"
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "private-transfer-name", "/private/transfer/output",
+        )
+
+        _record_lftp_status_breadcrumb(
+            controller,
+            [status],
+            source="fresh_healthy",
+            fresh=True,
+            healthy=True,
+            poll_correlation=poll_correlation,
+            raw_status_count=1,
+        )
+        ModelUpdater(controller)._handle_lftp_completion_detection(
+            [],
+            True,
+            lftp_status_poll_authoritative=True,
+            lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True,
+            lftp_status_source="fresh_healthy",
+            lftp_status_poll_correlation=poll_correlation,
+        )
+
+        linked = trace.snapshot(flow_id=poll_correlation)["entries"]
+        self.assertEqual(
+            {"lftp_status_poll", "completion_pending_registered"},
+            {entry["message"] for entry in linked},
+        )
+        self.assertTrue(all(entry["flow_id"] == poll_correlation for entry in linked))
+        status_entry = next(entry for entry in linked if entry["message"] == "lftp_status_poll")
+        self.assertEqual("status_inlet", status_entry["details"]["phase"])
+        self.assertEqual(1, status_entry["details"]["raw_status_count"])
+        self.assertEqual(1, status_entry["details"]["filtered_status_count"])
+        self.assertEqual(poll_correlation, status_entry["details"]["poll_correlation"])
+        completion_entry = next(
+            entry for entry in linked if entry["message"] == "completion_pending_registered"
+        )
+        self.assertEqual(poll_correlation, completion_entry["details"]["poll_correlation"])
+        serialized = str(linked)
+        self.assertNotIn("private-transfer-name", serialized)
+        self.assertNotIn("/private/transfer/output", serialized)
+
+    def test_update_links_running_100_percent_to_fresh_empty_completion(self):
+        """The real updater intake keeps one poll lineage through retirement."""
+        controller = self._make_v092_pending_completion_controller(
+            complete=False, sidecar_ready=True,
+        )
+        running = LftpJobStatus(
+            7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "private-transfer-name", "/private/transfer/output",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(10, 10, 100, 100, 0)
+        controller._Controller__lftp.backend_name = "lftp"
+        controller._Controller__lftp.status.side_effect = [[running], []]
+        # Use the production snapshot/accessor seam with the fixture's
+        # synchronous backend shape; only the PTY executor is bypassed.
+        controller._Controller__uses_async_lftp_owner = MagicMock(return_value=False)
+        controller._Controller__lftp_status_lineage_enabled = MagicMock(return_value=True)
+        controller._Controller__begin_lftp_status_poll_lineage = (
+            Controller._Controller__begin_lftp_status_poll_lineage.__get__(controller, Controller)
+        )
+        controller._get_lftp_status_snapshot = (
+            Controller._get_lftp_status_snapshot.__get__(controller, Controller)
+        )
+        controller._take_lftp_status_poll_correlation = (
+            Controller._take_lftp_status_poll_correlation.__get__(controller, Controller)
+        )
+
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=32,
+            policy={
+                "default": "off",
+                "rules": {"transfer.lftp": "debug", "completion.gate": "info"},
+            },
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__record_breadcrumb = lambda **kwargs: trace.record(
+            "model_updater", kwargs["message"], kwargs["details"],
+            **{key: value for key, value in kwargs.items() if key not in {"message", "details"}},
+        )
+
+        updater = ModelUpdater(controller)
+        updater.update()
+        first_status = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "lftp_status_poll"
+        )
+        first_correlation = first_status["details"]["poll_correlation"]
+        self.assertEqual("fresh_healthy", first_status["details"]["source"])
+        self.assertEqual(1, first_status["details"]["active_count"])
+
+        # The active cadence is deliberately forced due to make the second
+        # update a fresh PTY poll rather than a cached tick.
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+
+        status_events = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "lftp_status_poll"
+        ]
+        self.assertEqual(2, len(status_events))
+        second_correlation = status_events[-1]["details"]["poll_correlation"]
+        self.assertNotEqual(first_correlation, second_correlation)
+        self.assertEqual("fresh_healthy_empty", status_events[-1]["details"]["outcome"])
+        self.assertEqual(0, status_events[-1]["details"]["filtered_status_count"])
+
+        linked = trace.snapshot(flow_id=second_correlation)["entries"]
+        linked_messages = {entry["message"] for entry in linked}
+        self.assertIn("lftp_status_poll", linked_messages)
+        self.assertIn("completion_pending_registered", linked_messages)
+        self.assertTrue(all(
+            entry["details"].get("poll_correlation") == second_correlation
+            for entry in linked
+            if entry["message"] != "lftp_status_poll"
+        ))
+        # The token is consumed by the fresh-snapshot intake and cannot leak
+        # into a later cached/no-poll updater tick.
+        self.assertIsNone(controller._take_lftp_status_poll_correlation())
+        before_cached = len(trace.snapshot()["entries"])
+        controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(minutes=1)
+        controller._Controller__lftp_idle_status_authoritative = True
+        updater.update()
+        cached_entries = trace.snapshot()["entries"][before_cached:]
+        cached_status = next(
+            entry for entry in cached_entries if entry["message"] == "lftp_status_poll"
+        )
+        self.assertEqual("cached_idle", cached_status["details"]["source"])
+        self.assertNotIn("poll_correlation", cached_status["details"])
+        self.assertIsNone(cached_status["flow_id"])
+        self.assertTrue(all(entry["flow_id"] is None for entry in cached_entries))
+        serialized = str(linked)
+        self.assertNotIn("private-transfer-name", serialized)
+        self.assertNotIn("/private/transfer/output", serialized)
+
+    def test_lftp_poll_lineage_reader_is_skipped_when_diagnostics_are_disabled(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={
+                "default": "off",
+                "rules": {
+                    "transfer.lftp": "off",
+                    "completion.gate": "off",
+                },
+            },
+        )
+        controller, _ = self._make_progressive_update_controller(None, local_scan=None)
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._take_lftp_status_poll_correlation = MagicMock(
+            side_effect=AssertionError("disabled diagnostics must not read poll lineage")
+        )
+
+        ModelUpdater(controller).update()
+
+        controller._take_lftp_status_poll_correlation.assert_not_called()
+        self.assertEqual([], trace.snapshot()["entries"])
+
     def test_replaced_progressive_sessions_ignore_stale_rows_until_new_partial_evidence(self):
         def process(session_token, results):
             scanner_process = ScannerProcess(
