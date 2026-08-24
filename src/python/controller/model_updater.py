@@ -22,6 +22,7 @@ from typing import Callable, Mapping, Optional, Sequence, TYPE_CHECKING, cast
 from common import Context, PathPair
 from common.breadcrumb_trace import opaque_trace_correlation, trace_session_digest
 from common.root_progress_trace import (
+    count_bucket,
     eta_bucket,
     percent_bucket,
     root_progress_tracer,
@@ -554,7 +555,13 @@ def _record_root_progress_status(
     # Status objects can carry names, paths, and raw transfer sizes.  Only
     # inspect the bounded active subset after the model.progress gate passes;
     # every exported field is an enum, digest, bucket, or scalar percentage.
+    sampled_count = 0
+    active_count = 0
     for status in islice(statuses, 128):
+        sampled_count += 1
+        active = details_state_is_active(status)
+        if active:
+            active_count += 1
         state = getattr(getattr(status, "state", None), "name", None)
         status_type = getattr(getattr(status, "type", None), "name", None)
         transfer = getattr(status, "total_transfer_state", None)
@@ -569,10 +576,34 @@ def _record_root_progress_status(
             "eta_bucket": eta_bucket(getattr(transfer, "eta", None)),
             "model_version": model_version,
             "scope_digest": opaque_trace_correlation(getattr(status, "path_pair_id", None)),
-            "outcome": "active" if details_state_is_active(status) else "queued",
+            "outcome": "active" if active else "queued",
             "reason": "normalized_status",
+            "representation": "root_target",
         }
         tracer.record(getattr(status, "file_id", None), "status", details)
+
+    # Keep the list/target shape available even when the per-target event is
+    # deduplicated or later evicted.  This uses only the same bounded sample;
+    # it never performs a second status traversal.
+    total_count: Optional[int] = None
+    try:
+        candidate_count = len(statuses)  # type: ignore[arg-type]
+        if type(candidate_count) is int and candidate_count >= 0:
+            total_count = candidate_count
+    except (TypeError, AttributeError):
+        pass
+    summary: dict[str, object] = {
+        "representation": "status_list",
+        "status_source": source,
+        "status_count_bucket": count_bucket(total_count if total_count is not None else sampled_count),
+        "active_count_bucket": count_bucket(active_count),
+        "sampled_count_bucket": count_bucket(sampled_count),
+        "sampled_truncated": total_count is not None and total_count > sampled_count,
+        "model_version": model_version,
+        "outcome": "observed",
+        "reason": "bounded_status_list",
+    }
+    tracer.record_summary("status-list:{}".format(source), "status_list", summary)
 
 
 def details_state_is_active(status: object) -> bool:

@@ -18,12 +18,23 @@ from threading import RLock
 from typing import Any, Mapping, Optional
 from weakref import ReferenceType, WeakKeyDictionary, ref
 
-from .breadcrumb_trace import opaque_trace_correlation
+from .breadcrumb_trace import BreadcrumbTraceEmitter, opaque_trace_correlation
 
 
 ROOT_PROGRESS_TRACE_CATEGORY = "model.progress"
 ROOT_PROGRESS_TRACE_SCHEMA = "model_root_progress.v1"
 ROOT_PROGRESS_TRACE_SOURCE = "root_progress"
+ROOT_PROGRESS_HEALTH_SCHEMA = "model_root_progress_health.v1"
+ROOT_PROGRESS_HEALTH_OUTCOMES = (
+    "trace_policy_disabled",
+    "tracer_deduplicated",
+    "emitter_rejected",
+    "emitter_enqueued",
+    "collector_accepted",
+    "collector_evicted",
+    "collector_rejected",
+    "summary_observed",
+)
 _MAX_SUBJECTS = 128
 _ALLOWED_DETAIL_KEYS = frozenset({
     "scope_digest", "model_version", "scope_version", "outcome", "reason",
@@ -31,6 +42,8 @@ _ALLOWED_DETAIL_KEYS = frozenset({
     "publication", "event", "progress_percent", "percent_bucket",
     "speed_bucket", "eta_bucket", "root_count", "page_count", "record_count",
     "target_count", "duration_ms", "duration_bucket", "observed_ms",
+    "representation", "status_count_bucket", "active_count_bucket",
+    "sampled_count_bucket", "sampled_truncated",
 })
 
 
@@ -81,6 +94,11 @@ def eta_bucket(value: object) -> Optional[str]:
 
 def duration_bucket(value: object) -> Optional[str]:
     return _bucket(value, (4, 19, 99, 499, 1999))
+
+
+def count_bucket(value: object) -> Optional[str]:
+    """Return a small count bucket for aggregate diagnostics."""
+    return _bucket(value, (0, 1, 4, 16, 64, 127))
 
 
 def _safe_details(details: Mapping[str, object]) -> dict[str, object]:
@@ -153,6 +171,48 @@ class RootProgressTrace:
                 return False
         return callable(getattr(trace, "record", None))
 
+    @staticmethod
+    def __health(
+            trace: object, outcome: str, stage: str, job_digest: Optional[str] = None,
+            details: Optional[Mapping[str, object]] = None, count_attempt: bool = True,
+    ) -> None:
+        recorder = getattr(trace, "record_root_progress_health", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(
+                outcome,
+                stage,
+                job_digest,
+                details if isinstance(details, Mapping) else None,
+                count_attempt=count_attempt,
+            )
+        except Exception:
+            # Diagnostics must never affect model publication or transfer work.
+            return
+
+    def record_summary(
+            self,
+            identity: object,
+            stage: str,
+            details: Mapping[str, object],
+    ) -> bool:
+        """Publish one bounded representation summary without a noisy event."""
+        if not self.enabled("debug"):
+            return False
+        try:
+            trace = self.__trace_object()
+            if trace is None:
+                return False
+            job_digest = opaque_trace_correlation(identity)
+            self.__health(
+                trace, "summary_observed", stage, job_digest, _safe_details(details),
+                count_attempt=False,
+            )
+            return True
+        except Exception:
+            return False
+
     def record(
         self,
         identity: object,
@@ -162,12 +222,13 @@ class RootProgressTrace:
         level: str = "debug",
     ) -> bool:
         """Record one bounded state/progress change, returning admission status."""
+        trace = self.__trace_object()
+        if trace is None:
+            return False
         if not self.enabled(level):
+            self.__health(trace, "trace_policy_disabled", stage)
             return False
         try:
-            trace = self.__trace_object()
-            if trace is None:
-                return False
             job_digest = opaque_trace_correlation(identity)
             safe = _safe_details(details)
             safe["schema"] = ROOT_PROGRESS_TRACE_SCHEMA
@@ -193,11 +254,13 @@ class RootProgressTrace:
                 self.__sync_generation_locked(trace)
                 if self.__last_signatures.get(key) == signature:
                     self.__last_signatures.move_to_end(key)
+                    self.__health(trace, "tracer_deduplicated", stage, job_digest, safe)
                     return False
                 next_sequence = self.__next_sequence + 1
                 safe["sequence"] = next_sequence
                 recorder = getattr(trace, "record", None)
                 if not callable(recorder):
+                    self.__health(trace, "emitter_rejected", stage, job_digest, safe)
                     return False
                 outcome = recorder(
                     ROOT_PROGRESS_TRACE_SOURCE,
@@ -214,7 +277,19 @@ class RootProgressTrace:
                         job_digest, stage,
                         hashlib.sha256(signature.encode("utf-8")).hexdigest()[:16],
                     ),
+                    _root_progress=True,
                 )
+                if outcome in {None, "retained", "accepted", "coalesced"}:
+                    health_outcome = "collector_accepted"
+                elif outcome == "evicted":
+                    health_outcome = "collector_evicted"
+                elif outcome == "enqueued":
+                    health_outcome = "emitter_enqueued"
+                elif isinstance(trace, BreadcrumbTraceEmitter):
+                    health_outcome = "emitter_rejected"
+                else:
+                    health_outcome = "collector_rejected"
+                self.__health(trace, health_outcome, stage, job_digest, safe)
                 accepted = outcome in {None, "retained", "enqueued", "accepted", "coalesced"}
                 if accepted:
                     self.__last_signatures[key] = signature

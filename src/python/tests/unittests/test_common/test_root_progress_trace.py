@@ -75,6 +75,160 @@ class TestRootProgressTrace(unittest.TestCase):
 
         self.assertFalse(tracer.record("private-root-id", "status", ExplodingDetails()))
         self.assertEqual([], trace.snapshot(category="model.progress")["entries"])
+        health = trace.snapshot()["root_progress_health"]
+        self.assertEqual(1, health["outcome_counts"]["trace_policy_disabled"])
+        self.assertEqual("trace_policy_disabled", health["latest"]["outcome"])
+
+    def test_health_distinguishes_deduplication_and_collector_admission(self):
+        trace = self._trace()
+        tracer = root_progress_tracer(trace)
+        details = {"representation": "root_target", "status_state": "running"}
+        self.assertTrue(tracer.record("opaque-root", "status", details))
+        self.assertFalse(tracer.record("opaque-root", "status", details))
+
+        health = trace.snapshot()["root_progress_health"]
+        self.assertEqual(1, health["outcome_counts"]["tracer_deduplicated"])
+        self.assertEqual(1, health["outcome_counts"]["collector_accepted"])
+        self.assertEqual("root_target", health["latest_by_representation"]["root_target"]["details"]["representation"])
+
+    def test_health_reports_when_root_event_is_evicted(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=1,
+            policy={"default": "info", "rules": {"model.progress": "debug"}},
+        )
+        trace.record("controller", "failure", event_type="failure", category="other", level="error")
+        tracer = root_progress_tracer(trace)
+        self.assertFalse(tracer.record("opaque-root", "status", {"representation": "root_target"}))
+        health = trace.snapshot()["root_progress_health"]
+        self.assertEqual(1, health["outcome_counts"]["collector_evicted"])
+
+    def test_health_reports_collector_rejection_for_oversized_retention_budget(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, memory_budget_bytes=1,
+            policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        tracer = root_progress_tracer(trace)
+        self.assertFalse(tracer.record("opaque-root", "status", {"representation": "root_target"}))
+        health = trace.snapshot()["root_progress_health"]
+        self.assertEqual(1, health["outcome_counts"]["collector_rejected"])
+
+    def test_emitter_success_counts_one_tracer_attempt(self):
+        trace = self._trace()
+        emitter = trace.create_emitter()
+        tracer = root_progress_tracer(emitter)
+        self.assertTrue(tracer.record("opaque-root", "status", {"representation": "root_target"}))
+
+        health = trace.snapshot()["root_progress_health"]
+        self.assertEqual(1, health["attempt_count"])
+        self.assertEqual(1, health["outcome_counts"]["emitter_enqueued"])
+        self.assertEqual(1, health["outcome_counts"]["collector_accepted"])
+
+    def test_disabled_emitter_counts_one_policy_attempt_without_queueing(self):
+        trace = self._trace(enabled=False)
+        emitter = trace.create_emitter()
+        tracer = root_progress_tracer(emitter)
+        self.assertFalse(tracer.record("opaque-root", "status", {"representation": "root_target"}))
+
+        health = trace.snapshot()["root_progress_health"]
+        self.assertEqual(1, health["attempt_count"])
+        self.assertEqual(1, health["outcome_counts"]["trace_policy_disabled"])
+        self.assertEqual(0, health["outcome_counts"]["emitter_enqueued"])
+
+    def test_emitter_dedupe_and_summary_are_retrievable(self):
+        trace = self._trace()
+        emitter = trace.create_emitter()
+        tracer = root_progress_tracer(emitter)
+        details = {"representation": "root_target", "status_state": "running"}
+        self.assertTrue(tracer.record("opaque-root", "status", details))
+        self.assertFalse(tracer.record("opaque-root", "status", details))
+        self.assertTrue(tracer.record_summary(
+            "status-list", "status_list",
+            {"representation": "status_list", "sampled_count_bucket": "1-1"},
+        ))
+
+        health = trace.snapshot()["root_progress_health"]
+        self.assertEqual(2, health["attempt_count"])
+        self.assertEqual(1, health["outcome_counts"]["tracer_deduplicated"])
+        self.assertEqual(1, health["outcome_counts"]["summary_observed"])
+        self.assertEqual("summary_observed", health["latest_summary"]["outcome"])
+
+    def test_direct_collector_summary_does_not_count_as_attempt(self):
+        trace = self._trace()
+        tracer = root_progress_tracer(trace)
+        self.assertTrue(tracer.record_summary(
+            "status-list", "status_list",
+            {"representation": "status_list", "sampled_count_bucket": "1-1"},
+        ))
+
+        health = trace.snapshot()["root_progress_health"]
+        self.assertEqual(0, health["attempt_count"])
+        self.assertEqual(1, health["outcome_counts"]["summary_observed"])
+        self.assertEqual("summary_observed", health["latest_summary"]["outcome"])
+
+    def test_emitter_rejects_invalid_health_outcomes_before_mapping(self):
+        trace = self._trace()
+        emitter = trace.create_emitter()
+        self.assertFalse(emitter.record_root_progress_health([], "status"))
+        self.assertFalse(emitter.record_root_progress_health({"outcome": "bad"}, "status"))
+
+        health = trace.snapshot()["root_progress_health"]
+        self.assertEqual(0, health["attempt_count"])
+        self.assertTrue(all(value == 0 for value in health["outcome_counts"].values()))
+
+    def test_non_root_model_progress_emitter_record_does_not_change_health(self):
+        trace = self._trace()
+        emitter = trace.create_emitter()
+        self.assertEqual(
+            "enqueued",
+            emitter.record(
+                "worker", "ordinary", {"representation": "root_target"},
+                category="model.progress", level="debug", stage="ordinary",
+            ),
+        )
+        health = trace.snapshot()["root_progress_health"]
+        self.assertEqual(0, health["attempt_count"])
+        self.assertTrue(all(value == 0 for value in health["outcome_counts"].values()))
+
+    def test_emitter_rejection_is_counted_only_for_marked_root_records(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=1,
+            policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        emitter = trace.create_emitter()
+        self.assertEqual(
+            "enqueued",
+            emitter.record(
+                "root_progress", "queued", {"representation": "root_target"},
+                category="model.progress", level="debug", stage="root_progress_status",
+                _root_progress=True,
+            ),
+        )
+        rejected = False
+        for index in range(100):
+            if emitter.record(
+                    "root_progress", "full", {"index": index},
+                    category="model.progress", level="debug", stage="root_progress_status",
+                    _root_progress=True,
+            ) == "dropped":
+                rejected = True
+                break
+        self.assertTrue(rejected)
+        health = trace.snapshot()["root_progress_health"]
+        self.assertGreaterEqual(health["outcome_counts"]["emitter_rejected"], 1)
+        self.assertGreaterEqual(health["attempt_count"], 2)
+
+    def test_category_clear_resets_root_progress_health_with_evidence(self):
+        trace = self._trace()
+        tracer = root_progress_tracer(trace)
+        self.assertTrue(tracer.record("opaque-root", "status", {"representation": "root_target"}))
+        self.assertGreater(trace.snapshot()["root_progress_health"]["attempt_count"], 0)
+
+        trace.clear(category="model.progress")
+        health = trace.snapshot()["root_progress_health"]
+        self.assertEqual(0, health["attempt_count"])
+        self.assertIsNone(health["latest"])
+        self.assertIsNone(health["latest_summary"])
+        self.assertEqual([], trace.snapshot(category="model.progress")["entries"])
 
     def test_scalar_buckets_are_bounded(self):
         self.assertEqual(0, scalar_percent(-10))
@@ -156,6 +310,9 @@ class TestRootProgressTrace(unittest.TestCase):
         )
         self.assertEqual(128, statuses.visited)
         self.assertEqual(1, len(trace.snapshot(category="model.progress")["entries"]))
+        health = trace.snapshot()["root_progress_health"]
+        self.assertEqual("status_list", health["latest_by_representation"]["status_list"]["details"]["representation"])
+        self.assertEqual("128+", health["latest_by_representation"]["status_list"]["details"]["sampled_count_bucket"])
 
     def test_decision_matrix_uses_only_settled_bounded_outcomes(self):
         from controller.model_updater import ModelUpdater

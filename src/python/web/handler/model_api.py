@@ -423,6 +423,7 @@ class ModelApiHandler(IHandler):
                             "model_version": captured_global_version,
                             "scope_version": version if scoped and isinstance(version, int) else None,
                             "publication": "scoped" if scoped else "summary",
+                            "representation": "scoped_sse" if scoped else "summary_sse",
                             "event": event,
                             "outcome": "emitted",
                             "reason": "sse_write",

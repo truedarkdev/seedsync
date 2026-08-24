@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import queue
@@ -122,6 +123,11 @@ class BreadcrumbTraceEmitter:
         policy_length: multiprocessing.RawValue,
         policy_bytes: multiprocessing.RawArray,
         rejected_count: multiprocessing.Value,
+        root_progress_enqueued_count: multiprocessing.Value,
+        root_progress_rejected_count: multiprocessing.Value,
+        root_progress_disabled_count: multiprocessing.Value,
+        root_progress_deduplicated_count: multiprocessing.Value,
+        root_progress_summary_count: multiprocessing.Value,
     ):
         self.__record_queue = record_queue
         self.__enabled_gate = enabled_gate
@@ -131,6 +137,11 @@ class BreadcrumbTraceEmitter:
         self.__policy_length = policy_length
         self.__policy_bytes = policy_bytes
         self.__rejected_count = rejected_count
+        self.__root_progress_enqueued_count = root_progress_enqueued_count
+        self.__root_progress_rejected_count = root_progress_rejected_count
+        self.__root_progress_disabled_count = root_progress_disabled_count
+        self.__root_progress_deduplicated_count = root_progress_deduplicated_count
+        self.__root_progress_summary_count = root_progress_summary_count
         self.__effective_policy: Optional[_EffectiveBreadcrumbPolicy] = None
         self.__effective_policy_generation = -1
 
@@ -158,20 +169,76 @@ class BreadcrumbTraceEmitter:
             return "disabled"
         if not self.is_effectively_enabled(metadata.get("category", source), metadata.get("level", "info")):
             return "dropped"
-
         created_ns = time.time_ns()
         record = _bounded_ingress_record(source, message, details, metadata, created_ns, self.__policy_revision, self.__policy_epoch)
         if record is None:
             self.__reject()
+            self.__root_progress_reject_if_applicable(
+                metadata.get("category", source), metadata.get("_root_progress"),
+            )
             return "dropped"
         try:
             self.__record_queue.put_nowait(record)
+            self.__root_progress_increment_if_applicable(
+                metadata.get("category", source), metadata.get("_root_progress"),
+                self.__root_progress_enqueued_count,
+            )
             # This only acknowledges process-queue admission. The collector
             # remains authoritative for retention, policy, and deduplication.
             return "enqueued"
         except queue.Full:
             self.__reject()
+            self.__root_progress_reject_if_applicable(
+                metadata.get("category", source), metadata.get("_root_progress"),
+            )
             return "dropped"
+
+    def record_root_progress_health(
+            self, outcome: object, stage: object, job_digest: object = None,
+            details: object = None, count_attempt: bool = True,
+    ) -> bool:
+        """Forward supported bounded health outcomes across the process boundary.
+
+        Only policy-disabled, tracer-deduplicated, and summary observations
+        have shared counters; collector-owned outcomes are recorded locally.
+        """
+        del stage, job_digest, details, count_attempt
+        if type(outcome) is not str:
+            return False
+        counter = {
+            "trace_policy_disabled": self.__root_progress_disabled_count,
+            "tracer_deduplicated": self.__root_progress_deduplicated_count,
+            "summary_observed": self.__root_progress_summary_count,
+        }.get(outcome)
+        if counter is None:
+            return False
+        try:
+            with counter.get_lock():
+                counter.value += 1
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def __is_root_progress(category: object, marker: object) -> bool:
+        return category == "model.progress" and marker is True
+
+    @classmethod
+    def __root_progress_increment_if_applicable(
+            cls, category: object, marker: object, counter: multiprocessing.Value,
+    ) -> None:
+        if not cls.__is_root_progress(category, marker):
+            return
+        try:
+            with counter.get_lock():
+                counter.value += 1
+        except Exception:
+            pass
+
+    def __root_progress_reject_if_applicable(self, category: object, marker: object) -> None:
+        self.__root_progress_increment_if_applicable(
+            category, marker, self.__root_progress_rejected_count,
+        )
 
     def __current_effective_policy(self) -> Optional[_EffectiveBreadcrumbPolicy]:
         try:
@@ -356,6 +423,29 @@ class BreadcrumbTraceCollector:
     __ACTIVE_DELTA_POLL_SUPPRESSED_REASONS = frozenset({
         "cached_status", "idle_authoritative", "retry_backoff",
     })
+    __ROOT_PROGRESS_HEALTH_OUTCOMES = frozenset({
+        "trace_policy_disabled", "tracer_deduplicated", "emitter_rejected",
+        "emitter_enqueued", "collector_accepted", "collector_evicted",
+        "collector_rejected", "summary_observed",
+    })
+    __ROOT_PROGRESS_HEALTH_STAGES = frozenset({
+        "status", "status_list", "decision", "serialization_start",
+        "serialization_end", "sse", "other",
+    })
+    __ROOT_PROGRESS_HEALTH_REPRESENTATIONS = frozenset({
+        "status_list", "root_target", "scoped_sse", "summary_sse", "other",
+    })
+    __ROOT_PROGRESS_HEALTH_DETAIL_KEYS = frozenset({
+        "representation", "status_source", "status_state", "status_type",
+        "status_count_bucket", "active_count_bucket", "sampled_count_bucket",
+        "sampled_truncated", "progress_percent", "percent_bucket",
+        "speed_bucket", "eta_bucket", "model_version", "scope_version",
+        "publication", "event", "outcome", "reason", "decision",
+        "build_kind", "root_count", "page_count", "record_count",
+        "target_count", "duration_bucket",
+    })
+    __ROOT_PROGRESS_HEALTH_MAX_COUNTER = 2_147_483_647
+    __ROOT_PROGRESS_HEALTH_MAX_REPRESENTATIONS = 8
 
     def __init__(
         self,
@@ -398,6 +488,16 @@ class BreadcrumbTraceCollector:
         self.__worker_policy_bytes = multiprocessing.RawArray("B", _SHARED_POLICY_MAX_BYTES)
         self.__ingress_rejected_count = multiprocessing.Value("L", 0)
         self.__ingress_rejected_seen = 0
+        self.__root_progress_enqueued_count = multiprocessing.Value("L", 0)
+        self.__root_progress_enqueued_seen = 0
+        self.__root_progress_rejected_count = multiprocessing.Value("L", 0)
+        self.__root_progress_rejected_seen = 0
+        self.__root_progress_disabled_count = multiprocessing.Value("L", 0)
+        self.__root_progress_disabled_seen = 0
+        self.__root_progress_deduplicated_count = multiprocessing.Value("L", 0)
+        self.__root_progress_deduplicated_seen = 0
+        self.__root_progress_summary_count = multiprocessing.Value("L", 0)
+        self.__root_progress_summary_seen = 0
         self.__worker_policy_ack_revision = 0
         self.__worker_policy_ack_epoch = 0
         self.__policy_epoch = 0
@@ -419,6 +519,21 @@ class BreadcrumbTraceCollector:
         # retains the latest authorization rejection after a busy progress
         # trace evicts the event that first established it.
         self.__latest_active_delta_rejection_summary: Optional[Dict[str, Any]] = None
+        self.__root_progress_health: Dict[str, Any] = {
+            "schema": "model_root_progress_health.v1",
+            "attempt_semantics": "one_per_root_progress_attempt",
+            "attempt_count": 0,
+            "outcome_counts": {
+                outcome: 0 for outcome in (
+                    "trace_policy_disabled", "tracer_deduplicated", "emitter_rejected",
+                    "emitter_enqueued", "collector_accepted", "collector_evicted",
+                    "collector_rejected", "summary_observed",
+                )
+            },
+            "latest": None,
+            "latest_summary": None,
+            "latest_by_representation": {},
+        }
         self.__policy: Dict[str, Any] = cast(Dict[str, Any], policy_result["policy"])
         self.__effective_policy = _EffectiveBreadcrumbPolicy.from_policy(self.__policy)
         self.__policy_revision = 0
@@ -448,6 +563,11 @@ class BreadcrumbTraceCollector:
                 self.__external_records, self.__enabled_gate, self.__worker_policy_revision, self.__worker_policy_epoch,
                 self.__worker_policy_generation, self.__worker_policy_length, self.__worker_policy_bytes,
                 self.__ingress_rejected_count,
+                self.__root_progress_enqueued_count,
+                self.__root_progress_rejected_count,
+                self.__root_progress_disabled_count,
+                self.__root_progress_deduplicated_count,
+                self.__root_progress_summary_count,
             )
 
     def is_enabled(self) -> bool:
@@ -476,6 +596,105 @@ class BreadcrumbTraceCollector:
         """Return the retention generation for producer-side dedupe state."""
         with self.__lock:
             return self.__reset_generation
+
+    def record_root_progress_health(
+            self,
+            outcome: object,
+            stage: object,
+            job_digest: object = None,
+            details: object = None,
+            count_attempt: bool = True,
+    ) -> bool:
+        """Retain bounded root-progress admission health outside the event deque."""
+        if not isinstance(outcome, str) or outcome not in self.__ROOT_PROGRESS_HEALTH_OUTCOMES:
+            return False
+        normalized_stage = stage if isinstance(stage, str) and stage in self.__ROOT_PROGRESS_HEALTH_STAGES else "other"
+        normalized_digest = job_digest if isinstance(job_digest, str) else "unknown"
+        if normalized_digest != "unknown":
+            digest = normalized_digest.removeprefix("root-progress:")
+            if len(digest) != 16 or any(character not in "0123456789abcdef" for character in digest):
+                normalized_digest = "unknown"
+            else:
+                normalized_digest = digest
+        safe_details: Dict[str, Any] = {}
+        if isinstance(details, Mapping):
+            for key, value in details.items():
+                if key not in self.__ROOT_PROGRESS_HEALTH_DETAIL_KEYS:
+                    continue
+                if value is None or type(value) is bool:
+                    safe_details[str(key)] = value
+                elif type(value) is int:
+                    safe_details[str(key)] = max(-2_147_483_648, min(2_147_483_647, value))
+                elif type(value) is float and math.isfinite(value):
+                    safe_details[str(key)] = value
+                elif type(value) is str:
+                    safe_details[str(key)] = self.__truncate_string(
+                        self.__sanitize_string_content(value),
+                    )
+        representation = safe_details.get("representation")
+        if representation not in self.__ROOT_PROGRESS_HEALTH_REPRESENTATIONS:
+            representation = None
+        now_ms = int(time.time_ns() / 1_000_000)
+        latest = {
+            "outcome": outcome,
+            "stage": normalized_stage,
+            "job_digest": normalized_digest,
+            "observed_ms": now_ms,
+            "details": safe_details,
+        }
+        with self.__lock:
+            if count_attempt:
+                self.__root_progress_health["attempt_count"] = min(
+                    self.__ROOT_PROGRESS_HEALTH_MAX_COUNTER,
+                    int(self.__root_progress_health["attempt_count"]) + 1,
+                )
+            counts = self.__root_progress_health["outcome_counts"]
+            counts[outcome] = min(
+                self.__ROOT_PROGRESS_HEALTH_MAX_COUNTER,
+                int(counts.get(outcome, 0)) + 1,
+            )
+            if outcome == "summary_observed":
+                self.__root_progress_health["latest_summary"] = latest
+            else:
+                self.__root_progress_health["latest"] = latest
+            if representation is not None:
+                by_representation = self.__root_progress_health["latest_by_representation"]
+                if representation not in by_representation and len(by_representation) >= self.__ROOT_PROGRESS_HEALTH_MAX_REPRESENTATIONS:
+                    representation = "other"
+                by_representation[representation] = latest
+            return True
+
+    def __root_progress_health_snapshot(self) -> Dict[str, Any]:
+        health = copy.deepcopy(self.__root_progress_health)
+        health["enabled"] = self.is_effectively_enabled("model.progress", "debug")
+        return health
+
+    def __reset_root_progress_health_locked(self) -> None:
+        self.__root_progress_health = {
+            "schema": "model_root_progress_health.v1",
+            "attempt_semantics": "one_per_root_progress_attempt",
+            "attempt_count": 0,
+            "outcome_counts": {
+                outcome: 0 for outcome in (
+                    "trace_policy_disabled", "tracer_deduplicated", "emitter_rejected",
+                    "emitter_enqueued", "collector_accepted", "collector_evicted",
+                    "collector_rejected", "summary_observed",
+                )
+            },
+            "latest": None,
+            "latest_summary": None,
+            "latest_by_representation": {},
+        }
+
+    @staticmethod
+    def __clear_scope_includes_root_progress(clear_filters: Mapping[str, Any]) -> bool:
+        category = clear_filters.get("category")
+        if category == "model.progress":
+            return True
+        category_prefix = clear_filters.get("category_prefix")
+        if isinstance(category_prefix, str) and "model.progress".startswith(category_prefix):
+            return True
+        return clear_filters.get("source") == "root_progress"
 
     @property
     def memory_budget_bytes(self) -> int:
@@ -850,15 +1069,79 @@ class BreadcrumbTraceCollector:
                 with self.__ingress_rejected_count.get_lock():
                     rejected = int(self.__ingress_rejected_count.value)
             except Exception:
-                return
+                rejected = self.__ingress_rejected_seen
             delta = rejected - self.__ingress_rejected_seen
-            if delta <= 0:
-                return
-            start = self.__version + 1
-            self.__version += delta
-            self.__dropped_count += delta
-            self.__record_gap_range(start, self.__version, "ingress_rejected")
-            self.__ingress_rejected_seen = rejected
+            if delta > 0:
+                start = self.__version + 1
+                self.__version += delta
+                self.__dropped_count += delta
+                self.__record_gap_range(start, self.__version, "ingress_rejected")
+                self.__ingress_rejected_seen = rejected
+            self.__consume_root_progress_counter_locked(
+                "emitter_rejected", self.__root_progress_rejected_count,
+            )
+            self.__consume_root_progress_counter_locked(
+                "emitter_enqueued", self.__root_progress_enqueued_count,
+            )
+            self.__consume_root_progress_counter_locked(
+                "trace_policy_disabled", self.__root_progress_disabled_count,
+            )
+            self.__consume_root_progress_counter_locked(
+                "tracer_deduplicated", self.__root_progress_deduplicated_count,
+            )
+            self.__consume_root_progress_counter_locked(
+                "summary_observed", self.__root_progress_summary_count,
+                count_attempt=False,
+            )
+
+    def __consume_root_progress_counter_locked(
+            self, outcome: str, counter: multiprocessing.Value, *,
+            count_attempt: bool = True,
+    ) -> None:
+        """Fold child ingress outcomes into the non-evictable health summary."""
+        if outcome not in self.__ROOT_PROGRESS_HEALTH_OUTCOMES:
+            return
+        seen_name = {
+            "emitter_rejected": "_BreadcrumbTraceCollector__root_progress_rejected_seen",
+            "emitter_enqueued": "_BreadcrumbTraceCollector__root_progress_enqueued_seen",
+            "trace_policy_disabled": "_BreadcrumbTraceCollector__root_progress_disabled_seen",
+            "tracer_deduplicated": "_BreadcrumbTraceCollector__root_progress_deduplicated_seen",
+            "summary_observed": "_BreadcrumbTraceCollector__root_progress_summary_seen",
+        }.get(outcome)
+        if seen_name is None:
+            return
+        try:
+            with counter.get_lock():
+                current = int(counter.value)
+        except Exception:
+            return
+        seen = int(getattr(self, seen_name))
+        delta = current - seen
+        if delta <= 0:
+            return
+        setattr(self, seen_name, current)
+        health = self.__root_progress_health
+        if count_attempt:
+            health["attempt_count"] = min(
+                self.__ROOT_PROGRESS_HEALTH_MAX_COUNTER,
+                int(health["attempt_count"]) + delta,
+            )
+        counts = health["outcome_counts"]
+        counts[outcome] = min(
+            self.__ROOT_PROGRESS_HEALTH_MAX_COUNTER,
+            int(counts.get(outcome, 0)) + delta,
+        )
+        latest = {
+            "outcome": outcome,
+            "stage": "other",
+            "job_digest": "unknown",
+            "observed_ms": int(time.time_ns() / 1_000_000),
+            "details": {},
+        }
+        if outcome == "summary_observed":
+            health["latest_summary"] = latest
+        else:
+            health["latest"] = latest
 
     def clear(self, scope: object = None, **filters: Any) -> Dict[str, Any]:
         """Clear retained evidence, optionally restricted to one scope.
@@ -892,6 +1175,7 @@ class BreadcrumbTraceCollector:
                 self.__entry_sizes.clear()
                 self.__retained_bytes = 0
                 self.__latest_active_delta_rejection_summary = None
+                self.__reset_root_progress_health_locked()
             else:
                 kept_entries: Deque[Dict[str, Any]] = deque()
                 kept_sizes: Deque[int] = deque()
@@ -917,6 +1201,8 @@ class BreadcrumbTraceCollector:
             self.__last_signature = self.__signature(self.__entries[-1]) if self.__entries else None
             self.__coalesce_entries.clear()
             self.__refresh_failure_locked()
+            if self.__clear_scope_includes_root_progress(clear_filters):
+                self.__reset_root_progress_health_locked()
             self.__last_reset_version = self.__version
             self.__last_reset_reason = "clear"
             self.__reset_generation += 1
@@ -942,6 +1228,7 @@ class BreadcrumbTraceCollector:
             self.__last_failure_entry = None
             self.__last_failure_version = None
             self.__latest_active_delta_rejection_summary = None
+            self.__reset_root_progress_health_locked()
             self.__last_reset_version = self.__version
             self.__last_reset_reason = "reset"
             self.__reset_generation += 1
@@ -1121,6 +1408,7 @@ class BreadcrumbTraceCollector:
         # collector-owned coalescing. It is intentionally consumed here and
         # never retained or exported with the breadcrumb.
         coalesce_key = metadata.pop("_coalesce_key", None)
+        root_progress_observation = metadata.pop("_root_progress", False) is True
         if not isinstance(coalesce_key, str) or not coalesce_key:
             coalesce_key = None
         if not isinstance(category, str):
@@ -1197,7 +1485,9 @@ class BreadcrumbTraceCollector:
                     self.__last_failure_entry = copy.deepcopy(last_entry)
                     self.__last_failure_version = self.__version
                 self.__evict_to_budget()
-                return "retained" if self.__entry_range_is_retained(self.__version) else "dropped"
+                if self.__entry_range_is_retained(self.__version):
+                    return "retained"
+                return "evicted" if root_progress_observation else "dropped"
 
             self.__version += 1
             entry["version"] = self.__version
@@ -1222,7 +1512,9 @@ class BreadcrumbTraceCollector:
                 self.__last_failure_entry = copy.deepcopy(entry)
                 self.__last_failure_version = self.__version
             self.__evict_to_budget()
-            return "retained" if self.__entry_range_is_retained(self.__version) else "dropped"
+            if self.__entry_range_is_retained(self.__version):
+                return "retained"
+            return "evicted" if root_progress_observation else "dropped"
 
     def __entry_range_is_retained(self, version: int) -> bool:
         return any(
@@ -1632,6 +1924,7 @@ class BreadcrumbTraceCollector:
             "latest_failure_version": self.__last_failure_version,
             "latest_failure_entry": copy.deepcopy(self.__last_failure_entry),
             "failure_summary": self.__build_failure_summary(all_entries),
+            "root_progress_health": self.__root_progress_health_snapshot(),
             "active_delta_rejection_summary": copy.deepcopy(
                 self.__latest_active_delta_rejection_summary
             ),
@@ -1885,7 +2178,7 @@ class BreadcrumbTraceCollector:
                     if epoch == self.__policy_epoch:
                         self.__worker_policy_ack_revision = revision
                         self.__worker_policy_ack_epoch = epoch
-            self.__record_entry(
+            record_outcome = self.__record_entry(
                 source,
                 message,
                 record_mapping.get("details"),
@@ -1900,11 +2193,26 @@ class BreadcrumbTraceCollector:
                 path_pair_id=metadata.get("path_pair_id"),
                 path_pair_name=metadata.get("path_pair_name"),
                 _coalesce_key=metadata.get("_coalesce_key"),
+                _root_progress=metadata.get("_root_progress"),
                 worker_policy_revision=revision,
                 worker_policy_epoch=epoch,
                 created_ns=record_mapping.get("created_ns"),
                 created_ms=record_mapping.get("created_ms"),
             )
+            if metadata.get("category") == "model.progress" and metadata.get("_root_progress") is True:
+                health_outcome = {
+                    "retained": "collector_accepted",
+                    "coalesced": "collector_accepted",
+                    "evicted": "collector_evicted",
+                }.get(record_outcome, "collector_rejected")
+                stage = metadata.get("stage")
+                if isinstance(stage, str) and stage.startswith("root_progress_"):
+                    stage = stage[len("root_progress_"):]
+                details = record_mapping.get("details")
+                job_digest = details.get("job_digest") if isinstance(details, Mapping) else None
+                self.record_root_progress_health(
+                    health_outcome, stage, job_digest, details, count_attempt=False,
+                )
         if limit is not None and drained_count >= limit:
             try:
                 drain_limited = not self.__external_records.empty()

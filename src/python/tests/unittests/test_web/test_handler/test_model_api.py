@@ -205,6 +205,7 @@ class TestModelApi(unittest.TestCase):
         )
         self.assertEqual(8, invalidate_sse["details"]["model_version"])
         self.assertEqual(3, invalidate_sse["details"]["scope_version"])
+        self.assertEqual("scoped_sse", invalidate_sse["details"]["representation"])
         self.assertEqual(9, reset_serialization["details"]["model_version"])
         self.assertEqual(4, reset_serialization["details"]["scope_version"])
         self.assertNotIn("must-not-be-read", str(progress_entries))
