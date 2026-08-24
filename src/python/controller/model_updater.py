@@ -4876,13 +4876,10 @@ class ModelUpdater(_ControllerCoreAccess):
                 active_scan_progress_safe = active_scan_progress_inputs() is True
             except Exception:
                 active_scan_progress_safe = False
-        direct_reconciliation_due = bool(getattr(
-            controller, "_Controller__direct_root_counter_reconciliation_due", False,
-        ))
         read_only_counter_builder = getattr(model_builder, "build_read_only_lftp_root_counter_overlays", None)
         if lftp_status_poll_healthy and lftp_status_snapshot_fresh and \
                 lftp_status_source == "fresh_healthy" and active_scan_progress_safe and \
-                not direct_reconciliation_due and callable(read_only_counter_builder):
+                callable(read_only_counter_builder):
             try:
                 overlay_lock_started_ns = time.monotonic_ns()
                 with controller._Controller__model_lock:
@@ -4931,7 +4928,6 @@ class ModelUpdater(_ControllerCoreAccess):
                     overlay_admission_outcome = direct_outcome
                     if direct_outcome == "accepted":
                         active_progress_overlay_applied = True
-                        controller._Controller__direct_root_counter_reconciliation_due = True
                     if changed:
                         refresh_identities = getattr(
                             controller, "_refresh_model_file_command_identities_locked", None,
@@ -6930,8 +6926,5 @@ class ModelUpdater(_ControllerCoreAccess):
                         level=result_level,
                         child_identity=child_trace_identity,
                     )
-        if bool(getattr(controller, "_Controller__direct_root_counter_reconciliation_due", False)) and \
-                not model_builder.has_changes():
-            controller._Controller__direct_root_counter_reconciliation_due = False
         return full_build_triggered or progressive_delta_applied or authoritative_pair_delta_applied or \
             active_transfer_delta_applied
