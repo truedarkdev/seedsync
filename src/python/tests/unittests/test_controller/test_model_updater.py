@@ -6501,6 +6501,7 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("accepted", accepted["details"]["outcome"])
         self.assertEqual("lifecycle_epoch", rejected["details"]["outcome"])
         for step in (accepted, rejected):
+            self.assertEqual("none", step["details"]["active_scan_equivalence"])
             self.assertIn(step["details"]["lock_wait_duration_bucket"], {
                 "0-4", "5-19", "20-99", "100-499", "500-1999", "2000+",
             })
@@ -6537,6 +6538,46 @@ class TestModelUpdater(unittest.TestCase):
                 ModelUpdater(controller).update()
 
                 builder.adopt_active_progress_overlays.assert_not_called()
+
+    def test_direct_root_counter_lineage_classifies_active_tree_topology_mismatch(self):
+        def active_root(extra_child=False):
+            root = SystemFile("root", 100, True)
+            root.add_child(SystemFile("first", 25, False))
+            if extra_child:
+                root.add_child(SystemFile("second", 1, False))
+            return root
+
+        builder = ModelBuilder()
+        builder.set_remote_files([active_root()])
+        initial = LftpJobStatus(1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "")
+        initial.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        builder.set_lftp_statuses([initial])
+        builder.set_active_files([active_root()])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._take_lftp_status_poll_correlation = MagicMock(
+            return_value="lftp-poll:0123456789abcdef",
+        )
+        progressed = LftpJobStatus(1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "")
+        progressed.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 11, 7)
+        controller._Controller__lftp.status.return_value = [progressed]
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [active_root(extra_child=True)],
+        )
+
+        ModelUpdater(controller).update()
+
+        span = trace.snapshot()["progress_lineage"]["spans"][0]
+        direct = next(step for step in span["steps"] if step["phase"] == "direct_root_counter_publish")
+        self.assertEqual("invalidation_mixed", direct["details"]["outcome"])
+        self.assertEqual("topology", direct["details"]["active_scan_equivalence"])
 
     def test_same_tick_active_scan_progress_uses_projection_without_tree_build(self):
         builder = ModelBuilder()

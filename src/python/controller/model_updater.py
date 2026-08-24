@@ -4865,6 +4865,7 @@ class ModelUpdater(_ControllerCoreAccess):
         active_progress_overlay_applied = False
         overlay_adopter = getattr(model_builder, "adopt_active_progress_overlays", None)
         overlay_admission_outcome = "poll_gate"
+        active_scan_equivalence_failure = None
         direct_publish_timing: dict[str, object] = {}
         if lftp_status_poll_healthy and lftp_status_snapshot_fresh and \
                 lftp_status_source == "fresh_healthy" and callable(overlay_adopter):
@@ -4921,6 +4922,16 @@ class ModelUpdater(_ControllerCoreAccess):
                         (time.monotonic_ns() - direct_publish_started_ns) // 1_000_000,
                     )
                     overlay_admission_outcome = direct_outcome
+                    equivalence_reader = getattr(
+                        model_builder, "direct_progress_active_scan_equivalence_failure", None,
+                    )
+                    if direct_outcome == "invalidation_mixed" and callable(equivalence_reader):
+                        candidate_failure = equivalence_reader()
+                        if candidate_failure in {
+                                "root_set", "unknown", "status", "type", "pair", "sidecar",
+                                "collision", "metadata", "topology",
+                        }:
+                            active_scan_equivalence_failure = candidate_failure
                     if direct_outcome == "accepted":
                         active_progress_overlay_applied = True
                         overlay_adopter(model)
@@ -4943,7 +4954,11 @@ class ModelUpdater(_ControllerCoreAccess):
             )
             _record_progress_lineage(
                 controller, lftp_status_poll_correlation, "direct_root_counter_publish",
-                {"outcome": overlay_admission_outcome, **direct_publish_timing},
+                {
+                    "outcome": overlay_admission_outcome,
+                    "active_scan_equivalence": active_scan_equivalence_failure or "none",
+                    **direct_publish_timing,
+                },
             )
         active_transfer_delta_applied = False
         active_transfer_delta_adopted = False

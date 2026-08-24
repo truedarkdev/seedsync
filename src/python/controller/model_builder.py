@@ -264,6 +264,10 @@ class ModelBuilder:
         # classification separate from a normal active-scan invalidation.
         self.__active_progress_equivalent_root_file_ids: set[str] = set()
         self.__direct_progress_equivalent_root_file_ids: set[str] = set()
+        # Diagnostic-only reason why an active scan could not share the old
+        # strict same-tick projection.  This is an identity-free enum; it
+        # must never grant authority or affect invalidation consumption.
+        self.__direct_progress_active_scan_equivalence_failure: Optional[str] = None
         self.__direct_progress_deferred_active_scan_root_file_ids: set[str] = set()
         self.__direct_progress_active_scan_blocked_root_file_ids: set[str] = set()
         self.__lftp_regressed_root_file_ids: set[str] = set()
@@ -3525,6 +3529,7 @@ class ModelBuilder:
                         previous_active_files, next_active_files, touched_file_ids,
                 ):
                     self.__direct_progress_equivalent_root_file_ids = set(touched_file_ids)
+                    self.__direct_progress_active_scan_equivalence_failure = None
                     self.__direct_progress_deferred_active_scan_root_file_ids = {
                         file_id for file_id in touched_file_ids
                         if self.__active_root_has_descendant_progress_or_mtime_change(
@@ -3532,6 +3537,10 @@ class ModelBuilder:
                         )
                     }
                 else:
+                    self.__direct_progress_active_scan_equivalence_failure = \
+                        self.__direct_progress_active_scan_equivalence_failure_reason(
+                            previous_active_files, next_active_files, touched_file_ids,
+                        )
                     self.__direct_progress_active_scan_blocked_root_file_ids.update(touched_file_ids)
                     self.__direct_progress_equivalent_root_file_ids.clear()
                     self.__direct_progress_deferred_active_scan_root_file_ids.clear()
@@ -3633,6 +3642,56 @@ class ModelBuilder:
                     self.__active_root_identity_matches_except_progress_and_mtime(previous, current):
                 return False
         return True
+
+    @classmethod
+    def __active_root_direct_progress_difference(
+            cls, previous: SystemFile, current: SystemFile,
+    ) -> Optional[str]:
+        """Classify a strict active-tree mismatch without exposing a path."""
+        if previous.name != current.name or previous.is_dir != current.is_dir:
+            return "type"
+        if previous.path_pair_id != current.path_pair_id or \
+                previous.path_pair_name != current.path_pair_name:
+            return "pair"
+        if previous.is_staging != current.is_staging or \
+                previous.status_sidecar_ready != current.status_sidecar_ready:
+            return "sidecar"
+        if previous.has_staging_collision != current.has_staging_collision:
+            return "collision"
+        if previous.timestamp_created != current.timestamp_created:
+            return "metadata"
+        previous_children = tuple(previous.iter_children())
+        current_children = tuple(current.iter_children())
+        if len(previous_children) != len(current_children):
+            return "topology"
+        for previous_child, current_child in zip(previous_children, current_children):
+            difference = cls.__active_root_direct_progress_difference(previous_child, current_child)
+            if difference is not None:
+                return difference
+        return None
+
+    def __direct_progress_active_scan_equivalence_failure_reason(
+            self, previous_files: dict[str, SystemFile], next_files: dict[str, SystemFile],
+            touched_file_ids: set[str],
+    ) -> str:
+        if not touched_file_ids or not touched_file_ids.issubset(self.__lftp_touched_root_file_ids):
+            return "root_set"
+        for file_id in touched_file_ids:
+            previous, current = previous_files.get(file_id), next_files.get(file_id)
+            status = self.__lftp_statuses.get(file_id)
+            if previous is None or current is None:
+                return "unknown"
+            if status is None or status.file_id != file_id or \
+                    status.state != LftpJobStatus.State.RUNNING:
+                return "status"
+            difference = self.__active_root_direct_progress_difference(previous, current)
+            if difference is not None:
+                return difference
+        return "unknown"
+
+    def direct_progress_active_scan_equivalence_failure(self) -> Optional[str]:
+        """Return the last fixed active-scan comparator classification."""
+        return self.__direct_progress_active_scan_equivalence_failure
 
     def evict_active_file_ids(self, file_ids: Set[str]) -> None:
         """Drop exact active-scan roots during a completed move handoff."""

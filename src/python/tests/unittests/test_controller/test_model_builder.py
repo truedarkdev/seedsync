@@ -747,6 +747,7 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertTrue(self.model_builder.has_changes())
         self.assertIsNone(self.model_builder.build_active_progress_overlays(live_model.get_file_ids()))
+        self.assertEqual("topology", self.model_builder.direct_progress_active_scan_equivalence_failure())
 
     def test_direct_progress_overlay_accepts_deep_counter_mtime_churn_and_rejects_identity_changes(self):
         def active_tree(
@@ -863,6 +864,7 @@ class TestModelBuilder(unittest.TestCase):
                 self.assertIsNone(builder.build_active_progress_overlays(model.get_file_ids()))
                 self.assertNotEqual("accepted", builder.active_progress_overlay_admission_outcome())
                 self.assertTrue(builder.has_changes())
+                self.assertEqual(case, builder.direct_progress_active_scan_equivalence_failure())
 
     def test_direct_progress_barrier_is_scoped_to_unsafe_active_roots(self):
         def active_tree(name: str, size: int, mtime_ns: int, extra_children: int = 0) -> SystemFile:

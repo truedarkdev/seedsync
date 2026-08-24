@@ -468,6 +468,7 @@ class BreadcrumbTraceCollector:
         "selected_pair_duration_bucket", "global_copy_duration_bucket",
         "partial_build_duration_bucket", "updater_cycle_duration_bucket",
         "controller_cycle_duration_bucket", "overlay_admission",
+        "active_scan_equivalence",
     })
     __PROGRESS_LINEAGE_ENUMS = {
         "outcome": frozenset({
@@ -483,6 +484,10 @@ class BreadcrumbTraceCollector:
             "unknown_root", "global_safety", "status_shape", "accepted", "exception",
             "invalidation_scan", "invalidation_lifecycle", "invalidation_overlay",
             "invalidation_authority", "invalidation_unknown", "invalidation_mixed",
+        }),
+        "active_scan_equivalence": frozenset({
+            "none", "root_set", "unknown", "status", "type", "pair", "sidecar",
+            "collision", "metadata", "topology",
         }),
         "source": frozenset({
             "fresh_healthy", "fresh_unhealthy", "cached_retry", "cached_idle",
