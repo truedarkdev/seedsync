@@ -634,6 +634,195 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(200, live_model.get_file("retained.bin").remote_size)
         self.assertNotEqual(old_active, new_active)
 
+    def test_active_transfer_delta_selected_tree_matches_full_build_and_keeps_ownership(self):
+        remote_root = SystemFile("selected", 100, True)
+        remote_root.path_pair_id = "pair-a"
+        nested = SystemFile("nested", 60, True)
+        nested.add_child(SystemFile("first.bin", 30, False))
+        nested.add_child(SystemFile("second.bin", 30, False))
+        remote_root.add_child(nested)
+        remote_root.add_child(SystemFile("root.bin", 40, False))
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "selected", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 5, 12)
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_lftp_statuses([status])
+        full_model = self.model_builder.build_model()
+        root_file_id = ModelFile.build_file_id("selected", "pair-a")
+        partial = self.model_builder.build_active_transfer_roots({root_file_id})
+
+        full_root = full_model.get_file(root_file_id)
+        partial_root = partial.model.get_file(root_file_id)
+        self.assertEqual(full_root, partial_root)
+        self.assertIsNot(full_root, partial_root)
+        self.assertEqual(
+            [(child.name, child.full_path, child.file_id) for child in full_root.iter_children()],
+            [(child.name, child.full_path, child.file_id) for child in partial_root.iter_children()],
+        )
+        for child in partial_root.iter_children():
+            self.assertIs(partial_root, child.parent)
+            for descendant in child.iter_children():
+                self.assertIs(child, descendant.parent)
+
+    def test_active_transfer_delta_builds_each_selected_child_identity_once(self):
+        remote_root = SystemFile("selected", 120, True)
+        remote_root.path_pair_id = "pair-a"
+        child_names = ["child-{:03d}.bin".format(index) for index in range(24)]
+        for child_name in child_names:
+            remote_root.add_child(SystemFile(child_name, 5, False))
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.build_model()
+        root_file_id = ModelFile.build_file_id("selected", "pair-a")
+        expected_child_paths = {os.path.join("selected", name) for name in child_names}
+
+        with patch.object(ModelFile, "build_file_id", wraps=ModelFile.build_file_id) as build_file_id:
+            self.model_builder.build_active_transfer_roots({root_file_id})
+
+        selected_child_calls = [
+            call for call in build_file_id.call_args_list
+            if call.args and call.args[0] in expected_child_paths
+        ]
+        self.assertEqual(expected_child_paths, {call.args[0] for call in selected_child_calls})
+        self.assertEqual(len(expected_child_paths), len(selected_child_calls))
+
+    def test_active_transfer_delta_nested_lifecycle_overlay_matches_full_build(self):
+        remote_root = SystemFile("selected", 400, True)
+        remote_root.path_pair_id = "pair-a"
+        nested = SystemFile("nested", 300, True)
+        deeper = SystemFile("deeper", 260, True)
+        downloaded = SystemFile("downloaded.bin", 80, False)
+        finalized = SystemFile("finalized.bin", 90, False)
+        stopped = SystemFile("stopped.bin", 70, False)
+        active = SystemFile("active.bin", 20, False)
+        for child in (downloaded, finalized, stopped, active):
+            deeper.add_child(child)
+        nested.add_child(deeper)
+        remote_root.add_child(nested)
+
+        root_file_id = ModelFile.build_file_id("selected", "pair-a")
+        downloaded_id = ModelFile.build_file_id("selected/nested/deeper/downloaded.bin", "pair-a")
+        finalized_id = ModelFile.build_file_id("selected/nested/deeper/finalized.bin", "pair-a")
+        stopped_id = ModelFile.build_file_id("selected/nested/deeper/stopped.bin", "pair-a")
+        active_id = ModelFile.build_file_id("selected/nested/deeper/active.bin", "pair-a")
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "selected", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(200, 400, 50, 10, 20)
+        status.add_active_file_transfer_state(
+            "nested/deeper/active.bin", LftpJobStatus.TransferState(20, 20, 100, 10, 0),
+        )
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_lftp_statuses([status])
+        self.model_builder.set_downloaded_files({downloaded_id})
+        self.model_builder.set_downloaded_timestamps({downloaded_id: 1760000010.0})
+        self.model_builder.set_final_move_succeeded_files({finalized_id})
+        self.model_builder.set_stopped_files({stopped_id})
+        full_model = self.model_builder.build_model()
+        partial = self.model_builder.build_active_transfer_roots({root_file_id})
+
+        full_root = full_model.get_file(root_file_id)
+        partial_root = partial.model.get_file(root_file_id)
+        self.assertEqual(full_root, partial_root)
+        self.assertIsNot(full_root, partial_root)
+
+        def find_by_id(model_file, file_id):
+            if model_file.file_id == file_id:
+                return model_file
+            for child in model_file.iter_children():
+                found = find_by_id(child, file_id)
+                if found is not None:
+                    return found
+            return None
+
+        full_active = find_by_id(full_root, active_id)
+        partial_active = find_by_id(partial_root, active_id)
+        self.assertIsNotNone(full_active)
+        self.assertIsNotNone(partial_active)
+        self.assertEqual(ModelFile.State.DOWNLOADING, full_active.state)
+        self.assertEqual(20, full_active.transferred_size)
+        self.assertEqual(full_active, partial_active)
+        downloaded_file = find_by_id(full_root, downloaded_id)
+        finalized_file = find_by_id(full_root, finalized_id)
+        stopped_file = find_by_id(full_root, stopped_id)
+        self.assertIsNotNone(downloaded_file)
+        self.assertIsNotNone(finalized_file)
+        self.assertIsNotNone(stopped_file)
+        self.assertEqual(1760000010.0, downloaded_file.downloaded_timestamp.timestamp())
+        self.assertTrue(finalized_file.final_move_succeeded)
+        self.assertTrue(stopped_file.explicitly_stopped)
+
+        def assert_ownership(model_file):
+            for child in model_file.iter_children():
+                self.assertIs(model_file, child.parent)
+                assert_ownership(child)
+
+        assert_ownership(partial_root)
+
+    def test_active_transfer_delta_nested_size_aggregation_stops_at_live_ancestor(self):
+        remote_root = SystemFile("selected", 1000, True)
+        remote_root.path_pair_id = "pair-a"
+        remote_nested = SystemFile("nested", 800, True)
+        remote_nested.add_child(SystemFile("leaf.bin", 800, False))
+        remote_root.add_child(remote_nested)
+        active_root = SystemFile("selected", 500, True, is_staging=True)
+        active_root.path_pair_id = "pair-a"
+        active_nested = SystemFile("nested", 400, True, is_staging=True)
+        active_nested.add_child(SystemFile("leaf.bin", 250, False, is_staging=True))
+        active_root.add_child(active_nested)
+
+        root_file_id = ModelFile.build_file_id("selected", "pair-a")
+        nested_file_id = ModelFile.build_file_id("selected/nested", "pair-a")
+        leaf_file_id = ModelFile.build_file_id("selected/nested/leaf.bin", "pair-a")
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "selected", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(500, 1000, 50, 10, 50)
+        status.add_active_file_transfer_state(
+            "nested", LftpJobStatus.TransferState(400, 800, 50, 10, 40),
+        )
+        status.add_active_file_transfer_state(
+            "nested/leaf.bin", LftpJobStatus.TransferState(250, 800, 31, 10, 55),
+        )
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_active_files([active_root])
+        self.model_builder.set_lftp_statuses([status])
+        full_model = self.model_builder.build_model()
+        partial = self.model_builder.build_active_transfer_roots({root_file_id})
+
+        def find_by_id(model_file, file_id):
+            if model_file.file_id == file_id:
+                return model_file
+            for child in model_file.iter_children():
+                found = find_by_id(child, file_id)
+                if found is not None:
+                    return found
+            return None
+
+        for model in (full_model, partial.model):
+            root = model.get_file(root_file_id)
+            nested = find_by_id(root, nested_file_id)
+            leaf = find_by_id(root, leaf_file_id)
+            self.assertIsNotNone(nested)
+            self.assertIsNotNone(leaf)
+            self.assertEqual(500, root.transferred_size)
+            self.assertEqual(400, nested.transferred_size)
+            self.assertEqual(250, leaf.transferred_size)
+            self.assertNotEqual(
+                650, root.transferred_size,
+            )
+            self.assertNotEqual(
+                650, nested.transferred_size,
+            )
+        self.assertEqual(full_model.get_file(root_file_id), partial.model.get_file(root_file_id))
+
     def test_active_transfer_delta_falls_back_for_unknown_or_terminal_status_root(self):
         self.model_builder.set_remote_files([SystemFile("known.bin", 100, False)])
         live_model = self.model_builder.build_model()

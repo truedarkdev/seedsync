@@ -5094,6 +5094,7 @@ class ModelBuilder:
                 self.__transfer_state(status.total_transfer_state) if status is not None and
                 status.state == LftpJobStatus.State.RUNNING else None,
                 status.id if status is not None else None,
+                file_id=file_id,
             )
             self.__build_children(
                 model_file,
@@ -5102,6 +5103,7 @@ class ModelBuilder:
                 status,
                 root_seen_file_ids,
                 live_transferred_file_ids,
+                root_file_id=file_id,
             )
             self.__estimate_eta(model_file)
             incomplete_children, arbitration_source = self.__check_root_downloaded(
@@ -5408,6 +5410,7 @@ class ModelBuilder:
         status: Optional[LftpJobStatus],
         seen_file_ids: Set[str],
         live_transferred_file_ids: Set[str],
+        root_file_id: Optional[str] = None,
     ) -> None:
         # Traverse SystemFile children tree in BFS order
         # Store (remote, local, status, model_file) tuple in traversal frontier where remote and local
@@ -5418,17 +5421,22 @@ class ModelBuilder:
         #       merely used for traversing children
         frontier: deque[tuple[
             Optional[SystemFile], Optional[SystemFile], Optional[LftpJobStatus],
-            ModelFile, Optional[SystemFile], Optional[SystemFile], bool
+            ModelFile, Optional[SystemFile], Optional[SystemFile], bool,
+            str, str, tuple[str, ...]
         ]] = deque()
         if remote or local:
+            _root_full_path = root_model_file.full_path
+            _root_file_id = root_file_id if root_file_id is not None else root_model_file.file_id
             frontier.append((
                 remote, local, status, root_model_file, remote, local,
                 bool(getattr(local, "has_staging_collision", False)),
+                _root_full_path, _root_file_id, (),
             ))
         while frontier:
             (
                 _remote, _local, _status, _model_file, _root_remote, _root_local,
-                _ancestor_has_staging_collision,
+                _ancestor_has_staging_collision, _model_full_path, _model_file_id,
+                _ancestor_file_ids,
             ) = frontier.popleft()
             _remote_children: dict[str, SystemFile] = {sf.name: sf for sf in _remote.iter_children()} if _remote else {}
             _local_children: dict[str, SystemFile] = {sf.name: sf for sf in _local.iter_children()} if _local else {}
@@ -5446,6 +5454,10 @@ class ModelBuilder:
                    (_local_child and _is_dir != _local_child.is_dir):
                     raise ModelError("Mismatch in is_dir between child sources")
                 _child_model_file = ModelFile(_child_name, _is_dir)
+                _child_full_path = os.path.join(_model_full_path, _child_name)
+                _child_file_id = ModelFile.build_file_id(
+                    _child_full_path, _model_file.path_pair_id,
+                )
                 self.__apply_path_pair_metadata(
                     _child_model_file,
                     _model_file.path_pair_id,
@@ -5460,9 +5472,9 @@ class ModelBuilder:
                 # staging source here instead of publishing it as another
                 # root. Existing scanned local children remain authoritative.
                 if _local_child is None:
-                    _local_child = self.__active_files.get(_child_model_file.file_id)
-                seen_file_ids.add(_child_model_file.file_id)
-                _child_is_stopped = _child_model_file.file_id in self.__stopped_files
+                    _local_child = self.__active_files.get(_child_file_id)
+                seen_file_ids.add(_child_file_id)
+                _child_is_stopped = _child_file_id in self.__stopped_files
                 _child_model_file.explicitly_stopped = _child_is_stopped
                 _child_model_file.complete_local_coverage = not _ancestor_has_staging_collision and \
                     self.__directory_leaves_cover_remote_for_presentation(_remote_child, _local_child)
@@ -5482,7 +5494,7 @@ class ModelBuilder:
                 _child_current_transfer_state: Optional[_TransferState] = None
                 _child_recent_transfer_state: Optional[_TransferState] = None
                 _child_arbitration_source = "scan_only"
-                _child_status = self.__lftp_statuses.get(_child_model_file.file_id)
+                _child_status = self.__lftp_statuses.get(_child_file_id)
                 _child_live_status: Optional[LftpJobStatus] = None
                 if _child_status is not None and _child_status.state == LftpJobStatus.State.RUNNING and \
                         _child_status.type in (LftpJobStatus.Type.PGET, LftpJobStatus.Type.GET) and \
@@ -5501,7 +5513,7 @@ class ModelBuilder:
                         not self.__is_stopped_file(_status.file_id, _root_remote, _root_local, _status) and \
                         not _child_is_stopped:
                     # Transfer states are in root-relative paths.
-                    _child_status_path = "/".join(_child_model_file.full_path.split(os.sep)[1:])
+                    _child_status_path = "/".join(_child_full_path.split(os.sep)[1:])
                     for active_name, active_state in _status.get_active_file_transfer_states():
                         if active_name == _child_status_path:
                             _child_current_transfer_state = self.__transfer_state(active_state)
@@ -5511,7 +5523,7 @@ class ModelBuilder:
                         _child_arbitration_source = "live_status"
                 if _child_current_transfer_state is None and _status is None and _child_status is None:
                     _child_recent_transfer_state = self.__get_recent_live_transfer_state(
-                        _child_model_file.file_id,
+                        _child_file_id,
                         _remote_child,
                         _local_child,
                         _root_remote,
@@ -5551,6 +5563,8 @@ class ModelBuilder:
                     _child_current_transfer_state is not None,
                     _child_live_status.file_id if _child_live_status is not None else None,
                     live_transferred_file_ids,
+                    file_id=_child_file_id,
+                    ancestor_file_ids=(_model_file_id,) + _ancestor_file_ids,
                 )
                 # A successful child finalization persists an exact child
                 # identity before its staging entry is retired.  The raw
@@ -5558,11 +5572,11 @@ class ModelBuilder:
                 # sibling tree, so preserve that completed leaf's lifecycle
                 # presentation without promoting its parent directory.
                 _child_model_file.final_move_succeeded = (
-                    _child_model_file.file_id in self.__final_move_succeeded_files
+                    _child_file_id in self.__final_move_succeeded_files
                 )
                 if not _child_model_file.is_dir and \
                         _child_model_file.state == ModelFile.State.DEFAULT and \
-                        _child_model_file.file_id in (self.__downloaded_files or set()):
+                        _child_file_id in (self.__downloaded_files or set()):
                     _child_model_file.state = ModelFile.State.DOWNLOADED
                 _child_model_file.is_stoppable = self.__is_stoppable_model_file(
                     _child_model_file,
@@ -5573,12 +5587,12 @@ class ModelBuilder:
                 if self.__is_stop_resume_trace_enabled():
                     self.__trace_target_arbitration(
                         _child_model_file,
-                        root_model_file.file_id,
+                        _root_file_id,
                         _child_is_stopped,
                         _remote_child is not None,
                         _local_child is not None,
                         _local_child,
-                        _child_model_file.file_id in self.__active_file_ids,
+                        _child_file_id in self.__active_file_ids,
                         ModelBuilder.__summarize_local_freshness(_local_child),
                         _child_live_status,
                         _child_current_transfer_state,
@@ -5589,6 +5603,7 @@ class ModelBuilder:
                     _remote_child, _local_child, _status, _child_model_file, _root_remote, _root_local,
                     _ancestor_has_staging_collision or
                     bool(getattr(_local_child, "has_staging_collision", False)),
+                    _child_full_path, _child_file_id, (_model_file_id,) + _ancestor_file_ids,
                 ))
 
     def __fill_model_file(
@@ -5602,7 +5617,10 @@ class ModelBuilder:
         live_transferred_file_ids: Set[str],
         raw_transfer_state: Optional[_TransferState] = None,
         lftp_job_id: Optional[int] = None,
+        file_id: Optional[str] = None,
+        ancestor_file_ids: Optional[Tuple[str, ...]] = None,
     ) -> None:
+        effective_file_id = file_id if file_id is not None else model_file.file_id
         # set local and remote sizes
         model_file.remote_present = remote is not None
         model_file.local_present = local is not None
@@ -5622,8 +5640,8 @@ class ModelBuilder:
         if transfer_state:
             if store_recent_snapshot:
                 self.__store_recent_live_transfer_snapshot(
-                    model_file.file_id,
-                    recent_snapshot_root_file_id if recent_snapshot_root_file_id is not None else model_file.file_id,
+                    effective_file_id,
+                    recent_snapshot_root_file_id if recent_snapshot_root_file_id is not None else effective_file_id,
                     transfer_state,
                     raw_transfer_state,
                     lftp_job_id,
@@ -5633,7 +5651,7 @@ class ModelBuilder:
                 model_file.download_progress = download_progress
             if transfer_state.size_local is not None:
                 model_file.transferred_size = transfer_state.size_local
-                live_transferred_file_ids.add(model_file.file_id)
+                live_transferred_file_ids.add(effective_file_id)
             model_file.downloading_speed = transfer_state.speed
             model_file.eta = transfer_state.eta
 
@@ -5646,14 +5664,17 @@ class ModelBuilder:
                 transfer_state is None and getattr(local, "status_sidecar_ready", False) and
                 not model_file.explicitly_stopped
         ):
-            self.__update_transferred_size(model_file, remote, local, live_transferred_file_ids)
+            self.__update_transferred_size(
+                model_file, remote, local, live_transferred_file_ids,
+                ancestor_file_ids=ancestor_file_ids,
+            )
 
         # set the is_extractable flag
         self.__update_extractable_flag(model_file)
 
         # set the timestamps
         self.__update_timestamps(model_file, remote, local)
-        downloaded_timestamp = self.__downloaded_timestamps.get(model_file.file_id)
+        downloaded_timestamp = self.__downloaded_timestamps.get(effective_file_id)
         if downloaded_timestamp is not None:
             try:
                 model_file.downloaded_timestamp = datetime.fromtimestamp(downloaded_timestamp)
@@ -5670,6 +5691,7 @@ class ModelBuilder:
         remote: SystemFile,
         local: SystemFile,
         live_transferred_file_ids: Set[str],
+        ancestor_file_ids: Optional[Tuple[str, ...]] = None,
     ) -> None:
         if model_file.is_dir:
             if model_file.transferred_size is None:
@@ -5683,13 +5705,22 @@ class ModelBuilder:
             if model_file.transferred_size is not None:
                 # also update all parent directories
                 _parent_file = model_file.parent
-                while _parent_file is not None:
-                    if _parent_file.file_id in live_transferred_file_ids:
-                        break
-                    if _parent_file.transferred_size is None:
-                        _parent_file.transferred_size = 0
-                    _parent_file.transferred_size += model_file.transferred_size
-                    _parent_file = _parent_file.parent
+                if ancestor_file_ids is None:
+                    while _parent_file is not None:
+                        if _parent_file.file_id in live_transferred_file_ids:
+                            break
+                        if _parent_file.transferred_size is None:
+                            _parent_file.transferred_size = 0
+                        _parent_file.transferred_size += model_file.transferred_size
+                        _parent_file = _parent_file.parent
+                else:
+                    for ancestor_file_id in ancestor_file_ids:
+                        if _parent_file is None or ancestor_file_id in live_transferred_file_ids:
+                            break
+                        if _parent_file.transferred_size is None:
+                            _parent_file.transferred_size = 0
+                        _parent_file.transferred_size += model_file.transferred_size
+                        _parent_file = _parent_file.parent
 
     @staticmethod
     def __apply_local_only_union_progress(
