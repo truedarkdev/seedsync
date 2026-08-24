@@ -9273,6 +9273,101 @@ class TestController(unittest.TestCase):
             self.assertEqual({sidecar}, retained)
             self.assertTrue(os.path.exists(sidecar))
 
+    def test_collision_claim_sidecar_read_rejects_descriptor_identity_race(self):
+        payload = b'{"original_basename":"movie.mkv","path_pair_id":null,"version":1}'
+        before = SimpleNamespace(st_mode=stat.S_IFREG, st_size=len(payload), st_dev=1, st_ino=11)
+        replaced = SimpleNamespace(st_mode=stat.S_IFREG, st_size=len(payload), st_dev=1, st_ino=12)
+        with patch("controller.controller.os.lstat", return_value=before), \
+                patch("controller.controller.os.open", return_value=17), \
+                patch("controller.controller.os.fstat", return_value=replaced), \
+                patch("controller.controller.os.read") as read_mock, \
+                patch("controller.controller.os.close") as close_mock:
+            self.assertIsNone(Controller._Controller__read_collision_claim_sidecar("claim.json"))
+
+        read_mock.assert_not_called()
+        close_mock.assert_called_once_with(17)
+
+    def test_collision_claim_sidecar_read_allows_identity_fallback_when_inode_unavailable(self):
+        payload = b'{"original_basename":"movie.mkv","path_pair_id":null,"version":1}'
+        unsupported_identity = SimpleNamespace(
+            st_mode=stat.S_IFREG, st_size=len(payload), st_dev=0, st_ino=0,
+        )
+        with patch("controller.controller.os.lstat", return_value=unsupported_identity), \
+                patch("controller.controller.os.open", return_value=17), \
+                patch("controller.controller.os.fstat", return_value=unsupported_identity), \
+                patch("controller.controller.os.read", side_effect=(payload, b"")), \
+                patch("controller.controller.os.close"):
+            self.assertEqual(
+                ("movie.mkv", None),
+                Controller._Controller__read_collision_claim_sidecar("claim.json"),
+            )
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW requires POSIX")
+    def test_collision_claim_sidecar_read_uses_no_follow_descriptor_flag(self):
+        payload = b'{"original_basename":"movie.mkv","path_pair_id":null,"version":1}'
+        identity = SimpleNamespace(st_mode=stat.S_IFREG, st_size=len(payload), st_dev=1, st_ino=11)
+        with patch("controller.controller.os.lstat", return_value=identity), \
+                patch("controller.controller.os.open", return_value=17) as open_mock, \
+                patch("controller.controller.os.fstat", return_value=identity), \
+                patch("controller.controller.os.read", side_effect=(payload, b"")), \
+                patch("controller.controller.os.close"):
+            self.assertEqual(
+                ("movie.mkv", None),
+                Controller._Controller__read_collision_claim_sidecar("claim.json"),
+            )
+
+        self.assertTrue(open_mock.call_args.args[1] & os.O_NOFOLLOW)
+
+    @unittest.skipUnless(os.name == "posix", "symlink semantics require POSIX")
+    def test_collision_claim_sidecar_read_rejects_symlink_without_following_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "target.json")
+            sidecar = os.path.join(temp_dir, "claim.json")
+            Path(target).write_text(
+                '{"original_basename":"movie.mkv","path_pair_id":null,"version":1}', encoding="utf-8",
+            )
+            os.symlink(target, sidecar)
+
+            self.assertIsNone(Controller._Controller__read_collision_claim_sidecar(sidecar))
+
+    def test_collision_claim_recovery_stops_at_exact_artifact_cap_before_publication(self):
+        class StreamingEntries:
+            def __init__(self, entries):
+                self.entries = iter(entries)
+                self.next_calls = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.next_calls += 1
+                return next(self.entries)
+
+        entries = [
+            SimpleNamespace(
+                name=".seedsync-retire-" + "a" * 46 + "{:02x}".format(index),
+                path="claim-{}".format(index),
+            )
+            for index in range(129)
+        ]
+        entries.append(SimpleNamespace(name=".seedsync-retire-user.mkv", path="user-file"))
+        stream = StreamingEntries(entries)
+        self.controller._Controller__rename_no_replace = MagicMock()
+
+        with patch("controller.controller.os.scandir", return_value=stream):
+            retained, overflow = self.controller._Controller__recover_collision_claims("source", None)
+
+        self.assertEqual(set(), retained)
+        self.assertTrue(overflow)
+        self.assertEqual(129, stream.next_calls)
+        self.controller._Controller__rename_no_replace.assert_not_called()
+
     def test_recovery_overflow_retains_private_artifacts_beyond_scan_limit(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")

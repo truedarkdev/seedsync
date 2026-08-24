@@ -5522,14 +5522,56 @@ class Controller:
     def __collision_claim_owner_is_valid(value: object) -> bool:
         return value is None or (isinstance(value, str) and 0 < len(value) <= 512 and "\x00" not in value)
 
+    @staticmethod
+    def __collision_claim_sidecar_identity_matches(
+            expected: os.stat_result, opened: os.stat_result,
+    ) -> bool:
+        """Compare the no-follow snapshot to the descriptor when identities exist.
+
+        Windows filesystems which do not expose an inode report zero for it.
+        Retain the prior lstat validation on those filesystems, but whenever
+        either snapshot has a usable identity, require both to match exactly.
+        This makes a supported identity mismatch a fail-closed recovery error.
+        """
+        expected_device = getattr(expected, "st_dev", None)
+        expected_inode = getattr(expected, "st_ino", None)
+        opened_device = getattr(opened, "st_dev", None)
+        opened_inode = getattr(opened, "st_ino", None)
+        expected_identity = (
+            (expected_device, expected_inode)
+            if type(expected_device) is int and type(expected_inode) is int and expected_inode != 0
+            else None
+        )
+        opened_identity = (
+            (opened_device, opened_inode)
+            if type(opened_device) is int and type(opened_inode) is int and opened_inode != 0
+            else None
+        )
+        if expected_identity is None and opened_identity is None:
+            return True
+        return expected_identity is not None and expected_identity == opened_identity
+
     @classmethod
     def __read_collision_claim_sidecar(cls, sidecar_path: str) -> Optional[tuple[str, Optional[str]]]:
+        descriptor: Optional[int] = None
         try:
             sidecar_stat = os.lstat(sidecar_path)
             if not stat.S_ISREG(sidecar_stat.st_mode) or sidecar_stat.st_size > _COLLISION_CLAIM_SIDECAR_MAX_BYTES:
                 return None
-            with open(sidecar_path, "rb") as handle:
-                payload = handle.read(_COLLISION_CLAIM_SIDECAR_MAX_BYTES + 1)
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(sidecar_path, flags)
+            opened_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(opened_stat.st_mode) or \
+                    opened_stat.st_size > _COLLISION_CLAIM_SIDECAR_MAX_BYTES or \
+                    not cls.__collision_claim_sidecar_identity_matches(sidecar_stat, opened_stat):
+                return None
+            payload = bytearray()
+            read_limit = _COLLISION_CLAIM_SIDECAR_MAX_BYTES + 1
+            while len(payload) < read_limit:
+                chunk = os.read(descriptor, read_limit - len(payload))
+                if not chunk:
+                    break
+                payload.extend(chunk)
             if len(payload) > _COLLISION_CLAIM_SIDECAR_MAX_BYTES:
                 return None
             data = json.loads(payload.decode("utf-8"))
@@ -5540,6 +5582,12 @@ class Controller:
             return data["original_basename"], data["path_pair_id"]
         except (OSError, UnicodeDecodeError, ValueError, TypeError):
             return None
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     @classmethod
     def __write_collision_claim_sidecar(
@@ -5789,16 +5837,25 @@ class Controller:
         artifacts: set[str] = set()
         claims: dict[str, str] = {}
         sidecars: dict[str, str] = {}
-        for entry in sorted(os.scandir(source_directory), key=lambda item: item.name):
-            claim_match = re.fullmatch(r"\.seedsync-retire-([0-9a-f]{48})", entry.name)
-            sidecar_match = re.fullmatch(r"\.seedsync-retire-([0-9a-f]{48})\.json", entry.name)
-            if claim_match:
-                claims[claim_match.group(1)] = entry.path
-            elif sidecar_match:
-                sidecars[sidecar_match.group(1)] = entry.path
-            if len(claims) + len(sidecars) > _COLLISION_CLAIM_SCAN_LIMIT:
-                self.logger.warning("Too many private collision claim artifacts in '%s'; retaining them", source_directory)
-                return artifacts, True
+        with os.scandir(source_directory) as entries:
+            for entry in entries:
+                claim_match = re.fullmatch(r"\.seedsync-retire-([0-9a-f]{48})", entry.name)
+                sidecar_match = re.fullmatch(r"\.seedsync-retire-([0-9a-f]{48})\.json", entry.name)
+                if claim_match is None and sidecar_match is None:
+                    continue
+                # Do not materialize or sort a directory merely to discover an
+                # overflow. The first exact-token artifact past the configured
+                # cap retains the whole directory before any claim can publish.
+                if len(claims) + len(sidecars) >= _COLLISION_CLAIM_SCAN_LIMIT:
+                    self.logger.warning(
+                        "Too many private collision claim artifacts in '%s'; retaining them", source_directory,
+                    )
+                    return artifacts, True
+                if claim_match:
+                    claims[claim_match.group(1)] = entry.path
+                else:
+                    assert sidecar_match is not None
+                    sidecars[sidecar_match.group(1)] = entry.path
         for token in sorted(set(claims) | set(sidecars)):
             claim = claims.get(token)
             sidecar = sidecars.get(token)
