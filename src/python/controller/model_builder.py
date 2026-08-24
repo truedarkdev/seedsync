@@ -270,6 +270,7 @@ class ModelBuilder:
         self.__direct_progress_active_scan_equivalence_failure: Optional[str] = None
         self.__direct_progress_deferred_active_scan_root_file_ids: set[str] = set()
         self.__direct_progress_active_scan_blocked_root_file_ids: set[str] = set()
+        self.__direct_progress_structural_blocked_root_file_ids: set[str] = set()
         self.__lftp_regressed_root_file_ids: set[str] = set()
         self.__source_name_counts: dict[str, int] = {}
         # Global rendering hides local roots that collide by configured local
@@ -3537,11 +3538,13 @@ class ModelBuilder:
                         )
                     }
                 else:
-                    self.__direct_progress_active_scan_equivalence_failure = \
-                        self.__direct_progress_active_scan_equivalence_failure_reason(
-                            previous_active_files, next_active_files, touched_file_ids,
-                        )
+                    failure = self.__direct_progress_active_scan_equivalence_failure_reason(
+                        previous_active_files, next_active_files, touched_file_ids,
+                    )
+                    self.__direct_progress_active_scan_equivalence_failure = failure
                     self.__direct_progress_active_scan_blocked_root_file_ids.update(touched_file_ids)
+                    if failure in {"type", "pair", "sidecar", "collision", "topology"}:
+                        self.__direct_progress_structural_blocked_root_file_ids.update(touched_file_ids)
                     self.__direct_progress_equivalent_root_file_ids.clear()
                     self.__direct_progress_deferred_active_scan_root_file_ids.clear()
         finally:
@@ -4437,6 +4440,9 @@ class ModelBuilder:
         self.__direct_progress_active_scan_blocked_root_file_ids.difference_update(
             selected_root_ids.difference(self.__active_touched_root_file_ids),
         )
+        self.__direct_progress_structural_blocked_root_file_ids.difference_update(
+            selected_root_ids.difference(self.__active_touched_root_file_ids),
+        )
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
 
@@ -4566,6 +4572,71 @@ class ModelBuilder:
             MODEL_BUILDER_INVALIDATION_DOWNLOADED_FILES,
             MODEL_BUILDER_INVALIDATION_DOWNLOADED_TIMESTAMPS,
         }))
+
+    def has_only_live_progress_inputs(self) -> bool:
+        """Whether no non-progress authority is pending.
+
+        This is a read-only gate for the Model-owned LFTP root-counter
+        projection.  It deliberately neither admits a builder delta nor
+        consumes/coalesces any pending invalidation token.
+        """
+        return self.__invalidation_reasons.issubset({
+            MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
+            MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
+        })
+
+    def has_only_live_progress_with_active_scan(self) -> bool:
+        """Whether an active scan is the sole non-LFTP pending input."""
+        return MODEL_BUILDER_INVALIDATION_ACTIVE_FILES in self.__invalidation_reasons and \
+            self.has_only_live_progress_inputs()
+
+    def build_read_only_lftp_root_counter_overlays(
+            self, known_root_file_ids: Set[str] | Callable[[str], bool],
+            display_transfer_safe: Optional[Callable[[str], bool]] = None,
+    ) -> Optional[dict[str, ActiveProgressOverlay]]:
+        """Normalize fresh LFTP root counters without consuming builder state."""
+        root_ids = set(self.__lftp_touched_root_file_ids)
+        if not root_ids or self.__direct_progress_structural_blocked_root_file_ids.intersection(root_ids):
+            return None
+        if callable(known_root_file_ids):
+            try:
+                if not all(known_root_file_ids(file_id) for file_id in root_ids):
+                    return None
+            except Exception:
+                return None
+        elif not root_ids.issubset(known_root_file_ids):
+            return None
+        overlays: dict[str, ActiveProgressOverlay] = {}
+        for file_id in root_ids:
+            if display_transfer_safe is not None:
+                try:
+                    if not display_transfer_safe(file_id):
+                        return None
+                except Exception:
+                    return None
+            status = self.__lftp_statuses.get(file_id)
+            remote, local = self.__remote_file(file_id), self.__local_file(file_id)
+            if status is None or status.file_id != file_id or \
+                    status.state != LftpJobStatus.State.RUNNING or \
+                    self.__is_stopped_file(file_id, remote, local, status):
+                return None
+            try:
+                source = self.__transfer_state(status.total_transfer_state)
+                _, previous = self.__resolve_recent_live_transfer_snapshot(file_id, status.file_id)
+                current = self.__combine_split_root_transfer_state(
+                    source, remote, local, previous, status.id, status.type,
+                )
+                current = self.__coalesce_retained_stopped_transfer_state(
+                    file_id, status.file_id, remote, local, current, source,
+                    status.id, status.type,
+                )
+                progress = self.__normalize_download_progress(current.percent_local)
+            except (ModelError, TypeError, ValueError):
+                return None
+            if current.size_local is None and progress is None:
+                return None
+            overlays[file_id] = ActiveProgressOverlay(progress, current.size_local, current.speed, current.eta)
+        return overlays
 
     def has_only_pending_active_transfer_delta(self) -> bool:
         """Whether live transfer inputs are the only outstanding invalidation.
@@ -5297,6 +5368,7 @@ class ModelBuilder:
         self.__stop_resume_trace_last_signatures.clear()
         self.__direct_progress_deferred_active_scan_root_file_ids.clear()
         self.__direct_progress_active_scan_blocked_root_file_ids.clear()
+        self.__direct_progress_structural_blocked_root_file_ids.clear()
         self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_CLEAR)
         self.__cached_unresolved_staging_collision_file_ids.clear()
         self.__cached_terminalizable_staging_collision_file_ids.clear()
@@ -5341,6 +5413,7 @@ class ModelBuilder:
             self.__pending_invalidation_tokens.clear()
             self.__direct_progress_deferred_active_scan_root_file_ids.clear()
             self.__direct_progress_active_scan_blocked_root_file_ids.clear()
+            self.__direct_progress_structural_blocked_root_file_ids.clear()
             self.__active_transfer_delta_selector_failure = None
             self.__active_transfer_delta_status_missing_match = None
             return
@@ -5356,6 +5429,7 @@ class ModelBuilder:
         self.__active_progress_equivalent_root_file_ids.clear()
         self.__direct_progress_deferred_active_scan_root_file_ids.clear()
         self.__direct_progress_active_scan_blocked_root_file_ids.clear()
+        self.__direct_progress_structural_blocked_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
@@ -5402,6 +5476,7 @@ class ModelBuilder:
         self.__active_progress_equivalent_root_file_ids.clear()
         self.__direct_progress_deferred_active_scan_root_file_ids.clear()
         self.__direct_progress_active_scan_blocked_root_file_ids.difference_update(root_file_ids)
+        self.__direct_progress_structural_blocked_root_file_ids.difference_update(root_file_ids)
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
@@ -5717,6 +5792,7 @@ class ModelBuilder:
         self.__active_touched_root_file_ids.clear()
         self.__direct_progress_deferred_active_scan_root_file_ids.clear()
         self.__direct_progress_active_scan_blocked_root_file_ids.clear()
+        self.__direct_progress_structural_blocked_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None

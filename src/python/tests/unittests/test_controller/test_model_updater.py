@@ -59,7 +59,7 @@ from common.exclude_patterns import ExactPathExclusion
 from controller.scan.scanner_process import ScannerProcess, ScannerResult
 from lftp import LftpJobStatus
 from model.diff import ModelDiff
-from model import Model, ModelFile
+from model import ActiveProgressOverlay, Model, ModelFile
 from system import SystemFile
 from system.scanner import SystemScanner
 
@@ -6501,7 +6501,7 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("accepted", accepted["details"]["outcome"])
         self.assertEqual("lifecycle_epoch", rejected["details"]["outcome"])
         for step in (accepted, rejected):
-            self.assertEqual("none", step["details"]["active_scan_equivalence"])
+            self.assertEqual("model_owned", step["details"]["active_scan_equivalence"])
             self.assertIn(step["details"]["lock_wait_duration_bucket"], {
                 "0-4", "5-19", "20-99", "100-499", "500-1999", "2000+",
             })
@@ -6539,12 +6539,13 @@ class TestModelUpdater(unittest.TestCase):
 
                 builder.adopt_active_progress_overlays.assert_not_called()
 
-    def test_direct_root_counter_lineage_classifies_active_tree_topology_mismatch(self):
-        def active_root(extra_child=False):
-            root = SystemFile("root", 100, True)
+    def test_direct_root_counter_publishes_despite_active_metadata_churn_and_leaves_it_dirty(self):
+        def active_root(metadata_changed=False):
+            root = SystemFile(
+                "root", 100, True,
+                time_created=datetime.now() if metadata_changed else None,
+            )
             root.add_child(SystemFile("first", 25, False))
-            if extra_child:
-                root.add_child(SystemFile("second", 1, False))
             return root
 
         builder = ModelBuilder()
@@ -6569,15 +6570,30 @@ class TestModelUpdater(unittest.TestCase):
         progressed.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 11, 7)
         controller._Controller__lftp.status.return_value = [progressed]
         controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
-            datetime.now(), [active_root(extra_child=True)],
+            datetime.now(), [active_root(metadata_changed=True)],
+        )
+        normalized_overlay = ActiveProgressOverlay(77, 700, 11, 7)
+        builder.build_read_only_lftp_root_counter_overlays = MagicMock(
+            return_value={"root": normalized_overlay},
+        )
+        builder.build_active_progress_overlays = MagicMock(
+            side_effect=AssertionError("Model-owned projection must not call builder admission"),
+        )
+        builder.adopt_active_progress_overlays = MagicMock(
+            side_effect=AssertionError("Model-owned projection must not consume builder tokens"),
+        )
+        builder.build_active_transfer_roots = MagicMock(
+            side_effect=AssertionError("active reconciliation must defer to a later tick"),
         )
 
         ModelUpdater(controller).update()
 
         span = trace.snapshot()["progress_lineage"]["spans"][0]
         direct = next(step for step in span["steps"] if step["phase"] == "direct_root_counter_publish")
-        self.assertEqual("invalidation_mixed", direct["details"]["outcome"])
-        self.assertEqual("topology", direct["details"]["active_scan_equivalence"])
+        self.assertEqual("accepted", direct["details"]["outcome"])
+        self.assertEqual("model_owned", direct["details"]["active_scan_equivalence"])
+        self.assertEqual(normalized_overlay, live_model.active_progress_overlay("root"))
+        self.assertTrue(builder.has_changes())
 
     def test_same_tick_active_scan_progress_uses_projection_without_tree_build(self):
         builder = ModelBuilder()

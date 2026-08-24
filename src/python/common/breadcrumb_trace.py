@@ -486,7 +486,7 @@ class BreadcrumbTraceCollector:
             "invalidation_authority", "invalidation_unknown", "invalidation_mixed",
         }),
         "active_scan_equivalence": frozenset({
-            "none", "root_set", "unknown", "status", "type", "pair", "sidecar",
+            "none", "model_owned", "root_set", "unknown", "status", "type", "pair", "sidecar",
             "collision", "metadata", "topology",
         }),
         "source": frozenset({

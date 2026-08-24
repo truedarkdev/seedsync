@@ -4858,17 +4858,31 @@ class ModelUpdater(_ControllerCoreAccess):
             controller, lftp_status_poll_correlation, "pre_active_delta",
         )
         # Root-total LFTP progress has a deliberately narrower publication
-        # path than the historical active-root rebuild.  The builder admits
-        # only healthy, running canonical statuses and never derives child or
-        # ancestor values; the Model atomically replaces immutable overlay
-        # values and wakes scoped listeners without touching legacy streams.
+        # path than the historical active-root rebuild.  The Model owns this
+        # projection: it publishes only a normalized counter onto an already
+        # authoritative root and retains its lifecycle, job, and display
+        # fences.  Active scans intentionally remain builder-owned dirty work
+        # for a later reconciliation tick; they cannot veto or be consumed by
+        # a fresh exact LFTP root counter.
         active_progress_overlay_applied = False
-        overlay_adopter = getattr(model_builder, "adopt_active_progress_overlays", None)
         overlay_admission_outcome = "poll_gate"
-        active_scan_equivalence_failure = None
         direct_publish_timing: dict[str, object] = {}
+        active_scan_progress_inputs = getattr(
+            model_builder, "has_only_live_progress_with_active_scan", None,
+        )
+        active_scan_progress_safe = False
+        if callable(active_scan_progress_inputs):
+            try:
+                active_scan_progress_safe = active_scan_progress_inputs() is True
+            except Exception:
+                active_scan_progress_safe = False
+        direct_reconciliation_due = bool(getattr(
+            controller, "_Controller__direct_root_counter_reconciliation_due", False,
+        ))
+        read_only_counter_builder = getattr(model_builder, "build_read_only_lftp_root_counter_overlays", None)
         if lftp_status_poll_healthy and lftp_status_snapshot_fresh and \
-                lftp_status_source == "fresh_healthy" and callable(overlay_adopter):
+                lftp_status_source == "fresh_healthy" and active_scan_progress_safe and \
+                not direct_reconciliation_due and callable(read_only_counter_builder):
             try:
                 overlay_lock_started_ns = time.monotonic_ns()
                 with controller._Controller__model_lock:
@@ -4879,24 +4893,17 @@ class ModelUpdater(_ControllerCoreAccess):
                     job_identities: dict[str, tuple[int, str]] = {}
                     direct_publish_started_ns = time.monotonic_ns()
                     direct_outcome = "status_shape"
-                    overlay_builder = getattr(model_builder, "build_active_progress_overlays", None)
-                    if lftp_statuses and all(status.state == LftpJobStatus.State.RUNNING for status in lftp_statuses) and \
-                            callable(overlay_builder):
-                        overlay_values = overlay_builder(
+                    if lftp_statuses and all(status.state == LftpJobStatus.State.RUNNING for status in lftp_statuses):
+                        direct_overlays = read_only_counter_builder(
                             lambda file_id: file_id in model.get_file_ids(),
                             lambda file_id: model.get_file(file_id).display_size_total is None and
                             model.get_file(file_id).display_transferred_size is None,
                         )
-                        outcome_reader = getattr(model_builder, "active_progress_overlay_admission_outcome", None)
-                        direct_outcome = outcome_reader() if callable(outcome_reader) else "status_shape"
-                        if isinstance(overlay_values, dict) and direct_outcome == "accepted":
-                            direct_overlays = overlay_values
-                        else:
-                            direct_overlays = {}
-                    if direct_outcome == "accepted":
+                        if isinstance(direct_overlays, dict) and direct_overlays:
+                            direct_outcome = "accepted"
                         for status in lftp_statuses:
-                            if status.state != LftpJobStatus.State.RUNNING:
-                                continue
+                            if direct_outcome != "accepted":
+                                break
                             state = status.total_transfer_state
                             if type(status.id) is not int or status.id < 0 or \
                                     not isinstance(status.type.value, str) or \
@@ -4922,19 +4929,9 @@ class ModelUpdater(_ControllerCoreAccess):
                         (time.monotonic_ns() - direct_publish_started_ns) // 1_000_000,
                     )
                     overlay_admission_outcome = direct_outcome
-                    equivalence_reader = getattr(
-                        model_builder, "direct_progress_active_scan_equivalence_failure", None,
-                    )
-                    if direct_outcome == "invalidation_mixed" and callable(equivalence_reader):
-                        candidate_failure = equivalence_reader()
-                        if candidate_failure in {
-                                "root_set", "unknown", "status", "type", "pair", "sidecar",
-                                "collision", "metadata", "topology",
-                        }:
-                            active_scan_equivalence_failure = candidate_failure
                     if direct_outcome == "accepted":
                         active_progress_overlay_applied = True
-                        overlay_adopter(model)
+                        controller._Controller__direct_root_counter_reconciliation_due = True
                     if changed:
                         refresh_identities = getattr(
                             controller, "_refresh_model_file_command_identities_locked", None,
@@ -4942,11 +4939,9 @@ class ModelUpdater(_ControllerCoreAccess):
                         if callable(refresh_identities):
                             refresh_identities()
             except Exception:
-                # The established active delta remains the fail-closed path.
+                # The established reconciliation remains the fail-closed path.
                 active_progress_overlay_applied = False
                 overlay_admission_outcome = "exception"
-        elif not callable(overlay_adopter):
-            overlay_admission_outcome = "unavailable"
         if _controller_breadcrumb_effectively_enabled(controller, "model.progress", "debug"):
             _record_progress_lineage(
                 controller, lftp_status_poll_correlation, "active_progress_overlay_admission",
@@ -4956,7 +4951,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 controller, lftp_status_poll_correlation, "direct_root_counter_publish",
                 {
                     "outcome": overlay_admission_outcome,
-                    "active_scan_equivalence": active_scan_equivalence_failure or "none",
+                    "active_scan_equivalence": "model_owned",
                     **direct_publish_timing,
                 },
             )
@@ -6935,5 +6930,8 @@ class ModelUpdater(_ControllerCoreAccess):
                         level=result_level,
                         child_identity=child_trace_identity,
                     )
+        if bool(getattr(controller, "_Controller__direct_root_counter_reconciliation_due", False)) and \
+                not model_builder.has_changes():
+            controller._Controller__direct_root_counter_reconciliation_due = False
         return full_build_triggered or progressive_delta_applied or authoritative_pair_delta_applied or \
             active_transfer_delta_applied
