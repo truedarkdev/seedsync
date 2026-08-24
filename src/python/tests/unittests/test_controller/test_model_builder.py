@@ -864,6 +864,62 @@ class TestModelBuilder(unittest.TestCase):
                 self.assertNotEqual("accepted", builder.active_progress_overlay_admission_outcome())
                 self.assertTrue(builder.has_changes())
 
+    def test_direct_progress_barrier_is_scoped_to_unsafe_active_roots(self):
+        def active_tree(name: str, size: int, mtime_ns: int, extra_children: int = 0) -> SystemFile:
+            root = SystemFile(name, size, True, mtime_ns=100)
+            root.add_child(SystemFile("payload.bin", size, False, mtime_ns=mtime_ns))
+            for index in range(extra_children):
+                root.add_child(SystemFile(f"extra-{index}.bin", 1, False, mtime_ns=300 + index))
+            return root
+
+        def running_status(job_id: int, name: str, size: int) -> LftpJobStatus:
+            status = LftpJobStatus(
+                job_id, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, name, "",
+            )
+            status.total_transfer_state = LftpJobStatus.TransferState(size, 100, size, 10, 8)
+            return status
+
+        builder = ModelBuilder()
+        builder.set_remote_files([
+            active_tree("unsafe", 100, 1), active_tree("target", 100, 1),
+        ])
+        builder.set_lftp_statuses([
+            running_status(1, "unsafe", 20), running_status(2, "target", 20),
+        ])
+        builder.set_active_files([
+            active_tree("unsafe", 10, 1), active_tree("target", 10, 1),
+        ])
+        model = builder.build_model()
+
+        builder.set_lftp_statuses([
+            running_status(1, "unsafe", 21), running_status(2, "target", 20),
+        ])
+        builder.set_active_files([
+            active_tree("unsafe", 10, 1, extra_children=1), active_tree("target", 10, 1),
+        ])
+        self.assertIsNone(builder.build_active_progress_overlays(model.get_file_ids()))
+        self.assertEqual({"unsafe"}, builder._ModelBuilder__direct_progress_active_scan_blocked_root_file_ids)
+
+        builder.set_lftp_statuses([
+            running_status(1, "unsafe", 21), running_status(2, "target", 21),
+        ])
+        builder.set_active_files([
+            active_tree("unsafe", 10, 1, extra_children=1), active_tree("target", 11, 2),
+        ])
+        self.assertIsNotNone(
+            builder.build_active_progress_overlays(model.get_file_ids()),
+            builder.active_progress_overlay_admission_outcome(),
+        )
+
+        builder.set_lftp_statuses([
+            running_status(1, "unsafe", 22), running_status(2, "target", 21),
+        ])
+        builder.set_active_files([
+            active_tree("unsafe", 10, 1, extra_children=2), active_tree("target", 11, 2),
+        ])
+        self.assertIsNone(builder.build_active_progress_overlays(model.get_file_ids()))
+        self.assertNotEqual("accepted", builder.active_progress_overlay_admission_outcome())
+
     def test_active_progress_overlay_rejects_mixed_pending_active_root(self):
         self.model_builder.set_remote_files([
             SystemFile("active.bin", 100, False), SystemFile("unrelated.bin", 100, False),

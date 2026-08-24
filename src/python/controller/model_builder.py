@@ -265,7 +265,7 @@ class ModelBuilder:
         self.__active_progress_equivalent_root_file_ids: set[str] = set()
         self.__direct_progress_equivalent_root_file_ids: set[str] = set()
         self.__direct_progress_deferred_active_scan_root_file_ids: set[str] = set()
-        self.__direct_progress_active_scan_blocked = False
+        self.__direct_progress_active_scan_blocked_root_file_ids: set[str] = set()
         self.__lftp_regressed_root_file_ids: set[str] = set()
         self.__source_name_counts: dict[str, int] = {}
         # Global rendering hides local roots that collide by configured local
@@ -3532,8 +3532,7 @@ class ModelBuilder:
                         )
                     }
                 else:
-                    if touched_file_ids:
-                        self.__direct_progress_active_scan_blocked = True
+                    self.__direct_progress_active_scan_blocked_root_file_ids.update(touched_file_ids)
                     self.__direct_progress_equivalent_root_file_ids.clear()
                     self.__direct_progress_deferred_active_scan_root_file_ids.clear()
         finally:
@@ -3625,7 +3624,7 @@ class ModelBuilder:
             self, previous_files: dict[str, SystemFile], next_files: dict[str, SystemFile],
             touched_file_ids: set[str],
     ) -> bool:
-        if not touched_file_ids or touched_file_ids != self.__lftp_touched_root_file_ids:
+        if not touched_file_ids or not touched_file_ids.issubset(self.__lftp_touched_root_file_ids):
             return False
         for file_id in touched_file_ids:
             previous, current, status = previous_files.get(file_id), next_files.get(file_id), self.__lftp_statuses.get(file_id)
@@ -4376,11 +4375,9 @@ class ModelBuilder:
         )) if self.__pending_invalidation_tokens else set()
         self.__lftp_regressed_root_file_ids.intersection_update(self.__lftp_touched_root_file_ids)
         self.__cached_model = applied_model if not self.__pending_invalidation_tokens else None
-        if not any(
-                reason == MODEL_BUILDER_INVALIDATION_ACTIVE_FILES
-                for reason, _ in self.__pending_invalidation_tokens.values()
-        ):
-            self.__direct_progress_active_scan_blocked = False
+        self.__direct_progress_active_scan_blocked_root_file_ids.difference_update(
+            selected_root_ids.difference(self.__active_touched_root_file_ids),
+        )
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
 
@@ -4550,15 +4547,17 @@ class ModelBuilder:
         def reject(outcome: str) -> None:
             self.__active_progress_overlay_admission_outcome = outcome
 
-        if self.__direct_progress_active_scan_blocked:
-            reject("invalidation_scan")
-            return None
-
+        direct_root_ids = self.__direct_progress_equivalent_root_file_ids.intersection(
+            self.__lftp_touched_root_file_ids,
+        )
         direct_active_input = self.__invalidation_reasons == {
             MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
             MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
-        } and self.__direct_progress_equivalent_root_file_ids == self.__lftp_touched_root_file_ids and \
-            self.__active_touched_root_file_ids == self.__lftp_touched_root_file_ids
+        } and direct_root_ids == self.__direct_progress_equivalent_root_file_ids and \
+            bool(direct_root_ids) and \
+            self.__active_touched_root_file_ids.intersection(
+                direct_root_ids,
+            ) == direct_root_ids
         if self.__invalidation_reasons != {MODEL_BUILDER_INVALIDATION_LFTP_STATUSES} and not direct_active_input:
             non_lftp_reasons = self.__invalidation_reasons.difference({
                 MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
@@ -4586,7 +4585,10 @@ class ModelBuilder:
             else:
                 reject("invalidation_scope")
             return None
-        root_ids = set(self.__lftp_touched_root_file_ids)
+        root_ids = direct_root_ids if direct_active_input else set(self.__lftp_touched_root_file_ids)
+        if self.__direct_progress_active_scan_blocked_root_file_ids.intersection(root_ids):
+            reject("invalidation_scan")
+            return None
         if not root_ids or self.__lftp_regressed_root_file_ids.intersection(root_ids):
             reject("roots")
             return None
@@ -5235,7 +5237,7 @@ class ModelBuilder:
         self.__suppressed_ambiguous_extracted_file_names.clear()
         self.__stop_resume_trace_last_signatures.clear()
         self.__direct_progress_deferred_active_scan_root_file_ids.clear()
-        self.__direct_progress_active_scan_blocked = False
+        self.__direct_progress_active_scan_blocked_root_file_ids.clear()
         self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_CLEAR)
         self.__cached_unresolved_staging_collision_file_ids.clear()
         self.__cached_terminalizable_staging_collision_file_ids.clear()
@@ -5279,7 +5281,7 @@ class ModelBuilder:
             self.__cached_model = applied_model
             self.__pending_invalidation_tokens.clear()
             self.__direct_progress_deferred_active_scan_root_file_ids.clear()
-            self.__direct_progress_active_scan_blocked = False
+            self.__direct_progress_active_scan_blocked_root_file_ids.clear()
             self.__active_transfer_delta_selector_failure = None
             self.__active_transfer_delta_status_missing_match = None
             return
@@ -5294,7 +5296,7 @@ class ModelBuilder:
         self.__active_touched_root_file_ids.clear()
         self.__active_progress_equivalent_root_file_ids.clear()
         self.__direct_progress_deferred_active_scan_root_file_ids.clear()
-        self.__direct_progress_active_scan_blocked = False
+        self.__direct_progress_active_scan_blocked_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
@@ -5340,7 +5342,7 @@ class ModelBuilder:
         self.__active_touched_root_file_ids.clear()
         self.__active_progress_equivalent_root_file_ids.clear()
         self.__direct_progress_deferred_active_scan_root_file_ids.clear()
-        self.__direct_progress_active_scan_blocked = False
+        self.__direct_progress_active_scan_blocked_root_file_ids.difference_update(root_file_ids)
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
@@ -5655,7 +5657,7 @@ class ModelBuilder:
         self.__lftp_touched_root_file_ids.clear()
         self.__active_touched_root_file_ids.clear()
         self.__direct_progress_deferred_active_scan_root_file_ids.clear()
-        self.__direct_progress_active_scan_blocked = False
+        self.__direct_progress_active_scan_blocked_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
