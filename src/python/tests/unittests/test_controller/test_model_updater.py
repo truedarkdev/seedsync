@@ -4,6 +4,7 @@ import unittest
 import logging
 import os
 import tempfile
+from copy import copy
 from concurrent.futures import Future
 from datetime import datetime, timedelta
 from threading import RLock
@@ -8912,6 +8913,122 @@ class TestModelUpdater(unittest.TestCase):
             controller._Controller__pending_completion_file_names,
         )
         controller._Controller__local_scan_process.force_scan.assert_called_once_with(path_pair_id)
+
+    def test_fresh_empty_lftp_poll_releases_valid_partial_pget_to_resumable_default(self):
+        """A sidecar-backed partial is resumable, never an inferred Stop."""
+        file_name = "pending.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        remote = SystemFile(file_name, 10, False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, file_name)
+            with open(target, "wb") as handle:
+                handle.write(b"x" * 9)
+            with open(target + ".lftp-pget-status", "w", encoding="utf-8") as handle:
+                # This is the upstream-valid late PGET form: one base offset,
+                # no limit, and a physical staging file still one byte short.
+                handle.write("size=10\n0.pos=9\n")
+            active_scan_file = SystemScanner(temp_dir).scan_single(file_name)
+        self.assertIsNotNone(active_scan_file)
+        assert active_scan_file is not None
+        self.assertEqual(9, active_scan_file.size)
+        self.assertTrue(active_scan_file.status_sidecar_ready)
+        self.assertFalse(active_scan_file.is_staging)
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(10, 10, 100, 1, 0)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        # ActiveScanner leaves this flag false; ModelBuilder owns the staging
+        # interpretation for its own active-file copy. Preserve the raw scan
+        # object so ModelUpdater receives the real scanner provenance too.
+        builder.set_active_files([copy(active_scan_file)])
+        builder.set_lftp_statuses([running])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__prev_downloading_file_names = {(file_name, None, None)}
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"completion.gate": "info"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__record_breadcrumb = lambda **kwargs: trace.record(
+            "model_updater", kwargs["message"], kwargs["details"],
+            **{key: value for key, value in kwargs.items() if key not in {"message", "details"}},
+        )
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [active_scan_file], is_scan_final=True,
+        )
+        controller._Controller__lftp.status.return_value = []
+        self.assertFalse(active_scan_file.is_staging)
+
+        ModelUpdater(controller).update()
+
+        published = controller._Controller__model.get_file(file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, published.state)
+        self.assertIsNone(published.download_progress)
+        self.assertIn((file_name, None, None), controller._Controller__pending_completion_file_names)
+        self.assertNotIn(file_id, controller._Controller__persist.stopped_file_names)
+        controller._Controller__lftp.queue.assert_not_called()
+        pending = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "completion_pending_registered"
+        ]
+        self.assertEqual(1, len(pending))
+        self.assertEqual("lftp_job_finished", pending[0]["details"]["reason"])
+        self.assertNotIn(file_name, str(pending))
+        self.assertEqual("default", Controller._model_record_visible_state(published))
+
+        # Repeated empty polls leave the physical-proof owner pending, but do
+        # not reintroduce fake retained progress or dispatch another Queue.
+        ModelUpdater(controller).update()
+
+        retired = controller._Controller__model.get_file(file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, retired.state)
+        self.assertIsNone(retired.transferred_size)
+        self.assertIsNone(retired.download_progress)
+        self.assertEqual([], controller._Controller__active_downloading_file_names)
+        self.assertIn((file_name, None, None), controller._Controller__pending_completion_file_names)
+        self.assertNotIn(file_id, controller._Controller__persist.stopped_file_names)
+        controller._Controller__lftp.queue.assert_not_called()
+        self.assertEqual("default", Controller._model_record_visible_state(retired))
+
+    def test_fresh_empty_lftp_poll_honors_explicit_stop_despite_valid_sidecar(self):
+        file_name = "pending.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        remote = SystemFile(file_name, 10, False)
+        staged = SystemFile(file_name, 9, False, is_staging=True)
+        staged.status_sidecar_ready = True
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(9, 10, 90, 1, 0)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([staged])
+        builder.set_lftp_statuses([running])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=builder.build_model(),
+        )
+        controller._Controller__prev_downloading_file_names = {(file_name, None, None)}
+        controller._Controller__is_explicitly_stopped = MagicMock(return_value=True)
+        controller._Controller__persist.stopped_file_names.add(file_id)
+        active_staged = SystemFile(file_name, 9, False, is_staging=True)
+        active_staged.status_sidecar_ready = True
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [active_staged], is_scan_final=True,
+        )
+        controller._Controller__lftp.status.return_value = []
+
+        ModelUpdater(controller).update()
+
+        published = controller._Controller__model.get_file(file_id)
+        self.assertNotEqual(ModelFile.State.DOWNLOADING, published.state)
+        self.assertEqual([], controller._Controller__active_downloading_file_names)
+        self.assertNotIn((file_name, None, None), controller._Controller__pending_completion_file_names)
 
     def test_active_scan_force_retries_at_checkpoint_cadence_with_long_scan_interval(self):
         controller = SimpleNamespace(

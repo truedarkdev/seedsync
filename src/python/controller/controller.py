@@ -4384,6 +4384,25 @@ class Controller:
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
         if not _breadcrumb_effectively_enabled(breadcrumb_trace, "controller", "info"):
             return
+        # Older test/compatibility traces can expose an unconfigured effective
+        # gate alongside an explicit global gate.  Do not touch staging
+        # artifacts solely to build this optional boundary diagnostic when the
+        # latter has disabled tracing.
+        effective_gate = getattr(breadcrumb_trace, "is_effectively_enabled", None)
+        if callable(effective_gate):
+            try:
+                effective_result = effective_gate("controller", "info")
+            except Exception:
+                return
+            if not isinstance(effective_result, bool):
+                global_gate = getattr(breadcrumb_trace, "is_enabled", None)
+                if callable(global_gate):
+                    try:
+                        global_result = global_gate()
+                    except Exception:
+                        return
+                    if isinstance(global_result, bool) and not global_result:
+                        return
 
         temp_path = None
         sidecar_path = None

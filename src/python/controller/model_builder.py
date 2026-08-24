@@ -5611,6 +5611,9 @@ class ModelBuilder:
             model_file.remote_size = remote.size
         if local:
             model_file.local_size = local.size
+        model_file.resume_checkpoint_present = bool(
+            local is not None and getattr(local, "status_sidecar_ready", False)
+        )
 
         # LFTP counters are normalized to whole-root progress before this
         # point because resumed jobs can report only their remaining subset.
@@ -5634,8 +5637,15 @@ class ModelBuilder:
             model_file.downloading_speed = transfer_state.speed
             model_file.eta = transfer_state.eta
 
-        # set the transferred size (only if file or dir exists on both ends)
-        if local and remote:
+        # A parsed PGET sidecar is resumability metadata, not an owned live
+        # progress report. Once its RUNNING status has retired, presenting its
+        # physical bytes as retained DEFAULT progress makes the web state look
+        # like Stop even though no Stop occurred. Keep explicit Stop behavior,
+        # but otherwise wait for a live status or physical completion proof.
+        if local and remote and not (
+                transfer_state is None and getattr(local, "status_sidecar_ready", False) and
+                not model_file.explicitly_stopped
+        ):
             self.__update_transferred_size(model_file, remote, local, live_transferred_file_ids)
 
         # set the is_extractable flag

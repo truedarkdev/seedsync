@@ -2539,6 +2539,13 @@ class ModelUpdater(_ControllerCoreAccess):
         if new_file.file_id not in pending_completion_file_ids:
             return
 
+        # A parsed PGET sidecar remains a resumable checkpoint after the job
+        # retires. Do not turn its last live counters into a pending-completion
+        # floor: the physical move gate will keep observing it until a later
+        # scan proves completion, while DEFAULT must remain Queue-resumable.
+        if new_file.resume_checkpoint_present and not new_file.explicitly_stopped:
+            return
+
         # A pending completion can be invalidated when a healthy local scan
         # proves that the file reset/disappeared.  Keep that genuine reset
         # visible instead of copying the prior transfer checkpoint into the

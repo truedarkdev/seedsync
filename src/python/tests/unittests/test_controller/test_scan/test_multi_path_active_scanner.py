@@ -124,6 +124,8 @@ class TestMultiPathActiveScanner(unittest.TestCase):
         self.assertEqual(1, len(files))
         self.assertEqual("download.zip", files[0].name)
         self.assertEqual(30, files[0].size)
+        self.assertTrue(files[0].status_sidecar_ready)
+        self.assertFalse(files[0].is_staging)
         self.assertEqual("movies", files[0].path_pair_id)
         self.assertEqual("Movies", files[0].path_pair_name)
 

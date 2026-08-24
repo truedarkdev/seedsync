@@ -393,6 +393,41 @@ class TestController(unittest.TestCase):
         release.set()
         self.controller._Controller__lftp_executor.shutdown(wait=True)
 
+    def test_manual_queue_resumes_valid_sidecar_binding_once_after_idle_retirement(self):
+        """A resumable DEFAULT row keeps the confirmed remote binding on Queue."""
+        file = ModelFile("sample.bin", False)
+        file.remote_size = 10
+        file.state = ModelFile.State.DEFAULT
+        file.path_pair_id = "pair-a"
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        model.add_file(file)
+        self.controller._Controller__model = model
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__path_pairs_by_id = {
+            "pair-a": PathPair("/remote/pair-a", "/local/pair-a", id="pair-a"),
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            "pair-a": "/local/pair-a/incomplete",
+        }
+        self.controller._Controller__persist.resume_source_identities = {
+            file.file_id: (10, 1),
+        }
+        self.controller._Controller__model_builder.get_remote_resume_source_identity.return_value = (10, 1)
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            file.name,
+            False,
+            remote_base_dir_path="/remote/pair-a",
+            local_base_dir_path="/local/pair-a/incomplete",
+            allow_resume=True,
+            expected_size=10,
+        )
+
     def test_async_lftp_status_uses_one_inflight_future_then_completed_snapshot(self):
         self.controller._Controller__lftp.backend_name = "lftp"
         started = threading.Event()

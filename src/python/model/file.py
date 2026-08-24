@@ -400,6 +400,15 @@ class ModelFile:
         self.__set_runtime("complete_local_coverage", complete_local_coverage, False)
 
     @property
+    def resume_checkpoint_present(self) -> bool:
+        """Whether the current local source has validated LFTP resume metadata."""
+        return self.__runtime_value("resume_checkpoint_present", False)  # type: ignore[return-value]
+
+    @resume_checkpoint_present.setter
+    def resume_checkpoint_present(self, resume_checkpoint_present: bool):
+        self.__set_runtime("resume_checkpoint_present", resume_checkpoint_present, False)
+
+    @property
     def local_created_timestamp(self) -> datetime | None: return self.__local_created_timestamp
 
     @local_created_timestamp.setter
