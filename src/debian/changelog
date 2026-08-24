@@ -1,3 +1,19 @@
+seedsync (0.9.4) stable; urgency=low
+
+  * Fixed Queue requests during collision checks so SeedSync waits for the
+    relevant Path Pair scan when it can safely do so, while clearly rejecting
+    unsafe or stopped transfers instead of silently losing the request
+  * Fixed interrupted partial downloads so valid LFTP resume data remains
+    queueable after a terminal status refresh instead of appearing Stopped
+  * Made restart recovery safer when a staging-file collision is detected,
+    preserving suspicious recovery data for manual resolution
+  * Made Queue, Stop, Extract, Delete Local, Delete Remote, and Validate
+    controls appear immediately when expanding a file row
+  * Extended optional Breadcrumb diagnostics with privacy-safe active-transfer
+    lineage that connects status, model updates, and scoped browser delivery
+
+ -- Johan Rosén <johan.rosen.91@gmail.com>  Mon, 24 Aug 2026 00:00:00 +0200
+
 seedsync (0.9.3) stable; urgency=low
 
   * Fixed Queue, Stop, Delete Local, and Delete Remote for files inside
