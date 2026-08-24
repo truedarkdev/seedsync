@@ -463,6 +463,38 @@ class TestController(unittest.TestCase):
         self.assertTrue(self.controller.wait_for_process_wake(observed_generation, 1))
         self.controller._Controller__lftp_executor.shutdown(wait=True)
 
+    def test_async_lftp_poll_trace_keeps_submitted_token_after_lifecycle_clear(self):
+        self.controller._Controller__lftp.backend_name = "lftp"
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_status():
+            started.set()
+            release.wait(2)
+            return []
+
+        self.controller._Controller__lftp.status.side_effect = blocking_status
+        self.assertIsNone(self.controller._get_lftp_status_snapshot())
+        submitted = self.controller._Controller__lftp_status_poll_correlation
+        self.assertTrue(started.wait(1))
+        # Queue/reconfigure invalidation may clear or replace the controller's
+        # mutable correlation while the submitted PTY work remains running.
+        self.controller._Controller__lftp_status_poll_correlation = "lftp-poll:fedcba9876543210"
+        release.set()
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+        self.assertEqual(([], True), self.controller._get_lftp_status_snapshot())
+        self.assertIsNone(self.controller._take_lftp_status_poll_correlation())
+
+        spans = trace.snapshot()["progress_lineage"]["spans"]
+        old = next(span for span in spans if span["correlation"] == submitted)
+        self.assertEqual(["status_submit", "status_start", "status_finish"],
+                         [step["phase"] for step in old["steps"]])
+        self.assertFalse(any(span["correlation"] == "lftp-poll:fedcba9876543210" for span in spans))
+
     def test_async_queue_invalidates_completed_pre_queue_status_before_post_queue_poll(self):
         class TrackingFuture(Future):
             def __init__(self):

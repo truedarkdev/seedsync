@@ -874,6 +874,7 @@ class Controller:
         self.__lftp_operation_sequences: dict[str, int] = {}
         self.__lftp_failed_operation_sequences: set[tuple[str, int]] = set()
         self.__lftp_status_future: Optional[Future[object]] = None
+        self.__lftp_status_future_correlation: Optional[str] = None
 
     def __init__(self,
                  context: Context,
@@ -1121,6 +1122,7 @@ class Controller:
         self.__lftp_operation_sequences = {}
         self.__lftp_failed_operation_sequences = set()
         self.__lftp_status_future = None
+        self.__lftp_status_future_correlation = None
 
         # Keep track of active command processes
         self.__active_command_processes = []
@@ -1298,6 +1300,7 @@ class Controller:
                 # ordering, but abandon the reference so the next updater poll
                 # submits an authoritative post-Queue status behind this job.
                 self.__lftp_status_future = None
+                self.__lftp_status_future_correlation = None
                 self.__lftp_status_poll_correlation = None
                 self.__next_lftp_status_poll_at = None
                 self.__lftp_idle_status_authoritative = False
@@ -1570,21 +1573,35 @@ class Controller:
         return any(
             _breadcrumb_effectively_enabled(trace, category, level)
             for category, level in (
+                ("model.progress", "debug"),
                 ("transfer.lftp", "debug"),
                 ("transfer.lftp", "warning"),
                 ("completion.gate", "info"),
             )
         )
 
-    def __begin_lftp_status_poll_lineage(self) -> None:
+    def __begin_lftp_status_poll_lineage(self) -> Optional[str]:
         """Start one bounded, opaque lineage for a submitted PTY status poll."""
         if getattr(self.__lftp, "backend_name", "lftp") == "rclone":
             self.__lftp_status_poll_correlation = None
-            return
+            return None
         if not self.__lftp_status_lineage_enabled():
             self.__lftp_status_poll_correlation = None
-            return
+            return None
         self.__lftp_status_poll_correlation = "lftp-poll:{}".format(secrets.token_hex(8))
+        return self.__lftp_status_poll_correlation
+
+    def __record_lftp_status_poll_lineage(
+            self, correlation: object, phase: str, details: Optional[dict[str, object]] = None,
+    ) -> None:
+        """Best-effort timing marker; never participates in LFTP ownership."""
+        trace = getattr(getattr(self, "_Controller__context", None), "breadcrumb_trace", None)
+        recorder = getattr(trace, "record_progress_lineage", None)
+        if callable(recorder):
+            try:
+                recorder(correlation, phase, details)
+            except Exception:
+                pass
 
     def _take_lftp_status_poll_correlation(self) -> Optional[str]:
         """Consume the current diagnostic-only status poll lineage."""
@@ -1595,11 +1612,20 @@ class Controller:
     def _get_lftp_status_snapshot(self) -> Optional[tuple[list[LftpJobStatus], bool]]:
         """Return a completed snapshot, or None while the one PTY poll is in flight."""
         begin_lineage = getattr(self, "_Controller__begin_lftp_status_poll_lineage", None)
+        record_lineage = getattr(self, "_Controller__record_lftp_status_poll_lineage", None)
         if not self.__uses_async_lftp_owner():
             if callable(begin_lineage):
-                begin_lineage()
+                correlation = begin_lineage()
+            else:
+                correlation = None
+            if callable(record_lineage):
+                record_lineage(correlation, "status_submit")
             try:
+                if callable(record_lineage):
+                    record_lineage(correlation, "status_start")
                 statuses = self.__lftp.status()
+                if callable(record_lineage):
+                    record_lineage(correlation, "status_finish")
             except Exception:
                 # A failed synchronous poll has no completed snapshot for the
                 # updater to consume, so do not let its lineage leak into a
@@ -1610,17 +1636,37 @@ class Controller:
         future = getattr(self, "_Controller__lftp_status_future", None)
         if future is None:
             if callable(begin_lineage):
-                begin_lineage()
+                correlation = begin_lineage()
+            else:
+                correlation = None
+            if callable(record_lineage):
+                record_lineage(correlation, "status_submit")
             def poll() -> tuple[list[LftpJobStatus], bool]:
-                statuses = self.__lftp.status()
-                return (list(statuses or []), bool(getattr(self.__lftp, "last_status_poll_healthy", True)))
+                if callable(record_lineage):
+                    record_lineage(correlation, "status_start")
+                try:
+                    statuses = self.__lftp.status()
+                    if callable(record_lineage):
+                        record_lineage(correlation, "status_finish")
+                    return (list(statuses or []), bool(getattr(self.__lftp, "last_status_poll_healthy", True)))
+                except Exception:
+                    if callable(record_lineage):
+                        record_lineage(correlation, "status_finish", {"outcome": "exception"})
+                    raise
             if not self.__submit_lftp_operation("status", poll):
                 self.__lftp_status_poll_correlation = None
                 return None
+            self.__lftp_status_future_correlation = correlation if isinstance(correlation, str) else None
             return None
         if not future.done():
             return None
         self.__lftp_status_future = None
+        completed_correlation = getattr(self, "_Controller__lftp_status_future_correlation", None)
+        self.__lftp_status_future_correlation = None
+        if completed_correlation != getattr(self, "_Controller__lftp_status_poll_correlation", None):
+            # The reference may have been retired by Queue/reconfigure. The
+            # snapshot remains useful, but it must not consume a newer token.
+            self.__lftp_status_poll_correlation = None
         try:
             return cast(tuple[list[LftpJobStatus], bool], future.result())
         except Exception as exc:

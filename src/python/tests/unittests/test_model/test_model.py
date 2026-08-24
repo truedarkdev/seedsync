@@ -5,7 +5,7 @@ import sys
 import unittest
 from unittest.mock import MagicMock, call
 
-from common import overrides
+from common import BreadcrumbTraceCollector, overrides
 from model import Model, ModelFile, IModelListener, ModelError
 
 
@@ -24,6 +24,50 @@ class DummyModelListener(IModelListener):
 
 
 class TestLftpModel(unittest.TestCase):
+    def test_version_callbacks_keep_captured_versions_across_reentrant_listener_mutation(self):
+        first = ModelFile("first", False)
+        second = ModelFile("second", False)
+        observed = []
+
+        class ReentrantListener(DummyModelListener):
+            def model_version_changed(self, version, path_pair_id, file_id):
+                if file_id == first.file_id:
+                    self_model.add_file(second)
+
+            def model_version_published(self, scope_version, global_version, path_pair_id, file_id):
+                observed.append((file_id, global_version))
+
+        self_model = self.model
+        self.model.add_listener(ReentrantListener())
+        self.model.add_file(first)
+
+        self.assertIn((first.file_id, 1), observed)
+        self.assertIn((second.file_id, 2), observed)
+
+    def test_publication_mapping_survives_later_caller_exception(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        self.model.set_version_publication_callback(
+            lambda global_version, scope_version: trace.record_progress_lineage(
+                "lftp-poll:0123456789abcdef", "model_mutation",
+                {"outcome": "mutated", "model_version": global_version,
+                 "scope_version": scope_version},
+            )
+        )
+        try:
+            self.model.add_file(ModelFile("published", False))
+            self.model.add_file(ModelFile("published-second", False))
+            raise RuntimeError("later updater work failed")
+        except RuntimeError:
+            pass
+        self.assertTrue(trace.record_progress_lineage_for_model_version(
+            1, "scoped_stream_emit", {"scope_version": 1},
+        ))
+        self.assertTrue(trace.record_progress_lineage_for_model_version(
+            2, "scoped_stream_emit", {"scope_version": 2},
+        ))
+
     def setUp(self):
         logger = logging.getLogger(TestLftpModel.__name__)
         handler = logging.StreamHandler(sys.stdout)

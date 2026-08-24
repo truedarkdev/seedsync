@@ -506,6 +506,17 @@ class TestModelApi(unittest.TestCase):
         self.controller.remove_model_listener(listener)
         listener.close()
 
+    def test_scoped_listener_does_not_publish_before_atomic_origin_attachment(self):
+        listener = ScopedModelListener("pair-a")
+        # This models an interleaving immediately after Model's preserved
+        # legacy callback. It cannot expose an event without its origin.
+        listener.model_version_changed(4, "pair-a", "file-a")
+        self.assertIsNone(listener.take_next_event())
+        listener.model_version_published(4, 12, "pair-a", "file-a")
+        event = listener.take_next_event()
+        self.assertEqual(4, event["model_version"])
+        self.assertEqual(12, event["_origin_global_model_version"])
+
     def test_add_delete_changes_coalesce_to_scoped_invalidation(self):
         existing = self._file("existing", "pair-a")
         self.model.add_file(existing)
@@ -555,6 +566,84 @@ class TestModelApi(unittest.TestCase):
         self.assertEqual(changed.file_id, json.loads(update.split("data: ", 1)[1])["records"][0]["file_id"])
         stream.close()
 
+    def test_delayed_scoped_event_keeps_origin_lineage_not_later_cross_scope_version(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        a_root = self._file("a-root", "pair-a")
+        b_root = self._file("b-root", "pair-b")
+        self.model.add_file(a_root)
+        self.model.add_file(b_root)
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=trace)
+        environ: dict[str, object] = {}
+        setup_testing_defaults(environ)
+        environ["QUERY_STRING"] = "limit=1"
+        bottle.request.bind(environ)
+        bottle.response.bind()
+        stream = handler._ModelApiHandler__handle_stream("pair-a")
+        next(stream)
+
+        a_changed = self._file("a-root", "pair-a")
+        a_changed.local_size = 1
+        self.model.update_file(a_changed)
+        a_version = self.model.version
+        trace.record_progress_lineage(
+            "lftp-poll:0123456789abcdef", "model_mutation",
+            {"outcome": "mutated", "model_version": a_version},
+        )
+        b_changed = self._file("b-root", "pair-b")
+        b_changed.local_size = 2
+        self.model.update_file(b_changed)
+        b_version = self.model.version
+        trace.record_progress_lineage(
+            "lftp-poll:fedcba9876543210", "model_mutation",
+            {"outcome": "mutated", "model_version": b_version},
+        )
+
+        next(stream)
+        spans = trace.snapshot()["progress_lineage"]["spans"]
+        a_span = next(span for span in spans if span["correlation"] == "lftp-poll:0123456789abcdef")
+        b_span = next(span for span in spans if span["correlation"] == "lftp-poll:fedcba9876543210")
+        self.assertEqual("scoped_stream_emit", a_span["steps"][-1]["phase"])
+        self.assertEqual("model_mutation", b_span["steps"][-1]["phase"])
+        stream.close()
+
+    def test_large_multi_scope_delayed_events_link_early_and_late_range_versions(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        correlation = "lftp-poll:0123456789abcdef"
+        for phase in ("status_submit", "status_start", "status_finish", "status_consume", "updater_decision"):
+            trace.record_progress_lineage(correlation, phase, {"outcome": "ok", "source": "fresh_healthy"})
+        listeners = {"pair-a": ScopedModelListener("pair-a"), "pair-b": ScopedModelListener("pair-b")}
+        for global_version in range(1, 41):
+            scope = "pair-a" if global_version % 2 else "pair-b"
+            scope_version = (global_version + 1) // 2 if scope == "pair-a" else global_version // 2
+            listeners[scope].model_version_published(
+                scope_version, global_version, scope, "file-{}".format(global_version),
+            )
+            trace.record_progress_lineage(
+                correlation, "model_mutation",
+                {"outcome": "mutated", "model_version": global_version, "scope_version": scope_version},
+            )
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=trace)
+        for scope, listener in listeners.items():
+            event = listener.take_next_event()
+            handler._ModelApiHandler__sse(
+                "scoped", "model-invalidate", event, event["model_version"], 40, scope,
+                event["_origin_global_model_version"],
+            )
+        span = trace.snapshot()["progress_lineage"]["spans"][0]
+        self.assertEqual(1, next(step for step in span["steps"] if step["phase"] == "model_mutation")["details"]["model_version_first"])
+        self.assertEqual(40, next(step for step in span["steps"] if step["phase"] == "model_mutation")["details"]["model_version_last"])
+        emitted = next(step for step in span["steps"] if step["phase"] == "scoped_stream_emit")
+        self.assertEqual("2-4", emitted["details"]["scoped_stream_count_bucket"])
+        self.assertEqual(
+            ["status_submit", "status_start", "status_finish", "status_consume", "updater_decision"],
+            [step["phase"] for step in span["steps"][:5]],
+        )
+
     def test_scoped_stream_prioritizes_selected_pair_before_initial_page(self):
         self.model.add_file(self._file("root", "pair-a"))
         handler = ModelApiHandler(self.controller)
@@ -573,17 +662,43 @@ class TestModelApi(unittest.TestCase):
     def test_listener_bounds_reset_and_cleanup(self):
         listener = ScopedModelListener("pair-a")
         for number in range(listener._MAX_IDENTITIES + 1):
-            listener.model_version_changed(number + 1, "pair-a", "file-{}".format(number))
+            listener.model_version_published(number + 1, number + 1, "pair-a", "file-{}".format(number))
         reset = listener.take_next_event()
         self.assertEqual("model-reset", reset["event"])
         self.assertEqual("coalesced", reset["reason"])
         listener.close()
-        listener.model_version_changed(999, "pair-a", "ignored")
+        listener.model_version_published(999, 999, "pair-a", "ignored")
         self.assertIsNone(listener.take_next_event())
+
+    def test_coalesced_reset_retains_origin_for_lineage_but_synthetic_reset_does_not(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        listener = ScopedModelListener("pair-a")
+        for number in range(listener._MAX_IDENTITIES + 1):
+            listener.model_version_published(number + 1, number + 1, "pair-a", "file-{}".format(number))
+        event = listener.take_next_event()
+        self.assertEqual(listener._MAX_IDENTITIES + 1, event["_origin_global_model_version"])
+        trace.record_progress_lineage(
+            "lftp-poll:0123456789abcdef", "model_mutation",
+            {"outcome": "mutated", "model_version": event["_origin_global_model_version"]},
+        )
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=trace)
+        handler._ModelApiHandler__sse(
+            "scoped", "model-reset", event, event["model_version"], 999, "pair-a",
+            event["_origin_global_model_version"],
+        )
+        span = trace.snapshot()["progress_lineage"]["spans"][0]
+        self.assertEqual("scoped_stream_emit", span["steps"][-1]["phase"])
+        # Reconnect-generated resets have no listener origin and are refused.
+        handler._ModelApiHandler__sse(
+            "scoped", "model-reset", {"model_version": 1}, 1, 999, "pair-a", None,
+        )
+        self.assertEqual(2, len(span["steps"]))
 
     def test_scoped_listener_waits_until_a_matching_event(self):
         listener = ScopedModelListener("pair-a")
-        timer = Timer(0.01, lambda: listener.model_version_changed(1, "pair-a", "file-a"))
+        timer = Timer(0.01, lambda: listener.model_version_published(1, 1, "pair-a", "file-a"))
         timer.start()
         try:
             self.assertTrue(listener.wait_for_event(1.0))
@@ -611,7 +726,7 @@ class TestModelApi(unittest.TestCase):
             roots.append(root)
         listener = ScopedModelListener("pair-a")
         for number, root in enumerate(roots[:200]):
-            listener.model_version_changed(number + 1, "pair-a", root.file_id)
+            listener.model_version_published(number + 1, number + 1, "pair-a", root.file_id)
         event = listener.take_next_event()
         self.assertEqual("model-invalidate", event["event"])
         updates = self.controller.get_model_root_updates("pair-a", event["file_ids"])
@@ -620,7 +735,7 @@ class TestModelApi(unittest.TestCase):
 
         listener = ScopedModelListener("pair-a")
         for number, root in enumerate(roots):
-            listener.model_version_changed(number + 1, "pair-a", root.file_id)
+            listener.model_version_published(number + 1, number + 1, "pair-a", root.file_id)
         reset = listener.take_next_event()
         self.assertEqual("model-reset", reset["event"])
 

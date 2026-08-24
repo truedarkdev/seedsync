@@ -10,7 +10,7 @@ import multiprocessing
 import os
 import queue
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from threading import Lock, RLock
 from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Protocol, cast
 
@@ -446,6 +446,37 @@ class BreadcrumbTraceCollector:
     })
     __ROOT_PROGRESS_HEALTH_MAX_COUNTER = 2_147_483_647
     __ROOT_PROGRESS_HEALTH_MAX_REPRESENTATIONS = 8
+    # This deliberately lives outside the ordinary event deque: a busy trace
+    # must not erase the small causal record needed to explain a progress gap.
+    __PROGRESS_LINEAGE_MAX_SPANS = 32
+    __PROGRESS_LINEAGE_MAX_STEPS = 12
+    __PROGRESS_LINEAGE_MAX_VERSION_RANGES = 8
+    __PROGRESS_LINEAGE_PHASES = frozenset({
+        "status_submit", "status_start", "status_finish", "status_consume",
+        "updater_decision", "model_mutation", "scoped_stream_emit",
+    })
+    __PROGRESS_LINEAGE_DETAIL_KEYS = frozenset({
+        "outcome", "source", "fresh", "healthy", "status_count_bucket",
+        "active_count_bucket", "queue_age_bucket", "lock_wait_bucket",
+        "duration_bucket", "decision", "build_kind", "model_version",
+        "scope_version", "model_version_first", "model_version_last",
+        "mutation_count_bucket", "scoped_stream_count_bucket",
+    })
+    __PROGRESS_LINEAGE_ENUMS = {
+        "outcome": frozenset({"ok", "exception", "mutated", "unchanged"}),
+        "source": frozenset({
+            "fresh_healthy", "fresh_unhealthy", "cached_retry", "cached_idle",
+            "retry_empty", "cached_inflight", "inflight_empty", "cached_unhealthy",
+            "unhealthy_empty", "cached_error", "error_empty",
+        }),
+        "status_count_bucket": frozenset({"0", "1", "2-4", "5+"}),
+        "active_count_bucket": frozenset({"0", "1", "2-4", "5+"}),
+        "queue_age_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
+        "lock_wait_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
+        "duration_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
+        "decision": frozenset({"full_build", "active_delta", "cached"}),
+        "build_kind": frozenset({"candidate", "full", "none"}),
+    }
 
     def __init__(
         self,
@@ -534,6 +565,7 @@ class BreadcrumbTraceCollector:
             "latest_summary": None,
             "latest_by_representation": {},
         }
+        self.__progress_lineage: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self.__policy: Dict[str, Any] = cast(Dict[str, Any], policy_result["policy"])
         self.__effective_policy = _EffectiveBreadcrumbPolicy.from_policy(self.__policy)
         self.__policy_revision = 0
@@ -669,6 +701,142 @@ class BreadcrumbTraceCollector:
         health["enabled"] = self.is_effectively_enabled("model.progress", "debug")
         return health
 
+    def record_progress_lineage(
+            self, correlation: object, phase: object, details: object = None,
+    ) -> bool:
+        """Append one opaque active-progress causal step outside event retention.
+
+        Callers pass only fixed enums/buckets.  The collector owns timestamping,
+        bounds, and snapshot lifetime so a normal breadcrumb deque eviction
+        cannot erase an otherwise complete status-to-stream lineage.
+        """
+        if not self.is_effectively_enabled("model.progress", "debug"):
+            return False
+        if not isinstance(correlation, str) or not correlation.startswith("lftp-poll:") or \
+                len(correlation) != len("lftp-poll:") + 16:
+            return False
+        if not isinstance(phase, str) or phase not in self.__PROGRESS_LINEAGE_PHASES:
+            return False
+        suffix = correlation[len("lftp-poll:"):]
+        if any(character not in "0123456789abcdef" for character in suffix):
+            return False
+        safe: Dict[str, Any] = {}
+        try:
+            if isinstance(details, Mapping):
+                for key, value in details.items():
+                    if key not in self.__PROGRESS_LINEAGE_DETAIL_KEYS:
+                        continue
+                    if value is None or type(value) is bool:
+                        safe[key] = value
+                    elif type(value) is int and key in {
+                            "model_version", "scope_version", "model_version_first", "model_version_last",
+                    } and value >= 0:
+                        safe[key] = value
+                    elif isinstance(value, str) and value in self.__PROGRESS_LINEAGE_ENUMS.get(key, frozenset()):
+                        safe[key] = value
+        except Exception:
+            return False
+        step = {"phase": phase, "monotonic_ms": time.monotonic_ns() // 1_000_000, "details": safe}
+        with self.__lock:
+            span = self.__progress_lineage.get(correlation)
+            if span is None:
+                span = {"correlation": correlation, "steps": []}
+                self.__progress_lineage[correlation] = span
+            else:
+                self.__progress_lineage.move_to_end(correlation)
+            steps = span["steps"]
+            if phase == "scoped_stream_emit":
+                stream_step = next((candidate for candidate in steps if candidate["phase"] == "scoped_stream_emit"), None)
+                if stream_step is not None:
+                    count = min(128, int(span.get("scoped_stream_emit_count", 1)) + 1)
+                    span["scoped_stream_emit_count"] = count
+                    stream_step["details"].update(safe)
+                    stream_step["details"]["scoped_stream_count_bucket"] = self.__progress_lineage_count_bucket(count)
+                    stream_step["monotonic_ms"] = step["monotonic_ms"]
+                    return True
+            if phase == "model_mutation" and safe.get("outcome") == "mutated" and \
+                    type(safe.get("model_version")) is int:
+                version = safe["model_version"]
+                ranges = span.setdefault("mutation_version_ranges", [])
+                if not ranges or version != ranges[-1][1] + 1:
+                    if len(ranges) >= self.__PROGRESS_LINEAGE_MAX_VERSION_RANGES:
+                        span["mutation_ranges_truncated"] = True
+                        span["mutation_ranges_omitted_count"] = min(
+                            2_147_483_647,
+                            int(span.get("mutation_ranges_omitted_count", 0)) + 1,
+                        )
+                        return False
+                    ranges.append([version, version])
+                else:
+                    ranges[-1][1] = version
+                mutation_step = next((candidate for candidate in steps if candidate["phase"] == "model_mutation"), None)
+                if mutation_step is not None:
+                    details = mutation_step["details"]
+                    details["model_version"] = version
+                    details["model_version_first"] = ranges[0][0]
+                    details["model_version_last"] = version
+                    details["mutation_count_bucket"] = self.__progress_lineage_count_bucket(
+                        sum((end - start) + 1 for start, end in ranges)
+                    )
+                    mutation_step["monotonic_ms"] = step["monotonic_ms"]
+                    return True
+                safe["model_version_first"] = version
+                safe["model_version_last"] = version
+                safe["mutation_count_bucket"] = "1"
+            if len(steps) >= self.__PROGRESS_LINEAGE_MAX_STEPS:
+                del steps[0]
+            steps.append(step)
+            if phase == "scoped_stream_emit":
+                span["scoped_stream_emit_count"] = 1
+                step["details"]["scoped_stream_count_bucket"] = "1"
+            while len(self.__progress_lineage) > self.__PROGRESS_LINEAGE_MAX_SPANS:
+                self.__progress_lineage.popitem(last=False)
+        return True
+
+    def record_progress_lineage_for_model_version(
+            self, model_version: object, phase: object, details: object = None,
+    ) -> bool:
+        """Atomically append a stream step to its exact mutation lineage."""
+        if not self.is_effectively_enabled("model.progress", "debug") or type(model_version) is not int:
+            return False
+        with self.__lock:
+            correlation = next((key for key, span in reversed(self.__progress_lineage.items())
+                                if any(start <= model_version <= end
+                                       for start, end in span.get("mutation_version_ranges", ()))), None)
+            if correlation is None:
+                return False
+            return self.__record_progress_lineage_locked(correlation, phase, details)
+
+    def __record_progress_lineage_locked(
+            self, correlation: str, phase: object, details: object,
+    ) -> bool:
+        """Reuse the public validator while retaining mapping selection atomicity."""
+        # RLock permits the public writer's lock acquisition; keep the one
+        # lookup/append operation indivisible from clear and span eviction.
+        return self.record_progress_lineage(correlation, phase, details)
+
+    @staticmethod
+    def __progress_lineage_count_bucket(count: int) -> str:
+        if count <= 1:
+            return "1"
+        if count <= 4:
+            return "2-4"
+        if count <= 16:
+            return "5-16"
+        if count <= 32:
+            return "17-32"
+        return "33+"
+
+    def __progress_lineage_snapshot(self) -> Dict[str, Any]:
+        return {
+            "schema": "model_progress_lineage.v1",
+            "enabled": self.is_effectively_enabled("model.progress", "debug"),
+            "max_spans": self.__PROGRESS_LINEAGE_MAX_SPANS,
+            "max_steps_per_span": self.__PROGRESS_LINEAGE_MAX_STEPS,
+            "max_version_ranges_per_span": self.__PROGRESS_LINEAGE_MAX_VERSION_RANGES,
+            "spans": copy.deepcopy(list(self.__progress_lineage.values())),
+        }
+
     def __reset_root_progress_health_locked(self) -> None:
         self.__root_progress_health = {
             "schema": "model_root_progress_health.v1",
@@ -685,6 +853,7 @@ class BreadcrumbTraceCollector:
             "latest_summary": None,
             "latest_by_representation": {},
         }
+        self.__progress_lineage.clear()
 
     @staticmethod
     def __clear_scope_includes_root_progress(clear_filters: Mapping[str, Any]) -> bool:
@@ -1925,6 +2094,7 @@ class BreadcrumbTraceCollector:
             "latest_failure_entry": copy.deepcopy(self.__last_failure_entry),
             "failure_summary": self.__build_failure_summary(all_entries),
             "root_progress_health": self.__root_progress_health_snapshot(),
+            "progress_lineage": self.__progress_lineage_snapshot(),
             "active_delta_rejection_summary": copy.deepcopy(
                 self.__latest_active_delta_rejection_summary
             ),

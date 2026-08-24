@@ -365,11 +365,25 @@ def _lftp_status_lineage_trace_enabled(controller: object) -> bool:
     return any(
         _breadcrumb_effectively_enabled(trace, category, level)
         for category, level in (
+            ("model.progress", "debug"),
             ("transfer.lftp", "debug"),
             ("transfer.lftp", "warning"),
             ("completion.gate", "info"),
         )
     )
+
+
+def _record_progress_lineage(
+        controller: object, correlation: object, phase: str, details: Optional[Mapping[str, object]] = None,
+) -> None:
+    """Write bounded causal timing without changing an updater decision."""
+    try:
+        trace = getattr(getattr(controller, "_Controller__context", None), "breadcrumb_trace", None)
+        recorder = getattr(trace, "record_progress_lineage", None)
+        if callable(recorder):
+            recorder(correlation, phase, details)
+    except Exception:
+        pass
 
 
 _LFTP_STATUS_TRACE_CATEGORY = "transfer.lftp"
@@ -3078,6 +3092,11 @@ class ModelUpdater(_ControllerCoreAccess):
                 except Exception:
                     pass
         build_triggered = False
+        update_succeeded = False
+        self.__progress_lineage_correlation = None
+        set_publication_callback = getattr(controller._Controller__model, "set_version_publication_callback", None)
+        if callable(set_publication_callback):
+            set_publication_callback(None)
         work_state_lock = getattr(controller, "_Controller__work_state_lock", None)
         try:
             # Relocation snapshots treat these runtime collections as one
@@ -3085,6 +3104,7 @@ class ModelUpdater(_ControllerCoreAccess):
             # an alias switch cannot observe a halfway scan/status transition.
             if work_state_lock is None:
                 build_triggered = self._update_once()
+                update_succeeded = True
             else:
                 lock_wait_started = None
                 try:
@@ -3108,6 +3128,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     pass
                 try:
                     build_triggered = self._update_once()
+                    update_succeeded = True
                 finally:
                     if diagnostics is not None:
                         try:
@@ -3135,6 +3156,12 @@ class ModelUpdater(_ControllerCoreAccess):
                 if diagnostics is not None:
                     try:
                         diagnostics.finish_duration(DURATION_MODEL_UPDATE_TRACE_FINALIZATION, trace_finalization_started)
+                    except Exception:
+                            pass
+                self.__progress_lineage_correlation = None
+                if callable(set_publication_callback):
+                    try:
+                        set_publication_callback(None)
                     except Exception:
                         pass
 
@@ -3839,6 +3866,21 @@ class ModelUpdater(_ControllerCoreAccess):
                     )
                 except Exception:
                     lftp_status_poll_correlation = None
+            _record_progress_lineage(
+                controller, lftp_status_poll_correlation, "status_consume",
+                {"source": lftp_status_source, "fresh": lftp_status_snapshot_fresh,
+                 "healthy": lftp_status_poll_healthy},
+            )
+            self.__progress_lineage_correlation = lftp_status_poll_correlation
+            set_publication_callback = getattr(model, "set_version_publication_callback", None)
+            if callable(set_publication_callback) and lftp_status_poll_correlation is not None:
+                def record_publication(global_version: int, scope_version: int) -> None:
+                    _record_progress_lineage(
+                        controller, lftp_status_poll_correlation, "model_mutation",
+                        {"outcome": "mutated", "model_version": global_version,
+                         "scope_version": scope_version},
+                    )
+                set_publication_callback(record_publication)
 
         # Grab the latest extract results.
         latest_extract_statuses = controller._Controller__extract_process.pop_latest_statuses()
@@ -4998,6 +5040,17 @@ class ModelUpdater(_ControllerCoreAccess):
                 reason="no_pending_changes",
                 decision="active_delta_or_full_build",
             )
+        _record_progress_lineage(
+            controller, lftp_status_poll_correlation, "updater_decision",
+            {
+                "decision": "full_build" if full_build_triggered else
+                "active_delta" if active_transfer_delta_adopted else "cached",
+                "build_kind": "candidate" if candidate_lifecycle_triggered else
+                "full" if full_build_triggered else "none",
+                "model_version": getattr(model, "version", None),
+                "status_count_bucket": _active_delta_status_count_bucket(len(lftp_statuses)),
+            },
+        )
         lifecycle_publication_subject_ids: set[str] = set()
         lifecycle_publication_build_kind = "none"
         if full_build_triggered:

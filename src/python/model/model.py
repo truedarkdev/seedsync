@@ -3,7 +3,7 @@
 import logging
 from abc import ABC, abstractmethod
 from bisect import insort
-from typing import Dict, Iterable, Iterator, Optional, Set
+from typing import Callable, Dict, Iterable, Iterator, Optional, Set
 from threading import Lock
 
 # my libs
@@ -71,6 +71,7 @@ class Model:
         # Scoped publication may reuse roots only if their render overlay
         # matches the replacement roots' persisted timestamp snapshot.
         self.__downloaded_timestamp_overlay_generation = 0
+        self.__version_publication_callback: Optional[Callable[[int, int], None]] = None
 
     @property
     def version(self) -> int:
@@ -151,7 +152,9 @@ class Model:
         insort(self.__ordered_file_ids, file_id)
         self.__file_ids_by_name.setdefault(file.name, set()).add(file_id)
 
-    def __notify_versioned_change(self, file: ModelFile) -> None:
+    def __notify_versioned_change(
+            self, file: ModelFile, global_version: int, scope_version: int,
+    ) -> None:
         """Notify optional lightweight listeners after a model mutation.
 
         The historic IModelListener contract transports ModelFile instances.
@@ -165,7 +168,12 @@ class Model:
         for listener in listeners:
             callback = getattr(listener, "model_version_changed", None)
             if callable(callback):
-                callback(self.scope_version(scope_id), scope_id, file_id)
+                callback(scope_version, scope_id, file_id)
+            # Optional additive atomic callback. Scoped consumers must receive
+            # both captured versions before publishing event availability.
+            publication_callback = getattr(listener, "model_version_published", None)
+            if callable(publication_callback):
+                publication_callback(scope_version, global_version, scope_id, file_id)
 
     def notify_summary_changed(self) -> None:
         """Wake compact-summary listeners without inventing a file mutation.
@@ -181,10 +189,25 @@ class Model:
             if callable(callback):
                 callback()
 
-    def __advance_version(self, file: ModelFile) -> None:
+    def __advance_version(self, file: ModelFile) -> tuple[int, int]:
         self.__version += 1
         scope_id = file.path_pair_id
         self.__scope_versions[scope_id] = self.scope_version(scope_id) + 1
+        global_version = self.__version
+        scope_version = self.__scope_versions[scope_id]
+        callback = self.__version_publication_callback
+        if callable(callback):
+            try:
+                callback(global_version, scope_version)
+            except Exception:
+                pass
+        return global_version, scope_version
+
+    def set_version_publication_callback(
+            self, callback: Optional[Callable[[int, int], None]],
+    ) -> None:
+        """Set one transient, best-effort callback before listener dispatch."""
+        self.__version_publication_callback = callback if callable(callback) else None
 
     def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("Model")
@@ -235,12 +258,12 @@ class Model:
         if file.name not in self.__file_ids_by_name:
             self.__file_ids_by_name[file.name] = set()
         self.__file_ids_by_name[file.name].add(file_id)
-        self.__advance_version(file)
+        global_version, scope_version = self.__advance_version(file)
         with self.__listeners_lock:
             listeners = list(self.__listeners)
         for listener in listeners:
             listener.file_added(self.__files_by_id[file_id])
-        self.__notify_versioned_change(self.__files_by_id[file_id])
+        self.__notify_versioned_change(self.__files_by_id[file_id], global_version, scope_version)
 
     def __resolve_file_id(self, identifier: str) -> str:
         if identifier in self.__files_by_id:
@@ -266,12 +289,12 @@ class Model:
         self.__file_ids_by_name[file.name].remove(file_id)
         if not self.__file_ids_by_name[file.name]:
             del self.__file_ids_by_name[file.name]
-        self.__advance_version(file)
+        global_version, scope_version = self.__advance_version(file)
         with self.__listeners_lock:
             listeners = list(self.__listeners)
         for listener in listeners:
             listener.file_removed(file)
-        self.__notify_versioned_change(file)
+        self.__notify_versioned_change(file, global_version, scope_version)
 
     def update_file(self, file: ModelFile) -> None:
         """
@@ -286,12 +309,12 @@ class Model:
         old_file = self.__files_by_id[file_id]
         new_file = file
         self.__files_by_id[file_id] = new_file
-        self.__advance_version(new_file)
+        global_version, scope_version = self.__advance_version(new_file)
         with self.__listeners_lock:
             listeners = list(self.__listeners)
         for listener in listeners:
             listener.file_updated(old_file, new_file)
-        self.__notify_versioned_change(new_file)
+        self.__notify_versioned_change(new_file, global_version, scope_version)
 
     def get_file(self, name: str) -> ModelFile:
         """

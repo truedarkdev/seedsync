@@ -53,7 +53,9 @@ class ScopedModelListener(IModelListener):
     def __init__(self, scope_id: str):
         self.__scope_id = scope_id
         self.__changes: OrderedDict[str, int] = OrderedDict()
+        self.__global_versions: dict[str, int] = {}
         self.__reset_version: Optional[int] = None
+        self.__reset_origin_global_version: Optional[int] = None
         self.__identity_bytes = 0
         self.__closed = False
         self.__lock = Lock()
@@ -71,6 +73,14 @@ class ScopedModelListener(IModelListener):
     def model_version_changed(
         self, version: int, path_pair_id: Optional[str], file_id: str
     ) -> None:
+        # Legacy callbacks remain part of Model's listener contract. Exact
+        # scoped delivery uses the atomic additive callback below instead.
+        del version, path_pair_id, file_id
+
+    def model_version_published(
+        self, version: int, global_version: int, path_pair_id: Optional[str], file_id: str,
+    ) -> None:
+        """Queue scope/global origin and availability in one lock operation."""
         scope_id = path_pair_id if path_pair_id is not None else MODEL_LEGACY_SCOPE_ID
         if scope_id != self.__scope_id:
             return
@@ -79,19 +89,24 @@ class ScopedModelListener(IModelListener):
                 return
             if self.__reset_version is not None:
                 self.__reset_version = max(self.__reset_version, version)
+                self.__reset_origin_global_version = global_version if type(global_version) is int else None
                 return
             existing = self.__changes.pop(file_id, None)
             if existing is not None:
                 self.__identity_bytes -= len(file_id.encode("utf-8"))
+                self.__global_versions.pop(file_id, None)
             self.__changes[file_id] = version
+            self.__global_versions[file_id] = global_version if type(global_version) is int else -1
             self.__identity_bytes += len(file_id.encode("utf-8"))
             if (
                 len(self.__changes) > self._MAX_IDENTITIES
                 or self.__identity_bytes > self._MAX_IDENTITY_BYTES
             ):
                 self.__changes.clear()
+                self.__global_versions.clear()
                 self.__identity_bytes = 0
                 self.__reset_version = version
+                self.__reset_origin_global_version = global_version if type(global_version) is int else None
             self.__available.set()
 
     def take_next_event(self) -> Optional[dict[str, object]]:
@@ -100,19 +115,30 @@ class ScopedModelListener(IModelListener):
                 return None
             if self.__reset_version is not None:
                 version = self.__reset_version
+                origin_global_version = self.__reset_origin_global_version
                 self.__reset_version = None
+                self.__reset_origin_global_version = None
+                self.__global_versions.clear()
                 self.__available.clear()
-                return {"event": "model-reset", "model_version": version, "reason": "coalesced"}
+                return {
+                    "event": "model-reset", "model_version": version, "reason": "coalesced",
+                    "_origin_global_model_version": origin_global_version,
+                }
             if not self.__changes:
                 return None
             changes = list(self.__changes.items())
+            origin_global_version = max(
+                (self.__global_versions.get(file_id, -1) for file_id, _ in changes), default=-1,
+            )
             self.__changes.clear()
+            self.__global_versions.clear()
             self.__identity_bytes = 0
             self.__available.clear()
         return {
             "event": "model-invalidate",
             "model_version": max(version for _, version in changes),
             "file_ids": [file_id for file_id, _ in changes],
+            "_origin_global_model_version": origin_global_version if origin_global_version >= 0 else None,
         }
 
     def wait_for_event(self, timeout: float) -> bool:
@@ -122,8 +148,10 @@ class ScopedModelListener(IModelListener):
         with self.__lock:
             self.__closed = True
             self.__changes.clear()
+            self.__global_versions.clear()
             self.__identity_bytes = 0
             self.__reset_version = None
+            self.__reset_origin_global_version = None
             self.__available.set()
 
 
@@ -318,7 +346,7 @@ class ModelApiHandler(IHandler):
     def __sse(
         self, publication: str, event: str, payload: dict[str, object], version: Optional[int] = None,
         global_model_version: Optional[int] = None,
-        scope_id: Optional[str] = None,
+        scope_id: Optional[str] = None, lineage_model_version: Optional[int] = None,
     ) -> str:
         serialization_metric = DURATION_MODEL_SUMMARY_SERIALIZATION if publication == "summary" \
             else DURATION_MODEL_SCOPED_SERIALIZATION
@@ -415,6 +443,19 @@ class ModelApiHandler(IHandler):
                     if not isinstance(captured_global_version, int):
                         captured_global_version = None
                     if not scoped or scope_id is not None:
+                        if scoped:
+                            lineage_recorder = getattr(trace, "record_progress_lineage_for_model_version", None)
+                            if callable(lineage_recorder) and isinstance(lineage_model_version, int):
+                                lineage_recorder(
+                                    lineage_model_version, "scoped_stream_emit",
+                                    {
+                                        "model_version": captured_global_version,
+                                        "scope_version": version if isinstance(version, int) else None,
+                                        "duration_bucket": duration_bucket(
+                                            max(0, int((time.monotonic_ns() - emission_started_ns) / 1_000_000))
+                                        ),
+                                    },
+                                )
                         progress_trace.record(
                             progress_identity,
                             "sse",
@@ -684,7 +725,7 @@ class ModelApiHandler(IHandler):
                 yield self.__sse(
                     "scoped", "model-page", page, version if isinstance(version, int) else None,
                     global_model_version if isinstance(global_model_version, int) else None,
-                    scope_id,
+                    scope_id, global_model_version if isinstance(global_model_version, int) else None,
                 )
                 if reconnect_id:
                     yield self.__sse(
@@ -698,6 +739,10 @@ class ModelApiHandler(IHandler):
                     event = listener.take_next_event()
                     if event is not None:
                         event_name = event.pop("event")
+                        # Listener versions are captured at model mutation;
+                        # page assembly below may observe a later global
+                        # version. Retain this origin only for exact lineage.
+                        event_origin_global_model_version = event.pop("_origin_global_model_version", None)
                         event_global_model_version = None
                         if event_name == "model-invalidate":
                             changed_ids = event.get("file_ids")
@@ -722,6 +767,7 @@ class ModelApiHandler(IHandler):
                             event_version if isinstance(event_version, int) else None,
                             event_global_model_version,
                             scope_id,
+                            event_origin_global_model_version if isinstance(event_origin_global_model_version, int) else None,
                         )
                         last_keepalive_at = time.monotonic()
                     elif time.monotonic() - last_keepalive_at >= self._KEEPALIVE_INTERVAL_SECONDS:

@@ -65,6 +65,31 @@ from system.scanner import SystemScanner
 
 
 class TestModelUpdater(unittest.TestCase):
+    def test_update_exception_clears_lineage_without_false_mutation(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        builder = MagicMock()
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace, performance_diagnostics=None),
+            _Controller__model_builder=builder,
+            _Controller__model=SimpleNamespace(version=3),
+            _Controller__work_state_lock=None,
+            _Controller__stop_resume_trace_cycle_id=0,
+            logger=MagicMock(),
+        )
+        updater = ModelUpdater(controller)
+        def fail_after_status_consume():
+            updater._ModelUpdater__progress_lineage_correlation = "lftp-poll:0123456789abcdef"
+            raise RuntimeError("update failed")
+        updater._update_once = MagicMock(side_effect=fail_after_status_consume)
+
+        with self.assertRaisesRegex(RuntimeError, "update failed"):
+            updater.update()
+
+        self.assertIsNone(updater._ModelUpdater__progress_lineage_correlation)
+        self.assertEqual([], trace.snapshot()["progress_lineage"]["spans"])
+
     def test_update_attributes_trace_setup_lock_wait_and_finalization(self):
         diagnostics = MagicMock()
         diagnostics.begin_duration.side_effect = lambda metric: (metric,)

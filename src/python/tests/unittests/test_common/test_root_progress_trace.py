@@ -2,6 +2,7 @@ import unittest
 import gc
 import weakref
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from common.breadcrumb_trace import BreadcrumbTraceCollector
 from common.root_progress_trace import (
@@ -360,3 +361,148 @@ class TestRootProgressTrace(unittest.TestCase):
         ))
         entries = trace.snapshot(category="model.progress")["entries"]
         self.assertEqual([10, 11], [entry["details"]["model_version"] for entry in entries])
+
+    def test_progress_lineage_is_disabled_lazy_bounded_and_identity_free(self):
+        disabled = BreadcrumbTraceCollector(
+            lambda: True, max_entries=1,
+            policy={"default": "off", "rules": {"model.progress": "off"}},
+        )
+        with patch("common.breadcrumb_trace.time.monotonic_ns", side_effect=AssertionError("disabled")):
+            self.assertFalse(disabled.record_progress_lineage(
+                "lftp-poll:0123456789abcdef", "status_submit", {"outcome": "private-name"},
+            ))
+
+        trace = self._trace()
+        correlation = "lftp-poll:0123456789abcdef"
+        for phase in ("status_submit", "status_start", "status_finish", "status_consume", "updater_decision", "model_mutation"):
+            self.assertTrue(trace.record_progress_lineage(
+                correlation, phase, {"outcome": "mutated" if phase == "model_mutation" else "ok", "model_version": 9,
+                "path": "/private/path", "name": "private-name"},
+            ))
+        self.assertTrue(trace.record_progress_lineage_for_model_version(
+            9, "scoped_stream_emit", {"scope_version": 3},
+        ))
+        for index in range(1, 32):
+            trace.record_progress_lineage(
+                "lftp-poll:{:016x}".format(index), "status_submit", {"outcome": "ok"},
+            )
+        snapshot = trace.snapshot()["progress_lineage"]
+        self.assertEqual(32, len(snapshot["spans"]))
+        retained = next(span for span in snapshot["spans"] if span["correlation"] == correlation)
+        self.assertEqual(
+            ["status_submit", "status_start", "status_finish", "status_consume", "updater_decision", "model_mutation", "scoped_stream_emit"],
+            [step["phase"] for step in retained["steps"]],
+        )
+        serialized = str(snapshot)
+        self.assertNotIn("private-name", serialized)
+        self.assertNotIn("/private/path", serialized)
+
+        class BrokenDetails(dict):
+            def items(self):
+                raise RuntimeError("diagnostic-only")
+
+        self.assertFalse(trace.record_progress_lineage(
+            "lftp-poll:fedcba9876543210", "status_submit", BrokenDetails(),
+        ))
+
+    def test_progress_lineage_uses_exact_mutation_mapping_and_clear_is_safe(self):
+        trace = self._trace()
+        first = "lftp-poll:0123456789abcdef"
+        second = "lftp-poll:fedcba9876543210"
+        self.assertTrue(trace.record_progress_lineage(
+            first, "model_mutation", {"outcome": "mutated", "model_version": 10},
+        ))
+        # A no-op/intervening poll can mention a version but must not replace
+        # the published mutation's stream lineage.
+        self.assertTrue(trace.record_progress_lineage(
+            second, "updater_decision", {"decision": "cached", "model_version": 10},
+        ))
+        self.assertTrue(trace.record_progress_lineage_for_model_version(
+            10, "scoped_stream_emit", {"scope_version": 4},
+        ))
+        spans = trace.snapshot()["progress_lineage"]["spans"]
+        first_span = next(span for span in spans if span["correlation"] == first)
+        second_span = next(span for span in spans if span["correlation"] == second)
+        self.assertEqual("scoped_stream_emit", first_span["steps"][-1]["phase"])
+        self.assertEqual("updater_decision", second_span["steps"][-1]["phase"])
+
+        trace.clear(category="model.progress")
+        self.assertFalse(trace.record_progress_lineage_for_model_version(
+            10, "scoped_stream_emit", {"scope_version": 4},
+        ))
+
+    def test_progress_lineage_rejects_hostile_enabled_strings(self):
+        trace = self._trace()
+        self.assertTrue(trace.record_progress_lineage(
+            "lftp-poll:0123456789abcdef", "status_consume",
+            {"source": "/private/path", "outcome": "private-name", "fresh": True},
+        ))
+        details = trace.snapshot()["progress_lineage"]["spans"][0]["steps"][0]["details"]
+        self.assertEqual({"fresh": True}, details)
+
+    def test_large_mutation_update_keeps_lifecycle_and_early_late_version_links(self):
+        trace = self._trace()
+        correlation = "lftp-poll:0123456789abcdef"
+        for phase in ("status_submit", "status_start", "status_finish", "status_consume", "updater_decision"):
+            self.assertTrue(trace.record_progress_lineage(
+                correlation, phase, {"outcome": "ok", "source": "fresh_healthy"},
+            ))
+        for version in range(1, 41):
+            self.assertTrue(trace.record_progress_lineage(
+                correlation, "model_mutation",
+                {"outcome": "mutated", "model_version": version, "scope_version": version},
+            ))
+        self.assertTrue(trace.record_progress_lineage_for_model_version(
+            1, "scoped_stream_emit", {"scope_version": 1},
+        ))
+        self.assertTrue(trace.record_progress_lineage_for_model_version(
+            40, "scoped_stream_emit", {"scope_version": 40},
+        ))
+        span = trace.snapshot()["progress_lineage"]["spans"][0]
+        self.assertEqual(
+            ["status_submit", "status_start", "status_finish", "status_consume", "updater_decision", "model_mutation", "scoped_stream_emit"],
+            [step["phase"] for step in span["steps"]],
+        )
+        mutation = next(step for step in span["steps"] if step["phase"] == "model_mutation")
+        self.assertEqual(1, mutation["details"]["model_version_first"])
+        self.assertEqual(40, mutation["details"]["model_version_last"])
+        self.assertEqual("33+", mutation["details"]["mutation_count_bucket"])
+        self.assertEqual("2-4", span["steps"][-1]["details"]["scoped_stream_count_bucket"])
+
+    def test_mutation_range_overflow_is_explicit_and_never_links_omitted_version(self):
+        trace = self._trace()
+        correlation = "lftp-poll:0123456789abcdef"
+        for version in range(1, 18, 2):
+            trace.record_progress_lineage(
+                correlation, "model_mutation",
+                {"outcome": "mutated", "model_version": version, "scope_version": version},
+            )
+        span = trace.snapshot()["progress_lineage"]["spans"][0]
+        self.assertTrue(span["mutation_ranges_truncated"])
+        self.assertEqual(1, span["mutation_ranges_omitted_count"])
+        self.assertTrue(trace.record_progress_lineage_for_model_version(
+            15, "scoped_stream_emit", {"scope_version": 15},
+        ))
+        self.assertFalse(trace.record_progress_lineage_for_model_version(
+            17, "scoped_stream_emit", {"scope_version": 17},
+        ))
+
+    def test_many_scoped_emissions_coalesce_without_evicting_lifecycle(self):
+        trace = self._trace()
+        correlation = "lftp-poll:0123456789abcdef"
+        for phase in ("status_submit", "status_start", "status_finish", "status_consume", "updater_decision"):
+            trace.record_progress_lineage(correlation, phase, {"outcome": "ok", "source": "fresh_healthy"})
+        trace.record_progress_lineage(
+            correlation, "model_mutation", {"outcome": "mutated", "model_version": 1, "scope_version": 1},
+        )
+        for scope_version in range(1, 41):
+            self.assertTrue(trace.record_progress_lineage_for_model_version(
+                1, "scoped_stream_emit", {"scope_version": scope_version},
+            ))
+        span = trace.snapshot()["progress_lineage"]["spans"][0]
+        self.assertEqual(
+            ["status_submit", "status_start", "status_finish", "status_consume", "updater_decision", "model_mutation", "scoped_stream_emit"],
+            [step["phase"] for step in span["steps"]],
+        )
+        emission = span["steps"][-1]
+        self.assertEqual("33+", emission["details"]["scoped_stream_count_bucket"])
