@@ -45,6 +45,43 @@ class TestModelApi(unittest.TestCase):
     def test_model_sse_keepalive_matches_global_stream_closure_cadence(self):
         self.assertEqual(5.0, ModelApiHandler._KEEPALIVE_INTERVAL_SECONDS)
 
+    def test_scoped_stream_breadcrumb_is_opt_in_and_identity_free(self):
+        page = {"records": [{"private": "record"}] * 9, "model_version": 4, "next_cursor": "private"}
+        disabled = BreadcrumbTraceCollector(lambda: True, policy={"default": "off"})
+        self.controller._Controller__context.breadcrumb_trace = disabled
+        with patch("controller.controller.opaque_trace_correlation") as correlation:
+            self.controller.record_scoped_model_stream_breadcrumb("atomic_registered", "private-pair", page)
+        correlation.assert_not_called()
+        self.assertEqual([], disabled.snapshot()["entries"])
+
+        enabled = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model_stream": "debug"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = enabled
+        self.controller.record_scoped_model_stream_breadcrumb("atomic_registered", "private-pair", page)
+        self.controller.record_scoped_model_stream_breadcrumb("initial_page_emitted", "private-pair", page)
+        entries = enabled.snapshot()["entries"]
+        self.assertEqual(["scoped_stream_atomic_registered", "scoped_stream_initial_page_emitted"],
+                         [entry["message"] for entry in entries])
+        self.assertEqual({"phase", "scope_kind", "record_count_bucket", "model_version", "next_page"},
+                         set(entries[0]["details"]))
+        self.assertEqual("5+", entries[0]["details"]["record_count_bucket"])
+        self.assertNotIn("private-pair", str(entries))
+        self.assertNotIn("private", str(entries))
+
+    def test_scoped_stream_records_registration_before_initial_page_emission(self):
+        self.model.add_file(self._file("root", "pair-a"))
+        events = []
+        self.controller.record_scoped_model_stream_breadcrumb = lambda phase, scope, page: events.append(phase)
+        handler = ModelApiHandler(self.controller)
+        stream = handler._ModelApiHandler__handle_stream("pair-a")
+        self.assertEqual(["atomic_registered"], events)
+        # Advancing to the first page executes the pre-yield handoff trace;
+        # no second generator resume is needed to observe it.
+        self.assertIn("event: model-page", next(stream))
+        self.assertEqual(["atomic_registered", "initial_page_emitted"], events)
+        stream.close()
+
     def test_sse_publication_uses_context_supplied_bounded_collectors_without_payload_metadata(self):
         diagnostics_enabled = [True]
         breadcrumbs_enabled = [True]

@@ -3610,6 +3610,34 @@ class Controller:
             self.__model.add_listener(listener)
             return summary
 
+    def record_scoped_model_stream_breadcrumb(
+            self, phase: str, scope_id: object, page: object,
+    ) -> None:
+        """Record opt-in, identity-free scoped-stream handshake evidence."""
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        if not _breadcrumb_effectively_enabled(breadcrumb_trace, "model_stream", "debug"):
+            return
+        if phase not in {"atomic_registered", "initial_page_emitted"} or not isinstance(page, dict):
+            return
+        records = page.get("records")
+        record_count = len(records) if isinstance(records, list) else 0
+        version = page.get("model_version")
+        try:
+            breadcrumb_trace.record(
+                "model_stream", "scoped_stream_{}".format(phase), {
+                    "phase": phase,
+                    "scope_kind": "legacy" if scope_id == MODEL_LEGACY_SCOPE_ID else "scoped",
+                    "record_count_bucket": "0" if record_count < 1 else "1" if record_count == 1 else "2-4" if record_count <= 4 else "5+",
+                    "model_version": version if type(version) is int and version >= 0 else None,
+                    "next_page": type(page.get("next_cursor")) is str,
+                },
+                stage="scoped_model_stream", event_type="diagnostic",
+                corr_id=opaque_trace_correlation(scope_id), trace_scope="flow",
+                category="model_stream", level="debug",
+            )
+        except Exception:
+            self.logger.debug("Ignoring scoped model stream breadcrumb failure", exc_info=True)
+
     def is_file_stopped(self, filename: str) -> bool:
         return filename in self.__persist.stopped_file_names
 

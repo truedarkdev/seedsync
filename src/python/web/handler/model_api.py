@@ -666,6 +666,9 @@ class ModelApiHandler(IHandler):
                 page, 409 if page.get("error") == "cursor_reset_required" else 400,
                 scope_id=scope_id,
             )
+        trace_scoped_stream = getattr(self.__controller, "record_scoped_model_stream_breadcrumb", None)
+        if callable(trace_scoped_stream):
+            trace_scoped_stream("atomic_registered", scope_id, page)
         reconnect_id = bottle.request.get_header("Last-Event-ID", "").strip()
         bottle.response.content_type = "text/event-stream"
         bottle.response.cache_control = "no-cache"
@@ -675,6 +678,8 @@ class ModelApiHandler(IHandler):
                 version = page.get("model_version")
                 global_model_version = page.pop("_global_model_version", None)
                 last_keepalive_at = time.monotonic()
+                if callable(trace_scoped_stream):
+                    trace_scoped_stream("initial_page_emitted", scope_id, page)
                 yield self.__sse(
                     "scoped", "model-page", page, version if isinstance(version, int) else None,
                     global_model_version if isinstance(global_model_version, int) else None,
