@@ -20,6 +20,11 @@ from generate_fixture import CADENCE_FIELDS, _data_spec, config_fingerprint, nor
 # fixture settings, not production defaults.
 MIXED_RATE_LIMIT_BYTES_PER_SECOND = 64_000
 CADENCE_RATE_LIMIT_BYTES_PER_SECOND = 64_000
+# ScannerProcess uses this interval directly for active downloads. Keep the
+# cadence lane below the 150/200 ms browser-gap limits while leaving the
+# mixed/uniform performance profiles on their historical 60 s interval.
+CADENCE_INTERVAL_MS_DOWNLOADING_SCAN = 100
+LEGACY_INTERVAL_MS_DOWNLOADING_SCAN = 60_000
 
 
 def rate_limit_for_profile(profile: str) -> int:
@@ -181,7 +186,10 @@ xfer_verify = True
 [Controller]
 interval_ms_remote_scan = 120000
 interval_ms_local_scan = 86400000
-interval_ms_downloading_scan = 60000
+interval_ms_downloading_scan = {
+    CADENCE_INTERVAL_MS_DOWNLOADING_SCAN
+    if profile == "cadence" else LEGACY_INTERVAL_MS_DOWNLOADING_SCAN
+}
 extract_path = /tmp
 use_local_path_as_extract_path = True
 managed_extract_folders_enabled = True

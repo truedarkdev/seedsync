@@ -470,6 +470,7 @@ def test_cadence_config_records_staging_and_rate_limit(tmp_path):
         "total_connections": 4,
     }
     cadence_config = Config.from_file(str(config_dir / "settings.cfg"))
+    assert int(cadence_config.controller.interval_ms_downloading_scan) == 100
     assert int(cadence_config.lftp.num_max_parallel_files_per_download) == 4
     assert int(cadence_config.lftp.num_max_connections_per_root_file) == 1
     assert int(cadence_config.lftp.num_max_connections_per_dir_file) == 1
@@ -489,6 +490,19 @@ def test_cadence_config_records_staging_and_rate_limit(tmp_path):
     assert target["storage_size_bytes"] == CADENCE_TARGET_STORAGE_SIZE_BYTES
     persisted = json.loads((config_dir / "controller.persist").read_text(encoding="utf-8"))
     assert "resume_sources" not in persisted
+
+
+def test_seed_download_scan_interval_is_profile_specific(tmp_path):
+    expected_intervals = {
+        "uniform": 60_000,
+        "mixed": 60_000,
+        "cadence": 100,
+    }
+    for profile, expected in expected_intervals.items():
+        config_dir = tmp_path / profile
+        seed_config(config_dir, "local-test-token", profile=profile)
+        config = Config.from_file(str(config_dir / "settings.cfg"))
+        assert int(config.controller.interval_ms_downloading_scan) == expected
 
 
 def test_lab_cadence_summary_count_executes_manifest_calculation(tmp_path):
