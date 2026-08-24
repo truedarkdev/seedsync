@@ -103,7 +103,9 @@ def seed_config(config_dir: Path, api_token: str, pairs: int = 6, breadcrumb_mod
     except (AttributeError, PermissionError, OSError):
         pass
     try:
-        config_dir.chmod(0o770)
+        # The app's migration preflight correctly requires its configuration
+        # root to be private to the legacy runtime user.
+        config_dir.chmod(0o700)
     except (AttributeError, PermissionError, OSError):
         pass
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")

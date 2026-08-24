@@ -1523,7 +1523,7 @@ def test_seed_can_omit_move_failure_for_trigger_isolation(tmp_path):
     persisted = json.loads((config_dir / "controller.persist").read_text(encoding="utf-8"))
     assert persisted["move_failure_counts"] == {}
     if os.name == "posix":
-        assert stat.S_IMODE(config_dir.stat().st_mode) == 0o770
+        assert stat.S_IMODE(config_dir.stat().st_mode) == 0o700
 
 
 def test_mixed_disabled_pair_is_absent_from_seeded_persist(tmp_path):
