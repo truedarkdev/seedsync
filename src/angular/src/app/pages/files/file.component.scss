@@ -302,7 +302,7 @@ $file-layout-desktop-min-width: 900px;
 .actions {
     display: none;
 }
-.file.selected .actions {
+.file.selected .actions.visible {
     display: flex;
 }
 

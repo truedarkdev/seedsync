@@ -62,6 +62,7 @@ function createViewFile(props: any = {}): ViewFile {
         isRemotelyDeletable: props.isRemotelyDeletable || false,
         isValidatable: props.isValidatable || false,
         isMoveRetryable: props.isMoveRetryable || false,
+        isSelected: props.isSelected || false,
         percentDownloaded: props.percentDownloaded !== undefined ? props.percentDownloaded : 0,
         transferredSize: props.transferredSize !== undefined ? props.transferredSize : 0,
         displaySizeTotal: props.displaySizeTotal !== undefined ? props.displaySizeTotal : 0
@@ -744,6 +745,43 @@ describe("Testing file component", () => {
             false,
             true
         ]);
+    });
+
+    it("keeps eligible action controls mounted before expansion and reveals the same controls immediately", () => {
+        const actionProps = {
+            isQueueable: true,
+            isStoppable: true,
+            isExtractable: true,
+            isArchive: true,
+            isLocallyDeletable: false,
+            isRemotelyDeletable: true,
+            isValidatable: false
+        };
+        fixture.componentInstance.file = createViewFile(actionProps);
+        fixture.componentInstance.options = of(null) as any;
+
+        fixture.detectChanges();
+
+        const actions = fixture.nativeElement.querySelector(".actions") as HTMLElement;
+        const queueButton = actions.querySelector("button") as HTMLButtonElement;
+        expect(actions.getAttribute("aria-hidden")).toBeNull();
+        expect(getComputedStyle(actions).display).toBe("none");
+        expect(queueButton.disabled).toBe(false);
+
+        fixture.componentRef.setInput("file", createViewFile({...actionProps, isSelected: true}));
+        fixture.componentRef.setInput("showActions", false);
+        fixture.detectChanges();
+
+        expect(getComputedStyle(actions).display).toBe("none");
+        expect(actions.getAttribute("aria-hidden")).toBe("true");
+
+        fixture.componentRef.setInput("showActions", true);
+        fixture.detectChanges();
+
+        expect(fixture.nativeElement.querySelector(".actions button")).toBe(queueButton);
+        expect(actions.getAttribute("aria-hidden")).toBeNull();
+        expect(getComputedStyle(actions).display).toBe("flex");
+        expect(queueButton.disabled).toBe(false);
     });
 
     it("should ignore clicks on a disabled native queue button", () => {

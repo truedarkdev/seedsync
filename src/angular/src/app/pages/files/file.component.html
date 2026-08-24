@@ -134,8 +134,8 @@
         </div>
     </div>
 
-    <!-- actions div, visible on selection -->
-    <div class="actions" *ngIf="showActions">
+    <!-- Keep controls mounted so selection only changes visibility, not their render work. -->
+    <div class="actions" [class.visible]="showActions" [attr.aria-hidden]="showActions ? null : 'true'">
         <button *ngIf="file.status === ViewFile.Status.MOVE_FAILED"
              type="button" class="button" appClickStopPropagation
              title="Retry the final move to the local destination"
