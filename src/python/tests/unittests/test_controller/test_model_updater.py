@@ -17,6 +17,7 @@ from controller.persist_keys import KEY_SEP
 from controller.model_updater import (
     ModelUpdater,
     _breadcrumb_effectively_enabled,
+    _active_delta_rejection_correlation_identity,
     _record_lftp_status_breadcrumb,
     _ProgressiveScanAccumulator,
     _JointProgressiveReconciler,
@@ -7350,6 +7351,11 @@ class TestModelUpdater(unittest.TestCase):
         controller, _ = self._make_progressive_update_controller(
             remote_scan, local_scan=None, model_builder=builder, model=live_model,
         )
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=2,
+            policy={"default": "off", "rules": {"model.progress": "debug", "scan.authority": "info"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
         status = LftpJobStatus(
             1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "",
         )
@@ -7358,6 +7364,7 @@ class TestModelUpdater(unittest.TestCase):
         builder.authorize_active_transfer_delta = MagicMock(return_value=False)
         original_build = builder.build_model
         builder.build_model = MagicMock(wraps=original_build)
+        rejected_model_version = live_model.version
 
         ModelUpdater(controller).update()
 
@@ -7374,6 +7381,49 @@ class TestModelUpdater(unittest.TestCase):
             "published_after_active_delta_rejection",
             authority_calls[0].kwargs["details"]["reason"],
         )
+        summary = trace.snapshot()["active_delta_rejection_summary"]
+        self.assertEqual("active_delta_authorization_rejected", summary["reason"])
+        self.assertEqual(rejected_model_version, summary["model_version"])
+        self.assertTrue(summary["corr_id"].startswith("root-progress:"))
+        self.assertEqual(16, len(summary["corr_id"].removeprefix("root-progress:")))
+
+    def test_active_delta_rejection_diagnostics_failure_preserves_full_build_fallback(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("root", 100, False)])
+        live_model = builder.build_model()
+        remote_scan = ScannerResult(
+            datetime.now(), [SystemFile("root", 100, False)],
+            scanned_path_pair_ids={None}, is_scan_final=True,
+        )
+        controller, _ = self._make_progressive_update_controller(
+            remote_scan, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__context.breadcrumb_trace = SimpleNamespace(
+            is_effectively_enabled=MagicMock(side_effect=RuntimeError("diagnostic gate failed")),
+            record_active_delta_authorization_rejection=MagicMock(),
+        )
+        status = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        controller._Controller__lftp.status.return_value = [status]
+        builder.authorize_active_transfer_delta = MagicMock(return_value=False)
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+
+        ModelUpdater(controller).update()
+
+        builder.build_model.assert_called_once()
+        self.assertEqual(25, live_model.get_file("root").transferred_size)
+
+    def test_active_delta_rejection_correlation_identity_is_bounded_and_opaque(self):
+        file_ids = {"private-target-{:04d}".format(index) for index in range(1_000)}
+
+        with patch("controller.model_updater.opaque_trace_correlation", wraps=trace_session_digest) as digest:
+            identity = _active_delta_rejection_correlation_identity(file_ids)
+
+        self.assertLessEqual(digest.call_count, 16)
+        self.assertTrue(identity.startswith("active-delta-targets:128:"))
+        self.assertLessEqual(len(identity), len("active-delta-targets:128:") + (16 * 16) + 15)
+        self.assertNotIn("private-target", identity)
 
     def test_clean_idle_tick_skips_active_delta_model_root_lookup(self):
         builder = ModelBuilder()

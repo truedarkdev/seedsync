@@ -634,6 +634,81 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertLessEqual(len(snapshot["failure_summary"]["recent_stage_trail"]), 5)
         self.assertEqual("controller", snapshot["failure_summary"]["recent_stage_trail"][0]["stage"])
 
+    def test_active_delta_rejection_summary_survives_progress_eviction_and_is_queryable(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True, max_entries=2,
+            policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        admitted = collector.record_active_delta_authorization_rejection(
+            "root-progress:0123456789abcdef", 7,
+            {
+                "invalidation_reasons": ["safe_reason", "/private/path"],
+                "lftp_touched_count": 999,
+                "active_touched_count": 2,
+                "lftp_regressed_count": -1,
+                "pending_token_count": 4,
+                "token_reason_counts": {"private-token": 3, "other": -1},
+            },
+        )
+
+        self.assertTrue(admitted)
+        for index in range(1_000):
+            collector.record(
+                "root_progress", "noisy-{}".format(index), {"count": index},
+                category="model.progress", level="debug",
+            )
+
+        snapshot = collector.snapshot()
+        summary = snapshot["active_delta_rejection_summary"]
+        self.assertEqual("root-progress:0123456789abcdef", summary["corr_id"])
+        self.assertEqual("active_delta_authorization_rejected", summary["reason"])
+        self.assertEqual(7, summary["model_version"])
+        self.assertEqual(
+            {
+                "invalidation_reason_count": 2,
+                "lftp_touched_count": 128,
+                "active_touched_count": 2,
+                "pending_token_count": 4,
+                "token_reason_kind_count": 1,
+                "token_reason_total_count": 3,
+            },
+            summary["diagnostics"],
+        )
+        self.assertEqual(2, snapshot["retained_count"])
+        self.assertGreater(snapshot["evictions"], 0)
+        serialized = str(summary)
+        self.assertNotIn("/private/path", serialized)
+        self.assertNotIn("private-token", serialized)
+        self.assertEqual(summary, collector.query_events()["active_delta_rejection_summary"])
+
+        collector.reset()
+        self.assertIsNone(collector.snapshot()["active_delta_rejection_summary"])
+
+    def test_scoped_clear_matches_active_delta_rejection_summary_metadata(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        collector.record_active_delta_authorization_rejection(
+            "root-progress:0123456789abcdef", 7, {},
+        )
+
+        collector.clear({"corr_id": "other"})
+        self.assertIsNotNone(collector.snapshot()["active_delta_rejection_summary"])
+        collector.clear({"corr_id": "root-progress:0123456789abcdef"})
+        self.assertIsNone(collector.snapshot()["active_delta_rejection_summary"])
+
+        collector.record_active_delta_authorization_rejection(
+            "root-progress:0123456789abcdef", 7, {},
+        )
+        collector.clear({"flow": "root-progress:0123456789abcdef"})
+        self.assertIsNone(collector.snapshot()["active_delta_rejection_summary"])
+
+        collector.record_active_delta_authorization_rejection(
+            "root-progress:0123456789abcdef", 7, {},
+        )
+        collector.clear({"category": "model.progress", "event_type": "diagnostic"})
+        self.assertIsNone(collector.snapshot()["active_delta_rejection_summary"])
+
     def test_record_aggregate_failure_summary_stays_aggregate_scoped(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
 

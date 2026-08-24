@@ -90,6 +90,23 @@ _SCAN_AUTHORITY_DIAGNOSTIC_ONLY_KEYS = frozenset({
     "local_scan_generation",
     "remote_scan_generation",
 })
+_ACTIVE_DELTA_REJECTION_CORRELATION_TARGET_LIMIT = 16
+_ACTIVE_DELTA_REJECTION_CORRELATION_COUNT_LIMIT = 128
+
+
+def _active_delta_rejection_correlation_identity(file_ids: set[str]) -> str:
+    """Bound target-set evidence before deriving the process-local correlation."""
+    # A stable ordering would require walking/sorting the entire selected set
+    # while holding the model lock. The diagnostic only needs an opaque,
+    # bounded correlation sample, so inspect the first bounded set members.
+    target_digests = [
+        opaque_trace_correlation(file_id)
+        for file_id in islice(file_ids, _ACTIVE_DELTA_REJECTION_CORRELATION_TARGET_LIMIT)
+    ]
+    return "active-delta-targets:{}:{}".format(
+        min(len(file_ids), _ACTIVE_DELTA_REJECTION_CORRELATION_COUNT_LIMIT),
+        ",".join(target_digests),
+    )
 
 
 def _scan_authority_semantic_snapshot(snapshot: object) -> dict[str, object]:
@@ -4459,6 +4476,23 @@ class ModelUpdater(_ControllerCoreAccess):
                     # and must not suppress the established full-build path.
                     active_transfer_delta_rejected = True
                     partial_model = None
+                    try:
+                        breadcrumb_trace = getattr(
+                            getattr(controller, "_Controller__context", None), "breadcrumb_trace", None,
+                        )
+                        summary_recorder = getattr(
+                            breadcrumb_trace, "record_active_delta_authorization_rejection", None,
+                        )
+                        delta_diagnostics = getattr(model_builder, "active_transfer_delta_diagnostics", None)
+                        if callable(summary_recorder) and callable(delta_diagnostics) and \
+                                _breadcrumb_effectively_enabled(breadcrumb_trace, "model.progress", "debug"):
+                            target_identity = _active_delta_rejection_correlation_identity(active_delta_file_ids)
+                            summary_recorder(
+                                "root-progress:{}".format(opaque_trace_correlation(target_identity)),
+                                getattr(model, "version", None), delta_diagnostics(),
+                            )
+                    except Exception:
+                        pass
                 if partial_model is None:
                     replacement_roots = []
                 else:

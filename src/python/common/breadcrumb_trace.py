@@ -304,6 +304,13 @@ class BreadcrumbTraceCollector:
         "script",
         "shell",
     )
+    __ACTIVE_DELTA_DIAGNOSTIC_COUNT_KEYS = (
+        "lftp_touched_count",
+        "active_touched_count",
+        "lftp_regressed_count",
+        "pending_token_count",
+    )
+    __ACTIVE_DELTA_DIAGNOSTIC_MAX_COUNT = 128
 
     def __init__(
         self,
@@ -363,6 +370,10 @@ class BreadcrumbTraceCollector:
         self.__coalesce_entries: Dict[str, Dict[str, Any]] = {}
         self.__last_failure_entry: Optional[Dict[str, Any]] = None
         self.__last_failure_version: Optional[int] = None
+        # This is deliberately independent of the chronological deque.  It
+        # retains the latest authorization rejection after a busy progress
+        # trace evicts the event that first established it.
+        self.__latest_active_delta_rejection_summary: Optional[Dict[str, Any]] = None
         self.__policy: Dict[str, Any] = cast(Dict[str, Any], policy_result["policy"])
         self.__effective_policy = _EffectiveBreadcrumbPolicy.from_policy(self.__policy)
         self.__policy_revision = 0
@@ -835,6 +846,7 @@ class BreadcrumbTraceCollector:
                 self.__entries.clear()
                 self.__entry_sizes.clear()
                 self.__retained_bytes = 0
+                self.__latest_active_delta_rejection_summary = None
             else:
                 kept_entries: Deque[Dict[str, Any]] = deque()
                 kept_sizes: Deque[int] = deque()
@@ -855,6 +867,8 @@ class BreadcrumbTraceCollector:
                 self.__entries = kept_entries
                 self.__entry_sizes = kept_sizes
                 self.__retained_bytes = retained_bytes
+                if self.__active_delta_rejection_summary_matches(clear_filters):
+                    self.__latest_active_delta_rejection_summary = None
             self.__last_signature = self.__signature(self.__entries[-1]) if self.__entries else None
             self.__coalesce_entries.clear()
             self.__refresh_failure_locked()
@@ -882,12 +896,84 @@ class BreadcrumbTraceCollector:
             self.__coalesce_entries.clear()
             self.__last_failure_entry = None
             self.__last_failure_version = None
+            self.__latest_active_delta_rejection_summary = None
             self.__last_reset_version = self.__version
             self.__last_reset_reason = "reset"
             self.__reset_generation += 1
             self.__last_clear_scope = None
             self.__window_truncated_pending = False
             return {"cleared": True, "scope": "all", "cleared_count": cleared_count, "version": self.__version}
+
+    def record_active_delta_authorization_rejection(
+            self, corr_id: object, model_version: object, diagnostics: object,
+    ) -> bool:
+        """Retain bounded aggregate evidence for the latest rejected root delta.
+
+        The caller supplies an already-opaque target correlation.  This is a
+        semantic diagnostic summary, rather than another event-retention path,
+        so it is intentionally not subject to deque eviction.
+        """
+        if not self.is_effectively_enabled("model.progress", "debug"):
+            return False
+        safe_corr_id = self.__sanitize_optional_string(corr_id)
+        if not isinstance(safe_corr_id, str) or not self.__is_root_progress_correlation(safe_corr_id):
+            return False
+        safe_model_version = model_version if type(model_version) is int and model_version >= 0 else None
+        safe_diagnostics = self.__active_delta_diagnostics_summary(diagnostics)
+        with self.__lock:
+            self.__latest_active_delta_rejection_summary = {
+                "corr_id": safe_corr_id,
+                "flow_id": safe_corr_id,
+                "source": "root_progress",
+                "category": "model.progress",
+                "level": "debug",
+                "stage": "root_progress_decision",
+                "event_type": "diagnostic",
+                "trace_scope": "flow",
+                "reason": "active_delta_authorization_rejected",
+                "model_version": safe_model_version,
+                "diagnostics": safe_diagnostics,
+            }
+        return True
+
+    def __active_delta_rejection_summary_matches(self, filters: Mapping[str, Any]) -> bool:
+        summary = self.__latest_active_delta_rejection_summary
+        return summary is not None and self.__entry_matches(summary, filters)
+
+    @staticmethod
+    def __is_root_progress_correlation(value: str) -> bool:
+        prefix = "root-progress:"
+        digest = value[len(prefix):] if value.startswith(prefix) else ""
+        return len(digest) == 16 and all(character in "0123456789abcdef" for character in digest)
+
+    @classmethod
+    def __active_delta_diagnostics_summary(cls, diagnostics: object) -> Dict[str, int]:
+        """Project builder diagnostics to fixed, bounded aggregate counters."""
+        if not isinstance(diagnostics, Mapping):
+            return {}
+        result: Dict[str, int] = {}
+        invalidation_reasons = diagnostics.get("invalidation_reasons")
+        if isinstance(invalidation_reasons, (list, tuple, set, frozenset)):
+            result["invalidation_reason_count"] = min(
+                len(invalidation_reasons), cls.__ACTIVE_DELTA_DIAGNOSTIC_MAX_COUNT,
+            )
+        for key in cls.__ACTIVE_DELTA_DIAGNOSTIC_COUNT_KEYS:
+            value = diagnostics.get(key)
+            if type(value) is int and value >= 0:
+                result[key] = min(value, cls.__ACTIVE_DELTA_DIAGNOSTIC_MAX_COUNT)
+        token_reason_counts = diagnostics.get("token_reason_counts")
+        if isinstance(token_reason_counts, Mapping):
+            values = [
+                value for value in token_reason_counts.values()
+                if type(value) is int and value >= 0
+            ]
+            result["token_reason_kind_count"] = min(
+                len(values), cls.__ACTIVE_DELTA_DIAGNOSTIC_MAX_COUNT,
+            )
+            result["token_reason_total_count"] = min(
+                sum(values), cls.__ACTIVE_DELTA_DIAGNOSTIC_MAX_COUNT,
+            )
+        return result
 
     def record(self, source: str, message: str, details: object = None, **metadata: Any) -> str:
         if not self.is_effectively_enabled(metadata.get("category", source), metadata.get("level", "info")):
@@ -1440,6 +1526,9 @@ class BreadcrumbTraceCollector:
             "latest_failure_version": self.__last_failure_version,
             "latest_failure_entry": copy.deepcopy(self.__last_failure_entry),
             "failure_summary": self.__build_failure_summary(all_entries),
+            "active_delta_rejection_summary": copy.deepcopy(
+                self.__latest_active_delta_rejection_summary
+            ),
             "accounting": {
                 "accepted_count": self.__accepted_count,
                 "recorded_count": self.__accepted_count,
