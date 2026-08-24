@@ -4588,6 +4588,19 @@ class ModelUpdater(_ControllerCoreAccess):
             lifecycle_publication_build_kind = (
                 "authoritative_pair_candidate" if candidate_lifecycle_triggered else "full_build"
             )
+            def synchronize_applied_model_overlay_generation() -> None:
+                """Keep live model metadata aligned with an accepted candidate.
+
+                The timestamp overlay generation is render metadata, not a
+                model mutation version.  Copy it only at the candidate
+                adoption boundary so active-delta authorization can compare
+                the same overlay without advancing global or scoped versions.
+                """
+                generation = getattr(new_model, "downloaded_timestamp_overlay_generation", None)
+                setter = getattr(model, "set_downloaded_timestamp_overlay_generation", None)
+                if type(generation) is int and generation >= 0 and callable(setter):
+                    setter(generation)
+
             # A small set of completion side effects is applied directly to
             # the model objects from this build.  If those setters invalidate
             # the builder cache, retain their exact event tokens for adoption;
@@ -5541,6 +5554,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         authoritative_pair_build,
                         applied_builder_invalidation_tokens,
                     )
+                    synchronize_applied_model_overlay_generation()
                     authoritative_pair_delta_applied = True
                     progressive_source_buckets_adopted = True
                     refresh_identities = getattr(
@@ -5610,6 +5624,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     controller._Controller__model,
                     applied_builder_invalidation_tokens,
                 )
+                synchronize_applied_model_overlay_generation()
                 refresh_identities = getattr(
                     controller, "_refresh_model_file_command_identities_locked", None
                 )

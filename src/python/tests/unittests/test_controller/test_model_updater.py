@@ -3655,8 +3655,14 @@ class TestModelUpdater(unittest.TestCase):
         # Pair-b remains unavailable throughout this selected pair-a final;
         # retaining the same overlay makes candidate reuse provable.
         builder.set_unknown_local_path_pair_ids({"pair-b"})
+        old_id = ModelFile.build_file_id("old.bin", "pair-a")
+        builder.set_downloaded_timestamps({old_id: 1760000010.0})
         live_model = builder.build_model()
         idle_before = live_model.get_file(ModelFile.build_file_id("idle.bin", "pair-b"))
+        before_version = live_model.version
+        before_pair_a_scope_version = live_model.scope_version("pair-a")
+        before_pair_b_scope_version = live_model.scope_version("pair-b")
+        before_overlay_generation = live_model.downloaded_timestamp_overlay_generation
         builder.build_model = MagicMock(wraps=builder.build_model)
         builder.build_authoritative_pair_roots = MagicMock(wraps=builder.build_authoritative_pair_roots)
         next_local = SystemFile("new.bin", 30, False)
@@ -3689,6 +3695,13 @@ class TestModelUpdater(unittest.TestCase):
             live_model.get_file_ids(),
         )
         self.assertIs(idle_before, live_model.get_file(ModelFile.build_file_id("idle.bin", "pair-b")))
+        self.assertEqual(before_overlay_generation, live_model.downloaded_timestamp_overlay_generation)
+        # The selected pair replaces one root (remove + add), while the
+        # metadata synchronization itself must not create extra versions or
+        # touch an unaffected pair.
+        self.assertEqual(before_version + 2, live_model.version)
+        self.assertEqual(before_pair_a_scope_version + 2, live_model.scope_version("pair-a"))
+        self.assertEqual(before_pair_b_scope_version, live_model.scope_version("pair-b"))
         # Canonical pair adoption replaces only A's buckets, and is therefore
         # the transition allowed to publish the reconciler's exact overlay.
         self.assertEqual(frozenset({"pair-b"}), builder.unknown_local_path_pair_ids_snapshot())
@@ -6050,6 +6063,41 @@ class TestModelUpdater(unittest.TestCase):
         listener.file_updated.assert_called_once()
         self.assertFalse(builder.has_changes())
         builder.build_model.assert_not_called()
+
+    def test_timestamp_overlay_reconciliation_recovers_active_lftp_delta(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("root", 100, False)])
+        live_model = builder.build_model()
+        builder.set_downloaded_timestamps({"root": 1760000010.0})
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        initial_status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "",
+        )
+        initial_status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        controller._Controller__lftp.status.return_value = [initial_status]
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+        updater = ModelUpdater(controller)
+
+        updater.update()
+
+        builder.build_model.assert_called_once_with()
+        self.assertEqual(1, live_model.downloaded_timestamp_overlay_generation)
+        self.assertEqual(25, live_model.get_file("root").transferred_size)
+
+        next_status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "",
+        )
+        next_status.total_transfer_state = LftpJobStatus.TransferState(50, 100, 50, 10, 4)
+        controller._Controller__lftp.status.return_value = [next_status]
+        controller._Controller__next_lftp_status_poll_at = None
+
+        updater.update()
+
+        builder.build_model.assert_called_once_with()
+        self.assertEqual(50, live_model.get_file("root").transferred_size)
 
     def test_progressive_active_timestamp_overlay_rejection_forces_one_full_build(self):
         builder = ModelBuilder()
