@@ -311,6 +311,12 @@ class BreadcrumbTraceCollector:
         "pending_token_count",
     )
     __ACTIVE_DELTA_DIAGNOSTIC_MAX_COUNT = 128
+    __ACTIVE_DELTA_REJECTION_REASONS = frozenset({
+        "active_delta_selector_rejected", "active_delta_authorization_rejected",
+    })
+    __ACTIVE_DELTA_REJECTION_CATEGORY_ORDER = (
+        "scan", "lifecycle", "status", "root_identity", "ambiguity", "authority", "overlay", "unknown",
+    )
 
     def __init__(
         self,
@@ -907,6 +913,14 @@ class BreadcrumbTraceCollector:
     def record_active_delta_authorization_rejection(
             self, corr_id: object, model_version: object, diagnostics: object,
     ) -> bool:
+        """Compatibility wrapper for the original authorization-only writer."""
+        return self.record_active_delta_rejection(
+            corr_id, model_version, "active_delta_authorization_rejected", diagnostics,
+        )
+
+    def record_active_delta_rejection(
+            self, corr_id: object, model_version: object, reason: object, diagnostics: object,
+    ) -> bool:
         """Retain bounded aggregate evidence for the latest rejected root delta.
 
         The caller supplies an already-opaque target correlation.  This is a
@@ -918,8 +932,10 @@ class BreadcrumbTraceCollector:
         safe_corr_id = self.__sanitize_optional_string(corr_id)
         if not isinstance(safe_corr_id, str) or not self.__is_root_progress_correlation(safe_corr_id):
             return False
+        if type(reason) is not str or reason not in self.__ACTIVE_DELTA_REJECTION_REASONS:
+            return False
         safe_model_version = model_version if type(model_version) is int and model_version >= 0 else None
-        safe_diagnostics = self.__active_delta_diagnostics_summary(diagnostics)
+        safe_diagnostics = self.__active_delta_diagnostics_summary(reason, diagnostics)
         with self.__lock:
             self.__latest_active_delta_rejection_summary = {
                 "corr_id": safe_corr_id,
@@ -930,7 +946,7 @@ class BreadcrumbTraceCollector:
                 "stage": "root_progress_decision",
                 "event_type": "diagnostic",
                 "trace_scope": "flow",
-                "reason": "active_delta_authorization_rejected",
+                "reason": reason,
                 "model_version": safe_model_version,
                 "diagnostics": safe_diagnostics,
             }
@@ -947,16 +963,28 @@ class BreadcrumbTraceCollector:
         return len(digest) == 16 and all(character in "0123456789abcdef" for character in digest)
 
     @classmethod
-    def __active_delta_diagnostics_summary(cls, diagnostics: object) -> Dict[str, int]:
+    def __active_delta_diagnostics_summary(cls, reason: str, diagnostics: object) -> Dict[str, Any]:
         """Project builder diagnostics to fixed, bounded aggregate counters."""
         if not isinstance(diagnostics, Mapping):
             return {}
-        result: Dict[str, int] = {}
+        result: Dict[str, Any] = {}
         invalidation_reasons = diagnostics.get("invalidation_reasons")
         if isinstance(invalidation_reasons, (list, tuple, set, frozenset)):
             result["invalidation_reason_count"] = min(
                 len(invalidation_reasons), cls.__ACTIVE_DELTA_DIAGNOSTIC_MAX_COUNT,
             )
+        rejection_categories = diagnostics.get("rejection_categories")
+        category_set = {"authority"} if reason == "active_delta_authorization_rejected" else set()
+        if isinstance(rejection_categories, (list, tuple, set, frozenset)):
+            category_set.update(
+                category for category in rejection_categories
+                if isinstance(category, str) and category in cls.__ACTIVE_DELTA_REJECTION_CATEGORY_ORDER
+            )
+        if category_set:
+            result["rejection_categories"] = [
+                category for category in cls.__ACTIVE_DELTA_REJECTION_CATEGORY_ORDER
+                if category in category_set
+            ]
         for key in cls.__ACTIVE_DELTA_DIAGNOSTIC_COUNT_KEYS:
             value = diagnostics.get(key)
             if type(value) is int and value >= 0:

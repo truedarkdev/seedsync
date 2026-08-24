@@ -18,6 +18,7 @@ from controller.model_updater import (
     ModelUpdater,
     _breadcrumb_effectively_enabled,
     _active_delta_rejection_correlation_identity,
+    _record_active_delta_rejection_summary,
     _record_lftp_status_breadcrumb,
     _ProgressiveScanAccumulator,
     _JointProgressiveReconciler,
@@ -7387,7 +7388,90 @@ class TestModelUpdater(unittest.TestCase):
         self.assertTrue(summary["corr_id"].startswith("root-progress:"))
         self.assertEqual(16, len(summary["corr_id"].removeprefix("root-progress:")))
 
-    def test_active_delta_rejection_diagnostics_failure_preserves_full_build_fallback(self):
+    def test_active_delta_selector_rejection_replaces_older_authorization_summary(self):
+        first = SystemFile("private-release.bin", 100, False)
+        first.path_pair_id = "first"
+        second = SystemFile("private-release.bin", 100, False)
+        second.path_pair_id = "second"
+        builder = ModelBuilder()
+        builder.set_remote_files([first, second])
+        builder.set_extracted_files({"private-release.bin"})
+        live_model = builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "private-release.bin", "",
+        )
+        status.path_pair_id = "first"
+        builder.set_lftp_statuses([status])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=2,
+            policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        trace.record_active_delta_authorization_rejection(
+            "root-progress:0123456789abcdef", 1, {},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__lftp.status.return_value = [status]
+        original_diagnostics = builder.active_transfer_delta_diagnostics
+        def diagnostic_snapshot(*args):
+            self.assertFalse(getattr(builder.build_model, "called", False))
+            return original_diagnostics(*args)
+        builder.active_transfer_delta_diagnostics = MagicMock(side_effect=diagnostic_snapshot)
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+
+        ModelUpdater(controller).update()
+
+        builder.build_model.assert_called_once()
+        summary = trace.snapshot()["active_delta_rejection_summary"]
+        self.assertEqual("active_delta_selector_rejected", summary["reason"])
+        self.assertEqual(["status", "ambiguity"], summary["diagnostics"]["rejection_categories"])
+        self.assertNotIn("private-release.bin", str(summary))
+
+    def test_disabled_progress_trace_skips_selector_diagnostics_snapshot(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("active.bin", 100, False)])
+        live_model = builder.build_model()
+        builder.set_extracted_files({"unrelated-private.bin"})
+        status = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__context.breadcrumb_trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off"},
+        )
+        controller._Controller__lftp.status.return_value = [status]
+        builder.active_transfer_delta_diagnostics = MagicMock(
+            side_effect=AssertionError("disabled trace must not read selector diagnostics"),
+        )
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+
+        ModelUpdater(controller).update()
+
+        builder.active_transfer_delta_diagnostics.assert_not_called()
+        builder.build_model.assert_called_once()
+
+    def test_active_delta_authorization_summary_uses_enabled_legacy_recorder(self):
+        legacy_recorder = MagicMock()
+        trace = SimpleNamespace(
+            is_effectively_enabled=lambda category, level: category == "model.progress" and level == "debug",
+            record_active_delta_authorization_rejection=legacy_recorder,
+        )
+        controller = SimpleNamespace(_Controller__context=SimpleNamespace(breadcrumb_trace=trace))
+
+        _record_active_delta_rejection_summary(
+            controller, SimpleNamespace(version=3), "active_delta_authorization_rejected",
+            {"rejection_categories": ["authority"]}, {"private-file-id"},
+        )
+
+        legacy_recorder.assert_called_once()
+        self.assertEqual("root-progress:", legacy_recorder.call_args.args[0][:14])
+        self.assertEqual(3, legacy_recorder.call_args.args[1])
+
+    def test_disabled_progress_trace_skips_authorization_diagnostics_snapshot(self):
         builder = ModelBuilder()
         builder.set_remote_files([SystemFile("root", 100, False)])
         live_model = builder.build_model()
@@ -7398,20 +7482,23 @@ class TestModelUpdater(unittest.TestCase):
         controller, _ = self._make_progressive_update_controller(
             remote_scan, local_scan=None, model_builder=builder, model=live_model,
         )
-        controller._Controller__context.breadcrumb_trace = SimpleNamespace(
-            is_effectively_enabled=MagicMock(side_effect=RuntimeError("diagnostic gate failed")),
-            record_active_delta_authorization_rejection=MagicMock(),
+        controller._Controller__context.breadcrumb_trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off"},
         )
         status = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "")
         status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
         controller._Controller__lftp.status.return_value = [status]
         builder.authorize_active_transfer_delta = MagicMock(return_value=False)
+        builder.active_transfer_delta_diagnostics = MagicMock(
+            side_effect=AssertionError("disabled trace must not read authorization diagnostics"),
+        )
         original_build = builder.build_model
         builder.build_model = MagicMock(wraps=original_build)
 
         ModelUpdater(controller).update()
 
         builder.build_model.assert_called_once()
+        builder.active_transfer_delta_diagnostics.assert_not_called()
         self.assertEqual(25, live_model.get_file("root").transferred_size)
 
     def test_active_delta_rejection_correlation_identity_is_bounded_and_opaque(self):

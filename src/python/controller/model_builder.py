@@ -54,6 +54,32 @@ from .scan.scanner_process import _record_root_shape_breadcrumb
 from .validate import ValidateStatus
 
 
+# Diagnostics expose only these generic classes, never the invalidation
+# constants themselves.  The order below is the stable precedence exported by
+# ``active_transfer_delta_diagnostics``.
+_ACTIVE_TRANSFER_DELTA_REJECTION_CATEGORY_ORDER = (
+    "scan", "lifecycle", "status", "root_identity", "ambiguity", "authority", "overlay", "unknown",
+)
+_ACTIVE_TRANSFER_DELTA_INVALIDATION_CATEGORIES = {
+    MODEL_BUILDER_INVALIDATION_LOCAL_FILES: "scan",
+    MODEL_BUILDER_INVALIDATION_REMOTE_FILES: "scan",
+    MODEL_BUILDER_INVALIDATION_LOCAL_ROOT_PATHS: "scan",
+    MODEL_BUILDER_INVALIDATION_ACTIVE_FILES: "status",
+    MODEL_BUILDER_INVALIDATION_LFTP_STATUSES: "status",
+    MODEL_BUILDER_INVALIDATION_CONFIRMED_LOCAL_DELETIONS: "lifecycle",
+    MODEL_BUILDER_INVALIDATION_STOPPED_FILES: "lifecycle",
+    MODEL_BUILDER_INVALIDATION_DOWNLOADED_FILES: "lifecycle",
+    MODEL_BUILDER_INVALIDATION_EXTRACT_STATUSES: "lifecycle",
+    MODEL_BUILDER_INVALIDATION_MOVE_FAILED_FILES: "lifecycle",
+    MODEL_BUILDER_INVALIDATION_FINAL_MOVE_SUCCEEDED_FILES: "lifecycle",
+    MODEL_BUILDER_INVALIDATION_VALIDATION_STATUSES: "lifecycle",
+    MODEL_BUILDER_INVALIDATION_DOWNLOADED_TIMESTAMPS: "overlay",
+    MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS: "unknown",
+    MODEL_BUILDER_INVALIDATION_CLEAR: "authority",
+    MODEL_BUILDER_INVALIDATION_EXPLICIT: "authority",
+}
+
+
 def _breadcrumb_effectively_enabled(
         breadcrumb: object, category: str, level: str = "info",
 ) -> bool:
@@ -4319,10 +4345,39 @@ class ModelBuilder:
             MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS,
         }
 
-    def active_transfer_delta_diagnostics(self) -> dict[str, object]:
+    def active_transfer_delta_diagnostics(
+            self, root_file_ids: Optional[Set[str]] = None,
+    ) -> dict[str, object]:
         """Return identity-free bounded evidence for a rejected root delta."""
+        categories = {
+            _ACTIVE_TRANSFER_DELTA_INVALIDATION_CATEGORIES[reason]
+            for reason in self.__invalidation_reasons
+            if reason in _ACTIVE_TRANSFER_DELTA_INVALIDATION_CATEGORIES
+        }
+        if self.__lftp_regressed_root_file_ids:
+            categories.add("status")
+        if self.__active_touched_root_file_ids and not self.__lftp_touched_root_file_ids:
+            categories.add("root_identity")
+        diagnostic_root_ids = set(root_file_ids or set())
+        if not diagnostic_root_ids:
+            diagnostic_root_ids.update(self.__lftp_touched_root_file_ids)
+            diagnostic_root_ids.update(self.__active_touched_root_file_ids)
+            for _, affected in self.__pending_invalidation_tokens.values():
+                if affected is not None:
+                    diagnostic_root_ids.update(affected)
+        # Mirror the selector's global-safety condition: a legacy marker is
+        # ambiguous only when it applies to a selected/touched root and that
+        # name has non-unique source/status visibility.
+        if diagnostic_root_ids and not self.__active_transfer_delta_global_state_is_safe(
+                diagnostic_root_ids,
+        ):
+            categories.add("ambiguity")
         return {
             "invalidation_reasons": sorted(self.__invalidation_reasons),
+            "rejection_categories": [
+                category for category in _ACTIVE_TRANSFER_DELTA_REJECTION_CATEGORY_ORDER
+                if category in categories
+            ],
             "lftp_touched_count": len(self.__lftp_touched_root_file_ids),
             "active_touched_count": len(self.__active_touched_root_file_ids),
             "lftp_regressed_count": len(self.__lftp_regressed_root_file_ids),

@@ -109,6 +109,57 @@ def _active_delta_rejection_correlation_identity(file_ids: set[str]) -> str:
     )
 
 
+def _record_active_delta_rejection_summary(
+        controller: object, model: object, reason: str, diagnostics: object,
+        file_ids: Optional[set[str]] = None,
+) -> None:
+    """Write opt-in rejection evidence without influencing model fallback."""
+    try:
+        breadcrumb_trace = getattr(
+            getattr(controller, "_Controller__context", None), "breadcrumb_trace", None,
+        )
+        recorder = getattr(breadcrumb_trace, "record_active_delta_rejection", None)
+        legacy_recorder = getattr(breadcrumb_trace, "record_active_delta_authorization_rejection", None)
+        if not _breadcrumb_effectively_enabled(
+                breadcrumb_trace, "model.progress", "debug",
+        ):
+            return
+        identity = _active_delta_rejection_correlation_identity(file_ids) if file_ids else reason
+        corr_id = "root-progress:{}".format(opaque_trace_correlation(identity))
+        if callable(recorder):
+            recorder(corr_id, getattr(model, "version", None), reason, diagnostics)
+        elif reason == "active_delta_authorization_rejected" and callable(legacy_recorder):
+            legacy_recorder(corr_id, getattr(model, "version", None), diagnostics)
+    except Exception:
+        pass
+
+
+def _active_delta_diagnostics_snapshot(reader: object, root_file_ids: Optional[set[str]] = None) -> object:
+    """Read optional diagnostics without changing the rejection fallback."""
+    if not callable(reader):
+        return {}
+    try:
+        return reader(root_file_ids) if root_file_ids is not None else reader()
+    except TypeError:
+        try:
+            return reader()
+        except Exception:
+            return {}
+    except Exception:
+        return {}
+
+
+def _active_delta_rejection_trace_enabled(controller: object) -> bool:
+    """Gate rejection snapshots before invoking builder diagnostics."""
+    try:
+        context = getattr(controller, "_Controller__context", None)
+        return _breadcrumb_effectively_enabled(
+            getattr(context, "breadcrumb_trace", None), "model.progress", "debug",
+        )
+    except Exception:
+        return False
+
+
 def _scan_authority_semantic_snapshot(snapshot: object) -> dict[str, object]:
     """Exclude per-publication diagnostic identity from semantic comparisons."""
     if not isinstance(snapshot, dict):
@@ -4419,6 +4470,7 @@ class ModelUpdater(_ControllerCoreAccess):
         active_delta_authorizer = getattr(model_builder, "authorize_active_transfer_delta", None)
         active_delta_adopter = getattr(model_builder, "adopt_active_transfer_delta", None)
         active_delta_file_ids: Optional[set[str]] = None
+        selector_rejection_diagnostics: object = {}
         if authoritative_pair_candidate is None and callable(active_delta_pending) and bool(active_delta_pending()) and \
                 callable(active_delta_selector) and callable(active_delta_builder) and \
                 callable(active_delta_authorizer) and callable(active_delta_adopter):
@@ -4427,6 +4479,11 @@ class ModelUpdater(_ControllerCoreAccess):
                     def root_exists(file_id: str) -> bool:
                         return file_id in model.get_file_ids()
                     candidate_file_ids = active_delta_selector(root_exists)
+                    if not (isinstance(candidate_file_ids, set) and candidate_file_ids and all(
+                            isinstance(file_id, str) for file_id in candidate_file_ids)):
+                        if _active_delta_rejection_trace_enabled(controller):
+                            diagnostics_reader = getattr(model_builder, "active_transfer_delta_diagnostics", None)
+                            selector_rejection_diagnostics = _active_delta_diagnostics_snapshot(diagnostics_reader)
             except Exception:
                 candidate_file_ids = None
             if isinstance(candidate_file_ids, set) and candidate_file_ids and all(
@@ -4434,6 +4491,9 @@ class ModelUpdater(_ControllerCoreAccess):
                 active_delta_file_ids = candidate_file_ids
             else:
                 active_delta_selection_rejected = True
+                _record_active_delta_rejection_summary(
+                    controller, model, "active_delta_selector_rejected", selector_rejection_diagnostics,
+                )
                 if self._completion_gate_trace_enabled():
                     delta_diagnostics = getattr(model_builder, "active_transfer_delta_diagnostics", None)
                     details = delta_diagnostics() if callable(delta_diagnostics) else {}
@@ -4462,6 +4522,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 return 1 + sum(tree_file_count(child) for child in file.get_children())
 
             with controller._Controller__model_lock:
+                authorization_rejection_diagnostics: object = {}
                 try:
                     authorized = partial_build is not None and partial_model is not None and \
                         bool(active_delta_authorizer(
@@ -4476,23 +4537,11 @@ class ModelUpdater(_ControllerCoreAccess):
                     # and must not suppress the established full-build path.
                     active_transfer_delta_rejected = True
                     partial_model = None
-                    try:
-                        breadcrumb_trace = getattr(
-                            getattr(controller, "_Controller__context", None), "breadcrumb_trace", None,
+                    if _active_delta_rejection_trace_enabled(controller):
+                        diagnostics_reader = getattr(model_builder, "active_transfer_delta_diagnostics", None)
+                        authorization_rejection_diagnostics = _active_delta_diagnostics_snapshot(
+                            diagnostics_reader, active_delta_file_ids,
                         )
-                        summary_recorder = getattr(
-                            breadcrumb_trace, "record_active_delta_authorization_rejection", None,
-                        )
-                        delta_diagnostics = getattr(model_builder, "active_transfer_delta_diagnostics", None)
-                        if callable(summary_recorder) and callable(delta_diagnostics) and \
-                                _breadcrumb_effectively_enabled(breadcrumb_trace, "model.progress", "debug"):
-                            target_identity = _active_delta_rejection_correlation_identity(active_delta_file_ids)
-                            summary_recorder(
-                                "root-progress:{}".format(opaque_trace_correlation(target_identity)),
-                                getattr(model, "version", None), delta_diagnostics(),
-                            )
-                    except Exception:
-                        pass
                 if partial_model is None:
                     replacement_roots = []
                 else:
@@ -4526,6 +4575,11 @@ class ModelUpdater(_ControllerCoreAccess):
                     # full rebuild next tick.
                     active_delta_adopter(model, active_delta_file_ids, partial_build)
                     active_transfer_delta_adopted = True
+            if active_transfer_delta_rejected:
+                _record_active_delta_rejection_summary(
+                    controller, model, "active_delta_authorization_rejected",
+                    authorization_rejection_diagnostics, active_delta_file_ids,
+                )
             if diagnostics is not None:
                 try:
                     diagnostics.increment("active_transfer_delta_root_visits", len(active_delta_file_ids))

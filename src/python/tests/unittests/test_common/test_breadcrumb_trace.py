@@ -666,6 +666,7 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual(
             {
                 "invalidation_reason_count": 2,
+                "rejection_categories": ["authority"],
                 "lftp_touched_count": 128,
                 "active_touched_count": 2,
                 "pending_token_count": 4,
@@ -684,6 +685,15 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         collector.reset()
         self.assertIsNone(collector.snapshot()["active_delta_rejection_summary"])
 
+        collector.record_active_delta_rejection(
+            "root-progress:0123456789abcdef", 8, "active_delta_selector_rejected",
+            {"rejection_categories": ["status", "/private/path", "authority", "status"]},
+        )
+        summary = collector.snapshot()["active_delta_rejection_summary"]
+        self.assertEqual("active_delta_selector_rejected", summary["reason"])
+        self.assertEqual(["status", "authority"], summary["diagnostics"]["rejection_categories"])
+        self.assertNotIn("/private/path", str(summary))
+
     def test_scoped_clear_matches_active_delta_rejection_summary_metadata(self):
         collector = BreadcrumbTraceCollector(
             lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
@@ -695,6 +705,17 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         collector.clear({"corr_id": "other"})
         self.assertIsNotNone(collector.snapshot()["active_delta_rejection_summary"])
         collector.clear({"corr_id": "root-progress:0123456789abcdef"})
+        self.assertIsNone(collector.snapshot()["active_delta_rejection_summary"])
+
+    def test_active_delta_rejection_summary_rejects_malformed_reason(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        for reason in ({"active_delta_selector_rejected"}, ["active_delta_selector_rejected"],
+                       "unknown", b"active_delta_selector_rejected"):
+            self.assertFalse(collector.record_active_delta_rejection(
+                "root-progress:0123456789abcdef", 1, reason, {},
+            ))
         self.assertIsNone(collector.snapshot()["active_delta_rejection_summary"])
 
         collector.record_active_delta_authorization_rejection(

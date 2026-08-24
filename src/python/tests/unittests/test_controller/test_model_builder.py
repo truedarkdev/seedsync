@@ -882,6 +882,35 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_lftp_statuses([status])
 
         self.assertIsNone(self.model_builder.active_transfer_delta_file_ids(live_model.get_file_ids()))
+        diagnostics = self.model_builder.active_transfer_delta_diagnostics()
+        self.assertEqual(["status", "ambiguity"], diagnostics["rejection_categories"])
+        self.assertNotIn("release.bin", str(diagnostics["rejection_categories"]))
+
+    def test_active_transfer_delta_diagnostics_ignores_unrelated_extraction_marker(self):
+        self.model_builder.set_remote_files([SystemFile("active.bin", 100, False)])
+        self.model_builder.set_extracted_files({"unrelated-private.bin"})
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        self.model_builder.set_lftp_statuses([status])
+
+        self.assertEqual({"active.bin"}, self.model_builder.active_transfer_delta_file_ids(
+            live_model.get_file_ids(),
+        ))
+        self.assertNotIn("ambiguity", self.model_builder.active_transfer_delta_diagnostics()[
+            "rejection_categories"
+        ])
+
+    def test_active_transfer_delta_same_tick_unrelated_marker_rejects_without_ambiguity(self):
+        self.model_builder.set_remote_files([SystemFile("active.bin", 100, False)])
+        live_model = self.model_builder.build_model()
+        self.model_builder.set_extracted_files({"unrelated-private.bin"})
+        status = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        self.model_builder.set_lftp_statuses([status])
+
+        self.assertIsNone(self.model_builder.active_transfer_delta_file_ids(live_model.get_file_ids()))
+        categories = self.model_builder.active_transfer_delta_diagnostics()["rejection_categories"]
+        self.assertIn("status", categories)
+        self.assertNotIn("ambiguity", categories)
 
     def test_active_transfer_delta_selector_does_not_walk_effective_source_maps(self):
         self.model_builder.set_remote_files([SystemFile("root.bin", 100, False)])
