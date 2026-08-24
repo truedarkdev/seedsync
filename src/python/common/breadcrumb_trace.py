@@ -455,7 +455,7 @@ class BreadcrumbTraceCollector:
         "status_submit", "status_start", "status_finish", "status_consume",
         "pre_active_delta", "active_delta_selector", "active_delta_builder",
         "active_delta_authorization", "active_delta_adoption", "updater_decision",
-        "model_mutation", "scoped_stream_emit",
+        "active_progress_overlay_admission", "model_mutation", "scoped_stream_emit",
     })
     __PROGRESS_LINEAGE_DETAIL_KEYS = frozenset({
         "outcome", "source", "fresh", "healthy", "status_count_bucket",
@@ -465,10 +465,14 @@ class BreadcrumbTraceCollector:
         "mutation_count_bucket", "scoped_stream_count_bucket",
         "selected_pair_duration_bucket", "global_copy_duration_bucket",
         "partial_build_duration_bucket", "updater_cycle_duration_bucket",
-        "controller_cycle_duration_bucket",
+        "controller_cycle_duration_bucket", "overlay_admission",
     })
     __PROGRESS_LINEAGE_ENUMS = {
         "outcome": frozenset({"ok", "exception", "mutated", "unchanged"}),
+        "overlay_admission": frozenset({
+            "poll_gate", "unavailable", "invalidation_scope", "roots",
+            "unknown_root", "global_safety", "status_shape", "accepted", "exception",
+        }),
         "source": frozenset({
             "fresh_healthy", "fresh_unhealthy", "cached_retry", "cached_idle",
             "retry_empty", "cached_inflight", "inflight_empty", "cached_unhealthy",

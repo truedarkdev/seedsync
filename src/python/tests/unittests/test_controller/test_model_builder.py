@@ -689,6 +689,55 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_lftp_statuses([])
         self.assertIsNone(self.model_builder.build_active_progress_overlays(live_model.get_file_ids()))
 
+    def test_active_progress_overlay_reports_fixed_admission_outcomes(self):
+        # No status-only invalidation cannot enter the overlay path.
+        self.assertIsNone(self.model_builder.build_active_progress_overlays(set()))
+        self.assertEqual("invalidation_scope", self.model_builder.active_progress_overlay_admission_outcome())
+        self.model_builder._ModelBuilder__invalidation_reasons = {
+            MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
+        }
+        self.assertIsNone(self.model_builder.build_active_progress_overlays(set()))
+        self.assertEqual("roots", self.model_builder.active_progress_overlay_admission_outcome())
+
+        active = SystemFile("active.bin", 100, False)
+        self.model_builder.set_remote_files([active])
+        live_model = self.model_builder.build_model()
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        self.model_builder.set_lftp_statuses([running])
+        self.assertIsNone(self.model_builder.build_active_progress_overlays(set()))
+        self.assertEqual("unknown_root", self.model_builder.active_progress_overlay_admission_outcome())
+
+        queued_builder = ModelBuilder()
+        queued_builder.set_remote_files([SystemFile("active.bin", 100, False)])
+        queued_model = queued_builder.build_model()
+        queued = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, "active.bin", "",
+        )
+        queued_builder.set_lftp_statuses([queued])
+        self.assertIsNone(queued_builder.build_active_progress_overlays(queued_model.get_file_ids()))
+        self.assertEqual("status_shape", queued_builder.active_progress_overlay_admission_outcome())
+
+    def test_active_progress_overlay_reports_global_safety_without_identifiers(self):
+        first = SystemFile("same.bin", 100, False)
+        first.path_pair_id = "pair-a"
+        second = SystemFile("same.bin", 100, False)
+        second.path_pair_id = "pair-b"
+        self.model_builder.set_remote_files([first, second])
+        self.model_builder.set_extracted_files({"same.bin"})
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "same.bin", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        self.model_builder.set_lftp_statuses([status])
+
+        self.assertIsNone(self.model_builder.build_active_progress_overlays(live_model.get_file_ids()))
+        self.assertEqual("global_safety", self.model_builder.active_progress_overlay_admission_outcome())
+
     def test_active_transfer_delta_selected_tree_matches_full_build_and_keeps_ownership(self):
         remote_root = SystemFile("selected", 100, True)
         remote_root.path_pair_id = "pair-a"

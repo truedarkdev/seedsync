@@ -390,7 +390,11 @@ class TestRootProgressTrace(unittest.TestCase):
         self.assertTrue(trace.record_progress_lineage_for_model_version(
             9, "scoped_stream_emit", {"scope_version": 3},
         ))
-        for index in range(1, 32):
+        self.assertTrue(trace.record_progress_lineage(
+            "lftp-poll:1111111111111111", "active_progress_overlay_admission",
+            {"overlay_admission": "accepted", "file_id": "private-name"},
+        ))
+        for index in range(1, 31):
             trace.record_progress_lineage(
                 "lftp-poll:{:016x}".format(index), "status_submit", {"outcome": "ok"},
             )
@@ -408,6 +412,12 @@ class TestRootProgressTrace(unittest.TestCase):
         serialized = str(snapshot)
         self.assertNotIn("private-name", serialized)
         self.assertNotIn("/private/path", serialized)
+        admission_span = next(
+            span for span in snapshot["spans"]
+            if span["correlation"] == "lftp-poll:1111111111111111"
+        )
+        admission = admission_span["steps"][0]
+        self.assertEqual({"overlay_admission": "accepted"}, admission["details"])
 
         class BrokenDetails(dict):
             def items(self):

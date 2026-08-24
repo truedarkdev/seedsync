@@ -252,6 +252,7 @@ class ModelBuilder:
         self.__invalidation_reasons: set[str] = set()
         self.__active_transfer_delta_selector_failure: Optional[str] = None
         self.__active_transfer_delta_status_missing_match: dict[str, bool] | None = None
+        self.__active_progress_overlay_admission_outcome = "not_attempted"
         self.__next_invalidation_token = 0
         self.__pending_invalidation_tokens: dict[
             int, tuple[str, Optional[frozenset[str]]]
@@ -4416,20 +4417,29 @@ class ModelBuilder:
         lifecycle overlays, stopped state, missing/retired status, and active
         scanner changes retain the existing full/partial rebuild path.
         """
+        def reject(outcome: str) -> None:
+            self.__active_progress_overlay_admission_outcome = outcome
+
         if self.__invalidation_reasons != {MODEL_BUILDER_INVALIDATION_LFTP_STATUSES}:
+            reject("invalidation_scope")
             return None
         root_ids = set(self.__lftp_touched_root_file_ids)
         if not root_ids or self.__lftp_regressed_root_file_ids.intersection(root_ids):
+            reject("roots")
             return None
         if callable(known_root_file_ids):
             try:
                 if not all(known_root_file_ids(file_id) for file_id in root_ids):
+                    reject("unknown_root")
                     return None
             except Exception:
+                reject("unknown_root")
                 return None
         elif not root_ids.issubset(known_root_file_ids):
+            reject("unknown_root")
             return None
         if not self.__active_transfer_delta_global_state_is_safe(root_ids):
+            reject("global_safety")
             return None
         overlays: dict[str, ActiveProgressOverlay] = {}
         for file_id in root_ids:
@@ -4439,6 +4449,7 @@ class ModelBuilder:
             if status is None or status.file_id != file_id or \
                     status.state != LftpJobStatus.State.RUNNING or \
                     self.__is_stopped_file(file_id, remote, local, status):
+                reject("status_shape")
                 return None
             # The status total is LFTP's root counter.  It is the only value
             # this slice projects: no child/ancestor aggregation is inferred.
@@ -4453,9 +4464,11 @@ class ModelBuilder:
                     status.id, status.type,
                 )
             except (ModelError, TypeError, ValueError):
+                reject("status_shape")
                 return None
             progress = self.__normalize_download_progress(current.percent_local)
             if current.size_local is None and progress is None:
+                reject("status_shape")
                 return None
             self.__store_recent_live_transfer_snapshot(
                 file_id, status.file_id, current, source, status.id,
@@ -4463,7 +4476,12 @@ class ModelBuilder:
             overlays[file_id] = ActiveProgressOverlay(
                 progress, current.size_local, current.speed, current.eta,
             )
+        self.__active_progress_overlay_admission_outcome = "accepted"
         return overlays
+
+    def active_progress_overlay_admission_outcome(self) -> str:
+        """Return the last fixed, identity-free overlay admission outcome."""
+        return self.__active_progress_overlay_admission_outcome
 
     def adopt_active_progress_overlays(self, applied_model: Optional[Model] = None) -> None:
         """Commit only the consumed status invalidation after projection."""

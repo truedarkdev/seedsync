@@ -4859,12 +4859,18 @@ class ModelUpdater(_ControllerCoreAccess):
         active_progress_overlay_applied = False
         overlay_builder = getattr(model_builder, "build_active_progress_overlays", None)
         overlay_adopter = getattr(model_builder, "adopt_active_progress_overlays", None)
+        overlay_outcome_reader = getattr(model_builder, "active_progress_overlay_admission_outcome", None)
+        overlay_admission_outcome = "poll_gate"
         if lftp_status_poll_healthy and lftp_status_snapshot_fresh and \
                 lftp_status_source == "fresh_healthy" and callable(overlay_builder) and \
                 callable(overlay_adopter):
             try:
                 with controller._Controller__model_lock:
                     overlay_values = overlay_builder(lambda file_id: file_id in model.get_file_ids())
+                    if callable(overlay_outcome_reader):
+                        reported_outcome = overlay_outcome_reader()
+                        if isinstance(reported_outcome, str):
+                            overlay_admission_outcome = reported_outcome
                     if isinstance(overlay_values, dict):
                         merged_overlays = model.active_progress_overlays_snapshot()
                         merged_overlays.update(overlay_values)
@@ -4882,6 +4888,14 @@ class ModelUpdater(_ControllerCoreAccess):
             except Exception:
                 # The established active delta remains the fail-closed path.
                 active_progress_overlay_applied = False
+                overlay_admission_outcome = "exception"
+        elif not callable(overlay_builder) or not callable(overlay_adopter):
+            overlay_admission_outcome = "unavailable"
+        if _controller_breadcrumb_effectively_enabled(controller, "model.progress", "debug"):
+            _record_progress_lineage(
+                controller, lftp_status_poll_correlation, "active_progress_overlay_admission",
+                {"overlay_admission": overlay_admission_outcome},
+            )
         active_transfer_delta_applied = False
         active_transfer_delta_adopted = False
         active_transfer_delta_rejected = False
