@@ -17,7 +17,7 @@ from itertools import islice
 from types import SimpleNamespace
 from threading import Lock, RLock
 from datetime import datetime, timedelta
-from typing import Callable, Optional, Sequence, TYPE_CHECKING, cast
+from typing import Callable, Mapping, Optional, Sequence, TYPE_CHECKING, cast
 
 from common import Context, PathPair
 from common.breadcrumb_trace import opaque_trace_correlation, trace_session_digest
@@ -134,12 +134,17 @@ def _record_active_delta_rejection_summary(
         pass
 
 
-def _active_delta_diagnostics_snapshot(reader: object, root_file_ids: Optional[set[str]] = None) -> object:
+def _active_delta_diagnostics_snapshot(
+        reader: object, root_file_ids: Optional[set[str]] = None,
+        status_missing_provenance: Optional[dict[str, object]] = None,
+) -> object:
     """Read optional diagnostics without changing the rejection fallback."""
     if not callable(reader):
         return {}
     try:
-        return reader(root_file_ids) if root_file_ids is not None else reader()
+        if root_file_ids is not None:
+            return reader(root_file_ids, status_missing_provenance)
+        return reader(None, status_missing_provenance)
     except TypeError:
         try:
             return reader()
@@ -147,6 +152,92 @@ def _active_delta_diagnostics_snapshot(reader: object, root_file_ids: Optional[s
             return {}
     except Exception:
         return {}
+
+
+def _active_delta_status_count_bucket(count: object) -> str:
+    if type(count) is not int or count < 1:
+        return "0"
+    if count == 1:
+        return "1"
+    return "2-4" if count <= 4 else "5+"
+
+
+def _active_delta_status_match_evidence(
+        raw_statuses: Sequence[object], filtered_statuses: Sequence[object],
+) -> Callable[[str, Optional[str]], Mapping[str, bool]]:
+    """Return a transient, identity-free status relation projector.
+
+    The status objects stay in this updater tick.  The builder invokes the
+    projector only for the first root whose post-filter status is absent, and
+    keeps the resulting five booleans rather than any identity.
+    """
+    def relations(statuses: Sequence[object], root_file_id: str, path_pair_id: Optional[str]) -> tuple[bool, bool, bool]:
+        canonical_match = False
+        file_id_match = False
+        pair_match = False
+        for status in statuses:
+            try:
+                status_name = status.name
+                status_pair_id = status.path_pair_id
+                status_file_id = status.file_id
+            except Exception:
+                continue
+            if status_pair_id == path_pair_id:
+                pair_match = True
+            if status_file_id == root_file_id:
+                file_id_match = True
+            if type(status_name) is str and (
+                    ModelFile.build_file_id(status_name, status_pair_id) == root_file_id):
+                canonical_match = True
+        return canonical_match, file_id_match, pair_match
+
+    def evidence(root_file_id: str, path_pair_id: Optional[str]) -> Mapping[str, bool]:
+        raw_canonical, raw_file_id, raw_pair = relations(raw_statuses, root_file_id, path_pair_id)
+        filtered_canonical, filtered_file_id, _ = relations(
+            filtered_statuses, root_file_id, path_pair_id,
+        )
+        return {
+            "raw_status_match": raw_canonical or raw_file_id,
+            "filtered_status_match": filtered_canonical or filtered_file_id,
+            "canonical_match": raw_canonical,
+            "file_id_match": raw_file_id,
+            "pair_match": raw_pair,
+        }
+
+    return evidence
+
+
+def _active_delta_status_missing_provenance(
+        controller: object, *, source: object, fresh: object, healthy: object,
+        poll_error: Optional[BaseException], raw_count: int, filtered_count: int,
+        active_scan_root_present: bool,
+) -> dict[str, object]:
+    """Project this tick's status intake to fixed scalar rejection evidence."""
+    result: dict[str, object] = {
+        "poll_source": source if isinstance(source, str) else "error_empty",
+        "fresh": bool(fresh), "healthy": bool(healthy),
+        "raw_count_bucket": _active_delta_status_count_bucket(raw_count),
+        "filtered_count_bucket": _active_delta_status_count_bucket(filtered_count),
+        "active_scan_root_present": active_scan_root_present,
+        "retry_active": bool(getattr(controller, "_Controller__lftp_status_poll_retry_active", False)),
+        "future_state": "none",
+    }
+    if source in {"cached_inflight", "inflight_empty"}:
+        result["failure_reason"] = "inflight"
+    elif source in {"cached_retry", "retry_empty"}:
+        result["failure_reason"] = "retry_pending"
+    elif not bool(healthy):
+        backend = getattr(controller, "_Controller__lftp", None)
+        failure_reason = _lftp_status_poll_failure_reason(backend, poll_error)
+        if failure_reason is not None:
+            result["failure_reason"] = failure_reason
+    status_future = getattr(controller, "_Controller__lftp_status_future", None)
+    if status_future is not None:
+        try:
+            result["future_state"] = "done" if status_future.done() is True else "pending"
+        except Exception:
+            result["future_state"] = "pending"
+    return result
 
 
 def _active_delta_rejection_trace_enabled(controller: object) -> bool:
@@ -3541,12 +3632,18 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__malformed_status_only_file_ids.update(latest_active_scan.malformed_status_only_file_ids)
 
         # Update list of active file names.
+        raw_lftp_statuses = lftp_statuses
+        raw_lftp_status_count = len(raw_lftp_statuses)
         active_status_file_ids = {status.file_id for status in lftp_statuses}
         controller._Controller__malformed_status_only_file_ids.intersection_update(active_status_file_ids)
         lftp_statuses = [
             status for status in lftp_statuses
             if status.file_id not in controller._Controller__malformed_status_only_file_ids
         ]
+        # Keep this authoritative post-filter intake count before display-only
+        # pending-dispatch augmentation can add synthetic queued statuses.
+        post_filter_lftp_statuses = lftp_statuses
+        post_filter_lftp_status_count = len(post_filter_lftp_statuses)
         _record_lftp_status_breadcrumb(
             controller,
             lftp_statuses,
@@ -4478,12 +4575,34 @@ class ModelUpdater(_ControllerCoreAccess):
                 with controller._Controller__model_lock:
                     def root_exists(file_id: str) -> bool:
                         return file_id in model.get_file_ids()
-                    candidate_file_ids = active_delta_selector(root_exists)
+                    trace_enabled = _active_delta_rejection_trace_enabled(controller)
+                    if trace_enabled and isinstance(model_builder, ModelBuilder):
+                        candidate_file_ids = active_delta_selector(
+                            root_exists,
+                            status_match_evidence=_active_delta_status_match_evidence(
+                                raw_lftp_statuses, post_filter_lftp_statuses,
+                            ),
+                        )
+                    else:
+                        candidate_file_ids = active_delta_selector(root_exists)
                     if not (isinstance(candidate_file_ids, set) and candidate_file_ids and all(
                             isinstance(file_id, str) for file_id in candidate_file_ids)):
-                        if _active_delta_rejection_trace_enabled(controller):
+                        if trace_enabled:
                             diagnostics_reader = getattr(model_builder, "active_transfer_delta_diagnostics", None)
-                            selector_rejection_diagnostics = _active_delta_diagnostics_snapshot(diagnostics_reader)
+                            selector_rejection_diagnostics = _active_delta_diagnostics_snapshot(
+                                diagnostics_reader,
+                                status_missing_provenance=_active_delta_status_missing_provenance(
+                                    controller, source=lftp_status_source,
+                                    fresh=lftp_status_snapshot_fresh,
+                                    healthy=lftp_status_poll_healthy,
+                                    poll_error=lftp_status_poll_error,
+                                    raw_count=raw_lftp_status_count,
+                                    filtered_count=post_filter_lftp_status_count,
+                                    active_scan_root_present=bool(
+                                        latest_active_scan is not None and latest_active_scan.files
+                                    ),
+                                ),
+                            )
             except Exception:
                 candidate_file_ids = None
             if isinstance(candidate_file_ids, set) and candidate_file_ids and all(

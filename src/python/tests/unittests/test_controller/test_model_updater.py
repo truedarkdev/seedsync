@@ -18,6 +18,8 @@ from controller.model_updater import (
     ModelUpdater,
     _breadcrumb_effectively_enabled,
     _active_delta_rejection_correlation_identity,
+    _active_delta_status_match_evidence,
+    _active_delta_status_missing_provenance,
     _record_active_delta_rejection_summary,
     _record_lftp_status_breadcrumb,
     _ProgressiveScanAccumulator,
@@ -7431,6 +7433,72 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("ambiguous_global_visibility", summary["diagnostics"]["selector_failure"])
         self.assertNotIn("private-release.bin", str(summary))
 
+    def test_active_delta_status_missing_selector_summary_has_bounded_poll_provenance(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("active.bin", 100, False)])
+        live_model = builder.build_model()
+        prior_status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        builder.set_lftp_statuses([prior_status])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__lftp.status.return_value = []
+
+        ModelUpdater(controller).update()
+
+        summary = trace.snapshot()["active_delta_rejection_summary"]
+        self.assertEqual("active_delta_selector_rejected", summary["reason"])
+        diagnostics = summary["diagnostics"]
+        self.assertEqual("status_missing", diagnostics["selector_failure"])
+        self.assertEqual({
+            "poll_source": "fresh_healthy", "fresh": True, "healthy": True,
+            "raw_count_bucket": "0", "filtered_count_bucket": "0",
+            "active_scan_root_present": False, "raw_status_match": False,
+            "filtered_status_match": False, "canonical_match": False,
+            "file_id_match": False, "pair_match": False, "retry_active": False,
+            "future_state": "none",
+        }, diagnostics["status_missing_provenance"])
+        self.assertNotIn("active.bin", str(summary))
+
+    def test_active_delta_status_missing_summary_marks_healthy_cached_retry(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([
+            SystemFile("active.bin", 100, False), SystemFile("cached.bin", 100, False),
+        ])
+        live_model = builder.build_model()
+        prior_status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        cached_status = LftpJobStatus(
+            2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "cached.bin", "",
+        )
+        builder.set_lftp_statuses([prior_status])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__last_lftp_statuses = [cached_status]
+        controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(minutes=1)
+        controller._Controller__lftp.last_status_poll_healthy = True
+
+        ModelUpdater(controller).update()
+
+        summary = trace.snapshot()["active_delta_rejection_summary"]
+        self.assertEqual("status_missing", summary["diagnostics"]["selector_failure"])
+        provenance = summary["diagnostics"]["status_missing_provenance"]
+        self.assertEqual("cached_retry", provenance["poll_source"])
+        self.assertTrue(provenance["healthy"])
+        self.assertEqual("retry_pending", provenance["failure_reason"])
+
     def test_disabled_progress_trace_skips_selector_diagnostics_snapshot(self):
         builder = ModelBuilder()
         builder.set_remote_files([SystemFile("active.bin", 100, False)])
@@ -7471,6 +7539,102 @@ class TestModelUpdater(unittest.TestCase):
         legacy_recorder.assert_called_once()
         self.assertEqual("root-progress:", legacy_recorder.call_args.args[0][:14])
         self.assertEqual(3, legacy_recorder.call_args.args[1])
+
+    def test_active_delta_status_missing_provenance_distinguishes_poll_outcomes(self):
+        controller = SimpleNamespace(
+            _Controller__lftp=SimpleNamespace(last_status_poll_failure_reason="command_error"),
+            _Controller__lftp_status_poll_retry_active=True,
+        )
+        healthy_empty = _active_delta_status_missing_provenance(
+            controller, source="fresh_healthy", fresh=True, healthy=True, poll_error=None,
+            raw_count=0, filtered_count=0, active_scan_root_present=False,
+        )
+        cached_retry = _active_delta_status_missing_provenance(
+            controller, source="cached_retry", fresh=False, healthy=False, poll_error=None,
+            raw_count=2, filtered_count=1, active_scan_root_present=True,
+        )
+
+        self.assertEqual("fresh_healthy", healthy_empty["poll_source"])
+        self.assertEqual("0", healthy_empty["raw_count_bucket"])
+        self.assertNotIn("failure_reason", healthy_empty)
+        self.assertEqual("retry_pending", cached_retry["failure_reason"])
+        self.assertEqual("2-4", cached_retry["raw_count_bucket"])
+        self.assertEqual("1", cached_retry["filtered_count_bucket"])
+        self.assertTrue(cached_retry["retry_active"])
+
+    def test_active_delta_status_missing_provenance_accepts_timeout_and_eof_only_when_unhealthy(self):
+        controller = SimpleNamespace(
+            _Controller__lftp=SimpleNamespace(last_status_poll_failure_reason="timeout"),
+            _Controller__lftp_status_poll_retry_active=False,
+        )
+        healthy = _active_delta_status_missing_provenance(
+            controller, source="fresh_healthy", fresh=True, healthy=True, poll_error=None,
+            raw_count=0, filtered_count=0, active_scan_root_present=False,
+        )
+        unhealthy_timeout = _active_delta_status_missing_provenance(
+            controller, source="unhealthy_empty", fresh=True, healthy=False, poll_error=None,
+            raw_count=0, filtered_count=0, active_scan_root_present=False,
+        )
+        controller._Controller__lftp.last_status_poll_failure_reason = "eof"
+        unhealthy_eof = _active_delta_status_missing_provenance(
+            controller, source="error_empty", fresh=True, healthy=False, poll_error=None,
+            raw_count=0, filtered_count=0, active_scan_root_present=False,
+        )
+
+        self.assertNotIn("failure_reason", healthy)
+        self.assertEqual("timeout", unhealthy_timeout["failure_reason"])
+        self.assertEqual("eof", unhealthy_eof["failure_reason"])
+
+    def test_active_delta_status_missing_provenance_marks_healthy_cached_retry_not_idle(self):
+        controller = SimpleNamespace(
+            _Controller__lftp=SimpleNamespace(last_status_poll_failure_reason="command_error"),
+            _Controller__lftp_status_poll_retry_active=True,
+        )
+        cached_retry = _active_delta_status_missing_provenance(
+            controller, source="cached_retry", fresh=False, healthy=True, poll_error=None,
+            raw_count=1, filtered_count=1, active_scan_root_present=False,
+        )
+        cached_idle = _active_delta_status_missing_provenance(
+            controller, source="cached_idle", fresh=False, healthy=True, poll_error=None,
+            raw_count=0, filtered_count=0, active_scan_root_present=False,
+        )
+
+        self.assertEqual("retry_pending", cached_retry["failure_reason"])
+        self.assertNotIn("failure_reason", cached_idle)
+
+    def test_active_delta_status_match_evidence_is_target_specific_and_identity_free(self):
+        root_file_id = ModelFile.build_file_id("active.bin", "pair-a")
+        exact = SimpleNamespace(name="active.bin", path_pair_id="pair-a", file_id=root_file_id)
+        malformed = SimpleNamespace(name="active.bin", path_pair_id="pair-a", file_id=root_file_id)
+        pair_only = SimpleNamespace(
+            name="other.bin", path_pair_id="pair-a",
+            file_id=ModelFile.build_file_id("other.bin", "pair-a"),
+        )
+        canonical_only = SimpleNamespace(
+            name="active.bin", path_pair_id="pair-a", file_id="noncanonical-id",
+        )
+        unrelated = SimpleNamespace(
+            name="other.bin", path_pair_id="pair-b",
+            file_id=ModelFile.build_file_id("other.bin", "pair-b"),
+        )
+
+        self.assertEqual({
+            "raw_status_match": True, "filtered_status_match": False,
+            "canonical_match": True, "file_id_match": True, "pair_match": True,
+        }, _active_delta_status_match_evidence([malformed], [])(root_file_id, "pair-a"))
+        self.assertEqual({
+            "raw_status_match": False, "filtered_status_match": False,
+            "canonical_match": False, "file_id_match": False, "pair_match": True,
+        }, _active_delta_status_match_evidence([pair_only], [pair_only])(root_file_id, "pair-a"))
+        self.assertEqual({
+            "raw_status_match": True, "filtered_status_match": True,
+            "canonical_match": True, "file_id_match": False, "pair_match": True,
+        }, _active_delta_status_match_evidence([canonical_only], [canonical_only])(root_file_id, "pair-a"))
+        self.assertEqual({
+            "raw_status_match": False, "filtered_status_match": False,
+            "canonical_match": False, "file_id_match": False, "pair_match": False,
+        }, _active_delta_status_match_evidence([unrelated], [unrelated])(root_file_id, "pair-a"))
+        self.assertNotIn("active.bin", str(_active_delta_status_match_evidence([exact], [exact])(root_file_id, "pair-a")))
 
     def test_disabled_progress_trace_skips_authorization_diagnostics_snapshot(self):
         builder = ModelBuilder()

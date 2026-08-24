@@ -322,6 +322,27 @@ class BreadcrumbTraceCollector:
         "active_root_not_selected", "status_missing", "status_file_id_mismatch",
         "status_not_queued_or_running", "ambiguous_global_visibility",
     })
+    __ACTIVE_DELTA_STATUS_PROVENANCE_KEYS = frozenset({
+        "poll_source", "fresh", "healthy", "failure_reason", "raw_count_bucket",
+        "filtered_count_bucket", "active_scan_root_present", "raw_status_match",
+        "filtered_status_match", "canonical_match", "file_id_match", "pair_match",
+        "retry_active", "future_state",
+    })
+    __ACTIVE_DELTA_STATUS_PROVENANCE_BOOL_KEYS = frozenset({
+        "fresh", "healthy", "active_scan_root_present", "raw_status_match",
+        "filtered_status_match", "canonical_match", "file_id_match", "pair_match",
+        "retry_active",
+    })
+    __ACTIVE_DELTA_STATUS_POLL_SOURCES = frozenset({
+        "fresh_healthy", "fresh_unhealthy", "cached_retry", "cached_idle", "retry_empty",
+        "cached_inflight", "inflight_empty", "cached_unhealthy", "unhealthy_empty", "cached_error", "error_empty",
+    })
+    __ACTIVE_DELTA_STATUS_FAILURE_REASONS = frozenset({
+        "inflight", "retry_pending", "timeout", "eof", "command_error", "parser_error",
+        "unhealthy_snapshot",
+    })
+    __ACTIVE_DELTA_STATUS_FUTURE_STATES = frozenset({"none", "pending", "done"})
+    __ACTIVE_DELTA_STATUS_COUNT_BUCKETS = frozenset({"0", "1", "2-4", "5+"})
 
     def __init__(
         self,
@@ -993,6 +1014,25 @@ class BreadcrumbTraceCollector:
         selector_failure = diagnostics.get("selector_failure")
         if type(selector_failure) is str and selector_failure in cls.__ACTIVE_DELTA_SELECTOR_FAILURES:
             result["selector_failure"] = selector_failure
+        status_missing_provenance = diagnostics.get("status_missing_provenance")
+        if isinstance(status_missing_provenance, Mapping):
+            safe_provenance: Dict[str, Any] = {}
+            for key, value in status_missing_provenance.items():
+                if key not in cls.__ACTIVE_DELTA_STATUS_PROVENANCE_KEYS:
+                    continue
+                if key in cls.__ACTIVE_DELTA_STATUS_PROVENANCE_BOOL_KEYS and type(value) is bool:
+                    safe_provenance[key] = value
+                elif key == "poll_source" and type(value) is str and value in cls.__ACTIVE_DELTA_STATUS_POLL_SOURCES:
+                    safe_provenance[key] = value
+                elif key == "failure_reason" and type(value) is str and value in cls.__ACTIVE_DELTA_STATUS_FAILURE_REASONS:
+                    safe_provenance[key] = value
+                elif key == "future_state" and type(value) is str and value in cls.__ACTIVE_DELTA_STATUS_FUTURE_STATES:
+                    safe_provenance[key] = value
+                elif key in {"raw_count_bucket", "filtered_count_bucket"} and \
+                        type(value) is str and value in cls.__ACTIVE_DELTA_STATUS_COUNT_BUCKETS:
+                    safe_provenance[key] = value
+            if safe_provenance:
+                result["status_missing_provenance"] = safe_provenance
         for key in cls.__ACTIVE_DELTA_DIAGNOSTIC_COUNT_KEYS:
             value = diagnostics.get(key)
             if type(value) is int and value >= 0:

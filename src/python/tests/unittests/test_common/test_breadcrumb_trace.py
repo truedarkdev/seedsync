@@ -737,6 +737,33 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
             collector.snapshot()["active_delta_rejection_summary"]["diagnostics"]["selector_failure"],
         )
 
+    def test_active_delta_status_missing_provenance_is_allowlisted_and_redacted(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        collector.record_active_delta_rejection(
+            "root-progress:0123456789abcdef", 1, "active_delta_selector_rejected",
+            {
+                "selector_failure": "status_missing",
+                "status_missing_provenance": {
+                    "poll_source": "fresh_healthy", "fresh": True, "healthy": True,
+                    "raw_count_bucket": "1", "filtered_count_bucket": "0",
+                    "raw_status_match": True, "filtered_status_match": False,
+                    "failure_reason": "timeout", "future_state": True,
+                    "private_path": "/private/path", "poll_source_bad_type": True,
+                },
+            },
+        )
+
+        provenance = collector.snapshot()["active_delta_rejection_summary"]["diagnostics"][
+            "status_missing_provenance"
+        ]
+        self.assertEqual("fresh_healthy", provenance["poll_source"])
+        self.assertEqual("0", provenance["filtered_count_bucket"])
+        self.assertNotIn("private_path", provenance)
+        self.assertEqual("timeout", provenance["failure_reason"])
+        self.assertNotIn("future_state", provenance)
+
         collector.record_active_delta_authorization_rejection(
             "root-progress:0123456789abcdef", 7, {},
         )

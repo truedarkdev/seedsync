@@ -6,7 +6,7 @@ from datetime import datetime
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple, cast
+from typing import Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Set, Tuple, cast
 import math
 import json
 import time
@@ -64,6 +64,10 @@ _ACTIVE_TRANSFER_DELTA_SELECTOR_FAILURES = frozenset({
     "invalid_invalidation_scope", "no_selected_roots", "unknown_root", "lftp_regressed",
     "active_root_not_selected", "status_missing", "status_file_id_mismatch",
     "status_not_queued_or_running", "ambiguous_global_visibility",
+})
+_ACTIVE_TRANSFER_DELTA_STATUS_MATCH_KEYS = frozenset({
+    "raw_status_match", "filtered_status_match", "canonical_match",
+    "file_id_match", "pair_match",
 })
 _ACTIVE_TRANSFER_DELTA_INVALIDATION_CATEGORIES = {
     MODEL_BUILDER_INVALIDATION_LOCAL_FILES: "scan",
@@ -247,6 +251,7 @@ class ModelBuilder:
         # explicitly classified before it can participate in a partial build.
         self.__invalidation_reasons: set[str] = set()
         self.__active_transfer_delta_selector_failure: Optional[str] = None
+        self.__active_transfer_delta_status_missing_match: dict[str, bool] | None = None
         self.__next_invalidation_token = 0
         self.__pending_invalidation_tokens: dict[
             int, tuple[str, Optional[frozenset[str]]]
@@ -4188,6 +4193,7 @@ class ModelBuilder:
         self.__lftp_regressed_root_file_ids.intersection_update(self.__lftp_touched_root_file_ids)
         self.__cached_model = applied_model if not self.__pending_invalidation_tokens else None
         self.__active_transfer_delta_selector_failure = None
+        self.__active_transfer_delta_status_missing_match = None
 
     def commit_authoritative_pair_sources_for_full_rebuild(
             self, pair_build: _AuthoritativePairBuild,
@@ -4354,6 +4360,7 @@ class ModelBuilder:
 
     def active_transfer_delta_diagnostics(
             self, root_file_ids: Optional[Set[str]] = None,
+            status_missing_provenance: Optional[dict[str, object]] = None,
     ) -> dict[str, object]:
         """Return identity-free bounded evidence for a rejected root delta."""
         categories = {
@@ -4379,7 +4386,7 @@ class ModelBuilder:
                 diagnostic_root_ids,
         ):
             categories.add("ambiguity")
-        return {
+        result: dict[str, object] = {
             "invalidation_reasons": sorted(self.__invalidation_reasons),
             "rejection_categories": [
                 category for category in _ACTIVE_TRANSFER_DELTA_REJECTION_CATEGORY_ORDER
@@ -4396,9 +4403,17 @@ class ModelBuilder:
                 for reason in sorted({reason for reason, _ in self.__pending_invalidation_tokens.values()})
             },
         }
+        if self.__active_transfer_delta_selector_failure == "status_missing" and \
+                isinstance(status_missing_provenance, dict):
+            provenance = dict(status_missing_provenance)
+            if self.__active_transfer_delta_status_missing_match is not None:
+                provenance.update(self.__active_transfer_delta_status_missing_match)
+            result["status_missing_provenance"] = provenance
+        return result
 
     def active_transfer_delta_file_ids(
-            self, known_root_file_ids: Set[str] | Callable[[str], bool],
+            self, known_root_file_ids: Set[str] | Callable[[str], bool], *,
+            status_match_evidence: Optional[Callable[[str, Optional[str]], Mapping[str, object]]] = None,
     ) -> Optional[set[str]]:
         """Return roots eligible for a transfer-lifecycle partial publication.
 
@@ -4408,9 +4423,22 @@ class ModelBuilder:
         partial authority to remove a root.
         """
         self.__active_transfer_delta_selector_failure = None
+        self.__active_transfer_delta_status_missing_match = None
 
-        def reject(reason: str) -> None:
+        def reject(reason: str, file_id: Optional[str] = None) -> None:
             self.__active_transfer_delta_selector_failure = reason
+            if reason == "status_missing" and file_id is not None and callable(status_match_evidence):
+                root = self.__remote_file(file_id) or self.__local_file(file_id) or self.__active_files.get(file_id)
+                path_pair_id = getattr(root, "path_pair_id", None)
+                try:
+                    evidence = status_match_evidence(file_id, path_pair_id)
+                except Exception:
+                    evidence = None
+                if isinstance(evidence, Mapping):
+                    self.__active_transfer_delta_status_missing_match = {
+                        key: value for key, value in evidence.items()
+                        if key in _ACTIVE_TRANSFER_DELTA_STATUS_MATCH_KEYS and type(value) is bool
+                    }
             return None
 
         if not self.__invalidation_reasons.issubset({
@@ -4466,7 +4494,7 @@ class ModelBuilder:
                 if status is None and file_id in stopped_file_ids:
                     continue
                 if status is None:
-                    return reject("status_missing")
+                    return reject("status_missing", file_id)
                 if status.file_id != file_id:
                     return reject("status_file_id_mismatch")
                 if status.state not in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING):
@@ -4793,6 +4821,7 @@ class ModelBuilder:
 
     def clear(self) -> None:
         self.__active_transfer_delta_selector_failure = None
+        self.__active_transfer_delta_status_missing_match = None
         self.__local_files_by_pair.clear()
         self.__replace_local_library_inventory({})
         self.__active_files.clear()
@@ -4862,6 +4891,7 @@ class ModelBuilder:
             self.__cached_model = applied_model
             self.__pending_invalidation_tokens.clear()
             self.__active_transfer_delta_selector_failure = None
+            self.__active_transfer_delta_status_missing_match = None
             return
         if not self.__pending_invalidation_tokens or not applied_invalidation_tokens:
             return
@@ -4874,6 +4904,7 @@ class ModelBuilder:
         self.__active_touched_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
+        self.__active_transfer_delta_status_missing_match = None
 
     def authorize_active_transfer_delta(
             self, known_root_file_ids: Set[str] | Callable[[str], bool], root_file_ids: Set[str],
@@ -4916,6 +4947,7 @@ class ModelBuilder:
         self.__active_touched_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
+        self.__active_transfer_delta_status_missing_match = None
 
     def build_model(self) -> Model:
         if self.__cached_model is not None:
@@ -5220,6 +5252,7 @@ class ModelBuilder:
         self.__active_touched_root_file_ids.clear()
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
+        self.__active_transfer_delta_status_missing_match = None
         return model
 
     def __resolve_root_transfer_state(
