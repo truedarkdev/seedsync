@@ -2860,6 +2860,35 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__target_archive_trace_selector_matches_file = MagicMock(return_value=False)
         return controller
 
+    def _make_active_delta_lineage_fixture(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("root", 100, False)])
+        live_model = builder.build_model()
+        remote_scan = ScannerResult(
+            datetime.now(), [SystemFile("root", 100, False)],
+            scanned_path_pair_ids={None}, completed_path_pair_ids={None}, is_scan_final=True,
+        )
+        controller, _ = self._make_progressive_update_controller(
+            remote_scan, local_scan=None, model_builder=builder, model=live_model,
+        )
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        controller._Controller__lftp.status.return_value = [status]
+        controller._take_lftp_status_poll_correlation = lambda: "lftp-poll:0123456789abcdef"
+        return controller, builder, trace
+
+    @staticmethod
+    def _lineage_phases(trace):
+        return [
+            step["phase"] for step in trace.snapshot()["progress_lineage"]["spans"][0]["steps"]
+        ]
+
     def _make_v092_fast_get_controller(
             self, *, local_size=100, local_mtime_ns=1700000000000000000,
             local_scan=True, remote_scan=True, stopped=False, defer_scans=False,
@@ -3534,6 +3563,15 @@ class TestModelUpdater(unittest.TestCase):
         )
         status.path_pair_id = "pair-a"
         status.total_transfer_state = LftpJobStatus.TransferState(10, 80, 12, 100, 8)
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        poll_correlations = iter((
+            "lftp-poll:0123456789abcdef", "lftp-poll:fedcba9876543210",
+            "lftp-poll:0011223344556677",
+        ))
+        controller._take_lftp_status_poll_correlation = lambda: next(poll_correlations)
         updater = ModelUpdater(controller)
         updater.update()
         builder.build_model = MagicMock(wraps=builder.build_model)
@@ -3550,12 +3588,107 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(frozenset({"pair-a"}), builder.unknown_local_path_pair_ids_snapshot())
         self.assertFalse(builder.has_changes())
         builder.build_model.assert_not_called()
+        active_lineage = next(
+            span for span in trace.snapshot()["progress_lineage"]["spans"]
+            if span["correlation"] == "lftp-poll:fedcba9876543210"
+        )
+        self.assertEqual(
+            [
+                "status_consume", "pre_active_delta", "active_delta_selector",
+                "active_delta_builder", "active_delta_authorization", "active_delta_adoption",
+                "model_mutation", "updater_decision",
+            ],
+            [step["phase"] for step in active_lineage["steps"]],
+        )
 
         controller._Controller__next_lftp_status_poll_at = None
         updater.update()
 
         self.assertEqual(frozenset({"pair-a"}), builder.unknown_local_path_pair_ids_snapshot())
         builder.build_model.assert_not_called()
+
+    def test_active_delta_lineage_selector_failure_stops_before_builder(self):
+        controller, builder, trace = self._make_active_delta_lineage_fixture()
+        builder.active_transfer_delta_file_ids = MagicMock(return_value=None)
+
+        ModelUpdater(controller).update()
+
+        phases = self._lineage_phases(trace)
+        self.assertEqual(
+            [
+                "status_consume", "pre_active_delta", "active_delta_selector",
+                "updater_decision", "model_mutation",
+            ],
+            phases,
+        )
+        self.assertNotIn("active_delta_builder", phases)
+        self.assertNotIn("active_delta_authorization", phases)
+        self.assertNotIn("active_delta_adoption", phases)
+
+    def test_active_delta_lineage_builder_exception_stops_before_authorization(self):
+        controller, builder, trace = self._make_active_delta_lineage_fixture()
+        builder.build_active_transfer_roots = MagicMock(side_effect=RuntimeError("fixture"))
+
+        ModelUpdater(controller).update()
+
+        phases = self._lineage_phases(trace)
+        self.assertEqual(
+            [
+                "status_consume", "pre_active_delta", "active_delta_selector",
+                "active_delta_builder", "updater_decision", "model_mutation",
+            ],
+            phases,
+        )
+        self.assertNotIn("active_delta_authorization", phases)
+        self.assertNotIn("active_delta_adoption", phases)
+
+    def test_active_delta_lineage_authorizer_exception_records_exception_and_stops(self):
+        controller, builder, trace = self._make_active_delta_lineage_fixture()
+        builder.authorize_active_transfer_delta = MagicMock(side_effect=RuntimeError("fixture"))
+
+        ModelUpdater(controller).update()
+
+        phases = self._lineage_phases(trace)
+        self.assertEqual(
+            [
+                "status_consume", "pre_active_delta", "active_delta_selector",
+                "active_delta_builder", "active_delta_authorization", "updater_decision",
+                "model_mutation",
+            ],
+            phases,
+        )
+        authorization = next(
+            step for step in trace.snapshot()["progress_lineage"]["spans"][0]["steps"]
+            if step["phase"] == "active_delta_authorization"
+        )
+        self.assertEqual("active_delta_authorization", authorization["phase"])
+        self.assertEqual("exception", authorization["details"]["outcome"])
+        self.assertNotIn("active_delta_adoption", phases)
+
+    def test_active_delta_lineage_missing_root_stops_before_adoption(self):
+        controller, builder, trace = self._make_active_delta_lineage_fixture()
+        builder.build_active_transfer_roots = MagicMock(
+            return_value=SimpleNamespace(model=Model()),
+        )
+        builder.authorize_active_transfer_delta = MagicMock(return_value=True)
+
+        ModelUpdater(controller).update()
+
+        phases = self._lineage_phases(trace)
+        self.assertEqual(
+            [
+                "status_consume", "pre_active_delta", "active_delta_selector",
+                "active_delta_builder", "active_delta_authorization", "updater_decision",
+                "model_mutation",
+            ],
+            phases,
+        )
+        authorization = next(
+            step for step in trace.snapshot()["progress_lineage"]["spans"][0]["steps"]
+            if step["phase"] == "active_delta_authorization"
+        )
+        self.assertEqual("ok", authorization["details"]["outcome"])
+        self.assertNotIn("active_delta_adoption", phases)
 
     def test_unchanged_remote_progressive_chunk_skips_delta_builder(self):
         remote_token = "remote-unchanged-chunk"

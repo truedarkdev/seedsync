@@ -4822,6 +4822,9 @@ class ModelUpdater(_ControllerCoreAccess):
         # builder owns the invalidation contract; any scan, marker, lifecycle,
         # completion, extraction, validation, or ambiguous status condition
         # returns no ids here and retains the ordinary full-build path.
+        _record_progress_lineage(
+            controller, lftp_status_poll_correlation, "pre_active_delta",
+        )
         active_transfer_delta_applied = False
         active_transfer_delta_adopted = False
         active_transfer_delta_rejected = False
@@ -4850,6 +4853,9 @@ class ModelUpdater(_ControllerCoreAccess):
                         )
                     else:
                         candidate_file_ids = active_delta_selector(root_exists)
+                    _record_progress_lineage(
+                        controller, lftp_status_poll_correlation, "active_delta_selector",
+                    )
                     if not (isinstance(candidate_file_ids, set) and candidate_file_ids and all(
                             isinstance(file_id, str) for file_id in candidate_file_ids)):
                         if trace_enabled:
@@ -4902,18 +4908,32 @@ class ModelUpdater(_ControllerCoreAccess):
                 # rebuild instead of aborting this controller tick.
                 partial_build = None
                 partial_model = None
+            _record_progress_lineage(
+                controller, lftp_status_poll_correlation, "active_delta_builder",
+            )
 
             def tree_file_count(file: ModelFile) -> int:
                 return 1 + sum(tree_file_count(child) for child in file.get_children())
 
             with controller._Controller__model_lock:
                 authorization_rejection_diagnostics: object = {}
-                try:
-                    authorized = partial_build is not None and partial_model is not None and \
-                        bool(active_delta_authorizer(
+                authorization_called = partial_build is not None and partial_model is not None
+                authorization_outcome: Optional[str] = None
+                if authorization_called:
+                    try:
+                        authorized = bool(active_delta_authorizer(
                             root_exists, active_delta_file_ids, partial_build, model,
                         ))
-                except Exception:
+                    except Exception:
+                        authorized = False
+                        authorization_outcome = "exception"
+                    else:
+                        authorization_outcome = "ok"
+                    _record_progress_lineage(
+                        controller, lftp_status_poll_correlation, "active_delta_authorization",
+                        {"outcome": authorization_outcome},
+                    )
+                else:
                     authorized = False
                 if not authorized:
                     # A progressive partial may be eligible only because it
@@ -4942,6 +4962,9 @@ class ModelUpdater(_ControllerCoreAccess):
                             break
                         replacement_roots.append((old_file, new_file))
                 if replacement_roots:
+                    _record_progress_lineage(
+                        controller, lftp_status_poll_correlation, "active_delta_adoption",
+                    )
                     for old_file, new_file in replacement_roots:
                         if old_file != new_file:
                             model.update_file(new_file)

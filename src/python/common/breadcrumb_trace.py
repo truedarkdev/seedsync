@@ -453,7 +453,9 @@ class BreadcrumbTraceCollector:
     __PROGRESS_LINEAGE_MAX_VERSION_RANGES = 8
     __PROGRESS_LINEAGE_PHASES = frozenset({
         "status_submit", "status_start", "status_finish", "status_consume",
-        "updater_decision", "model_mutation", "scoped_stream_emit",
+        "pre_active_delta", "active_delta_selector", "active_delta_builder",
+        "active_delta_authorization", "active_delta_adoption", "updater_decision",
+        "model_mutation", "scoped_stream_emit",
     })
     __PROGRESS_LINEAGE_DETAIL_KEYS = frozenset({
         "outcome", "source", "fresh", "healthy", "status_count_bucket",

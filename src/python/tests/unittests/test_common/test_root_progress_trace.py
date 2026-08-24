@@ -374,7 +374,12 @@ class TestRootProgressTrace(unittest.TestCase):
 
         trace = self._trace()
         correlation = "lftp-poll:0123456789abcdef"
-        for phase in ("status_submit", "status_start", "status_finish", "status_consume", "updater_decision", "model_mutation"):
+        for phase in (
+                "status_submit", "status_start", "status_finish", "status_consume",
+                "pre_active_delta", "active_delta_selector", "active_delta_builder",
+                "active_delta_authorization", "active_delta_adoption", "updater_decision",
+                "model_mutation",
+        ):
             self.assertTrue(trace.record_progress_lineage(
                 correlation, phase, {"outcome": "mutated" if phase == "model_mutation" else "ok", "model_version": 9,
                 "path": "/private/path", "name": "private-name"},
@@ -390,7 +395,11 @@ class TestRootProgressTrace(unittest.TestCase):
         self.assertEqual(32, len(snapshot["spans"]))
         retained = next(span for span in snapshot["spans"] if span["correlation"] == correlation)
         self.assertEqual(
-            ["status_submit", "status_start", "status_finish", "status_consume", "updater_decision", "model_mutation", "scoped_stream_emit"],
+            [
+                "status_submit", "status_start", "status_finish", "status_consume", "pre_active_delta",
+                "active_delta_selector", "active_delta_builder", "active_delta_authorization",
+                "active_delta_adoption", "updater_decision", "model_mutation", "scoped_stream_emit",
+            ],
             [step["phase"] for step in retained["steps"]],
         )
         serialized = str(snapshot)
@@ -404,6 +413,45 @@ class TestRootProgressTrace(unittest.TestCase):
         self.assertFalse(trace.record_progress_lineage(
             "lftp-poll:fedcba9876543210", "status_submit", BrokenDetails(),
         ))
+
+    def test_active_delta_lineage_phase_order_and_unreached_tails_are_bounded(self):
+        trace = self._trace()
+        correlation = "lftp-poll:0123456789abcdef"
+        reached_failure = (
+            "status_consume", "pre_active_delta", "active_delta_selector",
+            "updater_decision",
+        )
+        for phase in reached_failure:
+            self.assertTrue(trace.record_progress_lineage(
+                correlation, phase,
+                {"outcome": "ok", "decision": "full_build"} if phase == "updater_decision"
+                else {"outcome": "ok"},
+            ))
+        span = trace.snapshot()["progress_lineage"]["spans"][0]
+        self.assertEqual(list(reached_failure), [step["phase"] for step in span["steps"]])
+        self.assertNotIn("active_delta_builder", [step["phase"] for step in span["steps"]])
+        self.assertNotIn("active_delta_authorization", [step["phase"] for step in span["steps"]])
+        self.assertNotIn("active_delta_adoption", [step["phase"] for step in span["steps"]])
+
+        noop_correlation = "lftp-poll:fedcba9876543210"
+        trace.record_progress_lineage(
+            noop_correlation, "status_consume", {"outcome": "ok"},
+        )
+        trace.record_progress_lineage(
+            noop_correlation, "pre_active_delta", {"outcome": "ok"},
+        )
+        trace.record_progress_lineage(
+            noop_correlation, "updater_decision", {"outcome": "ok", "decision": "cached"},
+        )
+        span = next(
+            span for span in trace.snapshot()["progress_lineage"]["spans"]
+            if span["correlation"] == noop_correlation
+        )
+        self.assertEqual(
+            ["status_consume", "pre_active_delta", "updater_decision"],
+            [step["phase"] for step in span["steps"]],
+        )
+        self.assertEqual(3, len(span["steps"]))
 
     def test_progress_lineage_uses_exact_mutation_mapping_and_clear_is_safe(self):
         trace = self._trace()
