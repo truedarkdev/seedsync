@@ -705,6 +705,87 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(expected_child_paths, {call.args[0] for call in selected_child_calls})
         self.assertEqual(len(expected_child_paths), len(selected_child_calls))
 
+    def test_build_local_subtree_memo_preserves_presentation_and_transferable_facts(self):
+        remote_root = SystemFile("sample-directory", 30, True)
+        remote_nested = SystemFile("nested", 20, True)
+        remote_nested.add_child(SystemFile("first.bin", 10, False))
+        remote_nested.add_child(SystemFile("second.bin", 10, False))
+        remote_root.add_child(remote_nested)
+        remote_root.add_child(SystemFile("root.bin", 10, False))
+        local_root = SystemFile("sample-directory", 30, True)
+        local_nested = SystemFile("nested", 20, True)
+        local_nested.add_child(SystemFile("first.bin", 10, False))
+        local_nested.add_child(SystemFile("second.bin", 10, False))
+        local_root.add_child(local_nested)
+        local_root.add_child(SystemFile("root.bin", 10, False))
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        model = self.model_builder.build_model()
+        built_root = model.get_file("sample-directory")
+        effective_local_root = self.model_builder._ModelBuilder__build_effective_local_files()[
+            "sample-directory"
+        ]
+
+        def assert_facts(remote_file, local_file, model_file):
+            self.assertEqual(
+                ModelBuilder._ModelBuilder__directory_leaves_cover_remote_for_presentation(
+                    remote_file, local_file
+                ),
+                model_file.complete_local_coverage,
+            )
+            self.assertEqual(
+                ModelBuilder._ModelBuilder__has_remote_transferable_content(remote_file),
+                model_file.remote_has_transferable_content,
+            )
+            local_children = {
+                child.name: child for child in local_file.iter_children()
+            } if local_file is not None and local_file.is_dir else {}
+            model_children = {child.name: child for child in model_file.iter_children()}
+            for remote_child in remote_file.iter_children():
+                assert_facts(
+                    remote_child,
+                    local_children.get(remote_child.name),
+                    model_children[remote_child.name],
+                )
+
+        assert_facts(remote_root, effective_local_root, built_root)
+
+    def test_build_local_subtree_memo_evaluates_each_source_node_once(self):
+        remote_root = SystemFile("sample-directory", 30, True)
+        remote_nested = SystemFile("nested", 20, True)
+        remote_nested.add_child(SystemFile("first.bin", 10, False))
+        remote_nested.add_child(SystemFile("second.bin", 10, False))
+        remote_root.add_child(remote_nested)
+        remote_root.add_child(SystemFile("root.bin", 10, False))
+        local_root = SystemFile("sample-directory", 30, True)
+        local_nested = SystemFile("nested", 20, True)
+        local_nested.add_child(SystemFile("first.bin", 10, False))
+        local_nested.add_child(SystemFile("second.bin", 10, False))
+        local_root.add_child(local_nested)
+        local_root.add_child(SystemFile("root.bin", 10, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        with patch.object(
+                ModelBuilder,
+                "_ModelBuilder__directory_leaves_cover_remote_for_presentation",
+                wraps=ModelBuilder._ModelBuilder__directory_leaves_cover_remote_for_presentation,
+        ) as presentation_coverage, patch.object(
+                ModelBuilder,
+                "_ModelBuilder__has_remote_transferable_content",
+                wraps=ModelBuilder._ModelBuilder__has_remote_transferable_content,
+        ) as transferable_content:
+            self.model_builder.build_model()
+            self.model_builder.request_rebuild()
+            self.model_builder.build_model()
+
+        # The source tree has five nodes. Root evaluation recursively fills the
+        # memo, and every child render then hits it instead of walking again.
+        # A rebuild gets a fresh memo rather than reusing facts across builds.
+        self.assertEqual(10, presentation_coverage.call_count)
+        self.assertEqual(10, transferable_content.call_count)
+
     def test_active_transfer_delta_nested_lifecycle_overlay_matches_full_build(self):
         remote_root = SystemFile("selected", 400, True)
         remote_root.path_pair_id = "pair-a"

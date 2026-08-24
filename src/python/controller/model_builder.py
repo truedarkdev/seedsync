@@ -2912,7 +2912,10 @@ class ModelBuilder:
         return False
 
     @staticmethod
-    def __has_remote_transferable_content(remote_file: Optional[SystemFile]) -> bool:
+    def __has_remote_transferable_content(
+            remote_file: Optional[SystemFile],
+            child_predicate: Optional[Callable[[SystemFile], bool]] = None,
+    ) -> bool:
         """Return whether a remote node contains a transferable file.
 
         Directory metadata alone is not transferable content. The remote scan
@@ -2924,10 +2927,46 @@ class ModelBuilder:
             return False
         if not remote_file.is_dir:
             return True
+        recurse = child_predicate or ModelBuilder.__has_remote_transferable_content
         return any(
-            ModelBuilder.__has_remote_transferable_content(child)
+            recurse(child)
             for child in remote_file.iter_children()
         )
+
+    @staticmethod
+    def __build_local_predicate_key(
+            predicate: str, remote_file: Optional[SystemFile], local_file: Optional[SystemFile],
+    ) -> tuple[object, ...]:
+        """Identify one immutable-enough source-subtree predicate input.
+
+        SystemFile is mutable and intentionally unhashable.  A build owns its
+        source trees for the duration of reconciliation, so object identity is
+        the safe scope; include the fields read by the predicates to avoid
+        reusing a result if a test or an unusual source adapter mutates a node
+        during that build.
+        """
+        def state(file: Optional[SystemFile]) -> object:
+            if file is None:
+                return None
+            return id(file), file.is_dir, file.size, file.is_staging, file.has_staging_collision
+
+        return predicate, state(remote_file), state(local_file)
+
+    def __build_local_remote_transferable_content(
+            self, remote_file: Optional[SystemFile],
+            cache: dict[tuple[object, ...], bool],
+    ) -> bool:
+        key = self.__build_local_predicate_key("remote_transferable", remote_file, None)
+        if key in cache:
+            return cache[key]
+        result = ModelBuilder.__has_remote_transferable_content(
+            remote_file,
+            child_predicate=lambda child: self.__build_local_remote_transferable_content(
+                child, cache
+            ),
+        )
+        cache[key] = result
+        return result
 
     @staticmethod
     def __normalize_download_progress(percent_local: Optional[int | float]) -> Optional[int]:
@@ -3718,7 +3757,9 @@ class ModelBuilder:
 
     @staticmethod
     def __directory_leaves_cover_remote_for_presentation(
-            remote_file: Optional[SystemFile], local_file: Optional[SystemFile]) -> bool:
+            remote_file: Optional[SystemFile], local_file: Optional[SystemFile],
+            child_predicate: Optional[Callable[[SystemFile, Optional[SystemFile]], bool]] = None,
+    ) -> bool:
         """Whether every remote leaf is locally complete for presentation.
 
         Presentation coverage is intentionally independent of unmatched local
@@ -3734,12 +3775,30 @@ class ModelBuilder:
         if not remote_file.is_dir:
             return local_file.size >= remote_file.size
         local_children = {child.name: child for child in local_file.iter_children()}
+        recurse = child_predicate or ModelBuilder.__directory_leaves_cover_remote_for_presentation
         return all(
-            ModelBuilder.__directory_leaves_cover_remote_for_presentation(
+            recurse(
                 remote_child, local_children.get(remote_child.name)
             )
             for remote_child in remote_file.iter_children()
         )
+
+    def __build_local_presentation_coverage(
+            self, remote_file: Optional[SystemFile], local_file: Optional[SystemFile],
+            cache: dict[tuple[object, ...], bool],
+    ) -> bool:
+        key = self.__build_local_predicate_key("presentation_coverage", remote_file, local_file)
+        if key in cache:
+            return cache[key]
+        result = ModelBuilder.__directory_leaves_cover_remote_for_presentation(
+            remote_file,
+            local_file,
+            child_predicate=lambda child_remote, child_local: self.__build_local_presentation_coverage(
+                child_remote, child_local, cache
+            ),
+        )
+        cache[key] = result
+        return result
 
     @staticmethod
     def __effective_local_tree_proves_completion(remote_file: Optional[SystemFile],
@@ -4990,6 +5049,10 @@ class ModelBuilder:
         model.set_downloaded_timestamp_overlay_generation(
             self.__downloaded_timestamp_overlay_generation
         )
+        # These predicates are pure for the lifetime of this build.  Keep the
+        # memo local so source trees and their derived facts never cross a
+        # model generation or an active/authoritative partial builder.
+        build_local_predicate_cache: dict[tuple[object, ...], bool] = {}
         live_transferred_file_ids: set[str] = set()
         effective_local_files = self.__build_effective_local_files()
         self.__cached_unresolved_staging_collision_file_ids = {
@@ -5062,8 +5125,8 @@ class ModelBuilder:
             # Presentation proof requires each remote leaf; lifecycle state
             # retains its separate staging-root size fallback.
             mixed_root_trace_enabled = self.__is_mixed_root_trace_enabled()
-            model_file.complete_local_coverage = self.__directory_leaves_cover_remote_for_presentation(
-                remote, local
+            model_file.complete_local_coverage = self.__build_local_presentation_coverage(
+                remote, local, build_local_predicate_cache
             )
             if mixed_root_trace_enabled:
                 self.__record_mixed_root_decision(
@@ -5111,6 +5174,7 @@ class ModelBuilder:
                 status.state == LftpJobStatus.State.RUNNING else None,
                 status.id if status is not None else None,
                 file_id=file_id,
+                build_local_predicate_cache=build_local_predicate_cache,
             )
             self.__build_children(
                 model_file,
@@ -5119,6 +5183,7 @@ class ModelBuilder:
                 status,
                 root_seen_file_ids,
                 live_transferred_file_ids,
+                build_local_predicate_cache,
                 root_file_id=file_id,
             )
             self.__estimate_eta(model_file)
@@ -5426,6 +5491,7 @@ class ModelBuilder:
         status: Optional[LftpJobStatus],
         seen_file_ids: Set[str],
         live_transferred_file_ids: Set[str],
+        build_local_predicate_cache: Optional[dict[tuple[object, ...], bool]] = None,
         root_file_id: Optional[str] = None,
     ) -> None:
         # Traverse SystemFile children tree in BFS order
@@ -5492,8 +5558,14 @@ class ModelBuilder:
                 seen_file_ids.add(_child_file_id)
                 _child_is_stopped = _child_file_id in self.__stopped_files
                 _child_model_file.explicitly_stopped = _child_is_stopped
-                _child_model_file.complete_local_coverage = not _ancestor_has_staging_collision and \
-                    self.__directory_leaves_cover_remote_for_presentation(_remote_child, _local_child)
+                _child_model_file.complete_local_coverage = not _ancestor_has_staging_collision and (
+                    self.__build_local_presentation_coverage(
+                        _remote_child, _local_child, build_local_predicate_cache
+                    ) if build_local_predicate_cache is not None else
+                    ModelBuilder.__directory_leaves_cover_remote_for_presentation(
+                        _remote_child, _local_child
+                    )
+                )
 
                 # Set the state, first matching criteria below decides state
                 #   child is a directory: Default
@@ -5581,6 +5653,7 @@ class ModelBuilder:
                     live_transferred_file_ids,
                     file_id=_child_file_id,
                     ancestor_file_ids=(_model_file_id,) + _ancestor_file_ids,
+                    build_local_predicate_cache=build_local_predicate_cache,
                 )
                 # A successful child finalization persists an exact child
                 # identity before its staging entry is retired.  The raw
@@ -5635,12 +5708,18 @@ class ModelBuilder:
         lftp_job_id: Optional[int] = None,
         file_id: Optional[str] = None,
         ancestor_file_ids: Optional[Tuple[str, ...]] = None,
+        build_local_predicate_cache: Optional[dict[tuple[object, ...], bool]] = None,
     ) -> None:
         effective_file_id = file_id if file_id is not None else model_file.file_id
         # set local and remote sizes
         model_file.remote_present = remote is not None
         model_file.local_present = local is not None
-        model_file.remote_has_transferable_content = self.__has_remote_transferable_content(remote)
+        model_file.remote_has_transferable_content = (
+            self.__build_local_remote_transferable_content(
+                remote, build_local_predicate_cache
+            ) if build_local_predicate_cache is not None else
+            ModelBuilder.__has_remote_transferable_content(remote)
+        )
         if remote:
             model_file.remote_size = remote.size
         if local:
