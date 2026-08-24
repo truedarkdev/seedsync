@@ -18,9 +18,13 @@ import stat
 import pytest
 
 from tests.utils import TestUtils, requires_live_ssh
-from common import overrides, Context, Config, Args, AppError, Localization, Status
+from common import (
+    overrides, Context, Config, Args, AppError, Localization, Status,
+    BreadcrumbTraceCollector, Constants,
+)
 from controller import Controller, ControllerPersist
 from model import ModelFile, IModelListener
+from system.scanner import lftp_sidecar_target_identity
 
 HAS_RAR = shutil.which("rar") is not None and shutil.which("7z") is not None
 
@@ -966,6 +970,114 @@ class TestController(unittest.TestCase):
         self.assertTrue(os.path.exists(final_target))
         self.assertFalse(os.path.exists(staging_target))
         self.assertTrue(cmp(os.path.join(TestController.temp_dir, "remote", "rc"), final_target))
+
+    def test_command_queue_file_records_normal_lftp_completion_trace(self):
+        """Exercise one real SSH/LFTP terminal transfer through trace and listener paths."""
+        remote_name = "observability-baseline.bin"
+        remote_size = 256 * 1024
+        TestController.my_sparse_touch(remote_size, "remote", remote_name)
+
+        self.context.breadcrumb_trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=128,
+            policy={
+                "default": "off",
+                "rules": {
+                    "transfer.lftp": "debug",
+                    "completion.gate": "info",
+                    "lftp.sidecar": "info",
+                },
+            },
+        )
+        trace = self.context.breadcrumb_trace
+
+        self.controller = Controller(self.context, self.controller_persist)
+        self.controller.start()
+        # Keep this real transfer controlled long enough for a fresh status
+        # inlet while retaining the normal terminal completion path.
+        self.controller._Controller__lftp.rate_limit = 64 * 1024
+        self.__wait_for_initial_model()
+
+        listener = DummyListener()
+        self.controller.add_model_listener(listener)
+        self.controller.process()
+        listener.file_added = MagicMock()
+        listener.file_updated = MagicMock()
+        listener.file_removed = MagicMock()
+
+        entries_before_queue = len(trace.snapshot()["entries"])
+        self.controller.queue_command(
+            Controller.Command(Controller.Command.Action.QUEUE, remote_name)
+        )
+        final_target = os.path.join(TestController.temp_dir, "local", remote_name)
+        staging_target = os.path.join(TestController.temp_dir, "local", "incomplete", remote_name)
+        downloaded_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DOWNLOADED and
+            os.path.exists(final_target),
+            "Timed out waiting for normal observability baseline transfer to finish",
+            max_iterations=4000,
+            timeout_seconds=15,
+            sleep_seconds=0.005,
+        )
+
+        self.assertEqual(ModelFile.State.DOWNLOADED, downloaded_file.state)
+        self.assertEqual(remote_size, downloaded_file.local_size)
+        self.assertTrue(os.path.exists(final_target))
+        self.assertTrue(cmp(
+            os.path.join(TestController.temp_dir, "remote", remote_name),
+            final_target,
+            shallow=False,
+        ))
+        for residue in (
+            staging_target,
+            staging_target + Constants.LFTP_TEMP_FILE_SUFFIX,
+            staging_target + ".lftp-pget-status",
+            staging_target + Constants.LFTP_TEMP_FILE_SUFFIX + ".lftp-pget-status",
+        ):
+            self.assertFalse(os.path.exists(residue), "Unexpected transfer residue: {}".format(residue))
+        self.assertTrue(any(
+            call.args[1].name == remote_name and
+            call.args[1].state == ModelFile.State.DOWNLOADED
+            for call in listener.file_updated.call_args_list
+        ))
+        listener.file_added.assert_not_called()
+        listener.file_removed.assert_not_called()
+
+        entries = trace.snapshot()["entries"]
+        post_queue_entries = entries[entries_before_queue:]
+        status_entries = [
+            entry for entry in post_queue_entries
+            if entry["category"] == "transfer.lftp" and
+            entry["message"] == "lftp_status_poll" and
+            entry["details"].get("fresh") is True
+        ]
+        self.assertTrue(status_entries, "Expected a fresh LFTP status breadcrumb")
+        poll_flow_ids = {
+            entry["flow_id"] for entry in status_entries
+            if entry.get("flow_id") is not None
+        }
+        self.assertTrue(poll_flow_ids, "Expected a correlated fresh LFTP status breadcrumb")
+        linked_entries = [
+            entry for entry in post_queue_entries if entry.get("flow_id") in poll_flow_ids
+        ]
+        self.assertTrue(any(
+            entry["category"] == "completion.gate" and
+            entry["message"] == "completion_pending_registered"
+            for entry in linked_entries
+        ), "Expected completion registration linked to a fresh LFTP poll")
+        expected_sidecar_corr_id = lftp_sidecar_target_identity(
+            os.path.dirname(staging_target), remote_name,
+        )
+        self.assertTrue(any(
+            entry["category"] == "lftp.sidecar" and
+            entry["message"] == "lftp_sidecar_classified" and
+            entry.get("corr_id") == expected_sidecar_corr_id
+            for entry in post_queue_entries
+        ), "Expected a post-queue sidecar observation for the transferred target")
+        serialized_entries = str(entries)
+        self.assertNotIn(TestController.temp_dir, serialized_entries)
+        self.assertNotIn(remote_name, serialized_entries)
 
     def test_command_queue_invalid(self):
         self.controller = Controller(self.context, self.controller_persist)
