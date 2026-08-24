@@ -481,6 +481,28 @@ class TestRootProgressTrace(unittest.TestCase):
         )
         self.assertEqual(3, len(span["steps"]))
 
+    def test_active_delta_timing_buckets_merge_without_consuming_another_step(self):
+        trace = self._trace()
+        correlation = "lftp-poll:0123456789abcdef"
+        self.assertTrue(trace.record_progress_lineage(
+            correlation, "active_delta_builder", {
+                "selected_pair_duration_bucket": "0-4",
+                "global_copy_duration_bucket": "5-19",
+                "partial_build_duration_bucket": "20-99",
+            },
+        ))
+        self.assertTrue(trace.record_progress_lineage(
+            correlation, "updater_decision", {"updater_cycle_duration_bucket": "100-499"},
+        ))
+        self.assertTrue(trace.record_progress_lineage(
+            correlation, "updater_decision", {"controller_cycle_duration_bucket": "500-1999"},
+        ))
+        steps = trace.snapshot()["progress_lineage"]["spans"][0]["steps"]
+        self.assertEqual(["active_delta_builder", "updater_decision"], [step["phase"] for step in steps])
+        self.assertEqual("20-99", steps[0]["details"]["partial_build_duration_bucket"])
+        self.assertEqual("100-499", steps[1]["details"]["updater_cycle_duration_bucket"])
+        self.assertEqual("500-1999", steps[1]["details"]["controller_cycle_duration_bucket"])
+
     def test_progress_lineage_uses_exact_mutation_mapping_and_clear_is_safe(self):
         trace = self._trace()
         first = "lftp-poll:0123456789abcdef"

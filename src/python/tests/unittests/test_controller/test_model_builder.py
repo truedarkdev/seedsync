@@ -334,6 +334,22 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(1760000020.0, rebuilt_model.get_file(second_id).downloaded_timestamp.timestamp())
         self.assertIs(rebuilt_model, self.model_builder.build_model())
 
+    def test_active_transfer_root_build_reports_bounded_setup_timing_without_changing_result(self):
+        remote = SystemFile("active.bin", 10, False)
+        remote.path_pair_id = "pair-a"
+        file_id = ModelFile.build_file_id("active.bin", "pair-a")
+        self.model_builder.set_remote_files([remote])
+        timings = []
+        partial = self.model_builder.build_active_transfer_roots(
+            {file_id}, lambda phase, elapsed_ms: timings.append((phase, elapsed_ms)),
+        )
+        self.assertEqual({file_id}, partial.model.get_file_ids())
+        self.assertEqual(
+            ["selected_pair", "global_copy", "partial_build"],
+            [phase for phase, _ in timings],
+        )
+        self.assertTrue(all(type(elapsed_ms) is int and elapsed_ms >= 0 for _, elapsed_ms in timings))
+
     def test_authoritative_pair_build_replaces_only_completed_pair_and_adopts_after_publication(self):
         first = SystemFile("old.bin", 10, False)
         first.path_pair_id = "pair-a"

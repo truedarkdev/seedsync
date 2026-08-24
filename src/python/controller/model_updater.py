@@ -386,6 +386,20 @@ def _record_progress_lineage(
         pass
 
 
+def _progress_lineage_duration_bucket(duration_ms: int) -> str:
+    if duration_ms <= 4:
+        return "0-4"
+    if duration_ms <= 19:
+        return "5-19"
+    if duration_ms <= 99:
+        return "20-99"
+    if duration_ms <= 499:
+        return "100-499"
+    if duration_ms <= 1999:
+        return "500-1999"
+    return "2000+"
+
+
 _LFTP_STATUS_TRACE_CATEGORY = "transfer.lftp"
 _LFTP_STATUS_TRACE_STAGE = "lftp_status"
 _LFTP_STATUS_TRACE_SCHEMA = "lftp_status_authority.v1"
@@ -3092,6 +3106,11 @@ class ModelUpdater(_ControllerCoreAccess):
                 except Exception:
                     pass
         build_triggered = False
+        lineage_cycle_enabled = _controller_breadcrumb_effectively_enabled(controller, "model.progress", "debug")
+        lineage_cycle_started_ns = time.monotonic_ns() if lineage_cycle_enabled else None
+        lineage_cycle_correlation = _safe_lftp_status_poll_correlation(
+            getattr(controller, "_Controller__lftp_status_poll_correlation", None)
+        ) if lineage_cycle_enabled else None
         update_succeeded = False
         self.__progress_lineage_correlation = None
         set_publication_callback = getattr(controller._Controller__model, "set_version_publication_callback", None)
@@ -3159,6 +3178,13 @@ class ModelUpdater(_ControllerCoreAccess):
                     except Exception:
                             pass
                 self.__progress_lineage_correlation = None
+                if lineage_cycle_started_ns is not None:
+                    _record_progress_lineage(
+                        controller, lineage_cycle_correlation, "updater_decision",
+                        {"updater_cycle_duration_bucket": _progress_lineage_duration_bucket(
+                            max(0, (time.monotonic_ns() - lineage_cycle_started_ns) // 1_000_000),
+                        )},
+                    )
                 if callable(set_publication_callback):
                     try:
                         set_publication_callback(None)
@@ -4899,8 +4925,20 @@ class ModelUpdater(_ControllerCoreAccess):
                         trace_scope="aggregate",
                     )
         if active_delta_file_ids is not None:
+            active_delta_timing: dict[str, object] = {}
+            def record_active_delta_timing(phase: str, duration_ms: int) -> None:
+                key = {
+                    "selected_pair": "selected_pair_duration_bucket",
+                    "global_copy": "global_copy_duration_bucket",
+                    "partial_build": "partial_build_duration_bucket",
+                }.get(phase)
+                if key is not None:
+                    active_delta_timing[key] = _progress_lineage_duration_bucket(duration_ms)
             try:
-                partial_build = active_delta_builder(active_delta_file_ids)
+                if isinstance(model_builder, ModelBuilder) and _active_delta_rejection_trace_enabled(controller):
+                    partial_build = active_delta_builder(active_delta_file_ids, record_active_delta_timing)
+                else:
+                    partial_build = active_delta_builder(active_delta_file_ids)
                 partial_model = partial_build.model
             except Exception:
                 # A temporary renderer is an optimization only.  Preserve the
@@ -4909,7 +4947,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 partial_build = None
                 partial_model = None
             _record_progress_lineage(
-                controller, lftp_status_poll_correlation, "active_delta_builder",
+                controller, lftp_status_poll_correlation, "active_delta_builder", active_delta_timing,
             )
 
             def tree_file_count(file: ModelFile) -> int:

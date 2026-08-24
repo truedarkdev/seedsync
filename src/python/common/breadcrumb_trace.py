@@ -463,6 +463,9 @@ class BreadcrumbTraceCollector:
         "duration_bucket", "decision", "build_kind", "model_version",
         "scope_version", "model_version_first", "model_version_last",
         "mutation_count_bucket", "scoped_stream_count_bucket",
+        "selected_pair_duration_bucket", "global_copy_duration_bucket",
+        "partial_build_duration_bucket", "updater_cycle_duration_bucket",
+        "controller_cycle_duration_bucket",
     })
     __PROGRESS_LINEAGE_ENUMS = {
         "outcome": frozenset({"ok", "exception", "mutated", "unchanged"}),
@@ -478,6 +481,11 @@ class BreadcrumbTraceCollector:
         "duration_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
         "decision": frozenset({"full_build", "active_delta", "cached"}),
         "build_kind": frozenset({"candidate", "full", "none"}),
+        "selected_pair_duration_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
+        "global_copy_duration_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
+        "partial_build_duration_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
+        "updater_cycle_duration_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
+        "controller_cycle_duration_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}),
     }
 
     def __init__(
@@ -769,6 +777,13 @@ class BreadcrumbTraceCollector:
                     stream_step["details"].update(safe)
                     stream_step["details"]["scoped_stream_count_bucket"] = self.__progress_lineage_count_bucket(count)
                     stream_step["monotonic_ms"] = step["monotonic_ms"]
+                    health["phase_accepted"][phase] += 1
+                    return True
+            if phase == "updater_decision":
+                decision_step = next((candidate for candidate in steps if candidate["phase"] == phase), None)
+                if decision_step is not None:
+                    decision_step["details"].update(safe)
+                    decision_step["monotonic_ms"] = step["monotonic_ms"]
                     health["phase_accepted"][phase] += 1
                     return True
             if phase == "model_mutation" and safe.get("outcome") == "mutated" and \

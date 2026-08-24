@@ -2926,6 +2926,8 @@ class Controller:
 
     def process(self):
         diagnostics = getattr(self.__context, "performance_diagnostics", None)
+        lineage_correlation = getattr(self, "_Controller__lftp_status_poll_correlation", None)
+        lineage_started_ns = time.monotonic_ns()
         try:
             started_at = diagnostics.begin_duration(DURATION_CONTROLLER_PROCESS) if diagnostics is not None else None
         except Exception:
@@ -2944,6 +2946,18 @@ class Controller:
                     )
                 self.__process_persist_transaction()
         finally:
+            trace = getattr(self.__context, "breadcrumb_trace", None)
+            recorder = getattr(trace, "record_progress_lineage", None)
+            enabled = getattr(trace, "is_effectively_enabled", None)
+            if callable(recorder) and callable(enabled) and enabled("model.progress", "debug"):
+                elapsed_ms = max(0, (time.monotonic_ns() - lineage_started_ns) // 1_000_000)
+                bucket = "0-4" if elapsed_ms <= 4 else "5-19" if elapsed_ms <= 19 else \
+                    "20-99" if elapsed_ms <= 99 else "100-499" if elapsed_ms <= 499 else \
+                    "500-1999" if elapsed_ms <= 1999 else "2000+"
+                try:
+                    recorder(lineage_correlation, "updater_decision", {"controller_cycle_duration_bucket": bucket})
+                except Exception:
+                    pass
             if diagnostics is not None:
                 try:
                     diagnostics.finish_duration(DURATION_CONTROLLER_PROCESS, started_at)

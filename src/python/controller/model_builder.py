@@ -4541,7 +4541,9 @@ class ModelBuilder:
             for name in selected_names
         )
 
-    def build_active_transfer_roots(self, root_file_ids: Set[str]) -> _ActiveTransferRootBuild:
+    def build_active_transfer_roots(
+            self, root_file_ids: Set[str], timing: Optional[Callable[[str, int], None]] = None,
+    ) -> _ActiveTransferRootBuild:
         """Build only existing roots whose live transfer inputs changed.
 
         The sibling API intentionally filters by canonical root id rather
@@ -4549,6 +4551,14 @@ class ModelBuilder:
         path-pair names can repeat), so widening to a pair would defeat the
         bounded work guarantee.
         """
+        def timed(phase: str, started_ns: int) -> None:
+            if timing is not None:
+                try:
+                    timing(phase, max(0, (time.monotonic_ns() - started_ns) // 1_000_000))
+                except Exception:
+                    pass
+
+        started_ns = time.monotonic_ns() if timing is not None else 0
         partial = ModelBuilder()
         partial.logger = self.logger
         partial.__target_archive_trace_logger = self.__target_archive_trace_logger
@@ -4560,6 +4570,8 @@ class ModelBuilder:
         selected_pair_ids = {
             self.__file_id_path_pair_id(file_id) for file_id in root_file_ids
         }
+        timed("selected_pair", started_ns)
+        started_ns = time.monotonic_ns() if timing is not None else 0
         partial.__local_files_by_pair = {
             pair_id: {
                 file_id: file for file_id, file in files.items()
@@ -4609,8 +4621,12 @@ class ModelBuilder:
         partial.__unknown_local_path_pair_ids = set(self.__unknown_local_path_pair_ids)
         partial.__local_root_paths = dict(self.__local_root_paths)
         partial.__local_staging_paths = dict(self.__local_staging_paths)
+        timed("global_copy", started_ns)
+        started_ns = time.monotonic_ns() if timing is not None else 0
+        built_model = partial.build_model()
+        timed("partial_build", started_ns)
         return _ActiveTransferRootBuild(
-            model=partial.build_model(),
+            model=built_model,
             recent_live_transfer_snapshots=dict(partial.__recent_live_transfer_snapshots),
             retained_stopped_transfer_snapshots=dict(partial.__retained_stopped_transfer_snapshots),
         )
