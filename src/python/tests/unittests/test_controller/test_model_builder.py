@@ -813,6 +813,55 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(80, overlays["active.bin"].transferred_size)
         self.assertEqual(80, self.model_builder.build_model().get_file("active.bin").transferred_size)
 
+    def test_full_build_prefers_same_job_alias_snapshot_after_unsafe_active_scan(self):
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1_000_000_000)
+        remote.path_pair_id = "pair-a"
+        self.model_builder.set_remote_files([remote])
+        status = LftpJobStatus(
+            7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(50, 100, 50, 10, 8)
+        self.model_builder.set_lftp_statuses([status])
+        active = SystemFile("active.bin", 50, False, is_staging=True)
+        active.path_pair_id = "pair-a"
+        active.status_sidecar_ready = True
+        self.model_builder.set_active_files([active])
+        baseline = self.model_builder.build_model()
+        file_id = ModelFile.build_file_id("active.bin", "pair-a")
+
+        # Represent a previously accepted direct projection under the legacy
+        # alias while a stale canonical alias from an older job remains.
+        accepted = _RecentLiveTransferSnapshot(
+            file_id, 50, 50, 11, 7, 7, "pget", 50, 100,
+        )
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots["active.bin"] = accepted
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_id] = \
+            _RecentLiveTransferSnapshot(file_id, 46, 46, 9, 9, 8, "pget", 46, 100)
+
+        lower = LftpJobStatus(
+            7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        lower.path_pair_id = "pair-a"
+        lower.total_transfer_state = LftpJobStatus.TransferState(46, 100, 46, 10, 8)
+        self.model_builder.set_lftp_statuses([lower])
+        direct = self.model_builder.build_read_only_lftp_root_counter_overlays({file_id})
+        self.assertIsNotNone(direct)
+        assert direct is not None
+        self.assertEqual(50, direct[file_id].transferred_size)
+        unsafe_active = SystemFile("active.bin", 46, False, is_staging=True)
+        unsafe_active.path_pair_id = "pair-a"
+        unsafe_active.status_sidecar_ready = True
+        unsafe_active.has_staging_collision = True
+        self.model_builder.set_active_files([unsafe_active])
+
+        rebuilt = self.model_builder.build_model().get_file(file_id)
+
+        self.assertIsNotNone(baseline.get_file(file_id))
+        self.assertEqual(ModelFile.State.DOWNLOADING, rebuilt.state)
+        self.assertEqual(50, rebuilt.transferred_size)
+        self.assertEqual(50, rebuilt.download_progress)
+
     def test_recent_pget_snapshot_promotion_rejects_mismatch_or_missing_sidecar(self):
         for subset_total, sidecar_ready in ((99, True), (100, False)):
             with self.subTest(subset_total=subset_total, sidecar_ready=sidecar_ready):

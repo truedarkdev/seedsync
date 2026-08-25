@@ -3304,6 +3304,58 @@ class ModelBuilder:
             return file_id, promoted_snapshot
         return resolved_file_id, snapshot
 
+    def __resolve_recent_live_transfer_snapshot_for_job(
+            self,
+            file_id: str,
+            root_file_id: Optional[str],
+            lftp_job_id: Optional[int],
+            lftp_job_type: Optional[LftpJobStatus.Type | str],
+    ) -> Tuple[Optional[str], Optional[_RecentLiveTransferSnapshot]]:
+        """Prefer an aliased recent snapshot for the current LFTP identity.
+
+        Scoped and legacy roots can coexist briefly while a status/scan
+        handoff is being reconciled.  The ordinary resolver intentionally
+        prefers an exact key, but that key may belong to an older job while a
+        same-job accepted projection remains under the other root alias.
+        Select the matching identity before falling back to the ordinary
+        resolver; a reset or replacement job therefore still fails closed.
+        """
+        if type(lftp_job_id) is not int:
+            return self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
+        normalized_type = lftp_job_type.value if isinstance(
+            lftp_job_type, LftpJobStatus.Type,
+        ) else lftp_job_type
+        if not isinstance(normalized_type, str) or not normalized_type:
+            return self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
+
+        aliases = set(self.__candidate_snapshot_root_aliases(root_file_id))
+        aliases.update(self.__candidate_snapshot_root_aliases(file_id))
+        candidates: list[tuple[int, int, str, _RecentLiveTransferSnapshot]] = []
+        for order, (snapshot_key, snapshot) in enumerate(
+                self.__recent_live_transfer_snapshots.items(),
+        ):
+            if snapshot_key != file_id and snapshot.root_file_id not in aliases:
+                continue
+            if snapshot.lftp_job_id != lftp_job_id or \
+                    snapshot.lftp_job_type != normalized_type:
+                continue
+            # Prefer the exact canonical key, then the exact root key, and
+            # finally the most recently inserted matching alias.
+            key_priority = 2 if snapshot_key == file_id else 1 if snapshot_key == root_file_id else 0
+            candidates.append((key_priority, order, snapshot_key, snapshot))
+        if candidates:
+            _, _, resolved_file_id, snapshot = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+            promoted_snapshot = self.__promote_transfer_snapshot(
+                self.__recent_live_transfer_snapshots,
+                resolved_file_id,
+                file_id,
+                root_file_id,
+            )
+            if promoted_snapshot is not None:
+                return file_id, promoted_snapshot
+            return resolved_file_id, snapshot
+        return self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
+
     def __evict_retained_stopped_transfer_snapshots(self,
                                                     resolved_file_id: str,
                                                     root_file_id: Optional[str] = None) -> None:
@@ -4833,7 +4885,9 @@ class ModelBuilder:
                 return None
             try:
                 source = self.__transfer_state(status.total_transfer_state)
-                _, previous = self.__resolve_recent_live_transfer_snapshot(file_id, status.file_id)
+                _, previous = self.__resolve_recent_live_transfer_snapshot_for_job(
+                    file_id, status.file_id, status.id, status.type,
+                )
                 current = self.__combine_split_root_transfer_state(
                     source, remote, local, previous, status.id, status.type,
                 )
@@ -5037,7 +5091,9 @@ class ModelBuilder:
             # this slice projects: no child/ancestor aggregation is inferred.
             try:
                 source = self.__transfer_state(status.total_transfer_state)
-                _, previous = self.__resolve_recent_live_transfer_snapshot(file_id, status.file_id)
+                _, previous = self.__resolve_recent_live_transfer_snapshot_for_job(
+                    file_id, status.file_id, status.id, status.type,
+                )
                 current = self.__combine_split_root_transfer_state(
                     source, remote, local, previous, status.id, status.type,
                 )
@@ -6333,10 +6389,14 @@ class ModelBuilder:
             status.state == LftpJobStatus.State.RUNNING else None
         raw_current_transfer_state = source_current_transfer_state
         if source_current_transfer_state is not None:
-            _, previous_snapshot = self.__resolve_recent_live_transfer_snapshot(
-                file_id,
-                status.file_id if status is not None else None,
-            )
+            if status is not None:
+                _, previous_snapshot = self.__resolve_recent_live_transfer_snapshot_for_job(
+                    file_id, status.file_id, status.id, status.type,
+                )
+            else:
+                _, previous_snapshot = self.__resolve_recent_live_transfer_snapshot(
+                    file_id, None,
+                )
             raw_current_transfer_state = self.__combine_split_root_transfer_state(
                 source_current_transfer_state,
                 remote,
