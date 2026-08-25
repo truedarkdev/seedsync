@@ -356,7 +356,7 @@ class PendingQueueDispatch:
 
 @dataclass
 class DeferredQueueIntent:
-    """Controller-owned Queue intent while local collision work settles."""
+    """Controller-owned Queue intent while scan or collision work settles."""
 
     command: "Controller.Command"
     file_id: str
@@ -373,6 +373,10 @@ class DeferredQueueIntent:
     stop_marker_at_defer: bool = False
     stop_requested: bool = False
     failure_notified: bool = False
+    # A failed targeted scan has no success token to satisfy the fence. Keep
+    # the fixed failure reason on the intent so the next controller turn can
+    # retire it instead of waiting indefinitely.
+    rescan_failure_reason: Optional[str] = None
 
 
 @dataclass
@@ -2351,8 +2355,56 @@ class Controller:
             self.__scan_authority_tokens = tokens
 
         def record(side: str, result: Optional[object]) -> None:
-            if result is None or bool(getattr(result, "failed", False)) or \
-                    not bool(getattr(result, "is_scan_final", True)) or \
+            if result is None:
+                return
+            if bool(getattr(result, "failed", False)):
+                failure_scope: set[object] = set()
+                for attribute in (
+                        "scanned_path_pair_ids",
+                        "completed_path_pair_ids",
+                        "unknown_path_pair_ids",
+                        "recoverable_failure_path_pair_ids",
+                        "terminal_failure_path_pair_ids",
+                ):
+                    values = getattr(result, attribute, set())
+                    if isinstance(values, (set, frozenset, list, tuple)):
+                        failure_scope.update(values)
+                failed_pair_ids = {
+                    value for value in failure_scope
+                    if isinstance(value, str)
+                }
+                unscoped_full_failure = failure_scope == {None} and not bool(
+                    getattr(result, "is_targeted_scan", False)
+                )
+                if failed_pair_ids or unscoped_full_failure:
+                    result_session = getattr(result, "session_token", None)
+                    result_generation = getattr(result, "generation", None)
+                    side_index = 0 if side == "local" else 1
+                    failure_reason = "initial_{}_scan_failed".format(side)
+                    for intent in self.__deferred_queue_intents_map().values():
+                        if intent.phase != "initial_rescan":
+                            continue
+                        if type(intent.path_pair_id) is str:
+                            if intent.path_pair_id not in failed_pair_ids:
+                                continue
+                        elif intent.path_pair_id is None:
+                            if not unscoped_full_failure:
+                                continue
+                        else:
+                            continue
+                        generations = intent.rescan_generations
+                        if not isinstance(generations, tuple) or len(generations) != 2 or \
+                                not isinstance(generations[side_index], tuple) or \
+                                len(generations[side_index]) != 2:
+                            continue
+                        baseline = generations[side_index]
+                        if type(baseline[0]) is not str or type(baseline[1]) is not int or \
+                                type(result_session) is not str or result_session != baseline[0] or \
+                                type(result_generation) is not int or result_generation <= baseline[1]:
+                            continue
+                        intent.rescan_failure_reason = failure_reason
+                return
+            if not bool(getattr(result, "is_scan_final", True)) or \
                     bool(getattr(result, "unknown_path_pair_ids", set())):
                 return
             session_token = getattr(result, "session_token", None)
@@ -8156,7 +8208,9 @@ class Controller:
             return self.__deferred_queue_intents
         return cast(dict[str, DeferredQueueIntent], intents)
 
-    def __queue_scoped_rescan(self, intent: DeferredQueueIntent) -> bool:
+    def __queue_scoped_rescan(
+            self, intent: DeferredQueueIntent, phase: str = "rescan",
+    ) -> bool:
         """Invalidate both sides, then request one targeted scan generation."""
         if intent.rescan_requested:
             return intent.rescan_generations is not None
@@ -8214,9 +8268,11 @@ class Controller:
                 "ready": False,
             })
             return False
-        intent.phase = "rescan"
+        intent.phase = phase
         intent.rescan_requested = True
-        intent.scoped_rescan_attempts += 1
+        if phase == "rescan":
+            # Initial scan-authority readiness is not collision retry work.
+            intent.scoped_rescan_attempts += 1
         self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
             "schema": "queue_readiness.v1",
             "phase": "rescan_request",
@@ -8382,6 +8438,31 @@ class Controller:
         })
         return intent
 
+    def __initial_rescan_failure_reason(
+            self, intent: DeferredQueueIntent,
+    ) -> Optional[str]:
+        if intent.rescan_failure_reason is not None:
+            return intent.rescan_failure_reason
+        generations = intent.rescan_generations
+        if not isinstance(generations, tuple) or len(generations) != 2:
+            return None
+        for side, process, baseline in zip(
+                ("local", "remote"),
+                (self.__local_scan_process, self.__remote_scan_process),
+                generations,
+        ):
+            if not isinstance(baseline, tuple) or len(baseline) != 2 or \
+                    type(baseline[0]) is not str or type(baseline[1]) is not int:
+                continue
+            session_token = getattr(process, "session_token", None)
+            if type(session_token) is str and session_token and session_token != baseline[0]:
+                return "initial_{}_scan_session_changed".format(side)
+            generation = getattr(process, "generation", None)
+            if type(session_token) is str and session_token == baseline[0] and \
+                    type(generation) is int and generation < baseline[1]:
+                return "initial_{}_scan_generation_reset".format(side)
+        return None
+
     def __prepare_deferred_queue_retries(self) -> None:
         """Put only ready intents back into the normal command flow."""
         intents = self.__deferred_queue_intents_map()
@@ -8419,12 +8500,27 @@ class Controller:
                 if self.__retire_deferred_queue_intent(file_id, "stop_state_unknown"):
                     self.__notify_deferred_queue_failure(intent, "stop_state_unknown")
                 continue
+            if intent.phase == "initial_rescan":
+                failure_reason = self.__initial_rescan_failure_reason(intent)
+                if failure_reason is not None:
+                    if self.__retire_deferred_queue_intent(file_id, failure_reason):
+                        self.__notify_deferred_queue_failure(intent, failure_reason)
+                    continue
             if intent.phase == "collision":
                 future = getattr(self, "_Controller__collision_compare_future", None)
                 if future is not None and not future.done():
                     continue
-            elif intent.phase == "rescan" and not self.__queue_scoped_rescan_ready(intent):
-                continue
+            elif intent.phase in ("rescan", "initial_rescan"):
+                if not self.__queue_scoped_rescan_ready(intent):
+                    continue
+                if intent.phase == "initial_rescan":
+                    # The initial scan fence only establishes a trustworthy
+                    # model boundary. Consume it before normal collision
+                    # preflight so any cleanup gets a fresh fence of its own.
+                    intents.pop(file_id, None)
+                    intent.phase = "collision"
+                    intent.rescan_requested = False
+                    intent.rescan_generations = None
             if id(intent.command) in queued_commands:
                 continue
             self.__command_queue.put(intent.command)
@@ -8476,14 +8572,23 @@ class Controller:
             # A future without its owner claim is stale/ambiguous; never
             # admit Queue against that unknown collision worker state.
             return "reject", "collision_claim_identity_unknown", intent
-        if intent is not None and intent.phase == "rescan":
+        if intent is not None and intent.phase in ("rescan", "initial_rescan"):
             rescan_ready = self.__queue_scoped_rescan_ready(intent)
             if not rescan_ready:
                 return "deferred", "scoped_rescan_pending", intent
+            if intent.phase == "initial_rescan":
+                # Initial readiness is only a model-authority gate. Remove
+                # that intent before collision preflight so cleanup cannot
+                # reuse its fence or consume its retry budget.
+                self.__deferred_queue_intents_map().pop(intent.file_id, None)
+                intent.phase = "collision"
+                intent.rescan_requested = False
+                intent.rescan_generations = None
+                intent = None
             # A ready scan cannot authorize admission while the exact active
             # claim is still private.  Re-enter collision settlement first;
             # equal cleanup will request a new post-cleanup scan fence.
-            if claim_match is True and (
+            if intent is not None and claim_match is True and (
                     getattr(self, "_Controller__collision_compare_claim", None) is not None or
                     getattr(self, "_Controller__collision_compare_future", None) is not None
             ):
@@ -8972,22 +9077,106 @@ class Controller:
                 elif file.is_dir and command.origin != "auto_queue" and not self.is_path_pair_reconciled(
                         file.path_pair_id
                 ):
-                    self.__retire_deferred_queue_intent(file.file_id, "local_readiness_unavailable")
+                    # Manual directory Queue must wait for a trustworthy
+                    # local+remote model boundary. Keep the caller's command
+                    # and callbacks in the controller-owned intent map while
+                    # the targeted two-sided scan establishes that boundary.
+                    def scan_authority_deferred_details() -> dict[str, object]:
+                        """Return bounded, identity-free scan readiness evidence."""
+                        local_reconciled = file.path_pair_id in getattr(
+                            self, "_Controller__reconciled_local_path_pair_ids", set(),
+                        )
+                        remote_reconciled = file.path_pair_id in getattr(
+                            self, "_Controller__reconciled_remote_path_pair_ids", set(),
+                        )
+                        unknown_local_overlay: Optional[bool] = False
+                        unknown_snapshotter = getattr(
+                            getattr(self, "_Controller__model_builder", None),
+                            "unknown_local_path_pair_ids_snapshot", None,
+                        )
+                        if callable(unknown_snapshotter):
+                            try:
+                                unknown_snapshot = unknown_snapshotter()
+                                if isinstance(unknown_snapshot, (set, frozenset, list, tuple)):
+                                    unknown_local_overlay = file.path_pair_id in unknown_snapshot
+                                else:
+                                    unknown_local_overlay = None
+                            except Exception:
+                                unknown_local_overlay = None
+                        authority_snapshot = getattr(
+                            self, "_Controller__scan_authority_snapshot", {},
+                        )
+                        if not isinstance(authority_snapshot, dict):
+                            authority_snapshot = {}
+
+                        def bounded_version(value: object) -> Optional[int]:
+                            return value if type(value) is int and 0 <= value <= 2_147_483_647 else None
+
+                        model_version = bounded_version(authority_snapshot.get("model_version"))
+                        if model_version is None:
+                            model_version = bounded_version(
+                                getattr(getattr(self, "_Controller__model", None), "version", None),
+                            )
+                        return {
+                            "schema": "queue_readiness.v2",
+                            "phase": "final_decision",
+                            "decision_boundary": "scan_authority",
+                            "origin": "manual",
+                            "outcome": "deferred",
+                            "decision": "defer",
+                            "reason": "initial_scan_authority_pending",
+                            "dispatch_attempted": False,
+                            "local_reconciled": local_reconciled,
+                            "remote_reconciled": remote_reconciled,
+                            "unknown_local_overlay": unknown_local_overlay,
+                            "path_pair_scope_configured": file.path_pair_id in getattr(
+                                self, "_Controller__path_pairs_by_id", {},
+                            ),
+                            "publication_id": bounded_version(
+                                authority_snapshot.get("publication_id"),
+                            ),
+                            "model_version": model_version,
+                        }
+
+                    # Capture the authority boundary before invalidating the
+                    # standing reconciliation sets for the targeted scan.
+                    self.__record_queue_readiness_trace(
+                        file.file_id,
+                        "queue_final_decision",
+                        scan_authority_deferred_details,
+                    )
+                    if deferred_queue_intent is None:
+                        deferred_queue_intent = DeferredQueueIntent(
+                            command,
+                            file.file_id,
+                            file.path_pair_id,
+                            phase="initial_rescan",
+                            stop_marker_at_defer=stopped_marked,
+                        )
+                        self.__deferred_queue_intents_map()[file.file_id] = deferred_queue_intent
+                    if not deferred_queue_intent.rescan_requested:
+                        if not self.__queue_scoped_rescan(
+                                deferred_queue_intent, phase="initial_rescan",
+                        ):
+                            retired = self.__retire_deferred_queue_intent(
+                                file.file_id, "scoped_rescan_request_failed",
+                            )
+                            if retired:
+                                self.__notify_deferred_queue_failure(
+                                    deferred_queue_intent,
+                                    "scoped_rescan_request_failed",
+                                )
+                            continue
                     _record_fractional_queue_trace(self, file.file_id, "queue_dispatch", lambda: {
                         "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                         "dispatch_mode": "not_dispatched",
                         "future_outcome": "not_applicable",
-                        "status_acknowledgement": "not_applicable",
-                        "result": "rejected",
-                        "reason": "local_readiness_unavailable",
+                        "status_acknowledgement": "pending",
+                        "result": "deferred",
+                        "reason": "initial_scan_authority_pending",
                     })
-                    _notify_failure(
-                        command,
-                        "Path Pair scan is in progress; retry Queue when it completes",
-                        409,
-                        file,
-                    )
                     continue
+
                 elif file.is_dir and file.full_path != file.name:
                     self.__retire_deferred_queue_intent(file.file_id, "directory_root_invalid")
                     _notify_failure(

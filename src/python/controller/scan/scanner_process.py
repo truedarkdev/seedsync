@@ -444,6 +444,29 @@ def _scanner_side(scanner: IScanner) -> str:
     )
 
 
+def _failed_scan_path_pair_ids(scanner: IScanner,
+                               scan_target_path_pair_ids: Optional[set[str]]) -> set[str | None]:
+    """Return authoritative scope for a recoverable scan failure.
+
+    A targeted generation's selected IDs are known at the process boundary,
+    even when a legacy scanner leaves its failure scope at the default
+    ``{None}``. Preserve explicit string IDs from scanners that can report a
+    narrower subset; use the selected target set only when no such IDs exist.
+    Full scans retain the unscoped ``None`` marker for existing reconciliation
+    behavior.
+    """
+    failed_ids = getattr(scanner, "failed_path_pair_ids", scanner.scanned_path_pair_ids)()
+    explicit_failed_ids = {
+        path_pair_id for path_pair_id in failed_ids
+        if isinstance(path_pair_id, str)
+    }
+    if explicit_failed_ids:
+        return explicit_failed_ids
+    if scan_target_path_pair_ids:
+        return set(scan_target_path_pair_ids)
+    return {None}
+
+
 def _scanner_correlation(scanner: IScanner, session_token: str, generation: int) -> str:
     """Join parent and worker scan events without exposing scan identity."""
     return "{}:{}:{}".format(_scanner_side(scanner), trace_session_digest(session_token), generation)
@@ -618,7 +641,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
             files = error.files if error.files is not None else []
             malformed = scanner.pop_malformed_status_only_file_ids()
             managed = scanner.pop_managed_extract_file_ids()
-            failed_ids = getattr(scanner, "failed_path_pair_ids", scanner.scanned_path_pair_ids)()
+            failed_ids = _failed_scan_path_pair_ids(scanner, scan_target_path_pair_ids)
             result = ScannerResult(
                 timestamp,
                 [] if progress_emitted else files,
@@ -1043,7 +1066,7 @@ class ScannerProcess:
             if error_message != self.__last_recoverable_error_message:
                 self.logger.warning("Recoverable scanner error; returning failed result: {}".format(error_message))
                 self.__last_recoverable_error_message = error_message
-            failed_ids = getattr(self.__scanner, "failed_path_pair_ids", self.__scanner.scanned_path_pair_ids)()
+            failed_ids = _failed_scan_path_pair_ids(self.__scanner, scan_target_path_pair_ids)
             result = ScannerResult(timestamp_start, [] if progress_emitted else files, malformed, managed,
                                    failed_ids,
                                    failed=True, error_message=error_message,

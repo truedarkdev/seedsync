@@ -1807,11 +1807,44 @@ class TestScannerProcess(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertTrue(result.failed)
         self.assertEqual("recoverable error", result.error_message)
+        self.assertEqual({"movies"}, result.scanned_path_pair_ids)
+        self.assertEqual({"movies"}, result.unknown_path_pair_ids)
+        self.assertEqual({"movies"}, result.recoverable_failure_path_pair_ids)
         self.assertEqual(
             [call({"movies"}), call(None)],
             mock_scanner.set_scan_target_path_pair_ids.mock_calls,
         )
         mock_scanner.scan.assert_called_once_with()
+
+    def test_spawned_targeted_recoverable_error_reports_selected_pair_scope(self):
+        self._scan_run_patcher.stop()
+        scanner = RecoverablePartialScanner()
+
+        process = ScannerProcess(
+            scanner=scanner,
+            interval_in_ms=0,
+            verbose=False,
+            recycle_scan_worker=True,
+        )
+        self.addCleanup(process.close_queues)
+
+        process.force_scan("movies")
+        time.sleep(0.05)
+        process.run_loop()
+
+        result = None
+        deadline = time.monotonic() + 2
+        while result is None and time.monotonic() < deadline:
+            process.run_loop()
+            result = process.pop_latest_result()
+            if result is None:
+                time.sleep(0.01)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.failed)
+        self.assertEqual({"movies"}, result.scanned_path_pair_ids)
+        self.assertEqual({"movies"}, result.unknown_path_pair_ids)
+        self.assertEqual({"movies"}, result.recoverable_failure_path_pair_ids)
 
     def test_run_loop_clears_targeted_scan_state_after_nonrecoverable_exception(self):
         mock_scanner = DummyScanner()

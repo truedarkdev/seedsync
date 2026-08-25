@@ -10214,6 +10214,450 @@ class TestController(unittest.TestCase):
             self.assertNotIn("sample-directory", str(entry))
             self.assertNotIn("path-pair-a", str(entry))
 
+    def test_manual_directory_scan_deferral_records_bounded_readiness_cause(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        root = ModelFile("private-directory", True)
+        root.path_pair_id = "private-pair"
+        root.remote_size = 10
+        root.remote_has_transferable_content = True
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        model.add_file(root)
+        self.controller._Controller__model = model
+        self.controller._Controller__path_pairs_by_id = {
+            "private-pair": SimpleNamespace(remote_path="/private/remote", local_path="/private/local"),
+        }
+        self.controller._Controller__reconciled_remote_path_pair_ids.add("private-pair")
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset(
+            {"private-pair"},
+        )
+        self.controller._Controller__scan_authority_snapshot = {
+            "publication_id": 7,
+            "model_version": 11,
+        }
+        callback = MagicMock()
+
+        command = Controller.Command(Controller.Command.Action.QUEUE, root.file_id, origin="manual")
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        correlation = "fractional-mtime:{}".format(opaque_trace_correlation(root.file_id))
+        result = trace.query_events(correlation_id=correlation, category_prefix="queue.")
+        entries = result["events"]
+        self.assertEqual(
+            [
+                "queue_admission", "queue_model_boundary",
+                "queue_final_decision", "queue_rescan_readiness",
+            ],
+            [entry["message"] for entry in entries],
+        )
+        decision = next(entry for entry in entries if entry["message"] == "queue_final_decision")
+        details = decision["details"]
+        self.assertEqual("queue_readiness.v2", details["schema"])
+        self.assertEqual("final_decision", details["phase"])
+        self.assertEqual("scan_authority", details["decision_boundary"])
+        self.assertEqual("manual", details["origin"])
+        self.assertEqual("deferred", details["outcome"])
+        self.assertEqual("defer", details["decision"])
+        self.assertEqual("initial_scan_authority_pending", details["reason"])
+        self.assertFalse(details["dispatch_attempted"])
+        self.assertFalse(details["local_reconciled"])
+        self.assertTrue(details["remote_reconciled"])
+        self.assertTrue(details["unknown_local_overlay"])
+        self.assertTrue(details["path_pair_scope_configured"])
+        self.assertEqual(7, details["publication_id"])
+        self.assertEqual(11, details["model_version"])
+        self.assertEqual({correlation}, {entry["corr_id"] for entry in entries})
+        self.assertIsNone(decision["file_id"])
+        self.assertIsNone(decision["path_pair_id"])
+        serialized = str(entries)
+        self.assertNotIn("private-directory", serialized)
+        self.assertNotIn("private-pair", serialized)
+        self.assertNotIn("/private/remote", serialized)
+        self.assertNotIn("/private/local", serialized)
+        self.assertEqual([], [entry for entry in entries if entry["message"] == "queue_dispatch_boundary"])
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_failure.assert_not_called()
+        self.assertEqual("initial_rescan", self.controller._Controller__deferred_queue_intents[root.file_id].phase)
+        self.assertTrue(self.controller._Controller__local_scan_process.force_scan.called)
+        self.assertTrue(self.controller._Controller__remote_scan_process.force_scan.called)
+
+    def test_manual_directory_scan_deferral_does_not_build_disabled_readiness_details(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "off"}},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        root = ModelFile("private-directory", True)
+        root.path_pair_id = "private-pair"
+        root.remote_size = 10
+        root.remote_has_transferable_content = True
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        model.add_file(root)
+        self.controller._Controller__model = model
+        self.controller._Controller__reconciled_remote_path_pair_ids.add("private-pair")
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.side_effect = AssertionError(
+            "disabled readiness trace evaluated details",
+        )
+        callback = MagicMock()
+
+        command = Controller.Command(Controller.Command.Action.QUEUE, root.file_id, origin="manual")
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        self.assertEqual([], trace.snapshot()["entries"])
+        callback.on_failure.assert_not_called()
+        self.assertIn(root.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__lftp.queue.assert_not_called()
+
+    def _seed_manual_directory_scan_readiness_fixture(self, path_pair_id="pair-a"):
+        file = ModelFile("sample-directory", True)
+        file.path_pair_id = path_pair_id
+        file.remote_size = 10
+        file.remote_has_transferable_content = True
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {} if path_pair_id is None else {
+            path_pair_id: SimpleNamespace(remote_path="/remote", local_path="/local"),
+        }
+        self.controller._Controller__path_pair_staging_paths = {} if path_pair_id is None else {
+            path_pair_id: "/local/incomplete",
+        }
+        self.controller._Controller__model_builder.has_unresolved_staging_collision.return_value = False
+        return file
+
+    def test_manual_directory_queue_retains_intent_until_initial_scan_authority_is_ready(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+        self.assertEqual("initial_rescan", intent.phase)
+        self.assertTrue(intent.rescan_requested)
+        self.assertEqual(0, intent.scoped_rescan_attempts)
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_success.assert_not_called()
+        callback.on_failure.assert_not_called()
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("pair-a")
+        self.controller._Controller__remote_scan_process.force_scan.assert_called_once_with("pair-a")
+
+    def test_manual_directory_queue_initial_fence_requires_later_tokens_on_both_sides(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+        initial_fence = intent.rescan_generations
+        self.assertEqual(
+            (("local-test-session", 0), ("remote-test-session", 0)),
+            initial_fence,
+        )
+
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {"pair-a": initial_fence[0]},
+            "remote": {"pair-a": initial_fence[1]},
+        }
+        self.controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+        self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+        self.assertIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        callback.on_success.assert_not_called()
+
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {"pair-a": ("local-test-session", 1)},
+            "remote": {"pair-a": ("remote-test-session", 1)},
+        }
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            file.name,
+            True,
+            remote_base_dir_path="/remote",
+            local_base_dir_path="/local/incomplete",
+        )
+        self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        callback.on_success.assert_called_once_with()
+        callback.on_failure.assert_not_called()
+
+    def test_manual_directory_duplicate_queue_coalesces_to_one_initial_scan_and_dispatch(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        first_callback = MagicMock()
+        first_command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        first_command.add_callback(first_callback)
+        self.controller.queue_command(first_command)
+        self.controller._Controller__process_commands()
+
+        duplicate_callback = MagicMock()
+        duplicate_command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        duplicate_command.add_callback(duplicate_callback)
+        self.controller.queue_command(duplicate_command)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {"pair-a": ("local-test-session", 1)},
+            "remote": {"pair-a": ("remote-test-session", 1)},
+        }
+        self.controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+        self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("pair-a")
+        self.controller._Controller__remote_scan_process.force_scan.assert_called_once_with("pair-a")
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            file.name,
+            True,
+            remote_base_dir_path="/remote",
+            local_base_dir_path="/local/incomplete",
+        )
+        first_callback.on_success.assert_called_once_with()
+        duplicate_callback.on_success.assert_called_once_with()
+        first_callback.on_failure.assert_not_called()
+        duplicate_callback.on_failure.assert_not_called()
+
+    def test_manual_directory_queue_stop_before_initial_scan_ready_cancels_intent(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        queue_callback = MagicMock()
+        queue_command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        queue_command.add_callback(queue_callback)
+        self.controller.queue_command(queue_command)
+        self.controller._Controller__process_commands()
+
+        stop_callback = MagicMock()
+        stop_command = Controller.Command(Controller.Command.Action.STOP, file.file_id)
+        stop_command.add_callback(stop_callback)
+        self.controller.queue_command(stop_command)
+        self.controller._Controller__process_commands()
+
+        self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__lftp.queue.assert_not_called()
+        queue_callback.on_failure.assert_called_once()
+        stop_callback.on_success.assert_called_once_with()
+        stop_callback.on_failure.assert_not_called()
+
+    def test_manual_directory_queue_initial_scan_request_failure_rejects_once(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        self.controller._Controller__local_scan_process.force_scan.side_effect = RuntimeError(
+            "local scan wake failed",
+        )
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_failure.assert_called_once()
+        callback.on_success.assert_not_called()
+
+    def test_manual_directory_queue_later_local_scan_failure_retires_without_dispatch(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        self.assertIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+
+        self.controller._record_path_pair_scan_tokens(
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-a"},
+                failed=True, is_scan_final=False,
+                error_message="local scan failed",
+                generation=1,
+                session_token="local-test-session",
+            ),
+            None,
+        )
+        self.controller._Controller__process_commands()
+
+        self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_failure.assert_called_once()
+        callback.on_success.assert_not_called()
+
+        self.controller._Controller__process_commands()
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_failure.assert_called_once()
+
+    def test_legacy_directory_queue_unscoped_full_scan_failure_retires_once(self):
+        file = self._seed_manual_directory_scan_readiness_fixture(None)
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+        self.assertIsNone(intent.path_pair_id)
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with(None)
+        self.controller._Controller__remote_scan_process.force_scan.assert_called_once_with(None)
+
+        self.controller._record_path_pair_scan_tokens(
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={None},
+                failed=True, is_scan_final=True, is_targeted_scan=False,
+                unknown_path_pair_ids={None}, generation=1,
+                session_token="local-test-session",
+            ),
+            None,
+        )
+        self.controller._Controller__process_commands()
+
+        self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_failure.assert_called_once()
+        callback.on_success.assert_not_called()
+
+        self.controller._Controller__process_commands()
+        callback.on_failure.assert_called_once()
+
+    def test_manual_directory_queue_stale_scan_failure_does_not_retire_intent(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        self.controller._record_path_pair_scan_tokens(
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-a"},
+                failed=True, is_scan_final=False, generation=0,
+                session_token="local-test-session",
+            ),
+            None,
+        )
+        self.controller._Controller__process_commands()
+
+        self.assertIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_failure.assert_not_called()
+
+    def test_manual_directory_queue_unscoped_or_unrelated_scan_failure_is_ignored(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        for scanned_pair_ids in ({None}, {"pair-b"}):
+            self.controller._record_path_pair_scan_tokens(
+                ScannerResult(
+                    datetime.now(), [], scanned_path_pair_ids=scanned_pair_ids,
+                    failed=True, is_scan_final=False, generation=1,
+                    session_token="local-test-session",
+                ),
+                None,
+            )
+            self.controller._Controller__process_commands()
+
+        self.assertIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_failure.assert_not_called()
+
+    def test_manual_directory_queue_scanner_session_change_retires_without_dispatch(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        self.controller._Controller__local_scan_process.session_token = "replacement-local-session"
+
+        self.controller._Controller__process_commands()
+
+        self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_failure.assert_called_once()
+        callback.on_success.assert_not_called()
+
+    def test_initial_ready_then_collision_uses_a_fresh_second_scan_fence(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        self.controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+        self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {"pair-a": ("local-test-session", 1)},
+            "remote": {"pair-a": ("remote-test-session", 1)},
+        }
+        self.controller._Controller__model_builder.has_unresolved_staging_collision.side_effect = [
+            True, True, False, False,
+        ]
+        self.controller._Controller__model_builder.get_terminalizable_staging_collision_file_ids.return_value = {
+            file.file_id,
+        }
+        self.controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED,
+        )
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+        initial_intent = DeferredQueueIntent(
+            command,
+            file.file_id,
+            file.path_pair_id,
+            phase="initial_rescan",
+            rescan_requested=True,
+            rescan_generations=(
+                ("local-test-session", 0),
+                ("remote-test-session", 0),
+            ),
+        )
+        self.controller._Controller__deferred_queue_intents_map()[file.file_id] = initial_intent
+
+        self.controller._Controller__process_commands()
+
+        second_intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+        self.assertEqual("rescan", second_intent.phase)
+        self.assertEqual(1, second_intent.scoped_rescan_attempts)
+        self.assertEqual(
+            (
+                ("local-test-session", 1),
+                ("remote-test-session", 1),
+            ),
+            second_intent.rescan_generations,
+        )
+        self.controller._Controller__lftp.queue.assert_not_called()
+
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {"pair-a": ("local-test-session", 2)},
+            "remote": {"pair-a": ("remote-test-session", 2)},
+        }
+        self.controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+        self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            file.name,
+            True,
+            remote_base_dir_path="/remote",
+            local_base_dir_path="/local/incomplete",
+        )
+        self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        callback.on_success.assert_called_once_with()
+        callback.on_failure.assert_not_called()
+
     def test_queue_collision_preflight_defers_without_lftp_and_stop_cancels_intent(self):
         file = ModelFile("sample-directory", True)
         file.path_pair_id = "pair-a"
@@ -11416,7 +11860,7 @@ class TestController(unittest.TestCase):
             exclude_patterns=["*.nfo", ExactPathExclusion("E06.mkv")],
         )
 
-    def test_process_commands_queue_rejects_manual_directory_until_path_pair_reconciles(self):
+    def test_process_commands_queue_defers_manual_directory_until_path_pair_reconciles(self):
         file = ModelFile("release", True)
         file.path_pair_id = "pair-a"
         file.remote_size = 100
@@ -11436,11 +11880,16 @@ class TestController(unittest.TestCase):
         self.controller._Controller__process_commands()
 
         self.controller._Controller__lftp.queue.assert_not_called()
-        blocked_callback.on_failure.assert_called_once()
-        self.assertEqual(409, blocked_callback.on_failure.call_args.args[1])
+        blocked_callback.on_failure.assert_not_called()
         blocked_callback.on_success.assert_not_called()
 
         self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset()
+        self.controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+        self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {"pair-a": ("local-test-session", 1)},
+            "remote": {"pair-a": ("remote-test-session", 1)},
+        }
         self.controller._Controller__model_builder.get_trusted_final_leaf_paths.return_value = ()
         admitted_callback = MagicMock()
         admitted = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
@@ -11454,7 +11903,9 @@ class TestController(unittest.TestCase):
             remote_base_dir_path="/remote/a",
             local_base_dir_path="/local/a/incomplete",
         )
+        blocked_callback.on_success.assert_called_once_with()
         admitted_callback.on_success.assert_called_once_with()
+        blocked_callback.on_failure.assert_not_called()
         admitted_callback.on_failure.assert_not_called()
 
     def test_ambiguous_split_local_target_refuses_final_delete(self):
