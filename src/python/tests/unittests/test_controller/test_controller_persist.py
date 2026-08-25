@@ -12,6 +12,32 @@ from controller.persist_keys import KEY_SEP, persist_key, strip_persist_key
 
 
 class TestControllerPersist(unittest.TestCase):
+    def test_display_progress_floors_round_trip_and_reject_terminal_floor(self):
+        file_id = '["pair-a","sample.bin"]'
+        persist = ControllerPersist()
+        persist.display_progress_floors[file_id] = (90, 90, 100, 1, 100)
+        reloaded = ControllerPersist.from_str(persist.to_str())
+        self.assertEqual({file_id: (90, 90, 100, 1, 100)}, reloaded.display_progress_floors)
+        persist.display_progress_floors = {file_id: (199, 99, 200, 1, 200)}
+        self.assertEqual(
+            {file_id: (199, 99, 200, 1, 200)},
+            ControllerPersist.from_str(persist.to_str()).display_progress_floors,
+        )
+        with self.assertRaises(PersistError):
+            ControllerPersist.from_str(json.dumps({
+                "downloaded": [], "extracted": [],
+                "display_progress_floors": {file_id: {
+                    "bytes": 100, "percent": 99, "size": 100, "mtime": 1, "subset": 100,
+                }},
+            }))
+        with self.assertRaises(PersistError):
+            ControllerPersist.from_str(json.dumps({
+                "downloaded": [], "extracted": [],
+                "display_progress_floors": {file_id: {
+                    "bytes": 90, "percent": 12, "size": 100, "mtime": 1, "subset": 101,
+                }},
+            }))
+
     def test_downloaded_timestamps_are_optional_and_drop_invalid_values(self):
         legacy = ControllerPersist.from_str('{"downloaded": [], "extracted": []}')
         self.assertEqual({}, legacy.downloaded_timestamps)

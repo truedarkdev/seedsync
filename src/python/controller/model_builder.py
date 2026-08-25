@@ -232,6 +232,12 @@ class ModelBuilder:
         # snapshot for that root is retired at the same boundary.
         self.__ambiguous_lftp_status_file_ids: set[str] = set()
         self.__recent_live_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot] = {}
+        # Restart handoff only: these are display floors persisted by the
+        # controller, never lifecycle/completion evidence.
+        self.__persisted_display_progress_floors: dict[str, tuple[int, int, int, int, int]] = {}
+        # Exact old LFTP identities revoked by a Controller lifecycle epoch.
+        # This is bounded transient suppression, not lifecycle authority.
+        self.__lifecycle_revoked_status_identities: dict[str, tuple[int, str]] = {}
         self.__retained_stopped_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot] = {}
         self.__downloaded_files: Optional[set[str]] = None
         self.__downloaded_timestamps: dict[str, float] = {}
@@ -3039,6 +3045,15 @@ class ModelBuilder:
             return int(round(percent_local))
         return int(percent_local)
 
+    def __is_lifecycle_revoked_status_identity(
+            self, file_id: str, job_id: Optional[int], job_type: Optional[str],
+    ) -> bool:
+        revoked = self.__lifecycle_revoked_status_identities.get(file_id)
+        if revoked is None or type(job_id) is not int:
+            return False
+        normalized_type = job_type.value if isinstance(job_type, LftpJobStatus.Type) else job_type
+        return isinstance(normalized_type, str) and revoked == (job_id, normalized_type)
+
     @staticmethod
     def __transfer_state(value: object) -> _TransferState:
         if not isinstance(value, tuple):
@@ -3101,6 +3116,8 @@ class ModelBuilder:
                 # lower raw subset would make the next root normalization
                 # subtract progress that was already published.
                 subset_size_local = max(subset_size_local, previous.subset_size_local)
+        if self.__is_lifecycle_revoked_status_identity(root_file_id, lftp_job_id, lftp_job_type):
+            return
         snapshot = _RecentLiveTransferSnapshot(
             root_file_id=root_file_id,
             size_local=transfer_state.size_local,
@@ -3115,6 +3132,47 @@ class ModelBuilder:
         if snapshot.size_local is None:
             return
         self.__recent_live_transfer_snapshots[file_id] = snapshot
+        self.__promote_recent_live_pget_snapshot_to_display_floor(
+            file_id, root_file_id, snapshot, raw_transfer_state,
+        )
+
+    def __promote_recent_live_pget_snapshot_to_display_floor(
+            self,
+            file_id: str,
+            root_file_id: str,
+            snapshot: _RecentLiveTransferSnapshot,
+            raw_transfer_state: Optional[_TransferState],
+    ) -> None:
+        """Synchronously hand off an accepted PGET snapshot to its display floor.
+
+        This closes the interval before the updater's trailing harvest.  It
+        intentionally mirrors that harvest's evidence requirements and only
+        changes presentation state; lifecycle transitions still clear the map.
+        """
+        status = self.__lftp_statuses.get(root_file_id)
+        remote = self.__remote_file(file_id)
+        local = self.__active_files.get(root_file_id) or self.__local_file(file_id)
+        raw = raw_transfer_state
+        if status is not None and status.state == LftpJobStatus.State.RUNNING and \
+                status.type == LftpJobStatus.Type.PGET and raw is not None and raw.size_local == 0:
+            # A real zero is the existing reset boundary.  Retire the prior
+            # presentation handoff before a later positive sample arrives.
+            self.__persisted_display_progress_floors.pop(file_id, None)
+            return
+        if status is None or status.state != LftpJobStatus.State.RUNNING or \
+                status.type != LftpJobStatus.Type.PGET or remote is None or remote.is_dir or \
+                self.__is_stopped_file(file_id, remote, local, status) or \
+                not getattr(local, "status_sidecar_ready", False) or raw is None or \
+                type(raw.size_local) is not int or type(raw.size_remote) is not int or \
+                not 0 < raw.size_local <= raw.size_remote <= remote.size or \
+                type(remote.mtime_ns) is not int or snapshot.size_local is None or \
+                not 0 < snapshot.size_local < remote.size:
+            return
+        percent = min(99, int(round(snapshot.size_local * 100 / remote.size)))
+        self.__persisted_display_progress_floors[file_id] = (
+            snapshot.size_local, percent, remote.size,
+            remote.mtime_ns // 1_000_000_000, raw.size_remote,
+        )
 
     def __store_retained_stopped_transfer_snapshot(self,
                                                    file_id: str,
@@ -3123,6 +3181,8 @@ class ModelBuilder:
                                                    raw_transfer_state: Optional[_TransferState] = None,
                                                    lftp_job_id: Optional[int] = None,
                                                    lftp_job_type: Optional[str] = None) -> None:
+        if self.__is_lifecycle_revoked_status_identity(root_file_id, lftp_job_id, lftp_job_type):
+            return
         snapshot = _RecentLiveTransferSnapshot(
             root_file_id=root_file_id,
             size_local=transfer_state.size_local,
@@ -4302,6 +4362,14 @@ class ModelBuilder:
             file_id: snapshot for file_id, snapshot in self.__recent_live_transfer_snapshots.items()
             if file_id in selected_file_ids or snapshot.root_file_id in selected_file_ids
         }
+        partial.__persisted_display_progress_floors = {
+            file_id: floor for file_id, floor in self.__persisted_display_progress_floors.items()
+            if file_id in selected_file_ids
+        }
+        partial.__lifecycle_revoked_status_identities = {
+            file_id: identity for file_id, identity in self.__lifecycle_revoked_status_identities.items()
+            if file_id in selected_file_ids
+        }
         partial.__retained_stopped_transfer_snapshots = {
             file_id: snapshot for file_id, snapshot in self.__retained_stopped_transfer_snapshots.items()
             if file_id in selected_file_ids or snapshot.root_file_id in selected_file_ids
@@ -4464,6 +4532,14 @@ class ModelBuilder:
         partial.__recent_live_transfer_snapshots = {
             file_id: snapshot for file_id, snapshot in self.__recent_live_transfer_snapshots.items()
             if file_id in selected_root_ids or snapshot.root_file_id in selected_root_ids
+        }
+        partial.__persisted_display_progress_floors = {
+            file_id: floor for file_id, floor in self.__persisted_display_progress_floors.items()
+            if file_id in selected_root_ids
+        }
+        partial.__lifecycle_revoked_status_identities = {
+            file_id: identity for file_id, identity in self.__lifecycle_revoked_status_identities.items()
+            if file_id in selected_root_ids
         }
         partial.__retained_stopped_transfer_snapshots = {
             file_id: snapshot for file_id, snapshot in self.__retained_stopped_transfer_snapshots.items()
@@ -4765,6 +4841,9 @@ class ModelBuilder:
                     file_id, status.file_id, remote, local, current, source,
                     status.id, status.type,
                 )
+                current = self.__apply_persisted_display_progress_floor(
+                    file_id, current, source, remote, local, status,
+                )
                 progress = self.__normalize_download_progress(current.percent_local)
             except (ModelError, TypeError, ValueError):
                 return None
@@ -4965,6 +5044,9 @@ class ModelBuilder:
                 current = self.__coalesce_retained_stopped_transfer_state(
                     file_id, status.file_id, remote, local, current, source,
                     status.id, status.type,
+                )
+                current = self.__apply_persisted_display_progress_floor(
+                    file_id, current, source, remote, local, status,
                 )
             except (ModelError, TypeError, ValueError):
                 reject("status_shape")
@@ -5296,6 +5378,14 @@ class ModelBuilder:
             file_id: snapshot for file_id, snapshot in self.__recent_live_transfer_snapshots.items()
             if file_id in root_file_ids or snapshot.root_file_id in root_file_ids
         }
+        partial.__persisted_display_progress_floors = {
+            file_id: floor for file_id, floor in self.__persisted_display_progress_floors.items()
+            if file_id in root_file_ids
+        }
+        partial.__lifecycle_revoked_status_identities = {
+            file_id: identity for file_id, identity in self.__lifecycle_revoked_status_identities.items()
+            if file_id in root_file_ids
+        }
         partial.__retained_stopped_transfer_snapshots = {
             file_id: snapshot for file_id, snapshot in self.__retained_stopped_transfer_snapshots.items()
             if file_id in root_file_ids or snapshot.root_file_id in root_file_ids
@@ -5343,6 +5433,13 @@ class ModelBuilder:
                 file.file_id: file for file in lftp_statuses
                 if status_counts[file.file_id] == 1
             }
+            # A Queue/Stop lifecycle can observe the previous RUNNING row for
+            # one final poll.  Only a different (id, type) proves the new
+            # lifecycle is current and may publish fresh snapshots again.
+            for file_id, revoked_identity in list(self.__lifecycle_revoked_status_identities.items()):
+                status = self.__lftp_statuses.get(file_id)
+                if status is not None and (status.id, status.type.value) != revoked_identity:
+                    self.__lifecycle_revoked_status_identities.pop(file_id, None)
             # A duplicate poll is not a status retirement.  It is an
             # ambiguous replacement, so do not let a previously published
             # live snapshot silently become the full-build fallback.
@@ -5381,6 +5478,103 @@ class ModelBuilder:
                 )
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_LFTP_STATUSES, started_at)
+
+    def set_persisted_display_progress_floors(
+            self, floors: Mapping[str, tuple[int, int, int, int, int]],
+    ) -> None:
+        """Install restart-only display floors from ControllerPersist.
+
+        Validation happens again at use time against the current scan/status;
+        this setter deliberately has no lifecycle side effects.
+        """
+        self.__persisted_display_progress_floors = {
+            file_id: floor for file_id, floor in floors.items()
+            if isinstance(file_id, str) and isinstance(floor, tuple) and len(floor) == 5 and
+            all(type(value) is int for value in floor) and file_id not in self.__stopped_files
+        }
+
+    def persisted_display_progress_floors(self) -> dict[str, tuple[int, int, int, int, int]]:
+        """Return only live, sidecar-backed, non-terminal display floors."""
+        floors: dict[str, tuple[int, int, int, int, int]] = {}
+        # Do not let a progressive/pair/active partial that did not select a
+        # root erase a restart handoff owned by the full builder.  Retain it
+        # only while current authority has not disproved it.
+        for file_id, floor in self.__persisted_display_progress_floors.items():
+            status = self.__lftp_statuses.get(file_id)
+            remote = self.__remote_file(file_id)
+            local = self.__active_files.get(file_id) or self.__local_file(file_id)
+            if file_id in self.__stopped_files or status is None or \
+                    status.state != LftpJobStatus.State.RUNNING or status.type != LftpJobStatus.Type.PGET:
+                continue
+            if self.__is_lifecycle_revoked_status_identity(file_id, status.id, status.type):
+                continue
+            if remote is None or remote.is_dir or type(remote.mtime_ns) is not int:
+                continue
+            if local is not None and not getattr(local, "status_sidecar_ready", False):
+                continue
+            raw = self.__transfer_state(status.total_transfer_state)
+            if type(raw.size_local) is not int or type(raw.size_remote) is not int or \
+                    not 0 < raw.size_local <= raw.size_remote <= remote.size:
+                continue
+            bytes_floor, percent_floor, source_size, source_mtime, subset_total = floor
+            if source_size == remote.size and source_mtime == remote.mtime_ns // 1_000_000_000 and \
+                    subset_total == raw.size_remote and 0 < bytes_floor < remote.size and \
+                    percent_floor == min(99, int(round(bytes_floor * 100 / remote.size))):
+                floors[file_id] = floor
+        for file_id, snapshot in self.__recent_live_transfer_snapshots.items():
+            status = self.__lftp_statuses.get(snapshot.root_file_id)
+            remote = self.__remote_file(file_id)
+            local = self.__active_files.get(snapshot.root_file_id) or self.__local_file(file_id)
+            raw = self.__transfer_state(status.total_transfer_state) if status is not None and \
+                status.state == LftpJobStatus.State.RUNNING else None
+            if status is None or status.type != LftpJobStatus.Type.PGET or \
+                    self.__is_stopped_file(file_id, remote, local, status) or \
+                    remote is None or remote.is_dir or not getattr(local, "status_sidecar_ready", False) or \
+                    raw is None or type(raw.size_remote) is not int or not 0 < raw.size_remote <= remote.size or \
+                    type(raw.size_local) is not int or not 0 < raw.size_local <= raw.size_remote or \
+                    type(remote.mtime_ns) is not int or snapshot.size_local is None or \
+                    snapshot.size_local <= 0 or snapshot.size_local >= remote.size:
+                continue
+            if self.__is_lifecycle_revoked_status_identity(snapshot.root_file_id, status.id, status.type):
+                continue
+            percent = min(99, int(round(snapshot.size_local * 100 / remote.size)))
+            floors[file_id] = (snapshot.size_local, percent, remote.size,
+                               remote.mtime_ns // 1_000_000_000, raw.size_remote)
+        return floors
+
+    def __apply_persisted_display_progress_floor(
+            self, file_id: str, state: _TransferState, raw_state: _TransferState,
+            remote: Optional[SystemFile], local: Optional[SystemFile], status: Optional[LftpJobStatus],
+    ) -> _TransferState:
+        """Apply a conservative post-restart presentation floor.
+
+        A valid sidecar and exact source/subset topology are required.  This
+        only changes the rendered counter for a currently running transfer;
+        zero/reset, stop, Queue replacement, and completion retain their
+        existing authoritative paths.
+        """
+        floor = self.__persisted_display_progress_floors.get(file_id)
+        if floor is None or status is None or status.state != LftpJobStatus.State.RUNNING or \
+                status.type != LftpJobStatus.Type.PGET or \
+                remote is None or remote.is_dir or not getattr(
+                    local or self.__active_files.get(status.file_id), "status_sidecar_ready", False
+                ) or \
+                type(raw_state.size_local) is not int or type(raw_state.size_remote) is not int or \
+                not 0 < raw_state.size_local <= raw_state.size_remote or \
+                not 0 < raw_state.size_remote <= remote.size or \
+                type(remote.mtime_ns) is not int:
+            return state
+        if self.__is_lifecycle_revoked_status_identity(file_id, status.id, status.type):
+            return state
+        bytes_floor, percent_floor, source_size, source_mtime, subset_total = floor
+        if source_size != remote.size or source_mtime != remote.mtime_ns // 1_000_000_000 or \
+                not 0 < subset_total <= source_size or subset_total != raw_state.size_remote or \
+                not 0 < bytes_floor < remote.size or \
+                percent_floor != min(99, int(round(bytes_floor * 100 / remote.size))):
+            return state
+        size_local = max(state.size_local or 0, bytes_floor)
+        percent = max(ModelBuilder.__normalize_download_progress(state.percent_local) or 0, percent_floor)
+        return _TransferState(min(size_local, remote.size), state.size_remote, min(percent, 99), state.speed, state.eta)
 
     def evict_ambiguous_lftp_status_snapshots(self, file_ids: Set[str]) -> None:
         """Retire live floors for raw status roots rejected before intake.
@@ -5472,6 +5666,38 @@ class ModelBuilder:
                 removed = True
         if removed:
             self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LFTP_STATUSES)
+
+    def evict_transfer_progress_for_lifecycle(self, file_ids: Set[str]) -> None:
+        """Revoke exact transient progress at Queue/Stop lifecycle replacement.
+
+        This is narrower than status retirement: a replacement operation can
+        retain the same canonical source and a still-running old status for a
+        short interval, so leaving its recent snapshot would let harvest
+        recreate a revoked persisted display floor.
+        """
+        if not file_ids:
+            return
+        removed = False
+        for file_id in file_ids:
+            status = self.__lftp_statuses.get(file_id)
+            if status is not None and status.state == LftpJobStatus.State.RUNNING:
+                self.__lifecycle_revoked_status_identities[file_id] = (status.id, status.type.value)
+        for snapshots in (
+                self.__recent_live_transfer_snapshots,
+                self.__retained_stopped_transfer_snapshots,
+        ):
+            for snapshot_id, snapshot in list(snapshots.items()):
+                if snapshot_id in file_ids or snapshot.root_file_id in file_ids:
+                    snapshots.pop(snapshot_id, None)
+                    removed = True
+        for file_id in file_ids:
+            if self.__persisted_display_progress_floors.pop(file_id, None) is not None:
+                removed = True
+        if removed:
+            self.__invalidate_cache(
+                MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
+                affected_file_ids=file_ids,
+            )
 
     def __completion_snapshot_canonical_claims(
             self,
@@ -5582,6 +5808,8 @@ class ModelBuilder:
         try:
             prev_stopped_files = self.__stopped_files
             self.__stopped_files = set(stopped_files)
+            for file_id in self.__stopped_files:
+                self.__persisted_display_progress_floors.pop(file_id, None)
             self.__sweep_recent_live_transfer_snapshots()
             # Invalidate the cache
             if self.__stopped_files != prev_stopped_files:
@@ -5633,6 +5861,8 @@ class ModelBuilder:
         self.__ambiguous_lftp_status_file_ids.clear()
         self.__recent_live_transfer_snapshots.clear()
         self.__retained_stopped_transfer_snapshots.clear()
+        self.__persisted_display_progress_floors.clear()
+        self.__lifecycle_revoked_status_identities.clear()
         self.__downloaded_files = None
         if self.__downloaded_timestamps:
             self.__downloaded_timestamp_overlay_generation += 1
@@ -6114,6 +6344,10 @@ class ModelBuilder:
                 previous_snapshot,
                 status.id if status is not None else None,
                 status.type if status is not None else None,
+            )
+            raw_current_transfer_state = self.__apply_persisted_display_progress_floor(
+                file_id, raw_current_transfer_state, source_current_transfer_state,
+                remote, local, status,
             )
         current_transfer_state = raw_current_transfer_state if not is_stopped else None
         counterless_current_transfer_state = None
@@ -6818,6 +7052,16 @@ class ModelBuilder:
                         model_file.state = ModelFile.State.DOWNLOADED
                     else:
                         incomplete_children = True
+
+        # Every positive-size Downloaded publication must carry its exact
+        # terminal counter.  Completion can be proved by several independent
+        # scan/status paths above; normalize once here so later model updates
+        # cannot emit a null percentage after an earlier 100% payload.
+        if model_file.state == ModelFile.State.DOWNLOADED and remote is not None and remote.size > 0:
+            model_file.transferred_size = remote.size
+            model_file.download_progress = 100
+            model_file.downloading_speed = None
+            model_file.eta = None
 
         if mixed_root_trace_enabled and initial_root_state in (
                 ModelFile.State.DEFAULT,

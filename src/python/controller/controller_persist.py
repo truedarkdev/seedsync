@@ -23,6 +23,7 @@ class ControllerPersist(Persist):
     __KEY_MOVE_FAILURE_COUNTS = "move_failure_counts"
     __KEY_FINAL_MOVE_SUCCEEDED = "final_move_succeeded"
     __KEY_RESUME_SOURCES = "resume_sources"
+    __KEY_DISPLAY_PROGRESS_FLOORS = "display_progress_floors"
     __KEY_MARKER_IDENTITY_MIGRATION = "marker_identity_migration"
     __MARKER_IDENTITY_PHASE_ONE = 1
     __MARKER_IDENTITY_PHASE_TWO = 2
@@ -39,6 +40,11 @@ class ControllerPersist(Persist):
         # same canonical ModelFile IDs used by every other controller marker;
         # values are (remote size, portable whole-second raw mtime).
         self.resume_source_identities: dict[str, tuple[int, int]] = {}
+        # Presentation-only active-transfer floors.  Unlike resume sources,
+        # these never authorize Queue, completion, or a final move.
+        # Values are (root bytes, percent, source size, source mtime,
+        # current PGET subset total).
+        self.display_progress_floors: dict[str, tuple[int, int, int, int, int]] = {}
         self.__marker_identity_migration = 0
 
     @contextmanager
@@ -235,6 +241,23 @@ class ControllerPersist(Persist):
                     raise TypeError("resume source identity must contain non-negative integer size and mtime")
                 resume_source_identities[key] = (size, mtime)
             persist.resume_source_identities = resume_source_identities
+            raw_floors = dct.get(cls.__KEY_DISPLAY_PROGRESS_FLOORS, {})
+            if not isinstance(raw_floors, dict):
+                raise TypeError("display_progress_floors must be an object")
+            floors: dict[str, tuple[int, int, int, int, int]] = {}
+            for key, value in cast(dict[object, object], raw_floors).items():
+                if not isinstance(key, str) or cls._canonical_resume_source_id(key) != key or \
+                        not isinstance(value, dict):
+                    raise TypeError("display_progress_floors must map canonical IDs to floors")
+                fields = tuple(value.get(field) for field in ("bytes", "percent", "size", "mtime", "subset"))
+                if not all(type(field) is int for field in fields) or fields[0] <= 0 or \
+                        not 0 <= fields[1] <= 99 or fields[2] <= 0 or fields[3] < 0 or \
+                        not 0 < fields[4] <= fields[2]:
+                    raise TypeError("display progress floor is invalid")
+                if fields[0] >= fields[2] or fields[1] != min(99, int(round(fields[0] * 100 / fields[2]))):
+                    raise TypeError("display progress floor cannot be terminal")
+                floors[key] = cast(tuple[int, int, int, int, int], fields)
+            persist.display_progress_floors = floors
             phase = dct.get(cls.__KEY_MARKER_IDENTITY_MIGRATION, 0)
             if type(phase) is not int or phase not in (0, 1, 2):
                 raise TypeError("marker_identity_migration must be 0, 1, or 2")
@@ -258,6 +281,12 @@ class ControllerPersist(Persist):
                 dct[self.__KEY_RESUME_SOURCES] = {
                     key: {"size": identity[0], "mtime": identity[1]}
                     for key, identity in self.resume_source_identities.items()
+                }
+            if self.display_progress_floors:
+                dct[self.__KEY_DISPLAY_PROGRESS_FLOORS] = {
+                    key: {"bytes": value[0], "percent": value[1], "size": value[2],
+                          "mtime": value[3], "subset": value[4]}
+                    for key, value in self.display_progress_floors.items()
                 }
             # Keep old/v0.8.6 files byte-compatible when no completion times
             # have ever been recorded; the field remains optional on disk.

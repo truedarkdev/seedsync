@@ -2801,6 +2801,17 @@ class ModelUpdater(_ControllerCoreAccess):
                 path_pair_ids,
             )
         )
+        persisted_display_floors = getattr(persist, "display_progress_floors", None)
+        set_display_floors = getattr(
+            controller._Controller__model_builder, "set_persisted_display_progress_floors", None,
+        )
+        if isinstance(controller._Controller__model_builder, ModelBuilder) and \
+                isinstance(persisted_display_floors, dict) and callable(set_display_floors):
+            set_display_floors({
+                file_id: floor
+                for file_id, floor in persisted_display_floors.items()
+                if self._normalize_scoped_persist_key(file_id, path_pair_ids) == file_id
+            })
         if hasattr(persist, "move_failure_counts"):
             canonical_move_failure_ids = self._filter_keys_for_model_builder(
                 set(move_failure_counts), path_pair_ids
@@ -4468,6 +4479,11 @@ class ModelUpdater(_ControllerCoreAccess):
         # builder first so a same-tick active result cannot create an unscoped
         # alias beside an already-scoped model root.
         model_builder.set_lftp_statuses(lftp_statuses)
+        persisted_display_floors = getattr(controller._Controller__persist, "display_progress_floors", None)
+        persisted_floors_setter = getattr(model_builder, "set_persisted_display_progress_floors", None)
+        if isinstance(model_builder, ModelBuilder) and isinstance(persisted_display_floors, dict) and \
+                callable(persisted_floors_setter):
+            persisted_floors_setter(persisted_display_floors)
         if latest_active_scan is not None:
             record_scan_result_attribution("active", latest_active_scan)
             active_scan_files = list(latest_active_scan.files)
@@ -5039,6 +5055,12 @@ class ModelUpdater(_ControllerCoreAccess):
         late_older_overlay_preserved = False
         late_older_overlay_preserved_file_ids: set[str] = set()
         late_older_overlay_reconciliation_required = False
+        # A rejected direct projection normally retires its live overlay
+        # immediately.  If this tick subsequently performs an authoritative
+        # replacement, retire it at that replacement boundary instead: an
+        # immediate clear would publish the old raw base between the prior
+        # overlay and the validated replacement model.
+        deferred_rejected_overlay_clear = False
         active_scan_progress_inputs = getattr(
             model_builder, "has_only_live_progress_with_active_scan", None,
         )
@@ -5207,10 +5229,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     late_older_overlay_preserved = preserve_late_older_overlay
                     late_older_overlay_preserved_file_ids = preserved_file_ids
                     if direct_outcome != "accepted":
-                        if preserve_late_older_overlay:
-                            model.clear_active_progress_overlays_except(preserved_file_ids)
-                        else:
-                            model.clear_active_progress_overlays()
+                        deferred_rejected_overlay_clear = True
                         changed = set()
                     else:
                         changed, direct_outcome = model.publish_active_lftp_root_counters(
@@ -5231,7 +5250,10 @@ class ModelUpdater(_ControllerCoreAccess):
                                 # publication.  Without the builder snapshot,
                                 # a later authoritative retirement could
                                 # regress the just-published root counter.
-                                model.clear_active_progress_overlays()
+                                # Apply the same deferred-retirement rule as
+                                # other rejected projections so a following
+                                # full build cannot expose its old raw base.
+                                deferred_rejected_overlay_clear = True
                                 changed = set()
                                 direct_outcome = "snapshot"
                             else:
@@ -5259,6 +5281,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 # The established reconciliation remains the fail-closed path.
                 active_progress_overlay_applied = False
                 overlay_admission_outcome = "exception"
+                deferred_rejected_overlay_clear = True
         if _controller_breadcrumb_effectively_enabled(controller, "model.progress", "debug"):
             _record_progress_lineage(
                 controller, lftp_status_poll_correlation, "active_progress_overlay_admission",
@@ -5474,6 +5497,25 @@ class ModelUpdater(_ControllerCoreAccess):
                     poll_correlation=lftp_status_poll_correlation,
                 )
         global_full_build_triggered = full_build_triggered and not candidate_lifecycle_triggered
+        def retire_deferred_rejected_overlay() -> None:
+            """Retire a rejected projection without exposing it past a failed build."""
+            nonlocal deferred_rejected_overlay_clear
+            if not deferred_rejected_overlay_clear:
+                return
+            with controller._Controller__model_lock:
+                if late_older_overlay_preserved:
+                    model.clear_active_progress_overlays_except(
+                        late_older_overlay_preserved_file_ids,
+                    )
+                else:
+                    model.clear_active_progress_overlays()
+            deferred_rejected_overlay_clear = False
+
+        if deferred_rejected_overlay_clear and not full_build_triggered:
+            # No authoritative replacement follows, so preserve the existing
+            # fail-closed retirement behavior (including the older-row
+            # protection narrowed above).
+            retire_deferred_rejected_overlay()
         # Emit the decision only after selection, authorization, adoption, and
         # the final build predicate have settled.  A selected delta is not yet
         # an active-delta outcome: it can still be rejected and fall back to a
@@ -5550,6 +5592,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     started_at = None
                 try:
                     new_model = model_builder.build_model()
+                except Exception:
+                    retire_deferred_rejected_overlay()
+                    raise
                 finally:
                     if diagnostics is not None:
                         try:
@@ -5804,6 +5849,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     if final_move_succeeded:
                         persist.final_move_succeeded_file_names.add(file.file_id)
                         persist.resume_source_identities.pop(file.file_id, None)
+                        getattr(persist, "display_progress_floors", {}).pop(file.file_id, None)
                     else:
                         persist.final_move_succeeded_file_names.discard(file.file_id)
                     controller._sync_final_move_succeeded_files_to_model()
@@ -5812,6 +5858,10 @@ class ModelUpdater(_ControllerCoreAccess):
                     if current_process_publication:
                         controller._mark_current_process_final_publication(file.file_id)
                     if file.file_id not in persist.downloaded_file_names:
+                        # Authoritative terminal publication is the durable
+                        # clear boundary; do not wait for a later snapshot
+                        # harvest to retire a presentation-only floor.
+                        getattr(persist, "display_progress_floors", {}).pop(file.file_id, None)
                         persist.downloaded_file_names.add(file.file_id)
                         invalidation_token = model_builder.set_downloaded_files(
                             persist.downloaded_file_names
@@ -6543,25 +6593,29 @@ class ModelUpdater(_ControllerCoreAccess):
             # work, so an unrelated post-lifecycle failure cannot strand the
             # only authoritative final scan in a temporary candidate.
             if authoritative_pair_build is not None:
-                with _CandidateLifecycleFallback(
-                        model_builder, authoritative_pair_build, pair_fallback_committer,
-                        record_candidate_lifecycle_fallback,
-                ), controller._Controller__model_lock:
-                    controller._Controller__model.clear_active_progress_overlays()
-                    controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
-                    pair_adopter(
-                        controller._Controller__model,
-                        authoritative_pair_build,
-                        applied_builder_invalidation_tokens,
-                    )
-                    synchronize_applied_model_overlay_generation()
-                    authoritative_pair_delta_applied = True
-                    progressive_source_buckets_adopted = True
-                    refresh_identities = getattr(
-                        controller, "_refresh_model_file_command_identities_locked", None
-                    )
-                    if callable(refresh_identities):
-                        refresh_identities()
+                try:
+                    with _CandidateLifecycleFallback(
+                            model_builder, authoritative_pair_build, pair_fallback_committer,
+                            record_candidate_lifecycle_fallback,
+                    ), controller._Controller__model_lock:
+                        controller._Controller__model.clear_active_progress_overlays()
+                        controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
+                        pair_adopter(
+                            controller._Controller__model,
+                            authoritative_pair_build,
+                            applied_builder_invalidation_tokens,
+                        )
+                        synchronize_applied_model_overlay_generation()
+                        authoritative_pair_delta_applied = True
+                        progressive_source_buckets_adopted = True
+                        refresh_identities = getattr(
+                            controller, "_refresh_model_file_command_identities_locked", None
+                        )
+                        if callable(refresh_identities):
+                            refresh_identities()
+                except Exception:
+                    retire_deferred_rejected_overlay()
+                    raise
                 if unrelated_candidate_lifecycle_work_deferred:
                     # This is deliberately after scoped adoption: otherwise
                     # the staged-token cleanup would consume the deferred
@@ -6617,20 +6671,24 @@ class ModelUpdater(_ControllerCoreAccess):
         if latest_local_scan is not None:
             controller._Controller__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp
         if global_full_build_triggered:
-            with controller._Controller__model_lock:
-                controller._Controller__model.clear_active_progress_overlays()
-                controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
-                model_builder.adopt_applied_model(
-                    new_model,
-                    controller._Controller__model,
-                    applied_builder_invalidation_tokens,
-                )
-                synchronize_applied_model_overlay_generation()
-                refresh_identities = getattr(
-                    controller, "_refresh_model_file_command_identities_locked", None
-                )
-                if callable(refresh_identities):
-                    refresh_identities()
+            try:
+                with controller._Controller__model_lock:
+                    controller._Controller__model.clear_active_progress_overlays()
+                    controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
+                    model_builder.adopt_applied_model(
+                        new_model,
+                        controller._Controller__model,
+                        applied_builder_invalidation_tokens,
+                    )
+                    synchronize_applied_model_overlay_generation()
+                    refresh_identities = getattr(
+                        controller, "_refresh_model_file_command_identities_locked", None
+                    )
+                    if callable(refresh_identities):
+                        refresh_identities()
+            except Exception:
+                retire_deferred_rejected_overlay()
+                raise
         if late_older_overlay_preserved_file_ids:
             protected_overlays = {
                 file_id: direct_prior_overlays[file_id]
@@ -7376,5 +7434,14 @@ class ModelUpdater(_ControllerCoreAccess):
                         level=result_level,
                         child_identity=child_trace_identity,
                     )
+        persisted_floors_getter = getattr(model_builder, "persisted_display_progress_floors", None)
+        if callable(persisted_floors_getter):
+            # This is intentionally a presentation handoff only.  Harvesting
+            # current running sidecar-backed snapshots naturally clears a
+            # floor on Stop, terminal completion, sidecar reset, or a new
+            # source identity without granting any lifecycle authority.
+            current_display_floors = persisted_floors_getter()
+            if isinstance(current_display_floors, dict):
+                controller._Controller__persist.display_progress_floors = current_display_floors
         return full_build_triggered or progressive_delta_applied or authoritative_pair_delta_applied or \
             active_transfer_delta_applied

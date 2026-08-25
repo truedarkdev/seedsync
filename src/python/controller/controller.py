@@ -2284,6 +2284,12 @@ class Controller:
     def __advance_transfer_lifecycle(self, file_id: str) -> None:
         # A lifecycle transition revokes every transient counter immediately;
         # the model diff remains the authoritative backstop for all roots.
+        self.__persist.display_progress_floors.pop(file_id, None)
+        evict_transfer_progress = getattr(
+            getattr(self, "_Controller__model_builder", None), "evict_transfer_progress_for_lifecycle", None,
+        )
+        if callable(evict_transfer_progress):
+            evict_transfer_progress({file_id})
         with self.__model_lock:
             self.__model.clear_active_progress_overlays()
             self.__progress_publication_epoch = getattr(self, "_Controller__progress_publication_epoch", 0) + 1
@@ -4018,6 +4024,9 @@ class Controller:
 
     def _record_download_completion(self, file: ModelFile) -> None:
         """Backfill recency when a start was not observed before completion."""
+        # This is the shared durable terminal boundary for direct moves,
+        # child finalization, and ALREADY_COMPLETED outcomes.
+        self.__persist.display_progress_floors.pop(file.file_id, None)
         if not isinstance(getattr(self.__persist, "downloaded_timestamps", None), dict):
             self.__persist.downloaded_timestamps = {}
         if file.file_id not in self.__persist.downloaded_timestamps:

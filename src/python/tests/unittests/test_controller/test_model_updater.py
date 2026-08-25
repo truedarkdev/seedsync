@@ -65,6 +65,158 @@ from system.scanner import SystemScanner
 
 
 class TestModelUpdater(unittest.TestCase):
+    @staticmethod
+    def _restart_progress_builder(
+            *, floor=None, stopped=False, mtime=1, sidecar=True, raw_local=5, raw_remote=100,
+    ):
+        remote = SystemFile("restart.bin", 100, False, mtime_ns=mtime * 1_000_000_000)
+        local = SystemFile("restart.bin", 5, False, is_staging=True)
+        local.status_sidecar_ready = sidecar
+        status = LftpJobStatus(2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "restart.bin", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(raw_local, raw_remote, 5, 1, 1)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        builder.set_lftp_statuses([status])
+        builder.set_stopped_files({status.file_id} if stopped else set())
+        if floor is not None:
+            builder.set_persisted_display_progress_floors({status.file_id: floor})
+        return builder, status.file_id
+
+    def test_restart_display_floor_restores_only_compatible_running_sidecar(self):
+        builder, file_id = self._restart_progress_builder(floor=(90, 90, 100, 1, 100))
+        file = builder.build_model().get_file(file_id)
+        self.assertEqual(90, file.transferred_size)
+        self.assertEqual(90, file.download_progress)
+        self.assertNotEqual(ModelFile.State.DOWNLOADED, file.state)
+
+    def test_restart_display_floor_rejects_source_mismatch_and_explicit_stop(self):
+        builder, file_id = self._restart_progress_builder(floor=(90, 90, 100, 2, 100))
+        self.assertEqual(5, builder.build_model().get_file(file_id).transferred_size)
+        builder, file_id = self._restart_progress_builder(floor=(90, 90, 100, 1, 100), stopped=True)
+        self.assertNotEqual(90, builder.build_model().get_file(file_id).transferred_size)
+
+    def test_restart_display_floor_is_not_retained_without_sidecar(self):
+        builder, file_id = self._restart_progress_builder(
+            floor=(90, 90, 100, 1, 100), sidecar=False,
+        )
+        self.assertEqual(5, builder.build_model().get_file(file_id).transferred_size)
+        self.assertEqual({}, builder.persisted_display_progress_floors())
+
+    def test_empty_persisted_floor_sync_clears_same_source_requeue_floor(self):
+        """An accepted replacement Queue must not revive its prior PGET floor."""
+        builder, file_id = self._restart_progress_builder(floor=(90, 90, 100, 1, 100))
+        builder.set_persisted_display_progress_floors({})
+        file = builder.build_model().get_file(file_id)
+        self.assertEqual(5, file.transferred_size)
+        self.assertEqual(5, builder.persisted_display_progress_floors()[file_id][0])
+
+    def test_record_download_completion_clears_floor_for_direct_and_already_completed_paths(self):
+        file = ModelFile("terminal.bin", False)
+        persist = SimpleNamespace(
+            display_progress_floors={file.file_id: (90, 90, 100, 1, 100)},
+            downloaded_timestamps={},
+        )
+        controller = SimpleNamespace(
+            _Controller__persist=persist,
+            _Controller__model_builder=SimpleNamespace(set_downloaded_timestamps=MagicMock()),
+            _download_timestamp_clock=lambda: datetime.now(),
+        )
+        Controller._record_download_completion(controller, file)
+        self.assertEqual({}, persist.display_progress_floors)
+
+    def test_new_queue_lifecycle_clears_same_source_floor_before_next_harvest(self):
+        file_id = ModelFile.build_file_id("queued.bin", None)
+        persist = SimpleNamespace(display_progress_floors={file_id: (90, 90, 100, 1, 100)})
+        controller = SimpleNamespace(
+            _Controller__persist=persist,
+            _Controller__model_lock=RLock(),
+            _Controller__model=SimpleNamespace(clear_active_progress_overlays=MagicMock()),
+            _Controller__progress_publication_epoch=0,
+            _Controller__transfer_lifecycle_epochs={},
+            _Controller__child_final_move_failure_counts={},
+            _Controller__child_final_move_retry_due={},
+            _Controller__retire_lftp_status_future_locked=lambda: None,
+        )
+        Controller._Controller__advance_transfer_lifecycle(controller, file_id)
+        self.assertEqual({}, persist.display_progress_floors)
+
+    def test_queue_replacement_evicts_old_running_snapshot_before_harvest(self):
+        builder, file_id = self._restart_progress_builder(floor=(90, 90, 100, 1, 100))
+        builder.build_model()  # establishes the old running snapshot
+        persist = SimpleNamespace(display_progress_floors={file_id: (90, 90, 100, 1, 100)})
+        controller = SimpleNamespace(
+            _Controller__persist=persist,
+            _Controller__model_builder=builder,
+            _Controller__model_lock=RLock(),
+            _Controller__model=SimpleNamespace(clear_active_progress_overlays=MagicMock()),
+            _Controller__progress_publication_epoch=0,
+            _Controller__transfer_lifecycle_epochs={},
+            _Controller__child_final_move_failure_counts={},
+            _Controller__child_final_move_retry_due={},
+            _Controller__retire_lftp_status_future_locked=lambda: None,
+        )
+        Controller._Controller__advance_transfer_lifecycle(controller, file_id)
+        self.assertEqual({}, persist.display_progress_floors)
+        builder.build_model()  # old RUNNING status remains visible for one poll
+        self.assertEqual({}, builder.persisted_display_progress_floors())
+        replacement = LftpJobStatus(
+            3, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "restart.bin", "",
+        )
+        replacement.total_transfer_state = LftpJobStatus.TransferState(5, 100, 5, 1, 1)
+        builder.set_lftp_statuses([replacement])
+        builder.build_model()
+        self.assertEqual(5, builder.persisted_display_progress_floors()[file_id][0])
+
+    def test_lifecycle_replacement_evicts_retained_stopped_snapshot(self):
+        builder, file_id = self._restart_progress_builder(floor=(90, 90, 100, 1, 100))
+        builder.set_stopped_files({file_id})
+        builder.build_model()
+        self.assertTrue(builder._ModelBuilder__retained_stopped_transfer_snapshots)
+        builder.evict_transfer_progress_for_lifecycle({file_id})
+        self.assertEqual({}, builder._ModelBuilder__retained_stopped_transfer_snapshots)
+        self.assertEqual({}, builder.persisted_display_progress_floors())
+
+    def test_restart_display_floor_rejects_invalid_pget_subset_evidence(self):
+        for raw_local, raw_remote, floor in (
+                (0, 100, (90, 90, 100, 1, 100)),
+                (101, 100, (90, 90, 100, 1, 100)),
+                (5, 101, (90, 90, 100, 1, 101)),
+                (5, 100, (90, 90, 100, 1, 0)),
+        ):
+            with self.subTest(raw_local=raw_local, raw_remote=raw_remote, floor=floor):
+                builder, file_id = self._restart_progress_builder(
+                    floor=floor, raw_local=raw_local, raw_remote=raw_remote,
+                )
+                self.assertNotEqual(90, builder.build_model().get_file(file_id).transferred_size)
+
+    def test_restart_display_floor_reaches_progressive_pair_and_active_partial_builds(self):
+        floor = (90, 90, 100, 1, 100)
+        builder, file_id = self._restart_progress_builder(floor=floor)
+        remote = SystemFile("restart.bin", 100, False, mtime_ns=1_000_000_000)
+        local = SystemFile("restart.bin", 5, False, is_staging=True)
+        local.status_sidecar_ready = True
+        self.assertEqual(
+            90,
+            builder.build_progressive_roots([local], [remote], set()).get_file(file_id).transferred_size,
+        )
+        self.assertEqual(90, builder.build_active_transfer_roots({file_id}).model.get_file(file_id).transferred_size)
+
+        pair_builder = ModelBuilder()
+        pair_builder.set_remote_files([remote])
+        pair_builder.set_local_files([local])
+        pair_builder.build_model()
+        status = LftpJobStatus(2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "restart.bin", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(5, 100, 5, 1, 1)
+        pair_builder.set_lftp_statuses([status])
+        pair_builder.set_persisted_display_progress_floors({file_id: floor})
+        # Pair eligibility itself is covered separately; force its already
+        # isolated render path so this regression proves the floor handoff.
+        with patch.object(pair_builder, "_ModelBuilder__pair_delta_is_globally_safe", return_value=True):
+            pair = pair_builder.build_authoritative_pair_roots(None, [local], [remote], set())
+        self.assertIsNotNone(pair)
+        self.assertEqual(90, pair.model.get_file(file_id).transferred_size)
+
     def test_update_exception_clears_lineage_without_false_mutation(self):
         trace = BreadcrumbTraceCollector(
             lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
@@ -4773,6 +4925,8 @@ class TestModelUpdater(unittest.TestCase):
         controller._mark_successful_final_move_handoff = MagicMock()
         controller._mark_current_process_final_publication = MagicMock()
         controller._Controller__target_archive_trace_selector_matches_file = MagicMock(return_value=False)
+        release_id = ModelFile.build_file_id("release.bin", "pair-a")
+        controller._Controller__persist.display_progress_floors = {release_id: (29, 97, 30, 0, 30)}
 
         # The candidate itself changes the selected root, but the pending
         # completion owner must not require a ModelDiff to attempt its move.
@@ -4782,9 +4936,10 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__move_from_staging.assert_called_once_with("release.bin", "pair-a")
         self.assertEqual(set(), controller._Controller__pending_completion_file_names)
         self.assertEqual(
-            {ModelFile.build_file_id("release.bin", "pair-a")},
+            {release_id},
             controller._Controller__persist.downloaded_file_names,
         )
+        self.assertEqual({}, controller._Controller__persist.display_progress_floors)
         builder.build_model.assert_not_called()
 
     def test_pair_final_with_stale_markers_uses_candidate_and_prunes_them(self):
@@ -7321,6 +7476,133 @@ class TestModelUpdater(unittest.TestCase):
 
                 builder.adopt_active_progress_overlays.assert_not_called()
 
+    def test_rejected_direct_overlay_defers_clear_until_full_build_replaces_base(self):
+        """A full build must not expose the old raw base between valid floors."""
+        remote = SystemFile("root", 100, False, mtime_ns=1_000_000_000)
+        local = SystemFile("root", 5, False, is_staging=True)
+        local.status_sidecar_ready = True
+        initial = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "")
+        initial.total_transfer_state = LftpJobStatus.TransferState(5, 100, 5, 10, 8)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        builder.set_lftp_statuses([initial])
+        active = SystemFile("root", 5, False, is_staging=True)
+        active.status_sidecar_ready = True
+        builder.set_active_files([active])
+        live_model = builder.build_model()
+        changed, outcome = live_model.publish_active_lftp_root_counters(
+            {"root": ActiveProgressOverlay(90, 90, 10, 8)},
+            {"root": (1, LftpJobStatus.Type.PGET.value)},
+            lambda _file_id: True,
+        )
+        self.assertEqual(({"root"}, "accepted"), (changed, outcome))
+
+        published_counters = []
+
+        class Listener:
+            def file_updated(self, _old_file, _new_file):
+                pass
+
+            def model_version_changed(self, _scope_version, _path_pair_id, file_id):
+                if file_id == "root":
+                    overlay = live_model.active_progress_overlay(file_id)
+                    published_counters.append(
+                        overlay.transferred_size if overlay is not None
+                        else live_model.get_file(file_id).transferred_size,
+                    )
+
+        live_model.add_listener(Listener())
+        builder.set_persisted_display_progress_floors({"root": (90, 90, 100, 1, 100)})
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        # A float percent is accepted by the authoritative Builder but
+        # deliberately rejected by the narrower direct counter projection.
+        # The valid floor makes the authoritative replacement 90, whereas the
+        # old model base remains raw 5 until that replacement occurs.
+        regressed = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "")
+        regressed.total_transfer_state = LftpJobStatus.TransferState(6, 100, 6.0, 10, 8)
+        controller._Controller__lftp.status.return_value = [regressed]
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [active], is_scan_final=True,
+        )
+        builder.has_pending_active_transfer_delta = MagicMock(return_value=False)
+        builder.has_only_live_progress_with_active_scan = MagicMock(return_value=True)
+
+        ModelUpdater(controller).update()
+
+        self.assertNotIn(6, published_counters)
+        self.assertIn(90, published_counters)
+        self.assertEqual(90, live_model.get_file("root").transferred_size)
+        self.assertIsNone(live_model.active_progress_overlay("root"))
+
+    def test_direct_admission_exception_without_full_build_still_clears_immediately(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("root", 100, False)])
+        initial = LftpJobStatus(1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "root", "")
+        initial.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        builder.set_lftp_statuses([initial])
+        builder.set_active_files([SystemFile("root", 25, False)])
+        live_model = builder.build_model()
+        changed, outcome = live_model.publish_active_lftp_root_counters(
+            {"root": ActiveProgressOverlay(25, 25, 10, 8)},
+            {"root": (1, LftpJobStatus.Type.GET.value)},
+            lambda _file_id: True,
+        )
+        self.assertEqual(({"root"}, "accepted"), (changed, outcome))
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__lftp.status.return_value = [initial]
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("root", 25, False)], is_scan_final=True,
+        )
+        builder.has_changes = MagicMock(return_value=False)
+        builder.has_only_live_progress_with_active_scan = MagicMock(return_value=True)
+        builder.build_read_only_lftp_root_counter_overlays = MagicMock(side_effect=RuntimeError("admission"))
+
+        ModelUpdater(controller).update()
+
+        self.assertIsNone(live_model.active_progress_overlay("root"))
+
+    def test_failed_authoritative_build_retires_deferred_rejected_overlay(self):
+        remote = SystemFile("root", 100, False, mtime_ns=1_000_000_000)
+        local = SystemFile("root", 5, False, is_staging=True)
+        local.status_sidecar_ready = True
+        initial = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "")
+        initial.total_transfer_state = LftpJobStatus.TransferState(5, 100, 5, 10, 8)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        builder.set_lftp_statuses([initial])
+        active = SystemFile("root", 5, False, is_staging=True)
+        active.status_sidecar_ready = True
+        builder.set_active_files([active])
+        live_model = builder.build_model()
+        live_model.publish_active_lftp_root_counters(
+            {"root": ActiveProgressOverlay(90, 90, 10, 8)},
+            {"root": (1, LftpJobStatus.Type.PGET.value)},
+            lambda _file_id: True,
+        )
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        rejected = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "")
+        rejected.total_transfer_state = LftpJobStatus.TransferState(6, 100, 6.0, 10, 8)
+        controller._Controller__lftp.status.return_value = [rejected]
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [active], is_scan_final=True,
+        )
+        builder.has_pending_active_transfer_delta = MagicMock(return_value=False)
+        builder.has_only_live_progress_with_active_scan = MagicMock(return_value=True)
+        builder.build_model = MagicMock(side_effect=RuntimeError("full build"))
+
+        with self.assertRaisesRegex(RuntimeError, "full build"):
+            ModelUpdater(controller).update()
+
+        self.assertIsNone(live_model.active_progress_overlay("root"))
+
     def test_direct_root_counter_publishes_despite_active_metadata_churn_and_leaves_it_dirty(self):
         def active_root(metadata_changed=False):
             root = SystemFile(
@@ -7811,14 +8093,13 @@ class TestModelUpdater(unittest.TestCase):
         diff_models.assert_called_once()
 
         controller._Controller__move_from_staging.assert_called_once_with("generic", None)
-        # These are the fields ViewFile consumes: DOWNLOADED plus equal
-        # transferred/remote bytes maps to 100%, even though completed model
-        # rows deliberately clear the live-only percentage.
+        # Completed positive-size rows now publish the exact terminal counter
+        # directly, so consecutive Downloaded SSE payloads remain complete.
         published_file = live_model.get_file("generic")
         self.assertEqual(ModelFile.State.DOWNLOADED, published_file.state)
         self.assertEqual(30, published_file.remote_size)
         self.assertEqual(30, published_file.transferred_size)
-        self.assertIsNone(published_file.download_progress)
+        self.assertEqual(100, published_file.download_progress)
         self.assertEqual(set(), controller._Controller__pending_completion_file_names)
         self.assertEqual({"generic"}, controller._Controller__persist.downloaded_file_names)
         self.assertEqual({"generic"}, controller._Controller__persist.final_move_succeeded_file_names)

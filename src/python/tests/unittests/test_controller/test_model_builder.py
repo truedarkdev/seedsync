@@ -663,6 +663,218 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(self.model_builder.build_active_progress_overlays(live_model.get_file_ids()))
         self.assertEqual("invalidation_scope", self.model_builder.active_progress_overlay_admission_outcome())
 
+    def test_positive_authoritative_local_completion_keeps_terminal_counter_on_rebuild(self):
+        remote = SystemFile("complete.bin", 100, False, mtime_ns=1_000_000_000)
+        local = SystemFile("complete.bin", 100, False, mtime_ns=1_000_000_000)
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+
+        first = self.model_builder.build_model().get_file("complete.bin")
+        self.model_builder.request_rebuild()
+        second = self.model_builder.build_model().get_file("complete.bin")
+
+        for model_file in (first, second):
+            self.assertEqual(ModelFile.State.DOWNLOADED, model_file.state)
+            self.assertEqual(100, model_file.transferred_size)
+            self.assertEqual(100, model_file.download_progress)
+            self.assertIsNone(model_file.downloading_speed)
+            self.assertIsNone(model_file.eta)
+
+    def test_positive_staging_completion_keeps_terminal_counter_on_rebuild(self):
+        remote = SystemFile("complete.bin", 100, False, mtime_ns=1_000_000_000)
+        local = SystemFile("complete.bin", 100, False, is_staging=True, mtime_ns=1_000_000_000)
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+
+        first = self.model_builder.build_model().get_file("complete.bin")
+        self.model_builder.request_rebuild()
+        second = self.model_builder.build_model().get_file("complete.bin")
+
+        for model_file in (first, second):
+            self.assertEqual(ModelFile.State.DOWNLOADED, model_file.state)
+            self.assertEqual(100, model_file.transferred_size)
+            self.assertEqual(100, model_file.download_progress)
+            self.assertIsNone(model_file.downloading_speed)
+            self.assertIsNone(model_file.eta)
+
+    def test_complete_move_failed_file_keeps_proven_terminal_counter(self):
+        remote = SystemFile("complete.bin", 100, False, mtime_ns=1_000_000_000)
+        local = SystemFile("complete.bin", 100, False, mtime_ns=1_000_000_000)
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+        self.model_builder.set_move_failed_files({"complete.bin"})
+
+        model_file = self.model_builder.build_model().get_file("complete.bin")
+
+        # The final-move lifecycle marker changes the state, not the already
+        # proven transfer counter.
+        self.assertEqual(ModelFile.State.MOVE_FAILED, model_file.state)
+        self.assertEqual(100, model_file.transferred_size)
+        self.assertEqual(100, model_file.download_progress)
+        self.assertIsNone(model_file.downloading_speed)
+        self.assertIsNone(model_file.eta)
+
+    def test_collision_move_failed_file_does_not_gain_terminal_counter(self):
+        remote = SystemFile("collision.bin", 100, False, mtime_ns=1_000_000_000)
+        local = SystemFile("collision.bin", 100, False, is_staging=True, mtime_ns=1_000_000_000)
+        local.has_staging_collision = True
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+        self.model_builder.set_move_failed_files({"collision.bin"})
+
+        model_file = self.model_builder.build_model().get_file("collision.bin")
+
+        # A collision prevents authoritative completion proof; Move Failed
+        # must not make the entry look downloaded merely because its raw bytes
+        # happen to equal the remote size.
+        self.assertEqual(ModelFile.State.MOVE_FAILED, model_file.state)
+        self.assertNotEqual(100, model_file.download_progress)
+
+    def test_zero_size_completion_keeps_existing_no_percent_policy(self):
+        remote = SystemFile("empty.bin", 0, False, mtime_ns=1_000_000_000)
+        local = SystemFile("empty.bin", 0, False, mtime_ns=1_000_000_000)
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+
+        model_file = self.model_builder.build_model().get_file("empty.bin")
+
+        self.assertEqual(ModelFile.State.DOWNLOADED, model_file.state)
+        self.assertIsNone(model_file.download_progress)
+
+    def test_direct_root_counter_overlay_applies_compatible_persisted_display_floor(self):
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1_000_000_000)
+        local = SystemFile("active.bin", 5, False, is_staging=True)
+        local.status_sidecar_ready = True
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(5, 100, 5, 10, 8)
+        self.model_builder.set_lftp_statuses([status])
+        self.model_builder.set_persisted_display_progress_floors({
+            "active.bin": (90, 90, 100, 1, 100),
+        })
+
+        overlays = self.model_builder.build_read_only_lftp_root_counter_overlays(
+            live_model.get_file_ids(),
+        )
+
+        self.assertIsNotNone(overlays)
+        assert overlays is not None
+        self.assertEqual(90, overlays["active.bin"].transferred_size)
+        self.assertEqual(90, overlays["active.bin"].download_progress)
+
+    def test_direct_root_counter_overlay_rejects_mismatched_persisted_display_floor(self):
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1_000_000_000)
+        local = SystemFile("active.bin", 5, False, is_staging=True)
+        local.status_sidecar_ready = True
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(5, 100, 5, 10, 8)
+        self.model_builder.set_lftp_statuses([status])
+        self.model_builder.set_persisted_display_progress_floors({
+            "active.bin": (90, 90, 100, 1, 99),
+        })
+
+        overlays = self.model_builder.build_read_only_lftp_root_counter_overlays(
+            live_model.get_file_ids(),
+        )
+
+        self.assertIsNotNone(overlays)
+        assert overlays is not None
+        self.assertEqual(5, overlays["active.bin"].transferred_size)
+        self.assertEqual(5, overlays["active.bin"].download_progress)
+
+    def test_recent_pget_snapshot_promotes_floor_before_next_job_identity(self):
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1_000_000_000)
+        local = SystemFile("active.bin", 80, False, is_staging=True)
+        local.status_sidecar_ready = True
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+        high = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        high.total_transfer_state = LftpJobStatus.TransferState(80, 100, 80, 10, 8)
+        self.model_builder.set_lftp_statuses([high])
+        self.assertEqual(80, self.model_builder.build_model().get_file("active.bin").transferred_size)
+        self.assertEqual(80, self.model_builder.persisted_display_progress_floors()["active.bin"][0])
+
+        low = LftpJobStatus(2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        low.total_transfer_state = LftpJobStatus.TransferState(5, 100, 5, 10, 8)
+        self.model_builder.set_lftp_statuses([low])
+
+        overlays = self.model_builder.build_read_only_lftp_root_counter_overlays({"active.bin"})
+        self.assertIsNotNone(overlays)
+        assert overlays is not None
+        self.assertEqual(80, overlays["active.bin"].transferred_size)
+        self.assertEqual(80, self.model_builder.build_model().get_file("active.bin").transferred_size)
+
+    def test_recent_pget_snapshot_promotion_rejects_mismatch_or_missing_sidecar(self):
+        for subset_total, sidecar_ready in ((99, True), (100, False)):
+            with self.subTest(subset_total=subset_total, sidecar_ready=sidecar_ready):
+                builder = ModelBuilder()
+                remote = SystemFile("active.bin", 100, False, mtime_ns=1_000_000_000)
+                local = SystemFile("active.bin", 80, False, is_staging=True)
+                local.status_sidecar_ready = sidecar_ready
+                builder.set_remote_files([remote])
+                builder.set_local_files([local])
+                high = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+                high.total_transfer_state = LftpJobStatus.TransferState(80, 100, 80, 10, 8)
+                builder.set_lftp_statuses([high])
+                builder.build_model()
+                low = LftpJobStatus(2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+                low.total_transfer_state = LftpJobStatus.TransferState(5, subset_total, 5, 10, 8)
+                builder.set_lftp_statuses([low])
+
+                overlays = builder.build_read_only_lftp_root_counter_overlays({"active.bin"})
+
+                self.assertIsNotNone(overlays)
+                assert overlays is not None
+                self.assertLess(overlays["active.bin"].transferred_size, 80)
+                self.assertLess(builder.build_model().get_file("active.bin").transferred_size, 80)
+
+    def test_recent_pget_snapshot_promotion_zero_reset_clears_prior_floor(self):
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1_000_000_000)
+        local = SystemFile("active.bin", 80, False, is_staging=True)
+        local.status_sidecar_ready = True
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+        high = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        high.total_transfer_state = LftpJobStatus.TransferState(80, 100, 80, 10, 8)
+        self.model_builder.set_lftp_statuses([high])
+        self.model_builder.build_model()
+        self.assertEqual(80, self.model_builder.persisted_display_progress_floors()["active.bin"][0])
+
+        reset = LftpJobStatus(2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        reset.total_transfer_state = LftpJobStatus.TransferState(0, 100, 0, 10, 8)
+        self.model_builder.set_lftp_statuses([reset])
+        self.assertEqual(0, self.model_builder.build_model().get_file("active.bin").transferred_size)
+        self.assertEqual({}, self.model_builder.persisted_display_progress_floors())
+
+        resumed = LftpJobStatus(2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        resumed.total_transfer_state = LftpJobStatus.TransferState(5, 100, 5, 10, 8)
+        self.model_builder.set_lftp_statuses([resumed])
+        self.assertEqual(5, self.model_builder.build_model().get_file("active.bin").transferred_size)
+
+    def test_recent_pget_snapshot_promotion_does_not_recreate_stopped_floor(self):
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1_000_000_000)
+        local = SystemFile("active.bin", 80, False, is_staging=True)
+        local.status_sidecar_ready = True
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+        self.model_builder.set_stopped_files({"active.bin"})
+        status = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(80, 100, 80, 10, 8)
+        self.model_builder.set_lftp_statuses([status])
+
+        self.model_builder.build_model()
+
+        self.assertEqual({}, self.model_builder.persisted_display_progress_floors())
+
     def test_active_progress_overlay_rejects_status_retirement_and_active_scan_input(self):
         active = SystemFile("active.bin", 100, False)
         self.model_builder.set_remote_files([active])
@@ -728,6 +940,61 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNotNone(overlays)
         assert overlays is not None
         self.assertEqual(26, overlays["active.bin"].transferred_size)
+
+    def test_active_progress_overlay_applies_compatible_persisted_display_floor(self):
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1_000_000_000)
+        self.model_builder.set_remote_files([remote])
+        initial = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        initial.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        active = SystemFile("active.bin", 25, False, is_staging=True)
+        active.status_sidecar_ready = True
+        self.model_builder.set_lftp_statuses([initial])
+        self.model_builder.set_active_files([active])
+        live_model = self.model_builder.build_model()
+        regressed = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        regressed.total_transfer_state = LftpJobStatus.TransferState(5, 100, 5, 10, 8)
+        self.model_builder.set_lftp_statuses([regressed])
+        regressed_active = SystemFile("active.bin", 5, False, is_staging=True)
+        regressed_active.status_sidecar_ready = True
+        self.model_builder.set_active_files([regressed_active])
+        self.model_builder.set_persisted_display_progress_floors({
+            "active.bin": (90, 90, 100, 1, 100),
+        })
+
+        overlays = self.model_builder.build_active_progress_overlays(live_model.get_file_ids())
+
+        self.assertIsNotNone(overlays)
+        assert overlays is not None
+        self.assertEqual(90, overlays["active.bin"].transferred_size)
+        self.assertEqual(90, overlays["active.bin"].download_progress)
+
+    def test_active_progress_overlay_rejects_mismatched_persisted_display_floor(self):
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1_000_000_000)
+        self.model_builder.set_remote_files([remote])
+        initial = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        initial.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        active = SystemFile("active.bin", 25, False, is_staging=True)
+        active.status_sidecar_ready = True
+        self.model_builder.set_lftp_statuses([initial])
+        self.model_builder.set_active_files([active])
+        live_model = self.model_builder.build_model()
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots.clear()
+        regressed = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        regressed.total_transfer_state = LftpJobStatus.TransferState(5, 100, 5, 10, 8)
+        self.model_builder.set_lftp_statuses([regressed])
+        regressed_active = SystemFile("active.bin", 5, False, is_staging=True)
+        regressed_active.status_sidecar_ready = True
+        self.model_builder.set_active_files([regressed_active])
+        self.model_builder.set_persisted_display_progress_floors({
+            "active.bin": (90, 90, 100, 1, 99),
+        })
+
+        overlays = self.model_builder.build_active_progress_overlays(live_model.get_file_ids())
+
+        self.assertIsNotNone(overlays)
+        assert overlays is not None
+        self.assertEqual(5, overlays["active.bin"].transferred_size)
+        self.assertEqual(5, overlays["active.bin"].download_progress)
 
     def test_active_progress_overlay_rejects_same_tick_active_tree_change(self):
         remote = SystemFile("active", 100, True)
@@ -2567,7 +2834,7 @@ class TestModelBuilder(unittest.TestCase):
         staged_file = model.get_file("movie.mkv")
         self.assertEqual(ModelFile.State.DOWNLOADED, staged_file.state)
         self.assertEqual(100, staged_file.transferred_size)
-        self.assertIsNone(staged_file.download_progress)
+        self.assertEqual(100, staged_file.download_progress)
 
     def test_build_scan_only_staging_root_archive_file_promotes_to_downloaded_when_local_size_matches_remote_size(self):
         self.model_builder.set_remote_files([SystemFile("archive.zip", 100, False)])
@@ -4052,7 +4319,7 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual(ModelFile.State.DOWNLOADED, built_root.state)
         self.assertEqual(200, built_root.transferred_size)
-        self.assertIsNone(built_root.download_progress)
+        self.assertEqual(100, built_root.download_progress)
         self.assertNotIn("release", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
 
     def test_build_state_dir_staging_root_downloaded_when_remote_child_size_is_unknown(self):
@@ -4444,7 +4711,7 @@ class TestModelBuilder(unittest.TestCase):
         file_a = model.get_file("a")
         self.assertEqual(ModelFile.State.DOWNLOADED, file_a.state)
         self.assertEqual(1000, file_a.transferred_size)
-        self.assertIsNone(file_a.download_progress)
+        self.assertEqual(100, file_a.download_progress)
         self.assertFalse(self.model_builder.has_changes())
 
     def test_running_null_counter_handoff_preserves_live_floor_until_terminal_scan(self):
@@ -4502,7 +4769,7 @@ class TestModelBuilder(unittest.TestCase):
         terminal = self.model_builder.build_model().get_file(file_name)
         self.assertEqual(ModelFile.State.DOWNLOADED, terminal.state)
         self.assertEqual(remote_size, terminal.transferred_size)
-        self.assertIsNone(terminal.download_progress)
+        self.assertEqual(100, terminal.download_progress)
 
     def test_running_same_job_lower_checkpoint_without_remote_denominator_keeps_floor(self):
         file_name = "same-job-lower-checkpoint.bin"
@@ -4893,7 +5160,7 @@ class TestModelBuilder(unittest.TestCase):
         staged_file = model.get_file("a")
         self.assertEqual(ModelFile.State.DOWNLOADED, staged_file.state)
         self.assertEqual(1000, staged_file.transferred_size)
-        self.assertIsNone(staged_file.download_progress)
+        self.assertEqual(100, staged_file.download_progress)
 
     def test_build_partial_staging_file_does_not_use_local_size_as_transferred_fallback(self):
         self.model_builder.clear()
@@ -4976,7 +5243,7 @@ class TestModelBuilder(unittest.TestCase):
         file_archive = model.get_file("archive.zip")
         self.assertEqual(ModelFile.State.DOWNLOADED, file_archive.state)
         self.assertEqual(1000, file_archive.transferred_size)
-        self.assertIsNone(file_archive.download_progress)
+        self.assertEqual(100, file_archive.download_progress)
         self.assertIsNone(file_archive.downloading_speed)
         self.assertIsNone(file_archive.eta)
         self.assertNotIn("archive.zip", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
@@ -5051,7 +5318,7 @@ class TestModelBuilder(unittest.TestCase):
         file_a = model.get_file("a")
         self.assertEqual(ModelFile.State.DOWNLOADED, file_a.state)
         self.assertEqual(1000, file_a.transferred_size)
-        self.assertIsNone(file_a.download_progress)
+        self.assertEqual(100, file_a.download_progress)
         self.assertNotIn("a", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
         self.assertNotIn("a", self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
         self.assertFalse(self.model_builder.has_changes())
@@ -5098,7 +5365,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DOWNLOADED, file_a.state)
         self.assertEqual(1000, file_a.local_size)
         self.assertEqual(1000, file_a.transferred_size)
-        self.assertIsNone(file_a.download_progress)
+        self.assertEqual(100, file_a.download_progress)
         self.assertIsNone(file_a.downloading_speed)
         self.assertIsNone(file_a.eta)
 
@@ -5978,7 +6245,7 @@ class TestModelBuilder(unittest.TestCase):
         file_a = model.get_file("a")
         self.assertEqual(ModelFile.State.DOWNLOADED, file_a.state)
         self.assertEqual(1000, file_a.transferred_size)
-        self.assertIsNone(file_a.download_progress)
+        self.assertEqual(100, file_a.download_progress)
         self.assertIsNone(file_a.downloading_speed)
         self.assertIsNone(file_a.eta)
 
@@ -8032,7 +8299,7 @@ class TestModelBuilder(unittest.TestCase):
         staged_root = model.get_file("a")
         self.assertEqual(ModelFile.State.DOWNLOADED, staged_root.state)
         self.assertEqual(42, staged_root.transferred_size)
-        self.assertIsNone(staged_root.download_progress)
+        self.assertEqual(100, staged_root.download_progress)
 
     def test_build_local_created_timestamp(self):
         self.model_builder.set_local_files([
