@@ -5771,11 +5771,66 @@ class ModelUpdater(_ControllerCoreAccess):
                     }
                     controller._Controller__pending_completion_progress_floors.pop(file_id, None)
 
+                def accepted_active_progress_overlay(file: ModelFile) -> Optional[ActiveProgressOverlay]:
+                    """Return an identity-paired live projection, if one was accepted.
+
+                    The base ``ModelFile`` can lag a direct LFTP projection until
+                    the replacement model is adopted.  Only the updater's
+                    identity-paired snapshots represent an accepted overlay;
+                    arbitrary overlay-shaped values must not seed a floor.
+                    """
+                    if getattr(file, "explicitly_stopped", False):
+                        return None
+                    is_explicitly_stopped = getattr(
+                        controller, "_Controller__is_explicitly_stopped", None,
+                    )
+                    if callable(is_explicitly_stopped):
+                        try:
+                            if is_explicitly_stopped(file.full_path, file.path_pair_id):
+                                return None
+                        except (AttributeError, TypeError):
+                            return None
+                    for overlays, identities in (
+                            (direct_published_overlays, direct_published_job_identities),
+                            (direct_prior_overlays, direct_prior_job_identities),
+                    ):
+                        overlay = overlays.get(file.file_id)
+                        identity = identities.get(file.file_id)
+                        if not isinstance(overlay, ActiveProgressOverlay) or \
+                                not isinstance(identity, tuple) or len(identity) != 2 or \
+                                type(identity[0]) is not int or identity[0] < 0 or \
+                                not isinstance(identity[1], str) or not identity[1]:
+                            continue
+                        return overlay
+                    overlay_reader = getattr(model, "active_progress_overlay", None)
+                    identity_reader = getattr(
+                        model, "active_progress_overlay_job_identities_snapshot", None,
+                    )
+                    if callable(overlay_reader) and callable(identity_reader):
+                        try:
+                            overlay = overlay_reader(file.file_id)
+                            identities = identity_reader()
+                            identity = identities.get(file.file_id) \
+                                if isinstance(identities, dict) else None
+                        except (AttributeError, TypeError):
+                            return None
+                        if isinstance(overlay, ActiveProgressOverlay) and \
+                                isinstance(identity, tuple) and len(identity) == 2 and \
+                                type(identity[0]) is int and identity[0] >= 0 and \
+                                isinstance(identity[1], str) and identity[1]:
+                            return overlay
+                    return None
+
                 def remember_pending_completion_floor(file: ModelFile) -> None:
                     if file.file_id not in pending_completion_file_ids():
                         return
                     previous = controller._Controller__pending_completion_progress_floors.get(file.file_id)
-                    current = (file.download_progress, file.transferred_size)
+                    overlay = accepted_active_progress_overlay(file)
+                    current = (
+                        (overlay.download_progress, overlay.transferred_size)
+                        if overlay is not None else
+                        (file.download_progress, file.transferred_size)
+                    )
                     if previous is None:
                         controller._Controller__pending_completion_progress_floors[file.file_id] = current
                         return
@@ -6133,11 +6188,22 @@ class ModelUpdater(_ControllerCoreAccess):
                             )
                         else:
                             remember_pending_completion_floor(old_file)
-                            self._preserve_pending_completion_progress_floor(
-                                old_file,
-                                new_file,
-                                pending_completion_file_ids(),
+                            floor = controller._Controller__pending_completion_progress_floors.get(
+                                new_file.file_id,
                             )
+                            if floor is not None:
+                                self._apply_pending_completion_progress_floor(
+                                    new_file,
+                                    pending_completion_file_ids(),
+                                    floor[0],
+                                    floor[1],
+                                )
+                            else:
+                                self._preserve_pending_completion_progress_floor(
+                                    old_file,
+                                    new_file,
+                                    pending_completion_file_ids(),
+                                )
                     elif diff.change == ModelDiff.Change.REMOVED and old_file is not None:
                         remember_pending_completion_floor(old_file)
                     elif diff.change == ModelDiff.Change.ADDED and new_file is not None:

@@ -10513,6 +10513,46 @@ class TestModelUpdater(unittest.TestCase):
         )
         controller._Controller__local_scan_process.force_scan.assert_called_once_with(path_pair_id)
 
+    def test_pending_completion_floor_prefers_accepted_overlay_over_stale_base(self):
+        file_name = "pending.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        remote = SystemFile(file_name, 100, False)
+        local = SystemFile(file_name, 61, False, is_staging=False)
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(61, 100, 61, 1, 2)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        builder.set_lftp_statuses([running])
+        live_model = builder.build_model()
+        changed, outcome = live_model.publish_active_lftp_root_counters(
+            {file_id: ActiveProgressOverlay(99, 99, 1, 2)},
+            {file_id: (running.id, running.type.value)},
+            lambda _file_id: True,
+        )
+        self.assertEqual(({file_id}, "accepted"), (changed, outcome))
+        self.assertEqual(61, live_model.get_file(file_id).transferred_size)
+        self.assertEqual(99, live_model.active_progress_overlay(file_id).transferred_size)
+
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__prev_downloading_file_names = {(file_name, None, None)}
+        controller._Controller__lftp.status.return_value = []
+
+        ModelUpdater(controller).update()
+
+        published = controller._Controller__model.get_file(file_id)
+        self.assertEqual(99, published.transferred_size)
+        self.assertEqual(99, published.download_progress)
+        self.assertIn((file_name, None, None), controller._Controller__pending_completion_file_names)
+        self.assertEqual(
+            (99, 99),
+            controller._Controller__pending_completion_progress_floors[file_id],
+        )
+
     def test_fresh_empty_lftp_poll_releases_valid_partial_pget_to_resumable_default(self):
         """A sidecar-backed partial is resumable, never an inferred Stop."""
         file_name = "pending.bin"
