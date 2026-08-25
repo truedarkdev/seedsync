@@ -93,7 +93,20 @@ RUN pip3 install --force-reinstall "poetry==2.3.2" \
 # Installs Seedsync python code
 FROM seedsync_run_python_env AS seedsync_run_python
 RUN mkdir -p /app
-COPY src/python /app/python
+# Copy only runtime modules and entry points.  A broad source-directory copy
+# can admit ignored local caches, diagnostics, and private repro material into
+# a release image.
+COPY src/python/__init__.py src/python/scan_fs.py src/python/seedsync.py /app/python/
+COPY src/python/common /app/python/common
+COPY src/python/controller /app/python/controller
+COPY src/python/lftp /app/python/lftp
+COPY src/python/migration /app/python/migration
+COPY src/python/model /app/python/model
+COPY src/python/ssh /app/python/ssh
+COPY src/python/system /app/python/system
+COPY src/python/transfer /app/python/transfer
+COPY src/python/typings /app/python/typings
+COPY src/python/web /app/python/web
 RUN chmod -R a+rX /app/python
 
 
