@@ -3594,10 +3594,10 @@ class TestModelUpdater(unittest.TestCase):
         )
         self.assertEqual(
             [
-                "status_consume", "pre_active_delta", "active_progress_overlay_admission",
-                "direct_root_counter_publish", "active_delta_selector",
+                "status_consume", "status_sample", "pre_active_delta", "active_progress_overlay_admission",
+                "active_delta_selector",
                 "active_delta_builder", "active_delta_authorization", "active_delta_adoption",
-                "model_mutation", "updater_decision",
+                "model_mutation", "updater_decision", "direct_root_counter_publish",
             ],
             [step["phase"] for step in active_lineage["steps"]],
         )
@@ -3617,9 +3617,9 @@ class TestModelUpdater(unittest.TestCase):
         phases = self._lineage_phases(trace)
         self.assertEqual(
             [
-                "status_consume", "pre_active_delta", "active_progress_overlay_admission",
-                "direct_root_counter_publish", "active_delta_selector",
-                "updater_decision", "model_mutation",
+                "status_consume", "status_sample", "pre_active_delta", "active_progress_overlay_admission",
+                "active_delta_selector", "updater_decision", "model_mutation",
+                "direct_root_counter_publish",
             ],
             phases,
         )
@@ -3675,9 +3675,9 @@ class TestModelUpdater(unittest.TestCase):
         phases = self._lineage_phases(trace)
         self.assertEqual(
             [
-                "status_consume", "pre_active_delta", "active_progress_overlay_admission",
-                "direct_root_counter_publish", "active_delta_selector",
-                "active_delta_builder", "updater_decision",
+                "status_consume", "status_sample", "pre_active_delta", "active_progress_overlay_admission",
+                "active_delta_selector", "active_delta_builder", "updater_decision",
+                "direct_root_counter_publish",
             ],
             phases,
         )
@@ -3693,9 +3693,9 @@ class TestModelUpdater(unittest.TestCase):
         phases = self._lineage_phases(trace)
         self.assertEqual(
             [
-                "status_consume", "pre_active_delta", "active_progress_overlay_admission",
-                "direct_root_counter_publish", "active_delta_selector",
-                "active_delta_builder", "active_delta_authorization", "updater_decision",
+                "status_consume", "status_sample", "pre_active_delta", "active_progress_overlay_admission",
+                "active_delta_selector", "active_delta_builder", "active_delta_authorization",
+                "updater_decision", "direct_root_counter_publish",
             ],
             phases,
         )
@@ -3719,10 +3719,9 @@ class TestModelUpdater(unittest.TestCase):
         phases = self._lineage_phases(trace)
         self.assertEqual(
             [
-                "status_consume", "pre_active_delta", "active_progress_overlay_admission",
-                "direct_root_counter_publish", "active_delta_selector",
-                "active_delta_builder", "active_delta_authorization", "updater_decision",
-                "model_mutation",
+                "status_consume", "status_sample", "pre_active_delta", "active_progress_overlay_admission",
+                "active_delta_selector", "active_delta_builder", "active_delta_authorization",
+                "updater_decision", "model_mutation", "direct_root_counter_publish",
             ],
             phases,
         )
@@ -5894,6 +5893,97 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(2, details["lftp_queue_operation_pending_count"])
         self.assertEqual(3, details["lftp_queue_operation_done_count"])
 
+    def test_lftp_status_breadcrumb_includes_bounded_record_provenance(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {
+                "transfer.lftp": "debug", "model.progress": "debug",
+            }},
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__record_breadcrumb=lambda **kwargs: trace.record(
+                "model_updater", kwargs["message"], kwargs["details"],
+                **{key: value for key, value in kwargs.items() if key not in {"message", "details"}},
+            ),
+            _Controller__lftp=SimpleNamespace(backend_name="lftp"),
+            _Controller__last_lftp_statuses=[],
+            _Controller__lftp_status_cache_expires_at=None,
+            _Controller__lftp_status_poll_retry_active=False,
+            _Controller__lftp_idle_status_authoritative=False,
+            _Controller__progress_publication_epoch=4,
+            logger=MagicMock(),
+        )
+        status = LftpJobStatus(
+            3, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "private-name", "",
+        )
+        status.set_record_provenance(
+            "got", bytes_present=True, percent_present=True,
+            speed_present=False, eta_present=True,
+        )
+
+        _record_lftp_status_breadcrumb(
+            controller,
+            [status],
+            source="fresh_healthy",
+            fresh=True,
+            healthy=True,
+            poll_due=True,
+            poll_correlation="lftp-poll:0123456789abcdef",
+        )
+
+        lftp_entry = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "lftp_status_poll"
+        )
+        details = lftp_entry["details"]
+        self.assertEqual({"at": 0, "got": 1, "none": 0}, details["record_shape_counts"])
+        self.assertEqual(
+            {"bytes": 1, "percent": 1, "speed": 0, "eta": 1},
+            details["record_presence_counts"],
+        )
+        self.assertEqual(4, details["lifecycle_epoch"])
+        sample = details["record_samples"][0]
+        self.assertEqual("got", sample["record_shape"])
+        self.assertIn(sample["record_has_bytes"], {True, "True"})
+        self.assertIn(sample["record_has_speed"], {False, "False"})
+        self.assertRegex(sample["job_correlation"], r"^lftp-job:[0-9a-f]{16}$")
+        self.assertNotIn("private-name", str(details))
+        span = trace.snapshot()["progress_lineage"]["spans"][0]
+        status_sample = next(step for step in span["steps"] if step["phase"] == "status_sample")
+        self.assertEqual("got", status_sample["details"]["record_shape"])
+        self.assertEqual(4, status_sample["details"]["lifecycle_epoch"])
+
+    def test_lftp_status_sample_uses_model_progress_policy_without_transfer_breadcrumb(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__lftp=SimpleNamespace(backend_name="lftp"),
+            _Controller__progress_publication_epoch=5,
+            _Controller__record_breadcrumb=MagicMock(),
+            logger=MagicMock(),
+        )
+        status = LftpJobStatus(
+            4, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "private-name", "",
+        )
+        status.set_record_provenance("at", bytes_present=False, percent_present=False)
+
+        _record_lftp_status_breadcrumb(
+            controller, [status], source="fresh_healthy", fresh=True, healthy=True,
+            poll_correlation="lftp-poll:0123456789abcdef",
+        )
+
+        span = trace.snapshot()["progress_lineage"]["spans"][0]
+        sample = next(step for step in span["steps"] if step["phase"] == "status_sample")
+        self.assertEqual("at", sample["details"]["record_shape"])
+        self.assertEqual(5, sample["details"]["lifecycle_epoch"])
+        controller._Controller__record_breadcrumb.assert_not_called()
+
     def test_lftp_status_breadcrumb_cached_retry_uses_warning_policy_level(self):
         trace = BreadcrumbTraceCollector(
             lambda: True,
@@ -6210,6 +6300,645 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotIn("private-transfer-name", serialized)
         self.assertNotIn("/private/transfer/output", serialized)
 
+    def test_direct_overlay_scan_retirement_does_not_regress_on_fresh_empty_lftp(self):
+        """Regression: real updater retirement must retain the direct 100% overlay."""
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1)
+        local = SystemFile("active.bin", 40, False, is_staging=False, mtime_ns=1)
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "/private/transfer/active.bin",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(100, 100, 100, 100, 0)
+        initial = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "/private/transfer/active.bin",
+        )
+        initial.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 0, 6)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_lftp_statuses([initial])
+        builder.set_active_files([local])
+        model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=model,
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+        controller._Controller__lftp.status.side_effect = [[running], []]
+        controller._Controller__reconciled_local_path_pair_ids = {None}
+        controller._Controller__reconciled_remote_path_pair_ids = {None}
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._take_lftp_status_poll_correlation = MagicMock(
+            side_effect=(
+                "lftp-poll:0123456789abcdef",
+                "lftp-poll:fedcba9876543210",
+            ),
+        )
+        controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(
+                datetime.now(), [SystemFile("active.bin", 40, False, time_modified=datetime.now())],
+            ),
+            ScannerResult(
+                datetime.now(), [SystemFile("active.bin", 40, False, time_modified=datetime.now())],
+            ),
+        ]
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        file_id = model.get_file_ids().pop()
+        self.assertEqual(100, model.active_progress_overlay(file_id).transferred_size)
+
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+
+        # No test-side overlay clearing: the assertion observes the actual
+        # scan/status retirement boundary and the builder-owned recent-live
+        # snapshot retained from the successful direct publication.
+        direct_steps = [
+            step for span in trace.snapshot()["progress_lineage"]["spans"]
+            for step in span["steps"]
+            if step["phase"] == "direct_root_counter_publish"
+        ]
+        retired_direct = direct_steps[-1]
+        self.assertRegex(
+            retired_direct["details"]["target_correlation"],
+            r"^model-target:[0-9a-f]{16}$",
+        )
+        self.assertEqual("overlay", retired_direct["details"]["prior_source"])
+        self.assertEqual("base", retired_direct["details"]["new_source"])
+        self.assertEqual("100", retired_direct["details"]["prior_counter_bucket"])
+        self.assertEqual("100", retired_direct["details"]["new_counter_bucket"])
+        self.assertEqual("same", retired_direct["details"]["monotonic_relation"])
+        overlay = model.active_progress_overlay(file_id)
+        effective_transferred_size = (
+            overlay.transferred_size if overlay is not None else model.get_file(file_id).transferred_size
+        )
+        self.assertEqual(100, effective_transferred_size)
+
+    def test_running_lower_checkpoint_does_not_regress_same_target_model(self):
+        """Same-job status cadence must not repaint a newer root checkpoint lower."""
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1)
+        local = SystemFile("active.bin", 40, False, is_staging=False, mtime_ns=1)
+        initial = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        initial.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 0, 6)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_lftp_statuses([initial])
+        builder.set_active_files([local])
+        model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=model,
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+        statuses = []
+        for transferred_size, progress in ((99, 99), (92, 92), (99, 99)):
+            status = LftpJobStatus(
+                1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+                "active.bin", "",
+            )
+            status.total_transfer_state = LftpJobStatus.TransferState(
+                transferred_size, None, progress, 100, 1,
+            )
+            statuses.append([status])
+        controller._Controller__lftp.status.side_effect = statuses
+        controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(
+                datetime.now(), [SystemFile("active.bin", 40, False, time_modified=datetime.now())],
+            ) for _ in statuses
+        ]
+        controller._Controller__reconciled_local_path_pair_ids = {None}
+        controller._Controller__reconciled_remote_path_pair_ids = {None}
+        updater = ModelUpdater(controller)
+        observed = []
+
+        for index in range(len(statuses)):
+            if index:
+                controller._Controller__next_lftp_status_poll_at = None
+                controller._Controller__lftp_idle_status_authoritative = False
+            updater.update()
+            overlay = model.active_progress_overlay("active.bin")
+            file = model.get_file("active.bin")
+            effective = overlay if overlay is not None else file
+            observed.append((effective.transferred_size, effective.download_progress))
+
+        self.assertEqual([(99, 99), (99, 99), (99, 99)], observed)
+
+    def _make_late_older_multi_root_fixture(self):
+        remotes = [
+            SystemFile("active-a.bin", 100, False, mtime_ns=1),
+            SystemFile("active-b.bin", 100, False, mtime_ns=1),
+        ]
+        locals_ = [
+            SystemFile("active-a.bin", 40, False, is_staging=False, mtime_ns=1),
+            SystemFile("active-b.bin", 40, False, is_staging=False, mtime_ns=1),
+        ]
+        initial = []
+        for file_name in ("active-a.bin", "active-b.bin"):
+            status = LftpJobStatus(
+                2, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file_name, "",
+            )
+            status.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 0, 6)
+            initial.append(status)
+        builder = ModelBuilder()
+        builder.set_remote_files(remotes)
+        builder.set_lftp_statuses(initial)
+        builder.set_active_files(locals_)
+        model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=model,
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+        controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(
+                datetime.now(), [
+                    SystemFile("active-a.bin", 40, False, time_modified=datetime.now()),
+                    SystemFile("active-b.bin", 40, False, time_modified=datetime.now()),
+                ],
+            ),
+            ScannerResult(
+                datetime.now(), [
+                    SystemFile("active-a.bin", 40, False, time_modified=datetime.now()),
+                    SystemFile("active-b.bin", 40, False, time_modified=datetime.now()),
+                ],
+            ),
+        ]
+        controller._Controller__reconciled_local_path_pair_ids = {None}
+        controller._Controller__reconciled_remote_path_pair_ids = {None}
+        return controller, builder, model
+
+    @staticmethod
+    def _multi_root_status(file_name, job_id, transferred_size, progress):
+        status = LftpJobStatus(
+            job_id, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(
+            transferred_size, 100, progress, 0, 6,
+        )
+        return status
+
+    def test_late_older_counterless_status_preserves_only_eligible_root(self):
+        controller, builder, model = self._make_late_older_multi_root_fixture()
+        first_a = self._multi_root_status("active-a.bin", 2, 100, 100)
+        first_b = self._multi_root_status("active-b.bin", 2, 100, 100)
+        older_counterless_a = self._multi_root_status("active-a.bin", 1, None, None)
+        older_counterless_a.total_transfer_state = LftpJobStatus.TransferState(
+            None, None, None, None, None,
+        )
+        matching_b = self._multi_root_status("active-b.bin", 3, 80, 80)
+        controller._Controller__lftp.status.side_effect = [
+            [first_a, first_b], [older_counterless_a, matching_b],
+        ]
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        self.assertEqual(100, model.active_progress_overlay("active-a.bin").transferred_size)
+        self.assertEqual(100, model.active_progress_overlay("active-b.bin").transferred_size)
+
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+
+        self.assertEqual(100, model.active_progress_overlay("active-a.bin").transferred_size)
+        self.assertIsNone(model.active_progress_overlay("active-b.bin"))
+        self.assertEqual(80, model.get_file("active-b.bin").transferred_size)
+        self.assertFalse(builder.has_changes())
+
+    def test_late_older_counterless_status_preserves_root_while_explicit_stop_clears_peer(self):
+        controller, builder, model = self._make_late_older_multi_root_fixture()
+        first_a = self._multi_root_status("active-a.bin", 2, 100, 100)
+        first_b = self._multi_root_status("active-b.bin", 2, 100, 100)
+        older_counterless_a = self._multi_root_status("active-a.bin", 1, None, None)
+        older_counterless_a.total_transfer_state = LftpJobStatus.TransferState(
+            None, None, None, None, None,
+        )
+        stopped_b = self._multi_root_status("active-b.bin", 2, 80, 80)
+        controller._Controller__lftp.status.side_effect = [
+            [first_a, first_b], [older_counterless_a, stopped_b],
+        ]
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        self.assertEqual(100, model.active_progress_overlay("active-a.bin").transferred_size)
+        self.assertEqual(100, model.active_progress_overlay("active-b.bin").transferred_size)
+
+        controller._Controller__is_explicitly_stopped = MagicMock(
+            side_effect=lambda full_path, path_pair_id: full_path == "active-b.bin",
+        )
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+
+        self.assertEqual(100, model.active_progress_overlay("active-a.bin").transferred_size)
+        self.assertIsNone(model.active_progress_overlay("active-b.bin"))
+        # Stop authority retires only B's projection; A remains protected.
+        # The established stop/reconciliation tests cover B's lifecycle state
+        # once the builder's stopped-file marker is consumed.
+
+    def test_filtered_malformed_older_status_does_not_preserve_overlay(self):
+        controller, builder, model = self._make_late_older_multi_root_fixture()
+        first_a = self._multi_root_status("active-a.bin", 2, 100, 100)
+        first_b = self._multi_root_status("active-b.bin", 2, 100, 100)
+        older_counterless_a = self._multi_root_status("active-a.bin", 1, None, None)
+        older_counterless_a.total_transfer_state = LftpJobStatus.TransferState(
+            None, None, None, None, None,
+        )
+        newer_b = self._multi_root_status("active-b.bin", 3, 80, 80)
+        controller._Controller__lftp.status.side_effect = [
+            [first_a, first_b], [older_counterless_a, newer_b],
+        ]
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        self.assertIsNotNone(model.active_progress_overlay("active-a.bin"))
+        controller._Controller__malformed_status_only_file_ids = {
+            ModelFile.build_file_id("active-a.bin", None),
+        }
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+
+        self.assertIsNone(model.active_progress_overlay("active-a.bin"))
+
+    def test_filtered_duplicate_malformed_statuses_evict_stale_snapshot_before_full_build(self):
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1)
+        local = SystemFile("active.bin", 40, False, is_staging=False, mtime_ns=1)
+        initial = LftpJobStatus(
+            2, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        initial.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 0, 6)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_lftp_statuses([initial])
+        builder.set_active_files([local])
+        model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=model,
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+        progressed = LftpJobStatus(
+            2, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        progressed.total_transfer_state = LftpJobStatus.TransferState(100, 100, 100, 100, 0)
+        duplicate_a = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        duplicate_a.total_transfer_state = LftpJobStatus.TransferState(
+            None, None, None, None, None,
+        )
+        duplicate_b = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        duplicate_b.total_transfer_state = LftpJobStatus.TransferState(
+            None, None, None, None, None,
+        )
+        controller._Controller__lftp.status.side_effect = [
+            [progressed], [duplicate_a, duplicate_b],
+        ]
+        controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(
+                datetime.now(), [SystemFile("active.bin", 40, False, time_modified=datetime.now())],
+            ),
+            ScannerResult(
+                datetime.now(), [SystemFile("active.bin", 40, False, time_modified=datetime.now())],
+            ),
+        ]
+        controller._Controller__reconciled_local_path_pair_ids = {None}
+        controller._Controller__reconciled_remote_path_pair_ids = {None}
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        file_id = model.get_file_ids().pop()
+        self.assertEqual(100, model.active_progress_overlay(file_id).transferred_size)
+        builder.build_model.reset_mock()
+
+        controller._Controller__malformed_status_only_file_ids = {file_id}
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+
+        # Filtering both duplicate raw rows must not turn their absence into
+        # ordinary retirement that restores the 100-byte live snapshot.
+        self.assertIsNone(model.active_progress_overlay(file_id))
+        self.assertNotIn(file_id, builder._ModelBuilder__recent_live_transfer_snapshots)
+        self.assertNotIn(file_id, builder._ModelBuilder__retained_stopped_transfer_snapshots)
+        builder.build_model.assert_called_once_with()
+        self.assertEqual(40, model.get_file(file_id).transferred_size)
+
+    def test_late_older_counterless_status_preserves_newer_overlay(self):
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1)
+        local = SystemFile("active.bin", 40, False, is_staging=False, mtime_ns=1)
+        initial = LftpJobStatus(
+            2, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        initial.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 0, 6)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_lftp_statuses([initial])
+        builder.set_active_files([local])
+        model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=model,
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+        newer = LftpJobStatus(
+            2, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        newer.total_transfer_state = LftpJobStatus.TransferState(100, 100, 100, 100, 0)
+        older_counterless = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        older_counterless.total_transfer_state = LftpJobStatus.TransferState(
+            None, None, None, None, None,
+        )
+        controller._Controller__lftp.status.side_effect = [[newer], [older_counterless]]
+        controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(
+                datetime.now(), [SystemFile("active.bin", 40, False, time_modified=datetime.now())],
+            ),
+            ScannerResult(
+                datetime.now(), [SystemFile("active.bin", 40, False, time_modified=datetime.now())],
+            ),
+        ]
+        controller._Controller__reconciled_local_path_pair_ids = {None}
+        controller._Controller__reconciled_remote_path_pair_ids = {None}
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        file_id = model.get_file_ids().pop()
+        self.assertEqual(100, model.active_progress_overlay(file_id).transferred_size)
+
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+
+        overlay = model.active_progress_overlay(file_id)
+        self.assertIsNotNone(overlay)
+        self.assertEqual(100, overlay.transferred_size)
+        self.assertEqual(100, overlay.download_progress)
+        builder.build_model.assert_not_called()
+
+    def test_duplicate_older_counterless_status_clears_newer_overlay(self):
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1)
+        local = SystemFile("active.bin", 40, False, is_staging=False, mtime_ns=1)
+        initial = LftpJobStatus(
+            2, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        initial.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 0, 6)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_lftp_statuses([initial])
+        builder.set_active_files([local])
+        model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=model,
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+        newer = LftpJobStatus(
+            2, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        newer.total_transfer_state = LftpJobStatus.TransferState(100, 100, 100, 100, 0)
+        older_a = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        older_a.total_transfer_state = LftpJobStatus.TransferState(
+            None, None, None, None, None,
+        )
+        older_b = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        older_b.total_transfer_state = LftpJobStatus.TransferState(
+            None, None, None, None, None,
+        )
+        controller._Controller__lftp.status.side_effect = [
+            [newer], [older_a, older_b],
+        ]
+        controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(
+                datetime.now(), [SystemFile("active.bin", 40, False, time_modified=datetime.now())],
+            ),
+            ScannerResult(
+                datetime.now(), [SystemFile("active.bin", 40, False, time_modified=datetime.now())],
+            ),
+        ]
+        controller._Controller__reconciled_local_path_pair_ids = {None}
+        controller._Controller__reconciled_remote_path_pair_ids = {None}
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        self.assertEqual(100, model.active_progress_overlay("active.bin").transferred_size)
+
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+
+        # Duplicate raw roots are never safe to preserve, even when every
+        # duplicate happens to carry an older identity.
+        self.assertIsNone(model.active_progress_overlay("active.bin"))
+        builder.build_model.assert_called_once_with()
+
+    def test_late_older_counterless_type_mismatch_does_not_preserve_overlay(self):
+        controller, builder, model = self._make_late_older_multi_root_fixture()
+        first_a = self._multi_root_status("active-a.bin", 2, 100, 100)
+        first_b = self._multi_root_status("active-b.bin", 2, 100, 100)
+        older_counterless_a = LftpJobStatus(
+            2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active-a.bin", "",
+        )
+        older_counterless_a.total_transfer_state = LftpJobStatus.TransferState(
+            None, None, None, None, None,
+        )
+        newer_b = self._multi_root_status("active-b.bin", 3, 80, 80)
+        controller._Controller__lftp.status.side_effect = [
+            [first_a, first_b], [older_counterless_a, newer_b],
+        ]
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        self.assertIsNotNone(model.active_progress_overlay("active-a.bin"))
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+
+        self.assertIsNone(model.active_progress_overlay("active-a.bin"))
+
+    def test_replacement_job_identity_clears_overlay_while_scan_invalidation_defers_rebuild(self):
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1)
+        local = SystemFile("active.bin", 40, False, is_staging=False, mtime_ns=1)
+        first = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        first.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 0, 6)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_lftp_statuses([first])
+        builder.set_active_files([local])
+        model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=model,
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+        progressed = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        progressed.total_transfer_state = LftpJobStatus.TransferState(100, 100, 100, 100, 0)
+        replacement = LftpJobStatus(
+            2, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        replacement.total_transfer_state = LftpJobStatus.TransferState(60, 100, 60, 20, 4)
+        controller._Controller__lftp.status.side_effect = [[progressed], [replacement]]
+        controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(datetime.now(), [SystemFile("active.bin", 40, False)]),
+            ScannerResult(datetime.now(), [SystemFile("active.bin", 40, False)]),
+        ]
+        controller._Controller__reconciled_local_path_pair_ids = {None}
+        controller._Controller__reconciled_remote_path_pair_ids = {None}
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        file_id = model.get_file_ids().pop()
+        self.assertEqual(100, model.active_progress_overlay(file_id).transferred_size)
+
+        controller._Controller__next_lftp_status_poll_at = None
+        updater.update()
+
+        # The replacement job is ambiguous for direct publication.  Its
+        # identity fence clears only the old Model overlay; active-scan work
+        # remains dirty for the next authoritative reconciliation.
+        self.assertIsNone(model.active_progress_overlay(file_id))
+        self.assertTrue(builder.has_changes())
+        builder.build_model.assert_not_called()
+
+    def test_duplicate_running_statuses_reject_direct_projection_and_use_full_fallback(self):
+        remote = SystemFile("active.bin", 100, False)
+        initial = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        initial.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([SystemFile("active.bin", 25, False, is_staging=True)])
+        builder.set_lftp_statuses([initial])
+        builder.set_active_files([SystemFile("active.bin", 25, False)])
+        model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=model,
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+        duplicate_a = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        duplicate_a.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 11, 7)
+        duplicate_b = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        duplicate_b.total_transfer_state = LftpJobStatus.TransferState(27, 100, 27, 12, 6)
+        controller._Controller__lftp.status.return_value = [duplicate_a, duplicate_b]
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("active.bin", 25, False, time_modified=datetime.now())],
+        )
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+
+        ModelUpdater(controller).update()
+
+        # Raw duplicate roots cannot select a direct counter.  The ordinary
+        # builder reconciliation owns the resulting state instead of a
+        # last-write-wins overlay publication.
+        self.assertIsNone(model.active_progress_overlay("active.bin"))
+        # The authoritative fallback must also reject both raw rows; this
+        # active-only scan has no usable transfer counter, so it must remain
+        # counterless rather than selecting duplicate_b's 27.
+        self.assertIsNone(model.get_file("active.bin").transferred_size)
+        builder.build_model.assert_called_once_with()
+        self.assertFalse(builder.has_changes())
+
+    def test_conflicting_duplicate_statuses_clear_prior_overlay_and_use_scanned_base(self):
+        remote = SystemFile("active.bin", 100, False)
+        local = SystemFile("active.bin", 40, False, is_staging=True)
+        initial = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        initial.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 0, 6)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        builder.set_lftp_statuses([initial])
+        builder.set_active_files([SystemFile("active.bin", 40, False, is_staging=False)])
+        model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=model,
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+        progressed = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        progressed.total_transfer_state = LftpJobStatus.TransferState(100, 100, 100, 100, 0)
+        duplicate_a = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        duplicate_a.total_transfer_state = LftpJobStatus.TransferState(60, 100, 60, 20, 4)
+        duplicate_b = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        duplicate_b.total_transfer_state = LftpJobStatus.TransferState(80, 100, 80, 20, 2)
+        controller._Controller__lftp.status.side_effect = [[progressed], [duplicate_a, duplicate_b]]
+        controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(
+                datetime.now(), [SystemFile("active.bin", 40, False, time_modified=datetime.now())],
+            ),
+            ScannerResult(
+                datetime.now(), [SystemFile("active.bin", 40, False, time_modified=datetime.now())],
+            ),
+        ]
+        controller._Controller__reconciled_local_path_pair_ids = {None}
+        controller._Controller__reconciled_remote_path_pair_ids = {None}
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        self.assertEqual(100, model.active_progress_overlay("active.bin").transferred_size)
+
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+
+        # Full reconciliation must not restore the old overlay or select
+        # either conflicting duplicate (60 or 80); this active-only scan has
+        # no usable transfer counter after the status rejection.
+        self.assertIsNone(model.active_progress_overlay("active.bin"))
+        self.assertIsNone(model.get_file("active.bin").transferred_size)
+        builder.build_model.assert_called_once_with()
+
     def test_lftp_poll_lineage_reader_is_skipped_when_diagnostics_are_disabled(self):
         trace = BreadcrumbTraceCollector(
             lambda: True,
@@ -6510,6 +7239,59 @@ class TestModelUpdater(unittest.TestCase):
             })
             self.assertNotIn("root", str(step["details"]))
 
+    def test_direct_root_counter_lineage_is_target_scoped_and_post_boundary(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([
+            SystemFile("root-a", 100, False), SystemFile("root-b", 100, False),
+        ])
+        initial_a = LftpJobStatus(1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "root-a", "")
+        initial_b = LftpJobStatus(2, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "root-b", "")
+        initial_a.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        initial_b.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        builder.set_lftp_statuses([initial_a, initial_b])
+        builder.set_active_files([SystemFile("root-a", 25, False), SystemFile("root-b", 25, False)])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._take_lftp_status_poll_correlation = MagicMock(
+            return_value="lftp-poll:0123456789abcdef",
+        )
+        progressed_a = LftpJobStatus(1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "root-a", "")
+        progressed_b = LftpJobStatus(2, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "root-b", "")
+        progressed_a.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 11, 7)
+        progressed_b.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 11, 7)
+        controller._Controller__lftp.status.return_value = [progressed_a, progressed_b]
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [
+                SystemFile("root-a", 26, False, time_modified=datetime.now()),
+                SystemFile("root-b", 26, False, time_modified=datetime.now()),
+            ],
+        )
+
+        ModelUpdater(controller).update()
+
+        span = trace.snapshot()["progress_lineage"]["spans"][0]
+        direct = next(step for step in span["steps"] if step["phase"] == "direct_root_counter_publish")
+        self.assertGreater(
+            [step["phase"] for step in span["steps"]].index("direct_root_counter_publish"),
+            [step["phase"] for step in span["steps"]].index("updater_decision"),
+        )
+        self.assertIsNone(direct["details"].get("target_correlation"))
+        self.assertIsNone(direct["details"].get("job_match"))
+        self.assertIsNone(direct["details"].get("epoch_match"))
+        self.assertEqual("unknown", direct["details"]["prior_source"])
+        self.assertEqual("unknown", direct["details"]["new_source"])
+        self.assertIn(direct["details"]["lock_wait_duration_bucket"], {
+            "0-4", "5-19", "20-99", "100-499", "500-1999", "2000+",
+        })
+        self.assertNotIn("root-a", str(direct["details"]))
+        self.assertNotIn("root-b", str(direct["details"]))
+
     def test_direct_root_counter_rejected_status_snapshots_leave_builder_dirty(self):
         for snapshot in ([], [
                 LftpJobStatus(1, LftpJobStatus.Type.GET, LftpJobStatus.State.QUEUED, "root", ""),
@@ -6592,6 +7374,12 @@ class TestModelUpdater(unittest.TestCase):
         direct = next(step for step in span["steps"] if step["phase"] == "direct_root_counter_publish")
         self.assertEqual("accepted", direct["details"]["outcome"])
         self.assertEqual("model_owned", direct["details"]["active_scan_equivalence"])
+        self.assertRegex(direct["details"]["target_correlation"], r"^model-target:[0-9a-f]{16}$")
+        self.assertEqual("overlay", direct["details"]["prior_source"])
+        self.assertEqual("overlay", direct["details"]["new_source"])
+        self.assertEqual("100", direct["details"]["prior_counter_bucket"])
+        self.assertEqual("100", direct["details"]["new_counter_bucket"])
+        self.assertEqual("same", direct["details"]["monotonic_relation"])
         self.assertEqual(normalized_overlay, live_model.active_progress_overlay("root"))
         self.assertTrue(builder.has_changes())
 
@@ -6695,6 +7483,73 @@ class TestModelUpdater(unittest.TestCase):
             {"payload.bin", "new.bin"},
             {child.name for child in live_model.get_file("root").get_children()[0].get_children()},
         )
+
+    def test_mirror_direct_overlay_keeps_descending_subset_floor(self):
+        stamp = 1_786_400_003_000_000_000
+
+        def active_tree(staged_size: int, mtime_ns: int) -> SystemFile:
+            root = SystemFile("root", 200 + staged_size, True, mtime_ns=100)
+            root.add_child(SystemFile("final.bin", 200, False, mtime_ns=stamp))
+            staged = SystemFile(
+                "staged.bin", staged_size, False, is_staging=True,
+                mtime_ns=mtime_ns,
+            )
+            staged.status_sidecar_ready = True
+            root.add_child(staged)
+            return root
+
+        remote_root = SystemFile("root", 1000, True, mtime_ns=100)
+        remote_root.add_child(SystemFile("final.bin", 200, False, mtime_ns=stamp))
+        remote_root.add_child(SystemFile("staged.bin", 800, False, mtime_ns=stamp + 1_000_000_000))
+        builder = ModelBuilder()
+        builder.set_remote_files([remote_root])
+        initial = LftpJobStatus(
+            11, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "",
+        )
+        initial.total_transfer_state = LftpJobStatus.TransferState(31, 700, 4, 100, 8)
+        builder.set_lftp_statuses([initial])
+        # The verified final leaf belongs to the authoritative local scan;
+        # the active scanner contributes only the staging subset.
+        builder.set_local_files([active_tree(31, 1)])
+        builder.set_active_files([active_tree(31, 1)])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__reconciled_local_path_pair_ids = {None}
+        controller._Controller__reconciled_remote_path_pair_ids = {None}
+        statuses = []
+        for transferred_size in (31, 20, 10):
+            status = LftpJobStatus(
+                11, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "",
+            )
+            status.total_transfer_state = LftpJobStatus.TransferState(
+                transferred_size, 700, 4, 100, 8,
+            )
+            statuses.append([status])
+        controller._Controller__lftp.status.side_effect = statuses
+        controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(datetime.now(), [active_tree(size, mtime)])
+            for size, mtime in ((31, 1), (20, 2), (10, 3))
+        ]
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+        updater = ModelUpdater(controller)
+        observed = []
+
+        for index in range(len(statuses)):
+            if index:
+                controller._Controller__next_lftp_status_poll_at = None
+                controller._Controller__lftp_idle_status_authoritative = False
+            updater.update()
+            overlay = live_model.active_progress_overlay("root")
+            if index:
+                self.assertIsNotNone(overlay)
+            effective = overlay if overlay is not None else live_model.get_file("root")
+            observed.append(effective.transferred_size)
+
+        self.assertEqual([231, 231, 231], observed)
+        builder.build_model.assert_not_called()
 
     def test_timestamp_overlay_reconciliation_recovers_active_lftp_delta(self):
         builder = ModelBuilder()
@@ -9025,6 +9880,13 @@ class TestModelUpdater(unittest.TestCase):
                 "marker_observed": False,
                 "local_scan_forced": True,
                 "registration_source": "lftp_job_finished",
+                "retirement_cause": "lftp_job_finished",
+                "pending_transition": "registered",
+                "physical_proof": "unknown",
+                "explicit_stop": False,
+                "terminal_outcome": "deferred",
+                "scan_health": "requested",
+                "scan_freshness": "unknown",
             },
             pending["details"],
         )
@@ -9069,6 +9931,13 @@ class TestModelUpdater(unittest.TestCase):
                         "reason": "completion_detection_not_authoritative",
                         "marker_observed": False,
                         "local_scan_forced": False,
+                        "retirement_cause": "completion_detection_not_authoritative",
+                        "pending_transition": "retained",
+                        "physical_proof": "unknown",
+                        "explicit_stop": False,
+                        "terminal_outcome": "deferred",
+                        "scan_health": "unknown",
+                        "scan_freshness": "unknown",
                     },
                     entries[0]["details"],
                 )

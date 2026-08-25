@@ -912,6 +912,16 @@ class TestSystemScanner(unittest.TestCase):
             self.assertEqual(False, details["status_only"])
             self.assertIn(details["parser_coverage"], {"known", "unknown"})
             self.assertEqual("local", details["scan_role"])
+            self.assertIn(details["sidecar_shape"], {"multi_segment", "invalid", "absent"})
+            self.assertIn(details["coverage_disk_relation"], {
+                "unknown", "sidecar_ahead", "equal", "sidecar_behind",
+            })
+            if details["classification"] == "valid":
+                self.assertTrue(details["total_match"] is False)
+                self.assertEqual("sidecar_ahead", details["coverage_disk_relation"])
+            else:
+                self.assertIsNone(details["total_match"])
+                self.assertEqual("unknown", details["coverage_disk_relation"])
             self.assertNotIn(TestSystemScanner.temp_dir, repr(event))
 
     def test_lftp_sidecar_does_not_emit_absent_for_ordinary_files(self):
@@ -958,12 +968,63 @@ class TestSystemScanner(unittest.TestCase):
         self.assertEqual(events[0].kwargs["corr_id"], events[1].kwargs["corr_id"])
         self.assertNotEqual(events[0].kwargs["_coalesce_key"], events[1].kwargs["_coalesce_key"])
 
+    def test_lftp_sidecar_coalescing_includes_shape_coverage_and_disk_relation(self):
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        target = lftp_sidecar_target_identity(TestSystemScanner.temp_dir, "download.zip")
+
+        _record_lftp_sidecar_breadcrumb(
+            trace, "valid", target, status_only=False, parser_coverage="known", scan_role="local",
+            sidecar_shape="base_only", total_match=False,
+            coverage_disk_relation="sidecar_ahead",
+        )
+        _record_lftp_sidecar_breadcrumb(
+            trace, "valid", target, status_only=False, parser_coverage="known", scan_role="local",
+            sidecar_shape="multi_segment", total_match=True,
+            coverage_disk_relation="equal",
+        )
+
+        events = [call for call in trace.record.call_args_list if call.args[1] == "lftp_sidecar_classified"]
+        self.assertEqual(2, len(events))
+        self.assertNotEqual(events[0].kwargs["_coalesce_key"], events[1].kwargs["_coalesce_key"])
+        self.assertEqual("base_only", events[0].args[2]["sidecar_shape"])
+        self.assertEqual(False, events[0].args[2]["total_match"])
+        self.assertEqual("sidecar_ahead", events[0].args[2]["coverage_disk_relation"])
+        self.assertEqual("multi_segment", events[1].args[2]["sidecar_shape"])
+        self.assertEqual(True, events[1].args[2]["total_match"])
+        self.assertEqual("equal", events[1].args[2]["coverage_disk_relation"])
+
     def test_lftp_sidecar_target_identity_distinguishes_roots_with_same_basename(self):
         first = lftp_sidecar_target_identity(os.path.join(TestSystemScanner.temp_dir, "movies"), "same.zip")
         second = lftp_sidecar_target_identity(os.path.join(TestSystemScanner.temp_dir, "tv"), "same.zip")
         self.assertNotEqual(first, second)
         self.assertNotIn(TestSystemScanner.temp_dir, first)
         self.assertNotIn(TestSystemScanner.temp_dir, second)
+
+    def test_recursive_lftp_sidecar_target_identity_distinguishes_duplicate_basenames(self):
+        my_mkdir("movies")
+        my_mkdir("tv")
+        my_touch(4, "movies", "same.zip")
+        my_touch(4, "tv", "same.zip")
+        for directory in ("movies", "tv"):
+            with open(os.path.join(
+                    TestSystemScanner.temp_dir, directory, "same.zip.lftp-pget-status",
+            ), "w") as handle:
+                handle.write("size=100\n0.pos=30\n0.limit=100\n")
+
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        scanner.set_breadcrumb_trace(trace)
+        scanner.scan()
+
+        events = [
+            call for call in trace.record.call_args_list
+            if call.args[1] == "lftp_sidecar_classified"
+        ]
+        self.assertEqual(2, len(events))
+        self.assertEqual(2, len({event.kwargs["corr_id"] for event in events}))
+        self.assertNotIn(TestSystemScanner.temp_dir, repr(events))
 
     def test_scan_file_with_latin_chars(self):
         tempdir = TestSystemScanner.temp_dir

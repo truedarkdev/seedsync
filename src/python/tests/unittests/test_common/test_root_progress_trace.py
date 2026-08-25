@@ -513,6 +513,44 @@ class TestRootProgressTrace(unittest.TestCase):
             for step in bounded_span["steps"]
         ))
 
+    def test_progress_lineage_accepts_bounded_record_and_publication_provenance(self):
+        trace = self._trace()
+        correlation = "lftp-poll:0123456789abcdef"
+        self.assertTrue(trace.record_progress_lineage(
+            correlation, "status_sample", {
+                "record_shape": "got",
+                "record_has_bytes": True,
+                "record_has_percent": True,
+                "record_has_speed": True,
+                "record_has_eta": True,
+                "job_correlation": "lftp-job:fedcba9876543210",
+                "lifecycle_epoch": 7,
+                "job_match": True,
+                "epoch_match": True,
+            },
+        ))
+        self.assertTrue(trace.record_progress_lineage(
+            correlation, "direct_root_counter_publish", {
+                "prior_source": "overlay",
+                "new_source": "base",
+                "destination": "base",
+                "prior_counter_bucket": "100",
+                "new_counter_bucket": "50-74",
+                "prior_percent_bucket": "100",
+                "new_percent_bucket": "50-74",
+                "monotonic_relation": "regress",
+            },
+        ))
+        steps = trace.snapshot()["progress_lineage"]["spans"][0]["steps"]
+        self.assertEqual("got", steps[0]["details"]["record_shape"])
+        self.assertEqual("lftp-job:fedcba9876543210", steps[0]["details"]["job_correlation"])
+        self.assertEqual("regress", steps[1]["details"]["monotonic_relation"])
+        self.assertTrue(trace.record_progress_lineage(
+            correlation, "status_sample", {"job_correlation": "lftp-job:private"},
+        ))
+        latest = trace.snapshot()["progress_lineage"]["spans"][0]["steps"][-1]
+        self.assertNotIn("job_correlation", latest["details"])
+
     def test_active_delta_lineage_phase_order_and_unreached_tails_are_bounded(self):
         trace = self._trace()
         correlation = "lftp-poll:0123456789abcdef"

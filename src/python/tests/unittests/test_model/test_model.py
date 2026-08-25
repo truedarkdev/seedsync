@@ -78,6 +78,45 @@ class TestLftpModel(unittest.TestCase):
         ))
         self.assertEqual(second, self.model.active_progress_overlay(file.file_id))
 
+    def test_selected_overlay_clear_and_restore_preserve_only_protected_root(self):
+        first = ModelFile("first", False)
+        second = ModelFile("second", False)
+        for file in (first, second):
+            file.state = ModelFile.State.DOWNLOADING
+            file.is_stoppable = True
+            self.model.add_file(file)
+        overlays = {
+            first.file_id: ActiveProgressOverlay(50, 50, 10, 8),
+            second.file_id: ActiveProgressOverlay(60, 60, 11, 7),
+        }
+        identities = {
+            first.file_id: (2, "get"),
+            second.file_id: (2, "get"),
+        }
+        self.assertEqual(
+            ({first.file_id, second.file_id}, "accepted"),
+            self.model.publish_active_lftp_root_counters(
+                overlays, identities, lambda _: True,
+            ),
+        )
+        self.assertEqual(
+            {second.file_id},
+            self.model.clear_active_progress_overlays_except({first.file_id}),
+        )
+        self.assertEqual(overlays[first.file_id], self.model.active_progress_overlay(first.file_id))
+        self.assertIsNone(self.model.active_progress_overlay(second.file_id))
+
+        self.model.update_file(self.model.get_file(second.file_id))
+        self.assertIsNone(self.model.active_progress_overlay(first.file_id))
+        self.assertEqual(
+            {first.file_id},
+            self.model.restore_active_progress_overlays(
+                {first.file_id: overlays[first.file_id]},
+                {first.file_id: identities[first.file_id]},
+            ),
+        )
+        self.assertEqual(overlays[first.file_id], self.model.active_progress_overlay(first.file_id))
+
     def test_version_callbacks_keep_captured_versions_across_reentrant_listener_mutation(self):
         first = ModelFile("first", False)
         second = ModelFile("second", False)

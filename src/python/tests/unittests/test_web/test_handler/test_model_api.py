@@ -63,9 +63,10 @@ class TestModelApi(unittest.TestCase):
         entries = enabled.snapshot()["entries"]
         self.assertEqual(["scoped_stream_atomic_registered", "scoped_stream_initial_page_emitted"],
                          [entry["message"] for entry in entries])
-        self.assertEqual({"phase", "scope_kind", "record_count_bucket", "model_version", "next_page"},
+        self.assertEqual({"phase", "scope_kind", "record_count_bucket", "model_version", "next_page", "stream_linkage"},
                          set(entries[0]["details"]))
         self.assertEqual("5+", entries[0]["details"]["record_count_bucket"])
+        self.assertEqual("linked", entries[0]["details"]["stream_linkage"])
         self.assertNotIn("private-pair", str(entries))
         self.assertNotIn("private", str(entries))
 

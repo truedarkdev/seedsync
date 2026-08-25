@@ -232,6 +232,10 @@ class Model:
         """Return a value snapshot for an atomic replacement transaction."""
         return dict(self.__active_progress_overlays)
 
+    def active_progress_overlay_job_identities_snapshot(self) -> dict[str, tuple[int, str]]:
+        """Return the live overlay job identities for one updater transaction."""
+        return dict(self.__active_progress_overlay_job_identities)
+
     def clear_active_progress_overlays(self) -> None:
         """Discard live-only values and publish each affected root's base state."""
         removed_file_ids = set(self.__active_progress_overlays)
@@ -243,6 +247,92 @@ class Model:
                 continue
             global_version, scope_version = self.__advance_version(file)
             self.__notify_versioned_change(file, global_version, scope_version)
+
+    def clear_active_progress_overlays_except(self, preserved_file_ids: Set[str]) -> set[str]:
+        """Clear only live projections outside one protected root set.
+
+        The updater holds the Model lock while calling this method.  A stale
+        status for one root must not retire a newer projection for another
+        root in the same status poll.
+        """
+        preserved = {
+            file_id for file_id in preserved_file_ids
+            if isinstance(file_id, str)
+        }
+        removed_file_ids = set(self.__active_progress_overlays).difference(preserved)
+        for file_id in removed_file_ids:
+            self.__active_progress_overlays.pop(file_id, None)
+            self.__active_progress_overlay_job_identities.pop(file_id, None)
+        for file_id in sorted(removed_file_ids):
+            file = self.__files_by_id.get(file_id)
+            if file is None:
+                continue
+            global_version, scope_version = self.__advance_version(file)
+            self.__notify_versioned_change(file, global_version, scope_version)
+        return removed_file_ids
+
+    def restore_active_progress_overlays(
+            self,
+            overlays: Dict[str, ActiveProgressOverlay],
+            job_identities: Dict[str, tuple[int, str]],
+    ) -> set[str]:
+        """Restore protected live projections after an unrelated reconciliation.
+
+        Only roots that still satisfy the direct-projection authority fence are
+        restored.  The updater holds the Model lock while calling this method.
+        """
+        normalized: dict[str, ActiveProgressOverlay] = {}
+        normalized_identities: dict[str, tuple[int, str]] = {}
+        for file_id, overlay in overlays.items():
+            identity = job_identities.get(file_id)
+            file = self.__files_by_id.get(file_id)
+            if not isinstance(file_id, str) or not isinstance(overlay, ActiveProgressOverlay) or \
+                    not isinstance(identity, tuple) or len(identity) != 2 or \
+                    type(identity[0]) is not int or identity[0] < 0 or \
+                    not isinstance(identity[1], str) or not identity[1] or \
+                    file is None or file.state != ModelFile.State.DOWNLOADING or \
+                    not file.is_stoppable or file.explicitly_stopped or \
+                    file.display_size_total is not None or file.display_transferred_size is not None:
+                continue
+            normalized[file_id] = overlay
+            normalized_identities[file_id] = identity
+        changed_root_ids = set(self.__active_progress_overlays).union(normalized)
+        changed = {
+            file_id for file_id in changed_root_ids
+            if self.__active_progress_overlays.get(file_id) != normalized.get(file_id) or
+            self.__active_progress_overlay_job_identities.get(file_id) != normalized_identities.get(file_id)
+        }
+        self.__active_progress_overlays = normalized
+        self.__active_progress_overlay_job_identities = normalized_identities
+        for file_id in sorted(changed):
+            file = self.__files_by_id.get(file_id)
+            if file is None:
+                continue
+            global_version, scope_version = self.__advance_version(file)
+            self.__notify_versioned_change(file, global_version, scope_version)
+        return changed
+
+    def clear_active_progress_overlay_if_job_identity_matches(
+            self, file_id: str, job_identity: tuple[int, str],
+    ) -> bool:
+        """Clear one stale projection when it still belongs to ``job_identity``.
+
+        The updater holds the Model lock while calling this method.  The
+        identity fence makes replacement-job cleanup safe if a later
+        publication has already installed a different root projection.
+        """
+        if self.__active_progress_overlay_job_identities.get(file_id) != job_identity:
+            return False
+        if file_id not in self.__active_progress_overlays:
+            return False
+        self.__active_progress_overlays.pop(file_id, None)
+        self.__active_progress_overlay_job_identities.pop(file_id, None)
+        file = self.__files_by_id.get(file_id)
+        if file is None:
+            return True
+        global_version, scope_version = self.__advance_version(file)
+        self.__notify_versioned_change(file, global_version, scope_version)
+        return True
 
     def replace_active_progress_overlays(
             self, overlays: Dict[str, ActiveProgressOverlay], changed_root_ids: Set[str],
@@ -284,6 +374,8 @@ class Model:
         """
         normalized: dict[str, ActiveProgressOverlay] = {}
         normalized_identities: dict[str, tuple[int, str]] = {}
+        identity_mismatches: dict[str, tuple[int, str]] = {}
+        identity_rejected = False
         for file_id, overlay in overlays.items():
             identity = job_identities.get(file_id)
             file = self.__files_by_id.get(file_id)
@@ -298,7 +390,13 @@ class Model:
                 return set(), "lifecycle_epoch"
             previous_identity = self.__active_progress_overlay_job_identities.get(file_id)
             if previous_identity is not None and previous_identity != identity:
-                return set(), "job_identity"
+                identity_rejected = True
+                # LFTP job ids are monotonic within the controller lifecycle.
+                # A newer replacement must retire the old projection; an
+                # older late row must leave the newer projection untouched.
+                if identity[0] > previous_identity[0]:
+                    identity_mismatches[file_id] = previous_identity
+                continue
             if file.state != ModelFile.State.DOWNLOADING or not file.is_stoppable or \
                     file.explicitly_stopped or file.display_size_total is not None or \
                     file.display_transferred_size is not None:
@@ -306,6 +404,13 @@ class Model:
                 return set(), "root_authority"
             normalized[file_id] = overlay
             normalized_identities[file_id] = identity
+
+        if identity_rejected:
+            for file_id, previous_identity in sorted(identity_mismatches.items()):
+                self.clear_active_progress_overlay_if_job_identity_matches(
+                    file_id, previous_identity,
+                )
+            return set(), "job_identity"
 
         changed_root_ids = set(self.__active_progress_overlays).union(normalized)
         changed = {

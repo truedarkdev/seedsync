@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 from system import SystemFile
 from lftp import Lftp, LftpJobStatus, LftpJobStatusParser
-from model import ModelError, ModelFile, Model
+from model import ActiveProgressOverlay, ModelError, ModelFile, Model
 from controller import Controller, ModelBuilder
 from controller.scan import LocalScanner
 from controller.model_builder import _RecentLiveTransferSnapshot, _TransferState
@@ -748,6 +748,22 @@ class TestModelBuilder(unittest.TestCase):
         self.assertTrue(self.model_builder.has_changes())
         self.assertIsNone(self.model_builder.build_active_progress_overlays(live_model.get_file_ids()))
         self.assertEqual("topology", self.model_builder.direct_progress_active_scan_equivalence_failure())
+
+    def test_direct_progress_snapshot_rejects_explicit_stop(self):
+        root = SystemFile("active.bin", 100, False)
+        self.model_builder.set_remote_files([root])
+        self.model_builder.set_active_files([SystemFile("active.bin", 40, False)])
+        self.model_builder.set_stopped_files({"active.bin"})
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(100, 100, 100, 10, 0)
+        self.model_builder.set_lftp_statuses([status])
+
+        self.assertFalse(self.model_builder.record_read_only_lftp_root_counter_overlays({
+            "active.bin": ActiveProgressOverlay(100, 100, 10, 0),
+        }))
+        self.assertEqual({}, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
 
     def test_direct_progress_overlay_accepts_deep_counter_mtime_churn_and_rejects_identity_changes(self):
         def active_tree(
@@ -2678,6 +2694,14 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual((231, 1000), (release.transferred_size, release.remote_size))
         self.assertEqual(23, release.download_progress)
 
+        # A descending raw subset is still the same running job.  The
+        # normalized root and its stored subset floor must both remain at the
+        # already-published 231 bytes (final 200 + staged 31).
+        lower_subset = render(20, 700)
+        lowest_subset = render(10, 700)
+        self.assertEqual((231, 1000), (lower_subset.transferred_size, lower_subset.remote_size))
+        self.assertEqual((231, 1000), (lowest_subset.transferred_size, lowest_subset.remote_size))
+
         # A changing discovered subset cannot lower the same-job raw floor;
         # an explicit zero reset and a new job still start from raw bytes.
         continued = render(50, 900)
@@ -4423,6 +4447,160 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(file_a.download_progress)
         self.assertFalse(self.model_builder.has_changes())
 
+    def test_running_null_counter_handoff_preserves_live_floor_until_terminal_scan(self):
+        file_name = "sample.bin"
+        remote_size = 33_554_432
+        prior_bytes = 33_506_687
+        self.model_builder.set_remote_files([SystemFile(file_name, remote_size, False)])
+        # The live LFTP counter and local scan can agree on bytes while the
+        # status row still has no usable counters.
+        self.model_builder.set_local_files([SystemFile(file_name, prior_bytes, False)])
+
+        running = LftpJobStatus(
+            7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(
+            prior_bytes, remote_size, 99, 1_000_000, 1,
+        )
+        self.model_builder.set_lftp_statuses([running])
+
+        initial = self.model_builder.build_model().get_file(file_name)
+        self.assertEqual(ModelFile.State.DOWNLOADING, initial.state)
+        self.assertEqual(prior_bytes, initial.transferred_size)
+        self.assertEqual(99, initial.download_progress)
+
+        # The same target/job can briefly have a status row without usable
+        # counters while the local completion scan is still pending.
+        null_counter_status = LftpJobStatus(
+            running.id, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        null_counter_status.total_transfer_state = LftpJobStatus.TransferState(
+            None, None, None, None, None,
+        )
+        self.model_builder.set_lftp_statuses([null_counter_status])
+
+        handoff = self.model_builder.build_model().get_file(file_name)
+        self.assertEqual(ModelFile.State.DOWNLOADING, handoff.state)
+        self.assertEqual(prior_bytes, handoff.transferred_size)
+        self.assertEqual(99, handoff.download_progress)
+
+        replacement_status = LftpJobStatus(
+            8, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        replacement_status.total_transfer_state = LftpJobStatus.TransferState(
+            None, None, None, None, None,
+        )
+        self.model_builder.set_lftp_statuses([replacement_status])
+
+        replacement = self.model_builder.build_model().get_file(file_name)
+        self.assertEqual(ModelFile.State.DOWNLOADING, replacement.state)
+        self.assertEqual(prior_bytes, replacement.transferred_size)
+        self.assertIsNone(replacement.download_progress)
+
+        self.model_builder.set_local_files([SystemFile(file_name, remote_size, False)])
+        self.model_builder.set_lftp_statuses([])
+        terminal = self.model_builder.build_model().get_file(file_name)
+        self.assertEqual(ModelFile.State.DOWNLOADED, terminal.state)
+        self.assertEqual(remote_size, terminal.transferred_size)
+        self.assertIsNone(terminal.download_progress)
+
+    def test_running_same_job_lower_checkpoint_without_remote_denominator_keeps_floor(self):
+        file_name = "same-job-lower-checkpoint.bin"
+        remote = SystemFile(file_name, 100, False)
+        previous = _RecentLiveTransferSnapshot(
+            root_file_id=file_name,
+            size_local=99,
+            percent_local=99,
+            speed=10,
+            eta=1,
+            lftp_job_id=7,
+            lftp_job_type=LftpJobStatus.Type.PGET.value,
+        )
+
+        lower = ModelBuilder._ModelBuilder__combine_split_root_transfer_state(
+            _TransferState(92, None, 92, 8, 2),
+            remote,
+            None,
+            previous,
+            7,
+            LftpJobStatus.Type.PGET,
+        )
+        recovered = ModelBuilder._ModelBuilder__combine_split_root_transfer_state(
+            _TransferState(99, None, 99, 12, 0),
+            remote,
+            None,
+            previous,
+            7,
+            LftpJobStatus.Type.PGET,
+        )
+        replacement = ModelBuilder._ModelBuilder__combine_split_root_transfer_state(
+            _TransferState(92, None, 92, 8, 2),
+            remote,
+            None,
+            previous,
+            8,
+            LftpJobStatus.Type.PGET,
+        )
+
+        self.assertEqual((99, 99), (lower.size_local, lower.percent_local))
+        self.assertEqual((99, 99), (recovered.size_local, recovered.percent_local))
+        self.assertEqual((92, 92), (replacement.size_local, replacement.percent_local))
+
+    def test_counterless_same_id_type_change_evicts_recent_snapshot(self):
+        file_name = "type-change.bin"
+        self.model_builder.set_remote_files([SystemFile(file_name, 100, False)])
+        self.model_builder.set_local_files([SystemFile(file_name, 40, False)])
+        running_get = LftpJobStatus(
+            4, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running_get.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 10, 2)
+        self.model_builder.set_lftp_statuses([running_get])
+        self.model_builder.build_model()
+        self.assertIn(file_name, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+        counterless_pget = LftpJobStatus(
+            4, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        counterless_pget.total_transfer_state = LftpJobStatus.TransferState(
+            None, None, None, None, None,
+        )
+        self.model_builder.set_lftp_statuses([counterless_pget])
+        changed_type = self.model_builder.build_model().get_file(file_name)
+
+        self.assertEqual(ModelFile.State.DOWNLOADING, changed_type.state)
+        self.assertEqual(40, changed_type.transferred_size)
+        self.assertIsNone(changed_type.download_progress)
+        self.assertNotIn(file_name, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+    def test_stopped_resume_same_id_type_change_evicts_retained_snapshot(self):
+        file_name = "stopped-type-change.bin"
+        self.model_builder.set_remote_files([SystemFile(file_name, 1000, False)])
+        self.model_builder.set_local_files([SystemFile(file_name, 650, False)])
+        running_pget = LftpJobStatus(
+            6, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running_pget.total_transfer_state = LftpJobStatus.TransferState(750, 1000, 75, 10, 2)
+        self.model_builder.set_lftp_statuses([running_pget])
+        self.model_builder.build_model()
+
+        self.model_builder.set_stopped_files({file_name})
+        self.model_builder.set_lftp_statuses([])
+        self.model_builder.build_model()
+        self.assertIn(file_name, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+
+        resumed_get = LftpJobStatus(
+            6, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        resumed_get.total_transfer_state = LftpJobStatus.TransferState(700, 1000, 70, 10, 2)
+        self.model_builder.set_stopped_files(set())
+        self.model_builder.set_lftp_statuses([resumed_get])
+        resumed = self.model_builder.build_model().get_file(file_name)
+
+        self.assertEqual(ModelFile.State.DOWNLOADING, resumed.state)
+        self.assertEqual(700, resumed.transferred_size)
+        self.assertEqual(70, resumed.download_progress)
+        self.assertNotIn(file_name, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+
     def test_build_recent_live_transfer_snapshot_rekeys_legacy_alias_to_canonical_file_id(self):
         self.model_builder.clear()
         qualified_file_id = ModelFile.build_file_id("dup", "movies")
@@ -5475,7 +5653,9 @@ class TestModelBuilder(unittest.TestCase):
             size_local=900,
             percent_local=90,
             speed=None,
-            eta=None
+            eta=None,
+            lftp_job_id=0,
+            lftp_job_type="pget",
         )
         self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots[qualified_file_id] = \
             _RecentLiveTransferSnapshot(
@@ -5483,7 +5663,9 @@ class TestModelBuilder(unittest.TestCase):
                 size_local=750,
                 percent_local=75,
                 speed=None,
-                eta=None
+                eta=None,
+                lftp_job_id=0,
+                lftp_job_type="pget",
             )
 
         resume_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "")
@@ -7918,6 +8100,32 @@ class TestModelBuilder(unittest.TestCase):
         self.assertTrue(self.model_builder.has_changes())
         model = self.model_builder.build_model()
         self.assertEqual({"b", "c", "d", "e"}, model.get_file_names())
+
+    def test_conflicting_duplicate_lftp_roots_fail_closed_in_full_build(self):
+        remote = SystemFile("active.bin", 100, False)
+        local = SystemFile("active.bin", 25, False)
+        first = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        first.total_transfer_state = LftpJobStatus.TransferState(26, 100, 26, 1, 1)
+        second = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        second.total_transfer_state = LftpJobStatus.TransferState(80, 100, 80, 1, 1)
+
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+        self.model_builder.set_lftp_statuses([first, second])
+
+        model = self.model_builder.build_model()
+
+        # Duplicate raw rows are ambiguous, so neither counter may become
+        # authoritative through the full builder fallback.
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("active.bin").state)
+        self.assertEqual(25, model.get_file("active.bin").transferred_size)
+        self.assertIsNone(model.get_file("active.bin").download_progress)
 
     def test_rebuild_on_active_files(self):
         self.assertTrue(self.model_builder.has_changes())

@@ -33,6 +33,19 @@ class TestLftpJobStatusParser(unittest.TestCase):
         self.assertEqual(1, statuses[0].total_transfer_state.size_local)
         self.assertEqual(0, statuses[0].total_transfer_state.percent_local)
 
+    def test_parser_retains_bounded_record_provenance_without_runtime_identity(self):
+        status = self._parse_pget_with_chunk_tail(
+            "", "1000 of 2000 (50%) 2K/s eta:3s",
+        )[0]
+
+        self.assertEqual("got", status.record_shape)
+        self.assertEqual(
+            {"bytes": True, "percent": True, "speed": True, "eta": True},
+            status.record_field_presence,
+        )
+        self.assertRegex(status.job_correlation, r"^lftp-job:[0-9a-f]{16}$")
+        self.assertNotIn("SomeFile", status.job_correlation)
+
     def test_size_to_bytes(self):
         self.assertEqual(345, LftpJobStatusParser._size_to_bytes("345"))
         self.assertEqual(1000, LftpJobStatusParser._size_to_bytes("1000b"))

@@ -54,6 +54,12 @@ LFTP_SIDECAR_TRACE_COVERAGE = frozenset({"known", "unknown"})
 LFTP_SIDECAR_TRACE_ROLES = frozenset({
     "system", "local", "active", "multipath_active", "unknown",
 })
+LFTP_SIDECAR_TRACE_SHAPES = frozenset({
+    "absent", "invalid", "multi_segment", "base_only", "unknown",
+})
+LFTP_SIDECAR_TRACE_COVERAGE_DISK_RELATIONS = frozenset({
+    "sidecar_ahead", "equal", "sidecar_behind", "unknown",
+})
 
 
 def _breadcrumb_effectively_enabled(trace: object, category: str, level: str = "info") -> bool:
@@ -94,8 +100,15 @@ def _record_lftp_sidecar_breadcrumb(
         status_only: Optional[bool],
         parser_coverage: str,
         scan_role: str,
+        sidecar_shape: str = "unknown",
+        total_match: Optional[bool] = None,
+        coverage_disk_relation: str = "unknown",
 ) -> None:
-    """Emit one privacy-safe, bounded scanner-side sidecar classification."""
+    """Classify sidecar coverage against this scan's physical disk size.
+
+    This is a same-scan coverage-vs-disk comparison, not a temporal
+    progression claim; the scanner owns no prior-sample history here.
+    """
     if classification not in LFTP_SIDECAR_TRACE_CLASSIFICATIONS:
         classification = "unknown"
     if parser_coverage not in LFTP_SIDECAR_TRACE_COVERAGE:
@@ -104,6 +117,12 @@ def _record_lftp_sidecar_breadcrumb(
         scan_role = "unknown"
     if type(status_only) is not bool:
         status_only = None
+    if sidecar_shape not in LFTP_SIDECAR_TRACE_SHAPES:
+        sidecar_shape = "unknown"
+    if type(total_match) is not bool:
+        total_match = None
+    if coverage_disk_relation not in LFTP_SIDECAR_TRACE_COVERAGE_DISK_RELATIONS:
+        coverage_disk_relation = "unknown"
 
     # The gate deliberately precedes the opaque correlation construction and
     # all diagnostic-only payload work.  The emitter is best-effort: a broken
@@ -119,12 +138,15 @@ def _record_lftp_sidecar_breadcrumb(
         if not isinstance(target_identity, str):
             target_identity = "unknown"
         coalesce_key = opaque_trace_correlation(
-            "lftp.sidecar.state|{}|{}|{}|{}|{}".format(
+            "lftp.sidecar.state|{}|{}|{}|{}|{}|{}|{}|{}".format(
                 target_identity,
                 classification,
                 "unknown" if status_only is None else str(status_only).lower(),
                 parser_coverage,
                 scan_role,
+                sidecar_shape,
+                "unknown" if total_match is None else str(total_match).lower(),
+                coverage_disk_relation,
             ),
         )
         recorder(
@@ -136,6 +158,9 @@ def _record_lftp_sidecar_breadcrumb(
                 "status_only": status_only,
                 "parser_coverage": parser_coverage,
                 "scan_role": scan_role,
+                "sidecar_shape": sidecar_shape,
+                "total_match": total_match,
+                "coverage_disk_relation": coverage_disk_relation,
             },
             stage="lftp_sidecar_scan",
             event_type="diagnostic",
@@ -367,13 +392,23 @@ class SystemScanner:
             parsed_size = None
             sidecar_classification: Optional[str] = None
             parser_coverage = "unknown"
+            sidecar_shape = "unknown"
+            sidecar_total_match: Optional[bool] = None
+            coverage_disk_relation = "unknown"
 
             def target_identity() -> str:
-                target_identity_name = entry.name
+                try:
+                    target_identity_name = os.path.relpath(entry.path, self.path_to_scan)
+                except (TypeError, ValueError, OSError):
+                    target_identity_name = entry.name
                 temp_suffix = self.__lftp_temp_file_suffix
-                if temp_suffix is not None and target_identity_name != temp_suffix and \
-                        target_identity_name.endswith(temp_suffix):
-                    target_identity_name = target_identity_name[:-len(temp_suffix)]
+                target_directory = os.path.dirname(target_identity_name)
+                target_basename = os.path.basename(target_identity_name)
+                if temp_suffix is not None and target_basename != temp_suffix and \
+                        target_basename.endswith(temp_suffix):
+                    target_basename = target_basename[:-len(temp_suffix)]
+                target_identity_name = os.path.join(target_directory, target_basename) \
+                    if target_directory else target_basename
                 return lftp_sidecar_target_identity(self.path_to_scan, target_identity_name)
 
             try:
@@ -381,16 +416,29 @@ class SystemScanner:
                 if sidecar_present:
                     parser_coverage = "known"
                     with open(lftp_status_file_path, "rb") as f:
-                        parsed_status = parse_lftp_pget_status_bytes(
-                            f.read(MAX_LFTP_PGET_STATUS_BYTES + 1)
-                        )
+                        sidecar_payload = f.read(MAX_LFTP_PGET_STATUS_BYTES + 1)
+                        parsed_status = parse_lftp_pget_status_bytes(sidecar_payload)
                         parsed_size = parsed_status.covered_size if parsed_status is not None else None
                     sidecar_classification = "valid" if parsed_size is not None else "malformed"
+                    if parsed_status is None:
+                        sidecar_shape = "invalid"
+                    elif parsed_status.base_only:
+                        sidecar_shape = "base_only"
+                    else:
+                        sidecar_shape = "multi_segment"
+                    if parsed_status is not None:
+                        sidecar_total_match = parsed_status.covered_size == parsed_status.total_size
+                        coverage_disk_relation = (
+                            "sidecar_ahead" if parsed_status.covered_size > entry_stat.st_size else
+                            "equal" if parsed_status.covered_size == entry_stat.st_size else
+                            "sidecar_behind"
+                        )
                     if parsed_size is not None:
                         file_size = parsed_size
                 elif self.__lftp_temp_file_suffix is not None and \
                         entry.path.endswith(self.__lftp_temp_file_suffix):
                     sidecar_classification = "absent"
+                    sidecar_shape = "absent"
             except (OSError, UnicodeError, ValueError, OverflowError):
                 sidecar_classification = "unknown"
                 _record_lftp_sidecar_breadcrumb(
@@ -400,6 +448,9 @@ class SystemScanner:
                     status_only=False,
                     parser_coverage=parser_coverage,
                     scan_role=self.__scan_role,
+                    sidecar_shape=sidecar_shape,
+                    total_match=sidecar_total_match,
+                    coverage_disk_relation=coverage_disk_relation,
                 )
                 raise
             if sidecar_classification is not None:
@@ -410,6 +461,9 @@ class SystemScanner:
                     status_only=False,
                     parser_coverage=parser_coverage,
                     scan_role=self.__scan_role,
+                    sidecar_shape=sidecar_shape,
+                    total_match=sidecar_total_match,
+                    coverage_disk_relation=coverage_disk_relation,
                 )
             status_sidecar_ready = parsed_size is not None
             if self.__lftp_temp_file_suffix is not None and \

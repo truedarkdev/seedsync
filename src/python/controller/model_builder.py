@@ -125,6 +125,7 @@ class _RecentLiveTransferSnapshot:
     speed: Optional[int]
     eta: Optional[int]
     lftp_job_id: Optional[int] = None
+    lftp_job_type: Optional[str] = None
     subset_size_local: Optional[int] = None
     subset_size_remote: Optional[int] = None
 
@@ -226,6 +227,10 @@ class ModelBuilder:
         self.__remote_files_by_pair: dict[Optional[str], dict[str, SystemFile]] = {}
         self.__active_file_ids: set[str] = set()
         self.__lftp_statuses: dict[str, LftpJobStatus] = {}
+        # Raw duplicate rows are retained only as an ambiguity marker.  The
+        # canonical status map deliberately excludes them, and any live
+        # snapshot for that root is retired at the same boundary.
+        self.__ambiguous_lftp_status_file_ids: set[str] = set()
         self.__recent_live_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot] = {}
         self.__retained_stopped_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot] = {}
         self.__downloaded_files: Optional[set[str]] = None
@@ -2293,6 +2298,13 @@ class ModelBuilder:
                 return True
             return any(has_staging_descendant(child) for child in candidate.iter_children())
 
+        snapshot_job_type = lftp_job_type.value if isinstance(
+            lftp_job_type, LftpJobStatus.Type,
+        ) else lftp_job_type
+        snapshot_identity_matches = previous_snapshot is not None and \
+            previous_snapshot.lftp_job_id == lftp_job_id and \
+            previous_snapshot.lftp_job_type == snapshot_job_type
+
         if remote_file is not None and transfer_state.size_remote is not None and \
                 transfer_state.size_local is not None:
             # LFTP reports the currently selected resume subset, not always
@@ -2321,9 +2333,7 @@ class ModelBuilder:
                 # value.  The raw transferred bytes and verified final leaves
                 # below are the only authorities available for this state.
                 size_local = subset_transferred
-                if previous_snapshot is not None and \
-                        previous_snapshot.lftp_job_id == lftp_job_id and \
-                        previous_snapshot.subset_size_local is not None:
+                if snapshot_identity_matches and previous_snapshot.subset_size_local is not None:
                     size_local = max(size_local, previous_snapshot.subset_size_local)
                 size_local = max(0, min(size_local, remote_file.size))
                 transfer_state = _TransferState(
@@ -2336,9 +2346,7 @@ class ModelBuilder:
                 )
             elif remaining_size != remote_file.size:
                 size_local = remote_file.size - (remaining_size - subset_transferred)
-                if previous_snapshot is not None and \
-                        previous_snapshot.lftp_job_id == lftp_job_id and \
-                        previous_snapshot.size_local is not None:
+                if snapshot_identity_matches and previous_snapshot.size_local is not None:
                     size_local = max(size_local, previous_snapshot.size_local)
                 size_local = max(0, min(size_local, remote_file.size))
                 return _TransferState(
@@ -2351,9 +2359,7 @@ class ModelBuilder:
                 )
             elif transfer_state.size_remote > remote_file.size:
                 size_local = subset_transferred
-                if previous_snapshot is not None and \
-                        previous_snapshot.lftp_job_id == lftp_job_id and \
-                        previous_snapshot.size_local is not None:
+                if snapshot_identity_matches and previous_snapshot.size_local is not None:
                     size_local = max(size_local, previous_snapshot.size_local)
                 size_local = max(0, min(size_local, remote_file.size))
                 transfer_state = _TransferState(
@@ -2364,9 +2370,7 @@ class ModelBuilder:
                     transfer_state.speed,
                     transfer_state.eta,
                 )
-            elif previous_snapshot is not None and \
-                    previous_snapshot.lftp_job_id == lftp_job_id and \
-                    previous_snapshot.size_local is not None:
+            elif snapshot_identity_matches and previous_snapshot.size_local is not None:
                 # A continuing LFTP job can switch from reporting its
                 # remaining subset to the exact whole-root total.  This is
                 # neither a reset (handled above) nor permission to lower the
@@ -2390,6 +2394,48 @@ class ModelBuilder:
                     transfer_state.speed,
                     transfer_state.eta,
                 )
+
+        # A status poll can expose a lower checkpoint for the same running
+        # LFTP identity while the sidecar catches up.  This is especially
+        # common when the status omits its remote denominator, which means
+        # the split-root branches above cannot establish a floor.  Keep the
+        # Builder-owned recent snapshot authoritative for that same identity
+        # so direct overlays and a concurrent full replacement share one
+        # monotonic root counter.  An explicit zero is the existing reset
+        # boundary; Stop, queued status, and a different (id, type) identity
+        # remain outside this floor.
+        if snapshot_identity_matches and previous_snapshot is not None and \
+                (transfer_state.size_local is not None or
+                 transfer_state.percent_local is not None) and \
+                transfer_state.size_local != 0:
+            floor_size = previous_snapshot.size_local
+            if lftp_job_type == LftpJobStatus.Type.MIRROR and \
+                    has_staging_descendant(local_file):
+                # Mirror snapshots include verified final leaves in
+                # ``size_local``; the staged portion is added again below.
+                # Preserve only that raw subset floor at this boundary.
+                floor_size = previous_snapshot.subset_size_local
+            size_local = transfer_state.size_local
+            if floor_size is not None and (
+                    size_local is None or size_local < floor_size
+            ):
+                size_local = floor_size
+            current_percent = ModelBuilder.__normalize_download_progress(
+                transfer_state.percent_local,
+            )
+            floor_percent = previous_snapshot.percent_local
+            percent_local = transfer_state.percent_local
+            if floor_percent is not None and (
+                    current_percent is None or current_percent < floor_percent
+            ):
+                percent_local = floor_percent
+            transfer_state = _TransferState(
+                size_local,
+                transfer_state.size_remote,
+                percent_local,
+                transfer_state.speed,
+                transfer_state.eta,
+            )
 
         if not has_staging_descendant(local_file):
             return transfer_state
@@ -3035,7 +3081,26 @@ class ModelBuilder:
                                               root_file_id: str,
                                               transfer_state: _TransferState,
                                               raw_transfer_state: Optional[_TransferState] = None,
-                                              lftp_job_id: Optional[int] = None) -> None:
+                                              lftp_job_id: Optional[int] = None,
+                                              lftp_job_type: Optional[str] = None,
+                                              merge_matching_subset_floor: bool = True) -> None:
+        subset_size_local = raw_transfer_state.size_local \
+            if raw_transfer_state is not None else None
+        subset_size_remote = raw_transfer_state.size_remote \
+            if raw_transfer_state is not None else None
+        if merge_matching_subset_floor and subset_size_local not in (None, 0):
+            _, previous = self.__resolve_recent_live_transfer_snapshot(
+                file_id, root_file_id,
+            )
+            if previous is not None and previous.lftp_job_id == lftp_job_id and \
+                    previous.lftp_job_type == lftp_job_type and \
+                    previous.subset_size_local is not None:
+                # MIRROR's normalized root value includes verified final
+                # leaves, while the raw status carries only its discovered
+                # subset. Preserve that subset floor too; otherwise a later
+                # lower raw subset would make the next root normalization
+                # subtract progress that was already published.
+                subset_size_local = max(subset_size_local, previous.subset_size_local)
         snapshot = _RecentLiveTransferSnapshot(
             root_file_id=root_file_id,
             size_local=transfer_state.size_local,
@@ -3043,8 +3108,9 @@ class ModelBuilder:
             speed=transfer_state.speed,
             eta=transfer_state.eta,
             lftp_job_id=lftp_job_id,
-            subset_size_local=raw_transfer_state.size_local if raw_transfer_state is not None else None,
-            subset_size_remote=raw_transfer_state.size_remote if raw_transfer_state is not None else None,
+            lftp_job_type=lftp_job_type,
+            subset_size_local=subset_size_local,
+            subset_size_remote=subset_size_remote,
         )
         if snapshot.size_local is None:
             return
@@ -3055,7 +3121,8 @@ class ModelBuilder:
                                                    root_file_id: str,
                                                    transfer_state: _TransferState,
                                                    raw_transfer_state: Optional[_TransferState] = None,
-                                                   lftp_job_id: Optional[int] = None) -> None:
+                                                   lftp_job_id: Optional[int] = None,
+                                                   lftp_job_type: Optional[str] = None) -> None:
         snapshot = _RecentLiveTransferSnapshot(
             root_file_id=root_file_id,
             size_local=transfer_state.size_local,
@@ -3063,6 +3130,7 @@ class ModelBuilder:
             speed=transfer_state.speed,
             eta=transfer_state.eta,
             lftp_job_id=lftp_job_id,
+            lftp_job_type=lftp_job_type,
             subset_size_local=raw_transfer_state.size_local if raw_transfer_state is not None else None,
             subset_size_remote=raw_transfer_state.size_remote if raw_transfer_state is not None else None,
         )
@@ -3247,7 +3315,8 @@ class ModelBuilder:
                                          remote: Optional[SystemFile],
                                          local: Optional[SystemFile],
                                          root_remote: Optional[SystemFile] = None,
-                                         root_local: Optional[SystemFile] = None) -> Optional[_TransferState]:
+                                         root_local: Optional[SystemFile] = None,
+                                         matching_lftp_job_id: Optional[int] = None) -> Optional[_TransferState]:
         root_file_id = self.__resolve_root_file_id(file_id, root_remote, root_local)
         resolved_file_id, snapshot = self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
         if snapshot is None:
@@ -3261,7 +3330,35 @@ class ModelBuilder:
                 None
             )
             return None
-        if self.__lftp_statuses.get(snapshot.root_file_id) is not None:
+        current_status = self.__lftp_statuses.get(snapshot.root_file_id)
+        if current_status is not None and matching_lftp_job_id is None:
+            return None
+        if current_status is not None and snapshot.lftp_job_id != matching_lftp_job_id:
+            # A counterless status from an older job can arrive after a
+            # newer direct projection. Retain that newer snapshot through an
+            # unrelated authoritative reconciliation; a usable counter or a
+            # newer identity still supersedes it and fails closed.
+            try:
+                current_state = self.__transfer_state(current_status.total_transfer_state)
+            except (ModelError, TypeError, ValueError, AttributeError):
+                current_state = None
+            older_counterless_status = current_status.state == LftpJobStatus.State.RUNNING and \
+                type(current_status.id) is int and type(snapshot.lftp_job_id) is int and \
+                snapshot.lftp_job_id > current_status.id and current_state is not None and \
+                current_state.size_local is None and current_state.percent_local is None and \
+                snapshot.lftp_job_type == getattr(getattr(current_status, "type", None), "value", None)
+            if not older_counterless_status:
+                self.__recent_live_transfer_snapshots.pop(
+                    resolved_file_id if resolved_file_id is not None else file_id,
+                    None
+                )
+                return None
+        if current_status is not None and snapshot.lftp_job_type != \
+                getattr(getattr(current_status, "type", None), "value", None):
+            self.__recent_live_transfer_snapshots.pop(
+                resolved_file_id if resolved_file_id is not None else file_id,
+                None
+            )
             return None
         if remote is None or local is None or snapshot.size_local is None:
             self.__recent_live_transfer_snapshots.pop(
@@ -3269,15 +3366,28 @@ class ModelBuilder:
                 None
             )
             return None
-        if self.__local_transfer_snapshot_is_caught_up(local, remote, snapshot.size_local):
+        local_snapshot_caught_up = self.__local_transfer_snapshot_is_caught_up(
+            local, remote, snapshot.size_local
+        )
+        if local_snapshot_caught_up and matching_lftp_job_id is None:
             self.__recent_live_transfer_snapshots.pop(
                 resolved_file_id if resolved_file_id is not None else file_id,
                 None
             )
             return None
 
+        observed_size_local = snapshot.size_local
+        if matching_lftp_job_id is not None and remote is not None and local is not None:
+            if remote.is_dir:
+                observed_size_local = max(
+                    observed_size_local,
+                    ModelBuilder.__authoritative_remote_leaf_progress_bytes(remote, local),
+                )
+            elif self.__is_authoritative_local_file(local):
+                observed_size_local = max(observed_size_local, min(local.size, remote.size))
+
         return _TransferState(
-            snapshot.size_local,
+            observed_size_local,
             remote.size,
             snapshot.percent_local,
             snapshot.speed,
@@ -3308,16 +3418,22 @@ class ModelBuilder:
         )
         if retained_snapshot is None or retained_snapshot.size_local is None:
             return current_transfer_state
+        current_job_type = lftp_job_type.value if isinstance(
+            lftp_job_type, LftpJobStatus.Type,
+        ) else lftp_job_type
+        if retained_snapshot.lftp_job_id != lftp_job_id or \
+                retained_snapshot.lftp_job_type != current_job_type:
+            self.__evict_retained_stopped_transfer_snapshots(
+                retained_snapshot_key if retained_snapshot_key is not None else file_id,
+                retained_snapshot.root_file_id
+            )
+            return current_transfer_state
         if lftp_job_type == LftpJobStatus.Type.MIRROR and raw_transfer_state is not None:
             # The combined state includes verified final leaves, so a raw zero
             # report must reach this boundary before it is turned into the
             # final-only value. A replacement MIRROR job is also a new
             # lifecycle and cannot inherit a stopped floor from the old one.
-            if raw_transfer_state.size_local == 0 or (
-                    retained_snapshot.lftp_job_id is not None and
-                    lftp_job_id is not None and
-                    retained_snapshot.lftp_job_id != lftp_job_id
-            ):
+            if raw_transfer_state.size_local == 0:
                 self.__evict_retained_stopped_transfer_snapshots(
                     retained_snapshot_key if retained_snapshot_key is not None else file_id,
                     retained_snapshot.root_file_id
@@ -3361,13 +3477,23 @@ class ModelBuilder:
             root_file_id: Optional[str],
             remote: Optional[SystemFile],
             local: Optional[SystemFile],
-            preserve_when_local_growth_only: bool = False) -> Optional[_TransferState]:
+            preserve_when_local_growth_only: bool = False,
+            lftp_job_id: Optional[int] = None,
+            lftp_job_type: Optional[str] = None) -> Optional[_TransferState]:
         retained_snapshot_key, retained_snapshot = self.__resolve_retained_stopped_transfer_snapshot(
             file_id,
             root_file_id
         )
         if retained_snapshot is None or retained_snapshot.size_local is None:
             return None
+        if lftp_job_id is not None or lftp_job_type is not None:
+            if retained_snapshot.lftp_job_id != lftp_job_id or \
+                    retained_snapshot.lftp_job_type != lftp_job_type:
+                self.__evict_retained_stopped_transfer_snapshots(
+                    retained_snapshot_key if retained_snapshot_key is not None else file_id,
+                    retained_snapshot.root_file_id
+                )
+                return None
         if self.__local_transfer_snapshot_is_caught_up(local, remote):
             self.__evict_transfer_completion_snapshots(
                 file_id,
@@ -4167,6 +4293,11 @@ class ModelBuilder:
             file_id: status for file_id, status in self.__lftp_statuses.items()
             if file_id in selected_file_ids or status.path_pair_id in selected_pair_ids
         }
+        partial.__ambiguous_lftp_status_file_ids = {
+            file_id for file_id in self.__ambiguous_lftp_status_file_ids
+            if file_id in selected_file_ids or
+            self.__file_id_path_pair_id(file_id) in selected_pair_ids
+        }
         partial.__recent_live_transfer_snapshots = {
             file_id: snapshot for file_id, snapshot in self.__recent_live_transfer_snapshots.items()
             if file_id in selected_file_ids or snapshot.root_file_id in selected_file_ids
@@ -4324,6 +4455,10 @@ class ModelBuilder:
         partial.__lftp_statuses = {
             file_id: status for file_id, status in self.__lftp_statuses.items()
             if status.path_pair_id == path_pair_id
+        }
+        partial.__ambiguous_lftp_status_file_ids = {
+            file_id for file_id in self.__ambiguous_lftp_status_file_ids
+            if self.__file_id_path_pair_id(file_id) == path_pair_id
         }
         selected_root_ids = set(next_local).union(next_remote)
         partial.__recent_live_transfer_snapshots = {
@@ -4638,6 +4773,67 @@ class ModelBuilder:
             overlays[file_id] = ActiveProgressOverlay(progress, current.size_local, current.speed, current.eta)
         return overlays
 
+    def record_read_only_lftp_root_counter_overlays(
+            self, overlays: dict[str, ActiveProgressOverlay],
+    ) -> bool:
+        """Record a successfully published direct projection for later rebuilds.
+
+        The Model owns the currently rendered overlay, while this builder owns
+        the recent-live snapshot used by an authoritative replacement.  Keep
+        those two publications paired: a later status retirement must not
+        replace a freshly published root counter with an older scan value.
+        Validate every root before mutating the snapshot store so ambiguity,
+        explicit Stop, or malformed values fail closed without a partial
+        snapshot update.
+        """
+        if not isinstance(overlays, dict) or not overlays:
+            return False
+        pending: list[tuple[str, str, _TransferState, _TransferState, int, str]] = []
+        for file_id, overlay in overlays.items():
+            try:
+                status = self.__lftp_statuses.get(file_id)
+                remote, local = self.__remote_file(file_id), self.__local_file(file_id)
+                status_type_value = status.type.value if status is not None else None
+                stopped = self.__is_stopped_file(file_id, remote, local, status)
+            except (AttributeError, TypeError, ValueError):
+                return False
+            if not isinstance(file_id, str) or not isinstance(overlay, ActiveProgressOverlay) or \
+                    status is None or status.file_id != file_id or \
+                    status.state != LftpJobStatus.State.RUNNING or \
+                    type(status.id) is not int or status.id < 0 or \
+                    not isinstance(status_type_value, str) or not status_type_value or stopped:
+                return False
+            if type(overlay.transferred_size) is not int or overlay.transferred_size < 0 or \
+                    (overlay.download_progress is not None and (
+                        type(overlay.download_progress) is not int or
+                        not 0 <= overlay.download_progress <= 100
+                    )) or \
+                    (overlay.downloading_speed is not None and (
+                        type(overlay.downloading_speed) is not int or
+                        overlay.downloading_speed < 0
+                    )) or \
+                    (overlay.eta is not None and (
+                        type(overlay.eta) is not int or overlay.eta < 0
+                    )):
+                return False
+            try:
+                source = self.__transfer_state(status.total_transfer_state)
+            except (ModelError, TypeError, ValueError):
+                return False
+            current = _TransferState(
+                overlay.transferred_size,
+                remote.size if remote is not None else source.size_remote,
+                overlay.download_progress,
+                overlay.downloading_speed,
+                overlay.eta,
+            )
+            pending.append((file_id, status.file_id, current, source, status.id, status.type.value))
+        for file_id, root_file_id, current, source, job_id, job_type in pending:
+            self.__store_recent_live_transfer_snapshot(
+                file_id, root_file_id, current, source, job_id, job_type,
+            )
+        return True
+
     def has_only_pending_active_transfer_delta(self) -> bool:
         """Whether live transfer inputs are the only outstanding invalidation.
 
@@ -4778,7 +4974,7 @@ class ModelBuilder:
                 reject("status_shape")
                 return None
             self.__store_recent_live_transfer_snapshot(
-                file_id, status.file_id, current, source, status.id,
+                file_id, status.file_id, current, source, status.id, status.type.value,
             )
             overlays[file_id] = ActiveProgressOverlay(
                 progress, current.size_local, current.speed, current.eta,
@@ -4986,8 +5182,6 @@ class ModelBuilder:
         stopped_file_ids = {
             file_id for file_id in file_ids if file_id in self.__stopped_files
         }
-        if self.__lftp_regressed_root_file_ids.intersection(file_ids).difference(stopped_file_ids):
-            return reject("lftp_regressed")
         if not self.__active_touched_root_file_ids.issubset(file_ids):
             return reject("active_root_not_selected")
         if MODEL_BUILDER_INVALIDATION_LFTP_STATUSES in self.__invalidation_reasons:
@@ -5001,6 +5195,13 @@ class ModelBuilder:
                     return reject("status_file_id_mismatch")
                 if status.state not in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING):
                     return reject("status_not_queued_or_running")
+        # Inspect the current status shape before the aggregate regression
+        # marker. A fresh empty poll is both a regression and a missing row,
+        # but ``status_missing`` carries the bounded poll-match provenance
+        # needed to explain why the active delta failed closed. Present
+        # non-running transitions retain the broader regression reason.
+        if self.__lftp_regressed_root_file_ids.intersection(file_ids).difference(stopped_file_ids):
+            return reject("lftp_regressed")
         if not self.__active_transfer_delta_global_state_is_safe(file_ids):
             return reject("ambiguous_global_visibility")
         return file_ids
@@ -5087,6 +5288,10 @@ class ModelBuilder:
             file_id: status for file_id, status in self.__lftp_statuses.items()
             if file_id in root_file_ids
         }
+        partial.__ambiguous_lftp_status_file_ids = {
+            file_id for file_id in self.__ambiguous_lftp_status_file_ids
+            if file_id in root_file_ids
+        }
         partial.__recent_live_transfer_snapshots = {
             file_id: snapshot for file_id, snapshot in self.__recent_live_transfer_snapshots.items()
             if file_id in root_file_ids or snapshot.root_file_id in root_file_ids
@@ -5121,12 +5326,45 @@ class ModelBuilder:
         started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_LFTP_STATUSES)
         try:
             prev_lftp_statuses = self.__lftp_statuses
-            self.__lftp_statuses = {file.file_id: file for file in lftp_statuses}
+            prev_ambiguous_lftp_status_file_ids = self.__ambiguous_lftp_status_file_ids
+            # A status poll is authoritative only when it supplies one
+            # unambiguous row per root.  Do not collapse duplicate raw rows
+            # into a dict: the last row is not evidence that it supersedes
+            # the first, and choosing it would let full reconciliation
+            # publish an arbitrary counter/state after direct projection has
+            # correctly rejected the same input.
+            status_counts: dict[str, int] = {}
+            for file in lftp_statuses:
+                status_counts[file.file_id] = status_counts.get(file.file_id, 0) + 1
+            self.__ambiguous_lftp_status_file_ids = {
+                file_id for file_id, count in status_counts.items() if count > 1
+            }
+            self.__lftp_statuses = {
+                file.file_id: file for file in lftp_statuses
+                if status_counts[file.file_id] == 1
+            }
+            # A duplicate poll is not a status retirement.  It is an
+            # ambiguous replacement, so do not let a previously published
+            # live snapshot silently become the full-build fallback.
+            for snapshots in (
+                    self.__recent_live_transfer_snapshots,
+                    self.__retained_stopped_transfer_snapshots,
+            ):
+                for snapshot_id, snapshot in list(snapshots.items()):
+                    if snapshot_id in self.__ambiguous_lftp_status_file_ids or \
+                            snapshot.root_file_id in self.__ambiguous_lftp_status_file_ids:
+                        snapshots.pop(snapshot_id, None)
             # Invalidate the cache
-            if self.__lftp_statuses != prev_lftp_statuses:
+            if self.__lftp_statuses != prev_lftp_statuses or \
+                    self.__ambiguous_lftp_status_file_ids != prev_ambiguous_lftp_status_file_ids:
                 touched_file_ids = {
-                    file_id for file_id in set(prev_lftp_statuses).union(self.__lftp_statuses)
-                    if prev_lftp_statuses.get(file_id) != self.__lftp_statuses.get(file_id)
+                    file_id for file_id in set(prev_lftp_statuses).union(self.__lftp_statuses).union(
+                        prev_ambiguous_lftp_status_file_ids,
+                        self.__ambiguous_lftp_status_file_ids,
+                    )
+                    if prev_lftp_statuses.get(file_id) != self.__lftp_statuses.get(file_id) or \
+                    (file_id in prev_ambiguous_lftp_status_file_ids) != \
+                    (file_id in self.__ambiguous_lftp_status_file_ids)
                 }
                 self.__lftp_regressed_root_file_ids.update({
                     file_id for file_id in touched_file_ids
@@ -5144,6 +5382,36 @@ class ModelBuilder:
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_LFTP_STATUSES, started_at)
 
+    def evict_ambiguous_lftp_status_snapshots(self, file_ids: Set[str]) -> None:
+        """Retire live floors for raw status roots rejected before intake.
+
+        The updater may discard malformed status-only rows before calling
+        ``set_lftp_statuses``.  If those rows were duplicated, the builder
+        must still fail closed rather than treating the resulting empty
+        status list as ordinary status retirement and reusing a stale floor.
+        """
+        ambiguous_file_ids = {
+            file_id for file_id in file_ids if isinstance(file_id, str)
+        }
+        if not ambiguous_file_ids:
+            return
+        removed = False
+        for snapshots in (
+                self.__recent_live_transfer_snapshots,
+                self.__retained_stopped_transfer_snapshots,
+        ):
+            for snapshot_id, snapshot in list(snapshots.items()):
+                if snapshot_id in ambiguous_file_ids or \
+                        snapshot.root_file_id in ambiguous_file_ids:
+                    snapshots.pop(snapshot_id, None)
+                    removed = True
+        if removed:
+            self.__invalidate_cache(
+                MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
+                touched_lftp_root_file_ids=ambiguous_file_ids,
+                affected_file_ids=ambiguous_file_ids,
+            )
+
     def evict_recent_live_transfer_snapshots_missing_roots(self, active_root_file_ids: Set[str]) -> None:
         removed = False
         for file_id, snapshot in list(self.__recent_live_transfer_snapshots.items()):
@@ -5158,7 +5426,9 @@ class ModelBuilder:
             self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LFTP_STATUSES)
 
     def evict_recent_live_transfer_snapshots_for_completed_file_ids(
-            self, completed_file_ids: Set[str]) -> None:
+            self, completed_file_ids: Set[str],
+            preserve_file_ids: Optional[Set[str]] = None,
+    ) -> None:
         """Discard live progress only after an authoritative completion handoff.
 
         A fresh LFTP status can disappear before a local scan catches up with
@@ -5166,7 +5436,9 @@ class ModelBuilder:
         transient status loss, whose snapshots remain available until local
         scan evidence catches up. The completion handoff supplies canonical
         file ids, so it can safely evict just those live snapshots without
-        affecting stopped-transfer floors or unrelated roots.
+        affecting stopped-transfer floors or unrelated roots. A root that is
+        still represented by a live Model overlay may be preserved by the
+        caller so this handoff cannot discard a just-published direct counter.
         """
         root_snapshots: dict[str, _RecentLiveTransferSnapshot] = {}
         for snapshot in self.__recent_live_transfer_snapshots.values():
@@ -5174,6 +5446,10 @@ class ModelBuilder:
         canonical_claims_by_legacy_root = self.__completion_snapshot_canonical_claims(
             completed_file_ids,
         )
+        preserved_file_ids = {
+            file_id for file_id in (preserve_file_ids or set())
+            if isinstance(file_id, str)
+        }
         root_file_ids_to_evict: set[str] = set()
         for completed_file_id in completed_file_ids:
             _, snapshot = self.__resolve_transfer_snapshot(
@@ -5182,6 +5458,8 @@ class ModelBuilder:
             if snapshot is None:
                 continue
             root_file_id = snapshot.root_file_id
+            if completed_file_id in preserved_file_ids or root_file_id in preserved_file_ids:
+                continue
             if (self.__file_id_path_pair_id(completed_file_id) is not None and
                     root_file_id == completed_file_id) or \
                     canonical_claims_by_legacy_root.get(root_file_id) == {completed_file_id}:
@@ -5352,6 +5630,7 @@ class ModelBuilder:
         self.__active_only_name_counts.clear()
         self.__active_file_ids.clear()
         self.__lftp_statuses.clear()
+        self.__ambiguous_lftp_status_file_ids.clear()
         self.__recent_live_transfer_snapshots.clear()
         self.__retained_stopped_transfer_snapshots.clear()
         self.__downloaded_files = None
@@ -5614,6 +5893,7 @@ class ModelBuilder:
                 self.__transfer_state(status.total_transfer_state) if status is not None and
                 status.state == LftpJobStatus.State.RUNNING else None,
                 status.id if status is not None else None,
+                status.type.value if status is not None else None,
                 file_id=file_id,
                 build_local_predicate_cache=build_local_predicate_cache,
             )
@@ -5836,6 +6116,16 @@ class ModelBuilder:
                 status.type if status is not None else None,
             )
         current_transfer_state = raw_current_transfer_state if not is_stopped else None
+        counterless_current_transfer_state = None
+        if current_transfer_state is not None and \
+                current_transfer_state.size_local is None and \
+                current_transfer_state.percent_local is None:
+            # A status row with only target/lifecycle data is not a usable
+            # counter publication. Keep its speed/ETA available as a
+            # best-effort status detail, but let the same-job recent snapshot
+            # own the displayed bytes/progress during the handoff below.
+            counterless_current_transfer_state = current_transfer_state
+            current_transfer_state = None
         if is_stopped and raw_current_transfer_state is not None:
             retained_transfer_state = self.__build_retained_transfer_state(
                 raw_current_transfer_state.size_local,
@@ -5848,6 +6138,8 @@ class ModelBuilder:
                 raw_current_transfer_state,
                 source_current_transfer_state,
                 status.id if status is not None else None,
+                status.type.value if status is not None else None,
+                merge_matching_subset_floor=False,
             )
             self.__store_retained_stopped_transfer_snapshot(
                 model_file.file_id,
@@ -5855,6 +6147,7 @@ class ModelBuilder:
                 raw_current_transfer_state,
                 source_current_transfer_state,
                 status.id if status is not None else None,
+                status.type.value if status is not None else None,
             )
             arbitration_source = "retained_stopped_snapshot_from_live_status"
         elif current_transfer_state is not None:
@@ -5877,11 +6170,41 @@ class ModelBuilder:
                 status.file_id,
                 remote,
                 local,
-                preserve_when_local_growth_only=is_stopped
+                preserve_when_local_growth_only=is_stopped,
+                lftp_job_id=status.id,
+                lftp_job_type=status.type.value,
             )
             arbitration_source = "retained_stopped_snapshot_without_live_progress" \
                 if retained_transfer_state is not None else \
                 "suppressed_stopped_live_status" if is_stopped else "live_status_without_transfer_state"
+        if current_transfer_state is None and status is not None and \
+                status.state == LftpJobStatus.State.RUNNING and not is_stopped:
+            # A target-bearing RUNNING status can briefly publish no usable
+            # root counters while its completion/scan handoff is in flight.
+            # Reuse the Builder-owned snapshot only for the same LFTP job;
+            # replacement identities must fail closed rather than inherit an
+            # older lifecycle's progress.
+            recent_transfer_state = self.__get_recent_live_transfer_state(
+                file_id,
+                remote,
+                local,
+                matching_lftp_job_id=status.id,
+            )
+            if recent_transfer_state is not None:
+                _, recent_snapshot = self.__resolve_recent_live_transfer_snapshot(
+                    file_id, status.file_id,
+                )
+                if recent_snapshot is not None and type(recent_snapshot.lftp_job_id) is int and \
+                        recent_snapshot.lftp_job_id > status.id:
+                    # Keep a newer direct projection authoritative while an
+                    # older counterless row is reconciled with another root.
+                    # Treat its retained state as current for stoppability so
+                    # the protected overlay can survive that reconciliation.
+                    current_transfer_state = recent_transfer_state
+                arbitration_source = "recent_live_snapshot_with_live_status"
+            elif counterless_current_transfer_state is not None:
+                current_transfer_state = counterless_current_transfer_state
+                arbitration_source = "live_status_without_transfer_counters"
         if current_transfer_state is None and status is None and not is_stopped:
             recent_transfer_state = self.__get_recent_live_transfer_state(file_id, remote, local)
             if recent_transfer_state is not None:
@@ -6095,6 +6418,8 @@ class ModelBuilder:
                     _child_current_transfer_state is not None,
                     _child_live_status.file_id if _child_live_status is not None else None,
                     live_transferred_file_ids,
+                    lftp_job_id=_child_live_status.id if _child_live_status is not None else None,
+                    lftp_job_type=_child_live_status.type.value if _child_live_status is not None else None,
                     file_id=_child_file_id,
                     ancestor_file_ids=(_model_file_id,) + _ancestor_file_ids,
                     build_local_predicate_cache=build_local_predicate_cache,
@@ -6150,6 +6475,7 @@ class ModelBuilder:
         live_transferred_file_ids: Set[str],
         raw_transfer_state: Optional[_TransferState] = None,
         lftp_job_id: Optional[int] = None,
+        lftp_job_type: Optional[str] = None,
         file_id: Optional[str] = None,
         ancestor_file_ids: Optional[Tuple[str, ...]] = None,
         build_local_predicate_cache: Optional[dict[tuple[object, ...], bool]] = None,
@@ -6184,6 +6510,7 @@ class ModelBuilder:
                     transfer_state,
                     raw_transfer_state,
                     lftp_job_id,
+                    lftp_job_type,
                 )
             download_progress = ModelBuilder.__normalize_download_progress(transfer_state.percent_local)
             if download_progress is not None:

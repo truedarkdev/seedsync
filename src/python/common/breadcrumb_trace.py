@@ -453,6 +453,7 @@ class BreadcrumbTraceCollector:
     __PROGRESS_LINEAGE_MAX_VERSION_RANGES = 8
     __PROGRESS_LINEAGE_PHASES = frozenset({
         "status_submit", "status_start", "status_finish", "status_consume",
+        "status_sample",
         "pre_active_delta", "active_delta_selector", "active_delta_builder",
         "active_delta_authorization", "active_delta_adoption", "updater_decision",
         "active_progress_overlay_admission", "direct_root_counter_publish",
@@ -469,6 +470,19 @@ class BreadcrumbTraceCollector:
         "partial_build_duration_bucket", "updater_cycle_duration_bucket",
         "controller_cycle_duration_bucket", "overlay_admission",
         "active_scan_equivalence",
+        "record_shape", "record_has_bytes", "record_has_percent",
+        "record_has_speed", "record_has_eta", "job_correlation",
+        "target_correlation",
+        "lifecycle_epoch", "job_match", "epoch_match",
+        "prior_source", "new_source", "destination",
+        "prior_counter_bucket", "new_counter_bucket",
+        "prior_percent_bucket", "new_percent_bucket",
+        "monotonic_relation", "sidecar_shape", "sidecar_total_match",
+        "coverage_disk_relation", "pending_transition", "physical_proof",
+        "explicit_stop", "terminal_outcome", "retirement_cause",
+        "scan_health", "scan_freshness", "collector_admission",
+        "collector_drop", "collector_eviction", "collector_truncation",
+        "stream_linkage",
     })
     __PROGRESS_LINEAGE_ENUMS = {
         "outcome": frozenset({
@@ -479,6 +493,33 @@ class BreadcrumbTraceCollector:
             "invalidation_mixed", "invalidation_scope", "roots", "unknown_root",
             "global_safety", "status_shape",
         }),
+        "record_shape": frozenset({"at", "got", "none"}),
+        "job_correlation": frozenset(),
+        "target_correlation": frozenset(),
+        "prior_source": frozenset({"overlay", "base", "none", "unknown"}),
+        "new_source": frozenset({"overlay", "base", "none", "unknown"}),
+        "destination": frozenset({"overlay", "base", "none", "unknown"}),
+        "prior_counter_bucket": frozenset({"none", "0", "1-9", "10-24", "25-49", "50-74", "75-99", "100"}),
+        "new_counter_bucket": frozenset({"none", "0", "1-9", "10-24", "25-49", "50-74", "75-99", "100"}),
+        "prior_percent_bucket": frozenset({"none", "0", "1-9", "10-24", "25-49", "50-74", "75-99", "100"}),
+        "new_percent_bucket": frozenset({"none", "0", "1-9", "10-24", "25-49", "50-74", "75-99", "100"}),
+        "monotonic_relation": frozenset({"advance", "same", "regress", "unknown"}),
+        "sidecar_shape": frozenset({"absent", "invalid", "multi_segment", "base_only", "unknown"}),
+        "sidecar_total_match": frozenset({"true", "false", "unknown"}),
+        "coverage_disk_relation": frozenset({
+            "sidecar_ahead", "equal", "sidecar_behind", "unknown",
+        }),
+        "pending_transition": frozenset({"registered", "retained", "cleared", "unknown"}),
+        "physical_proof": frozenset({"proven", "missing", "unknown"}),
+        "terminal_outcome": frozenset({"downloaded", "stopped", "deferred", "rejected", "unknown"}),
+        "retirement_cause": frozenset({
+            "lftp_job_finished", "explicit_stop", "still_active",
+            "completion_detection_not_authoritative", "unknown",
+        }),
+        "scan_health": frozenset({"healthy", "unhealthy", "requested", "unknown"}),
+        "scan_freshness": frozenset({"fresh", "stale", "unknown"}),
+        "collector_admission": frozenset({"accepted", "rejected", "unknown"}),
+        "stream_linkage": frozenset({"linked", "unlinked", "unknown"}),
         "overlay_admission": frozenset({
             "poll_gate", "unavailable", "invalidation_scope", "roots",
             "unknown_root", "global_safety", "status_shape", "accepted", "exception",
@@ -774,7 +815,16 @@ class BreadcrumbTraceCollector:
                         safe[key] = value
                     elif type(value) is int and key in {
                             "model_version", "scope_version", "model_version_first", "model_version_last",
+                            "lifecycle_epoch",
                     } and value >= 0:
+                        safe[key] = value
+                    elif key == "job_correlation" and isinstance(value, str) and \
+                            value.startswith("lftp-job:") and len(value) == len("lftp-job:") + 16 and \
+                            all(character in "0123456789abcdef" for character in value[len("lftp-job:"):]):
+                        safe[key] = value
+                    elif key == "target_correlation" and isinstance(value, str) and \
+                            value.startswith("model-target:") and len(value) == len("model-target:") + 16 and \
+                            all(character in "0123456789abcdef" for character in value[len("model-target:"):]):
                         safe[key] = value
                     elif isinstance(value, str) and value in self.__PROGRESS_LINEAGE_ENUMS.get(key, frozenset()):
                         safe[key] = value

@@ -3805,14 +3805,19 @@ class Controller:
         record_count = len(records) if isinstance(records, list) else 0
         version = page.get("model_version")
         try:
+            details = {
+                "phase": phase,
+                "scope_kind": "legacy" if scope_id == MODEL_LEGACY_SCOPE_ID else "scoped",
+                "record_count_bucket": "0" if record_count < 1 else "1" if record_count == 1 else "2-4" if record_count <= 4 else "5+",
+                "model_version": version if type(version) is int and version >= 0 else None,
+                "next_page": type(page.get("next_cursor")) is str,
+                # A valid model version is the only stream-to-publication
+                # linkage this handshake can prove without retaining scope
+                # or record identities.
+                "stream_linkage": "linked" if type(version) is int and version >= 0 else "unlinked",
+            }
             breadcrumb_trace.record(
-                "model_stream", "scoped_stream_{}".format(phase), {
-                    "phase": phase,
-                    "scope_kind": "legacy" if scope_id == MODEL_LEGACY_SCOPE_ID else "scoped",
-                    "record_count_bucket": "0" if record_count < 1 else "1" if record_count == 1 else "2-4" if record_count <= 4 else "5+",
-                    "model_version": version if type(version) is int and version >= 0 else None,
-                    "next_page": type(page.get("next_cursor")) is str,
-                },
+                "model_stream", "scoped_stream_{}".format(phase), details,
                 stage="scoped_model_stream", event_type="diagnostic",
                 corr_id=opaque_trace_correlation(scope_id), trace_scope="flow",
                 category="model_stream", level="debug",

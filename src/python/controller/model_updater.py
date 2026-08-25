@@ -400,6 +400,25 @@ def _progress_lineage_duration_bucket(duration_ms: int) -> str:
     return "2000+"
 
 
+def _progress_counter_bucket(value: object) -> str:
+    """Return a fixed bucket for a progress counter without retaining bytes."""
+    if type(value) is not int or value < 0:
+        return "none"
+    if value == 0:
+        return "0"
+    if value <= 9:
+        return "1-9"
+    if value <= 24:
+        return "10-24"
+    if value <= 49:
+        return "25-49"
+    if value <= 74:
+        return "50-74"
+    if value <= 99:
+        return "75-99"
+    return "100"
+
+
 _LFTP_STATUS_TRACE_CATEGORY = "transfer.lftp"
 _LFTP_STATUS_TRACE_STAGE = "lftp_status"
 _LFTP_STATUS_TRACE_SCHEMA = "lftp_status_authority.v1"
@@ -445,6 +464,55 @@ def _lftp_status_trace_level(source: str, healthy: bool) -> str:
     return "warning" if source in _LFTP_STATUS_TRACE_WARNING_OUTCOMES or not healthy else "debug"
 
 
+def _record_lftp_status_sample_lineage(
+        controller: object, statuses: Sequence[object], poll_correlation: object,
+) -> None:
+    """Link one unambiguous LFTP record to model-progress lineage.
+
+    This consumer is deliberately gated by ``model.progress`` rather than
+    ``transfer.lftp``. Aggregate transfer breadcrumbs may be disabled while
+    the model lineage still needs its one-record provenance sample.
+    """
+    if not _controller_breadcrumb_effectively_enabled(controller, "model.progress", "debug"):
+        return
+    safe_poll_correlation = _safe_lftp_status_poll_correlation(poll_correlation)
+    if safe_poll_correlation is None or len(statuses) != 1:
+        return
+    try:
+        status = statuses[0]
+        shape = getattr(status, "record_shape", "none")
+        if shape not in {"at", "got", "none"}:
+            shape = "none"
+        presence = getattr(status, "record_field_presence", {})
+        if not isinstance(presence, Mapping):
+            presence = {}
+        job_correlation = getattr(status, "job_correlation", None)
+        if not isinstance(job_correlation, str) or not job_correlation.startswith("lftp-job:") or \
+                len(job_correlation) != len("lftp-job:") + 16:
+            job_correlation = "unknown"
+        lifecycle_epoch = getattr(controller, "_Controller__progress_publication_epoch", None)
+        if type(lifecycle_epoch) is not int or lifecycle_epoch < 0:
+            lifecycle_epoch = None
+        _record_progress_lineage(
+            controller, safe_poll_correlation, "status_sample", {
+                "record_shape": shape,
+                "record_has_bytes": presence.get("bytes") is True,
+                "record_has_percent": presence.get("percent") is True,
+                "record_has_speed": presence.get("speed") is True,
+                "record_has_eta": presence.get("eta") is True,
+                "job_correlation": job_correlation,
+                "lifecycle_epoch": lifecycle_epoch,
+            },
+        )
+    except Exception:
+        logger = getattr(controller, "logger", None)
+        if logger is not None:
+            try:
+                logger.debug("Ignoring LFTP status sample breadcrumb failure", exc_info=True)
+            except Exception:
+                pass
+
+
 def _record_lftp_status_breadcrumb(
         controller: object,
         statuses: Sequence[object],
@@ -468,6 +536,7 @@ def _record_lftp_status_breadcrumb(
     backend = getattr(controller, "_Controller__lftp", None)
     if getattr(backend, "backend_name", "lftp") == "rclone":
         return
+    _record_lftp_status_sample_lineage(controller, statuses, poll_correlation)
     level = _lftp_status_trace_level(source, healthy)
     if not _controller_breadcrumb_effectively_enabled(
             controller, _LFTP_STATUS_TRACE_CATEGORY, level,
@@ -547,6 +616,40 @@ def _record_lftp_status_breadcrumb(
                 if isinstance(candidate_context, dict):
                     authority_context.update(candidate_context)
             details.update(authority_context)
+        # Parser provenance is already retained on each status record. Read
+        # only a bounded sample after the transfer.lftp gate; never include
+        # names, paths, or raw counters in the diagnostic payload.
+        record_samples: list[dict[str, object]] = []
+        record_shape_counts = {"at": 0, "got": 0, "none": 0}
+        record_presence_counts = {"bytes": 0, "percent": 0, "speed": 0, "eta": 0}
+        for status in islice(statuses, 16):
+            shape = getattr(status, "record_shape", "none")
+            if shape not in record_shape_counts:
+                shape = "none"
+            record_shape_counts[shape] += 1
+            presence = getattr(status, "record_field_presence", {})
+            if not isinstance(presence, Mapping):
+                presence = {}
+            for field in record_presence_counts:
+                if presence.get(field) is True:
+                    record_presence_counts[field] += 1
+            job_correlation = getattr(status, "job_correlation", None)
+            if not isinstance(job_correlation, str) or not job_correlation.startswith("lftp-job:") or len(job_correlation) != len("lftp-job:") + 16:
+                job_correlation = "unknown"
+            record_samples.append({
+                "record_shape": shape,
+                "record_has_bytes": presence.get("bytes") is True,
+                "record_has_percent": presence.get("percent") is True,
+                "record_has_speed": presence.get("speed") is True,
+                "record_has_eta": presence.get("eta") is True,
+                "job_correlation": job_correlation,
+            })
+        details["record_shape_counts"] = record_shape_counts
+        details["record_presence_counts"] = record_presence_counts
+        details["record_samples"] = record_samples
+        lifecycle_epoch = getattr(controller, "_Controller__progress_publication_epoch", None)
+        if type(lifecycle_epoch) is int and lifecycle_epoch >= 0:
+            details["lifecycle_epoch"] = lifecycle_epoch
         corr_id = "lftp:{}".format(opaque_trace_correlation(_LFTP_STATUS_TRACE_CORRELATION))
         recorder(
             stage=_LFTP_STATUS_TRACE_STAGE,
@@ -2887,6 +2990,26 @@ class ModelUpdater(_ControllerCoreAccess):
                 "reason": reason,
                 "marker_observed": marker_observed,
                 "local_scan_forced": local_scan_forced,
+                "retirement_cause": reason if reason in {
+                    "lftp_job_finished", "explicit_stop", "still_active",
+                    "completion_detection_not_authoritative",
+                } else "unknown",
+                "pending_transition": (
+                    "registered" if decision == "pending" else
+                    "cleared" if decision == "excluded" else
+                    "retained"
+                ),
+                "physical_proof": "unknown",
+                "explicit_stop": marker_observed,
+                "terminal_outcome": (
+                    "stopped" if marker_observed else
+                    "deferred" if decision in {"blocked", "pending", "no_retirement"} else
+                    "unknown"
+                ),
+                # A forced scan is only a request; no health or freshness is
+                # established until a result is consumed by a later update.
+                "scan_health": "requested" if local_scan_forced else "unknown",
+                "scan_freshness": "unknown",
             }
             if decision == "pending":
                 details["registration_source"] = "lftp_job_finished"
@@ -2968,9 +3091,34 @@ class ModelUpdater(_ControllerCoreAccess):
                     local_scan_forced=True,
                 )
             controller._Controller__pending_completion_file_names.update(just_completed_file_names)
-            controller._Controller__model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids(
-                completed_file_ids,
-            )
+            preserve_overlay_file_ids: set[str] = set()
+            live_model = getattr(controller, "_Controller__model", None)
+            overlay_snapshot_reader = getattr(live_model, "active_progress_overlays_snapshot", None)
+            live_overlay_snapshot: dict[str, ActiveProgressOverlay] = {}
+            if callable(overlay_snapshot_reader):
+                try:
+                    model_lock = getattr(controller, "_Controller__model_lock", None)
+                    if model_lock is not None and callable(getattr(model_lock, "__enter__", None)):
+                        with model_lock:
+                            snapshot = overlay_snapshot_reader()
+                    else:
+                        snapshot = overlay_snapshot_reader()
+                    if isinstance(snapshot, dict):
+                        live_overlay_snapshot = snapshot
+                except Exception:
+                    live_overlay_snapshot = {}
+            for name, path_pair_id, _ in just_completed_file_names:
+                file_id = ModelFile.build_file_id(name, path_pair_id)
+                if isinstance(live_overlay_snapshot.get(file_id), ActiveProgressOverlay):
+                    preserve_overlay_file_ids.add(file_id)
+            evict_snapshots = controller._Controller__model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids
+            if preserve_overlay_file_ids:
+                evict_snapshots(
+                    completed_file_ids,
+                    preserve_file_ids=preserve_overlay_file_ids,
+                )
+            else:
+                evict_snapshots(completed_file_ids)
             if None in completed_path_pair_ids:
                 controller._Controller__local_scan_process.force_scan()
             else:
@@ -3928,6 +4076,19 @@ class ModelUpdater(_ControllerCoreAccess):
         # Update list of active file names.
         raw_lftp_statuses = lftp_statuses
         raw_lftp_status_count = len(raw_lftp_statuses)
+        raw_status_id_counts: dict[str, int] = {}
+        for status in raw_lftp_statuses:
+            raw_file_id = getattr(status, "file_id", None)
+            if isinstance(raw_file_id, str):
+                raw_status_id_counts[raw_file_id] = raw_status_id_counts.get(raw_file_id, 0) + 1
+        raw_duplicate_status_file_ids = {
+            file_id for file_id, count in raw_status_id_counts.items() if count > 1
+        }
+        evict_ambiguous_status_snapshots = getattr(
+            model_builder, "evict_ambiguous_lftp_status_snapshots", None,
+        )
+        if raw_duplicate_status_file_ids and callable(evict_ambiguous_status_snapshots):
+            evict_ambiguous_status_snapshots(raw_duplicate_status_file_ids)
         active_status_file_ids = {status.file_id for status in lftp_statuses}
         controller._Controller__malformed_status_only_file_ids.intersection_update(active_status_file_ids)
         lftp_statuses = [
@@ -4867,6 +5028,17 @@ class ModelUpdater(_ControllerCoreAccess):
         active_progress_overlay_applied = False
         overlay_admission_outcome = "poll_gate"
         direct_publish_timing: dict[str, object] = {}
+        direct_prior_overlays: dict[str, ActiveProgressOverlay] = {}
+        direct_prior_job_identities: dict[str, tuple[int, str]] = {}
+        direct_prior_base_counters: dict[str, tuple[object, object]] = {}
+        direct_published_overlays: dict[str, ActiveProgressOverlay] = {}
+        direct_published_job_identities: dict[str, tuple[int, str]] = {}
+        direct_published_target_file_id: Optional[str] = None
+        direct_target_file_id: Optional[str] = None
+        direct_job_identities: dict[str, tuple[int, str]] = {}
+        late_older_overlay_preserved = False
+        late_older_overlay_preserved_file_ids: set[str] = set()
+        late_older_overlay_reconciliation_required = False
         active_scan_progress_inputs = getattr(
             model_builder, "has_only_live_progress_with_active_scan", None,
         )
@@ -4883,45 +5055,194 @@ class ModelUpdater(_ControllerCoreAccess):
             try:
                 overlay_lock_started_ns = time.monotonic_ns()
                 with controller._Controller__model_lock:
+                    prior_overlays = model.active_progress_overlays_snapshot()
+                    if isinstance(prior_overlays, dict):
+                        direct_prior_overlays = prior_overlays
+                    identity_snapshot_builder = getattr(
+                        model, "active_progress_overlay_job_identities_snapshot", None,
+                    )
+                    if callable(identity_snapshot_builder):
+                        prior_job_identities = identity_snapshot_builder()
+                        if isinstance(prior_job_identities, dict):
+                            direct_prior_job_identities = prior_job_identities
                     direct_publish_timing["lock_wait_duration_bucket"] = _progress_lineage_duration_bucket(
                         (time.monotonic_ns() - overlay_lock_started_ns) // 1_000_000,
                     )
                     direct_overlays: dict[str, ActiveProgressOverlay] = {}
-                    job_identities: dict[str, tuple[int, str]] = {}
                     direct_publish_started_ns = time.monotonic_ns()
                     direct_outcome = "status_shape"
                     if lftp_statuses and all(status.state == LftpJobStatus.State.RUNNING for status in lftp_statuses):
-                        direct_overlays = read_only_counter_builder(
-                            lambda file_id: file_id in model.get_file_ids(),
-                            lambda file_id: model.get_file(file_id).display_size_total is None and
-                            model.get_file(file_id).display_transferred_size is None,
+                        raw_status_file_ids = [getattr(status, "file_id", None) for status in raw_lftp_statuses]
+                        if not all(isinstance(file_id, str) for file_id in raw_status_file_ids) or \
+                                len(set(raw_status_file_ids)) != len(raw_status_file_ids):
+                            # A duplicate root has no unambiguous direct
+                            # projection. Preserve the normal authoritative
+                            # fallback rather than allowing dict last-write-wins.
+                            direct_outcome = "status_identity"
+                        else:
+                            direct_overlays = read_only_counter_builder(
+                                lambda file_id: file_id in model.get_file_ids(),
+                                lambda file_id: model.get_file(file_id).display_size_total is None and
+                                model.get_file(file_id).display_transferred_size is None and
+                                not (
+                                    callable(getattr(
+                                        controller, "_Controller__is_explicitly_stopped", None,
+                                    )) and controller._Controller__is_explicitly_stopped(
+                                        model.get_file(file_id).full_path,
+                                        model.get_file(file_id).path_pair_id,
+                                    )
+                                ),
+                            )
+                            if isinstance(direct_overlays, dict) and direct_overlays:
+                                direct_outcome = "accepted"
+                                for file_id in direct_overlays:
+                                    try:
+                                        base_file = model.get_file(file_id)
+                                        direct_prior_base_counters[file_id] = (
+                                            getattr(base_file, "transferred_size", None),
+                                            getattr(base_file, "download_progress", None),
+                                        )
+                                    except (AttributeError, ModelError):
+                                        pass
+                            for status in lftp_statuses:
+                                if direct_outcome != "accepted":
+                                    break
+                                state = status.total_transfer_state
+                                if type(status.id) is not int or status.id < 0 or \
+                                        not isinstance(status.type.value, str) or \
+                                        type(state.size_local) is not int or state.size_local < 0 or \
+                                        (state.percent_local is not None and
+                                         (type(state.percent_local) is not int or not 0 <= state.percent_local <= 100)) or \
+                                        (state.speed is not None and (type(state.speed) is not int or state.speed < 0)) or \
+                                        (state.eta is not None and (type(state.eta) is not int or state.eta < 0)):
+                                    direct_outcome = "counter_shape"
+                                    break
+                                direct_job_identities[status.file_id] = (status.id, status.type.value)
+                        if direct_outcome == "accepted":
+                            candidate_targets = set(direct_overlays).intersection(
+                                direct_job_identities,
+                            )
+                            if len(candidate_targets) == 1:
+                                direct_target_file_id = next(iter(candidate_targets))
+                    # An empty, fresh status poll retires the just-published
+                    # overlay before the post-boundary comparison runs. Keep
+                    # the target only when the model-owned overlay and its
+                    # existing job identity identify exactly one root; do not
+                    # infer a target from an arbitrary status row.
+                    if not lftp_statuses and direct_target_file_id is None:
+                        prior_targets = set(direct_prior_overlays).intersection(
+                            direct_prior_job_identities,
                         )
-                        if isinstance(direct_overlays, dict) and direct_overlays:
-                            direct_outcome = "accepted"
+                        if len(prior_targets) == 1:
+                            direct_target_file_id = next(iter(prior_targets))
+                    preserve_late_older_overlay = False
+                    preserved_file_ids: set[str] = set()
+                    if direct_outcome not in {"accepted", "status_identity"} and \
+                            direct_prior_overlays and lftp_statuses:
+                        statuses_by_file_id: dict[str, list[LftpJobStatus]] = {}
                         for status in lftp_statuses:
-                            if direct_outcome != "accepted":
-                                break
-                            state = status.total_transfer_state
-                            if type(status.id) is not int or status.id < 0 or \
-                                    not isinstance(status.type.value, str) or \
-                                    type(state.size_local) is not int or state.size_local < 0 or \
-                                    (state.percent_local is not None and
-                                     (type(state.percent_local) is not int or not 0 <= state.percent_local <= 100)) or \
-                                    (state.speed is not None and (type(state.speed) is not int or state.speed < 0)) or \
-                                    (state.eta is not None and (type(state.eta) is not int or state.eta < 0)):
-                                direct_outcome = "counter_shape"
-                                break
-                            job_identities[status.file_id] = (status.id, status.type.value)
+                            statuses_by_file_id.setdefault(status.file_id, []).append(status)
+                        raw_identity_statuses_by_file_id: dict[str, list[LftpJobStatus]] = {}
+                        for status in raw_lftp_statuses:
+                            raw_file_id = getattr(status, "file_id", None)
+                            raw_job_id = getattr(status, "id", None)
+                            raw_state = getattr(status, "state", None)
+                            if isinstance(raw_file_id, str) and type(raw_job_id) is int and \
+                                    raw_job_id >= 0 and raw_state == LftpJobStatus.State.RUNNING:
+                                raw_identity_statuses_by_file_id.setdefault(raw_file_id, []).append(status)
+                        malformed_status_file_ids = set(getattr(
+                            controller, "_Controller__malformed_status_only_file_ids", set(),
+                        ))
+                        for file_id, previous_identity in direct_prior_job_identities.items():
+                            if file_id not in direct_prior_overlays:
+                                continue
+                            if file_id in malformed_status_file_ids:
+                                # The raw row is deliberately filtered from
+                                # authoritative intake; do not let its
+                                # partially parseable identity preserve an
+                                # overlay through that ambiguity.
+                                continue
+                            try:
+                                prior_file = model.get_file(file_id)
+                            except ModelError:
+                                continue
+                            if prior_file.explicitly_stopped or \
+                                    controller._Controller__is_explicitly_stopped(
+                                        prior_file.full_path, prior_file.path_pair_id,
+                                    ):
+                                continue
+                            # Prefer raw identity evidence when it is usable.
+                            # A filtered status list can hide a malformed older
+                            # row; retaining a root is safe only when the raw
+                            # row independently proves its older identity.
+                            late_statuses = raw_identity_statuses_by_file_id.get(file_id) \
+                                if raw_lftp_statuses else statuses_by_file_id.get(file_id, [])
+                            if len(late_statuses) != 1 or not all(
+                                    status.state == LftpJobStatus.State.RUNNING and
+                                    type(status.id) is int and
+                                    status.id < previous_identity[0] and
+                                    getattr(getattr(status, "type", None), "value", None) == previous_identity[1]
+                                    for status in late_statuses
+                            ):
+                                continue
+                            counterless = all(
+                                getattr(status.total_transfer_state, "size_local", None) is None and
+                                getattr(status.total_transfer_state, "percent_local", None) is None
+                                for status in late_statuses
+                            )
+                            if counterless:
+                                preserved_file_ids.add(file_id)
+                        preserve_late_older_overlay = bool(preserved_file_ids)
+                        status_file_ids = {
+                            status.file_id for status in lftp_statuses
+                            if isinstance(getattr(status, "file_id", None), str)
+                        }
+                        status_file_ids.update(raw_identity_statuses_by_file_id)
+                        normal_root_ids = (
+                            set(direct_prior_overlays).union(status_file_ids)
+                        ).difference(preserved_file_ids)
+                        late_older_overlay_reconciliation_required = bool(
+                            preserved_file_ids and normal_root_ids
+                        )
+                    late_older_overlay_preserved = preserve_late_older_overlay
+                    late_older_overlay_preserved_file_ids = preserved_file_ids
                     if direct_outcome != "accepted":
-                        model.clear_active_progress_overlays()
+                        if preserve_late_older_overlay:
+                            model.clear_active_progress_overlays_except(preserved_file_ids)
+                        else:
+                            model.clear_active_progress_overlays()
                         changed = set()
                     else:
                         changed, direct_outcome = model.publish_active_lftp_root_counters(
-                            direct_overlays, job_identities,
+                            direct_overlays, direct_job_identities,
                             lambda file_id: getattr(
                                 controller, "_Controller__progress_publication_epoch", 0,
                             ) == lftp_status_publication_epoch,
                         )
+                        if direct_outcome == "accepted":
+                            record_direct_snapshot = getattr(
+                                model_builder,
+                                "record_read_only_lftp_root_counter_overlays",
+                                None,
+                            )
+                            if not callable(record_direct_snapshot) or \
+                                    record_direct_snapshot(direct_overlays) is not True:
+                                # Keep Model and ModelBuilder as one coherent
+                                # publication.  Without the builder snapshot,
+                                # a later authoritative retirement could
+                                # regress the just-published root counter.
+                                model.clear_active_progress_overlays()
+                                changed = set()
+                                direct_outcome = "snapshot"
+                            else:
+                                # Keep this update's accepted projection in
+                                # the existing updater transaction so the
+                                # post-authoritative comparison describes the
+                                # just-published overlay, not only the base
+                                # observed before publication.
+                                direct_published_overlays = dict(direct_overlays)
+                                direct_published_job_identities = dict(direct_job_identities)
+                                direct_published_target_file_id = direct_target_file_id
                     direct_publish_timing["publish_duration_bucket"] = _progress_lineage_duration_bucket(
                         (time.monotonic_ns() - direct_publish_started_ns) // 1_000_000,
                     )
@@ -4943,17 +5264,13 @@ class ModelUpdater(_ControllerCoreAccess):
                 controller, lftp_status_poll_correlation, "active_progress_overlay_admission",
                 {"overlay_admission": overlay_admission_outcome},
             )
-            _record_progress_lineage(
-                controller, lftp_status_poll_correlation, "direct_root_counter_publish",
-                {
-                    "outcome": overlay_admission_outcome,
-                    "active_scan_equivalence": "model_owned",
-                    **direct_publish_timing,
-                },
-            )
         active_transfer_delta_applied = False
         active_transfer_delta_adopted = False
-        active_transfer_delta_rejected = overlay_admission_outcome in {"lifecycle_epoch", "job_identity"} or \
+        late_older_overlay_only = late_older_overlay_preserved and not \
+            late_older_overlay_reconciliation_required
+        active_transfer_delta_rejected = late_older_overlay_only or \
+            overlay_admission_outcome in {"lifecycle_epoch", "job_identity"} or \
+            (overlay_admission_outcome == "status_identity" and not late_older_overlay_preserved) or \
             not (lftp_status_poll_healthy and lftp_status_snapshot_fresh and
                  lftp_status_source == "fresh_healthy")
         active_delta_selection_rejected = False
@@ -5140,8 +5457,9 @@ class ModelUpdater(_ControllerCoreAccess):
         defer_nonfresh_active_only_inputs = active_transfer_delta_rejected and callable(active_delta_pending) and \
             bool(active_delta_pending()) and not bool(
                 getattr(controller, "_Controller__pending_completion_file_names", set())
-            ) and not bool(getattr(controller, "_Controller__pending_queue_dispatches", {}))
-        full_build_triggered = candidate_lifecycle_triggered or (
+            ) and not bool(getattr(controller, "_Controller__pending_queue_dispatches", {})) and \
+            overlay_admission_outcome != "status_identity"
+        full_build_triggered = candidate_lifecycle_triggered or late_older_overlay_reconciliation_required or (
             model_builder.has_changes() and (not progressive_delta_eligible or active_transfer_delta_rejected) and \
             not authoritative_pair_delta_applied and not defer_nonfresh_active_only_inputs and \
             not active_progress_overlay_applied
@@ -5692,6 +6010,15 @@ class ModelUpdater(_ControllerCoreAccess):
                                     if candidate_file is not None else False
                                 ),
                                 "complete_local_coverage": coverage,
+                                "physical_proof": "proven" if coverage else "missing",
+                                "exact_final_file_proof": coverage,
+                                "scan_health": "healthy" if latest_local_scan is not None and
+                                not bool(getattr(latest_local_scan, "failed", False)) else "unknown",
+                                "scan_freshness": "fresh" if latest_local_scan is not None else "unknown",
+                                "pending_transition": "retained",
+                                "explicit_stop": bool(
+                                    getattr(candidate_file, "explicitly_stopped", False)
+                                ) if candidate_file is not None else False,
                                 "model_diff_present": pending_file_id in diff_file_ids,
                             },
                             poll_correlation=lftp_status_poll_correlation,
@@ -5837,6 +6164,16 @@ class ModelUpdater(_ControllerCoreAccess):
                                 "completion_proved": completion_proved,
                                 "decision": "attempt_eligible" if completion_proved else "deferred",
                                 "reason": completion_reason,
+                                "physical_proof": "proven" if completion_proved else "missing",
+                                "exact_final_file_proof": completion_proved,
+                                "pending_transition": (
+                                    "cleared" if completion_proved or explicitly_stopped else "retained"
+                                ),
+                                "explicit_stop": explicitly_stopped,
+                                "terminal_outcome": (
+                                    "downloaded" if completion_proved else
+                                    "stopped" if explicitly_stopped else "deferred"
+                                ),
                             },
                             poll_correlation=lftp_status_poll_correlation,
                         )
@@ -6294,6 +6631,119 @@ class ModelUpdater(_ControllerCoreAccess):
                 )
                 if callable(refresh_identities):
                     refresh_identities()
+        if late_older_overlay_preserved_file_ids:
+            protected_overlays = {
+                file_id: direct_prior_overlays[file_id]
+                for file_id in late_older_overlay_preserved_file_ids
+                if file_id in direct_prior_overlays
+            }
+            protected_identities = {
+                file_id: direct_prior_job_identities[file_id]
+                for file_id in late_older_overlay_preserved_file_ids
+                if file_id in direct_prior_job_identities
+            }
+            restore_overlays = getattr(
+                controller._Controller__model, "restore_active_progress_overlays", None,
+            )
+            if callable(restore_overlays):
+                with controller._Controller__model_lock:
+                    restore_overlays(protected_overlays, protected_identities)
+        # Capture direct-overlay lineage only after the authoritative model
+        # adoption/replacement boundary above. A fresh scan may retire the
+        # status row and replace the base after direct publication; recording
+        # the earlier overlay snapshot would hide that causal regression.
+        if _controller_breadcrumb_effectively_enabled(controller, "model.progress", "debug"):
+            final_overlays: dict[str, ActiveProgressOverlay] = {}
+            final_base_counters: dict[str, tuple[object, object]] = {}
+            with controller._Controller__model_lock:
+                try:
+                    snapshot = controller._Controller__model.active_progress_overlays_snapshot()
+                    if isinstance(snapshot, dict):
+                        final_overlays = snapshot
+                except AttributeError:
+                    final_overlays = {}
+                if direct_target_file_id is not None:
+                    try:
+                        final_file = controller._Controller__model.get_file(direct_target_file_id)
+                        final_base_counters[direct_target_file_id] = (
+                            getattr(final_file, "transferred_size", None),
+                            getattr(final_file, "download_progress", None),
+                        )
+                    except (AttributeError, ModelError):
+                        pass
+            comparison_target_file_id = direct_published_target_file_id \
+                if direct_published_target_file_id is not None else direct_target_file_id
+            comparison_prior_overlays = direct_published_overlays \
+                if direct_published_target_file_id is not None else direct_prior_overlays
+            comparison_job_identities = direct_published_job_identities \
+                if direct_published_target_file_id is not None else direct_job_identities
+            target_overlay_before = (
+                comparison_prior_overlays.get(comparison_target_file_id)
+                if comparison_target_file_id is not None else None
+            )
+            target_overlay_after = (
+                final_overlays.get(comparison_target_file_id)
+                if comparison_target_file_id is not None else None
+            )
+            prior_base = direct_prior_base_counters.get(comparison_target_file_id, (None, None))
+            final_base = final_base_counters.get(comparison_target_file_id, (None, None))
+            prior_source = (
+                "overlay" if target_overlay_before is not None else
+                "base" if comparison_target_file_id in direct_prior_base_counters else "unknown"
+            )
+            new_source = (
+                "overlay" if target_overlay_after is not None else
+                "base" if comparison_target_file_id in final_base_counters else "unknown"
+            )
+            prior_counter = getattr(target_overlay_before, "transferred_size", prior_base[0])
+            new_counter = getattr(target_overlay_after, "transferred_size", final_base[0])
+            prior_percent = getattr(target_overlay_before, "download_progress", prior_base[1])
+            new_percent = getattr(target_overlay_after, "download_progress", final_base[1])
+            if type(prior_counter) is int and type(new_counter) is int:
+                monotonic_relation = (
+                    "advance" if new_counter > prior_counter else
+                    "regress" if new_counter < prior_counter else "same"
+                )
+            elif target_overlay_before is None and target_overlay_after is not None:
+                monotonic_relation = "advance"
+            else:
+                monotonic_relation = "unknown"
+            job_match = None
+            epoch_match = None
+            if comparison_target_file_id is not None:
+                if overlay_admission_outcome == "job_identity":
+                    job_match = False
+                elif overlay_admission_outcome == "accepted" and comparison_target_file_id in comparison_job_identities:
+                    job_match = True
+                if overlay_admission_outcome == "lifecycle_epoch":
+                    epoch_match = False
+                elif overlay_admission_outcome == "accepted" and comparison_target_file_id in comparison_job_identities:
+                    epoch_match = True
+            direct_relation_details = {
+                "target_correlation": (
+                    "model-target:{}".format(opaque_trace_correlation(comparison_target_file_id))
+                    if comparison_target_file_id is not None else None
+                ),
+                "prior_source": prior_source,
+                "new_source": new_source,
+                "destination": new_source,
+                "prior_counter_bucket": _progress_counter_bucket(prior_counter),
+                "new_counter_bucket": _progress_counter_bucket(new_counter),
+                "prior_percent_bucket": _progress_counter_bucket(prior_percent),
+                "new_percent_bucket": _progress_counter_bucket(new_percent),
+                "monotonic_relation": monotonic_relation,
+                "job_match": job_match,
+                "epoch_match": epoch_match,
+            }
+            _record_progress_lineage(
+                controller, lftp_status_poll_correlation, "direct_root_counter_publish",
+                {
+                    "outcome": overlay_admission_outcome,
+                    "active_scan_equivalence": "model_owned",
+                    **direct_relation_details,
+                    **direct_publish_timing,
+                },
+            )
         if full_build_triggered and lifecycle_publication_subject_ids:
             live_recorder = getattr(model_builder, "record_lifecycle_live_publication", None)
             if callable(live_recorder):

@@ -55,6 +55,17 @@ class LftpJobStatus:
         # dict of active file transfer states, maps filename to their transfer state
         # there's no hierarchical info for now
         self.__active_files_state: dict[str, LftpJobStatus.TransferState] = {}
+        # Parser provenance is deliberately kept on the status record rather
+        # than in a parallel controller cache. It is bounded to fixed enums
+        # and booleans; callers can derive an opaque job correlation lazily
+        # when the diagnostic gate is enabled.
+        self.__record_shape = "none"
+        self.__record_field_presence = {
+            "bytes": False,
+            "percent": False,
+            "speed": False,
+            "eta": False,
+        }
 
     @property
     def id(self) -> int: return self.__id
@@ -124,6 +135,47 @@ class LftpJobStatus:
         """
         return list(zip(self.__active_files_state.keys(), self.__active_files_state.values()))
 
+    @property
+    def record_shape(self) -> str:
+        """Fixed parser form: at, got, or none."""
+        return self.__record_shape
+
+    @property
+    def status_record_shape(self) -> str:
+        """Compatibility alias for diagnostic consumers."""
+        return self.__record_shape
+
+    @property
+    def record_field_presence(self) -> dict[str, bool]:
+        """Bounded presence flags for the parsed status record."""
+        return dict(self.__record_field_presence)
+
+    @property
+    def job_correlation(self) -> str:
+        """Return a process-local opaque correlation for this LFTP job."""
+        # Keep the diagnostic dependency lazy: ordinary transfer status
+        # consumers should not initialize the breadcrumb machinery.
+        from common.breadcrumb_trace import opaque_trace_correlation
+        return "lftp-job:{}".format(
+            opaque_trace_correlation("lftp.job.v1|{}|{}".format(self.__id, self.__type.value))
+        )
+
+    def set_record_provenance(
+            self, shape: object, *, bytes_present: object = False,
+            percent_present: object = False, speed_present: object = False,
+            eta_present: object = False,
+    ) -> None:
+        """Set parser-owned, privacy-safe provenance for one status record."""
+        if shape not in {"at", "got", "none"}:
+            shape = "none"
+        self.__record_shape = shape
+        self.__record_field_presence = {
+            "bytes": bytes_present is True,
+            "percent": percent_present is True,
+            "speed": speed_present is True,
+            "eta": eta_present is True,
+        }
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, LftpJobStatus):
             return NotImplemented
@@ -132,6 +184,8 @@ class LftpJobStatus:
             "_LftpJobStatus__local_path",
             "_LftpJobStatus__path_pair_id",
             "_LftpJobStatus__path_pair_name",
+            "_LftpJobStatus__record_shape",
+            "_LftpJobStatus__record_field_presence",
         }
         self_dict = {k: v for k, v in self.__dict__.items() if k not in ignored}
         other_dict = {k: v for k, v in other.__dict__.items() if k not in ignored}

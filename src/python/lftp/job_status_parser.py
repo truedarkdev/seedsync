@@ -97,6 +97,20 @@ class LftpJobStatusParser:
         return eta_d*24*3600 + eta_h*3600 + eta_m*60 + eta_s
 
     @staticmethod
+    def __set_record_provenance(
+            status: LftpJobStatus, shape: str,
+            transfer_state: LftpJobStatus.TransferState,
+    ) -> None:
+        """Retain only fixed parser form and field-presence provenance."""
+        status.set_record_provenance(
+            shape,
+            bytes_present=shape == "got" and transfer_state.size_local is not None,
+            percent_present=shape == "got" and transfer_state.percent_local is not None,
+            speed_present=transfer_state.speed is not None,
+            eta_present=transfer_state.eta is not None,
+        )
+
+    @staticmethod
     def __quoted_spans(line: str) -> list[tuple[int, int]]:
         spans: list[tuple[int, int]] = []
         index = 0
@@ -394,6 +408,7 @@ class LftpJobStatusParser:
                                        flags=flags,
                                        remote_path=result.group("remote"),
                                        local_path=result.group("local"))
+                record_shape = "none"
                 if result_at:
                     if result.group("remote") != result_at.group("name"):
                         raise ValueError("Mismatch between pget names '{}' vs '{}'".format(
@@ -414,12 +429,14 @@ class LftpJobStatusParser:
                         speed,
                         eta
                     )
+                    record_shape = "at"
                 elif result_at2:
                     if result.group("remote") != result_at2.group("name"):
                         raise ValueError("Mismatch between pget names '{}' vs '{}'".format(
                             result.group("remote"), result_at2.group("name")
                         ))
                     transfer_state = LftpJobStatus.TransferState(None, None, None, None, None)
+                    record_shape = "at"
                 elif result_got:
                     got_group_basename = os.path.basename(os.path.normpath(result_got.group("name")))
                     if got_group_basename != name:
@@ -441,10 +458,12 @@ class LftpJobStatusParser:
                         speed,
                         eta
                     )
+                    record_shape = "got"
                 else:
                     # No data line at all
                     transfer_state = LftpJobStatus.TransferState(None, None, None, None, None)
 
+                LftpJobStatusParser.__set_record_provenance(status, record_shape, transfer_state)
                 status.total_transfer_state = transfer_state
                 jobs.append(status)
                 prev_job = status
@@ -477,6 +496,7 @@ class LftpJobStatusParser:
                     speed,
                     None  # eta
                 )
+                LftpJobStatusParser.__set_record_provenance(status, "got", transfer_state)
                 status.total_transfer_state = transfer_state
                 jobs.append(status)
                 prev_job = status
@@ -504,6 +524,9 @@ class LftpJobStatusParser:
                                        flags=flags,
                                        remote_path=result.group("remote"),
                                        local_path=result.group("local"))
+                LftpJobStatusParser.__set_record_provenance(
+                    status, "none", LftpJobStatus.TransferState(None, None, None, None, None),
+                )
                 jobs.append(status)
                 prev_job = status
                 # Continue the outer loop
