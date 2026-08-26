@@ -7542,14 +7542,7 @@ class Controller:
         self._reset_move_retry_rebuild_gate(file_id)
         self.__deferred_move_file_ids.discard(file_id)
         self.__move_retry_due.pop(file_id, None)
-        self.__pending_completion_file_names = {
-            entry for entry in self.__pending_completion_file_names
-            if ModelFile.build_file_id(entry[0], entry[1]) != file_id
-        }
-        getattr(self, "_Controller__pending_completion_authority_rebuild_ids", set()).discard(file_id)
-        getattr(self, "_Controller__pending_completion_progress_floors", {}).pop(file_id, None)
-        getattr(self, "_Controller__pending_completion_publications", {}).pop(file_id, None)
-        ModelUpdater._clear_admitted_progress_publications(self, file_id)
+        self.__consume_pending_completion_transaction(file_id)
         getattr(self, "_Controller__successful_final_move_handoff_file_ids", set()).discard(file_id)
         self.__persist.final_move_succeeded_file_names.discard(file_id)
         getattr(self, "_Controller__current_process_final_publication_file_ids", set()).discard(file_id)
@@ -7561,6 +7554,37 @@ class Controller:
         self.__reset_download_start_after_local_delete(file_id, path_pair_id)
         if isinstance(file_name, str):
             self.__clear_resume_source_if_staging_absent(file_id, file_name, path_pair_id)
+
+    def __has_pending_completion_transaction(self, file_id: str) -> bool:
+        """Whether one exact retired-job publication still owns this row."""
+        if not isinstance(file_id, str):
+            return False
+        pending = getattr(self, "_Controller__pending_completion_file_names", set())
+        publications = getattr(self, "_Controller__pending_completion_publications", {})
+        return isinstance(pending, set) and isinstance(publications, dict) and \
+            any(ModelFile.build_file_id(entry[0], entry[1]) == file_id for entry in pending) and \
+            file_id in publications
+
+    def __consume_pending_completion_transaction(self, file_id: str) -> bool:
+        """Clear exact retired-job lifecycle state at an explicit reset boundary."""
+        if not isinstance(file_id, str):
+            return False
+        pending = getattr(self, "_Controller__pending_completion_file_names", set())
+        had_pending_name = isinstance(pending, set) and any(
+            ModelFile.build_file_id(entry[0], entry[1]) == file_id
+            for entry in pending
+        )
+        if isinstance(pending, set):
+            self.__pending_completion_file_names = {
+                entry for entry in pending
+                if ModelFile.build_file_id(entry[0], entry[1]) != file_id
+            }
+        getattr(self, "_Controller__pending_completion_authority_rebuild_ids", set()).discard(file_id)
+        # Floors are generic retired-job lifecycle state.  The updater reads
+        # any paired publication identity before clearing Model provenance, so
+        # a later job's admitted overlay cannot be removed by this reset.
+        ModelUpdater._clear_pending_completion_progress_floor(self, file_id)
+        return had_pending_name
 
     def __clear_resume_source_if_staging_absent(
             self, file_id: str, file_name: str, path_pair_id: Optional[str],
@@ -7687,6 +7711,15 @@ class Controller:
 
     def __has_pending_delete_local_command(self, file_id: str) -> bool:
         return self.__has_pending_delete_command(file_id, Controller.Command.Action.DELETE_LOCAL)
+
+    def __has_queued_queue_command(self, file_id: str) -> bool:
+        """Whether an exact Queue command owns the next command handoff."""
+        with self.__command_queue.mutex:
+            return any(
+                command.action == Controller.Command.Action.QUEUE and
+                command.filename == file_id
+                for command in self.__command_queue.queue
+            )
 
     def __pending_delete_command_count_unlocked(self) -> int:
         with self.__command_queue.mutex:
@@ -8890,7 +8923,21 @@ class Controller:
                     _notify_failure(command, "File '{}' not found".format(command.filename), 404)
                     continue
 
-                already_active = file.state in (
+                # A Delete Local process owns the physical target until it
+                # settles.  Do not turn a retained completion publication
+                # into a new LFTP lifecycle while that delete can still
+                # succeed or fail for this exact canonical file identity.
+                if self.__has_pending_delete_local_command(file.file_id):
+                    _notify_failure(
+                        command,
+                        "Local deletion is still pending; Queue was rejected",
+                        409,
+                        file,
+                    )
+                    continue
+
+                pending_completion_recovery = self.__has_pending_completion_transaction(file.file_id)
+                already_active = not pending_completion_recovery and file.state in (
                     ModelFile.State.QUEUED,
                     ModelFile.State.DOWNLOADING,
                 )
@@ -9443,7 +9490,7 @@ class Controller:
                         # ambiguity window. Beyond that window Queue is
                         # intentionally at-least-once: LFTP acknowledgement is
                         # not transactional with controller model observation.
-                        is_new_transfer_lifecycle = stop_boundary or file.state not in (
+                        is_new_transfer_lifecycle = pending_completion_recovery or stop_boundary or file.state not in (
                             ModelFile.State.QUEUED,
                             ModelFile.State.DOWNLOADING,
                         )
@@ -9453,16 +9500,7 @@ class Controller:
                             self._reset_move_retry_rebuild_gate(file.file_id)
                             self.__move_retry_due.pop(file.file_id, None)
                             self.__deferred_move_file_ids.discard(file.file_id)
-                            self.__pending_completion_file_names = {
-                                entry for entry in self.__pending_completion_file_names
-                                if ModelFile.build_file_id(entry[0], entry[1]) != file.file_id
-                            }
-                            getattr(self, "_Controller__pending_completion_authority_rebuild_ids", set()).discard(file.file_id)
-                            getattr(self, "_Controller__pending_completion_publications", {}).pop(
-                                file.file_id,
-                                None,
-                            )
-                            ModelUpdater._clear_admitted_progress_publications(self, file.file_id)
+                            self.__consume_pending_completion_transaction(file.file_id)
                             with self.__move_attempt_lock:
                                 self.__move_attempt_reservations.discard(file.file_id)
                             self.__model_builder.set_move_failed_files({
@@ -9556,10 +9594,11 @@ class Controller:
 
             elif command.action == Controller.Command.Action.STOP:
                 pending_stop = file.file_id in pending_queue_dispatches
+                pending_completion_recovery = self.__has_pending_completion_transaction(file.file_id)
                 deferred_stop_intent = self.__deferred_queue_intents_map().get(file.file_id)
                 if deferred_stop_intent is not None:
                     pending_stop = True
-                if not pending_stop and file.state not in (
+                if not pending_stop and not pending_completion_recovery and file.state not in (
                     ModelFile.State.DOWNLOADING,
                     ModelFile.State.QUEUED,
                 ):
@@ -9617,6 +9656,50 @@ class Controller:
                         message="command_finished",
                         details={
                             "command": "STOP",
+                            "lifecycle_phase": "dispatch",
+                            "completion": "accepted",
+                        },
+                        file=file,
+                    )
+                    continue
+                if pending_completion_recovery and \
+                        self.__has_pending_delete_local_command(file.file_id):
+                    _notify_failure(
+                        command,
+                        "Local deletion is still pending; Stop was rejected",
+                        409,
+                        file,
+                    )
+                    continue
+                if pending_completion_recovery:
+                    marker_before_stop = file.file_id in self.__persist.stopped_file_names
+                    self.__persist.stopped_file_names.add(file.file_id)
+                    pending_queue_dispatches.pop(file.file_id, None)
+                    stopped_queue_lifecycle_ids.add(file.file_id)
+                    self.__suppress_download_start_lifecycle(file.file_id)
+                    self.__consume_pending_completion_transaction(file.file_id)
+                    self.__advance_transfer_lifecycle(file.file_id)
+                    self.__next_lftp_status_poll_at = None
+                    self.__lftp_idle_status_authoritative = False
+                    self.__validate_process.clear(file.file_id)
+                    self.__record_transfer_stop_breadcrumb(
+                        file.file_id,
+                        source="stop",
+                        marker_before=marker_before_stop,
+                        marker_after=True,
+                        backend_outcome="success",
+                        marker_observed=True,
+                        rejection_reason="none",
+                        message="transfer_stop_pending_completion",
+                    )
+                    for callback in command.callbacks:
+                        callback.on_success()
+                    self.__record_command_breadcrumb(
+                        command=command,
+                        message="command_finished",
+                        details={
+                            "command": "STOP",
+                            "mode": "pending_completion_cancel",
                             "lifecycle_phase": "dispatch",
                             "completion": "accepted",
                         },
@@ -9933,7 +10016,31 @@ class Controller:
                     )
 
             elif command.action == Controller.Command.Action.DELETE_LOCAL:
-                if file.state not in (
+                active_lftp_file_ids = {
+                    ModelFile.build_file_id(name, path_pair_id)
+                    for name, path_pair_id, _ in self.__active_downloading_file_names
+                }
+                active_lftp_file_ids.update(
+                    status.file_id
+                    for status in (self.__last_lftp_statuses or [])
+                    if getattr(status, "state", None) in (
+                        LftpJobStatus.State.QUEUED,
+                        LftpJobStatus.State.RUNNING,
+                    )
+                )
+                if file.file_id in self.__queue_dispatch_pending() or \
+                        file.file_id in self.__deferred_queue_intents_map() or \
+                        self.__has_queued_queue_command(file.file_id) or \
+                        file.file_id in active_lftp_file_ids:
+                    _notify_failure(
+                        command,
+                        "Transfer is still pending or active; Delete Local was rejected",
+                        409,
+                        file,
+                    )
+                    continue
+                pending_completion_recovery = self.__has_pending_completion_transaction(file.file_id)
+                if not pending_completion_recovery and file.state not in (
                     ModelFile.State.DEFAULT,
                     ModelFile.State.DOWNLOADED,
                     ModelFile.State.EXTRACTED,

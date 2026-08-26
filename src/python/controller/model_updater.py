@@ -321,7 +321,6 @@ class _PendingCompletionPublication:
 
     overlay: ActiveProgressOverlay
     job_identity: Optional[tuple[int, str]]
-    authoritative_missing_proof_generation: Optional[tuple[Optional[str], int, Optional[str], int]] = None
 
 
 def _breadcrumb_effectively_enabled(
@@ -2729,10 +2728,10 @@ class ModelUpdater(_ControllerCoreAccess):
         if ModelUpdater._pending_completion_floor_reset(new_file):
             return
 
-        # A parsed PGET sidecar remains a resumable checkpoint after the job
-        # retires. Do not turn its last live counters into a pending-completion
-        # floor: the physical move gate will keep observing it until a later
-        # scan proves completion, while DEFAULT must remain Queue-resumable.
+        # A parsed PGET sidecar is physical proof that the retired transfer is
+        # incomplete and resumable.  It releases the pending-completion
+        # presentation transaction at the caller's lifecycle boundary rather
+        # than allowing a Builder snapshot to do so speculatively.
         if new_file.resume_checkpoint_present and not new_file.explicitly_stopped:
             return
 
@@ -2841,6 +2840,8 @@ class ModelUpdater(_ControllerCoreAccess):
         """Recognize explicit stop/zero evidence that revokes a retired floor."""
         if new_file.explicitly_stopped:
             return True
+        if new_file.resume_checkpoint_present:
+            return True
         if new_file.remote_size is None or new_file.remote_size <= 0:
             return False
         # A replacement's zero live counters are not physical reset proof:
@@ -2892,7 +2893,9 @@ class ModelUpdater(_ControllerCoreAccess):
         getattr(
             controller, "_Controller__pending_completion_publications", {},
         ).pop(file_id, None)
-        ModelUpdater._clear_admitted_progress_publications(controller, file_id)
+        ModelUpdater._clear_admitted_progress_publications(
+            controller, file_id, expected_identity,
+        )
         ModelUpdater._clear_published_file_job_identity(
             controller, file_id, expected_identity,
         )
@@ -2923,12 +2926,15 @@ class ModelUpdater(_ControllerCoreAccess):
     @staticmethod
     def _clear_admitted_progress_publications(
         controller: _ControllerCoreAccess, file_id: str,
+        expected_job_identity: Optional[tuple[int, str]] = None,
     ) -> None:
         """Forget live admissions at an explicit lifecycle reset boundary."""
         publications = getattr(controller, "_Controller__admitted_progress_publications", None)
         if isinstance(publications, dict):
             for key in tuple(publications):
-                if isinstance(key, tuple) and len(key) == 2 and key[0] == file_id:
+                if isinstance(key, tuple) and len(key) == 2 and key[0] == file_id and (
+                        expected_job_identity is None or key[1] == expected_job_identity
+                ):
                     publications.pop(key, None)
 
     @staticmethod
@@ -2953,7 +2959,9 @@ class ModelUpdater(_ControllerCoreAccess):
         getattr(
             controller, "_Controller__pending_completion_publications", {},
         ).pop(file_id, None)
-        ModelUpdater._clear_admitted_progress_publications(controller, file_id)
+        ModelUpdater._clear_admitted_progress_publications(
+            controller, file_id, expected_identity,
+        )
         ModelUpdater._clear_published_file_job_identity(
             controller, file_id, expected_identity,
         )
@@ -6578,6 +6586,34 @@ class ModelUpdater(_ControllerCoreAccess):
                 )
                 return callable(identity_proof) and identity_proof(file_id) is True
 
+            def candidate_has_resumable_checkpoint(file_id: str) -> bool:
+                """Recognize physical proof that a retired transfer is incomplete.
+
+                The candidate can still carry ModelBuilder's recent LFTP
+                snapshot, so inspect the authoritative active-scan result as
+                well as the built root.  A valid sidecar means the row must
+                return to its ordinary Queue-resumable lifecycle rather than
+                retaining a completion publication indefinitely.
+                """
+                try:
+                    candidate_file = new_model.get_file(file_id)
+                except ModelError:
+                    candidate_file = None
+                if bool(getattr(candidate_file, "resume_checkpoint_present", False)):
+                    return True
+                if latest_active_scan is None or bool(getattr(latest_active_scan, "failed", False)):
+                    return False
+                for scanned_file in getattr(latest_active_scan, "files", ()):
+                    scanned_id = ModelFile.build_file_id(
+                        getattr(scanned_file, "name", ""),
+                        getattr(scanned_file, "path_pair_id", None),
+                    )
+                    if scanned_id == file_id and bool(
+                            getattr(scanned_file, "status_sidecar_ready", False)
+                    ):
+                        return True
+                return False
+
             def candidate_terminalizable_collision_file_ids() -> set[str]:
                 cached = model_builder.get_terminalizable_staging_collision_file_ids()
                 if authoritative_pair_build is None:
@@ -6635,134 +6671,6 @@ class ModelUpdater(_ControllerCoreAccess):
                 authorized = candidate_verified_staging_identity(file_id) and \
                     candidate_complete_local_coverage(file_id)
                 return authorized
-
-            def pending_completion_authority_generation(
-                    file_id: str,
-            ) -> Optional[tuple[Optional[str], int, Optional[str], int]]:
-                """Whether this candidate can make a later proof-less decision.
-
-                The retained presentation bridges one accepted LFTP retirement
-                into the next reconciled scan candidate.  It is not a lease:
-                only a *later scan generation* that again has complete
-                authority may release the display floor.  Fast no-scan model
-                rebuilds therefore cannot consume the handoff allowance.
-                """
-                if not candidate_lifecycle_allows(file_id):
-                    return None
-                try:
-                    pending_file = new_model.get_file(file_id)
-                except ModelError:
-                    return None
-                path_pair_id = pending_file.path_pair_id
-                if path_pair_id not in reconciled_local_path_pair_ids or \
-                        path_pair_id not in reconciled_remote_path_pair_ids:
-                    return None
-                if not lftp_status_poll_healthy or not bool(getattr(
-                        controller, "_Controller__lftp_idle_status_authoritative", False
-                )):
-                    return None
-                if file_id in active_lftp_status_file_ids or (
-                    path_pair_id is not None and
-                    pending_file.name in active_unscoped_lftp_status_names
-                ):
-                    return None
-                # Standing reconciliation is sufficient to authorize a move,
-                # but not to expire a retained presentation. Expiry needs the
-                # concrete, fresh paired scan generation that re-evaluated
-                # this root after the LFTP handoff.
-                if latest_local_scan is None or latest_remote_scan is None:
-                    return None
-
-                def fresh_scan_authority_includes_pair(
-                        result: ScannerResult,
-                ) -> bool:
-                    if bool(getattr(result, "failed", False)) or \
-                            path_pair_id in set(getattr(result, "unknown_path_pair_ids", set()) or set()):
-                        return False
-                    scanned_ids = set(getattr(result, "scanned_path_pair_ids", set()) or set())
-                    completed_ids = set(getattr(result, "completed_path_pair_ids", set()) or set())
-                    if path_pair_id in completed_ids:
-                        return True
-                    # Legacy non-progress results have only scanned IDs. They
-                    # are authoritative when final; a non-final progress chunk
-                    # must not advance expiry on its own.
-                    return path_pair_id in scanned_ids and bool(
-                        getattr(result, "is_scan_final", True)
-                    )
-
-                if not fresh_scan_authority_includes_pair(latest_local_scan) or \
-                        not fresh_scan_authority_includes_pair(latest_remote_scan):
-                    return None
-                return (
-                    getattr(latest_local_scan, "session_token", None),
-                    scan_generation(latest_local_scan),
-                    getattr(latest_remote_scan, "session_token", None),
-                    scan_generation(latest_remote_scan),
-                )
-
-            def expire_unproven_pending_completion_publications() -> None:
-                """Bound a retained live projection by scan authority, not time.
-
-                One authoritative candidate without proof is expected while a
-                just-retired LFTP job hands off to scanning.  A second later
-                candidate with the same full authority and still no exact
-                staging proof revokes only the presentation floor.  The
-                pending identity remains for the established Stop, Queue,
-                Delete Local, and eventual proven-completion paths.
-                """
-                publications = getattr(
-                    controller, "_Controller__pending_completion_publications", {},
-                )
-                if not isinstance(publications, dict):
-                    return
-                for file_id in self._pending_completion_publication_file_ids(
-                        controller, pending_completion_file_ids(),
-                ):
-                    publication = publications.get(file_id)
-                    if not isinstance(publication, _PendingCompletionPublication):
-                        continue
-                    authority_generation = pending_completion_authority_generation(file_id)
-                    if authority_generation is None:
-                        continue
-                    proof_present = candidate_verified_staging_identity(file_id) and \
-                        candidate_complete_local_coverage(file_id)
-                    if proof_present:
-                        continue
-                    if publication.authoritative_missing_proof_generation is None:
-                        publications[file_id] = _PendingCompletionPublication(
-                            publication.overlay,
-                            publication.job_identity,
-                            authoritative_missing_proof_generation=authority_generation,
-                        )
-                    elif publication.authoritative_missing_proof_generation != authority_generation:
-                        # Retire the original direct projection as well as its
-                        # floor. The identity fence cannot clear a new job's
-                        # overlay if one arrived during this scan boundary.
-                        clear_overlay = getattr(
-                            model, "clear_active_progress_overlay_if_job_identity_matches", None,
-                        )
-                        if callable(clear_overlay) and publication.job_identity is not None:
-                            clear_overlay(file_id, publication.job_identity)
-                        self._invalidate_pending_completion_progress_floor(
-                            controller, file_id,
-                        )
-                        try:
-                            recovery_file = new_model.get_file(file_id)
-                        except ModelError:
-                            continue
-                        # A candidate can have inherited the old rendered
-                        # DOWNLOADING runtime fields during model composition.
-                        # Once the identity-paired projection is revoked, do
-                        # not let those derived fields re-publish the retired
-                        # job. Physical scan facts remain untouched.
-                        if recovery_file.state == ModelFile.State.DOWNLOADING and \
-                                not recovery_file.explicitly_stopped:
-                            recovery_file.state = ModelFile.State.DEFAULT
-                            recovery_file.transferred_size = None
-                            recovery_file.download_progress = None
-                            recovery_file.downloading_speed = None
-                            recovery_file.eta = None
-                            recovery_file.is_stoppable = False
 
             def candidate_has_actionable_unrelated_retry(file_id: str) -> bool:
                 """Keep a stale durable marker from invalidating a pair candidate.
@@ -7139,10 +7047,28 @@ class ModelUpdater(_ControllerCoreAccess):
                             continue
                         terminalize_unresolved_staging_collision(pending_file)
 
-                # Bound each accepted pending-completion projection before
-                # diff application so a second proof-less authoritative scan
-                # publishes the genuine recoverable state in this update.
-                expire_unproven_pending_completion_publications()
+                # A status sidecar is physical evidence of a resumable partial
+                # transfer.  Release only that exact pending transaction
+                # before diffing, so a retained Builder PGET snapshot cannot
+                # repaint it as live progress after the release decision.
+                for pending_file_id in pending_completion_file_ids():
+                    if not candidate_has_resumable_checkpoint(pending_file_id):
+                        continue
+                    self._clear_pending_completion_progress_floor(
+                        controller, pending_file_id,
+                    )
+                    try:
+                        recovery_file = new_model.get_file(pending_file_id)
+                    except ModelError:
+                        continue
+                    if recovery_file.state == ModelFile.State.DOWNLOADING and \
+                            not recovery_file.explicitly_stopped:
+                        recovery_file.state = ModelFile.State.DEFAULT
+                        recovery_file.transferred_size = None
+                        recovery_file.download_progress = None
+                        recovery_file.downloading_speed = None
+                        recovery_file.eta = None
+                        recovery_file.is_stoppable = False
 
                 # Diff the new model with old model.
                 model_diff = ModelDiffUtil.diff_models(model, new_model)

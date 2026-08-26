@@ -2334,7 +2334,7 @@ class TestController(unittest.TestCase):
         self.assertGreater(self.controller.process_wake_generation(), wake_generation)
         self.controller._Controller__process_commands()
 
-        self.controller._Controller__lftp.queue.assert_called_once()
+        self.assertIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
         self.assertIsNone(self.controller._Controller__next_lftp_status_poll_at)
         self.assertFalse(self.controller._Controller__lftp_idle_status_authoritative)
 
@@ -7031,6 +7031,336 @@ class TestController(unittest.TestCase):
         self.controller._Controller__process_commands()
 
         self.assertNotIn(file.file_id, self.controller._Controller__download_start_state)
+
+    def _seed_pending_completion_command_recovery(self, file):
+        identity = (7, LftpJobStatus.Type.PGET.value)
+        self.controller._Controller__model = Model()
+        self.controller._Controller__model.add_file(file)
+        self.controller._Controller__pending_completion_file_names = {
+            (file.name, file.path_pair_id, file.path_pair_name),
+        }
+        self.controller._Controller__pending_completion_progress_floors = {
+            file.file_id: (100, 1000),
+        }
+        self.controller._Controller__pending_completion_progress_floor_identities = {
+            file.file_id: identity,
+        }
+        self.controller._Controller__pending_completion_progress_floor_overlay_ids = {file.file_id}
+        self.controller._Controller__pending_completion_publications = {
+            file.file_id: _PendingCompletionPublication(
+                ActiveProgressOverlay(100, 1000, None, None), identity,
+            ),
+        }
+
+    def test_pending_completion_row_queue_starts_new_lifecycle(self):
+        file = ModelFile("pending-recovery", False)
+        file.remote_size = 1000
+        file.state = ModelFile.State.DOWNLOADING
+        self._seed_pending_completion_command_recovery(file)
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once()
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_publications)
+        self.assertNotIn((file.name, None, None), self.controller._Controller__pending_completion_file_names)
+
+    def test_pending_completion_row_stop_consumes_without_lftp_kill(self):
+        file = ModelFile("pending-recovery", False)
+        file.remote_size = 1000
+        file.state = ModelFile.State.DOWNLOADING
+        self._seed_pending_completion_command_recovery(file)
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.STOP, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.kill.assert_not_called()
+        self.assertIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_publications)
+        callback.on_success.assert_called_once_with()
+
+    def test_pending_completion_row_delete_consumes_after_confirmed_delete(self):
+        file = ModelFile("pending-recovery", False)
+        file.remote_size = 1000
+        file.local_size = 1000
+        file.state = ModelFile.State.DOWNLOADING
+        self._seed_pending_completion_command_recovery(file)
+
+        with patch.object(self.controller, "_Controller__queue_delete_local_process") as queue_delete:
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id))
+            self.controller._Controller__process_commands()
+
+        queue_delete.assert_called_once()
+        self.assertIn(file.file_id, self.controller._Controller__pending_completion_publications)
+        self.controller._Controller__complete_delete_local_lifecycle(file.file_id, None, file.name)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_publications)
+        self.assertNotIn((file.name, None, None), self.controller._Controller__pending_completion_file_names)
+
+    def test_confirmed_delete_clears_pending_completion_lifecycle_without_publication(self):
+        file = ModelFile("pending-no-publication", False)
+        file.remote_size = 1000
+        file.local_size = 1000
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__model = Model()
+        self.controller._Controller__model.add_file(file)
+        self.controller._Controller__pending_completion_file_names = {
+            (file.name, file.path_pair_id, file.path_pair_name),
+        }
+        self.controller._Controller__pending_completion_authority_rebuild_ids = {file.file_id}
+        self.controller._Controller__pending_completion_progress_floors = {file.file_id: (100, 1000)}
+        self.controller._Controller__pending_completion_progress_floor_overlay_ids = {file.file_id}
+        self.controller._Controller__pending_completion_publications = {}
+
+        with patch.object(self.controller, "_Controller__queue_delete_local_process") as queue_delete:
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id))
+            self.controller._Controller__process_commands()
+
+        queue_delete.assert_called_once()
+        self.controller._Controller__complete_delete_local_lifecycle(file.file_id, None, file.name)
+        self.assertNotIn((file.name, None, None), self.controller._Controller__pending_completion_file_names)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_authority_rebuild_ids)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_progress_floors)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_progress_floor_overlay_ids)
+
+    def test_pending_completion_delete_local_blocks_queue_until_success_settles(self):
+        file = ModelFile("pending-recovery", False)
+        file.remote_size = 1000
+        file.local_size = 1000
+        file.state = ModelFile.State.DOWNLOADING
+        self._seed_pending_completion_command_recovery(file)
+        delete = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(delete, file.file_id, file.name, MagicMock(), MagicMock(), True),
+        ]
+        callback = MagicMock()
+        queue = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        queue.add_callback(callback)
+
+        self.controller.queue_command(queue)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_failure.assert_called_once_with(
+            "Local deletion is still pending; Queue was rejected", 409,
+        )
+        self.assertIn(file.file_id, self.controller._Controller__pending_completion_publications)
+
+        self.controller._Controller__active_command_processes = []
+        self.controller._Controller__complete_delete_local_lifecycle(file.file_id, None, file.name)
+        file.local_size = None
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.update_file(file)
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once()
+
+    def test_pending_completion_delete_local_failure_leaves_queue_recoverable(self):
+        file = ModelFile("pending-recovery", False)
+        file.remote_size = 1000
+        file.local_size = 1000
+        file.state = ModelFile.State.DOWNLOADING
+        self._seed_pending_completion_command_recovery(file)
+        delete = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(delete, file.file_id, file.name, MagicMock(), MagicMock(), True),
+        ]
+        blocked = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        blocked_callback = MagicMock()
+        blocked.add_callback(blocked_callback)
+        self.controller.queue_command(blocked)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__active_command_processes = []
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        blocked_callback.on_failure.assert_called_once_with(
+            "Local deletion is still pending; Queue was rejected", 409,
+        )
+        self.controller._Controller__lftp.queue.assert_called_once()
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_publications)
+
+    def test_pending_completion_delete_local_blocks_stop_until_failure_cleanup(self):
+        file = ModelFile("pending-recovery", False)
+        file.remote_size = 1000
+        file.local_size = 1000
+        file.state = ModelFile.State.DOWNLOADING
+        self._seed_pending_completion_command_recovery(file)
+        delete_callback = MagicMock()
+        delete = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        delete.add_callback(delete_callback)
+        failed_process = MagicMock()
+        failed_process.is_alive.return_value = False
+        failed_process.propagate_exception.side_effect = RuntimeError("delete failed")
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(delete, file.file_id, file.name, failed_process, MagicMock(), True),
+        ]
+        blocked_callback = MagicMock()
+        stop = Controller.Command(Controller.Command.Action.STOP, file.file_id)
+        stop.add_callback(blocked_callback)
+
+        self.controller.queue_command(stop)
+        self.controller._Controller__process_commands()
+
+        blocked_callback.on_failure.assert_called_once_with(
+            "Local deletion is still pending; Stop was rejected", 409,
+        )
+        self.assertNotIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
+        self.assertIn(file.file_id, self.controller._Controller__pending_completion_publications)
+
+        self.controller._Controller__cleanup_commands()
+
+        failed_process.propagate_exception.assert_called_once_with()
+        delete_callback.on_failure.assert_called_once_with(
+            "Failed to delete local file 'pending-recovery'", 500,
+        )
+        self.assertEqual([], self.controller._Controller__active_command_processes)
+        self.assertIn(file.file_id, self.controller._Controller__pending_completion_publications)
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.assertIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_publications)
+        self.controller._Controller__lftp.kill.assert_not_called()
+
+    def test_queue_then_delete_local_same_drain_rejects_delete(self):
+        file = ModelFile("queue-delete", False)
+        file.remote_size = 1000
+        file.local_size = 1000
+        self.controller._Controller__model.get_file.return_value = file
+        callback = MagicMock()
+        delete = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        delete.add_callback(callback)
+
+        # Queue admission is accepted before its LFTP operation can publish a
+        # status.  Keep that operation pending to exercise the exact same
+        # command-drain race against Delete Local.
+        with (
+                patch.object(self.controller, "_Controller__uses_async_lftp_owner", return_value=True),
+                patch.object(
+                    self.controller,
+                    "_Controller__submit_lftp_operation",
+                    side_effect=lambda *_args, **_kwargs: (
+                        self.controller.queue_command(delete) or True
+                    ),
+                ) as submit,
+        ):
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+            self.controller._Controller__process_commands()
+
+        submit.assert_called_once()
+        callback.on_failure.assert_called_once_with(
+            "Transfer is still pending or active; Delete Local was rejected", 409,
+        )
+        self.assertEqual([], self.controller._Controller__active_command_processes)
+
+    def test_delete_local_waits_for_queue_settlement_then_admits(self):
+        file = ModelFile("queue-delete", False)
+        file.remote_size = 1000
+        file.local_size = 1000
+        self.controller._Controller__model.get_file.return_value = file
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.assertIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+
+        blocked = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        blocked_callback = MagicMock()
+        blocked.add_callback(blocked_callback)
+        self.controller.queue_command(blocked)
+        self.controller._Controller__process_commands()
+
+        blocked_callback.on_failure.assert_called_once_with(
+            "Transfer is still pending or active; Delete Local was rejected", 409,
+        )
+        self.controller._Controller__pending_queue_dispatches.pop(file.file_id)
+        with patch.object(self.controller, "_Controller__queue_delete_local_process") as queue_delete:
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id))
+            self.controller._Controller__process_commands()
+
+        queue_delete.assert_called_once()
+
+    def test_delete_local_preserves_deferred_queue_until_retry_dispatches(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        queue_callback = MagicMock()
+        queue = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        queue.add_callback(queue_callback)
+
+        self.controller.queue_command(queue)
+        self.controller._Controller__process_commands()
+        intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+        self.assertEqual("initial_rescan", intent.phase)
+
+        delete_callback = MagicMock()
+        delete = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        delete.add_callback(delete_callback)
+        with patch.object(self.controller, "_Controller__queue_delete_local_process") as queue_delete:
+            self.controller.queue_command(delete)
+            self.controller._Controller__process_commands()
+
+        delete_callback.on_failure.assert_called_once_with(
+            "Transfer is still pending or active; Delete Local was rejected", 409,
+        )
+        queue_delete.assert_not_called()
+        self.assertIs(intent, self.controller._Controller__deferred_queue_intents[file.file_id])
+
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {"pair-a": ("local-test-session", 1)},
+            "remote": {"pair-a": ("remote-test-session", 1)},
+        }
+        self.controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+        self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            file.name,
+            True,
+            remote_base_dir_path="/remote",
+            local_base_dir_path="/local/incomplete",
+        )
+        self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        queue_callback.on_success.assert_called_once_with()
+
+    def test_delete_local_cannot_overtake_ready_deferred_queue_handoff(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        queue = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+
+        self.controller.queue_command(queue)
+        self.controller._Controller__process_commands()
+        self.assertIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {"pair-a": ("local-test-session", 1)},
+            "remote": {"pair-a": ("remote-test-session", 1)},
+        }
+        self.controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+        self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+        delete_callback = MagicMock()
+        delete = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        delete.add_callback(delete_callback)
+
+        with patch.object(self.controller, "_Controller__queue_delete_local_process") as queue_delete:
+            # Delete is already queued when retry preparation consumes the
+            # intent and appends its Queue command behind it.
+            self.controller.queue_command(delete)
+            self.controller._Controller__process_commands()
+
+        delete_callback.on_failure.assert_called_once_with(
+            "Transfer is still pending or active; Delete Local was rejected", 409,
+        )
+        queue_delete.assert_not_called()
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            file.name,
+            True,
+            remote_base_dir_path="/remote",
+            local_base_dir_path="/local/incomplete",
+        )
+        self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
 
     def test_process_commands_completed_file_does_not_arm_without_delete_reset(self):
         file = ModelFile("dup", False)
@@ -12299,6 +12629,10 @@ class TestController(unittest.TestCase):
         self.controller._Controller__pending_completion_file_names = {
             (file.name, file.path_pair_id, file.path_pair_name)
         }
+        self.controller._Controller__pending_completion_authority_rebuild_ids = {file.file_id}
+        self.controller._Controller__pending_completion_progress_floors = {file.file_id: (100, 1000)}
+        self.controller._Controller__pending_completion_progress_floor_overlay_ids = {file.file_id}
+        self.controller._Controller__pending_completion_publications = {}
         self.controller._Controller__move_retry_due[file.file_id] = datetime.now() + timedelta(seconds=30)
         self.controller._Controller__deferred_move_file_ids.add(file.file_id)
         self.controller._Controller__move_attempt_reservations.add(file.file_id)
@@ -12316,6 +12650,9 @@ class TestController(unittest.TestCase):
         self.assertNotIn(file.file_id, self.controller._Controller__deferred_move_file_ids)
         self.assertNotIn(file.file_id, self.controller._Controller__move_attempt_reservations)
         self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_authority_rebuild_ids)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_progress_floors)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_progress_floor_overlay_ids)
         self.assertNotIn(file.file_id, self.controller._Controller__persist.final_move_succeeded_file_names)
         self.controller._Controller__model_builder.set_move_failed_files.assert_called()
 

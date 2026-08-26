@@ -11404,8 +11404,8 @@ class TestModelUpdater(unittest.TestCase):
             controller._Controller__pending_completion_progress_floors[file_id],
         )
 
-    def test_pending_completion_overlay_expires_only_after_later_authoritative_scan_generation(self):
-        """Rapid rebuilds cannot consume the one-generation scan handoff."""
+    def test_pending_completion_overlay_survives_later_proofless_scan_generations(self):
+        """A later proof-less scan cannot replace a retired job's publication."""
         file_name = "pending.bin"
         file_id = ModelFile.build_file_id(file_name, None)
         remote = SystemFile(file_name, 100, False)
@@ -11453,28 +11453,28 @@ class TestModelUpdater(unittest.TestCase):
                 first_local, first_local, scan_generation(2)[1],
             ]
 
-            # The first fully authoritative scan accepts the temporary handoff.
+            # The first fully authoritative scan observes no physical proof.
             ModelUpdater(controller).update()
             self.assertEqual(ModelFile.State.DOWNLOADING, controller._Controller__model.get_file(file_id).state)
-            publication = controller._Controller__pending_completion_publications[file_id]
-            self.assertEqual(("local-session", 1, "remote-session", 1), publication.authoritative_missing_proof_generation)
+            self.assertIn(file_id, controller._Controller__pending_completion_publications)
 
             # A rapid rebuild of that same scan generation cannot revoke it.
             ModelUpdater(controller).update()
             self.assertEqual(ModelFile.State.DOWNLOADING, controller._Controller__model.get_file(file_id).state)
             self.assertIn(file_id, controller._Controller__pending_completion_publications)
 
-            # A later reconciled generation still has no physical proof: publish
-            # the ordinary recoverable DEFAULT state rather than fake downloading.
+            # A later reconciled generation still has no physical proof. Its
+            # retained Builder snapshot is diagnostic, not publication authority.
             ModelUpdater(controller).update()
             published = controller._Controller__model.get_file(file_id)
-            self.assertEqual(ModelFile.State.DEFAULT, published.state)
-            self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
+            self.assertEqual(ModelFile.State.DOWNLOADING, published.state)
+            self.assertEqual(99, published.download_progress)
+            self.assertIn(file_id, controller._Controller__pending_completion_publications)
             self.assertIn((file_name, None, None), controller._Controller__pending_completion_file_names)
             self.assertNotIn(file_id, controller._Controller__persist.stopped_file_names)
 
-    def test_pending_completion_overlay_expiry_requires_matching_pair_scans(self):
-        """Unrelated or mixed-pair scans must not expire pair A's handoff."""
+    def test_pending_completion_overlay_survives_matching_proofless_pair_scans(self):
+        """Neither unrelated nor matching proof-less scans release pair A."""
         file_name = "pending.bin"
         pair_a = "pair-a"
         pair_b = "pair-b"
@@ -11555,28 +11555,24 @@ class TestModelUpdater(unittest.TestCase):
                 scan_event(pair_a, 4, "local"),
             ]
 
-            # A paired A scan arms the generation fence.
+            # A paired A scan without proof leaves the transaction in place.
             ModelUpdater(controller).update()
-            publication = controller._Controller__pending_completion_publications[file_id]
-            self.assertEqual(("local-session", 1, "remote-session", 1),
-                             publication.authoritative_missing_proof_generation)
+            self.assertIn(file_id, controller._Controller__pending_completion_publications)
 
             # Newer scans of B must not advance A's fence.
             ModelUpdater(controller).update()
-            publication = controller._Controller__pending_completion_publications[file_id]
-            self.assertEqual(("local-session", 1, "remote-session", 1),
-                             publication.authoritative_missing_proof_generation)
+            self.assertIn(file_id, controller._Controller__pending_completion_publications)
 
             # A local-A/remote-B boundary is also insufficient for A.
             ModelUpdater(controller).update()
-            publication = controller._Controller__pending_completion_publications[file_id]
-            self.assertEqual(("local-session", 1, "remote-session", 1),
-                             publication.authoritative_missing_proof_generation)
+            self.assertIn(file_id, controller._Controller__pending_completion_publications)
 
-            # Only a later paired A scan may revoke the proof-less projection.
+            # A later paired A scan remains diagnostic without exact proof.
             ModelUpdater(controller).update()
-            self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
-            self.assertEqual(ModelFile.State.DEFAULT, controller._Controller__model.get_file(file_id).state)
+            published = controller._Controller__model.get_file(file_id)
+            self.assertIn(file_id, controller._Controller__pending_completion_publications)
+            self.assertEqual(ModelFile.State.DOWNLOADING, published.state)
+            self.assertEqual(99, published.download_progress)
 
     def test_pending_completion_floor_preservation_keeps_accepted_overlay_state(self):
         file_name = "pending.bin"
@@ -12110,6 +12106,24 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(100, incomplete.download_progress)
         self.assertNotEqual("stopped", Controller._model_record_visible_state(incomplete))
 
+        # A later proof-less candidate may contain a lower retained PGET
+        # snapshot, but it is diagnostic while this exact completion
+        # transaction remains pending.
+        later_incomplete = ModelFile("release", False)
+        later_incomplete.remote_size = 1050
+        later_incomplete.local_size = 1000
+        later_incomplete.local_present = True
+        later_incomplete.remote_has_transferable_content = True
+        later_incomplete.transferred_size = 980
+        later_incomplete.download_progress = 98
+        later_incomplete.state = ModelFile.State.DEFAULT
+        ModelUpdater._apply_pending_completion_progress_floor(
+            later_incomplete, {file_id}, 100, 1000, {file_id}, publication_file_ids,
+        )
+        self.assertEqual(ModelFile.State.DOWNLOADING, later_incomplete.state)
+        self.assertEqual(100, later_incomplete.download_progress)
+        self.assertNotEqual("stopped", Controller._model_record_visible_state(later_incomplete))
+
     def test_no_diff_terminal_completion_clears_provenance_before_late_same_identity_retirement(self):
         """A no-diff terminal handoff cannot be reused by a late retirement."""
         file_id = ModelFile.build_file_id("release", None)
@@ -12248,10 +12262,16 @@ class TestModelUpdater(unittest.TestCase):
                 ActiveProgressOverlay(99, 990, None, None), stale_identity,
             ),
         }
+        controller._Controller__admitted_progress_publications = {
+            (file_id, current_identity): ActiveProgressOverlay(100, 1000, None, None),
+        }
 
         ModelUpdater._invalidate_pending_completion_progress_floor(controller, file_id)
 
         self.assertEqual(current_identity, model.published_file_job_identity(file_id))
+        self.assertIn(
+            (file_id, current_identity), controller._Controller__admitted_progress_publications,
+        )
         ModelUpdater(controller)._handle_lftp_completion_detection(
             [], True, retired_job_identities={file_id: current_identity},
             lftp_status_poll_authoritative=True, lftp_status_snapshot_fresh=True,
