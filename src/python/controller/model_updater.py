@@ -5775,14 +5775,137 @@ class ModelUpdater(_ControllerCoreAccess):
                             break
                         replacement_roots.append((old_file, new_file))
                 if replacement_roots:
+                    retained_overlays: dict[str, ActiveProgressOverlay] = {}
+                    retained_overlay_identities: dict[str, tuple[int, str]] = {}
+                    existing_overlays: dict[str, ActiveProgressOverlay] = {}
+                    existing_identities: dict[str, tuple[int, str]] = {}
+                    overlay_snapshot_reader = getattr(model, "active_progress_overlays_snapshot", None)
+                    identity_snapshot_reader = getattr(
+                        model, "active_progress_overlay_job_identities_snapshot", None,
+                    )
+                    if callable(overlay_snapshot_reader) and callable(identity_snapshot_reader):
+                        try:
+                            existing_overlays = overlay_snapshot_reader()
+                            existing_identities = identity_snapshot_reader()
+                        except (AttributeError, TypeError):
+                            existing_overlays = {}
+                            existing_identities = {}
+                        if isinstance(existing_overlays, dict) and isinstance(existing_identities, dict):
+                            statuses_by_file_id = {
+                                status.file_id: status for status in lftp_statuses
+                                if isinstance(getattr(status, "file_id", None), str)
+                            }
+                            for old_file, _new_file in replacement_roots:
+                                file_id = old_file.file_id
+                                overlay = existing_overlays.get(file_id)
+                                identity = existing_identities.get(file_id)
+                                status = statuses_by_file_id.get(file_id)
+                                raw_size_local = getattr(
+                                    getattr(status, "total_transfer_state", None),
+                                    "size_local", None,
+                                )
+                                status_id = getattr(status, "id", None)
+                                status_type = getattr(getattr(status, "type", None), "value", None)
+                                current_identity = (
+                                    (status_id, status_type)
+                                    if status is not None and type(status_id) is int and
+                                    status_id >= 0 and isinstance(status_type, str)
+                                    else None
+                                )
+                                explicitly_stopped = getattr(old_file, "explicitly_stopped", False)
+                                stop_checker = getattr(
+                                    controller, "_Controller__is_explicitly_stopped", None,
+                                )
+                                if callable(stop_checker):
+                                    try:
+                                        explicitly_stopped = explicitly_stopped or bool(
+                                            stop_checker(old_file.full_path, old_file.path_pair_id),
+                                        )
+                                    except Exception:
+                                        explicitly_stopped = True
+                                else:
+                                    explicitly_stopped = True
+                                # Active-delta adoption normally replaces the
+                                # root and Model.update_file clears overlays.
+                                # Keep a newer presentation counter only for
+                                # the same live job; an explicit zero remains
+                                # the reset boundary and all lifecycle/type
+                                # changes fail closed through normal adoption.
+                                if isinstance(overlay, ActiveProgressOverlay) and \
+                                        isinstance(identity, tuple) and len(identity) == 2 and \
+                                        current_identity == identity and status is not None and \
+                                        status.state == LftpJobStatus.State.RUNNING and \
+                                        raw_size_local != 0 and not explicitly_stopped:
+                                    retained_overlays[file_id] = overlay
+                                    retained_overlay_identities[file_id] = identity
+                        else:
+                            existing_overlays = {}
+                            existing_identities = {}
+
+                    replacement_file_ids = {
+                        old_file.file_id for old_file, _new_file in replacement_roots
+                    }
+                    restore_overlays = {
+                        file_id: overlay
+                        for file_id, overlay in existing_overlays.items()
+                        if file_id not in replacement_file_ids and
+                        isinstance(overlay, ActiveProgressOverlay) and
+                        file_id in existing_identities
+                    }
+                    restore_overlay_identities = {
+                        file_id: existing_identities[file_id]
+                        for file_id in restore_overlays
+                    }
+                    retire_overlay_file_ids = replacement_file_ids.difference(retained_overlays)
+
+                    def max_positive_counter(previous: object, current: object) -> object:
+                        if type(previous) is int and previous > 0:
+                            if type(current) is int and current > 0:
+                                return max(previous, current)
+                            return previous
+                        return current
+
+                    for old_file, new_file in replacement_roots:
+                        file_id = old_file.file_id
+                        overlay = retained_overlays.get(file_id)
+                        if overlay is not None:
+                            retained_overlays[file_id] = ActiveProgressOverlay(
+                                max_positive_counter(
+                                    overlay.download_progress,
+                                    getattr(new_file, "download_progress", None),
+                                ),
+                                max_positive_counter(
+                                    overlay.transferred_size,
+                                    getattr(new_file, "transferred_size", None),
+                                ),
+                                getattr(new_file, "downloading_speed", None),
+                                getattr(new_file, "eta", None),
+                            )
+                    restore_overlays.update(retained_overlays)
+                    restore_overlay_identities.update(retained_overlay_identities)
+
+                    def apply_replacement_roots() -> None:
+                        nonlocal active_transfer_delta_applied, next_tree_count
+                        for old_file, new_file in replacement_roots:
+                            if old_file != new_file:
+                                model.update_file(new_file)
+                                next_tree_count += tree_file_count(new_file) - tree_file_count(old_file)
+                                active_transfer_delta_applied = True
+
                     _record_progress_lineage(
                         controller, lftp_status_poll_correlation, "active_delta_adoption",
                     )
-                    for old_file, new_file in replacement_roots:
-                        if old_file != new_file:
-                            model.update_file(new_file)
-                            next_tree_count += tree_file_count(new_file) - tree_file_count(old_file)
-                            active_transfer_delta_applied = True
+                    retain_overlays = getattr(model, "apply_with_active_progress_retained", None)
+                    restore_overlay_fn = getattr(model, "restore_active_progress_overlays", None)
+                    if existing_overlays and callable(retain_overlays):
+                        retain_overlays(
+                            apply_replacement_roots,
+                            retire_file_ids=retire_overlay_file_ids,
+                        )
+                    else:
+                        apply_replacement_roots()
+                    if retained_overlays and callable(restore_overlay_fn):
+                        restore_overlay_fn(restore_overlays, restore_overlay_identities)
                     if active_transfer_delta_applied:
                         model.set_tree_file_count(max(0, next_tree_count))
                         refresh_identities = getattr(

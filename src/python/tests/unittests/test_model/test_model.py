@@ -55,6 +55,61 @@ class TestLftpModel(unittest.TestCase):
         self.assertEqual(3, published.eta)
         self.assertIsNot(published, replacement)
 
+    def test_retired_equal_root_refreshes_base_without_unrelated_notification(self):
+        active = ModelFile("active", False)
+        active.state = ModelFile.State.DOWNLOADING
+        active.is_stoppable = True
+        active.download_progress = 10
+        active.transferred_size = 10
+        other = ModelFile("other", False)
+        other.state = ModelFile.State.DOWNLOADING
+        other.is_stoppable = True
+        other.download_progress = 25
+        other.transferred_size = 25
+        self.model.add_file(active)
+        self.model.add_file(other)
+        overlays = {
+            active.file_id: ActiveProgressOverlay(60, 60, 12, 6),
+            other.file_id: ActiveProgressOverlay(25, 25, 7, 9),
+        }
+        identities = {
+            active.file_id: (7, "pget"),
+            other.file_id: (8, "pget"),
+        }
+        self.assertEqual(
+            ({active.file_id, other.file_id}, "accepted"),
+            self.model.publish_active_lftp_root_counters(
+                overlays, identities, lambda _: True,
+            ),
+        )
+        listener = MagicMock()
+        self.model.add_listener(listener)
+
+        # The equal root models the active-delta replacement that carries a
+        # changed job identity or explicit zero but no topology difference.
+        self.model.apply_with_active_progress_retained(
+            lambda: None, retire_file_ids={active.file_id},
+        )
+
+        published = self.model.published_file(active.file_id)
+        self.assertIsNotNone(published)
+        assert published is not None
+        self.assertEqual((10, 10), (published.transferred_size, published.download_progress))
+        self.assertIsNone(self.model.active_progress_overlay(active.file_id))
+        self.assertEqual(overlays[other.file_id], self.model.active_progress_overlay(other.file_id))
+        self.assertEqual(
+            (25, 25),
+            (
+                self.model.published_file(other.file_id).transferred_size,
+                self.model.published_file(other.file_id).download_progress,
+            ),
+        )
+        self.assertEqual(1, listener.model_version_changed.call_count)
+        self.assertEqual(active.file_id, listener.model_version_changed.call_args.args[2])
+        self.assertEqual(1, listener.model_version_published.call_count)
+        self.assertEqual(active.file_id, listener.model_version_published.call_args.args[3])
+        listener.file_updated.assert_not_called()
+
     def test_lftp_root_counter_publish_rejects_stale_lifecycle_and_clears_projection(self):
         file = ModelFile("active", False)
         file.state = ModelFile.State.DOWNLOADING

@@ -3760,6 +3760,245 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(frozenset({"pair-a"}), builder.unknown_local_path_pair_ids_snapshot())
         builder.build_model.assert_not_called()
 
+    def test_active_delta_preserves_same_job_overlay_floor_through_root_replacement(self):
+        pair_id = "pair-a"
+        remote = SystemFile("active.bin", 32_000_000, False)
+        remote.path_pair_id = pair_id
+        other_remote = SystemFile("other.bin", 20_000_000, False)
+        other_remote.path_pair_id = pair_id
+        builder = ModelBuilder()
+        builder.set_remote_files([remote, other_remote])
+        initial = LftpJobStatus(
+            7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        initial.path_pair_id = pair_id
+        initial.total_transfer_state = LftpJobStatus.TransferState(15_400_000, 32_000_000, 48, 10, 8)
+        local = SystemFile("active.bin", 15_400_000, False, is_staging=True)
+        local.path_pair_id = pair_id
+        local.status_sidecar_ready = True
+        other_local = SystemFile("other.bin", 10_000_000, False, is_staging=True)
+        other_local.path_pair_id = pair_id
+        other_local.status_sidecar_ready = True
+        other_initial = LftpJobStatus(
+            8, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "other.bin", "",
+        )
+        other_initial.path_pair_id = pair_id
+        other_initial.total_transfer_state = LftpJobStatus.TransferState(5_000_000, 20_000_000, 25, 7, 9)
+        builder.set_local_files([local, other_local])
+        builder.set_lftp_statuses([initial, other_initial])
+        live_model = builder.build_model()
+        file_id = ModelFile.build_file_id("active.bin", pair_id)
+        other_file_id = ModelFile.build_file_id("other.bin", pair_id)
+        identity = {
+            file_id: (7, LftpJobStatus.Type.PGET.value),
+            other_file_id: (8, LftpJobStatus.Type.PGET.value),
+        }
+        self.assertEqual(
+            ({file_id, other_file_id}, "accepted"),
+            live_model.publish_active_lftp_root_counters(
+                {
+                    file_id: ActiveProgressOverlay(60, 19_200_000, 12, 6),
+                    other_file_id: ActiveProgressOverlay(25, 5_000_000, 7, 9),
+                },
+                identity,
+                lambda _file_id: True,
+            ),
+        )
+        listener = MagicMock()
+        live_model.add_listener(listener)
+
+        def assert_no_other_root_listener_update() -> None:
+            for event in listener.file_updated.call_args_list:
+                self.assertNotEqual(other_file_id, event.args[0].file_id)
+                self.assertNotEqual(other_file_id, event.args[1].file_id)
+            for event in listener.model_version_changed.call_args_list:
+                self.assertNotEqual(other_file_id, event.args[2])
+            for event in listener.model_version_published.call_args_list:
+                self.assertNotEqual(other_file_id, event.args[3])
+            listener.reset_mock()
+
+        # Make this tick use the scoped active-delta replacement path. The
+        # current Builder snapshot is 48, while Model's accepted live overlay
+        # is the newer 60% checkpoint.
+        active = SystemFile("active.bin", 15_400_000, False, is_staging=True)
+        active.path_pair_id = pair_id
+        active.status_sidecar_ready = True
+        builder.set_active_files([active])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {pair_id: MagicMock()}
+        current_active = LftpJobStatus(
+            7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        current_active.total_transfer_state = LftpJobStatus.TransferState(15_400_000, 32_000_000, 48, 10, 8)
+        current_active.path_pair_id = pair_id
+        current_other = LftpJobStatus(
+            8, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "other.bin", "",
+        )
+        current_other.total_transfer_state = LftpJobStatus.TransferState(5_000_000, 20_000_000, 25, 7, 9)
+        current_other.path_pair_id = pair_id
+        controller._Controller__lftp.status.return_value = [current_active, current_other]
+        builder.has_only_live_progress_with_active_scan = MagicMock(return_value=False)
+
+        ModelUpdater(controller).update()
+
+        overlay = live_model.active_progress_overlay(file_id)
+        self.assertIsNotNone(overlay)
+        assert overlay is not None
+        self.assertEqual((19_200_000, 60), (overlay.transferred_size, overlay.download_progress))
+        self.assertEqual((10, 8), (overlay.downloading_speed, overlay.eta))
+        self.assertEqual(19_200_000, live_model.published_file(file_id).transferred_size)
+        other_overlay = live_model.active_progress_overlay(other_file_id)
+        self.assertEqual(
+            ActiveProgressOverlay(25, 5_000_000, 7, 9), other_overlay,
+        )
+        self.assertEqual(
+            (8, LftpJobStatus.Type.PGET.value),
+            live_model.active_progress_overlay_job_identities_snapshot()[other_file_id],
+        )
+        other_published = live_model.published_file(other_file_id)
+        assert other_published is not None
+        self.assertEqual(
+            (5_000_000, 25, 7, 9),
+            (
+                other_published.transferred_size,
+                other_published.download_progress,
+                other_published.downloading_speed,
+                other_published.eta,
+            ),
+        )
+        assert_no_other_root_listener_update()
+
+        # A later same-job forward pulse must win the counter merge while its
+        # current rate metadata replaces the stale prior presentation.
+        forward_active = SystemFile(
+            "active.bin", 15_400_001, False, is_staging=True, mtime_ns=2,
+        )
+        forward_active.path_pair_id = pair_id
+        forward_active.status_sidecar_ready = True
+        builder.set_active_files([forward_active])
+        forward = LftpJobStatus(
+            7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        forward.path_pair_id = pair_id
+        forward.total_transfer_state = LftpJobStatus.TransferState(25_600_000, 32_000_000, 80, 21, 3)
+        controller._Controller__lftp.status.return_value = [forward, current_other]
+        controller._Controller__next_lftp_status_poll_at = None
+
+        ModelUpdater(controller).update()
+
+        overlay = live_model.active_progress_overlay(file_id)
+        self.assertIsNotNone(overlay)
+        assert overlay is not None
+        self.assertEqual((25_600_000, 80, 21, 3), (
+            overlay.transferred_size,
+            overlay.download_progress,
+            overlay.downloading_speed,
+            overlay.eta,
+        ))
+        self.assertEqual(25_600_000, live_model.published_file(file_id).transferred_size)
+        self.assertEqual(
+            ActiveProgressOverlay(25, 5_000_000, 7, 9),
+            live_model.active_progress_overlay(other_file_id),
+        )
+        assert_no_other_root_listener_update()
+
+        # A replacement job identity must retire the prior live projection,
+        # even when the replacement still reports a positive counter.
+        replacement_active = SystemFile(
+            "active.bin", 15_400_002, False, is_staging=True, mtime_ns=3,
+        )
+        replacement_active.path_pair_id = pair_id
+        replacement_active.status_sidecar_ready = True
+        builder.set_active_files([replacement_active])
+        replacement = LftpJobStatus(
+            9, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        replacement.path_pair_id = pair_id
+        replacement.total_transfer_state = LftpJobStatus.TransferState(16_000_000, 32_000_000, 50, 15, 5)
+        controller._Controller__lftp.status.return_value = [replacement, current_other]
+        controller._Controller__next_lftp_status_poll_at = None
+
+        ModelUpdater(controller).update()
+
+        self.assertIsNone(live_model.active_progress_overlay(file_id))
+        self.assertNotIn(
+            file_id, live_model.active_progress_overlay_job_identities_snapshot(),
+        )
+        self.assertEqual(
+            ActiveProgressOverlay(25, 5_000_000, 7, 9),
+            live_model.active_progress_overlay(other_file_id),
+        )
+        self.assertEqual(
+            (8, LftpJobStatus.Type.PGET.value),
+            live_model.active_progress_overlay_job_identities_snapshot()[other_file_id],
+        )
+        other_published = live_model.published_file(other_file_id)
+        assert other_published is not None
+        self.assertEqual(
+            (5_000_000, 25),
+            (other_published.transferred_size, other_published.download_progress),
+        )
+        assert_no_other_root_listener_update()
+
+        # Re-admit the new identity so the explicit-zero reset remains covered
+        # independently of the replacement-identity retirement above.
+        self.assertEqual(
+            ({file_id}, "accepted"),
+            live_model.publish_active_lftp_root_counters(
+                {
+                    file_id: ActiveProgressOverlay(50, 16_000_000, 15, 5),
+                    other_file_id: ActiveProgressOverlay(25, 5_000_000, 7, 9),
+                },
+                {
+                    file_id: (9, LftpJobStatus.Type.PGET.value),
+                    other_file_id: (8, LftpJobStatus.Type.PGET.value),
+                },
+                lambda _file_id: True,
+            ),
+        )
+
+        # A same-job zero is an explicit reset, so the retained overlay must
+        # be retired on the next active-delta replacement.
+        reset_active = SystemFile(
+            "active.bin", 15_400_003, False, is_staging=True, mtime_ns=4,
+        )
+        reset_active.path_pair_id = pair_id
+        reset_active.status_sidecar_ready = True
+        builder.set_active_files([reset_active])
+        reset = LftpJobStatus(
+            9, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        reset.path_pair_id = pair_id
+        reset.total_transfer_state = LftpJobStatus.TransferState(0, 32_000_000, 0, 0, 0)
+        controller._Controller__lftp.status.return_value = [reset, current_other]
+        controller._Controller__next_lftp_status_poll_at = None
+
+        ModelUpdater(controller).update()
+
+        self.assertIsNone(live_model.active_progress_overlay(file_id))
+        self.assertEqual(
+            ActiveProgressOverlay(25, 5_000_000, 7, 9),
+            live_model.active_progress_overlay(other_file_id),
+        )
+        self.assertEqual(
+            (8, LftpJobStatus.Type.PGET.value),
+            live_model.active_progress_overlay_job_identities_snapshot()[other_file_id],
+        )
+        other_published = live_model.published_file(other_file_id)
+        assert other_published is not None
+        self.assertEqual(
+            (5_000_000, 25),
+            (other_published.transferred_size, other_published.download_progress),
+        )
+        assert_no_other_root_listener_update()
+
     def test_active_delta_lineage_selector_failure_stops_before_builder(self):
         controller, builder, trace = self._make_active_delta_lineage_fixture()
         builder.active_transfer_delta_file_ids = MagicMock(return_value=None)

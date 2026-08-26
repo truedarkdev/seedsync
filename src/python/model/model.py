@@ -343,25 +343,51 @@ class Model:
         """Return the live overlay job identities for one updater transaction."""
         return dict(self.__active_progress_overlay_job_identities)
 
-    def apply_with_active_progress_retained(self, operation: Callable[[], object]) -> object:
+    def apply_with_active_progress_retained(
+            self,
+            operation: Callable[[], object],
+            retire_file_ids: Optional[Set[str]] = None,
+    ) -> object:
         """Apply a replacement mutation without publishing an interim base.
 
         ModelUpdater uses this only after it has admitted the same live job
         for restoration across an authoritative replacement.  The normal
         mutation methods still own their notifications; their publication
-        snapshots retain the admitted overlay until the explicit restore or
-        retirement decision immediately following the replacement.
+        snapshots retain admitted overlays until the explicit restore or
+        retirement decision immediately following the replacement.  Selected
+        roots in ``retire_file_ids`` are removed before the operation so a
+        replacement cannot publish their stale live projection while unrelated
+        roots remain retained.
         """
+        retired_file_ids = {
+            file_id for file_id in (retire_file_ids or set())
+            if isinstance(file_id, str)
+        }
         retained_before = {
             file_id: self.__full_effective_file(file)
             for file_id, file in self.__files_by_id.items()
             if file_id in self.__active_progress_overlays
         }
+        for file_id in retired_file_ids:
+            self.__active_progress_overlays.pop(file_id, None)
+            self.__active_progress_overlay_job_identities.pop(file_id, None)
+            self.__legacy_overlay_correction_file_ids.discard(file_id)
+            self.__legacy_overlay_correction_old_files.pop(file_id, None)
         self.__suppress_active_progress_clear += 1
         try:
             return operation()
         finally:
             self.__suppress_active_progress_clear -= 1
+            for file_id in sorted(retired_file_ids):
+                file = self.__files_by_id.get(file_id)
+                if file is None:
+                    continue
+                previous_published = self.__published_files_by_id.get(file_id)
+                new_published = self.__refresh_published_file(file)
+                if previous_published is not None and previous_published == new_published:
+                    continue
+                global_version, scope_version = self.__advance_version(file)
+                self.__notify_versioned_change(file, global_version, scope_version)
             for file_id, old_file in retained_before.items():
                 if file_id in self.__active_progress_overlays and file_id in self.__files_by_id:
                     self.__legacy_overlay_correction_file_ids.add(file_id)
