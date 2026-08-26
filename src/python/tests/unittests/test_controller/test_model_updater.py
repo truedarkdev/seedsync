@@ -9719,6 +9719,32 @@ class TestModelUpdater(unittest.TestCase):
 
         controller._Controller__move_from_staging.assert_called_once_with("pending.bin", "pair-b")
 
+    def test_v092_pending_completion_authority_wake_retries_quiet_no_diff(self):
+        controller = self._make_v092_pending_completion_controller()
+        controller._Controller__reconciled_local_path_pair_ids = set()
+        controller._Controller__reconciled_remote_path_pair_ids = set()
+        builder = controller._Controller__model_builder
+        file_id = ModelFile.build_file_id("pending.bin", None)
+
+        with patch.object(builder, "request_rebuild", wraps=builder.request_rebuild) as request_rebuild, \
+                patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+            self.assertEqual(0, request_rebuild.call_count)
+            self.assertEqual(0, controller._Controller__move_from_staging.call_count)
+            self.assertIn(
+                ("pending.bin", None, None), controller._Controller__pending_completion_file_names,
+            )
+
+            controller._Controller__reconciled_local_path_pair_ids = {None}
+            controller._Controller__reconciled_remote_path_pair_ids = {None}
+            ModelUpdater(controller).update()
+
+        request_rebuild.assert_called_once_with()
+        controller._Controller__move_from_staging.assert_called_once_with("pending.bin", None)
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        self.assertEqual({file_id}, controller._Controller__persist.downloaded_file_names)
+        self.assertNotIn(file_id, controller._Controller__persist.stopped_file_names)
+
     def test_v092_pending_completion_failure_retries_after_existing_delay(self):
         controller = self._make_v092_pending_completion_controller()
         controller._Controller__move_from_staging.side_effect = [

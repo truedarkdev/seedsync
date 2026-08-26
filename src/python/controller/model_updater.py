@@ -2475,6 +2475,7 @@ class _ControllerCoreAccess:
     _Controller__next_active_scan_force_at: Optional[datetime]
     _Controller__prev_downloading_file_names: set[tuple[str, Optional[str], Optional[str]]]
     _Controller__pending_completion_file_names: set[tuple[str, Optional[str], Optional[str]]]
+    _Controller__pending_completion_authority_rebuild_ids: set[str]
     _Controller__active_scan_lftp_roots_awaiting: set[str]
     _Controller__active_scan_lftp_roots_seen: set[str]
     _Controller__pending_completion_progress_floors: dict[str, tuple[Optional[int], Optional[int]]]
@@ -3281,6 +3282,11 @@ class ModelUpdater(_ControllerCoreAccess):
                     local_scan_forced=True,
                 )
             controller._Controller__pending_completion_file_names.update(just_completed_file_names)
+            pending_authority_rebuild_ids = getattr(
+                controller, "_Controller__pending_completion_authority_rebuild_ids", None,
+            )
+            if isinstance(pending_authority_rebuild_ids, set):
+                pending_authority_rebuild_ids.difference_update(completed_file_ids)
             preserve_overlay_file_ids: set[str] = set()
             live_model = getattr(controller, "_Controller__model", None)
             overlay_snapshot_reader = getattr(live_model, "active_progress_overlays_snapshot", None)
@@ -3674,6 +3680,8 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__prev_downloading_file_names = set()
         if not hasattr(controller, "_Controller__pending_completion_file_names"):
             controller._Controller__pending_completion_file_names = set()
+        if not hasattr(controller, "_Controller__pending_completion_authority_rebuild_ids"):
+            controller._Controller__pending_completion_authority_rebuild_ids = set()
         if not hasattr(controller, "_Controller__active_scan_lftp_roots_awaiting"):
             controller._Controller__active_scan_lftp_roots_awaiting = set()
         if not hasattr(controller, "_Controller__active_scan_lftp_roots_seen"):
@@ -3706,6 +3714,9 @@ class ModelUpdater(_ControllerCoreAccess):
             if file_id in pending_completion_ids
         }
         controller._Controller__pending_completion_progress_floor_overlay_ids.intersection_update(
+            pending_completion_ids
+        )
+        controller._Controller__pending_completion_authority_rebuild_ids.intersection_update(
             pending_completion_ids
         )
         if not hasattr(controller, "_Controller__active_scan_force_file_ids"):
@@ -4982,6 +4993,86 @@ class ModelUpdater(_ControllerCoreAccess):
         # can publish MOVE_FAILED; terminal/stopped/live/incomplete roots do
         # not keep waking the idle loop.
         retry_now = datetime.now()
+        # A pending completion can become move-authoritative without changing
+        # the rendered model: for example, the physical scan proof may arrive
+        # before the matching Path Pair reconciliation is recorded.  Wake one
+        # full build on that false-to-true edge so the pending lifecycle pass
+        # can re-evaluate it.  Keep this edge-triggered and fail-closed; the
+        # regular pending loop remains the only place that can attempt a move.
+        current_pending_completion_ids = {
+            ModelFile.build_file_id(file_name, path_pair_id)
+            for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
+        }
+        pending_authority_rebuild_ids = getattr(
+            controller, "_Controller__pending_completion_authority_rebuild_ids", set()
+        )
+        if not isinstance(pending_authority_rebuild_ids, set):
+            pending_authority_rebuild_ids = set()
+            controller._Controller__pending_completion_authority_rebuild_ids = \
+                pending_authority_rebuild_ids
+        pending_authority_rebuild_ids.intersection_update(current_pending_completion_ids)
+
+        reconciled_local_path_pair_ids = set(getattr(
+            controller, "_Controller__reconciled_local_path_pair_ids", set()
+        ))
+        reconciled_remote_path_pair_ids = set(getattr(
+            controller, "_Controller__reconciled_remote_path_pair_ids", set()
+        ))
+        active_lftp_status_file_ids = {
+            status.file_id for status in lftp_statuses
+            if status.state in (
+                LftpJobStatus.State.QUEUED,
+                LftpJobStatus.State.RUNNING,
+            ) and isinstance(status.file_id, str)
+        }
+        active_unscoped_lftp_status_names = {
+            status.name for status in lftp_statuses
+            if status.state in (
+                LftpJobStatus.State.QUEUED,
+                LftpJobStatus.State.RUNNING,
+            ) and status.path_pair_id is None and isinstance(status.name, str)
+        }
+
+        def pending_completion_authority_available(file_id: str) -> bool:
+            try:
+                pending_file = model.get_file(file_id)
+            except ModelError:
+                return False
+            path_pair_id = pending_file.path_pair_id
+            if path_pair_id not in reconciled_local_path_pair_ids or \
+                    path_pair_id not in reconciled_remote_path_pair_ids:
+                return False
+            if not lftp_status_poll_healthy or not bool(getattr(
+                    controller, "_Controller__lftp_idle_status_authoritative", False
+            )):
+                return False
+            if file_id in active_lftp_status_file_ids or (
+                    path_pair_id is not None and
+                    pending_file.name in active_unscoped_lftp_status_names
+            ):
+                return False
+            if controller._Controller__is_explicitly_stopped(
+                    pending_file.full_path, path_pair_id
+            ):
+                return False
+            # Physical identity, complete coverage, and collision authority
+            # remain the final gate in the pending lifecycle pass below.  This
+            # wake only makes that existing gate run after its scan/status
+            # authority becomes available.
+            return True
+
+        authority_wake_ids: set[str] = set()
+        for file_id in current_pending_completion_ids:
+            if pending_completion_authority_available(file_id):
+                if file_id not in pending_authority_rebuild_ids:
+                    authority_wake_ids.add(file_id)
+                pending_authority_rebuild_ids.add(file_id)
+            else:
+                pending_authority_rebuild_ids.discard(file_id)
+        if authority_wake_ids:
+            _request_model_rebuild(
+                model_builder, diagnostics, MODEL_REBUILD_REASON_DEFERRED_MOVE_PENDING,
+            )
         if recovering_from_unhealthy_poll and lftp_status_poll_healthy and \
                 lftp_status_snapshot_fresh and lftp_status_source == "fresh_healthy":
             deferred_recovery_ids = controller._Controller__move_retry_rebuild_gate.deferred_recovery_ids(
@@ -6259,30 +6350,16 @@ class ModelUpdater(_ControllerCoreAccess):
                 except ModelError:
                     return False
                 path_pair_id = pending_file.path_pair_id
-                local_reconciled = set(getattr(
-                    controller, "_Controller__reconciled_local_path_pair_ids", set()
-                ))
-                remote_reconciled = set(getattr(
-                    controller, "_Controller__reconciled_remote_path_pair_ids", set()
-                ))
-                if path_pair_id not in local_reconciled or path_pair_id not in remote_reconciled:
+                if path_pair_id not in reconciled_local_path_pair_ids or \
+                        path_pair_id not in reconciled_remote_path_pair_ids:
                     return False
                 if not lftp_status_poll_healthy or not bool(getattr(
                         controller, "_Controller__lftp_idle_status_authoritative", False
                 )):
                     return False
-                if any(
-                        status.state in (
-                            LftpJobStatus.State.QUEUED,
-                            LftpJobStatus.State.RUNNING,
-                        ) and (
-                            status.file_id == file_id or (
-                                path_pair_id is not None and
-                                status.path_pair_id is None and
-                                status.name == pending_file.name
-                            )
-                        )
-                        for status in lftp_statuses
+                if file_id in active_lftp_status_file_ids or (
+                        path_pair_id is not None and
+                        pending_file.name in active_unscoped_lftp_status_names
                 ):
                     return False
                 return candidate_verified_staging_identity(file_id) and \
@@ -6333,6 +6410,9 @@ class ModelUpdater(_ControllerCoreAccess):
                         for file_name in controller._Controller__pending_completion_file_names
                         if ModelFile.build_file_id(file_name[0], file_name[1]) != file_id
                     }
+                    getattr(
+                        controller, "_Controller__pending_completion_authority_rebuild_ids", set(),
+                    ).discard(file_id)
                     self._clear_pending_completion_progress_floor(controller, file_id)
 
                 def accepted_active_progress_overlay(file: ModelFile) -> Optional[ActiveProgressOverlay]:
@@ -6501,6 +6581,9 @@ class ModelUpdater(_ControllerCoreAccess):
                         for file_name in controller._Controller__pending_completion_file_names
                         if ModelFile.build_file_id(file_name[0], file_name[1]) != file.file_id
                     }
+                    getattr(
+                        controller, "_Controller__pending_completion_authority_rebuild_ids", set(),
+                    ).discard(file.file_id)
                     self._clear_pending_completion_progress_floor(controller, file.file_id)
 
                 def run_reserved_automatic_move(file: ModelFile, trace_completion_gate: bool = False):
