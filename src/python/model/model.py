@@ -112,6 +112,8 @@ class Model:
         # Publication is intentionally shallow for the scoped hot path.
         # Legacy callbacks use a separate full-tree freeze only for lifecycle
         # events, never for per-pulse overlay publication.
+        previous_published = self.__published_files_by_id.get(file.file_id)
+        previous_identity = self.__published_file_job_identities.get(file.file_id)
         published = ModelFile(file.name, file.is_dir)
         published.state = file.state
         published.remote_size = file.remote_size
@@ -158,6 +160,15 @@ class Model:
                 type(identity[0]) is int and identity[0] >= 0 and \
                 isinstance(identity[1], str) and identity[1]:
             self.__published_file_job_identities[file.file_id] = identity
+        elif previous_published == published and previous_identity is not None:
+            # An equal effective snapshot is the same committed publication,
+            # even when a routine model rebuild no longer has the transient
+            # overlay that originally established its provenance.  Keep the
+            # retirement identity until the controller consumes it at an
+            # explicit completion/reset boundary.  A changed publication
+            # still drops it below, so stale identity can never authorize a
+            # different rendered root.
+            self.__published_file_job_identities[file.file_id] = previous_identity
         else:
             self.__published_file_job_identities.pop(file.file_id, None)
         self.__published_files_by_id[file.file_id] = published

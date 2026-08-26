@@ -12072,6 +12072,11 @@ class TestModelUpdater(unittest.TestCase):
             lambda: model.update_file(local_only), retire_file_ids={file_id},
         )
         self.assertEqual(identity, model.published_file_job_identity(file_id))
+        # A scan can rebuild the identical Local Only root before the LFTP
+        # retirement is observed.  That no-op publication must not sever the
+        # committed provenance which completion detection consumes below.
+        model.update_file(local_only)
+        self.assertEqual(identity, model.published_file_job_identity(file_id))
         controller = self._make_lftp_completion_controller({("release", None, None)})
         controller._Controller__model = model
         controller._Controller__model_lock = RLock()
