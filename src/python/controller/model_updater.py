@@ -13,7 +13,7 @@ import json
 import logging
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import islice
 from types import SimpleNamespace
 from threading import Lock, RLock
@@ -321,6 +321,7 @@ class _PendingCompletionPublication:
 
     overlay: ActiveProgressOverlay
     job_identity: Optional[tuple[int, str]]
+    retired_at: Optional[datetime] = field(default=None, compare=False)
 
 
 def _breadcrumb_effectively_enabled(
@@ -3589,6 +3590,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     pending_publications[file_id] = _PendingCompletionPublication(
                         ActiveProgressOverlay(merged_floor[0], merged_floor[1], None, None),
                         floor_identity,
+                        datetime.now(),
                     )
             if defer_snapshot_eviction:
                 deferred_snapshot_eviction = (
@@ -6584,6 +6586,16 @@ class ModelUpdater(_ControllerCoreAccess):
                 snapshot after the sidecar has disappeared.  They are useful
                 diagnostics but cannot revoke the retired-job publication.
                 """
+                publications = getattr(
+                    controller, "_Controller__pending_completion_publications", {},
+                )
+                publication = publications.get(file_id) if isinstance(publications, dict) else None
+                retired_at = publication.retired_at \
+                    if isinstance(publication, _PendingCompletionPublication) else None
+                scan_started_at = getattr(latest_active_scan, "timestamp", None)
+                if not isinstance(retired_at, datetime) or not isinstance(scan_started_at, datetime) or \
+                        scan_started_at <= retired_at:
+                    return False
                 if latest_active_scan is None or bool(getattr(latest_active_scan, "failed", False)):
                     return False
                 for scanned_file in getattr(latest_active_scan, "files", ()):
@@ -6806,9 +6818,13 @@ class ModelUpdater(_ControllerCoreAccess):
                         {},
                     ).get(file.file_id)
                     if isinstance(publications, dict) and overlay is not None and floor_identity is not None:
+                        previous_publication = publications.get(file.file_id)
                         publications[file.file_id] = _PendingCompletionPublication(
                             ActiveProgressOverlay(floor[0], floor[1], None, None),
                             floor_identity,
+                            previous_publication.retired_at
+                            if isinstance(previous_publication, _PendingCompletionPublication)
+                            else datetime.now(),
                         )
 
                 def keep_completion_pending_after_failed_staging_move(file: ModelFile, consume_budget: bool):

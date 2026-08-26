@@ -9225,10 +9225,19 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__pending_completion_progress_floor_identities = {file_id: identity}
         controller._Controller__pending_completion_progress_floor_overlay_ids = {file_id}
         controller._Controller__pending_completion_publications = {
-            file_id: _PendingCompletionPublication(ActiveProgressOverlay(99, 99, None, None), identity),
+            file_id: _PendingCompletionPublication(
+                ActiveProgressOverlay(99, 99, None, None), identity,
+                datetime.now() - timedelta(seconds=1),
+            ),
         }
         controller._Controller__lftp.status.return_value = []
         controller._Controller__lftp.last_status_poll_healthy = True
+        stale_sidecar = SystemFile("pending.bin", 93, False, is_staging=True, mtime_ns=1)
+        stale_sidecar.status_sidecar_ready = True
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now() - timedelta(seconds=2), [stale_sidecar],
+            scanned_path_pair_ids={None}, is_scan_final=True,
+        )
         controller._Controller__move_from_staging = MagicMock()
 
         ModelUpdater(controller).update()
@@ -9268,7 +9277,10 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__pending_completion_progress_floor_identities = {file_id: identity}
         controller._Controller__pending_completion_progress_floor_overlay_ids = {file_id}
         controller._Controller__pending_completion_publications = {
-            file_id: _PendingCompletionPublication(ActiveProgressOverlay(99, 99, None, None), identity),
+            file_id: _PendingCompletionPublication(
+                ActiveProgressOverlay(99, 99, None, None), identity,
+                datetime.now() - timedelta(seconds=1),
+            ),
         }
         controller._Controller__lftp.status.return_value = []
         controller._Controller__lftp.last_status_poll_healthy = True
