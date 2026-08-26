@@ -2492,6 +2492,7 @@ class _ControllerCoreAccess:
     _Controller__pending_completion_progress_floor_identities: dict[str, Optional[tuple[int, str]]]
     _Controller__pending_completion_progress_floor_overlay_ids: set[str]
     _Controller__pending_completion_publications: dict[str, _PendingCompletionPublication]
+    _Controller__admitted_progress_publications: dict[tuple[str, tuple[int, str]], ActiveProgressOverlay]
     _Controller__successful_final_move_handoff_file_ids: set[str]
     _Controller__move_retry_due: dict[str, datetime]
     _Controller__move_attempt_lock: Lock
@@ -2847,6 +2848,18 @@ class ModelUpdater(_ControllerCoreAccess):
         getattr(
             controller, "_Controller__pending_completion_publications", {},
         ).pop(file_id, None)
+        ModelUpdater._clear_admitted_progress_publications(controller, file_id)
+
+    @staticmethod
+    def _clear_admitted_progress_publications(
+        controller: _ControllerCoreAccess, file_id: str,
+    ) -> None:
+        """Forget live admissions at an explicit lifecycle reset boundary."""
+        publications = getattr(controller, "_Controller__admitted_progress_publications", None)
+        if isinstance(publications, dict):
+            for key in tuple(publications):
+                if isinstance(key, tuple) and len(key) == 2 and key[0] == file_id:
+                    publications.pop(key, None)
 
     @staticmethod
     def _invalidate_pending_completion_progress_floor(
@@ -2867,6 +2880,7 @@ class ModelUpdater(_ControllerCoreAccess):
         getattr(
             controller, "_Controller__pending_completion_publications", {},
         ).pop(file_id, None)
+        ModelUpdater._clear_admitted_progress_publications(controller, file_id)
 
     @staticmethod
     def _pending_completion_progress_floor_invalidated(
@@ -2911,7 +2925,19 @@ class ModelUpdater(_ControllerCoreAccess):
         overlay_identities: Mapping[str, tuple[int, str]],
     ) -> tuple[Optional[tuple[Optional[int], Optional[int]]], bool, Optional[tuple[int, str]]]:
         """Capture accepted live counters before retirement evicts their source."""
-        model = getattr(self._controller, "_Controller__model", None)
+        admitted = getattr(
+            self._controller, "_Controller__admitted_progress_publications", None,
+        )
+        if isinstance(retired_job_identity, tuple) and isinstance(admitted, dict):
+            admitted_overlay = admitted.pop((file_id, retired_job_identity), None)
+            if isinstance(admitted_overlay, ActiveProgressOverlay) and \
+                    (type(admitted_overlay.download_progress) is int or
+                     type(admitted_overlay.transferred_size) is int):
+                return (
+                    (admitted_overlay.download_progress, admitted_overlay.transferred_size),
+                    True,
+                    retired_job_identity,
+                )
         overlay = overlays.get(file_id)
         overlay_identity = overlay_identities.get(file_id)
         if isinstance(overlay, ActiveProgressOverlay):
@@ -2930,20 +2956,46 @@ class ModelUpdater(_ControllerCoreAccess):
                     overlay_identity or retired_job_identity,
                 )
 
-        try:
-            file = model.get_file(file_id) if model is not None else None
-        except (AttributeError, ModelError):
-            file = None
-        if retired_job_identity is None or not isinstance(file, ModelFile) or \
-                file.state != ModelFile.State.DOWNLOADING:
-            return None, False, None
-        if type(file.download_progress) is not int and type(file.transferred_size) is not int:
-            return None, False, None
-        return (
-            (file.download_progress, file.transferred_size),
-            False,
-            retired_job_identity,
-        )
+        # Never synthesize a completion projection from a base ModelFile:
+        # base state may now be Local Only/DEFAULT after the accepted overlay
+        # was retired.  Only an identity-paired live admission is authority.
+        return None, False, None
+
+    def _clear_replaced_admitted_progress_publications(
+        self, statuses: Iterable[LftpJobStatus],
+    ) -> None:
+        """Drop an admitted projection when a newer live job is observed.
+
+        This fence is intentionally independent of pending-completion floors:
+        a newer queued/running row must revoke an older admitted identity even
+        when no retirement floor has been captured yet.  Invalid and
+        synthetic identities do not establish a replacement boundary.
+        """
+        controller = self._controller
+        admitted = getattr(controller, "_Controller__admitted_progress_publications", None)
+        if not isinstance(admitted, dict):
+            return
+        for status in statuses:
+            if getattr(status, "state", None) not in (
+                    LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING,
+            ):
+                continue
+            file_id = getattr(status, "file_id", None)
+            status_id = getattr(status, "id", None)
+            status_type = getattr(getattr(status, "type", None), "value", None)
+            if not isinstance(file_id, str) or type(status_id) is not int or status_id < 0 or \
+                    not isinstance(status_type, str) or not status_type:
+                continue
+            for key in tuple(admitted):
+                if not isinstance(key, tuple) or len(key) != 2 or key[0] != file_id:
+                    continue
+                admitted_identity = key[1]
+                if not isinstance(admitted_identity, tuple) or len(admitted_identity) != 2 or \
+                        type(admitted_identity[0]) is not int or admitted_identity[0] < 0 or \
+                        not isinstance(admitted_identity[1], str) or not admitted_identity[1]:
+                    continue
+                if status_id > admitted_identity[0]:
+                    admitted.pop(key, None)
 
     def _clear_replaced_pending_completion_floors(
         self, statuses: Iterable[LftpJobStatus],
@@ -3749,6 +3801,8 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__pending_completion_progress_floor_overlay_ids = set()
         if not hasattr(controller, "_Controller__pending_completion_publications"):
             controller._Controller__pending_completion_publications = {}
+        if not hasattr(controller, "_Controller__admitted_progress_publications"):
+            controller._Controller__admitted_progress_publications = {}
         if not hasattr(controller, "_Controller__successful_final_move_handoff_file_ids"):
             controller._Controller__successful_final_move_handoff_file_ids = set()
         if not hasattr(controller, "_Controller__current_process_final_publication_file_ids"):
@@ -4511,6 +4565,9 @@ class ModelUpdater(_ControllerCoreAccess):
                 # pass the meaningful empty map so the builder retains floors
                 # conservatively until a later boundary supplies identity.
                 retired_job_identities = {}
+        # Revoke stale admitted projections before completion capture.  A
+        # newer active job must win even when no pending floor exists yet.
+        self._clear_replaced_admitted_progress_publications(lftp_statuses)
         completion_snapshot_evictions = self._handle_lftp_completion_detection(
             current_downloading_file_names,
             lftp_status_poll_healthy or bool(lftp_statuses),
@@ -5754,6 +5811,19 @@ class ModelUpdater(_ControllerCoreAccess):
                                 direct_published_overlays = dict(direct_overlays)
                                 direct_published_job_identities = dict(direct_job_identities)
                                 direct_published_target_file_id = direct_target_file_id
+                                admitted = getattr(
+                                    controller, "_Controller__admitted_progress_publications", None,
+                                )
+                                if not isinstance(admitted, dict):
+                                    admitted = {}
+                                    controller._Controller__admitted_progress_publications = admitted
+                                for file_id in direct_published_overlays:
+                                    self._clear_admitted_progress_publications(controller, file_id)
+                                    identity = direct_published_job_identities.get(file_id)
+                                    overlay = direct_published_overlays[file_id]
+                                    if isinstance(identity, tuple) and len(identity) == 2 and \
+                                            isinstance(overlay, ActiveProgressOverlay):
+                                        admitted[(file_id, identity)] = overlay
                     direct_publish_timing["publish_duration_bucket"] = _progress_lineage_duration_bucket(
                         (time.monotonic_ns() - direct_publish_started_ns) // 1_000_000,
                     )

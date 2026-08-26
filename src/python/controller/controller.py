@@ -844,6 +844,11 @@ class Controller:
         self.__active_scan_lftp_roots_seen = set()
         self.__pending_completion_progress_floors = {}
         self.__pending_completion_publications = {}
+        # A successful Model overlay admission is the last coherent live
+        # projection for a job that can disappear before LFTP retirement is
+        # observed.  Keep it keyed by both model root and LFTP identity; it is
+        # consumed only by the matching retirement handoff.
+        self.__admitted_progress_publications = {}
         self.__collision_compare_lock = Lock()
         self.__collision_compare_executor = None
         self.__collision_compare_future = None
@@ -1099,6 +1104,7 @@ class Controller:
         self.__pending_completion_authority_rebuild_ids = set()
         self.__pending_completion_progress_floors = {}
         self.__pending_completion_publications = {}
+        self.__admitted_progress_publications = {}
         self.__shutdown_collision_compare_worker()
         self.__collision_compare_epoch = getattr(self, "_Controller__collision_compare_epoch", 0) + 1
         self.__collision_compare_lock = Lock()
@@ -2297,6 +2303,7 @@ class Controller:
         # A lifecycle transition revokes every transient counter immediately;
         # the model diff remains the authoritative backstop for all roots.
         self.__persist.display_progress_floors.pop(file_id, None)
+        ModelUpdater._clear_admitted_progress_publications(self, file_id)
         evict_transfer_progress = getattr(
             getattr(self, "_Controller__model_builder", None), "evict_transfer_progress_for_lifecycle", None,
         )
@@ -7542,6 +7549,7 @@ class Controller:
         getattr(self, "_Controller__pending_completion_authority_rebuild_ids", set()).discard(file_id)
         getattr(self, "_Controller__pending_completion_progress_floors", {}).pop(file_id, None)
         getattr(self, "_Controller__pending_completion_publications", {}).pop(file_id, None)
+        ModelUpdater._clear_admitted_progress_publications(self, file_id)
         getattr(self, "_Controller__successful_final_move_handoff_file_ids", set()).discard(file_id)
         self.__persist.final_move_succeeded_file_names.discard(file_id)
         getattr(self, "_Controller__current_process_final_publication_file_ids", set()).discard(file_id)
@@ -9454,6 +9462,7 @@ class Controller:
                                 file.file_id,
                                 None,
                             )
+                            ModelUpdater._clear_admitted_progress_publications(self, file.file_id)
                             with self.__move_attempt_lock:
                                 self.__move_attempt_reservations.discard(file.file_id)
                             self.__model_builder.set_move_failed_files({
@@ -10157,6 +10166,7 @@ class Controller:
                             file.file_id,
                             None,
                         )
+                        ModelUpdater._clear_admitted_progress_publications(self, file.file_id)
                         self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
                         self._sync_final_move_succeeded_files_to_model()
                         self.__model_builder.set_move_failed_files({

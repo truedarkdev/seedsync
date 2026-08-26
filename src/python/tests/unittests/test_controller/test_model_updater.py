@@ -129,8 +129,12 @@ class TestModelUpdater(unittest.TestCase):
     def test_new_queue_lifecycle_clears_same_source_floor_before_next_harvest(self):
         file_id = ModelFile.build_file_id("queued.bin", None)
         persist = SimpleNamespace(display_progress_floors={file_id: (90, 90, 100, 1, 100)})
+        admitted = {
+            (file_id, (1, LftpJobStatus.Type.PGET.value)): ActiveProgressOverlay(90, 90, 1, 1),
+        }
         controller = SimpleNamespace(
             _Controller__persist=persist,
+            _Controller__admitted_progress_publications=admitted,
             _Controller__model_lock=RLock(),
             _Controller__model=SimpleNamespace(clear_active_progress_overlays=MagicMock()),
             _Controller__progress_publication_epoch=0,
@@ -141,6 +145,7 @@ class TestModelUpdater(unittest.TestCase):
         )
         Controller._Controller__advance_transfer_lifecycle(controller, file_id)
         self.assertEqual({}, persist.display_progress_floors)
+        self.assertEqual({}, admitted)
 
     def test_queue_replacement_evicts_old_running_snapshot_before_harvest(self):
         builder, file_id = self._restart_progress_builder(floor=(90, 90, 100, 1, 100))
@@ -12011,6 +12016,82 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotIn(file_id, controller._Controller__pending_completion_progress_floor_overlay_ids)
         self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
         self.assertIn(("release", None, None), controller._Controller__pending_completion_file_names)
+
+    def test_completion_retirement_uses_admitted_projection_after_overlay_disappears(self):
+        """A PGET handoff survives global overlay retirement before polling sees it."""
+        file_id = ModelFile.build_file_id("release", None)
+        identity = (7, LftpJobStatus.Type.PGET.value)
+        local_only = ModelFile("release", False)
+        local_only.state = ModelFile.State.DEFAULT
+        model = Model()
+        model.add_file(local_only)
+        controller = self._make_lftp_completion_controller({("release", None, None)})
+        controller._Controller__model = model
+        controller._Controller__model_lock = RLock()
+        controller._Controller__admitted_progress_publications = {
+            (file_id, identity): ActiveProgressOverlay(93, 930, 1, 2),
+        }
+
+        ModelUpdater(controller)._handle_lftp_completion_detection(
+            [], True, retired_job_identities={file_id: identity},
+            lftp_status_poll_authoritative=True, lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True, lftp_status_source="fresh_healthy",
+        )
+
+        self.assertEqual((93, 930), controller._Controller__pending_completion_progress_floors[file_id])
+        self.assertEqual(
+            _PendingCompletionPublication(ActiveProgressOverlay(93, 930, None, None), identity),
+            controller._Controller__pending_completion_publications[file_id],
+        )
+        self.assertNotIn((file_id, identity), controller._Controller__admitted_progress_publications)
+
+    def test_completion_retirement_rejects_admitted_projection_for_other_job_identity(self):
+        file_id = ModelFile.build_file_id("release", None)
+        retired_identity = (7, LftpJobStatus.Type.PGET.value)
+        controller = self._make_lftp_completion_controller({("release", None, None)})
+        controller._Controller__model = Model()
+        controller._Controller__model_lock = RLock()
+        controller._Controller__admitted_progress_publications = {
+            (file_id, (8, LftpJobStatus.Type.PGET.value)): ActiveProgressOverlay(93, 930, 1, 2),
+        }
+
+        ModelUpdater(controller)._handle_lftp_completion_detection(
+            [], True, retired_job_identities={file_id: retired_identity},
+            lftp_status_poll_authoritative=True, lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True, lftp_status_source="fresh_healthy",
+        )
+
+        self.assertNotIn(file_id, getattr(controller, "_Controller__pending_completion_progress_floors", {}))
+        self.assertNotIn(file_id, getattr(controller, "_Controller__pending_completion_publications", {}))
+
+    def test_newer_active_job_prunes_admission_before_late_retirement_without_floor(self):
+        file_id = ModelFile.build_file_id("release", None)
+        retired_identity = (7, LftpJobStatus.Type.PGET.value)
+        newer = LftpJobStatus(
+            8, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, "release", "",
+        )
+        local_only = ModelFile("release", False)
+        local_only.state = ModelFile.State.DEFAULT
+        model = Model()
+        model.add_file(local_only)
+        controller = self._make_lftp_completion_controller({("release", None, None)})
+        controller._Controller__model = model
+        controller._Controller__model_lock = RLock()
+        controller._Controller__admitted_progress_publications = {
+            (file_id, retired_identity): ActiveProgressOverlay(93, 930, 1, 2),
+        }
+        updater = ModelUpdater(controller)
+
+        updater._clear_replaced_admitted_progress_publications([newer])
+        updater._handle_lftp_completion_detection(
+            [], True, retired_job_identities={file_id: retired_identity},
+            lftp_status_poll_authoritative=True, lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True, lftp_status_source="fresh_healthy",
+        )
+
+        self.assertEqual({}, controller._Controller__admitted_progress_publications)
+        self.assertNotIn(file_id, controller._Controller__pending_completion_progress_floors)
+        self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
 
     def test_pending_completion_floor_does_not_resurrect_after_zero_reset_or_stop(self):
         for stopped in (False, True):
