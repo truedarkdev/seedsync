@@ -71,6 +71,64 @@ class TestLftpModel(unittest.TestCase):
         self.assertEqual((set(), "lifecycle_epoch"), (changed, outcome))
         self.assertIsNone(self.model.active_progress_overlay(file.file_id))
 
+    def test_lftp_root_counter_publish_floors_stale_positive_same_job_counters(self):
+        file = ModelFile("active", False)
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        self.model.add_file(file)
+        identity = {file.file_id: (7, "pget")}
+
+        first = ActiveProgressOverlay(51, 17153537, 120, 6)
+        stale = ActiveProgressOverlay(49, 16467263, 80, 9)
+        latest = ActiveProgressOverlay(54, 18127086, 140, 3)
+        self.assertEqual(
+            ({file.file_id}, "accepted"),
+            self.model.publish_active_lftp_root_counters(
+                {file.file_id: first}, identity, lambda _: True,
+            ),
+        )
+        self.assertEqual(first, self.model.active_progress_overlay(file.file_id))
+
+        self.assertEqual(
+            ({file.file_id}, "accepted"),
+            self.model.publish_active_lftp_root_counters(
+                {file.file_id: stale}, identity, lambda _: True,
+            ),
+        )
+        self.assertEqual(
+            ActiveProgressOverlay(51, 17153537, 80, 9),
+            self.model.active_progress_overlay(file.file_id),
+        )
+
+        bytes_advance = ActiveProgressOverlay(49, 17500000, 95, 7)
+        self.assertEqual(
+            ({file.file_id}, "accepted"),
+            self.model.publish_active_lftp_root_counters(
+                {file.file_id: bytes_advance}, identity, lambda _: True,
+            ),
+        )
+        self.assertEqual(
+            ActiveProgressOverlay(51, 17500000, 95, 7),
+            self.model.active_progress_overlay(file.file_id),
+        )
+
+        self.assertEqual(
+            ({file.file_id}, "accepted"),
+            self.model.publish_active_lftp_root_counters(
+                {file.file_id: latest}, identity, lambda _: True,
+            ),
+        )
+        self.assertEqual(latest, self.model.active_progress_overlay(file.file_id))
+
+        reset = ActiveProgressOverlay(0, 0, 0, 0)
+        self.assertEqual(
+            ({file.file_id}, "accepted"),
+            self.model.publish_active_lftp_root_counters(
+                {file.file_id: reset}, identity, lambda _: True,
+            ),
+        )
+        self.assertEqual(reset, self.model.active_progress_overlay(file.file_id))
+
     def test_lftp_root_counter_publish_preserves_lifecycle_state_and_rejects_display_union(self):
         file = ModelFile("active", False)
         file.state = ModelFile.State.DOWNLOADING

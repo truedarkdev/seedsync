@@ -555,6 +555,23 @@ class Model:
                     file.display_transferred_size is not None:
                 self.clear_active_progress_overlays()
                 return set(), "root_authority"
+            prior_overlay = self.__active_progress_overlays.get(file_id)
+            if previous_identity == identity and prior_overlay is not None:
+                # A delayed positive counter from the same live job must not
+                # repaint an already-published root backwards.  Zero and
+                # None remain explicit reset/unknown values; rate metadata is
+                # intentionally always taken from the incoming status.
+                progress = overlay.download_progress
+                if type(progress) is int and progress > 0 and \
+                        type(prior_overlay.download_progress) is int:
+                    progress = max(progress, prior_overlay.download_progress)
+                transferred_size = overlay.transferred_size
+                if type(transferred_size) is int and transferred_size > 0 and \
+                        type(prior_overlay.transferred_size) is int:
+                    transferred_size = max(transferred_size, prior_overlay.transferred_size)
+                overlay = ActiveProgressOverlay(
+                    progress, transferred_size, overlay.downloading_speed, overlay.eta,
+                )
             normalized[file_id] = overlay
             normalized_identities[file_id] = identity
 

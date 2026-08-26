@@ -7702,6 +7702,80 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(40, live_model.get_file(file_id).transferred_size)
         self.assertEqual(75, live_model.active_progress_overlay(file_id).transferred_size)
 
+    def test_same_job_floored_overlay_survives_authoritative_replacement(self):
+        """Replacement retention must use Model's normalized overlay, not raw status counters."""
+        def system_file(name, size, path_pair_id, *, is_staging=False):
+            file = SystemFile(name, size, False, is_staging=is_staging)
+            file.path_pair_id = path_pair_id
+            file.status_sidecar_ready = is_staging
+            return file
+
+        old = system_file("old.bin", 10, "pair-a")
+        remote = system_file("active.bin", 100, "pair-b")
+        local = system_file("active.bin", 49, "pair-b", is_staging=True)
+        builder = ModelBuilder()
+        builder.set_local_files([old, local])
+        builder.set_remote_files([old, remote])
+        builder.set_unknown_local_path_pair_ids({"pair-b"})
+        initial = LftpJobStatus(
+            2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        initial.path_pair_id = "pair-b"
+        initial.total_transfer_state = LftpJobStatus.TransferState(49, 100, 49, 10, 8)
+        builder.set_lftp_statuses([initial])
+        live_model = builder.build_model()
+        file_id = ModelFile.build_file_id("active.bin", "pair-b")
+        identity = {file_id: (2, LftpJobStatus.Type.PGET.value)}
+        self.assertEqual(
+            ({file_id}, "accepted"),
+            live_model.publish_active_lftp_root_counters(
+                {file_id: ActiveProgressOverlay(51, 60, 12, 6)},
+                identity,
+                lambda _file_id: True,
+            ),
+        )
+
+        replacement_local = system_file("new.bin", 30, "pair-a")
+        replacement_remote = system_file("new.bin", 30, "pair-a")
+        final_local = ScannerResult(
+            datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {
+            "pair-a": MagicMock(), "pair-b": MagicMock(),
+        }
+        controller._Controller__progress_publication_epoch = 0
+        builder.has_only_live_progress_with_active_scan = MagicMock(return_value=True)
+        builder.authorize_authoritative_pair_delta = MagicMock(return_value=True)
+        stale = LftpJobStatus(
+            2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        stale.path_pair_id = "pair-b"
+        stale.total_transfer_state = LftpJobStatus.TransferState(49, 100, 49, 8, 11)
+        controller._Controller__lftp.status.return_value = [stale]
+        controller._Controller__active_scan_process.pop_latest_result.return_value = final_local
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(51, live_model.active_progress_overlay(file_id).download_progress)
+        self.assertEqual(60, live_model.active_progress_overlay(file_id).transferred_size)
+        published = live_model.published_file(file_id)
+        self.assertIsNotNone(published)
+        assert published is not None
+        self.assertEqual(51, published.download_progress)
+        self.assertEqual(60, published.transferred_size)
+
     def test_candidate_replacement_clears_terminal_reset_and_explicit_stop_overlay(self):
         """Updater adoption must not resurrect a revoked direct PGET projection."""
         def system_file(name, size, path_pair_id, *, is_staging=False):

@@ -5552,12 +5552,32 @@ class ModelUpdater(_ControllerCoreAccess):
                             ) == lftp_status_publication_epoch,
                         )
                         if direct_outcome == "accepted":
+                            accepted_overlay_snapshot = model.active_progress_overlays_snapshot()
+                            if not isinstance(accepted_overlay_snapshot, dict) or not all(
+                                    file_id in accepted_overlay_snapshot
+                                    and isinstance(accepted_overlay_snapshot[file_id], ActiveProgressOverlay)
+                                    for file_id in direct_overlays
+                            ):
+                                # The Model may normalize same-job counters at
+                                # admission.  Do not let the pre-admission map
+                                # seed the builder snapshot or replacement
+                                # restore path when that accepted projection
+                                # cannot be read coherently.
+                                deferred_rejected_overlay_clear = True
+                                changed = set()
+                                direct_outcome = "snapshot"
+                            else:
+                                direct_overlays = {
+                                    file_id: accepted_overlay_snapshot[file_id]
+                                    for file_id in direct_overlays
+                                }
                             record_direct_snapshot = getattr(
                                 model_builder,
                                 "record_read_only_lftp_root_counter_overlays",
                                 None,
                             )
-                            if not callable(record_direct_snapshot) or \
+                            if direct_outcome != "accepted" or \
+                                    not callable(record_direct_snapshot) or \
                                     record_direct_snapshot(direct_overlays) is not True:
                                 # Keep Model and ModelBuilder as one coherent
                                 # publication.  Without the builder snapshot,
