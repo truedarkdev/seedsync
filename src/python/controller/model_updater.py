@@ -2934,12 +2934,14 @@ class ModelUpdater(_ControllerCoreAccess):
         should_process_completion_detection: bool,
         retired_queue_dispatches: set[tuple[str, Optional[str], Optional[str]]] | None = None,
         *,
+        defer_snapshot_eviction: bool = False,
+        retired_job_identities: Optional[Mapping[str, tuple[int, str]]] = None,
         lftp_status_poll_authoritative: Optional[bool] = None,
         lftp_status_snapshot_fresh: Optional[bool] = None,
         lftp_status_poll_healthy: Optional[bool] = None,
         lftp_status_source: Optional[str] = None,
         lftp_status_poll_correlation: Optional[str] = None,
-    ) -> None:
+    ) -> tuple[set[str], set[str], dict[str, tuple[int, str]]]:
         controller = self._controller
         current_downloading_file_names_set = set(current_downloading_file_names)
         previous_downloading_file_names = controller._Controller__prev_downloading_file_names
@@ -3045,7 +3047,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     reason="completion_detection_not_authoritative",
                     local_scan_forced=False,
                 )
-            return
+            return set(), set(), {}
 
         just_completed_file_names = previous_downloading_file_names - current_downloading_file_names_set
         for entry in sorted(
@@ -3080,6 +3082,9 @@ class ModelUpdater(_ControllerCoreAccess):
                 local_scan_forced=False,
             )
         just_completed_file_names -= explicitly_stopped_file_names
+        deferred_snapshot_eviction: tuple[set[str], set[str], dict[str, tuple[int, str]]] = (
+            set(), set(), {},
+        )
         if just_completed_file_names:
             completed_path_pair_ids: set[Optional[str]] = set()
             completed_file_ids: set[str] = set()
@@ -3122,14 +3127,23 @@ class ModelUpdater(_ControllerCoreAccess):
                 file_id = ModelFile.build_file_id(name, path_pair_id)
                 if isinstance(live_overlay_snapshot.get(file_id), ActiveProgressOverlay):
                     preserve_overlay_file_ids.add(file_id)
-            evict_snapshots = controller._Controller__model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids
-            if preserve_overlay_file_ids:
-                evict_snapshots(
+            if defer_snapshot_eviction:
+                deferred_snapshot_eviction = (
                     completed_file_ids,
-                    preserve_file_ids=preserve_overlay_file_ids,
+                    preserve_overlay_file_ids,
+                    dict(retired_job_identities or {}),
                 )
             else:
-                evict_snapshots(completed_file_ids)
+                evict_snapshots = controller._Controller__model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids
+                eviction_kwargs: dict[str, object] = {}
+                if preserve_overlay_file_ids:
+                    eviction_kwargs["preserve_file_ids"] = preserve_overlay_file_ids
+                # An empty identity map is meaningful: lookup uncertainty must
+                # fail closed instead of falling back to legacy name-only
+                # eviction. Omit this keyword only for compatibility callers
+                # that do not participate in identity-aware handoff.
+                eviction_kwargs["retired_job_identities"] = dict(retired_job_identities or {})
+                evict_snapshots(completed_file_ids, **eviction_kwargs)
             if None in completed_path_pair_ids:
                 controller._Controller__local_scan_process.force_scan()
             else:
@@ -3138,6 +3152,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 ):
                     controller._Controller__local_scan_process.force_scan(path_pair_id)
         controller._Controller__prev_downloading_file_names = current_downloading_file_names_set
+        return deferred_snapshot_eviction
 
     def _force_active_scan_for_stoppability(
         self,
@@ -3863,6 +3878,7 @@ class ModelUpdater(_ControllerCoreAccess):
         lftp_status_poll_error: Optional[BaseException] = None
         lftp_status_poll_correlation: Optional[str] = None
         lftp_status_snapshot_completed = False
+        pre_poll_lftp_statuses = list(controller._Controller__last_lftp_statuses or [])
         # Fence a status request at submission time.  A Queue/Stop/reconfigure
         # can complete while an async owner is still obtaining this snapshot.
         with controller._Controller__model_lock:
@@ -4155,10 +4171,39 @@ class ModelUpdater(_ControllerCoreAccess):
             (s.name, s.path_pair_id, s.path_pair_name)
             for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
         ]
-        self._handle_lftp_completion_detection(
+        completion_candidate_ids = {
+            ModelFile.build_file_id(file_name, path_pair_id)
+            for file_name, path_pair_id, _ in (
+                controller._Controller__prev_downloading_file_names | retired_queue_dispatches
+            )
+        }
+        retired_job_identities: dict[str, tuple[int, str]] = {}
+        for status in pre_poll_lftp_statuses:
+            if status.state == LftpJobStatus.State.RUNNING and type(status.id) is int and \
+                    status.id >= 0 and isinstance(status.type.value, str) and \
+                    status.file_id in completion_candidate_ids:
+                retired_job_identities[status.file_id] = (status.id, status.type.value)
+        snapshot_identity_reader = getattr(
+            type(model_builder), "recent_live_transfer_snapshot_identities", None,
+        )
+        if callable(snapshot_identity_reader):
+            try:
+                for file_id, identity in model_builder.recent_live_transfer_snapshot_identities(
+                        completion_candidate_ids,
+                ).items():
+                    retired_job_identities.setdefault(file_id, identity)
+            except Exception:
+                # A failed snapshot lookup is not evidence that a name-only
+                # retirement is safe. Drop even partial lookup results and
+                # pass the meaningful empty map so the builder retains floors
+                # conservatively until a later boundary supplies identity.
+                retired_job_identities = {}
+        completion_snapshot_evictions = self._handle_lftp_completion_detection(
             current_downloading_file_names,
             lftp_status_poll_healthy or bool(lftp_statuses),
             retired_queue_dispatches,
+            defer_snapshot_eviction=True,
+            retired_job_identities=retired_job_identities,
             lftp_status_poll_authoritative=lftp_status_poll_healthy or bool(lftp_statuses),
             lftp_status_snapshot_fresh=lftp_status_snapshot_fresh,
             lftp_status_poll_healthy=lftp_status_poll_healthy,
@@ -4520,6 +4565,24 @@ class ModelUpdater(_ControllerCoreAccess):
                     level="info",
                     corr_id=controller._Controller__trace_corr_id_from_files(latest_active_scan.files, "active_scan"),
                 )
+        completed_snapshot_ids, preserved_overlay_ids, retired_snapshot_identities = \
+            completion_snapshot_evictions if isinstance(completion_snapshot_evictions, tuple) and \
+            len(completion_snapshot_evictions) == 3 else (set(), set(), {})
+        if completed_snapshot_ids:
+            evict_snapshots = getattr(
+                model_builder,
+                "evict_recent_live_transfer_snapshots_for_completed_file_ids",
+                None,
+            )
+            if callable(evict_snapshots):
+                eviction_kwargs: dict[str, object] = {}
+                if preserved_overlay_ids:
+                    eviction_kwargs["preserve_file_ids"] = preserved_overlay_ids
+                # The updater always uses identity-aware completion handoff;
+                # {} means the retired identity could not be proven and must
+                # therefore retain the snapshot conservatively.
+                eviction_kwargs["retired_job_identities"] = retired_snapshot_identities
+                evict_snapshots(completed_snapshot_ids, **eviction_kwargs)
         if lftp_status_snapshot_fresh and not lftp_status_poll_healthy and not lftp_statuses:
             model_builder.evict_recent_live_transfer_snapshots_missing_roots(
                 {status.file_id for status in lftp_statuses}
@@ -5130,9 +5193,19 @@ class ModelUpdater(_ControllerCoreAccess):
                                 if direct_outcome != "accepted":
                                     break
                                 state = status.total_transfer_state
+                                overlay = direct_overlays.get(status.file_id)
+                                counterless_pget_snapshot = status.type == LftpJobStatus.Type.PGET and \
+                                    state.size_local is None and state.percent_local is None and \
+                                    isinstance(overlay, ActiveProgressOverlay) and \
+                                    type(overlay.transferred_size) is int and overlay.transferred_size >= 0 and \
+                                    direct_prior_job_identities.get(status.file_id) == (
+                                        status.id, status.type.value,
+                                    )
                                 if type(status.id) is not int or status.id < 0 or \
                                         not isinstance(status.type.value, str) or \
-                                        type(state.size_local) is not int or state.size_local < 0 or \
+                                        (not counterless_pget_snapshot and (
+                                            type(state.size_local) is not int or state.size_local < 0
+                                        )) or \
                                         (state.percent_local is not None and
                                          (type(state.percent_local) is not int or not 0 <= state.percent_local <= 100)) or \
                                         (state.speed is not None and (type(state.speed) is not int or state.speed < 0)) or \

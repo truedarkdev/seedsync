@@ -2315,6 +2315,24 @@ class ModelBuilder:
             previous_snapshot.lftp_job_id == lftp_job_id and \
             previous_snapshot.lftp_job_type == snapshot_job_type
 
+        # LFTP's PGET status stream can briefly expose an ``at`` record with
+        # speed/ETA but no counters between two counter-bearing ``got``
+        # records.  The record is still the same running job, so retain the
+        # latest accepted root checkpoint and only refresh its transient rate
+        # fields.  Without this bridge the direct overlay path rejects the
+        # counterless sample and leaves the browser on the old cached base.
+        if snapshot_identity_matches and previous_snapshot is not None and \
+                snapshot_job_type == LftpJobStatus.Type.PGET.value and \
+                transfer_state.size_local is None and transfer_state.percent_local is None and \
+                previous_snapshot.size_local is not None:
+            transfer_state = _TransferState(
+                previous_snapshot.size_local,
+                remote_file.size if remote_file is not None else previous_snapshot.subset_size_remote,
+                previous_snapshot.percent_local,
+                transfer_state.speed,
+                transfer_state.eta,
+            )
+
         if remote_file is not None and transfer_state.size_remote is not None and \
                 transfer_state.size_local is not None:
             # LFTP reports the currently selected resume subset, not always
@@ -5775,6 +5793,7 @@ class ModelBuilder:
     def evict_recent_live_transfer_snapshots_for_completed_file_ids(
             self, completed_file_ids: Set[str],
             preserve_file_ids: Optional[Set[str]] = None,
+            retired_job_identities: Optional[Mapping[str, tuple[int, str]]] = None,
     ) -> None:
         """Discard live progress only after an authoritative completion handoff.
 
@@ -5786,6 +5805,9 @@ class ModelBuilder:
         affecting stopped-transfer floors or unrelated roots. A root that is
         still represented by a live Model overlay may be preserved by the
         caller so this handoff cannot discard a just-published direct counter.
+        ``retired_job_identities=None`` preserves the legacy compatibility
+        behavior; a supplied mapping, including ``{}``, requires identity
+        evidence and fails closed when that evidence is unavailable.
         """
         root_snapshots: dict[str, _RecentLiveTransferSnapshot] = {}
         for snapshot in self.__recent_live_transfer_snapshots.values():
@@ -5798,6 +5820,7 @@ class ModelBuilder:
             if isinstance(file_id, str)
         }
         root_file_ids_to_evict: set[str] = set()
+        retired_identities_by_root: dict[str, set[tuple[int, str]]] = {}
         for completed_file_id in completed_file_ids:
             _, snapshot = self.__resolve_transfer_snapshot(
                 root_snapshots, completed_file_id, completed_file_id,
@@ -5811,14 +5834,82 @@ class ModelBuilder:
                     root_file_id == completed_file_id) or \
                     canonical_claims_by_legacy_root.get(root_file_id) == {completed_file_id}:
                 root_file_ids_to_evict.add(root_file_id)
+                if retired_job_identities is not None:
+                    identity = retired_job_identities.get(completed_file_id)
+                    if isinstance(identity, tuple) and len(identity) == 2 and \
+                            type(identity[0]) is int and identity[0] >= 0 and \
+                            isinstance(identity[1], str) and identity[1]:
+                        retired_identities_by_root.setdefault(root_file_id, set()).add(identity)
 
         removed = False
         for file_id, snapshot in list(self.__recent_live_transfer_snapshots.items()):
             if snapshot.root_file_id in root_file_ids_to_evict:
+                if retired_job_identities is not None:
+                    expected_identities = retired_identities_by_root.get(snapshot.root_file_id)
+                    snapshot_identity = (snapshot.lftp_job_id, snapshot.lftp_job_type)
+                    # A completion handoff may retire only the job that
+                    # actually ended. If that identity is unavailable, keep
+                    # the floor until a later scan/status boundary supplies
+                    # enough evidence; a same-name replacement must not erase
+                    # or inherit the wrong lifecycle's snapshot.
+                    if not expected_identities or snapshot_identity not in expected_identities:
+                        continue
+                if self.__is_pending_staging_pget_snapshot(file_id, snapshot):
+                    # A healthy status retirement only starts the physical
+                    # completion handoff.  Keep the accepted same-job PGET
+                    # floor while its staging target is still incomplete;
+                    # the next scan can then prove completion or expose a
+                    # genuine reset without presenting the lower staging
+                    # checkpoint as an inferred Stop.
+                    continue
                 self.__recent_live_transfer_snapshots.pop(file_id, None)
                 removed = True
         if removed:
             self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LFTP_STATUSES)
+
+    def recent_live_transfer_snapshot_identities(
+            self, file_ids: Set[str],
+    ) -> dict[str, tuple[int, str]]:
+        """Return completion identity evidence before status replacement."""
+        identities: dict[str, tuple[int, str]] = {}
+        for file_id in file_ids:
+            _, snapshot = self.__resolve_recent_live_transfer_snapshot(file_id, file_id)
+            if snapshot is None or type(snapshot.lftp_job_id) is not int or \
+                    snapshot.lftp_job_id < 0 or not isinstance(snapshot.lftp_job_type, str) or \
+                    not snapshot.lftp_job_type:
+                continue
+            identities[file_id] = (snapshot.lftp_job_id, snapshot.lftp_job_type)
+        return identities
+
+    def __is_pending_staging_pget_snapshot(
+            self, file_id: str, snapshot: _RecentLiveTransferSnapshot,
+    ) -> bool:
+        """Whether a retired PGET snapshot still guards incomplete staging."""
+        if type(snapshot.lftp_job_id) is not int or snapshot.lftp_job_id < 0 or \
+                snapshot.lftp_job_type != LftpJobStatus.Type.PGET.value:
+            return False
+        current_status = self.__lftp_statuses.get(snapshot.root_file_id) or self.__lftp_statuses.get(file_id)
+        if current_status is not None and (
+                current_status.id, current_status.type.value,
+        ) != (snapshot.lftp_job_id, snapshot.lftp_job_type):
+            return False
+        source_unavailable = False
+        for candidate_id in (file_id, snapshot.root_file_id):
+            remote = self.__remote_file(candidate_id)
+            local = self.__active_files.get(candidate_id) or self.__local_file(candidate_id)
+            if remote is None or local is None or not getattr(local, "is_staging", False):
+                source_unavailable = source_unavailable or remote is None or local is None
+                continue
+            if self.__is_stopped_file(candidate_id, remote, local):
+                return False
+            if not local.is_dir and local.size == 0:
+                # A zero-byte staging scan is the explicit reset boundary;
+                # retaining the retired floor would resurrect the old job.
+                return False
+            return not self.__effective_local_tree_proves_completion(remote, local)
+        # Completion/reset evidence is not available yet. Keep the retired
+        # same-job floor until an authoritative source supplies either proof.
+        return source_unavailable
 
     def evict_transfer_progress_for_lifecycle(self, file_ids: Set[str]) -> None:
         """Revoke exact transient progress at Queue/Stop lifecycle replacement.

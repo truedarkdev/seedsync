@@ -6584,6 +6584,87 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertEqual([(99, 99), (99, 99), (99, 99)], observed)
 
+    def test_counterless_pget_at_republishes_latest_same_job_overlay(self):
+        """PGET ``at`` samples keep an identity-paired overlay without a full build."""
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1)
+        local = SystemFile("active.bin", 40, False, is_staging=False, mtime_ns=1)
+        local.status_sidecar_ready = True
+        initial = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        initial.total_transfer_state = LftpJobStatus.TransferState(46, 100, 46, 10, 6)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        seed = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        seed.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 8, 7)
+        builder.set_lftp_statuses([seed])
+        builder.set_active_files([local])
+        model = builder.build_model()
+        restored = model.restore_active_progress_overlays(
+            {"active.bin": ActiveProgressOverlay(40, 40, 8, 7)},
+            {"active.bin": (1, LftpJobStatus.Type.PGET.value)},
+        )
+        self.assertEqual({"active.bin"}, restored)
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=model,
+        )
+        controller._Controller__lftp.backend_name = "lftp"
+        active_scan_file = SystemFile(
+            "active.bin", 40, False, is_staging=False, time_modified=datetime.now(),
+        )
+        active_scan_file.status_sidecar_ready = True
+
+        at = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        at.total_transfer_state = LftpJobStatus.TransferState(None, None, None, 12, 4)
+        got = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "active.bin", "",
+        )
+        got.total_transfer_state = LftpJobStatus.TransferState(60, 100, 60, 14, 3)
+        controller._Controller__lftp.status.side_effect = [[initial], [at], [got]]
+        controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(datetime.now(), [active_scan_file]) for _ in range(3)
+        ]
+        controller._Controller__reconciled_local_path_pair_ids = {None}
+        controller._Controller__reconciled_remote_path_pair_ids = {None}
+        updater = ModelUpdater(controller)
+        observed = []
+
+        def assert_overlay(expected):
+            overlay = model.active_progress_overlay("active.bin")
+            self.assertIsNotNone(overlay)
+            assert overlay is not None
+            self.assertEqual(
+                (1, LftpJobStatus.Type.PGET.value),
+                model.active_progress_overlay_job_identities_snapshot().get("active.bin"),
+            )
+            self.assertEqual(expected, (overlay.transferred_size, overlay.download_progress))
+            return overlay
+
+        # The first status/scan pair establishes the authoritative model.
+        updater.update()
+        assert_overlay((46, 46))
+        builder.build_model.reset_mock()
+
+        for expected in ((46, 46), (60, 60)):
+            controller._Controller__next_lftp_status_poll_at = None
+            controller._Controller__lftp_idle_status_authoritative = False
+            updater.update()
+            overlay = assert_overlay(expected)
+            observed.append((overlay.transferred_size, overlay.download_progress))
+
+        self.assertEqual([(46, 46), (60, 60)], observed)
+        builder.build_model.assert_not_called()
+
     def _make_late_older_multi_root_fixture(self):
         remotes = [
             SystemFile("active-a.bin", 100, False, mtime_ns=1),
@@ -8527,6 +8608,83 @@ class TestModelUpdater(unittest.TestCase):
         self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
         self.assertNotIn(file_id, controller._Controller__persist.downloaded_file_names)
 
+    def test_v092_pending_completion_retains_latest_same_job_floor_until_scan_catches_up(self):
+        """Retirement must not expose a lower staging checkpoint as Stopped."""
+        remote = SystemFile("pending.bin", 100, False, mtime_ns=1)
+        local = SystemFile("pending.bin", 93, False, is_staging=True, mtime_ns=1)
+        local.status_sidecar_ready = True
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "pending.bin", "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(99, 100, 99, 100, 0)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        builder.set_lftp_statuses([running])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__reconciled_local_path_pair_ids = {None}
+        controller._Controller__reconciled_remote_path_pair_ids = {None}
+        controller._Controller__prev_downloading_file_names = {
+            ("pending.bin", None, None),
+        }
+        controller._Controller__lftp.status.return_value = []
+        controller._Controller__lftp.last_status_poll_healthy = True
+        controller._Controller__move_from_staging = MagicMock()
+
+        ModelUpdater(controller).update()
+
+        file = live_model.get_file("pending.bin")
+        self.assertEqual(ModelFile.State.DOWNLOADING, file.state)
+        self.assertEqual(99, file.transferred_size)
+        self.assertEqual(99, file.download_progress)
+        self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+        controller._Controller__move_from_staging.assert_not_called()
+        self.assertNotIn("pending.bin", controller._Controller__persist.downloaded_file_names)
+
+    def test_v092_pending_completion_retains_floor_when_staging_first_appears_in_active_scan(self):
+        """Completion eviction waits for the same-tick active staging source."""
+        remote = SystemFile("pending.bin", 100, False, mtime_ns=1)
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "pending.bin", "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(99, 100, 99, 100, 0)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_lftp_statuses([running])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__reconciled_local_path_pair_ids = {None}
+        controller._Controller__reconciled_remote_path_pair_ids = {None}
+        controller._Controller__prev_downloading_file_names = {
+            ("pending.bin", None, None),
+        }
+        controller._Controller__lftp.status.return_value = []
+        controller._Controller__lftp.last_status_poll_healthy = True
+        staged = SystemFile("pending.bin", 93, False, is_staging=True, mtime_ns=1)
+        staged.status_sidecar_ready = True
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [staged], scanned_path_pair_ids={None}, is_scan_final=True,
+        )
+        controller._Controller__move_from_staging = MagicMock()
+
+        ModelUpdater(controller).update()
+
+        file = live_model.get_file("pending.bin")
+        self.assertEqual(ModelFile.State.DOWNLOADING, file.state)
+        self.assertEqual(99, file.transferred_size)
+        self.assertIn(
+            "pending.bin",
+            builder._ModelBuilder__recent_live_transfer_snapshots,
+        )
+        controller._Controller__move_from_staging.assert_not_called()
+
     def test_v092_pending_completion_defers_when_local_scan_is_unknown(self):
         controller = self._make_v092_pending_completion_controller()
         controller._Controller__local_scan_process.pop_latest_result.return_value = ScannerResult(
@@ -10048,7 +10206,10 @@ class TestModelUpdater(unittest.TestCase):
             controller._Controller__pending_completion_file_names,
         )
         controller._Controller__model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids \
-            .assert_called_once_with({ModelFile.build_file_id(*completion_entry[:2])})
+            .assert_called_once_with(
+                {ModelFile.build_file_id(*completion_entry[:2])},
+                retired_job_identities={},
+            )
         controller._Controller__local_scan_process.force_scan.assert_called_once_with("movies")
         controller.logger.info.assert_called_once_with(
             "Download completion pending (LFTP job finished): {}".format(

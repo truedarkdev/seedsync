@@ -6525,6 +6525,75 @@ class TestModelBuilder(unittest.TestCase):
         self.assertNotIn("release", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
         self.assertNotIn(child_file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
 
+    def test_completed_handoff_with_empty_retired_identity_evidence_fails_closed(self):
+        """An identity lookup gap retains the snapshot instead of evicting by name."""
+        self.model_builder.clear()
+        file_id = "active.bin"
+        remote = SystemFile(file_id, 100, False, mtime_ns=1)
+        local = SystemFile(file_id, 40, False, mtime_ns=1)
+        status = LftpJobStatus(
+            7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_id, "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 10, 2)
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+        self.model_builder.set_lftp_statuses([status])
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_id] = \
+            _RecentLiveTransferSnapshot(
+                file_id, 40, 40, 10, 2, status.id, status.type.value,
+            )
+
+        self.model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids(
+            {file_id}, retired_job_identities={},
+        )
+
+        self.assertIn(file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+        # A direct legacy compatibility call still has its documented omitted-
+        # evidence behavior; the updater never takes this unsafe branch.
+        self.model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids({file_id})
+        self.assertNotIn(file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+    def test_completed_handoff_cleans_replacement_stop_and_zero_reset_snapshots(self):
+        """Replacement and explicit reset boundaries retire the old PGET floor."""
+        file_id = "active.bin"
+        pget_type = LftpJobStatus.Type.PGET.value
+        for label, local_size, current_job_id, current_state, stopped in (
+                ("replacement", 40, 8, LftpJobStatus.State.RUNNING, False),
+                ("queued_replacement", 40, 8, LftpJobStatus.State.QUEUED, False),
+                ("stop", 40, 7, LftpJobStatus.State.RUNNING, True),
+                ("zero_reset", 0, 7, LftpJobStatus.State.RUNNING, False),
+        ):
+            with self.subTest(label=label):
+                self.model_builder.clear()
+                remote = SystemFile(file_id, 100, False, mtime_ns=1)
+                local = SystemFile(file_id, local_size, False, is_staging=True, mtime_ns=1)
+                local.status_sidecar_ready = True
+                current_status = LftpJobStatus(
+                    current_job_id, LftpJobStatus.Type.PGET,
+                    current_state, file_id, "",
+                )
+                if current_state != LftpJobStatus.State.QUEUED:
+                    current_status.total_transfer_state = LftpJobStatus.TransferState(
+                        local_size, 100, local_size, 10, 2,
+                    )
+                self.model_builder.set_remote_files([remote])
+                self.model_builder.set_local_files([local])
+                self.model_builder.set_lftp_statuses([current_status])
+                if stopped:
+                    self.model_builder.set_stopped_files({file_id})
+                self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_id] = \
+                    _RecentLiveTransferSnapshot(
+                        file_id, 40, 40, 10, 2, 7, pget_type,
+                    )
+
+                self.model_builder.evict_recent_live_transfer_snapshots_for_completed_file_ids(
+                    {file_id}, retired_job_identities={file_id: (7, pget_type)},
+                )
+
+                self.assertNotIn(
+                    file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots,
+                )
+
     def test_completed_handoff_evicts_unique_legacy_root_alias_and_descendants(self):
         self.model_builder.clear()
         file_name = "release"
