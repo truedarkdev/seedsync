@@ -11010,6 +11010,190 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual((40, 39, 98), (file.remote_size, file.transferred_size, file.download_progress))
         self.assertEqual((100, 99), (file.display_size_total, file.display_transferred_size))
 
+    def test_pending_completion_floor_survives_local_only_denominator_replacement(self):
+        """Retirement progress must not become Stopped when remote totals reappear."""
+        file_id = ModelFile.build_file_id("release", None)
+        local_only = ModelFile("release", True)
+        local_only.local_size = 40
+        local_only.transferred_size = 299
+        local_only.download_progress = 100
+        local_only.state = ModelFile.State.DEFAULT
+        ModelUpdater._apply_pending_completion_progress_floor(
+            local_only,
+            {file_id},
+            previous_download_progress=99,
+            previous_transferred_size=299,
+            presentation_floor_file_ids={file_id},
+        )
+        self.assertEqual("local_only", Controller._model_record_visible_state(local_only))
+
+        reintroduced_remote = ModelFile("release", True)
+        reintroduced_remote.remote_size = 320
+        reintroduced_remote.local_size = 300
+        reintroduced_remote.state = ModelFile.State.DEFAULT
+        ModelUpdater._apply_pending_completion_progress_floor(
+            reintroduced_remote,
+            {file_id},
+            previous_download_progress=99,
+            previous_transferred_size=299,
+            presentation_floor_file_ids={file_id},
+        )
+
+        self.assertEqual(299, reintroduced_remote.transferred_size)
+        self.assertEqual(93, reintroduced_remote.download_progress)
+        self.assertEqual(ModelFile.State.DOWNLOADING, reintroduced_remote.state)
+        self.assertEqual("downloading", Controller._model_record_visible_state(reintroduced_remote))
+
+    def test_pending_completion_floor_registration_records_overlay_and_replacement_clear_boundary(self):
+        file_id = ModelFile.build_file_id("release", None)
+        live_file = ModelFile("release", False)
+        live_file.remote_size = 1000
+        live_file.local_size = 10
+        live_file.is_stoppable = True
+        live_file.state = ModelFile.State.DOWNLOADING
+        model = Model()
+        model.add_file(live_file)
+        self.assertEqual(
+            ({file_id}, "accepted"),
+            model.publish_active_lftp_root_counters(
+                {file_id: ActiveProgressOverlay(93, 930, 1, 2)},
+                {file_id: (7, LftpJobStatus.Type.PGET.value)},
+                lambda _file_id: True,
+            ),
+        )
+        controller = self._make_lftp_completion_controller({("release", None, None)})
+        controller._Controller__model = model
+        controller._Controller__model_lock = RLock()
+        controller._Controller__pending_completion_progress_floors = {}
+        controller._Controller__pending_completion_progress_floor_identities = {}
+        controller._Controller__pending_completion_progress_floor_overlay_ids = set()
+        updater = ModelUpdater(controller)
+
+        updater._handle_lftp_completion_detection(
+            [],
+            True,
+            retired_job_identities={file_id: (7, LftpJobStatus.Type.PGET.value)},
+            lftp_status_poll_authoritative=True,
+            lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True,
+            lftp_status_source="fresh_healthy",
+        )
+
+        self.assertEqual((93, 930), controller._Controller__pending_completion_progress_floors[file_id])
+        self.assertIn(file_id, controller._Controller__pending_completion_progress_floor_overlay_ids)
+        self.assertEqual(
+            (7, LftpJobStatus.Type.PGET.value),
+            controller._Controller__pending_completion_progress_floor_identities[file_id],
+        )
+
+        older_identity = LftpJobStatus(
+            6, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "release", "",
+        )
+        updater._clear_replaced_pending_completion_floors([older_identity])
+        self.assertEqual(
+            (93, 930), controller._Controller__pending_completion_progress_floors[file_id],
+        )
+
+        synthetic_queue = LftpJobStatus(
+            -1, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, "release", "",
+        )
+        updater._clear_replaced_pending_completion_floors([synthetic_queue])
+        self.assertEqual(
+            (93, 930), controller._Controller__pending_completion_progress_floors[file_id],
+        )
+
+        same_identity = LftpJobStatus(
+            7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "release", "",
+        )
+        updater._clear_replaced_pending_completion_floors([same_identity])
+        self.assertEqual(
+            (93, 930), controller._Controller__pending_completion_progress_floors[file_id],
+        )
+
+        replacement = LftpJobStatus(
+            8, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "release", "",
+        )
+        updater._clear_replaced_pending_completion_floors([replacement])
+
+        self.assertNotIn(file_id, controller._Controller__pending_completion_progress_floors)
+        self.assertNotIn(file_id, controller._Controller__pending_completion_progress_floor_overlay_ids)
+        self.assertIn(("release", None, None), controller._Controller__pending_completion_file_names)
+
+    def test_pending_completion_floor_does_not_resurrect_after_zero_reset_or_stop(self):
+        for stopped in (False, True):
+            with self.subTest(stopped=stopped):
+                file = ModelFile("release", False)
+                file.remote_size = 1000
+                file.local_size = 0 if not stopped else 10
+                file.explicitly_stopped = stopped
+                file.state = ModelFile.State.DEFAULT
+                ModelUpdater._apply_pending_completion_progress_floor(
+                    file,
+                    {file.file_id},
+                    previous_download_progress=93,
+                    previous_transferred_size=930,
+                    presentation_floor_file_ids={file.file_id},
+                )
+                self.assertIsNone(file.transferred_size)
+                self.assertIsNone(file.download_progress)
+                self.assertNotEqual(ModelFile.State.DOWNLOADING, file.state)
+
+    def test_newer_replacement_full_update_does_not_inherit_retired_floor(self):
+        """A newer active job clears the floor before candidate diff handling."""
+        file_name = "replacement.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        remote = SystemFile(file_name, 1000, False, mtime_ns=1)
+        local = SystemFile(file_name, 930, False, is_staging=True, mtime_ns=1)
+        retired = LftpJobStatus(
+            7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        retired.total_transfer_state = LftpJobStatus.TransferState(930, 1000, 93, 1, 1)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        builder.set_lftp_statuses([retired])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__pending_completion_file_names = {(file_name, None, None)}
+        controller._Controller__pending_completion_progress_floors = {file_id: (93, 930)}
+        controller._Controller__pending_completion_progress_floor_identities = {
+            file_id: (7, LftpJobStatus.Type.PGET.value),
+        }
+        controller._Controller__pending_completion_progress_floor_overlay_ids = {file_id}
+        replacement_status = LftpJobStatus(
+            8, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        replacement_status.total_transfer_state = LftpJobStatus.TransferState(320, 1000, 32, 1, 1)
+        controller._Controller__lftp.status.return_value = [replacement_status]
+
+        replacement = ModelFile(file_name, False)
+        replacement.remote_size = 1000
+        replacement.local_size = 320
+        replacement.transferred_size = 320
+        replacement.download_progress = 32
+        replacement.state = ModelFile.State.DEFAULT
+        candidate = Model()
+        candidate.add_file(replacement)
+        builder.has_changes = MagicMock(return_value=True)
+        builder.build_model = MagicMock(return_value=candidate)
+
+        with patch(
+                "controller.model_updater.ModelDiffUtil.diff_models",
+                return_value=[ModelDiff(ModelDiff.Change.UPDATED, live_model.get_file(file_id), replacement)],
+        ):
+            ModelUpdater(controller).update()
+
+        published = controller._Controller__model.get_file(file_id)
+        self.assertEqual(320, published.transferred_size)
+        self.assertEqual(32, published.download_progress)
+        self.assertEqual({}, controller._Controller__pending_completion_progress_floors)
+        self.assertIsNone(
+            controller._Controller__pending_completion_progress_floor_identities[file_id],
+        )
+        self.assertNotIn(file_id, controller._Controller__pending_completion_progress_floor_overlay_ids)
+
     def test_delayed_ready_scan_does_not_suppress_same_identity_restart_wake(self):
         controller = SimpleNamespace(
             _Controller__active_scan_process=MagicMock(),

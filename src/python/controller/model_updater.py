@@ -17,7 +17,7 @@ from itertools import islice
 from types import SimpleNamespace
 from threading import Lock, RLock
 from datetime import datetime, timedelta
-from typing import Callable, Mapping, Optional, Sequence, TYPE_CHECKING, cast
+from typing import Callable, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING, cast
 
 from common import Context, PathPair
 from common.breadcrumb_trace import opaque_trace_correlation, trace_session_digest
@@ -2478,6 +2478,8 @@ class _ControllerCoreAccess:
     _Controller__active_scan_lftp_roots_awaiting: set[str]
     _Controller__active_scan_lftp_roots_seen: set[str]
     _Controller__pending_completion_progress_floors: dict[str, tuple[Optional[int], Optional[int]]]
+    _Controller__pending_completion_progress_floor_identities: dict[str, Optional[tuple[int, str]]]
+    _Controller__pending_completion_progress_floor_overlay_ids: set[str]
     _Controller__successful_final_move_handoff_file_ids: set[str]
     _Controller__move_retry_due: dict[str, datetime]
     _Controller__move_attempt_lock: Lock
@@ -2696,9 +2698,17 @@ class ModelUpdater(_ControllerCoreAccess):
         pending_completion_file_ids: set[str],
         previous_download_progress: Optional[int],
         previous_transferred_size: Optional[int],
+        presentation_floor_file_ids: Optional[set[str]] = None,
     ) -> None:
         """Apply a stored pending-completion checkpoint to a rebuilt file."""
         if new_file.file_id not in pending_completion_file_ids:
+            return
+
+        # Stop/zero are lifecycle boundaries, not lower checkpoints from the
+        # retired transfer.  The caller removes the stored floor as well;
+        # this guard keeps compatibility callers from resurrecting it while
+        # the pending identity is being discarded.
+        if ModelUpdater._pending_completion_floor_reset(new_file):
             return
 
         # A parsed PGET sidecar remains a resumable checkpoint after the job
@@ -2763,6 +2773,168 @@ class ModelUpdater(_ControllerCoreAccess):
                 (new_file.transferred_size or 0) + local_only_delta,
                 new_file.display_size_total,
             )
+
+        # A candidate may lose the status-backed DOWNLOADING state while the
+        # physical completion proof is still pending.  Keep an accepted live
+        # overlay's presentation lifecycle visible through that source
+        # replacement; Local Only still wins in the web-visible-state helper.
+        if presentation_floor_file_ids is not None and \
+                new_file.file_id in presentation_floor_file_ids and \
+                new_file.state == ModelFile.State.DEFAULT and \
+                (new_file.transferred_size or 0) > 0 and \
+                not new_file.complete_local_coverage:
+            new_file.state = ModelFile.State.DOWNLOADING
+
+    @staticmethod
+    def _merge_pending_completion_progress_floor(
+        previous: Optional[tuple[Optional[int], Optional[int]]],
+        current: tuple[Optional[int], Optional[int]],
+    ) -> tuple[Optional[int], Optional[int]]:
+        """Keep the greatest accepted raw counters for one pending identity."""
+        if previous is None:
+            return current
+        previous_progress, previous_transferred = previous
+        current_progress, current_transferred = current
+        return (
+            max(value for value in (previous_progress, current_progress) if value is not None)
+            if previous_progress is not None or current_progress is not None else None,
+            max(value for value in (previous_transferred, current_transferred) if value is not None)
+            if previous_transferred is not None or current_transferred is not None else None,
+        )
+
+    @staticmethod
+    def _pending_completion_floor_reset(new_file: ModelFile) -> bool:
+        """Recognize explicit stop/zero evidence that revokes a retired floor."""
+        if new_file.explicitly_stopped:
+            return True
+        if new_file.remote_size is None or new_file.remote_size <= 0:
+            return False
+        return new_file.local_size == 0 or (
+            new_file.state == ModelFile.State.DOWNLOADING and
+            new_file.transferred_size == 0 and
+            new_file.download_progress == 0
+        )
+
+    @staticmethod
+    def _clear_pending_completion_progress_floor(
+        controller: _ControllerCoreAccess, file_id: str,
+    ) -> None:
+        """Clear the floor and its retirement identity at a lifecycle boundary."""
+        getattr(
+            controller, "_Controller__pending_completion_progress_floors", {},
+        ).pop(file_id, None)
+        getattr(
+            controller, "_Controller__pending_completion_progress_floor_identities", {},
+        ).pop(file_id, None)
+        getattr(
+            controller, "_Controller__pending_completion_progress_floor_overlay_ids", set(),
+        ).discard(file_id)
+
+    @staticmethod
+    def _invalidate_pending_completion_progress_floor(
+        controller: _ControllerCoreAccess, file_id: str,
+    ) -> None:
+        """Retire a floor while blocking old-model counters from re-seeding it."""
+        getattr(
+            controller, "_Controller__pending_completion_progress_floors", {},
+        ).pop(file_id, None)
+        identities = getattr(
+            controller, "_Controller__pending_completion_progress_floor_identities", None,
+        )
+        if isinstance(identities, dict):
+            identities[file_id] = None
+        getattr(
+            controller, "_Controller__pending_completion_progress_floor_overlay_ids", set(),
+        ).discard(file_id)
+
+    @staticmethod
+    def _pending_completion_progress_floor_invalidated(
+        controller: _ControllerCoreAccess, file_id: str,
+    ) -> bool:
+        """Whether a replacement boundary has blocked old candidate counters."""
+        identities = getattr(
+            controller, "_Controller__pending_completion_progress_floor_identities", None,
+        )
+        return isinstance(identities, dict) and file_id in identities and identities[file_id] is None
+
+    def _capture_pending_completion_progress_floor(
+        self,
+        file_id: str,
+        retired_job_identity: Optional[tuple[int, str]],
+        overlays: Mapping[str, ActiveProgressOverlay],
+        overlay_identities: Mapping[str, tuple[int, str]],
+    ) -> tuple[Optional[tuple[Optional[int], Optional[int]]], bool, Optional[tuple[int, str]]]:
+        """Capture accepted live counters before retirement evicts their source."""
+        model = getattr(self._controller, "_Controller__model", None)
+        overlay = overlays.get(file_id)
+        overlay_identity = overlay_identities.get(file_id)
+        if isinstance(overlay, ActiveProgressOverlay):
+            if not (
+                    isinstance(overlay_identity, tuple) and len(overlay_identity) == 2 and
+                    type(overlay_identity[0]) is int and overlay_identity[0] >= 0 and
+                    isinstance(overlay_identity[1], str) and overlay_identity[1]
+            ):
+                return None, False, None
+            if retired_job_identity is not None and overlay_identity != retired_job_identity:
+                return None, False, None
+            if type(overlay.download_progress) is int or type(overlay.transferred_size) is int:
+                return (
+                    (overlay.download_progress, overlay.transferred_size),
+                    True,
+                    overlay_identity or retired_job_identity,
+                )
+
+        try:
+            file = model.get_file(file_id) if model is not None else None
+        except (AttributeError, ModelError):
+            file = None
+        if retired_job_identity is None or not isinstance(file, ModelFile) or \
+                file.state != ModelFile.State.DOWNLOADING:
+            return None, False, None
+        if type(file.download_progress) is not int and type(file.transferred_size) is not int:
+            return None, False, None
+        return (
+            (file.download_progress, file.transferred_size),
+            False,
+            retired_job_identity,
+        )
+
+    def _clear_replaced_pending_completion_floors(
+        self, statuses: Iterable[LftpJobStatus],
+    ) -> None:
+        """Drop a retired floor when a distinct active LFTP identity returns."""
+        controller = self._controller
+        floors = getattr(controller, "_Controller__pending_completion_progress_floors", None)
+        identities = getattr(
+            controller, "_Controller__pending_completion_progress_floor_identities", None,
+        )
+        if not isinstance(floors, dict) or not isinstance(identities, dict):
+            return
+        pending_ids = {
+            ModelFile.build_file_id(file_name, path_pair_id)
+            for file_name, path_pair_id, _ in getattr(
+                controller, "_Controller__pending_completion_file_names", set(),
+            )
+        }
+        for status in statuses:
+            if status.state not in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING):
+                continue
+            file_id = getattr(status, "file_id", None)
+            if file_id not in pending_ids:
+                continue
+            retired_identity = identities.get(file_id)
+            if not isinstance(retired_identity, tuple) or len(retired_identity) != 2 or \
+                    type(retired_identity[0]) is not int or not isinstance(retired_identity[1], str):
+                continue
+            if type(status.id) is not int or status.id <= retired_identity[0]:
+                # LFTP status IDs are monotonic for real jobs.  In particular,
+                # a late older row must not revoke the retired job's floor.
+                # Synthetic queued rows use negative IDs and are not proof of
+                # a replacement; wait for the acknowledged job identity.
+                continue
+            current_identity = (status.id, status.type.value)
+            if current_identity != retired_identity:
+                self._invalidate_pending_completion_progress_floor(controller, file_id)
 
     @staticmethod
     def _get_exclude_patterns(controller: _ControllerCoreAccess) -> str:
@@ -3111,22 +3283,75 @@ class ModelUpdater(_ControllerCoreAccess):
             live_model = getattr(controller, "_Controller__model", None)
             overlay_snapshot_reader = getattr(live_model, "active_progress_overlays_snapshot", None)
             live_overlay_snapshot: dict[str, ActiveProgressOverlay] = {}
+            live_overlay_identity_snapshot: dict[str, tuple[int, str]] = {}
             if callable(overlay_snapshot_reader):
                 try:
                     model_lock = getattr(controller, "_Controller__model_lock", None)
                     if model_lock is not None and callable(getattr(model_lock, "__enter__", None)):
                         with model_lock:
                             snapshot = overlay_snapshot_reader()
+                            identity_reader = getattr(
+                                live_model, "active_progress_overlay_job_identities_snapshot", None,
+                            )
+                            identity_snapshot = identity_reader() \
+                                if callable(identity_reader) else {}
                     else:
                         snapshot = overlay_snapshot_reader()
+                        identity_reader = getattr(
+                            live_model, "active_progress_overlay_job_identities_snapshot", None,
+                        )
+                        identity_snapshot = identity_reader() \
+                            if callable(identity_reader) else {}
                     if isinstance(snapshot, dict):
                         live_overlay_snapshot = snapshot
+                    if isinstance(identity_snapshot, dict):
+                        live_overlay_identity_snapshot = identity_snapshot
                 except Exception:
                     live_overlay_snapshot = {}
+                    live_overlay_identity_snapshot = {}
             for name, path_pair_id, _ in just_completed_file_names:
                 file_id = ModelFile.build_file_id(name, path_pair_id)
                 if isinstance(live_overlay_snapshot.get(file_id), ActiveProgressOverlay):
                     preserve_overlay_file_ids.add(file_id)
+            pending_floors = getattr(
+                controller, "_Controller__pending_completion_progress_floors", None,
+            )
+            if not isinstance(pending_floors, dict):
+                pending_floors = {}
+                controller._Controller__pending_completion_progress_floors = pending_floors
+            pending_floor_identities = getattr(
+                controller,
+                "_Controller__pending_completion_progress_floor_identities",
+                None,
+            )
+            if not isinstance(pending_floor_identities, dict):
+                pending_floor_identities = {}
+                controller._Controller__pending_completion_progress_floor_identities = \
+                    pending_floor_identities
+            pending_overlay_ids = getattr(
+                controller, "_Controller__pending_completion_progress_floor_overlay_ids", None,
+            )
+            if not isinstance(pending_overlay_ids, set):
+                pending_overlay_ids = set()
+                controller._Controller__pending_completion_progress_floor_overlay_ids = pending_overlay_ids
+            for name, path_pair_id, _ in just_completed_file_names:
+                file_id = ModelFile.build_file_id(name, path_pair_id)
+                retired_identity = (retired_job_identities or {}).get(file_id)
+                current_floor, overlay_sourced, floor_identity = self._capture_pending_completion_progress_floor(
+                    file_id,
+                    retired_identity,
+                    live_overlay_snapshot,
+                    live_overlay_identity_snapshot,
+                )
+                if current_floor is None:
+                    continue
+                pending_floors[file_id] = self._merge_pending_completion_progress_floor(
+                    pending_floors.get(file_id), current_floor,
+                )
+                if floor_identity is not None:
+                    pending_floor_identities[file_id] = floor_identity
+                if overlay_sourced:
+                    pending_overlay_ids.add(file_id)
             if defer_snapshot_eviction:
                 deferred_snapshot_eviction = (
                     completed_file_ids,
@@ -3453,6 +3678,10 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__active_scan_lftp_roots_seen = set()
         if not hasattr(controller, "_Controller__pending_completion_progress_floors"):
             controller._Controller__pending_completion_progress_floors = {}
+        if not hasattr(controller, "_Controller__pending_completion_progress_floor_identities"):
+            controller._Controller__pending_completion_progress_floor_identities = {}
+        if not hasattr(controller, "_Controller__pending_completion_progress_floor_overlay_ids"):
+            controller._Controller__pending_completion_progress_floor_overlay_ids = set()
         if not hasattr(controller, "_Controller__successful_final_move_handoff_file_ids"):
             controller._Controller__successful_final_move_handoff_file_ids = set()
         if not hasattr(controller, "_Controller__current_process_final_publication_file_ids"):
@@ -3469,6 +3698,14 @@ class ModelUpdater(_ControllerCoreAccess):
             for file_id, floor in controller._Controller__pending_completion_progress_floors.items()
             if file_id in pending_completion_ids
         }
+        controller._Controller__pending_completion_progress_floor_identities = {
+            file_id: identity
+            for file_id, identity in controller._Controller__pending_completion_progress_floor_identities.items()
+            if file_id in pending_completion_ids
+        }
+        controller._Controller__pending_completion_progress_floor_overlay_ids.intersection_update(
+            pending_completion_ids
+        )
         if not hasattr(controller, "_Controller__active_scan_force_file_ids"):
             controller._Controller__active_scan_force_file_ids = set()
         if not hasattr(controller, "_Controller__active_scan_ready_file_ids"):
@@ -4210,6 +4447,7 @@ class ModelUpdater(_ControllerCoreAccess):
             lftp_status_source=lftp_status_source,
             lftp_status_poll_correlation=lftp_status_poll_correlation,
         )
+        self._clear_replaced_pending_completion_floors(lftp_statuses)
         controller._Controller__active_downloading_file_names = current_downloading_file_names
         if controller._Controller__malformed_status_only_file_ids != previous_malformed_status_only_file_ids:
             controller._Controller__next_lftp_status_poll_at = None
@@ -5842,7 +6080,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         for file_name in controller._Controller__pending_completion_file_names
                         if ModelFile.build_file_id(file_name[0], file_name[1]) != file_id
                     }
-                    controller._Controller__pending_completion_progress_floors.pop(file_id, None)
+                    self._clear_pending_completion_progress_floor(controller, file_id)
 
                 def accepted_active_progress_overlay(file: ModelFile) -> Optional[ActiveProgressOverlay]:
                     """Return an identity-paired live projection, if one was accepted.
@@ -5897,6 +6135,10 @@ class ModelUpdater(_ControllerCoreAccess):
                 def remember_pending_completion_floor(file: ModelFile) -> None:
                     if file.file_id not in pending_completion_file_ids():
                         return
+                    if self._pending_completion_progress_floor_invalidated(
+                            controller, file.file_id,
+                    ):
+                        return
                     previous = controller._Controller__pending_completion_progress_floors.get(file.file_id)
                     overlay = accepted_active_progress_overlay(file)
                     current = (
@@ -5904,17 +6146,12 @@ class ModelUpdater(_ControllerCoreAccess):
                         if overlay is not None else
                         (file.download_progress, file.transferred_size)
                     )
-                    if previous is None:
-                        controller._Controller__pending_completion_progress_floors[file.file_id] = current
-                        return
-                    previous_progress, previous_transferred = previous
-                    current_progress, current_transferred = current
-                    controller._Controller__pending_completion_progress_floors[file.file_id] = (
-                        max(value for value in (previous_progress, current_progress) if value is not None)
-                        if previous_progress is not None or current_progress is not None else None,
-                        max(value for value in (previous_transferred, current_transferred) if value is not None)
-                        if previous_transferred is not None or current_transferred is not None else None,
-                    )
+                    controller._Controller__pending_completion_progress_floors[file.file_id] = \
+                        self._merge_pending_completion_progress_floor(previous, current)
+                    if overlay is not None:
+                        getattr(
+                            controller, "_Controller__pending_completion_progress_floor_overlay_ids", set(),
+                        ).add(file.file_id)
 
                 def keep_completion_pending_after_failed_staging_move(file: ModelFile, consume_budget: bool):
                     persist.final_move_succeeded_file_names.discard(file.file_id)
@@ -6011,7 +6248,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         for file_name in controller._Controller__pending_completion_file_names
                         if ModelFile.build_file_id(file_name[0], file_name[1]) != file.file_id
                     }
-                    controller._Controller__pending_completion_progress_floors.pop(file.file_id, None)
+                    self._clear_pending_completion_progress_floor(controller, file.file_id)
 
                 def run_reserved_automatic_move(file: ModelFile, trace_completion_gate: bool = False):
                     reserve_move = getattr(controller, "_reserve_move_attempt", None)
@@ -6071,7 +6308,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     controller._Controller__current_process_final_publication_file_ids.discard(file.file_id)
                     controller._Controller__deferred_move_file_ids.discard(file.file_id)
                     controller._Controller__move_retry_due.pop(file.file_id, None)
-                    controller._Controller__pending_completion_progress_floors.pop(file.file_id, None)
+                    self._clear_pending_completion_progress_floor(controller, file.file_id)
                     terminalized_collision_file_ids.add(file.file_id)
                     controller._Controller__pending_completion_file_names.add((
                         file.name,
@@ -6255,23 +6492,30 @@ class ModelUpdater(_ControllerCoreAccess):
                         and new_file is not None
                     ):
                         if new_file.file_id in terminalized_collision_file_ids:
-                            controller._Controller__pending_completion_progress_floors.pop(
-                                new_file.file_id,
-                                None,
-                            )
+                            self._clear_pending_completion_progress_floor(controller, new_file.file_id)
                         else:
                             remember_pending_completion_floor(old_file)
                             floor = controller._Controller__pending_completion_progress_floors.get(
                                 new_file.file_id,
                             )
                             if floor is not None:
-                                self._apply_pending_completion_progress_floor(
-                                    new_file,
-                                    pending_completion_file_ids(),
-                                    floor[0],
-                                    floor[1],
-                                )
-                            else:
+                                if self._pending_completion_floor_reset(new_file):
+                                    self._clear_pending_completion_progress_floor(controller, new_file.file_id)
+                                else:
+                                    self._apply_pending_completion_progress_floor(
+                                        new_file,
+                                        pending_completion_file_ids(),
+                                        floor[0],
+                                        floor[1],
+                                        getattr(
+                                            controller,
+                                            "_Controller__pending_completion_progress_floor_overlay_ids",
+                                            set(),
+                                        ),
+                                    )
+                            elif not self._pending_completion_progress_floor_invalidated(
+                                    controller, new_file.file_id,
+                            ):
                                 self._preserve_pending_completion_progress_floor(
                                     old_file,
                                     new_file,
@@ -6281,12 +6525,19 @@ class ModelUpdater(_ControllerCoreAccess):
                         remember_pending_completion_floor(old_file)
                     elif diff.change == ModelDiff.Change.ADDED and new_file is not None:
                         floor = controller._Controller__pending_completion_progress_floors.get(new_file.file_id)
-                        if floor is not None:
+                        if floor is not None and self._pending_completion_floor_reset(new_file):
+                            self._clear_pending_completion_progress_floor(controller, new_file.file_id)
+                        elif floor is not None:
                             self._apply_pending_completion_progress_floor(
                                 new_file,
                                 pending_completion_file_ids(),
                                 floor[0],
                                 floor[1],
+                                getattr(
+                                    controller,
+                                    "_Controller__pending_completion_progress_floor_overlay_ids",
+                                    set(),
+                                ),
                             )
 
                     if diff.change == ModelDiff.Change.ADDED:
