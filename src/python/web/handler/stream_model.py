@@ -158,7 +158,10 @@ class ModelStreamHandler(IStreamHandler):
                         )
                     except Exception:
                         pass
-                return self.serialize.update_event(event)
+                return self.serialize.update_event(
+                    event,
+                    self.controller._model_file_progress_presentation,
+                )
             else:
                 return None
 

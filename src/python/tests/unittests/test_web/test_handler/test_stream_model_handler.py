@@ -1,8 +1,10 @@
+import json
 import unittest
 from unittest.mock import MagicMock
 
 from controller import Controller
 from model import ModelFile
+from tests.unittests.test_web.test_serialize.test_serialize import parse_stream
 from web.handler.stream_model import ModelStreamHandler, WebResponseModelListener
 from web.serialize import SerializeModel
 
@@ -119,6 +121,45 @@ class TestModelStreamHandler(unittest.TestCase):
         result = self.handler.get_value()
 
         self.assertIn("event: model-removed", result)
+
+    def test_updated_event_serializes_current_active_progress_overlay(self):
+        self.controller._model_file_progress_presentation.return_value = {
+            "download_progress": 53,
+            "transferred_size": 53,
+            "downloading_speed": 12,
+            "eta": 3,
+        }
+        self.handler.first_run = False
+        old_file = ModelFile("active.bin", False)
+        new_file = ModelFile("active.bin", False)
+        old_file.download_progress = 48
+        old_file.transferred_size = 48
+        new_file.download_progress = 48
+        new_file.transferred_size = 48
+
+        self.handler.model_listener.file_updated(old_file, new_file)
+
+        result = json.loads(parse_stream(self.handler.get_value())["data"])
+
+        self.assertEqual(48, result["old_file"]["download_progress"])
+        self.assertEqual(48, result["old_file"]["transferred_size"])
+        self.assertEqual(53, result["new_file"]["download_progress"])
+        self.assertEqual(53, result["new_file"]["transferred_size"])
+        self.controller._model_file_progress_presentation.assert_called_once_with(new_file)
+
+    def test_updated_event_keeps_base_when_progress_overlay_is_unavailable(self):
+        self.controller._model_file_progress_presentation.return_value = None
+        self.handler.first_run = False
+        new_file = ModelFile("stopped.bin", False)
+        new_file.download_progress = 53
+        new_file.transferred_size = 53
+
+        self.handler.model_listener.file_updated(new_file, new_file)
+
+        result = json.loads(parse_stream(self.handler.get_value())["data"])
+
+        self.assertEqual(53, result["new_file"]["download_progress"])
+        self.assertEqual(53, result["new_file"]["transferred_size"])
 
     def test_enabled_enqueue_then_disable_before_emit_strips_trace_metadata(self):
         self.controller.is_stop_resume_trace_enabled.return_value = True

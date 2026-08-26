@@ -3,7 +3,7 @@
 from enum import Enum
 import json
 import time
-from typing import List, Optional
+from typing import Callable, List, Mapping, Optional
 
 from .serialize import Serialize
 from model import ModelFile
@@ -131,7 +131,12 @@ class SerializeModel(Serialize):
     __KEY_FILE_CHILDREN = "children"
 
     @staticmethod
-    def __model_file_to_json_dict(model_file: ModelFile) -> dict[str, object]:
+    def __model_file_to_json_dict(
+        model_file: ModelFile,
+        progress_presentation_provider: Optional[
+            Callable[[ModelFile], Mapping[str, object]]
+        ] = None,
+    ) -> dict[str, object]:
         json_dict: dict[str, object] = {}
         json_dict[SerializeModel.__KEY_FILE_NAME] = model_file.name
         json_dict[SerializeModel.__KEY_FILE_IS_DIR] = model_file.is_dir
@@ -170,8 +175,23 @@ class SerializeModel(Serialize):
         json_dict[SerializeModel.__KEY_FILE_VALIDATION_ERROR] = model_file.validation_error
         json_dict[SerializeModel.__KEY_FILE_CORRUPT_CHUNKS] = model_file.corrupt_chunks
         json_dict[SerializeModel.__KEY_FILE_FINAL_MOVE_SUCCEEDED] = model_file.final_move_succeeded
+        if progress_presentation_provider is not None:
+            try:
+                presentation = progress_presentation_provider(model_file)
+            except Exception:
+                # Presentation diagnostics must never interrupt model delivery.
+                presentation = None
+            if isinstance(presentation, Mapping):
+                for key in (
+                    SerializeModel.__KEY_FILE_DOWNLOAD_PROGRESS,
+                    SerializeModel.__KEY_FILE_TRANSFERRED_SIZE,
+                    SerializeModel.__KEY_FILE_DOWNLOADING_SPEED,
+                    SerializeModel.__KEY_FILE_ETA,
+                ):
+                    if key in presentation:
+                        json_dict[key] = presentation[key]
         json_dict[SerializeModel.__KEY_FILE_CHILDREN] = [
-            SerializeModel.__model_file_to_json_dict(child)
+            SerializeModel.__model_file_to_json_dict(child, progress_presentation_provider)
             for child in model_file.get_children()
         ]
         return json_dict
@@ -186,12 +206,20 @@ class SerializeModel(Serialize):
         return self._sse_pack(event=SerializeModel.__EVENT_INIT,
                               data=model_json)
 
-    def update_event(self, event: UpdateEvent) -> str:
+    def update_event(
+        self,
+        event: UpdateEvent,
+        progress_presentation_provider: Optional[
+            Callable[[ModelFile], Mapping[str, object]]
+        ] = None,
+    ) -> str:
         model_file_json_dict = {
             SerializeModel.__KEY_UPDATE_OLD_FILE:
                 SerializeModel.__model_file_to_json_dict(event.old_file) if event.old_file else None,
             SerializeModel.__KEY_UPDATE_NEW_FILE:
-                SerializeModel.__model_file_to_json_dict(event.new_file) if event.new_file else None
+                SerializeModel.__model_file_to_json_dict(
+                    event.new_file, progress_presentation_provider
+                ) if event.new_file else None
         }
         if event.trace_metadata is not None:
             model_file_json_dict[SerializeModel.__KEY_UPDATE_TRACE] = event.trace_metadata
