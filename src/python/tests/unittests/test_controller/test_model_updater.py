@@ -10328,6 +10328,44 @@ class TestModelUpdater(unittest.TestCase):
         self.assertFalse(controller._Controller__lftp_idle_status_authoritative)
         self.assertIsNone(controller._Controller__next_lftp_status_poll_at)
 
+    def test_cached_inflight_excludes_stopped_root_without_dropping_active_root(self):
+        builder = ModelBuilder()
+        stopped_root = SystemFile("same.bin", 100, False)
+        stopped_root.path_pair_id = "pair-a"
+        active_root = SystemFile("same.bin", 100, False)
+        active_root.path_pair_id = "pair-b"
+        builder.set_remote_files([stopped_root, active_root])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        stopped = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "same.bin", "",
+        )
+        stopped.path_pair_id = "pair-a"
+        stopped.total_transfer_state = LftpJobStatus.TransferState(10, 100, 10, 10, 1)
+        active = LftpJobStatus(
+            2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "same.bin", "",
+        )
+        active.path_pair_id = "pair-b"
+        active.total_transfer_state = LftpJobStatus.TransferState(20, 100, 20, 20, 1)
+        cached_statuses = [stopped, active]
+        controller._Controller__last_lftp_statuses = cached_statuses
+        controller._get_lftp_status_snapshot = MagicMock(return_value=None)
+        stopped_file_id = ModelFile.build_file_id("same.bin", "pair-a")
+        controller._Controller__persist.stopped_file_names.add(stopped_file_id)
+        controller._Controller__is_explicitly_stopped = MagicMock(
+            side_effect=lambda name, path_pair_id: ModelFile.build_file_id(name, path_pair_id) == stopped_file_id,
+        )
+        set_lftp_statuses = MagicMock(wraps=builder.set_lftp_statuses)
+        builder.set_lftp_statuses = set_lftp_statuses
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual([active], set_lftp_statuses.call_args.args[0])
+        self.assertEqual([("same.bin", "pair-b", None)], controller._Controller__active_downloading_file_names)
+        self.assertIs(cached_statuses, controller._Controller__last_lftp_statuses)
+
     def test_identical_active_scan_does_not_repeat_idle_wakeup_after_empty_poll(self):
         builder = ModelBuilder()
         builder.set_remote_files([SystemFile("active.bin", 100, False)])

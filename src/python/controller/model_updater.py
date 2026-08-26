@@ -4470,6 +4470,15 @@ class ModelUpdater(_ControllerCoreAccess):
                     lftp_status_poll_healthy = False
                     lftp_statuses = list(controller._Controller__last_lftp_statuses or [])
                     lftp_status_source = "cached_inflight" if lftp_statuses else "inflight_empty"
+                    if lftp_statuses:
+                        is_explicitly_stopped = getattr(
+                            controller, "_Controller__is_explicitly_stopped", None,
+                        )
+                        if callable(is_explicitly_stopped):
+                            lftp_statuses = [
+                                status for status in lftp_statuses
+                                if not is_explicitly_stopped(status.name, status.path_pair_id)
+                            ]
                     controller._Controller__lftp_idle_status_authoritative = False
                     controller._Controller__next_lftp_status_poll_at = None
                     raise StopIteration
