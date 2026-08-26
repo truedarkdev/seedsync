@@ -13,6 +13,7 @@ import json
 import logging
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from itertools import islice
 from types import SimpleNamespace
 from threading import Lock, RLock
@@ -312,6 +313,15 @@ def _completion_entry_sort_key(
 ) -> tuple[tuple[int, str], ...]:
     """Sort completion targets without comparing None to string values."""
     return tuple(_completion_optional_sort_key(value) for value in entry)
+
+
+@dataclass(frozen=True)
+class _PendingCompletionPublication:
+    """One accepted presentation retained while physical completion is pending."""
+
+    overlay: ActiveProgressOverlay
+    job_identity: Optional[tuple[int, str]]
+    authoritative_missing_proof_generation: Optional[tuple[Optional[str], int, Optional[str], int]] = None
 
 
 def _breadcrumb_effectively_enabled(
@@ -2481,6 +2491,7 @@ class _ControllerCoreAccess:
     _Controller__pending_completion_progress_floors: dict[str, tuple[Optional[int], Optional[int]]]
     _Controller__pending_completion_progress_floor_identities: dict[str, Optional[tuple[int, str]]]
     _Controller__pending_completion_progress_floor_overlay_ids: set[str]
+    _Controller__pending_completion_publications: dict[str, _PendingCompletionPublication]
     _Controller__successful_final_move_handoff_file_ids: set[str]
     _Controller__move_retry_due: dict[str, datetime]
     _Controller__move_attempt_lock: Lock
@@ -2812,11 +2823,12 @@ class ModelUpdater(_ControllerCoreAccess):
             return True
         if new_file.remote_size is None or new_file.remote_size <= 0:
             return False
-        return new_file.local_size == 0 or (
-            new_file.state == ModelFile.State.DOWNLOADING and
-            new_file.transferred_size == 0 and
-            new_file.download_progress == 0
-        )
+        # A replacement's zero live counters are not physical reset proof:
+        # global candidate composition may have already retired the accepted
+        # overlay.  Local absence is authoritative reset evidence; a distinct
+        # new LFTP identity is retired earlier by
+        # ``_clear_replaced_pending_completion_floors``.
+        return new_file.local_size == 0
 
     @staticmethod
     def _clear_pending_completion_progress_floor(
@@ -2832,6 +2844,9 @@ class ModelUpdater(_ControllerCoreAccess):
         getattr(
             controller, "_Controller__pending_completion_progress_floor_overlay_ids", set(),
         ).discard(file_id)
+        getattr(
+            controller, "_Controller__pending_completion_publications", {},
+        ).pop(file_id, None)
 
     @staticmethod
     def _invalidate_pending_completion_progress_floor(
@@ -2849,6 +2864,9 @@ class ModelUpdater(_ControllerCoreAccess):
         getattr(
             controller, "_Controller__pending_completion_progress_floor_overlay_ids", set(),
         ).discard(file_id)
+        getattr(
+            controller, "_Controller__pending_completion_publications", {},
+        ).pop(file_id, None)
 
     @staticmethod
     def _pending_completion_progress_floor_invalidated(
@@ -2859,6 +2877,31 @@ class ModelUpdater(_ControllerCoreAccess):
             controller, "_Controller__pending_completion_progress_floor_identities", None,
         )
         return isinstance(identities, dict) and file_id in identities and identities[file_id] is None
+
+    @staticmethod
+    def _pending_completion_publication_file_ids(
+        controller: _ControllerCoreAccess, pending_file_ids: set[str],
+    ) -> set[str]:
+        """Return pending identities with an accepted retained projection.
+
+        This is deliberately independent of the live Model overlay.  The
+        overlay can be retired by a global candidate before that candidate's
+        incomplete scan state is published; the controller-owned record is
+        the single handoff authority until completion or a lifecycle reset.
+        """
+        publications = getattr(
+            controller, "_Controller__pending_completion_publications", {},
+        )
+        if not isinstance(publications, dict):
+            return set()
+        return {
+            file_id for file_id, publication in publications.items()
+            if file_id in pending_file_ids and
+            isinstance(publication, _PendingCompletionPublication) and
+            not ModelUpdater._pending_completion_progress_floor_invalidated(
+                controller, file_id,
+            )
+        }
 
     def _capture_pending_completion_progress_floor(
         self,
@@ -3342,6 +3385,12 @@ class ModelUpdater(_ControllerCoreAccess):
             if not isinstance(pending_overlay_ids, set):
                 pending_overlay_ids = set()
                 controller._Controller__pending_completion_progress_floor_overlay_ids = pending_overlay_ids
+            pending_publications = getattr(
+                controller, "_Controller__pending_completion_publications", None,
+            )
+            if not isinstance(pending_publications, dict):
+                pending_publications = {}
+                controller._Controller__pending_completion_publications = pending_publications
             for name, path_pair_id, _ in just_completed_file_names:
                 file_id = ModelFile.build_file_id(name, path_pair_id)
                 retired_identity = (retired_job_identities or {}).get(file_id)
@@ -3360,6 +3409,12 @@ class ModelUpdater(_ControllerCoreAccess):
                     pending_floor_identities[file_id] = floor_identity
                 if overlay_sourced:
                     pending_overlay_ids.add(file_id)
+                merged_floor = pending_floors.get(file_id)
+                if merged_floor is not None and overlay_sourced and floor_identity is not None:
+                    pending_publications[file_id] = _PendingCompletionPublication(
+                        ActiveProgressOverlay(merged_floor[0], merged_floor[1], None, None),
+                        floor_identity,
+                    )
             if defer_snapshot_eviction:
                 deferred_snapshot_eviction = (
                     completed_file_ids,
@@ -3692,6 +3747,8 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__pending_completion_progress_floor_identities = {}
         if not hasattr(controller, "_Controller__pending_completion_progress_floor_overlay_ids"):
             controller._Controller__pending_completion_progress_floor_overlay_ids = set()
+        if not hasattr(controller, "_Controller__pending_completion_publications"):
+            controller._Controller__pending_completion_publications = {}
         if not hasattr(controller, "_Controller__successful_final_move_handoff_file_ids"):
             controller._Controller__successful_final_move_handoff_file_ids = set()
         if not hasattr(controller, "_Controller__current_process_final_publication_file_ids"):
@@ -3716,6 +3773,12 @@ class ModelUpdater(_ControllerCoreAccess):
         controller._Controller__pending_completion_progress_floor_overlay_ids.intersection_update(
             pending_completion_ids
         )
+        controller._Controller__pending_completion_publications = {
+            file_id: publication
+            for file_id, publication in controller._Controller__pending_completion_publications.items()
+            if file_id in pending_completion_ids and
+            isinstance(publication, _PendingCompletionPublication)
+        }
         controller._Controller__pending_completion_authority_rebuild_ids.intersection_update(
             pending_completion_ids
         )
@@ -6379,6 +6442,134 @@ class ModelUpdater(_ControllerCoreAccess):
                     candidate_complete_local_coverage(file_id)
                 return authorized
 
+            def pending_completion_authority_generation(
+                    file_id: str,
+            ) -> Optional[tuple[Optional[str], int, Optional[str], int]]:
+                """Whether this candidate can make a later proof-less decision.
+
+                The retained presentation bridges one accepted LFTP retirement
+                into the next reconciled scan candidate.  It is not a lease:
+                only a *later scan generation* that again has complete
+                authority may release the display floor.  Fast no-scan model
+                rebuilds therefore cannot consume the handoff allowance.
+                """
+                if not candidate_lifecycle_allows(file_id):
+                    return None
+                try:
+                    pending_file = new_model.get_file(file_id)
+                except ModelError:
+                    return None
+                path_pair_id = pending_file.path_pair_id
+                if path_pair_id not in reconciled_local_path_pair_ids or \
+                        path_pair_id not in reconciled_remote_path_pair_ids:
+                    return None
+                if not lftp_status_poll_healthy or not bool(getattr(
+                        controller, "_Controller__lftp_idle_status_authoritative", False
+                )):
+                    return None
+                if file_id in active_lftp_status_file_ids or (
+                    path_pair_id is not None and
+                    pending_file.name in active_unscoped_lftp_status_names
+                ):
+                    return None
+                # Standing reconciliation is sufficient to authorize a move,
+                # but not to expire a retained presentation. Expiry needs the
+                # concrete, fresh paired scan generation that re-evaluated
+                # this root after the LFTP handoff.
+                if latest_local_scan is None or latest_remote_scan is None:
+                    return None
+
+                def fresh_scan_authority_includes_pair(
+                        result: ScannerResult,
+                ) -> bool:
+                    if bool(getattr(result, "failed", False)) or \
+                            path_pair_id in set(getattr(result, "unknown_path_pair_ids", set()) or set()):
+                        return False
+                    scanned_ids = set(getattr(result, "scanned_path_pair_ids", set()) or set())
+                    completed_ids = set(getattr(result, "completed_path_pair_ids", set()) or set())
+                    if path_pair_id in completed_ids:
+                        return True
+                    # Legacy non-progress results have only scanned IDs. They
+                    # are authoritative when final; a non-final progress chunk
+                    # must not advance expiry on its own.
+                    return path_pair_id in scanned_ids and bool(
+                        getattr(result, "is_scan_final", True)
+                    )
+
+                if not fresh_scan_authority_includes_pair(latest_local_scan) or \
+                        not fresh_scan_authority_includes_pair(latest_remote_scan):
+                    return None
+                return (
+                    getattr(latest_local_scan, "session_token", None),
+                    scan_generation(latest_local_scan),
+                    getattr(latest_remote_scan, "session_token", None),
+                    scan_generation(latest_remote_scan),
+                )
+
+            def expire_unproven_pending_completion_publications() -> None:
+                """Bound a retained live projection by scan authority, not time.
+
+                One authoritative candidate without proof is expected while a
+                just-retired LFTP job hands off to scanning.  A second later
+                candidate with the same full authority and still no exact
+                staging proof revokes only the presentation floor.  The
+                pending identity remains for the established Stop, Queue,
+                Delete Local, and eventual proven-completion paths.
+                """
+                publications = getattr(
+                    controller, "_Controller__pending_completion_publications", {},
+                )
+                if not isinstance(publications, dict):
+                    return
+                for file_id in self._pending_completion_publication_file_ids(
+                        controller, pending_completion_file_ids(),
+                ):
+                    publication = publications.get(file_id)
+                    if not isinstance(publication, _PendingCompletionPublication):
+                        continue
+                    authority_generation = pending_completion_authority_generation(file_id)
+                    if authority_generation is None:
+                        continue
+                    proof_present = candidate_verified_staging_identity(file_id) and \
+                        candidate_complete_local_coverage(file_id)
+                    if proof_present:
+                        continue
+                    if publication.authoritative_missing_proof_generation is None:
+                        publications[file_id] = _PendingCompletionPublication(
+                            publication.overlay,
+                            publication.job_identity,
+                            authoritative_missing_proof_generation=authority_generation,
+                        )
+                    elif publication.authoritative_missing_proof_generation != authority_generation:
+                        # Retire the original direct projection as well as its
+                        # floor. The identity fence cannot clear a new job's
+                        # overlay if one arrived during this scan boundary.
+                        clear_overlay = getattr(
+                            model, "clear_active_progress_overlay_if_job_identity_matches", None,
+                        )
+                        if callable(clear_overlay) and publication.job_identity is not None:
+                            clear_overlay(file_id, publication.job_identity)
+                        self._invalidate_pending_completion_progress_floor(
+                            controller, file_id,
+                        )
+                        try:
+                            recovery_file = new_model.get_file(file_id)
+                        except ModelError:
+                            continue
+                        # A candidate can have inherited the old rendered
+                        # DOWNLOADING runtime fields during model composition.
+                        # Once the identity-paired projection is revoked, do
+                        # not let those derived fields re-publish the retired
+                        # job. Physical scan facts remain untouched.
+                        if recovery_file.state == ModelFile.State.DOWNLOADING and \
+                                not recovery_file.explicitly_stopped:
+                            recovery_file.state = ModelFile.State.DEFAULT
+                            recovery_file.transferred_size = None
+                            recovery_file.download_progress = None
+                            recovery_file.downloading_speed = None
+                            recovery_file.eta = None
+                            recovery_file.is_stoppable = False
+
             def candidate_has_actionable_unrelated_retry(file_id: str) -> bool:
                 """Keep a stale durable marker from invalidating a pair candidate.
 
@@ -6417,6 +6608,22 @@ class ModelUpdater(_ControllerCoreAccess):
                         ModelFile.build_file_id(file_name, path_pair_id)
                         for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
                     }
+
+                def pending_completion_presentation_file_ids() -> set[str]:
+                    # Compatibility floors recorded before this ownership
+                    # record remain presentation-capable. New pending
+                    # completions use the record so global candidate adoption
+                    # cannot erase their lifecycle projection.
+                    pending_ids = pending_completion_file_ids()
+                    return set(getattr(
+                        controller,
+                        "_Controller__pending_completion_progress_floor_overlay_ids",
+                        set(),
+                    )).intersection(pending_ids).union(
+                        self._pending_completion_publication_file_ids(
+                            controller, pending_ids,
+                        )
+                    )
 
                 def discard_pending_completion_file(file_id: str) -> None:
                     controller._Controller__pending_completion_file_names = {
@@ -6499,6 +6706,20 @@ class ModelUpdater(_ControllerCoreAccess):
                         getattr(
                             controller, "_Controller__pending_completion_progress_floor_overlay_ids", set(),
                         ).add(file.file_id)
+                    floor = controller._Controller__pending_completion_progress_floors[file.file_id]
+                    publications = getattr(
+                        controller, "_Controller__pending_completion_publications", None,
+                    )
+                    floor_identity = getattr(
+                        controller,
+                        "_Controller__pending_completion_progress_floor_identities",
+                        {},
+                    ).get(file.file_id)
+                    if isinstance(publications, dict) and overlay is not None and floor_identity is not None:
+                        publications[file.file_id] = _PendingCompletionPublication(
+                            ActiveProgressOverlay(floor[0], floor[1], None, None),
+                            floor_identity,
+                        )
 
                 def keep_completion_pending_after_failed_staging_move(file: ModelFile, consume_budget: bool):
                     persist.final_move_succeeded_file_names.discard(file.file_id)
@@ -6719,6 +6940,11 @@ class ModelUpdater(_ControllerCoreAccess):
                             continue
                         terminalize_unresolved_staging_collision(pending_file)
 
+                # Bound each accepted pending-completion projection before
+                # diff application so a second proof-less authoritative scan
+                # publishes the genuine recoverable state in this update.
+                expire_unproven_pending_completion_publications()
+
                 # Diff the new model with old model.
                 model_diff = ModelDiffUtil.diff_models(model, new_model)
                 attempted_move_file_ids: set[str] = set()
@@ -6857,11 +7083,7 @@ class ModelUpdater(_ControllerCoreAccess):
                                         pending_completion_file_ids(),
                                         floor[0],
                                         floor[1],
-                                        getattr(
-                                            controller,
-                                            "_Controller__pending_completion_progress_floor_overlay_ids",
-                                            set(),
-                                        ),
+                                        pending_completion_presentation_file_ids(),
                                     )
                             elif not self._pending_completion_progress_floor_invalidated(
                                     controller, new_file.file_id,
@@ -6870,11 +7092,7 @@ class ModelUpdater(_ControllerCoreAccess):
                                     old_file,
                                     new_file,
                                     pending_completion_file_ids(),
-                                    getattr(
-                                        controller,
-                                        "_Controller__pending_completion_progress_floor_overlay_ids",
-                                        set(),
-                                    ),
+                                    pending_completion_presentation_file_ids(),
                                 )
                     elif diff.change == ModelDiff.Change.REMOVED and old_file is not None:
                         remember_pending_completion_floor(old_file)
@@ -6888,11 +7106,7 @@ class ModelUpdater(_ControllerCoreAccess):
                                 pending_completion_file_ids(),
                                 floor[0],
                                 floor[1],
-                                getattr(
-                                    controller,
-                                    "_Controller__pending_completion_progress_floor_overlay_ids",
-                                    set(),
-                                ),
+                                pending_completion_presentation_file_ids(),
                             )
 
                     if diff.change == ModelDiff.Change.ADDED:

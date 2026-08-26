@@ -460,6 +460,7 @@ class Controller:
     __pending_completion_file_names: set[tuple[str, Optional[str], Optional[str]]]
     __pending_completion_authority_rebuild_ids: set[str]
     __pending_completion_progress_floors: dict[str, tuple[Optional[int], Optional[int]]]
+    __pending_completion_publications: dict[str, object]
     __move_retry_due: dict[str, datetime]
     __move_attempt_reservations: set[str]
     __deferred_move_file_ids: set[str]
@@ -506,6 +507,7 @@ class Controller:
     _Controller__pending_completion_file_names: set[tuple[str, Optional[str], Optional[str]]]
     _Controller__pending_completion_authority_rebuild_ids: set[str]
     _Controller__pending_completion_progress_floors: dict[str, tuple[Optional[int], Optional[int]]]
+    _Controller__pending_completion_publications: dict[str, object]
     _Controller__move_retry_due: dict[str, datetime]
     _Controller__move_attempt_lock: Lock
     _Controller__move_attempt_reservations: set[str]
@@ -841,6 +843,7 @@ class Controller:
         self.__active_scan_lftp_roots_awaiting = set()
         self.__active_scan_lftp_roots_seen = set()
         self.__pending_completion_progress_floors = {}
+        self.__pending_completion_publications = {}
         self.__collision_compare_lock = Lock()
         self.__collision_compare_executor = None
         self.__collision_compare_future = None
@@ -1095,6 +1098,7 @@ class Controller:
         self.__pending_completion_file_names = set()
         self.__pending_completion_authority_rebuild_ids = set()
         self.__pending_completion_progress_floors = {}
+        self.__pending_completion_publications = {}
         self.__shutdown_collision_compare_worker()
         self.__collision_compare_epoch = getattr(self, "_Controller__collision_compare_epoch", 0) + 1
         self.__collision_compare_lock = Lock()
@@ -7537,6 +7541,7 @@ class Controller:
         }
         getattr(self, "_Controller__pending_completion_authority_rebuild_ids", set()).discard(file_id)
         getattr(self, "_Controller__pending_completion_progress_floors", {}).pop(file_id, None)
+        getattr(self, "_Controller__pending_completion_publications", {}).pop(file_id, None)
         getattr(self, "_Controller__successful_final_move_handoff_file_ids", set()).discard(file_id)
         self.__persist.final_move_succeeded_file_names.discard(file_id)
         getattr(self, "_Controller__current_process_final_publication_file_ids", set()).discard(file_id)
@@ -9445,6 +9450,10 @@ class Controller:
                                 if ModelFile.build_file_id(entry[0], entry[1]) != file.file_id
                             }
                             getattr(self, "_Controller__pending_completion_authority_rebuild_ids", set()).discard(file.file_id)
+                            getattr(self, "_Controller__pending_completion_publications", {}).pop(
+                                file.file_id,
+                                None,
+                            )
                             with self.__move_attempt_lock:
                                 self.__move_attempt_reservations.discard(file.file_id)
                             self.__model_builder.set_move_failed_files({
@@ -10141,6 +10150,10 @@ class Controller:
                         }
                         getattr(self, "_Controller__pending_completion_authority_rebuild_ids", set()).discard(file.file_id)
                         getattr(self, "_Controller__pending_completion_progress_floors", {}).pop(
+                            file.file_id,
+                            None,
+                        )
+                        getattr(self, "_Controller__pending_completion_publications", {}).pop(
                             file.file_id,
                             None,
                         )

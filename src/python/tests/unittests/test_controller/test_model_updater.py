@@ -17,6 +17,7 @@ from controller.extract import ExtractCompletedResult
 from controller.persist_keys import KEY_SEP
 from controller.model_updater import (
     ModelUpdater,
+    _PendingCompletionPublication,
     _breadcrumb_effectively_enabled,
     _active_delta_rejection_correlation_identity,
     _active_delta_poll_decision_diagnostics,
@@ -11354,6 +11355,7 @@ class TestModelUpdater(unittest.TestCase):
             (file_name, path_pair_id, "Movies"),
             controller._Controller__pending_completion_file_names,
         )
+        self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
         controller._Controller__local_scan_process.force_scan.assert_called_once_with(path_pair_id)
 
     def test_pending_completion_floor_prefers_accepted_overlay_over_stale_base(self):
@@ -11396,6 +11398,180 @@ class TestModelUpdater(unittest.TestCase):
             (99, 99),
             controller._Controller__pending_completion_progress_floors[file_id],
         )
+
+    def test_pending_completion_overlay_expires_only_after_later_authoritative_scan_generation(self):
+        """Rapid rebuilds cannot consume the one-generation scan handoff."""
+        file_name = "pending.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        remote = SystemFile(file_name, 100, False)
+        local = SystemFile(file_name, 61, False, is_staging=False)
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(61, 100, 61, 1, 2)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        builder.set_lftp_statuses([running])
+        live_model = builder.build_model()
+        live_model.publish_active_lftp_root_counters(
+            {file_id: ActiveProgressOverlay(99, 99, 1, 2)},
+            {file_id: (running.id, running.type.value)}, lambda _file_id: True,
+        )
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__prev_downloading_file_names = {(file_name, None, None)}
+        controller._Controller__lftp.status.return_value = []
+
+        def scan_generation(generation):
+            return (
+                ScannerResult(
+                    datetime.now(), [SystemFile(file_name, 100, False)], generation=generation,
+                    scanned_path_pair_ids={None}, completed_path_pair_ids={None},
+                    session_token="remote-session",
+                ),
+                ScannerResult(
+                    datetime.now(), [SystemFile(file_name, 61, False, is_staging=False)],
+                    generation=generation, scanned_path_pair_ids={None}, completed_path_pair_ids={None},
+                    session_token="local-session",
+                ),
+            )
+
+        with patch.object(builder, "has_changes", return_value=True):
+            ModelUpdater(controller).update()
+            first_remote, first_local = scan_generation(1)
+            controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
+                first_remote, first_remote, scan_generation(2)[0],
+            ]
+            controller._Controller__local_scan_process.pop_latest_result.side_effect = [
+                first_local, first_local, scan_generation(2)[1],
+            ]
+
+            # The first fully authoritative scan accepts the temporary handoff.
+            ModelUpdater(controller).update()
+            self.assertEqual(ModelFile.State.DOWNLOADING, controller._Controller__model.get_file(file_id).state)
+            publication = controller._Controller__pending_completion_publications[file_id]
+            self.assertEqual(("local-session", 1, "remote-session", 1), publication.authoritative_missing_proof_generation)
+
+            # A rapid rebuild of that same scan generation cannot revoke it.
+            ModelUpdater(controller).update()
+            self.assertEqual(ModelFile.State.DOWNLOADING, controller._Controller__model.get_file(file_id).state)
+            self.assertIn(file_id, controller._Controller__pending_completion_publications)
+
+            # A later reconciled generation still has no physical proof: publish
+            # the ordinary recoverable DEFAULT state rather than fake downloading.
+            ModelUpdater(controller).update()
+            published = controller._Controller__model.get_file(file_id)
+            self.assertEqual(ModelFile.State.DEFAULT, published.state)
+            self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
+            self.assertIn((file_name, None, None), controller._Controller__pending_completion_file_names)
+            self.assertNotIn(file_id, controller._Controller__persist.stopped_file_names)
+
+    def test_pending_completion_overlay_expiry_requires_matching_pair_scans(self):
+        """Unrelated or mixed-pair scans must not expire pair A's handoff."""
+        file_name = "pending.bin"
+        pair_a = "pair-a"
+        pair_b = "pair-b"
+        file_id = ModelFile.build_file_id(file_name, pair_a)
+
+        remote = SystemFile(file_name, 100, False)
+        remote.path_pair_id = pair_a
+        local = SystemFile(file_name, 61, False, is_staging=False)
+        local.path_pair_id = pair_a
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running.path_pair_id = pair_a
+        running.total_transfer_state = LftpJobStatus.TransferState(61, 100, 61, 1, 2)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        builder.set_lftp_statuses([running])
+        live_model = builder.build_model()
+        live_model.publish_active_lftp_root_counters(
+            {file_id: ActiveProgressOverlay(99, 99, 1, 2)},
+            {file_id: (running.id, running.type.value)}, lambda _file_id: True,
+        )
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {pair_a: object(), pair_b: object()}
+        controller._Controller__legacy_local_scan_files = {
+            (pair_a, file_name): local,
+            (pair_b, file_name): SystemFile(file_name, 50, False, is_staging=False),
+        }
+        controller._Controller__legacy_remote_scan_files = {
+            (pair_a, file_name): remote,
+            (pair_b, file_name): SystemFile(file_name, 80, False),
+        }
+        controller._Controller__prev_downloading_file_names = {(file_name, pair_a, "Pair A")}
+        controller._Controller__pending_completion_file_names = {
+            (file_name, pair_a, "Pair A"),
+        }
+        controller._Controller__pending_completion_progress_floors = {file_id: (99, 99)}
+        controller._Controller__pending_completion_progress_floor_identities = {
+            file_id: (running.id, running.type.value),
+        }
+        controller._Controller__pending_completion_progress_floor_overlay_ids = {file_id}
+        controller._Controller__pending_completion_publications = {
+            file_id: _PendingCompletionPublication(
+                ActiveProgressOverlay(99, 99, None, None),
+                (running.id, running.type.value),
+            ),
+        }
+        controller._Controller__lftp.status.return_value = []
+
+        def scan_event(pair_id, generation, side):
+            if side == "local":
+                scanned_file = SystemFile(file_name, 61 if pair_id == pair_a else 50, False, is_staging=False)
+            else:
+                scanned_file = SystemFile(file_name, 100 if pair_id == pair_a else 80, False)
+            scanned_file.path_pair_id = pair_id
+            return ScannerResult(
+                datetime.now(), [scanned_file], generation=generation,
+                scanned_path_pair_ids={pair_id}, completed_path_pair_ids={pair_id},
+                session_token="{}-session".format(side), is_targeted_scan=True,
+            )
+
+        with patch.object(builder, "has_changes", return_value=True):
+            # Register the retained publication before any fresh scan arrives.
+            ModelUpdater(controller).update()
+            controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
+                scan_event(pair_a, 1, "remote"),
+                scan_event(pair_b, 2, "remote"),
+                scan_event(pair_b, 3, "remote"),
+                scan_event(pair_a, 4, "remote"),
+            ]
+            controller._Controller__local_scan_process.pop_latest_result.side_effect = [
+                scan_event(pair_a, 1, "local"),
+                scan_event(pair_b, 2, "local"),
+                scan_event(pair_a, 3, "local"),
+                scan_event(pair_a, 4, "local"),
+            ]
+
+            # A paired A scan arms the generation fence.
+            ModelUpdater(controller).update()
+            publication = controller._Controller__pending_completion_publications[file_id]
+            self.assertEqual(("local-session", 1, "remote-session", 1),
+                             publication.authoritative_missing_proof_generation)
+
+            # Newer scans of B must not advance A's fence.
+            ModelUpdater(controller).update()
+            publication = controller._Controller__pending_completion_publications[file_id]
+            self.assertEqual(("local-session", 1, "remote-session", 1),
+                             publication.authoritative_missing_proof_generation)
+
+            # A local-A/remote-B boundary is also insufficient for A.
+            ModelUpdater(controller).update()
+            publication = controller._Controller__pending_completion_publications[file_id]
+            self.assertEqual(("local-session", 1, "remote-session", 1),
+                             publication.authoritative_missing_proof_generation)
+
+            # Only a later paired A scan may revoke the proof-less projection.
+            ModelUpdater(controller).update()
+            self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
+            self.assertEqual(ModelFile.State.DEFAULT, controller._Controller__model.get_file(file_id).state)
 
     def test_pending_completion_floor_preservation_keeps_accepted_overlay_state(self):
         file_name = "pending.bin"
@@ -11775,6 +11951,7 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__pending_completion_progress_floors = {}
         controller._Controller__pending_completion_progress_floor_identities = {}
         controller._Controller__pending_completion_progress_floor_overlay_ids = set()
+        controller._Controller__pending_completion_publications = {}
         updater = ModelUpdater(controller)
 
         updater._handle_lftp_completion_detection(
@@ -11792,6 +11969,13 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(
             (7, LftpJobStatus.Type.PGET.value),
             controller._Controller__pending_completion_progress_floor_identities[file_id],
+        )
+        self.assertEqual(
+            _PendingCompletionPublication(
+                ActiveProgressOverlay(93, 930, None, None),
+                (7, LftpJobStatus.Type.PGET.value),
+            ),
+            controller._Controller__pending_completion_publications[file_id],
         )
 
         older_identity = LftpJobStatus(
@@ -11825,6 +12009,7 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertNotIn(file_id, controller._Controller__pending_completion_progress_floors)
         self.assertNotIn(file_id, controller._Controller__pending_completion_progress_floor_overlay_ids)
+        self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
         self.assertIn(("release", None, None), controller._Controller__pending_completion_file_names)
 
     def test_pending_completion_floor_does_not_resurrect_after_zero_reset_or_stop(self):
@@ -11870,6 +12055,12 @@ class TestModelUpdater(unittest.TestCase):
             file_id: (7, LftpJobStatus.Type.PGET.value),
         }
         controller._Controller__pending_completion_progress_floor_overlay_ids = {file_id}
+        controller._Controller__pending_completion_publications = {
+            file_id: _PendingCompletionPublication(
+                ActiveProgressOverlay(93, 930, None, None),
+                (7, LftpJobStatus.Type.PGET.value),
+            ),
+        }
         replacement_status = LftpJobStatus(
             8, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "",
         )
@@ -11901,6 +12092,7 @@ class TestModelUpdater(unittest.TestCase):
             controller._Controller__pending_completion_progress_floor_identities[file_id],
         )
         self.assertNotIn(file_id, controller._Controller__pending_completion_progress_floor_overlay_ids)
+        self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
 
     def test_delayed_ready_scan_does_not_suppress_same_identity_restart_wake(self):
         controller = SimpleNamespace(

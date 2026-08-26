@@ -17,7 +17,9 @@ from unittest.mock import ANY, MagicMock, mock_open, patch
 from types import SimpleNamespace
 
 from controller import AutoQueue, AutoQueuePersist, Controller, ControllerPersist, ModelBuilder
-from controller.model_updater import ModelUpdater, _ProgressiveScanAccumulator, _pop_scan_updates
+from controller.model_updater import (
+    ModelUpdater, _PendingCompletionPublication, _ProgressiveScanAccumulator, _pop_scan_updates,
+)
 from controller.extract import ExtractRequest, ExtractStatus
 from controller.validate import ValidateProcess
 from controller.scan import MultiPathActiveScanner, ScannerProcess, ScannerResult
@@ -42,7 +44,7 @@ from common.exclude_patterns import ExactPathExclusion
 from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation
 from common.path_pair import PathPair
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
-from model import IModelListener, Model, ModelDiff, ModelError, ModelFile
+from model import ActiveProgressOverlay, IModelListener, Model, ModelDiff, ModelError, ModelFile
 from system import SystemFile
 from transfer import RcloneTransferError
 
@@ -4937,6 +4939,73 @@ class TestController(unittest.TestCase):
             {completion_file_id},
         )
         self.assertEqual(0, other_pair_file.download_progress)
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
+    def test_pending_completion_publication_survives_incomplete_default_candidate(self, diff_models):
+        """A retired Local Only projection must not publish as Stopped mid-handoff."""
+        completion_entry = ("movie.mkv", "movies", "Movies")
+        completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
+
+        local_only = ModelFile("movie.mkv", False)
+        local_only.path_pair_id = "movies"
+        local_only.remote_size = 1000
+        local_only.local_size = 1000
+        local_only.transferred_size = 1000
+        local_only.download_progress = 100
+        local_only.local_present = True
+        local_only.remote_has_transferable_content = False
+        local_only.state = ModelFile.State.DOWNLOADING
+        current_model = Model()
+        current_model.set_base_logger(self.controller.logger)
+        current_model.add_file(local_only)
+
+        incomplete = ModelFile("movie.mkv", False)
+        incomplete.path_pair_id = "movies"
+        incomplete.remote_size = 1000
+        incomplete.local_size = 950
+        incomplete.transferred_size = 950
+        incomplete.download_progress = 95
+        incomplete.local_present = True
+        incomplete.remote_has_transferable_content = True
+        incomplete.state = ModelFile.State.DEFAULT
+        candidate = Model()
+        candidate.set_base_logger(self.controller.logger)
+        candidate.add_file(incomplete)
+
+        listener = MagicMock()
+        current_model.add_listener(listener)
+        self.controller._Controller__model = current_model
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = candidate
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__pending_completion_file_names = {completion_entry}
+        self.controller._Controller__pending_completion_progress_floors = {
+            completion_file_id: (100, 1000),
+        }
+        self.controller._Controller__pending_completion_publications = {
+            completion_file_id: _PendingCompletionPublication(
+                ActiveProgressOverlay(100, 1000, None, None), (7, "pget"),
+            ),
+        }
+        diff_models.return_value = [
+            SimpleNamespace(
+                change=ModelDiff.Change.UPDATED,
+                old_file=local_only,
+                new_file=incomplete,
+            )
+        ]
+
+        self.controller._Controller__update_model()
+
+        published = listener.file_updated.call_args.args[1]
+        self.assertEqual(ModelFile.State.DOWNLOADING, published.state)
+        self.assertEqual(100, published.download_progress)
+        self.assertEqual(1000, published.transferred_size)
+        self.assertEqual("downloading", Controller._model_record_visible_state(published))
+        self.assertNotEqual("stopped", Controller._model_record_visible_state(published))
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_pending_completion_reset_does_not_retain_stale_progress(self, diff_models):
