@@ -2930,6 +2930,128 @@ class ModelUpdater(_ControllerCoreAccess):
                     publications.pop(key, None)
 
     @staticmethod
+    def _apply_admitted_progress_floor_to_active_delta_root(
+            controller: _ControllerCoreAccess,
+            new_file: ModelFile,
+            status: LftpJobStatus,
+    ) -> bool:
+        """Floor one active-delta root from its exact accepted job identity.
+
+        Active-delta rendering can outlive a rejected/cleared direct overlay.
+        In that gap the selected partial root may contain an older PGET
+        checkpoint.  The controller admission map is the only source allowed
+        to carry the newer presentation into that root, and only for the
+        exact live job.  Lifecycle/reset boundaries deliberately remain
+        authoritative and do not receive a carried floor.
+        """
+        file_id = getattr(new_file, "file_id", None)
+        status_id = getattr(status, "id", None)
+        status_type = getattr(getattr(status, "type", None), "value", None)
+        identity = (
+            (status_id, status_type)
+            if type(status_id) is int and status_id >= 0 and
+            isinstance(status_type, str) and status_type
+            else None
+        )
+        if not isinstance(file_id, str) or identity is None:
+            return False
+
+        admitted = getattr(controller, "_Controller__admitted_progress_publications", None)
+        if not isinstance(admitted, dict):
+            return False
+        floor = admitted.get((file_id, identity))
+        if not isinstance(floor, ActiveProgressOverlay):
+            return False
+
+        candidate_remote_size = getattr(new_file, "remote_size", None)
+        terminal_floor = (
+            type(floor.download_progress) is int and floor.download_progress >= 100
+        ) or (
+            type(floor.transferred_size) is int and floor.transferred_size >= 0 and
+            type(candidate_remote_size) is int and candidate_remote_size >= 0 and
+            floor.transferred_size >= candidate_remote_size
+        )
+        if terminal_floor:
+            ModelUpdater._clear_admitted_progress_publications(
+                controller, file_id, identity,
+            )
+            return False
+
+        transfer_state = getattr(status, "total_transfer_state", None)
+        reset_sample = (
+            type(getattr(transfer_state, "size_local", None)) is int and
+            getattr(transfer_state, "size_local") <= 0
+        ) or (
+            type(getattr(transfer_state, "percent_local", None)) is int and
+            getattr(transfer_state, "percent_local") <= 0
+        )
+        if reset_sample:
+            ModelUpdater._clear_admitted_progress_publications(
+                controller, file_id, identity,
+            )
+            return False
+
+        pending_dispatches = getattr(controller, "_Controller__pending_queue_dispatches", None)
+        if getattr(status, "state", None) == LftpJobStatus.State.QUEUED or \
+                getattr(new_file, "state", None) == ModelFile.State.QUEUED or \
+                getattr(new_file, "explicitly_stopped", False) or \
+                isinstance(pending_dispatches, dict) and file_id in pending_dispatches:
+            ModelUpdater._clear_admitted_progress_publications(
+                controller, file_id, identity,
+            )
+            return False
+
+        stop_checker = getattr(controller, "_Controller__is_explicitly_stopped", None)
+        if callable(stop_checker):
+            try:
+                if stop_checker(new_file.full_path, new_file.path_pair_id):
+                    ModelUpdater._clear_admitted_progress_publications(
+                        controller, file_id, identity,
+                    )
+                    return False
+            except Exception:
+                return False
+
+        if getattr(status, "state", None) != LftpJobStatus.State.RUNNING or \
+                getattr(new_file, "state", None) != ModelFile.State.DOWNLOADING or \
+                getattr(new_file, "display_size_total", None) is not None or \
+                getattr(new_file, "display_transferred_size", None) is not None or \
+                getattr(new_file, "complete_local_coverage", False) or \
+                (getattr(new_file, "download_progress", None) is not None and
+                 getattr(new_file, "download_progress") >= 100) or \
+                getattr(new_file, "local_size", None) == 0:
+            return False
+
+        pending_completion_ids = {
+            ModelFile.build_file_id(file_name, path_pair_id)
+            for file_name, path_pair_id, _ in getattr(
+                controller, "_Controller__pending_completion_file_names", set(),
+            )
+        }
+        if file_id in pending_completion_ids:
+            return False
+
+        changed = False
+        floor_progress = floor.download_progress
+        current_progress = getattr(new_file, "download_progress", None)
+        if type(floor_progress) is int and 0 < floor_progress < 100 and \
+                (type(current_progress) is not int or current_progress < floor_progress):
+            new_file.download_progress = floor_progress
+            changed = True
+
+        floor_transferred_size = floor.transferred_size
+        if type(floor_transferred_size) is int and floor_transferred_size > 0:
+            remote_size = getattr(new_file, "remote_size", None)
+            if type(remote_size) is int and remote_size >= 0:
+                floor_transferred_size = min(floor_transferred_size, remote_size)
+            current_transferred_size = getattr(new_file, "transferred_size", None)
+            if type(current_transferred_size) is not int or \
+                    current_transferred_size < floor_transferred_size:
+                new_file.transferred_size = floor_transferred_size
+                changed = True
+        return changed
+
+    @staticmethod
     def _invalidate_pending_completion_progress_floor(
         controller: _ControllerCoreAccess, file_id: str,
     ) -> None:
@@ -6174,6 +6296,17 @@ class ModelUpdater(_ControllerCoreAccess):
                             break
                         replacement_roots.append((old_file, new_file))
                 if replacement_roots:
+                    active_delta_statuses_by_file_id: dict[str, list[LftpJobStatus]] = {}
+                    for status in lftp_statuses:
+                        file_id = getattr(status, "file_id", None)
+                        if isinstance(file_id, str):
+                            active_delta_statuses_by_file_id.setdefault(file_id, []).append(status)
+                    for _old_file, new_file in replacement_roots:
+                        status_candidates = active_delta_statuses_by_file_id.get(new_file.file_id, [])
+                        if len(status_candidates) == 1:
+                            self._apply_admitted_progress_floor_to_active_delta_root(
+                                controller, new_file, status_candidates[0],
+                            )
                     retained_overlays: dict[str, ActiveProgressOverlay] = {}
                     retained_overlay_identities: dict[str, tuple[int, str]] = {}
                     existing_overlays: dict[str, ActiveProgressOverlay] = {}

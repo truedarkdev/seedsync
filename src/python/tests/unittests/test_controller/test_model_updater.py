@@ -8021,6 +8021,177 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(51, published.download_progress)
         self.assertEqual(60, published.transferred_size)
 
+    def test_active_delta_applies_only_matching_admitted_progress_floor(self):
+        """A cleared direct overlay must not let an active partial regress it."""
+        def run_case(second_status_id=7, raw_local=49, raw_percent=49):
+            remote = SystemFile("active.bin", 100, False)
+            local = SystemFile("active.bin", 49, False, is_staging=True)
+            local.status_sidecar_ready = True
+            initial = LftpJobStatus(
+                7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+            )
+            initial.total_transfer_state = LftpJobStatus.TransferState(49, 100, 49, 10, 8)
+            builder = ModelBuilder()
+            builder.set_remote_files([remote])
+            builder.set_local_files([local])
+            builder.set_lftp_statuses([initial])
+            builder.set_active_files([local])
+            live_model = builder.build_model()
+            file_id = ModelFile.build_file_id("active.bin", None)
+
+            stale_builder = ModelBuilder()
+            stale_builder.set_remote_files([remote])
+            stale_builder.set_local_files([local])
+            stale_builder.set_lftp_statuses([initial])
+            stale_partial_model = stale_builder.build_model()
+
+            controller, _ = self._make_progressive_update_controller(
+                None, local_scan=None, model_builder=builder, model=live_model,
+            )
+            builder.has_changes = MagicMock(return_value=False)
+            builder.has_only_live_progress_with_active_scan = MagicMock(
+                side_effect=[True, False],
+            )
+            builder.build_read_only_lftp_root_counter_overlays = MagicMock(
+                return_value={file_id: ActiveProgressOverlay(86, 86, 10, 8)},
+            )
+            builder.has_pending_active_transfer_delta = MagicMock(return_value=True)
+            builder.active_transfer_delta_file_ids = MagicMock(return_value={file_id})
+            builder.build_active_transfer_roots = MagicMock(
+                return_value=SimpleNamespace(model=stale_partial_model),
+            )
+            builder.authorize_active_transfer_delta = MagicMock(return_value=True)
+            builder.adopt_active_transfer_delta = MagicMock()
+
+            admitted_status = LftpJobStatus(
+                7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+                "active.bin", "",
+            )
+            admitted_status.total_transfer_state = LftpJobStatus.TransferState(
+                86, 100, 86, 10, 8,
+            )
+            active_delta_status = LftpJobStatus(
+                second_status_id, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+                "active.bin", "",
+            )
+            active_delta_status.total_transfer_state = LftpJobStatus.TransferState(
+                raw_local, 100, raw_percent, 8, 11,
+            )
+            controller._Controller__lftp.status.side_effect = [
+                [admitted_status], [active_delta_status],
+            ]
+            active_scan = ScannerResult(datetime.now(), [local])
+            controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+                active_scan, active_scan,
+            ]
+
+            updater = ModelUpdater(controller)
+            updater.update()
+            self.assertEqual(
+                ActiveProgressOverlay(86, 86, 10, 8),
+                controller._Controller__admitted_progress_publications[
+                    (file_id, (7, LftpJobStatus.Type.PGET.value))
+                ],
+            )
+
+            # Simulate a rejected direct projection being cleared while the
+            # controller admission remains authoritative for this job.
+            live_model.clear_active_progress_overlays()
+            observed = []
+
+            class Listener:
+                def file_updated(self, _old_file, new_file):
+                    if new_file.file_id == file_id:
+                        observed.append((new_file.download_progress, new_file.transferred_size))
+
+                def file_added(self, _file):
+                    pass
+
+                def file_removed(self, _file):
+                    pass
+
+                def model_version_changed(self, _scope_version, _path_pair_id, changed_file_id):
+                    if changed_file_id == file_id:
+                        published = live_model.published_file(file_id)
+                        if published is not None:
+                            observed.append((published.download_progress, published.transferred_size))
+
+                def model_version_published(self, *_args):
+                    pass
+
+            live_model.add_listener(Listener())
+            controller._Controller__next_lftp_status_poll_at = None
+            updater.update()
+            builder.build_active_transfer_roots.assert_called_once()
+            builder.adopt_active_transfer_delta.assert_called_once()
+            return live_model, file_id, controller, observed
+
+        live_model, file_id, controller, observed = run_case()
+        self.assertEqual((86, 86), (
+            live_model.get_file(file_id).download_progress,
+            live_model.get_file(file_id).transferred_size,
+        ))
+        published = live_model.published_file(file_id)
+        self.assertIsNotNone(published)
+        assert published is not None
+        self.assertEqual((86, 86), (published.download_progress, published.transferred_size))
+        self.assertTrue(observed)
+        self.assertTrue(all(progress >= 86 and transferred >= 86 for progress, transferred in observed))
+
+        for label, kwargs in (
+                ("reset", {"raw_local": 0, "raw_percent": 0}),
+                ("different-identity", {"second_status_id": 8}),
+        ):
+            with self.subTest(label=label):
+                live_model, file_id, controller, _ = run_case(**kwargs)
+                self.assertEqual(49, live_model.get_file(file_id).transferred_size)
+                published = live_model.published_file(file_id)
+                self.assertIsNotNone(published)
+                assert published is not None
+                self.assertEqual(49, published.transferred_size)
+                self.assertNotIn(
+                    (file_id, (7, LftpJobStatus.Type.PGET.value)),
+                    controller._Controller__admitted_progress_publications,
+                )
+
+    def test_active_delta_rejects_terminal_admission_for_incomplete_root(self):
+        """A terminal admission must not seed an incomplete active partial."""
+        for floor in (
+                ActiveProgressOverlay(100, 86, 10, 8),
+                ActiveProgressOverlay(86, 100, 10, 8),
+        ):
+            with self.subTest(floor=floor):
+                file = ModelFile("active.bin", False)
+                file.remote_size = 100
+                file.local_size = 49
+                file.state = ModelFile.State.DOWNLOADING
+                file.transferred_size = 49
+                file.download_progress = 49
+                status = LftpJobStatus(
+                    7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+                    "active.bin", "",
+                )
+                status.total_transfer_state = LftpJobStatus.TransferState(49, 100, 49, 8, 11)
+                controller = SimpleNamespace(
+                    _Controller__admitted_progress_publications={
+                        (file.file_id, (7, LftpJobStatus.Type.PGET.value)): floor,
+                    },
+                    _Controller__is_explicitly_stopped=lambda _name, _path_pair_id: False,
+                    _Controller__pending_queue_dispatches={},
+                    _Controller__pending_completion_file_names=set(),
+                )
+
+                self.assertFalse(
+                    ModelUpdater._apply_admitted_progress_floor_to_active_delta_root(
+                        controller, file, status,
+                    ),
+                )
+                self.assertEqual((49, 49), (file.download_progress, file.transferred_size))
+                self.assertNotIn(
+                    (file.file_id, (7, LftpJobStatus.Type.PGET.value)),
+                    controller._Controller__admitted_progress_publications,
+                )
+
     def test_admitted_same_identity_floor_survives_fallback_then_reset_restarts(self):
         """Fallback publication keeps an accepted floor, but a new/reset job may restart."""
         remote = SystemFile("active.bin", 100, False, mtime_ns=1)
