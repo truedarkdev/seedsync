@@ -128,6 +128,10 @@ class _RecentLiveTransferSnapshot:
     lftp_job_type: Optional[str] = None
     subset_size_local: Optional[int] = None
     subset_size_remote: Optional[int] = None
+    # ``dict`` replacement preserves insertion order, so it cannot identify
+    # which alias was updated most recently.  This is only used when an
+    # identity-aware lookup has more than one scoped alias candidate.
+    updated_at_ns: int = 0
 
 
 class _TransferState(NamedTuple):
@@ -3131,6 +3135,7 @@ class ModelBuilder:
         )
         if snapshot.size_local is None:
             return
+        snapshot.updated_at_ns = time.monotonic_ns()
         self.__recent_live_transfer_snapshots[file_id] = snapshot
         self.__promote_recent_live_pget_snapshot_to_display_floor(
             file_id, root_file_id, snapshot, raw_transfer_state,
@@ -3196,6 +3201,7 @@ class ModelBuilder:
         )
         if snapshot.size_local is None:
             return
+        snapshot.updated_at_ns = time.monotonic_ns()
         self.__retained_stopped_transfer_snapshots[file_id] = snapshot
 
     @staticmethod
@@ -3330,31 +3336,112 @@ class ModelBuilder:
 
         aliases = set(self.__candidate_snapshot_root_aliases(root_file_id))
         aliases.update(self.__candidate_snapshot_root_aliases(file_id))
-        candidates: list[tuple[int, int, str, _RecentLiveTransferSnapshot]] = []
-        for order, (snapshot_key, snapshot) in enumerate(
-                self.__recent_live_transfer_snapshots.items(),
-        ):
+        requested_pair_id = self.__file_id_path_pair_id(file_id)
+        if requested_pair_id is None:
+            requested_pair_id = self.__file_id_path_pair_id(root_file_id or "")
+
+        def is_scoped_candidate(snapshot_key: str, snapshot: _RecentLiveTransferSnapshot) -> bool:
             if snapshot_key != file_id and snapshot.root_file_id not in aliases:
+                return False
+            snapshot_root_pair_id = self.__file_id_path_pair_id(snapshot.root_file_id)
+            snapshot_key_pair_id = self.__file_id_path_pair_id(snapshot_key)
+            if snapshot_key == file_id:
+                # An exact scoped key is authoritative, but reject an
+                # impossible cross-pair root identity rather than letting an
+                # exact key bypass pair isolation.
+                return requested_pair_id is None or snapshot_root_pair_id in (None, requested_pair_id)
+            if requested_pair_id is None:
+                # An unscoped legacy root cannot safely borrow a scoped
+                # snapshot from an arbitrary Path Pair.
+                return snapshot_root_pair_id is None and snapshot_key_pair_id is None
+            return snapshot_root_pair_id == requested_pair_id or snapshot_key_pair_id == requested_pair_id
+
+        def is_revoked(snapshot: _RecentLiveTransferSnapshot) -> bool:
+            return any(
+                candidate_id is not None and
+                self.__is_lifecycle_revoked_status_identity(
+                    candidate_id, lftp_job_id, normalized_type,
+                )
+                for candidate_id in (file_id, root_file_id, snapshot.root_file_id)
+            )
+
+        candidates: list[tuple[str, _RecentLiveTransferSnapshot]] = []
+        for snapshot_key, snapshot in self.__recent_live_transfer_snapshots.items():
+            if not is_scoped_candidate(snapshot_key, snapshot) or \
+                    snapshot.lftp_job_id != lftp_job_id or \
+                    snapshot.lftp_job_type != normalized_type or is_revoked(snapshot):
                 continue
-            if snapshot.lftp_job_id != lftp_job_id or \
-                    snapshot.lftp_job_type != normalized_type:
-                continue
-            # Prefer the exact canonical key, then the exact root key, and
-            # finally the most recently inserted matching alias.
-            key_priority = 2 if snapshot_key == file_id else 1 if snapshot_key == root_file_id else 0
-            candidates.append((key_priority, order, snapshot_key, snapshot))
+            candidates.append((snapshot_key, snapshot))
+
+        selected: Optional[tuple[str, _RecentLiveTransferSnapshot]] = None
         if candidates:
-            _, _, resolved_file_id, snapshot = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+            def progress_key(candidate: tuple[str, _RecentLiveTransferSnapshot]) -> tuple[int, int]:
+                snapshot = candidate[1]
+                size = snapshot.size_local if type(snapshot.size_local) is int else -1
+                percent = self.__normalize_download_progress(snapshot.percent_local)
+                return size, percent if percent is not None else -1
+
+            # A newer zero is an explicit reset boundary; otherwise retain the
+            # greatest accepted progress and use the real update timestamp to
+            # break ties.  Never use dict insertion order as recency.
+            zero_candidates = [candidate for candidate in candidates if candidate[1].size_local == 0]
+            nonzero_candidates = [candidate for candidate in candidates if candidate[1].size_local != 0]
+            if zero_candidates and (
+                    not nonzero_candidates or
+                    max(candidate[1].updated_at_ns for candidate in zero_candidates) >=
+                    max(candidate[1].updated_at_ns for candidate in nonzero_candidates)
+            ):
+                selected = max(zero_candidates, key=lambda candidate: (
+                    candidate[1].updated_at_ns,
+                    candidate[0] == file_id,
+                ))
+            elif nonzero_candidates:
+                best_progress = max(progress_key(candidate) for candidate in nonzero_candidates)
+                best_candidates = [
+                    candidate for candidate in nonzero_candidates
+                    if progress_key(candidate) == best_progress
+                ]
+                best_updated_at = max(candidate[1].updated_at_ns for candidate in best_candidates)
+                best_candidates = [
+                    candidate for candidate in best_candidates
+                    if candidate[1].updated_at_ns == best_updated_at
+                ]
+                if len(best_candidates) == 1:
+                    selected = best_candidates[0]
+                else:
+                    # A scoped exact match is safe.  Tied aliases are not;
+                    # preserve the existing fail-closed ambiguity policy.
+                    exact_candidates = [candidate for candidate in best_candidates if candidate[0] == file_id]
+                    if len(exact_candidates) == 1:
+                        selected = exact_candidates[0]
+
+        if selected is not None:
+            resolved_file_id, _ = selected
+            promotion_root_file_id = file_id if requested_pair_id is not None else root_file_id
             promoted_snapshot = self.__promote_transfer_snapshot(
                 self.__recent_live_transfer_snapshots,
                 resolved_file_id,
                 file_id,
-                root_file_id,
+                promotion_root_file_id,
             )
             if promoted_snapshot is not None:
                 return file_id, promoted_snapshot
-            return resolved_file_id, snapshot
-        return self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
+
+        if requested_pair_id is not None:
+            # A scoped lookup may not fall back to the ordinary resolver:
+            # its singleton legacy-alias promotion can assign an unscoped or
+            # wrong-pair snapshot to this canonical file id.
+            return None, None
+
+        resolved_file_id, snapshot = self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
+        if snapshot is not None and snapshot.lftp_job_id == lftp_job_id and \
+                snapshot.lftp_job_type == normalized_type and (
+                    is_revoked(snapshot) or not is_scoped_candidate(resolved_file_id or "", snapshot)
+                ):
+            # Do not fall through to an exact/unique alias that has the
+            # revoked identity or cannot be tied to this Path Pair.
+            return None, None
+        return resolved_file_id, snapshot
 
     def __evict_retained_stopped_transfer_snapshots(self,
                                                     resolved_file_id: str,
@@ -3428,9 +3515,19 @@ class ModelBuilder:
                                          local: Optional[SystemFile],
                                          root_remote: Optional[SystemFile] = None,
                                          root_local: Optional[SystemFile] = None,
-                                         matching_lftp_job_id: Optional[int] = None) -> Optional[_TransferState]:
+                                         matching_lftp_job_id: Optional[int] = None,
+                                         matching_lftp_job_type: Optional[LftpJobStatus.Type | str] = None,
+                                         ) -> Optional[_TransferState]:
         root_file_id = self.__resolve_root_file_id(file_id, root_remote, root_local)
-        resolved_file_id, snapshot = self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
+        if matching_lftp_job_id is not None:
+            resolved_file_id, snapshot = self.__resolve_recent_live_transfer_snapshot_for_job(
+                file_id,
+                root_file_id,
+                matching_lftp_job_id,
+                matching_lftp_job_type,
+            )
+        else:
+            resolved_file_id, snapshot = self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
         if snapshot is None:
             return None
         root_status = self.__lftp_statuses.get(snapshot.root_file_id)
@@ -6483,6 +6580,7 @@ class ModelBuilder:
                 remote,
                 local,
                 matching_lftp_job_id=status.id,
+                matching_lftp_job_type=status.type,
             )
             if recent_transfer_state is not None:
                 _, recent_snapshot = self.__resolve_recent_live_transfer_snapshot(

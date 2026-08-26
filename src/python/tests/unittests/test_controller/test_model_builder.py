@@ -862,6 +862,135 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(50, rebuilt.transferred_size)
         self.assertEqual(50, rebuilt.download_progress)
 
+    def test_same_job_alias_snapshot_fails_closed_for_ambiguous_duplicate_pairs(self):
+        file_id = ModelFile.build_file_id("active.bin", "pair-a")
+        snapshots = self.model_builder._ModelBuilder__recent_live_transfer_snapshots
+        snapshots["legacy-a"] = _RecentLiveTransferSnapshot(
+            "active.bin", 40, 40, 1, 1, 7, "pget",
+        )
+        snapshots["legacy-b"] = _RecentLiveTransferSnapshot(
+            "active.bin", 60, 60, 1, 1, 7, "pget",
+        )
+
+        resolved_file_id, snapshot = self.model_builder._ModelBuilder__resolve_recent_live_transfer_snapshot_for_job(
+            file_id, "active.bin", 7, "pget",
+        )
+
+        # A legacy root name has no Path Pair identity.  It must not be
+        # selected merely because one duplicate-pair alias happens to occur
+        # first or last in the snapshot dictionary.
+        self.assertIsNone(resolved_file_id)
+        self.assertIsNone(snapshot)
+
+    def test_same_job_singleton_legacy_alias_fails_closed_for_scoped_lookup(self):
+        file_id = ModelFile.build_file_id("active.bin", "pair-a")
+        wrong_pair_id = ModelFile.build_file_id("active.bin", "pair-b")
+
+        for case, snapshot_key, snapshot_root_file_id in (
+                ("unscoped", "legacy-alias", "active.bin"),
+                ("wrong-pair", "active.bin", wrong_pair_id),
+        ):
+            with self.subTest(case=case):
+                snapshots = self.model_builder._ModelBuilder__recent_live_transfer_snapshots
+                snapshots.clear()
+                snapshots[snapshot_key] = _RecentLiveTransferSnapshot(
+                    snapshot_root_file_id, 40, 40, 1, 1, 7, "pget",
+                )
+
+                resolved_file_id, snapshot = self.model_builder._ModelBuilder__resolve_recent_live_transfer_snapshot_for_job(
+                    file_id, "active.bin", 7, "pget",
+                )
+
+                self.assertIsNone(resolved_file_id)
+                self.assertIsNone(snapshot)
+                self.assertIn(snapshot_key, snapshots)
+
+    def test_same_job_alias_snapshot_uses_updated_alias_timestamp_not_dict_order(self):
+        file_id = ModelFile.build_file_id("active.bin", "pair-a")
+        snapshots = self.model_builder._ModelBuilder__recent_live_transfer_snapshots
+        snapshots["alias-a"] = _RecentLiveTransferSnapshot(
+            file_id, 50, 50, 601, 1, 7, "pget", updated_at_ns=20,
+        )
+        snapshots["alias-b"] = _RecentLiveTransferSnapshot(
+            file_id, 50, 50, 602, 1, 7, "pget", updated_at_ns=10,
+        )
+        # Updating an existing dict key does not move it.  Timestamp order is
+        # the actual snapshot recency and must win the insertion order above.
+        snapshots["alias-a"] = _RecentLiveTransferSnapshot(
+            file_id, 50, 50, 603, 1, 7, "pget", updated_at_ns=30,
+        )
+
+        _, snapshot = self.model_builder._ModelBuilder__resolve_recent_live_transfer_snapshot_for_job(
+            file_id, "active.bin", 7, "pget",
+        )
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(603, snapshot.speed)
+
+    def test_same_job_alias_snapshot_rejects_trailing_revoked_stop_and_queue_identity(self):
+        for lifecycle in ("Stop", "Queue"):
+            with self.subTest(lifecycle=lifecycle):
+                builder = ModelBuilder()
+                file_id = ModelFile.build_file_id("active.bin", "pair-a")
+                status = LftpJobStatus(
+                    7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+                )
+                status.path_pair_id = "pair-a"
+                builder.set_lftp_statuses([status])
+                builder._ModelBuilder__recent_live_transfer_snapshots["trailing-alias"] = \
+                    _RecentLiveTransferSnapshot(
+                        "active.bin", 50, 50, 1, 1, 7, "pget",
+                    )
+
+                # The lifecycle operation may leave one trailing old status
+                # poll; identity revocation must still suppress its alias.
+                builder.evict_transfer_progress_for_lifecycle({file_id})
+                resolved_file_id, snapshot = builder._ModelBuilder__resolve_recent_live_transfer_snapshot_for_job(
+                    file_id, status.file_id, 7, "pget",
+                )
+
+                self.assertIsNone(resolved_file_id)
+                self.assertIsNone(snapshot)
+
+    def test_full_build_rejects_counterless_trailing_revoked_stop_and_queue_identity(self):
+        for lifecycle in ("Stop", "Queue"):
+            with self.subTest(lifecycle=lifecycle):
+                builder = ModelBuilder()
+                file_id = ModelFile.build_file_id("active.bin", "pair-a")
+                remote = SystemFile("active.bin", 100, False, mtime_ns=1_000_000_000)
+                remote.path_pair_id = "pair-a"
+                local = SystemFile("active.bin", 50, False, is_staging=True)
+                local.path_pair_id = "pair-a"
+                local.status_sidecar_ready = True
+                builder.set_remote_files([remote])
+                builder.set_local_files([local])
+
+                running = LftpJobStatus(
+                    7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_id, "",
+                )
+                running.total_transfer_state = LftpJobStatus.TransferState(50, 100, 50, 10, 8)
+                builder.set_lftp_statuses([running])
+                builder._ModelBuilder__recent_live_transfer_snapshots["active.bin"] = \
+                    _RecentLiveTransferSnapshot(
+                        "active.bin", 50, 50, 10, 8, 7, "pget",
+                    )
+
+                # Stop/Queue revokes the old identity, but one trailing poll
+                # can still report that same job without transfer counters.
+                builder.evict_transfer_progress_for_lifecycle({file_id})
+                trailing = LftpJobStatus(
+                    7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_id, "",
+                )
+                trailing.total_transfer_state = LftpJobStatus.TransferState(None, None, None, 10, 8)
+                builder.set_lftp_statuses([trailing])
+
+                model_file = builder.build_model().get_file(file_id)
+
+                self.assertEqual(ModelFile.State.DOWNLOADING, model_file.state)
+                self.assertIsNone(model_file.transferred_size)
+                self.assertIsNone(model_file.download_progress)
+
     def test_recent_pget_snapshot_promotion_rejects_mismatch_or_missing_sidecar(self):
         for subset_total, sidecar_ready in ((99, True), (100, False)):
             with self.subTest(subset_total=subset_total, sidecar_ready=sidecar_ready):
