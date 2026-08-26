@@ -844,11 +844,6 @@ class Controller:
         self.__active_scan_lftp_roots_seen = set()
         self.__pending_completion_progress_floors = {}
         self.__pending_completion_publications = {}
-        # A successful Model overlay admission is the last coherent live
-        # projection for a job that can disappear before LFTP retirement is
-        # observed.  Keep it keyed by both model root and LFTP identity; it is
-        # consumed only by the matching retirement handoff.
-        self.__admitted_progress_publications = {}
         self.__collision_compare_lock = Lock()
         self.__collision_compare_executor = None
         self.__collision_compare_future = None
@@ -1104,7 +1099,6 @@ class Controller:
         self.__pending_completion_authority_rebuild_ids = set()
         self.__pending_completion_progress_floors = {}
         self.__pending_completion_publications = {}
-        self.__admitted_progress_publications = {}
         self.__shutdown_collision_compare_worker()
         self.__collision_compare_epoch = getattr(self, "_Controller__collision_compare_epoch", 0) + 1
         self.__collision_compare_lock = Lock()
@@ -1230,7 +1224,7 @@ class Controller:
                 self.__replace_validate_process()
             self.__validate_idle_deadline_monotonic = None
 
-    def __configure_lftp(self):
+    def __configure_lftp(self, runtime_reconfigure: bool = False):
         # Configure the active transfer backend while preserving the legacy lftp
         # runtime path unchanged when lftp remains selected.
         config = self.__context.config
@@ -1252,7 +1246,11 @@ class Controller:
         self.__lftp.num_max_total_connections = Controller.__runtime_int_or_default(
             lftp_cfg.num_max_total_connections, 0
         )
-        self.__lftp.use_temp_file = Controller.__runtime_bool_or_default(lftp_cfg.use_temp_file, False)
+        if not runtime_reconfigure:
+            # Scanners capture this setting when they are built.  It is
+            # restart-required, so a runtime reconfigure must not make the
+            # transfer backend disagree with the existing scanners.
+            self.__lftp.use_temp_file = Controller.__runtime_bool_or_default(lftp_cfg.use_temp_file, False)
         rate_limit = lftp_cfg.rate_limit
         self.__lftp.rate_limit = 0 if rate_limit in (None, "") else rate_limit
         net_socket_buffer = lftp_cfg.net_socket_buffer
@@ -2303,7 +2301,6 @@ class Controller:
         # A lifecycle transition revokes every transient counter immediately;
         # the model diff remains the authoritative backstop for all roots.
         self.__persist.display_progress_floors.pop(file_id, None)
-        ModelUpdater._clear_admitted_progress_publications(self, file_id)
         evict_transfer_progress = getattr(
             getattr(self, "_Controller__model_builder", None), "evict_transfer_progress_for_lifecycle", None,
         )
@@ -3116,7 +3113,7 @@ class Controller:
                         # therefore leaves both runtime and controller state
                         # on the previous configuration until the request is
                         # retried.
-                        self.__configure_lftp()
+                        self.__configure_lftp(runtime_reconfigure=True)
                         self.__exclude_patterns = Controller.__get_exclude_patterns(self.__context)
                         return None
 
@@ -3124,7 +3121,7 @@ class Controller:
                         self.__restore_lftp_reconfigure_request()
                 else:
                     try:
-                        self.__configure_lftp()
+                        self.__configure_lftp(runtime_reconfigure=True)
                         self.__exclude_patterns = Controller.__get_exclude_patterns(self.__context)
                     except Exception:
                         self.__restore_lftp_reconfigure_request()
@@ -7582,7 +7579,7 @@ class Controller:
         getattr(self, "_Controller__pending_completion_authority_rebuild_ids", set()).discard(file_id)
         # Floors are generic retired-job lifecycle state.  The updater reads
         # any paired publication identity before clearing Model provenance, so
-        # a later job's admitted overlay cannot be removed by this reset.
+        # a later job's Model-owned overlay cannot be removed by this reset.
         ModelUpdater._clear_pending_completion_progress_floor(self, file_id)
         return had_pending_name
 
@@ -10273,7 +10270,6 @@ class Controller:
                             file.file_id,
                             None,
                         )
-                        ModelUpdater._clear_admitted_progress_publications(self, file.file_id)
                         self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
                         self._sync_final_move_succeeded_files_to_model()
                         self.__model_builder.set_move_failed_files({

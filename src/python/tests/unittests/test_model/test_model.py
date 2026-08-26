@@ -3,6 +3,7 @@
 import logging
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 from common import BreadcrumbTraceCollector, overrides
@@ -24,6 +25,185 @@ class DummyModelListener(IModelListener):
 
 
 class TestLftpModel(unittest.TestCase):
+    def test_authoritative_replacement_retains_only_same_live_provenance(self):
+        file = ModelFile("active", False)
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        self.model.add_file(file)
+        identity = (7, "pget")
+        self.model.publish_active_lftp_root_counters(
+            {file.file_id: ActiveProgressOverlay(93, 29900000, None, None)},
+            {file.file_id: identity}, lambda _: True, lambda _: 3,
+        )
+        stale = ModelFile("active", False)
+        stale.state = ModelFile.State.DOWNLOADING
+        stale.is_stoppable = True
+        stale.download_progress = 48
+        stale.transferred_size = 15600000
+        running = SimpleNamespace(
+            id=7, type=SimpleNamespace(value="pget"),
+            state=SimpleNamespace(name="RUNNING"),
+            total_transfer_state=SimpleNamespace(size_local=15600000, percent_local=48),
+        )
+        self.model.apply_authoritative_root_replacement(
+            lambda: self.model.update_file(stale), {file.file_id: running}, lambda _: 3,
+        )
+        published = self.model.published_file(file.file_id)
+        self.assertEqual((93, 29900000), (published.download_progress, published.transferred_size))
+
+        queued = SimpleNamespace(
+            id=7, type=SimpleNamespace(value="pget"),
+            state=SimpleNamespace(name="QUEUED"),
+            total_transfer_state=SimpleNamespace(size_local=0, percent_local=0),
+        )
+        self.model.apply_authoritative_root_replacement(
+            lambda: self.model.update_file(stale), {file.file_id: queued}, lambda _: 3,
+        )
+        published = self.model.published_file(file.file_id)
+        self.assertEqual((48, 15600000), (published.download_progress, published.transferred_size))
+
+    def test_authoritative_replacement_retires_projection_for_terminal_candidate(self):
+        file = ModelFile("active", False)
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        self.model.add_file(file)
+        self.model.publish_active_lftp_root_counters(
+            {file.file_id: ActiveProgressOverlay(93, 93, None, None)},
+            {file.file_id: (7, "pget")}, lambda _: True, lambda _: 3,
+        )
+        terminal = ModelFile("active", False)
+        terminal.state = ModelFile.State.DOWNLOADED
+        terminal.download_progress = 100
+        terminal.transferred_size = 100
+        running = SimpleNamespace(
+            id=7, type=SimpleNamespace(value="pget"),
+            state=SimpleNamespace(name="RUNNING"),
+            total_transfer_state=SimpleNamespace(size_local=93, percent_local=93),
+        )
+        self.model.apply_authoritative_root_replacement(
+            lambda: self.model.update_file(terminal), {file.file_id: running}, lambda _: 3,
+        )
+        self.assertIsNone(self.model.active_progress_overlay(file.file_id))
+        published = self.model.published_file(file.file_id)
+        self.assertEqual((100, 100), (published.download_progress, published.transferred_size))
+
+    def test_authoritative_replacement_retires_projection_for_invalid_active_candidate(self):
+        for label, mutate in (
+                ("not-stoppable", lambda candidate: setattr(candidate, "is_stoppable", False)),
+                ("zero-counters", lambda candidate: (
+                    setattr(candidate, "local_size", 0),
+                    setattr(candidate, "transferred_size", 0),
+                    setattr(candidate, "download_progress", 0),
+                )),
+                ("display-union", lambda candidate: setattr(candidate, "display_transferred_size", 1)),
+                ("complete", lambda candidate: setattr(candidate, "complete_local_coverage", True)),
+        ):
+            with self.subTest(label=label):
+                model = Model()
+                active = ModelFile("active", False)
+                active.remote_size = 100
+                active.local_size = 40
+                active.transferred_size = 40
+                active.download_progress = 40
+                active.state = ModelFile.State.DOWNLOADING
+                active.is_stoppable = True
+                model.add_file(active)
+                model.publish_active_lftp_root_counters(
+                    {active.file_id: ActiveProgressOverlay(60, 60, None, None)},
+                    {active.file_id: (7, "pget")}, lambda _: True,
+                )
+                candidate = ModelFile("active", False)
+                candidate.remote_size = 100
+                candidate.local_size = 40
+                candidate.transferred_size = 40
+                candidate.download_progress = 40
+                candidate.state = ModelFile.State.DOWNLOADING
+                candidate.is_stoppable = True
+                mutate(candidate)
+                running = SimpleNamespace(
+                    id=7, type=SimpleNamespace(value="pget"),
+                    state=SimpleNamespace(name="RUNNING"),
+                    total_transfer_state=SimpleNamespace(size_local=40, percent_local=40),
+                )
+
+                model.apply_authoritative_root_replacement(
+                    lambda: model.update_file(candidate),
+                    {active.file_id: running}, lambda _: 0,
+                )
+
+                self.assertIsNone(model.active_progress_overlay(active.file_id))
+
+    def test_authoritative_replacement_preserves_untouched_overlay_without_base_counters(self):
+        for label, set_counters in (
+                ("unset", False), ("zero", True),
+        ):
+            with self.subTest(label=label):
+                model = Model()
+                active = ModelFile("active", False)
+                active.state = ModelFile.State.DOWNLOADING
+                active.is_stoppable = True
+                if set_counters:
+                    active.local_size = 0
+                    active.transferred_size = 0
+                    active.download_progress = 0
+                model.add_file(active)
+                unrelated = ModelFile("unrelated", False)
+                model.add_file(unrelated)
+                overlay = ActiveProgressOverlay(60, 60, None, None)
+                identity = (7, "pget")
+                model.publish_active_lftp_root_counters(
+                    {active.file_id: overlay},
+                    {active.file_id: identity}, lambda _: True,
+                )
+                replacement = ModelFile("unrelated", False)
+                running = SimpleNamespace(
+                    id=7, type=SimpleNamespace(value="pget"),
+                    state=SimpleNamespace(name="RUNNING"),
+                    total_transfer_state=SimpleNamespace(size_local=60, percent_local=60),
+                )
+
+                model.apply_authoritative_root_replacement(
+                    lambda: model.update_file(replacement),
+                    {active.file_id: running}, lambda _: 0,
+                )
+
+                self.assertEqual(overlay, model.active_progress_overlay(active.file_id))
+
+    def test_authoritative_replacement_publishes_physical_base_fallback_once(self):
+        active = ModelFile("active", False)
+        active.local_size = 64
+        active.transferred_size = 32
+        active.state = ModelFile.State.DOWNLOADING
+        active.is_stoppable = True
+        self.model.add_file(active)
+        identity = (7, "pget")
+        self.model.publish_active_lftp_root_counters(
+            {active.file_id: ActiveProgressOverlay(60, 48, 12, 6)},
+            {active.file_id: identity}, lambda _: True,
+        )
+        listener = MagicMock()
+        self.model.add_listener(listener)
+
+        candidate = ModelFile("active", False)
+        candidate.local_size = 64
+        candidate.transferred_size = None
+        candidate.state = ModelFile.State.DOWNLOADING
+        candidate.is_stoppable = True
+
+        self.model.apply_authoritative_root_replacement(
+            lambda: self.model.update_file(candidate), {}, lambda _: 0,
+        )
+
+        self.assertEqual(32, self.model.get_file(active.file_id).transferred_size)
+        published = self.model.published_file(active.file_id)
+        self.assertIsNotNone(published)
+        self.assertEqual(32, published.transferred_size)
+        self.assertEqual(1, listener.file_updated.call_count)
+        _old_published, new_published = listener.file_updated.call_args.args
+        self.assertEqual(32, new_published.transferred_size)
+        self.assertEqual(1, listener.model_version_changed.call_count)
+        self.assertEqual(1, listener.model_version_published.call_count)
+
     def test_published_file_and_job_identity_are_read_as_one_snapshot(self):
         file = ModelFile("active", False)
         file.state = ModelFile.State.DOWNLOADING

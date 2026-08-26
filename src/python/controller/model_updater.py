@@ -96,6 +96,30 @@ _ACTIVE_DELTA_REJECTION_CORRELATION_TARGET_LIMIT = 16
 _ACTIVE_DELTA_REJECTION_CORRELATION_COUNT_LIMIT = 128
 
 
+def _fresh_unique_replacement_statuses(
+        raw_statuses: Sequence[object], filtered_statuses: Sequence[object],
+        *, poll_healthy: bool, snapshot_fresh: bool, source: object,
+) -> dict[str, object]:
+    """Build one shared, fail-closed status adapter for Model replacements."""
+    if not poll_healthy or not snapshot_fresh or source != "fresh_healthy":
+        return {}
+    filtered_by_file_id: dict[str, list[object]] = {}
+    for status in filtered_statuses:
+        file_id = getattr(status, "file_id", None)
+        if isinstance(file_id, str):
+            filtered_by_file_id.setdefault(file_id, []).append(status)
+    raw_by_file_id: dict[str, list[object]] = {}
+    for status in raw_statuses:
+        file_id = getattr(status, "file_id", None)
+        if isinstance(file_id, str):
+            raw_by_file_id.setdefault(file_id, []).append(status)
+    return {
+        file_id: statuses[0]
+        for file_id, statuses in filtered_by_file_id.items()
+        if len(statuses) == 1 and len(raw_by_file_id.get(file_id, [])) == 1
+    }
+
+
 def _active_delta_rejection_correlation_identity(file_ids: set[str]) -> str:
     """Bound target-set evidence before deriving the process-local correlation."""
     # A stable ordering would require walking/sorting the entire selected set
@@ -2492,7 +2516,6 @@ class _ControllerCoreAccess:
     _Controller__pending_completion_progress_floor_identities: dict[str, Optional[tuple[int, str]]]
     _Controller__pending_completion_progress_floor_overlay_ids: set[str]
     _Controller__pending_completion_publications: dict[str, _PendingCompletionPublication]
-    _Controller__admitted_progress_publications: dict[tuple[str, tuple[int, str]], ActiveProgressOverlay]
     _Controller__successful_final_move_handoff_file_ids: set[str]
     _Controller__move_retry_due: dict[str, datetime]
     _Controller__move_attempt_lock: Lock
@@ -2885,9 +2908,6 @@ class ModelUpdater(_ControllerCoreAccess):
         getattr(
             controller, "_Controller__pending_completion_publications", {},
         ).pop(file_id, None)
-        ModelUpdater._clear_admitted_progress_publications(
-            controller, file_id, expected_identity,
-        )
         ModelUpdater._clear_published_file_job_identity(
             controller, file_id, expected_identity,
         )
@@ -2916,142 +2936,6 @@ class ModelUpdater(_ControllerCoreAccess):
                 pass
 
     @staticmethod
-    def _clear_admitted_progress_publications(
-        controller: _ControllerCoreAccess, file_id: str,
-        expected_job_identity: Optional[tuple[int, str]] = None,
-    ) -> None:
-        """Forget live admissions at an explicit lifecycle reset boundary."""
-        publications = getattr(controller, "_Controller__admitted_progress_publications", None)
-        if isinstance(publications, dict):
-            for key in tuple(publications):
-                if isinstance(key, tuple) and len(key) == 2 and key[0] == file_id and (
-                        expected_job_identity is None or key[1] == expected_job_identity
-                ):
-                    publications.pop(key, None)
-
-    @staticmethod
-    def _apply_admitted_progress_floor_to_active_delta_root(
-            controller: _ControllerCoreAccess,
-            new_file: ModelFile,
-            status: LftpJobStatus,
-    ) -> bool:
-        """Floor one active-delta root from its exact accepted job identity.
-
-        Active-delta rendering can outlive a rejected/cleared direct overlay.
-        In that gap the selected partial root may contain an older PGET
-        checkpoint.  The controller admission map is the only source allowed
-        to carry the newer presentation into that root, and only for the
-        exact live job.  Lifecycle/reset boundaries deliberately remain
-        authoritative and do not receive a carried floor.
-        """
-        file_id = getattr(new_file, "file_id", None)
-        status_id = getattr(status, "id", None)
-        status_type = getattr(getattr(status, "type", None), "value", None)
-        identity = (
-            (status_id, status_type)
-            if type(status_id) is int and status_id >= 0 and
-            isinstance(status_type, str) and status_type
-            else None
-        )
-        if not isinstance(file_id, str) or identity is None:
-            return False
-
-        admitted = getattr(controller, "_Controller__admitted_progress_publications", None)
-        if not isinstance(admitted, dict):
-            return False
-        floor = admitted.get((file_id, identity))
-        if not isinstance(floor, ActiveProgressOverlay):
-            return False
-
-        candidate_remote_size = getattr(new_file, "remote_size", None)
-        terminal_floor = (
-            type(floor.download_progress) is int and floor.download_progress >= 100
-        ) or (
-            type(floor.transferred_size) is int and floor.transferred_size >= 0 and
-            type(candidate_remote_size) is int and candidate_remote_size >= 0 and
-            floor.transferred_size >= candidate_remote_size
-        )
-        if terminal_floor:
-            ModelUpdater._clear_admitted_progress_publications(
-                controller, file_id, identity,
-            )
-            return False
-
-        transfer_state = getattr(status, "total_transfer_state", None)
-        reset_sample = (
-            type(getattr(transfer_state, "size_local", None)) is int and
-            getattr(transfer_state, "size_local") <= 0
-        ) or (
-            type(getattr(transfer_state, "percent_local", None)) is int and
-            getattr(transfer_state, "percent_local") <= 0
-        )
-        if reset_sample:
-            ModelUpdater._clear_admitted_progress_publications(
-                controller, file_id, identity,
-            )
-            return False
-
-        pending_dispatches = getattr(controller, "_Controller__pending_queue_dispatches", None)
-        if getattr(status, "state", None) == LftpJobStatus.State.QUEUED or \
-                getattr(new_file, "state", None) == ModelFile.State.QUEUED or \
-                getattr(new_file, "explicitly_stopped", False) or \
-                isinstance(pending_dispatches, dict) and file_id in pending_dispatches:
-            ModelUpdater._clear_admitted_progress_publications(
-                controller, file_id, identity,
-            )
-            return False
-
-        stop_checker = getattr(controller, "_Controller__is_explicitly_stopped", None)
-        if callable(stop_checker):
-            try:
-                if stop_checker(new_file.full_path, new_file.path_pair_id):
-                    ModelUpdater._clear_admitted_progress_publications(
-                        controller, file_id, identity,
-                    )
-                    return False
-            except Exception:
-                return False
-
-        if getattr(status, "state", None) != LftpJobStatus.State.RUNNING or \
-                getattr(new_file, "state", None) != ModelFile.State.DOWNLOADING or \
-                getattr(new_file, "display_size_total", None) is not None or \
-                getattr(new_file, "display_transferred_size", None) is not None or \
-                getattr(new_file, "complete_local_coverage", False) or \
-                (getattr(new_file, "download_progress", None) is not None and
-                 getattr(new_file, "download_progress") >= 100) or \
-                getattr(new_file, "local_size", None) == 0:
-            return False
-
-        pending_completion_ids = {
-            ModelFile.build_file_id(file_name, path_pair_id)
-            for file_name, path_pair_id, _ in getattr(
-                controller, "_Controller__pending_completion_file_names", set(),
-            )
-        }
-        if file_id in pending_completion_ids:
-            return False
-
-        changed = False
-        floor_progress = floor.download_progress
-        current_progress = getattr(new_file, "download_progress", None)
-        if type(floor_progress) is int and 0 < floor_progress < 100 and \
-                (type(current_progress) is not int or current_progress < floor_progress):
-            new_file.download_progress = floor_progress
-            changed = True
-
-        floor_transferred_size = floor.transferred_size
-        if type(floor_transferred_size) is int and floor_transferred_size > 0:
-            remote_size = getattr(new_file, "remote_size", None)
-            if type(remote_size) is int and remote_size >= 0:
-                floor_transferred_size = min(floor_transferred_size, remote_size)
-            current_transferred_size = getattr(new_file, "transferred_size", None)
-            if type(current_transferred_size) is not int or \
-                    current_transferred_size < floor_transferred_size:
-                new_file.transferred_size = floor_transferred_size
-                changed = True
-        return changed
-
-    @staticmethod
     def _invalidate_pending_completion_progress_floor(
         controller: _ControllerCoreAccess, file_id: str,
     ) -> None:
@@ -3073,9 +2957,6 @@ class ModelUpdater(_ControllerCoreAccess):
         getattr(
             controller, "_Controller__pending_completion_publications", {},
         ).pop(file_id, None)
-        ModelUpdater._clear_admitted_progress_publications(
-            controller, file_id, expected_identity,
-        )
         ModelUpdater._clear_published_file_job_identity(
             controller, file_id, expected_identity,
         )
@@ -3129,19 +3010,6 @@ class ModelUpdater(_ControllerCoreAccess):
         overlay_identities: Mapping[str, tuple[int, str]],
     ) -> tuple[Optional[tuple[Optional[int], Optional[int]]], bool, Optional[tuple[int, str]]]:
         """Capture accepted live counters before retirement evicts their source."""
-        admitted = getattr(
-            self._controller, "_Controller__admitted_progress_publications", None,
-        )
-        if isinstance(retired_job_identity, tuple) and isinstance(admitted, dict):
-            admitted_overlay = admitted.pop((file_id, retired_job_identity), None)
-            if isinstance(admitted_overlay, ActiveProgressOverlay) and \
-                    (type(admitted_overlay.download_progress) is int or
-                     type(admitted_overlay.transferred_size) is int):
-                return (
-                    (admitted_overlay.download_progress, admitted_overlay.transferred_size),
-                    True,
-                    retired_job_identity,
-                )
         overlay = overlays.get(file_id)
         overlay_identity = overlay_identities.get(file_id)
         if isinstance(overlay, ActiveProgressOverlay):
@@ -3203,45 +3071,10 @@ class ModelUpdater(_ControllerCoreAccess):
 
         # Never synthesize a completion projection from an arbitrary base
         # ModelFile: it may now be Local Only/DEFAULT after the accepted
-        # projection was retired.  The committed published snapshot above and
-        # identity-paired live admissions are the only handoff authorities.
+        # projection was retired.  Only the Model-owned active projection or
+        # its identity-paired committed published snapshot can authorize the
+        # handoff.
         return None, False, None
-
-    def _clear_replaced_admitted_progress_publications(
-        self, statuses: Iterable[LftpJobStatus],
-    ) -> None:
-        """Drop an admitted projection when a newer live job is observed.
-
-        This fence is intentionally independent of pending-completion floors:
-        a newer queued/running row must revoke an older admitted identity even
-        when no retirement floor has been captured yet.  Invalid and
-        synthetic identities do not establish a replacement boundary.
-        """
-        controller = self._controller
-        admitted = getattr(controller, "_Controller__admitted_progress_publications", None)
-        if not isinstance(admitted, dict):
-            return
-        for status in statuses:
-            if getattr(status, "state", None) not in (
-                    LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING,
-            ):
-                continue
-            file_id = getattr(status, "file_id", None)
-            status_id = getattr(status, "id", None)
-            status_type = getattr(getattr(status, "type", None), "value", None)
-            if not isinstance(file_id, str) or type(status_id) is not int or status_id < 0 or \
-                    not isinstance(status_type, str) or not status_type:
-                continue
-            for key in tuple(admitted):
-                if not isinstance(key, tuple) or len(key) != 2 or key[0] != file_id:
-                    continue
-                admitted_identity = key[1]
-                if not isinstance(admitted_identity, tuple) or len(admitted_identity) != 2 or \
-                        type(admitted_identity[0]) is not int or admitted_identity[0] < 0 or \
-                        not isinstance(admitted_identity[1], str) or not admitted_identity[1]:
-                    continue
-                if status_id > admitted_identity[0]:
-                    admitted.pop(key, None)
 
     def _clear_replaced_pending_completion_floors(
         self, statuses: Iterable[LftpJobStatus],
@@ -3279,6 +3112,38 @@ class ModelUpdater(_ControllerCoreAccess):
             current_identity = (status.id, status.type.value)
             if current_identity != retired_identity:
                 self._invalidate_pending_completion_progress_floor(controller, file_id)
+
+    def _revoke_stale_model_published_provenance(
+            self, statuses_by_file_id: Mapping[str, object],
+    ) -> None:
+        """Revoke older Model publication identities before retirement capture."""
+        model = getattr(self._controller, "_Controller__model", None)
+        revoke = getattr(model, "clear_published_file_job_identity_if_replaced", None)
+        if not callable(revoke):
+            return
+        model_lock = getattr(self._controller, "_Controller__model_lock", None)
+
+        def revoke_statuses() -> None:
+            for file_id, status in statuses_by_file_id.items():
+                if not isinstance(file_id, str) or getattr(status, "state", None) not in (
+                        LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING,
+                ):
+                    continue
+                status_id = getattr(status, "id", None)
+                status_type = getattr(getattr(status, "type", None), "value", None)
+                if type(status_id) is not int or status_id < 0 or \
+                        not isinstance(status_type, str) or not status_type:
+                    continue
+                revoke(file_id, (status_id, status_type))
+
+        try:
+            if model_lock is not None and callable(getattr(model_lock, "__enter__", None)):
+                with model_lock:
+                    revoke_statuses()
+            else:
+                revoke_statuses()
+        except (AttributeError, TypeError):
+            pass
 
     @staticmethod
     def _get_exclude_patterns(controller: _ControllerCoreAccess) -> str:
@@ -4048,8 +3913,6 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__pending_completion_progress_floor_overlay_ids = set()
         if not hasattr(controller, "_Controller__pending_completion_publications"):
             controller._Controller__pending_completion_publications = {}
-        if not hasattr(controller, "_Controller__admitted_progress_publications"):
-            controller._Controller__admitted_progress_publications = {}
         if not hasattr(controller, "_Controller__successful_final_move_handoff_file_ids"):
             controller._Controller__successful_final_move_handoff_file_ids = set()
         if not hasattr(controller, "_Controller__current_process_final_publication_file_ids"):
@@ -4740,6 +4603,40 @@ class ModelUpdater(_ControllerCoreAccess):
         # pending-dispatch augmentation can add synthetic queued statuses.
         post_filter_lftp_statuses = lftp_statuses
         post_filter_lftp_status_count = len(post_filter_lftp_statuses)
+
+        def replacement_statuses_by_file_id() -> dict[str, object]:
+            """Return only fresh, unique raw/filtered status provenance.
+
+            Every Model authoritative-replacement path shares this adapter.
+            Display-only queue rows and cached/unhealthy polls cannot establish
+            continuity, and duplicate raw rows must not collapse through a
+            dict before the Model sees the ambiguity.
+            """
+            statuses = _fresh_unique_replacement_statuses(
+                raw_lftp_statuses,
+                post_filter_lftp_statuses,
+                poll_healthy=lftp_status_poll_healthy,
+                snapshot_fresh=lftp_status_snapshot_fresh,
+                source=lftp_status_source,
+            )
+            # A duplicate with usable but conflicting counters is explicit
+            # replacement evidence, although it is not usable continuity.
+            # Preserve that distinction for the Model boundary: it must
+            # retire any old overlay without copying a prior scanned base
+            # over the rejected candidate. Fully malformed rows remain
+            # absent, allowing the bounded physical-base fallback.
+            for file_id in raw_duplicate_status_file_ids:
+                conflicting = any(
+                    getattr(status, "file_id", None) == file_id and (
+                        type(getattr(getattr(status, "total_transfer_state", None), "size_local", None)) is int or
+                        type(getattr(getattr(status, "total_transfer_state", None), "percent_local", None)) is int
+                    )
+                    for status in raw_lftp_statuses
+                )
+                if conflicting:
+                    statuses.setdefault(file_id, object())
+            return statuses
+
         _record_lftp_status_breadcrumb(
             controller,
             lftp_statuses,
@@ -4785,6 +4682,17 @@ class ModelUpdater(_ControllerCoreAccess):
             (s.name, s.path_pair_id, s.path_pair_name)
             for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
         ]
+        # Duplicate rows are ambiguous, not a proved transfer retirement.
+        # Keep their running identities in completion detection only, so an
+        # invalid filtered poll cannot turn a live floor into a completion.
+        completion_downloading_file_names = list(current_downloading_file_names)
+        if raw_duplicate_status_file_ids:
+            completion_downloading_file_names.extend(
+                (s.name, s.path_pair_id, s.path_pair_name)
+                for s in raw_lftp_statuses
+                if s.file_id in raw_duplicate_status_file_ids and
+                s.state == LftpJobStatus.State.RUNNING
+            )
         completion_candidate_ids = {
             ModelFile.build_file_id(file_name, path_pair_id)
             for file_name, path_pair_id, _ in (
@@ -4809,14 +4717,14 @@ class ModelUpdater(_ControllerCoreAccess):
             except Exception:
                 # A failed snapshot lookup is not evidence that a name-only
                 # retirement is safe. Drop even partial lookup results and
-                # pass the meaningful empty map so the builder retains floors
-                # conservatively until a later boundary supplies identity.
-                retired_job_identities = {}
-        # Revoke stale admitted projections before completion capture.  A
-        # newer active job must win even when no pending floor exists yet.
-        self._clear_replaced_admitted_progress_publications(raw_lftp_statuses)
+                    # pass the meaningful empty map so the builder retains floors
+                    # conservatively until a later boundary supplies identity.
+                    retired_job_identities = {}
+        self._revoke_stale_model_published_provenance(
+            replacement_statuses_by_file_id(),
+        )
         completion_snapshot_evictions = self._handle_lftp_completion_detection(
-            current_downloading_file_names,
+            completion_downloading_file_names,
             lftp_status_poll_healthy or bool(lftp_statuses),
             retired_queue_dispatches,
             defer_snapshot_eviction=True,
@@ -5438,7 +5346,14 @@ class ModelUpdater(_ControllerCoreAccess):
                     authority_wake_ids.add(file_id)
             else:
                 pending_authority_rebuild_ids.discard(file_id)
-        if authority_wake_ids:
+        scoped_pending_completion_ids = {
+            ModelFile.build_file_id(file_name, path_pair_id)
+            for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
+            if path_pair_id in scoped_final_pair_ids
+        } if scoped_final_pair_ids else set()
+        pending_wake_covered_by_pair_candidate = bool(scoped_pending_completion_ids) and \
+            authority_wake_ids.issubset(scoped_pending_completion_ids)
+        if authority_wake_ids and not pending_wake_covered_by_pair_candidate:
             _request_model_rebuild(
                 model_builder, diagnostics, MODEL_REBUILD_REASON_DEFERRED_MOVE_PENDING,
             )
@@ -5628,25 +5543,33 @@ class ModelUpdater(_ControllerCoreAccess):
             with controller._Controller__model_lock:
                 current_tree_count = getattr(model, "tree_file_count", 0)
                 next_tree_count = current_tree_count if type(current_tree_count) is int else 0
-                for file_id in delta_file_ids:
-                    try:
-                        new_file = partial_model.get_file(file_id)
-                    except ModelError:
-                        # Partial authority may add or update roots, never
-                        # prove their absence. Final reconciliation owns
-                        # removals and marker pruning.
-                        continue
-                    try:
-                        old_file = model.get_file(file_id)
-                    except ModelError:
-                        model.add_file(new_file)
-                        next_tree_count += tree_file_count(new_file)
-                        progressive_delta_applied = True
-                    else:
-                        if old_file != new_file:
-                            model.update_file(new_file)
-                            next_tree_count += tree_file_count(new_file) - tree_file_count(old_file)
+                def apply_progressive_delta() -> None:
+                    nonlocal progressive_delta_applied, next_tree_count
+                    for file_id in delta_file_ids:
+                        try:
+                            new_file = partial_model.get_file(file_id)
+                        except ModelError:
+                            # Partial authority may add or update roots, never
+                            # prove their absence. Final reconciliation owns
+                            # removals and marker pruning.
+                            continue
+                        try:
+                            old_file = model.get_file(file_id)
+                        except ModelError:
+                            model.add_file(new_file)
+                            next_tree_count += tree_file_count(new_file)
                             progressive_delta_applied = True
+                        else:
+                            if old_file != new_file:
+                                model.update_file(new_file)
+                                next_tree_count += tree_file_count(new_file) - tree_file_count(old_file)
+                                progressive_delta_applied = True
+                model.apply_authoritative_root_replacement(
+                    apply_progressive_delta, replacement_statuses_by_file_id(),
+                    lambda file_id: getattr(
+                        controller, "_Controller__transfer_lifecycle_epochs", {},
+                    ).get(file_id, 0),
+                )
                 if progressive_delta_applied:
                     model.set_tree_file_count(max(0, next_tree_count))
                     refresh_identities = getattr(
@@ -5727,7 +5650,8 @@ class ModelUpdater(_ControllerCoreAccess):
                 if len(authoritative_pair_delta_builds) == 1 else None
             pair_fallback_reason = CANDIDATE_PAIR_FALLBACK_REASON_PREREQUISITES
             pair_safe = pair_build is not None and pair_build.path_pair_id is not None and \
-                bool(getattr(controller, "_Controller__startup_recovery_done", False)) and \
+                (bool(getattr(controller, "_Controller__startup_recovery_done", False)) or
+                 bool(getattr(controller, "_Controller__pending_completion_file_names", set()))) and \
                 callable(pair_authorizer) and callable(pair_adopter)
 
             def tree_file_count(file: ModelFile) -> int:
@@ -5813,10 +5737,6 @@ class ModelUpdater(_ControllerCoreAccess):
         direct_published_overlays: dict[str, ActiveProgressOverlay] = {}
         direct_published_job_identities: dict[str, tuple[int, str]] = {}
         direct_published_target_file_id: Optional[str] = None
-        replacement_source_overlays: dict[str, ActiveProgressOverlay] = {}
-        replacement_source_job_identities: dict[str, tuple[int, str]] = {}
-        replacement_source_captured = False
-        replacement_source_is_direct = False
         direct_target_file_id: Optional[str] = None
         direct_job_identities: dict[str, tuple[int, str]] = {}
         late_older_overlay_preserved = False
@@ -5831,6 +5751,21 @@ class ModelUpdater(_ControllerCoreAccess):
         active_scan_progress_inputs = getattr(
             model_builder, "has_only_live_progress_with_active_scan", None,
         )
+        # The direct path does not run for an empty fresh poll, but its
+        # diagnostic retirement record still needs the one model-owned prior
+        # target. Capture only the unambiguous overlay/identity pair.
+        if not lftp_statuses and lftp_status_poll_healthy and lftp_status_snapshot_fresh and \
+                lftp_status_source == "fresh_healthy" and \
+                _controller_breadcrumb_effectively_enabled(controller, "model.progress", "debug"):
+            with controller._Controller__model_lock:
+                prior_overlays = model.active_progress_overlays_snapshot()
+                prior_identities = model.active_progress_overlay_job_identities_snapshot()
+            if isinstance(prior_overlays, dict) and isinstance(prior_identities, dict):
+                prior_targets = set(prior_overlays).intersection(prior_identities)
+                if len(prior_targets) == 1:
+                    direct_target_file_id = next(iter(prior_targets))
+                    direct_prior_overlays = prior_overlays
+                    direct_prior_job_identities = prior_identities
         active_scan_progress_safe = False
         if callable(active_scan_progress_inputs):
             try:
@@ -6009,55 +5944,14 @@ class ModelUpdater(_ControllerCoreAccess):
                         deferred_rejected_overlay_clear = True
                         changed = set()
                     else:
-                        # Keep the controller-owned identity floor in front of
-                        # the direct Model admission.  A prior full rebuild
-                        # may have cleared the live overlay while the exact
-                        # running job is still current; accepting the stale
-                        # status directly in that gap would lower the root
-                        # before the next replacement can apply its floor.
-                        admitted = getattr(
-                            controller, "_Controller__admitted_progress_publications", None,
-                        )
-                        if isinstance(admitted, dict):
-                            for file_id, identity in direct_job_identities.items():
-                                status = next(
-                                    (candidate for candidate in lftp_statuses
-                                     if getattr(candidate, "file_id", None) == file_id),
-                                    None,
-                                )
-                                transfer_state = getattr(status, "total_transfer_state", None)
-                                reset_sample = (
-                                    type(getattr(transfer_state, "size_local", None)) is int and
-                                    getattr(transfer_state, "size_local") <= 0
-                                ) or (
-                                    type(getattr(transfer_state, "percent_local", None)) is int and
-                                    getattr(transfer_state, "percent_local") <= 0
-                                )
-                                key = (file_id, identity)
-                                if reset_sample:
-                                    admitted.pop(key, None)
-                                    continue
-                                floor = admitted.get(key)
-                                overlay = direct_overlays.get(file_id)
-                                if not isinstance(floor, ActiveProgressOverlay) or \
-                                        not isinstance(overlay, ActiveProgressOverlay):
-                                    continue
-                                progress = overlay.download_progress
-                                if type(floor.download_progress) is int and \
-                                        (type(progress) is not int or floor.download_progress > progress):
-                                    progress = floor.download_progress
-                                transferred_size = overlay.transferred_size
-                                if type(floor.transferred_size) is int and \
-                                        (type(transferred_size) is not int or floor.transferred_size > transferred_size):
-                                    transferred_size = floor.transferred_size
-                                direct_overlays[file_id] = ActiveProgressOverlay(
-                                    progress, transferred_size, overlay.downloading_speed, overlay.eta,
-                                )
                         changed, direct_outcome = model.publish_active_lftp_root_counters(
                             direct_overlays, direct_job_identities,
                             lambda file_id: getattr(
                                 controller, "_Controller__progress_publication_epoch", 0,
                             ) == lftp_status_publication_epoch,
+                            lambda file_id: getattr(
+                                controller, "_Controller__transfer_lifecycle_epochs", {},
+                            ).get(file_id, 0),
                         )
                         if direct_outcome == "accepted":
                             accepted_overlay_snapshot = model.active_progress_overlays_snapshot()
@@ -6106,19 +6000,6 @@ class ModelUpdater(_ControllerCoreAccess):
                                 direct_published_overlays = dict(direct_overlays)
                                 direct_published_job_identities = dict(direct_job_identities)
                                 direct_published_target_file_id = direct_target_file_id
-                                admitted = getattr(
-                                    controller, "_Controller__admitted_progress_publications", None,
-                                )
-                                if not isinstance(admitted, dict):
-                                    admitted = {}
-                                    controller._Controller__admitted_progress_publications = admitted
-                                for file_id in direct_published_overlays:
-                                    self._clear_admitted_progress_publications(controller, file_id)
-                                    identity = direct_published_job_identities.get(file_id)
-                                    overlay = direct_published_overlays[file_id]
-                                    if isinstance(identity, tuple) and len(identity) == 2 and \
-                                            isinstance(overlay, ActiveProgressOverlay):
-                                        admitted[(file_id, identity)] = overlay
                     direct_publish_timing["publish_duration_bucket"] = _progress_lineage_duration_bucket(
                         (time.monotonic_ns() - direct_publish_started_ns) // 1_000_000,
                     )
@@ -6157,8 +6038,14 @@ class ModelUpdater(_ControllerCoreAccess):
         active_delta_authorizer = getattr(model_builder, "authorize_active_transfer_delta", None)
         active_delta_adopter = getattr(model_builder, "adopt_active_transfer_delta", None)
         active_delta_file_ids: Optional[set[str]] = None
+        active_delta_authorization_rejected = False
         selector_rejection_diagnostics: object = {}
-        if not active_progress_overlay_applied and not active_transfer_delta_rejected and authoritative_pair_candidate is None and callable(active_delta_pending) and bool(active_delta_pending()) and \
+        active_delta_diagnostics_only = active_transfer_delta_rejected and \
+            lftp_status_source == "cached_retry" and \
+            _active_delta_rejection_trace_enabled(controller)
+        if not active_progress_overlay_applied and (
+                not active_transfer_delta_rejected or active_delta_diagnostics_only
+        ) and authoritative_pair_candidate is None and callable(active_delta_pending) and bool(active_delta_pending()) and \
                 callable(active_delta_selector) and callable(active_delta_builder) and \
                 callable(active_delta_authorizer) and callable(active_delta_adopter):
             try:
@@ -6175,6 +6062,11 @@ class ModelUpdater(_ControllerCoreAccess):
                         )
                     else:
                         candidate_file_ids = active_delta_selector(root_exists)
+                    if active_delta_diagnostics_only:
+                        # A cached retry may be inspected for bounded
+                        # rejection provenance, but it cannot authorize a
+                        # stale active-delta publication.
+                        candidate_file_ids = None
                     _record_progress_lineage(
                         controller, lftp_status_poll_correlation, "active_delta_selector",
                     )
@@ -6275,6 +6167,8 @@ class ModelUpdater(_ControllerCoreAccess):
                     # from the live model, it cannot publish selected roots
                     # and must not suppress the established full-build path.
                     active_transfer_delta_rejected = True
+                    active_delta_authorization_rejected = authorization_called and \
+                        authorization_outcome == "ok"
                     partial_model = None
                     if _active_delta_rejection_trace_enabled(controller):
                         diagnostics_reader = getattr(model_builder, "active_transfer_delta_diagnostics", None)
@@ -6296,126 +6190,6 @@ class ModelUpdater(_ControllerCoreAccess):
                             break
                         replacement_roots.append((old_file, new_file))
                 if replacement_roots:
-                    active_delta_statuses_by_file_id: dict[str, list[LftpJobStatus]] = {}
-                    for status in lftp_statuses:
-                        file_id = getattr(status, "file_id", None)
-                        if isinstance(file_id, str):
-                            active_delta_statuses_by_file_id.setdefault(file_id, []).append(status)
-                    for _old_file, new_file in replacement_roots:
-                        status_candidates = active_delta_statuses_by_file_id.get(new_file.file_id, [])
-                        if len(status_candidates) == 1:
-                            self._apply_admitted_progress_floor_to_active_delta_root(
-                                controller, new_file, status_candidates[0],
-                            )
-                    retained_overlays: dict[str, ActiveProgressOverlay] = {}
-                    retained_overlay_identities: dict[str, tuple[int, str]] = {}
-                    existing_overlays: dict[str, ActiveProgressOverlay] = {}
-                    existing_identities: dict[str, tuple[int, str]] = {}
-                    overlay_snapshot_reader = getattr(model, "active_progress_overlays_snapshot", None)
-                    identity_snapshot_reader = getattr(
-                        model, "active_progress_overlay_job_identities_snapshot", None,
-                    )
-                    if callable(overlay_snapshot_reader) and callable(identity_snapshot_reader):
-                        try:
-                            existing_overlays = overlay_snapshot_reader()
-                            existing_identities = identity_snapshot_reader()
-                        except (AttributeError, TypeError):
-                            existing_overlays = {}
-                            existing_identities = {}
-                        if isinstance(existing_overlays, dict) and isinstance(existing_identities, dict):
-                            statuses_by_file_id = {
-                                status.file_id: status for status in lftp_statuses
-                                if isinstance(getattr(status, "file_id", None), str)
-                            }
-                            for old_file, _new_file in replacement_roots:
-                                file_id = old_file.file_id
-                                overlay = existing_overlays.get(file_id)
-                                identity = existing_identities.get(file_id)
-                                status = statuses_by_file_id.get(file_id)
-                                raw_size_local = getattr(
-                                    getattr(status, "total_transfer_state", None),
-                                    "size_local", None,
-                                )
-                                status_id = getattr(status, "id", None)
-                                status_type = getattr(getattr(status, "type", None), "value", None)
-                                current_identity = (
-                                    (status_id, status_type)
-                                    if status is not None and type(status_id) is int and
-                                    status_id >= 0 and isinstance(status_type, str)
-                                    else None
-                                )
-                                explicitly_stopped = getattr(old_file, "explicitly_stopped", False)
-                                stop_checker = getattr(
-                                    controller, "_Controller__is_explicitly_stopped", None,
-                                )
-                                if callable(stop_checker):
-                                    try:
-                                        explicitly_stopped = explicitly_stopped or bool(
-                                            stop_checker(old_file.full_path, old_file.path_pair_id),
-                                        )
-                                    except Exception:
-                                        explicitly_stopped = True
-                                else:
-                                    explicitly_stopped = True
-                                # Active-delta adoption normally replaces the
-                                # root and Model.update_file clears overlays.
-                                # Keep a newer presentation counter only for
-                                # the same live job; an explicit zero remains
-                                # the reset boundary and all lifecycle/type
-                                # changes fail closed through normal adoption.
-                                if isinstance(overlay, ActiveProgressOverlay) and \
-                                        isinstance(identity, tuple) and len(identity) == 2 and \
-                                        current_identity == identity and status is not None and \
-                                        status.state == LftpJobStatus.State.RUNNING and \
-                                        raw_size_local != 0 and not explicitly_stopped:
-                                    retained_overlays[file_id] = overlay
-                                    retained_overlay_identities[file_id] = identity
-                        else:
-                            existing_overlays = {}
-                            existing_identities = {}
-
-                    replacement_file_ids = {
-                        old_file.file_id for old_file, _new_file in replacement_roots
-                    }
-                    restore_overlays = {
-                        file_id: overlay
-                        for file_id, overlay in existing_overlays.items()
-                        if file_id not in replacement_file_ids and
-                        isinstance(overlay, ActiveProgressOverlay) and
-                        file_id in existing_identities
-                    }
-                    restore_overlay_identities = {
-                        file_id: existing_identities[file_id]
-                        for file_id in restore_overlays
-                    }
-                    retire_overlay_file_ids = replacement_file_ids.difference(retained_overlays)
-
-                    def max_positive_counter(previous: object, current: object) -> object:
-                        if type(previous) is int and previous > 0:
-                            if type(current) is int and current > 0:
-                                return max(previous, current)
-                            return previous
-                        return current
-
-                    for old_file, new_file in replacement_roots:
-                        file_id = old_file.file_id
-                        overlay = retained_overlays.get(file_id)
-                        if overlay is not None:
-                            retained_overlays[file_id] = ActiveProgressOverlay(
-                                max_positive_counter(
-                                    overlay.download_progress,
-                                    getattr(new_file, "download_progress", None),
-                                ),
-                                max_positive_counter(
-                                    overlay.transferred_size,
-                                    getattr(new_file, "transferred_size", None),
-                                ),
-                                getattr(new_file, "downloading_speed", None),
-                                getattr(new_file, "eta", None),
-                            )
-                    restore_overlays.update(retained_overlays)
-                    restore_overlay_identities.update(retained_overlay_identities)
-
                     def apply_replacement_roots() -> None:
                         nonlocal active_transfer_delta_applied, next_tree_count
                         for old_file, new_file in replacement_roots:
@@ -6427,17 +6201,13 @@ class ModelUpdater(_ControllerCoreAccess):
                     _record_progress_lineage(
                         controller, lftp_status_poll_correlation, "active_delta_adoption",
                     )
-                    retain_overlays = getattr(model, "apply_with_active_progress_retained", None)
-                    restore_overlay_fn = getattr(model, "restore_active_progress_overlays", None)
-                    if existing_overlays and callable(retain_overlays):
-                        retain_overlays(
-                            apply_replacement_roots,
-                            retire_file_ids=retire_overlay_file_ids,
-                        )
-                    else:
-                        apply_replacement_roots()
-                    if retained_overlays and callable(restore_overlay_fn):
-                        restore_overlay_fn(restore_overlays, restore_overlay_identities)
+                    model.apply_authoritative_root_replacement(
+                        apply_replacement_roots,
+                        replacement_statuses_by_file_id(),
+                        lambda file_id: getattr(
+                            controller, "_Controller__transfer_lifecycle_epochs", {},
+                        ).get(file_id, 0),
+                    )
                     if active_transfer_delta_applied:
                         model.set_tree_file_count(max(0, next_tree_count))
                         refresh_identities = getattr(
@@ -6465,8 +6235,15 @@ class ModelUpdater(_ControllerCoreAccess):
                     pass
 
         candidate_lifecycle_triggered = authoritative_pair_candidate is not None
-        defer_nonfresh_active_only_inputs = active_transfer_delta_rejected and callable(active_delta_pending) and \
-            bool(active_delta_pending()) and not bool(
+        defer_nonfresh_active_only_inputs = active_transfer_delta_rejected and \
+            not active_delta_authorization_rejected and callable(active_delta_pending) and \
+            not (joint_reconciliation_final and progressive_final_publication_required) and \
+            (bool(active_delta_pending()) or (
+                unknown_overlay_only and not (
+                    lftp_status_poll_healthy and lftp_status_snapshot_fresh and
+                    lftp_status_source == "fresh_healthy"
+                )
+            )) and not bool(
                 getattr(controller, "_Controller__pending_completion_file_names", set())
             ) and not bool(getattr(controller, "_Controller__pending_queue_dispatches", {})) and \
             overlay_admission_outcome != "status_identity"
@@ -6605,226 +6382,24 @@ class ModelUpdater(_ControllerCoreAccess):
                 if type(generation) is int and generation >= 0 and callable(setter):
                     setter(generation)
 
-            def direct_overlays_for_replacement() -> tuple[
-                    dict[str, ActiveProgressOverlay], dict[str, tuple[int, str]]]:
-                """Retain an accepted direct projection across one replacement.
-
-                A model replacement may be rendered from the lower scan/base
-                checkpoint even though the same PGET is still authoritative.
-                Restore only when the replacement and the fresh status poll
-                independently prove that exact live, stoppable job.  Any
-                lifecycle reset or uncertainty deliberately leaves the
-                replacement's base state visible.
-                """
-                capture_replacement_overlay_source()
-                if not replacement_source_overlays or not replacement_source_job_identities or \
-                        not (lftp_status_poll_healthy and lftp_status_snapshot_fresh and
-                             lftp_status_source == "fresh_healthy"):
-                    return {}, {}
-                replacement_overlays: dict[str, ActiveProgressOverlay] = {}
-                replacement_identities: dict[str, tuple[int, str]] = {}
-                statuses_by_file_id: dict[str, list[LftpJobStatus]] = {}
-                for status in lftp_statuses:
-                    file_id = getattr(status, "file_id", None)
-                    if isinstance(file_id, str):
-                        statuses_by_file_id.setdefault(file_id, []).append(status)
-                raw_statuses_by_file_id: dict[str, list[object]] = {}
-                for status in raw_lftp_statuses:
-                    file_id = getattr(status, "file_id", None)
-                    if isinstance(file_id, str):
-                        raw_statuses_by_file_id.setdefault(file_id, []).append(status)
-                for file_id, overlay in replacement_source_overlays.items():
-                    identity = replacement_source_job_identities.get(file_id)
-                    if not isinstance(identity, tuple) or len(identity) != 2 or \
-                            type(identity[0]) is not int or identity[0] < 0 or \
-                            not isinstance(identity[1], str) or not identity[1] or \
-                            not isinstance(overlay, ActiveProgressOverlay):
-                        continue
-                    statuses = statuses_by_file_id.get(file_id, [])
-                    raw_statuses = raw_statuses_by_file_id.get(file_id, [])
-                    if len(statuses) != 1 or len(raw_statuses) != 1:
-                        continue
-                    status = statuses[0]
-                    raw_status = raw_statuses[0]
-                    if status.state != LftpJobStatus.State.RUNNING or \
-                            raw_status.state != LftpJobStatus.State.RUNNING or \
-                            type(getattr(status, "id", None)) is not int or \
-                            type(getattr(raw_status, "id", None)) is not int or \
-                            getattr(status, "id", -1) < 0 or \
-                            getattr(raw_status, "id", -1) < 0 or \
-                            (getattr(status, "id", None), getattr(
-                                getattr(status, "type", None), "value", None,
-                            )) != identity or \
-                            (getattr(raw_status, "id", None), getattr(
-                                getattr(raw_status, "type", None), "value", None,
-                            )) != identity:
-                        continue
-                    transfer_state = getattr(raw_status, "total_transfer_state", None)
-                    if (
-                            type(getattr(transfer_state, "size_local", None)) is int and
-                            getattr(transfer_state, "size_local") <= 0
-                    ) or (
-                            type(getattr(transfer_state, "percent_local", None)) is int and
-                            getattr(transfer_state, "percent_local") <= 0
-                    ):
-                        # A zero counter is an explicit same-name reset, not
-                        # evidence that the prior job's floor is still live.
-                        self._clear_admitted_progress_publications(
-                            controller, file_id, identity,
-                        )
-                        continue
-                    try:
-                        replacement = new_model.get_file(file_id)
-                    except (AttributeError, ModelError):
-                        continue
-                    if replacement.state != ModelFile.State.DOWNLOADING or \
-                            replacement.is_stoppable is not True or \
-                            replacement.explicitly_stopped or \
-                            replacement.display_size_total is not None or \
-                            replacement.display_transferred_size is not None or \
-                            replacement.complete_local_coverage or \
-                            (replacement.download_progress is not None and
-                             replacement.download_progress >= 100) or \
-                            replacement.local_size == 0 or \
-                            (replacement.transferred_size == 0 and
-                             replacement.download_progress == 0):
-                        continue
-                    stop_checker = getattr(controller, "_Controller__is_explicitly_stopped", None)
-                    if callable(stop_checker):
-                        try:
-                            if stop_checker(replacement.full_path, replacement.path_pair_id):
-                                continue
-                        except Exception:
-                            continue
-                    else:
-                        continue
-                    replacement_overlays[file_id] = overlay
-                    replacement_identities[file_id] = identity
-                return replacement_overlays, replacement_identities
-
-            def capture_replacement_overlay_source() -> None:
-                """Snapshot the latest accepted projection before replacement.
-
-                A full/candidate build can follow a tick that did not accept a
-                new direct projection.  In that case the live Model overlay is
-                still the newest accepted counter, and must remain available
-                for the same-identity replacement checks below.
-                """
-                nonlocal replacement_source_captured, replacement_source_is_direct
-                if replacement_source_captured:
-                    return
-                replacement_source_captured = True
-                if direct_published_overlays and direct_published_job_identities:
-                    replacement_source_is_direct = True
-                    replacement_source_overlays.update(direct_published_overlays)
-                    replacement_source_job_identities.update(direct_published_job_identities)
-                    return
-                with controller._Controller__model_lock:
-                    overlay_reader = getattr(model, "active_progress_overlays_snapshot", None)
-                    identity_reader = getattr(
-                        model, "active_progress_overlay_job_identities_snapshot", None,
-                    )
-                    if not callable(overlay_reader) or not callable(identity_reader):
-                        return
-                    try:
-                        overlays = overlay_reader()
-                        identities = identity_reader()
-                    except (AttributeError, TypeError):
-                        overlays = {}
-                        identities = {}
-                    if isinstance(overlays, dict) and isinstance(identities, dict):
-                        replacement_source_overlays.update(overlays)
-                        replacement_source_job_identities.update(identities)
-                # The admission map is the same identity-scoped projection
-                # used by the direct path.  It survives a full replacement
-                # that clears the Model overlay, but is retired by Stop,
-                # Queue/replacement, completion, or an explicit zero reset.
-                admitted = getattr(
-                    controller, "_Controller__admitted_progress_publications", None,
-                )
-                if isinstance(admitted, dict):
-                    for key, overlay in admitted.items():
-                        if not isinstance(key, tuple) or len(key) != 2 or \
-                                not isinstance(key[0], str) or \
-                                not isinstance(key[1], tuple) or len(key[1]) != 2 or \
-                                type(key[1][0]) is not int or key[1][0] < 0 or \
-                                not isinstance(key[1][1], str) or not key[1][1] or \
-                                not isinstance(overlay, ActiveProgressOverlay):
-                            continue
-                        file_id, identity = key
-                        existing_identity = replacement_source_job_identities.get(file_id)
-                        if existing_identity is not None and existing_identity != identity:
-                            continue
-                        existing = replacement_source_overlays.get(file_id)
-                        if isinstance(existing, ActiveProgressOverlay):
-                            progress = existing.download_progress
-                            if type(overlay.download_progress) is int and \
-                                    (type(progress) is not int or overlay.download_progress > progress):
-                                progress = overlay.download_progress
-                            transferred_size = existing.transferred_size
-                            if type(overlay.transferred_size) is int and \
-                                    (type(transferred_size) is not int or overlay.transferred_size > transferred_size):
-                                transferred_size = overlay.transferred_size
-                            overlay = ActiveProgressOverlay(
-                                progress, transferred_size,
-                                existing.downloading_speed, existing.eta,
-                            )
-                        replacement_source_overlays[file_id] = overlay
-                        replacement_source_job_identities[file_id] = identity
-
-            def floor_replacement_base_counters() -> None:
-                """Carry a prior accepted counter into a safe replacement base.
-
-                A fallback build cannot restore a live-only overlay after its
-                clear/adopt boundary.  For the unchanged identity, render its
-                accepted counters into the candidate instead; lifecycle state
-                and completion proof remain candidate-owned.
-                """
-                if replacement_source_is_direct:
-                    return
-                overlays, identities = direct_overlays_for_replacement()
-                for file_id, overlay in overlays.items():
-                    try:
-                        replacement = new_model.get_file(file_id)
-                    except (AttributeError, ModelError):
-                        continue
-                    progress = overlay.download_progress
-                    if type(progress) is int and 0 < progress < 100:
-                        candidate_progress = getattr(replacement, "download_progress", None)
-                        if type(candidate_progress) is not int or candidate_progress < progress:
-                            replacement.download_progress = progress
-                    transferred_size = overlay.transferred_size
-                    if type(transferred_size) is int and transferred_size > 0:
-                        candidate_transferred_size = getattr(replacement, "transferred_size", None)
-                        if type(candidate_transferred_size) is not int or \
-                                candidate_transferred_size < transferred_size:
-                            replacement.transferred_size = transferred_size
-
-            def restore_direct_overlays_after_replacement() -> None:
-                overlays, identities = direct_overlays_for_replacement()
-                if not replacement_source_overlays:
-                    return
-                restore_overlays = getattr(
-                    controller._Controller__model, "restore_active_progress_overlays", None,
-                )
-                if callable(restore_overlays):
-                    restore_overlays(overlays, identities)
-
             def apply_model_replacement(operation: Callable[[], object]) -> object:
-                """Apply one diff without exposing an accepted live overlay's base."""
-                capture_replacement_overlay_source()
-                if not replacement_source_overlays:
-                    return operation()
-                retain_overlays = getattr(model, "apply_with_active_progress_retained", None)
-                if not callable(retain_overlays):
-                    return operation()
-                return retain_overlays(operation)
+                """Use the Model's one progress-provenance publication boundary."""
+                return model.apply_authoritative_root_replacement(
+                    operation, replacement_statuses_by_file_id(),
+                    lambda file_id: getattr(
+                        controller, "_Controller__transfer_lifecycle_epochs", {},
+                    ).get(file_id, 0),
+                )
 
             def clear_overlays_for_replacement() -> None:
                 """Clear/rebase only after the replacement restore decision."""
-                capture_replacement_overlay_source()
-                if not replacement_source_overlays:
+                nonlocal deferred_rejected_overlay_clear
+                if deferred_rejected_overlay_clear:
+                    # Every changed root has already crossed its authoritative
+                    # replacement boundary.  Clearing now publishes that new
+                    # base, rather than the old raw counters that preceded it.
                     model.clear_active_progress_overlays()
+                    deferred_rejected_overlay_clear = False
                     return
                 apply_model_replacement(lambda: model.clear_active_progress_overlays())
 
@@ -6889,8 +6464,13 @@ class ModelUpdater(_ControllerCoreAccess):
                 retired_at = publication.retired_at \
                     if isinstance(publication, _PendingCompletionPublication) else None
                 scan_started_at = getattr(latest_active_scan, "timestamp", None)
-                if not isinstance(retired_at, datetime) or not isinstance(scan_started_at, datetime) or \
-                        scan_started_at <= retired_at:
+                if not isinstance(scan_started_at, datetime):
+                    return False
+                # An identity-paired published overlay needs a later scan so
+                # its browser floor cannot be revoked by an older result. A
+                # status-only retirement has no such published floor; the
+                # current healthy active scan is its physical sidecar proof.
+                if isinstance(retired_at, datetime) and scan_started_at <= retired_at:
                     return False
                 if latest_active_scan is None or bool(getattr(latest_active_scan, "failed", False)):
                     return False
@@ -7351,7 +6931,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         continue
                     release_identity = self._pending_completion_provenance_identity(
                         controller, pending_file_id,
-                    )
+                    ) or retired_job_identities.get(pending_file_id)
                     # A current Builder snapshot can belong to a newer job
                     # with the same file id. Passive sidecar release is only
                     # safe when this pending transaction retained its own
@@ -7375,7 +6955,10 @@ class ModelUpdater(_ControllerCoreAccess):
                     )
                     if replacement_active:
                         continue
-                    self._clear_pending_completion_progress_floor(
+                    # This is a lifecycle release, not a normal completed
+                    # handoff: block the old 100% record from being copied
+                    # back during the candidate diff below.
+                    self._invalidate_pending_completion_progress_floor(
                         controller, pending_file_id,
                     )
                     evict_snapshots = getattr(
@@ -8017,7 +7600,6 @@ class ModelUpdater(_ControllerCoreAccess):
                             model_builder, authoritative_pair_build, pair_fallback_committer,
                             record_candidate_lifecycle_fallback,
                     ), controller._Controller__model_lock:
-                        floor_replacement_base_counters()
                         clear_overlays_for_replacement()
                         controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
                         pair_adopter(
@@ -8026,7 +7608,6 @@ class ModelUpdater(_ControllerCoreAccess):
                             applied_builder_invalidation_tokens,
                         )
                         synchronize_applied_model_overlay_generation()
-                        restore_direct_overlays_after_replacement()
                         authoritative_pair_delta_applied = True
                         progressive_source_buckets_adopted = True
                         refresh_identities = getattr(
@@ -8094,7 +7675,6 @@ class ModelUpdater(_ControllerCoreAccess):
         if global_full_build_triggered:
             try:
                 with controller._Controller__model_lock:
-                    floor_replacement_base_counters()
                     clear_overlays_for_replacement()
                     controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
                     model_builder.adopt_applied_model(
@@ -8103,7 +7683,6 @@ class ModelUpdater(_ControllerCoreAccess):
                         applied_builder_invalidation_tokens,
                     )
                     synchronize_applied_model_overlay_generation()
-                    restore_direct_overlays_after_replacement()
                     refresh_identities = getattr(
                         controller, "_refresh_model_file_command_identities_locked", None
                     )
@@ -8412,7 +7991,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     reason = "published_after_pair_fallback"
                 else:
                     reason = "published"
-            elif active_transfer_delta_rejected:
+            elif active_delta_authorization_rejected:
                 outcome = "reject"
                 reason = "active_delta_rejected"
             elif pair_delta_fallback:

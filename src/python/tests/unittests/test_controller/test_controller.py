@@ -2702,6 +2702,23 @@ class TestController(unittest.TestCase):
 
         self.assertEqual("512K", self.controller._Controller__lftp.net_socket_buffer)
 
+    def test_configure_lftp_applies_use_temp_file_at_startup(self):
+        self.controller._Controller__context.config.lftp.use_temp_file = True
+
+        self.controller._Controller__configure_lftp()
+
+        self.assertTrue(self.controller._Controller__lftp.use_temp_file)
+
+    def test_runtime_reconfigure_lftp_does_not_apply_use_temp_file(self):
+        self.controller._Controller__context.config.general = SimpleNamespace(verbose=False)
+        self.controller._Controller__context.config.validate = SimpleNamespace(xfer_verify=False)
+        self.controller._Controller__context.config.lftp.use_temp_file = True
+        self.controller._Controller__lftp.use_temp_file = False
+
+        self.controller._Controller__configure_lftp(runtime_reconfigure=True)
+
+        self.assertFalse(self.controller._Controller__lftp.use_temp_file)
+
     def test_configure_lftp_applies_rate_limit_when_configured(self):
         self.controller._Controller__context.config.lftp.rate_limit = "512K"
 
@@ -2765,7 +2782,7 @@ class TestController(unittest.TestCase):
 
         self.controller.process()
 
-        self.controller._Controller__configure_lftp.assert_called_once_with()
+        self.controller._Controller__configure_lftp.assert_called_once_with(runtime_reconfigure=True)
         self.assertEqual("*.nfo,Season */*.nfo", self.controller._Controller__exclude_patterns)
         self.assertFalse(self.controller._Controller__lftp_reconfigure_requested)
         self.controller._Controller__propagate_exceptions.assert_called_once_with()
@@ -2833,7 +2850,7 @@ class TestController(unittest.TestCase):
 
         self.controller.process()
 
-        self.controller._Controller__configure_lftp.assert_called_once_with()
+        self.controller._Controller__configure_lftp.assert_called_once_with(runtime_reconfigure=True)
         self.assertTrue(self.controller._Controller__lftp_reconfigure_requested)
 
     def test_async_lftp_reconfigure_publishes_exclusions_only_after_success(self):

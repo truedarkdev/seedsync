@@ -89,6 +89,12 @@ class Model:
         # Kept with the live-only values so a later status can never be
         # mistaken for a continuation of a cleared LFTP job.
         self.__active_progress_overlay_job_identities: Dict[str, tuple[int, str]] = {}
+        # The controller owns lifecycle advancement, but the Model owns the
+        # browser-facing projection.  Bind each admitted counter to both so a
+        # root replacement can retain only the exact still-live transfer.
+        self.__active_progress_overlay_lifecycle_epochs: Dict[str, int] = {}
+        self.__authoritative_replacement_depth = 0
+        self.__authoritative_replacement_physical_base_fallbacks: Dict[str, int] = {}
         self.__suppress_active_progress_clear = 0
         self.__legacy_overlay_correction_file_ids: Set[str] = set()
         self.__legacy_overlay_correction_old_files: Dict[str, ModelFile] = {}
@@ -216,6 +222,27 @@ class Model:
         browser-facing snapshot remains available until the next publication.
         """
         if self.__published_file_job_identities.get(file_id) != expected_job_identity:
+            return False
+        self.__published_file_job_identities.pop(file_id, None)
+        return True
+
+    def clear_published_file_job_identity_if_replaced(
+            self, file_id: str, replacement_job_identity: tuple[int, str],
+    ) -> bool:
+        """Revoke older publication provenance when a newer job is observed."""
+        current_identity = self.__published_file_job_identities.get(file_id)
+        if not isinstance(current_identity, tuple) or len(current_identity) != 2 or \
+                type(current_identity[0]) is not int or current_identity[0] < 0 or \
+                not isinstance(current_identity[1], str) or not current_identity[1] or \
+                not isinstance(replacement_job_identity, tuple) or \
+                len(replacement_job_identity) != 2 or \
+                type(replacement_job_identity[0]) is not int or \
+                replacement_job_identity[0] < 0 or \
+                not isinstance(replacement_job_identity[1], str) or \
+                not replacement_job_identity[1]:
+            return False
+        if current_identity == replacement_job_identity or \
+                replacement_job_identity[0] < current_identity[0]:
             return False
         self.__published_file_job_identities.pop(file_id, None)
         return True
@@ -439,6 +466,7 @@ class Model:
                 self.__retiring_progress_overlay_job_identities[file_id] = identity
             self.__active_progress_overlays.pop(file_id, None)
             self.__active_progress_overlay_job_identities.pop(file_id, None)
+            self.__active_progress_overlay_lifecycle_epochs.pop(file_id, None)
             self.__legacy_overlay_correction_file_ids.discard(file_id)
             self.__legacy_overlay_correction_old_files.pop(file_id, None)
         self.__suppress_active_progress_clear += 1
@@ -463,6 +491,156 @@ class Model:
             for file_id in retired_file_ids:
                 self.__retiring_progress_overlay_job_identities.pop(file_id, None)
 
+    def apply_authoritative_root_replacement(
+            self,
+            operation: Callable[[], object],
+            statuses_by_file_id: Dict[str, object],
+            lifecycle_epoch_for: Callable[[str], object],
+    ) -> object:
+        """Apply reconciliation without letting a same-job root regress.
+
+        Scans/builders own the candidate ModelFile.  This Model boundary owns
+        whether its already-published progress projection survives that
+        candidate.  A missing, stopped, queued, reset, invalid active root,
+        replacement, or epoch mismatch retires the projection before the
+        candidate is visible.
+        """
+        retire: Set[str] = set()
+        for file_id, identity in self.__active_progress_overlay_job_identities.items():
+            status = statuses_by_file_id.get(file_id)
+            status_id = getattr(status, "id", None)
+            status_type = getattr(getattr(status, "type", None), "value", None)
+            status_identity = (status_id, status_type) if type(status_id) is int and \
+                isinstance(status_type, str) else None
+            transfer = getattr(status, "total_transfer_state", None)
+            reset = (
+                type(getattr(transfer, "size_local", None)) is int and
+                getattr(transfer, "size_local") <= 0
+            ) or (
+                type(getattr(transfer, "percent_local", None)) is int and
+                getattr(transfer, "percent_local") <= 0
+            )
+            state = getattr(status, "state", None)
+            running = getattr(state, "name", None) == "RUNNING"
+            try:
+                epoch = lifecycle_epoch_for(file_id)
+            except Exception:
+                epoch = None
+            stored_epoch = self.__active_progress_overlay_lifecycle_epochs.get(file_id)
+            if status_identity != identity or not running or reset or \
+                    (stored_epoch is not None and (
+                        type(epoch) is not int or stored_epoch != epoch
+                    )):
+                retire.add(file_id)
+        roots_before_replacement = dict(self.__files_by_id)
+        previous_physical_base_fallbacks = self.__authoritative_replacement_physical_base_fallbacks
+        self.__authoritative_replacement_physical_base_fallbacks = {
+            file_id: previous.transferred_size
+            for file_id in retire
+            if statuses_by_file_id.get(file_id) is None
+            and (previous := roots_before_replacement.get(file_id)) is not None
+            and type(previous.transferred_size) is int
+            and previous.transferred_size >= 0
+        }
+        try:
+            self.__authoritative_replacement_depth += 1
+            try:
+                result = self.apply_with_active_progress_retained(operation, retire)
+            finally:
+                self.__authoritative_replacement_depth -= 1
+        finally:
+            self.__authoritative_replacement_physical_base_fallbacks = previous_physical_base_fallbacks
+        replaced_file_ids = {
+            file_id for file_id, file in self.__files_by_id.items()
+            if roots_before_replacement.get(file_id) is not file
+        }
+        # Counters are continuity state; rate metadata is an observation of
+        # the current status/candidate.  Keep the former monotonic while
+        # publishing the latter from this replacement atomically.
+        for file_id, overlay in tuple(self.__active_progress_overlays.items()):
+            if file_id in retire:
+                continue
+            status = statuses_by_file_id.get(file_id)
+            file = self.__files_by_id.get(file_id)
+            if status is None or file is None:
+                continue
+            if file_id in replaced_file_ids and not self.__candidate_can_retain_active_projection(file):
+                identity = self.__active_progress_overlay_job_identities.get(file_id)
+                if isinstance(identity, tuple):
+                    self.clear_active_progress_overlay_if_job_identity_matches(
+                        file_id, identity,
+                    )
+                continue
+            transfer = getattr(status, "total_transfer_state", None)
+            speed = getattr(file, "downloading_speed", None)
+            eta = getattr(file, "eta", None)
+            if speed is None:
+                speed = getattr(transfer, "speed", None)
+            if eta is None:
+                eta = getattr(transfer, "eta", None)
+            candidate_progress = getattr(file, "download_progress", None)
+            candidate_transferred = getattr(file, "transferred_size", None)
+            progress = overlay.download_progress
+            transferred = overlay.transferred_size
+            if type(candidate_progress) is int and candidate_progress > 0 and \
+                    (type(progress) is not int or candidate_progress > progress):
+                progress = candidate_progress
+            if type(candidate_transferred) is int and candidate_transferred > 0 and \
+                    (type(transferred) is not int or candidate_transferred > transferred):
+                transferred = candidate_transferred
+            refreshed = ActiveProgressOverlay(progress, transferred, speed, eta)
+            if refreshed == overlay:
+                continue
+            self.__active_progress_overlays[file_id] = refreshed
+            self.__refresh_published_file(file)
+            global_version, scope_version = self.__advance_version(file)
+            self.__notify_legacy_overlay_correction_if_needed(file_id, file)
+            self.__notify_versioned_change(file, global_version, scope_version)
+        return result
+
+    @staticmethod
+    def __candidate_can_retain_active_projection(file: ModelFile) -> bool:
+        """Require a replacement root to retain a live LFTP projection."""
+        if file.state != ModelFile.State.DOWNLOADING or \
+                file.is_stoppable is not True or file.explicitly_stopped or \
+                file.display_size_total is not None or \
+                file.display_transferred_size is not None or \
+                file.complete_local_coverage:
+            return False
+
+        progress = file.download_progress
+        transferred = file.transferred_size
+        local_size = file.local_size
+        remote_size = file.remote_size
+        if type(local_size) is int and local_size <= 0:
+            return False
+        if progress is not None and (
+                type(progress) is not int or not 0 <= progress < 100
+        ):
+            return False
+        if transferred is not None and (
+                type(transferred) is not int or transferred < 0 or
+                (type(remote_size) is int and transferred > remote_size)
+        ):
+            return False
+        progress_valid = type(progress) is int and 0 <= progress < 100
+        transferred_valid = type(transferred) is int and transferred >= 0 and (
+            remote_size is None or
+            type(remote_size) is int and transferred <= remote_size
+        )
+        if not progress_valid and not transferred_valid:
+            return False
+        return (progress_valid and progress > 0) or (transferred_valid and transferred > 0)
+
+    def __retire_active_projection_for_candidate(self, file: ModelFile) -> None:
+        """Retire before an invalid candidate's normal mutation publishes."""
+        if not self.__authoritative_replacement_depth or file.file_id not in self.__active_progress_overlays:
+            return
+        if not self.__candidate_can_retain_active_projection(file):
+            self.__active_progress_overlays.pop(file.file_id, None)
+            self.__active_progress_overlay_job_identities.pop(file.file_id, None)
+            self.__active_progress_overlay_lifecycle_epochs.pop(file.file_id, None)
+
     def clear_active_progress_overlays(self) -> None:
         """Discard live-only values and publish each affected root's base state."""
         if self.__suppress_active_progress_clear:
@@ -470,6 +648,7 @@ class Model:
         removed_file_ids = set(self.__active_progress_overlays)
         self.__active_progress_overlays = {}
         self.__active_progress_overlay_job_identities = {}
+        self.__active_progress_overlay_lifecycle_epochs = {}
         for file_id in sorted(removed_file_ids):
             file = self.__files_by_id.get(file_id)
             if file is None:
@@ -496,6 +675,7 @@ class Model:
         for file_id in removed_file_ids:
             self.__active_progress_overlays.pop(file_id, None)
             self.__active_progress_overlay_job_identities.pop(file_id, None)
+            self.__active_progress_overlay_lifecycle_epochs.pop(file_id, None)
         for file_id in sorted(removed_file_ids):
             file = self.__files_by_id.get(file_id)
             if file is None:
@@ -541,6 +721,10 @@ class Model:
         }
         self.__active_progress_overlays = normalized
         self.__active_progress_overlay_job_identities = normalized_identities
+        self.__active_progress_overlay_lifecycle_epochs = {
+            file_id: self.__active_progress_overlay_lifecycle_epochs[file_id]
+            for file_id in normalized if file_id in self.__active_progress_overlay_lifecycle_epochs
+        }
         for file_id in sorted(changed):
             file = self.__files_by_id.get(file_id)
             if file is None:
@@ -568,6 +752,7 @@ class Model:
             return False
         self.__active_progress_overlays.pop(file_id, None)
         self.__active_progress_overlay_job_identities.pop(file_id, None)
+        self.__active_progress_overlay_lifecycle_epochs.pop(file_id, None)
         file = self.__files_by_id.get(file_id)
         if file is None:
             self.__notify_legacy_overlay_correction_if_needed(file_id, None)
@@ -600,6 +785,7 @@ class Model:
         }
         self.__active_progress_overlays = normalized
         self.__active_progress_overlay_job_identities = {}
+        self.__active_progress_overlay_lifecycle_epochs = {}
         for file_id in sorted(changed):
             file = self.__files_by_id[file_id]
             old_published = self.__published_files_by_id.get(file_id)
@@ -613,6 +799,7 @@ class Model:
             self, overlays: Dict[str, ActiveProgressOverlay],
             job_identities: Dict[str, tuple[int, str]],
             lifecycle_epoch_matches: Callable[[str], bool],
+            lifecycle_epoch_for: Optional[Callable[[str], object]] = None,
     ) -> tuple[set[str], str]:
         """Publish fresh LFTP counters only onto already-authoritative roots.
 
@@ -635,6 +822,17 @@ class Model:
                 self.clear_active_progress_overlays()
                 return set(), "job_identity"
             if not callable(lifecycle_epoch_matches) or not lifecycle_epoch_matches(file_id):
+                self.clear_active_progress_overlays()
+                return set(), "lifecycle_epoch"
+            try:
+                lifecycle_epoch = lifecycle_epoch_for(file_id) if callable(lifecycle_epoch_for) else None
+            except Exception:
+                lifecycle_epoch = None
+            if callable(lifecycle_epoch_for) and type(lifecycle_epoch) is not int:
+                self.clear_active_progress_overlays()
+                return set(), "lifecycle_epoch"
+            previous_epoch = self.__active_progress_overlay_lifecycle_epochs.get(file_id)
+            if previous_epoch is not None and lifecycle_epoch is not None and previous_epoch != lifecycle_epoch:
                 self.clear_active_progress_overlays()
                 return set(), "lifecycle_epoch"
             previous_identity = self.__active_progress_overlay_job_identities.get(file_id)
@@ -686,6 +884,16 @@ class Model:
         }
         self.__active_progress_overlays = normalized
         self.__active_progress_overlay_job_identities = normalized_identities
+        next_epochs: Dict[str, int] = {}
+        if callable(lifecycle_epoch_for):
+            for file_id in normalized:
+                try:
+                    epoch = lifecycle_epoch_for(file_id)
+                except Exception:
+                    continue
+                if type(epoch) is int:
+                    next_epochs[file_id] = epoch
+        self.__active_progress_overlay_lifecycle_epochs = next_epochs
         for file_id in sorted(changed):
             file = self.__files_by_id.get(file_id)
             if file is None:
@@ -791,6 +999,7 @@ class Model:
         # that reuses the same canonical identity.
         self.__active_progress_overlays.pop(file_id, None)
         self.__active_progress_overlay_job_identities.pop(file_id, None)
+        self.__active_progress_overlay_lifecycle_epochs.pop(file_id, None)
         self.__legacy_overlay_correction_file_ids.discard(file_id)
         self.__legacy_overlay_correction_old_files.pop(file_id, None)
         global_version, scope_version = self.__advance_version(file)
@@ -806,6 +1015,11 @@ class Model:
         :param file:
         :return:
         """
+        fallback = self.__authoritative_replacement_physical_base_fallbacks.get(file.file_id)
+        if file.transferred_size is None and type(fallback) is int and fallback >= 0 and \
+                type(file.local_size) is int and file.local_size >= fallback:
+            file.transferred_size = fallback
+        self.__retire_active_projection_for_candidate(file)
         self.clear_active_progress_overlays()
         self.logger.debug("LftpModel: Updating file '{}'".format(self.__format_file_for_log(file)))
         file_id = file.file_id
