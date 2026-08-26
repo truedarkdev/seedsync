@@ -24,6 +24,31 @@ class DummyModelListener(IModelListener):
 
 
 class TestLftpModel(unittest.TestCase):
+    def test_published_file_and_job_identity_are_read_as_one_snapshot(self):
+        file = ModelFile("active", False)
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        self.model.add_file(file)
+        identity = (7, "pget")
+        self.model.publish_active_lftp_root_counters(
+            {file.file_id: ActiveProgressOverlay(100, 1000, None, None)},
+            {file.file_id: identity}, lambda _: True,
+        )
+
+        published, published_identity = self.model.published_file_with_job_identity(file.file_id)
+
+        self.assertIs(published, self.model.published_file(file.file_id))
+        self.assertEqual(identity, published_identity)
+        self.assertFalse(
+            self.model.clear_published_file_job_identity_if_matches(file.file_id, (6, "pget")),
+        )
+        self.assertEqual(identity, self.model.published_file_job_identity(file.file_id))
+        self.assertTrue(
+            self.model.clear_published_file_job_identity_if_matches(file.file_id, identity),
+        )
+        self.assertIsNotNone(self.model.published_file(file.file_id))
+        self.assertIsNone(self.model.published_file_job_identity(file.file_id))
+
     def test_published_root_snapshot_keeps_effective_overlay_across_replacement(self):
         file = ModelFile("active", False)
         file.state = ModelFile.State.DOWNLOADING

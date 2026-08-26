@@ -4941,8 +4941,8 @@ class TestController(unittest.TestCase):
         self.assertEqual(0, other_pair_file.download_progress)
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
-    def test_pending_completion_publication_survives_incomplete_default_candidate(self, diff_models):
-        """A retired Local Only projection must not publish as Stopped mid-handoff."""
+    def test_pending_completion_listener_never_publishes_incomplete_candidate_after_local_only(self, diff_models):
+        """Local Only 100% reaches its terminal handoff without a lower listener row."""
         completion_entry = ("movie.mkv", "movies", "Movies")
         completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
 
@@ -4958,6 +4958,7 @@ class TestController(unittest.TestCase):
         current_model = Model()
         current_model.set_base_logger(self.controller.logger)
         current_model.add_file(local_only)
+        self.assertEqual("local_only", Controller._model_record_visible_state(local_only))
 
         incomplete = ModelFile("movie.mkv", False)
         incomplete.path_pair_id = "movies"
@@ -5000,12 +5001,13 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__update_model()
 
-        published = listener.file_updated.call_args.args[1]
-        self.assertEqual(ModelFile.State.DOWNLOADING, published.state)
-        self.assertEqual(100, published.download_progress)
-        self.assertEqual(1000, published.transferred_size)
-        self.assertEqual("downloading", Controller._model_record_visible_state(published))
-        self.assertNotEqual("stopped", Controller._model_record_visible_state(published))
+        self.assertGreaterEqual(listener.file_updated.call_count, 1)
+        for published in (call.args[1] for call in listener.file_updated.call_args_list):
+            self.assertEqual(ModelFile.State.DOWNLOADING, published.state)
+            self.assertEqual(100, published.download_progress)
+            self.assertEqual(1000, published.transferred_size)
+            self.assertEqual("downloading", Controller._model_record_visible_state(published))
+            self.assertNotEqual("stopped", Controller._model_record_visible_state(published))
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_pending_completion_reset_does_not_retain_stale_progress(self, diff_models):

@@ -12045,6 +12045,221 @@ class TestModelUpdater(unittest.TestCase):
         )
         self.assertNotIn((file_id, identity), controller._Controller__admitted_progress_publications)
 
+    def test_completion_retirement_promotes_committed_local_only_publication(self):
+        """A Local Only 100% publication protects the next incomplete candidate."""
+        file_id = ModelFile.build_file_id("release", None)
+        identity = (7, LftpJobStatus.Type.PGET.value)
+        active = ModelFile("release", False)
+        active.state = ModelFile.State.DOWNLOADING
+        active.is_stoppable = True
+        local_only = ModelFile("release", False)
+        local_only.local_present = True
+        local_only.remote_has_transferable_content = False
+        local_only.local_size = 1000
+        local_only.transferred_size = 1000
+        local_only.download_progress = 100
+        local_only.state = ModelFile.State.DEFAULT
+        model = Model()
+        model.add_file(active)
+        self.assertEqual(
+            ({file_id}, "accepted"),
+            model.publish_active_lftp_root_counters(
+                {file_id: ActiveProgressOverlay(100, 1000, None, None)},
+                {file_id: identity}, lambda _: True,
+            ),
+        )
+        model.apply_with_active_progress_retained(
+            lambda: model.update_file(local_only), retire_file_ids={file_id},
+        )
+        self.assertEqual(identity, model.published_file_job_identity(file_id))
+        controller = self._make_lftp_completion_controller({("release", None, None)})
+        controller._Controller__model = model
+        controller._Controller__model_lock = RLock()
+        controller._Controller__admitted_progress_publications = {}
+
+        ModelUpdater(controller)._handle_lftp_completion_detection(
+            [], True, retired_job_identities={file_id: identity},
+            lftp_status_poll_authoritative=True, lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True, lftp_status_source="fresh_healthy",
+        )
+
+        self.assertEqual(
+            _PendingCompletionPublication(ActiveProgressOverlay(100, 1000, None, None), identity),
+            controller._Controller__pending_completion_publications[file_id],
+        )
+        incomplete = ModelFile("release", False)
+        incomplete.remote_size = 1050
+        incomplete.local_size = 1000
+        incomplete.local_present = True
+        incomplete.remote_has_transferable_content = True
+        incomplete.transferred_size = 1000
+        incomplete.download_progress = 95
+        incomplete.state = ModelFile.State.DEFAULT
+        publication_file_ids = ModelUpdater._pending_completion_publication_file_ids(
+            controller, {file_id},
+        )
+        ModelUpdater._apply_pending_completion_progress_floor(
+            incomplete, {file_id}, 100, 1000, {file_id}, publication_file_ids,
+        )
+        self.assertEqual(ModelFile.State.DOWNLOADING, incomplete.state)
+        self.assertEqual(100, incomplete.download_progress)
+        self.assertNotEqual("stopped", Controller._model_record_visible_state(incomplete))
+
+    def test_no_diff_terminal_completion_clears_provenance_before_late_same_identity_retirement(self):
+        """A no-diff terminal handoff cannot be reused by a late retirement."""
+        file_id = ModelFile.build_file_id("release", None)
+        identity = (7, LftpJobStatus.Type.PGET.value)
+        active = ModelFile("release", False)
+        active.state = ModelFile.State.DOWNLOADING
+        active.is_stoppable = True
+        local_only = ModelFile("release", False)
+        local_only.local_present = True
+        local_only.remote_has_transferable_content = False
+        local_only.local_size = 1000
+        local_only.transferred_size = 1000
+        local_only.download_progress = 100
+        model = Model()
+        model.add_file(active)
+        model.publish_active_lftp_root_counters(
+            {file_id: ActiveProgressOverlay(100, 1000, None, None)},
+            {file_id: identity}, lambda _: True,
+        )
+        model.apply_with_active_progress_retained(
+            lambda: model.update_file(local_only), retire_file_ids={file_id},
+        )
+        self.assertEqual(identity, model.published_file_job_identity(file_id))
+
+        controller = self._make_lftp_completion_controller({("release", None, None)})
+        controller._Controller__model = model
+        controller._Controller__model_lock = RLock()
+        controller._Controller__pending_completion_progress_floors = {
+            file_id: (100, 1000),
+        }
+        controller._Controller__pending_completion_progress_floor_identities = {
+            file_id: identity,
+        }
+        controller._Controller__pending_completion_publications = {
+            file_id: _PendingCompletionPublication(
+                ActiveProgressOverlay(100, 1000, None, None), identity,
+            ),
+        }
+
+        # This is the cleanup reached by publish_completed_download even when
+        # the terminal candidate produced no ModelDiff.
+        ModelUpdater._clear_pending_completion_progress_floor(controller, file_id)
+        self.assertIsNone(model.published_file_job_identity(file_id))
+
+        ModelUpdater(controller)._handle_lftp_completion_detection(
+            [], True, retired_job_identities={file_id: identity},
+            lftp_status_poll_authoritative=True, lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True, lftp_status_source="fresh_healthy",
+        )
+
+        self.assertNotIn(file_id, controller._Controller__pending_completion_progress_floors)
+        self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
+
+    def test_completion_retirement_rejects_stale_local_only_publication_for_newer_identity(self):
+        """A Local Only 100% snapshot is not authority for a later LFTP job."""
+        file_id = ModelFile.build_file_id("release", None)
+        prior_identity = (7, LftpJobStatus.Type.PGET.value)
+        newer_identity = (8, LftpJobStatus.Type.PGET.value)
+        active = ModelFile("release", False)
+        active.state = ModelFile.State.DOWNLOADING
+        active.is_stoppable = True
+        local_only = ModelFile("release", False)
+        local_only.local_present = True
+        local_only.remote_has_transferable_content = False
+        local_only.local_size = 1000
+        local_only.transferred_size = 1000
+        local_only.download_progress = 100
+        model = Model()
+        model.add_file(active)
+        self.assertEqual(
+            ({file_id}, "accepted"),
+            model.publish_active_lftp_root_counters(
+                {file_id: ActiveProgressOverlay(100, 1000, None, None)},
+                {file_id: prior_identity}, lambda _: True,
+            ),
+        )
+        model.apply_with_active_progress_retained(
+            lambda: model.update_file(local_only), retire_file_ids={file_id},
+        )
+        self.assertEqual(prior_identity, model.published_file_job_identity(file_id))
+        controller = self._make_lftp_completion_controller({("release", None, None)})
+        controller._Controller__model = model
+        controller._Controller__model_lock = RLock()
+        controller._Controller__admitted_progress_publications = {}
+
+        ModelUpdater(controller)._handle_lftp_completion_detection(
+            [], True, retired_job_identities={file_id: newer_identity},
+            lftp_status_poll_authoritative=True, lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True, lftp_status_source="fresh_healthy",
+        )
+
+        self.assertNotIn(file_id, getattr(controller, "_Controller__pending_completion_progress_floors", {}))
+        self.assertNotIn(file_id, getattr(controller, "_Controller__pending_completion_publications", {}))
+
+    def test_invalidating_stale_identity_preserves_newer_publication_for_retirement(self):
+        """Invalidating job A must not erase a committed job B handoff."""
+        file_id = ModelFile.build_file_id("release", None)
+        stale_identity = (7, LftpJobStatus.Type.PGET.value)
+        current_identity = (8, LftpJobStatus.Type.PGET.value)
+        active = ModelFile("release", False)
+        active.state = ModelFile.State.DOWNLOADING
+        active.is_stoppable = True
+        local_only = ModelFile("release", False)
+        local_only.local_present = True
+        local_only.remote_has_transferable_content = False
+        local_only.local_size = 1000
+        local_only.transferred_size = 1000
+        local_only.download_progress = 100
+        model = Model()
+        model.add_file(active)
+        model.publish_active_lftp_root_counters(
+            {file_id: ActiveProgressOverlay(100, 1000, None, None)},
+            {file_id: stale_identity}, lambda _: True,
+        )
+        model.clear_active_progress_overlays()
+        model.publish_active_lftp_root_counters(
+            {file_id: ActiveProgressOverlay(100, 1000, None, None)},
+            {file_id: current_identity}, lambda _: True,
+        )
+        model.apply_with_active_progress_retained(
+            lambda: model.update_file(local_only), retire_file_ids={file_id},
+        )
+        self.assertEqual(current_identity, model.published_file_job_identity(file_id))
+
+        controller = self._make_lftp_completion_controller({("release", None, None)})
+        controller._Controller__model = model
+        controller._Controller__model_lock = RLock()
+        controller._Controller__pending_completion_progress_floors = {
+            file_id: (99, 990),
+        }
+        controller._Controller__pending_completion_progress_floor_identities = {
+            file_id: stale_identity,
+        }
+        controller._Controller__pending_completion_publications = {
+            file_id: _PendingCompletionPublication(
+                ActiveProgressOverlay(99, 990, None, None), stale_identity,
+            ),
+        }
+
+        ModelUpdater._invalidate_pending_completion_progress_floor(controller, file_id)
+
+        self.assertEqual(current_identity, model.published_file_job_identity(file_id))
+        ModelUpdater(controller)._handle_lftp_completion_detection(
+            [], True, retired_job_identities={file_id: current_identity},
+            lftp_status_poll_authoritative=True, lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True, lftp_status_source="fresh_healthy",
+        )
+
+        self.assertEqual(
+            _PendingCompletionPublication(
+                ActiveProgressOverlay(100, 1000, None, None), current_identity,
+            ),
+            controller._Controller__pending_completion_publications[file_id],
+        )
+
     def test_completion_retirement_rejects_admitted_projection_for_other_job_identity(self):
         file_id = ModelFile.build_file_id("release", None)
         retired_identity = (7, LftpJobStatus.Type.PGET.value)

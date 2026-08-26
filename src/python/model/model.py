@@ -98,6 +98,13 @@ class Model:
         # boundary as its version notification.  These snapshots are runtime
         # publication state only; scans remain authoritative for ModelFiles.
         self.__published_files_by_id: Dict[str, ModelFile] = {}
+        # A materialized root can outlive its live overlay while the updater
+        # hands an LFTP retirement to completion reconciliation.  Bind that
+        # committed projection to the exact overlay identity only at the
+        # replacement boundary that retires the overlay; never infer an
+        # identity from a later base/root rebuild.
+        self.__published_file_job_identities: Dict[str, tuple[int, str]] = {}
+        self.__retiring_progress_overlay_job_identities: Dict[str, tuple[int, str]] = {}
 
     def __refresh_published_file(self, file: ModelFile) -> ModelFile:
         """Materialize one immutable-effective root for asynchronous readers."""
@@ -144,6 +151,15 @@ class Model:
             published.transferred_size = overlay.transferred_size
             published.downloading_speed = overlay.downloading_speed
             published.eta = overlay.eta
+        identity = self.__active_progress_overlay_job_identities.get(file.file_id)
+        if identity is None:
+            identity = self.__retiring_progress_overlay_job_identities.get(file.file_id)
+        if isinstance(identity, tuple) and len(identity) == 2 and \
+                type(identity[0]) is int and identity[0] >= 0 and \
+                isinstance(identity[1], str) and identity[1]:
+            self.__published_file_job_identities[file.file_id] = identity
+        else:
+            self.__published_file_job_identities.pop(file.file_id, None)
         self.__published_files_by_id[file.file_id] = published
         return published
 
@@ -154,6 +170,44 @@ class Model:
         private immutable-by-convention transport snapshot, never a live root.
         """
         return self.__published_files_by_id.get(file_id)
+
+    def published_file_with_job_identity(
+            self, file_id: str,
+    ) -> tuple[Optional[ModelFile], Optional[tuple[int, str]]]:
+        """Return a published root and its provenance from one lock scope.
+
+        Callers must hold the controller model lock.  Keeping the snapshot and
+        identity read in one Model operation prevents completion reconciliation
+        from pairing values from different publication boundaries.
+        """
+        return (
+            self.__published_files_by_id.get(file_id),
+            self.__published_file_job_identities.get(file_id),
+        )
+
+    def published_file_job_identity(self, file_id: str) -> Optional[tuple[int, str]]:
+        """Return the identity bound when the effective root was committed.
+
+        The binding is publication provenance, not a claim about the current
+        base root.  It is present only when the corresponding snapshot was
+        committed while an admitted live overlay (or its immediate retirement
+        replacement) established that exact LFTP identity.
+        """
+        return self.__published_file_job_identities.get(file_id)
+
+    def clear_published_file_job_identity_if_matches(
+            self, file_id: str, expected_job_identity: tuple[int, str],
+    ) -> bool:
+        """Forget provenance only when it still belongs to one job identity.
+
+        A successful terminal/no-diff completion or an explicit reset consumes
+        the one retirement handoff represented by this identity.  The
+        browser-facing snapshot remains available until the next publication.
+        """
+        if self.__published_file_job_identities.get(file_id) != expected_job_identity:
+            return False
+        self.__published_file_job_identities.pop(file_id, None)
+        return True
 
     def __full_effective_file(self, file: ModelFile) -> ModelFile:
         """Freeze a recursive legacy callback record outside the hot path."""
@@ -369,6 +423,9 @@ class Model:
             if file_id in self.__active_progress_overlays
         }
         for file_id in retired_file_ids:
+            identity = self.__active_progress_overlay_job_identities.get(file_id)
+            if identity is not None:
+                self.__retiring_progress_overlay_job_identities[file_id] = identity
             self.__active_progress_overlays.pop(file_id, None)
             self.__active_progress_overlay_job_identities.pop(file_id, None)
             self.__legacy_overlay_correction_file_ids.discard(file_id)
@@ -392,6 +449,8 @@ class Model:
                 if file_id in self.__active_progress_overlays and file_id in self.__files_by_id:
                     self.__legacy_overlay_correction_file_ids.add(file_id)
                     self.__legacy_overlay_correction_old_files[file_id] = old_file
+            for file_id in retired_file_ids:
+                self.__retiring_progress_overlay_job_identities.pop(file_id, None)
 
     def clear_active_progress_overlays(self) -> None:
         """Discard live-only values and publish each affected root's base state."""
@@ -715,6 +774,7 @@ class Model:
         if not self.__file_ids_by_name[file.name]:
             del self.__file_ids_by_name[file.name]
         self.__published_files_by_id.pop(file_id, None)
+        self.__published_file_job_identities.pop(file_id, None)
         # A suppressed replacement can remove the root before its retained
         # overlay reaches a clear path.  It must never attach to a later root
         # that reuses the same canonical identity.

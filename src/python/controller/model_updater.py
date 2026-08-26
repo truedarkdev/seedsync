@@ -2689,6 +2689,7 @@ class ModelUpdater(_ControllerCoreAccess):
         new_file: ModelFile,
         pending_completion_file_ids: set[str],
         presentation_floor_file_ids: Optional[set[str]] = None,
+        committed_publication_file_ids: Optional[set[str]] = None,
     ) -> None:
         """Keep a pending completion row from publishing a lower checkpoint.
 
@@ -2705,6 +2706,7 @@ class ModelUpdater(_ControllerCoreAccess):
             old_file.download_progress,
             old_file.transferred_size,
             presentation_floor_file_ids,
+            committed_publication_file_ids,
         )
 
     @staticmethod
@@ -2714,6 +2716,7 @@ class ModelUpdater(_ControllerCoreAccess):
         previous_download_progress: Optional[int],
         previous_transferred_size: Optional[int],
         presentation_floor_file_ids: Optional[set[str]] = None,
+        committed_publication_file_ids: Optional[set[str]] = None,
     ) -> None:
         """Apply a stored pending-completion checkpoint to a rebuilt file."""
         if new_file.file_id not in pending_completion_file_ids:
@@ -2771,9 +2774,25 @@ class ModelUpdater(_ControllerCoreAccess):
         # bytes whenever the remote total is authoritative.
         if new_file.remote_size is not None:
             if new_file.remote_size > 0 and new_file.transferred_size is not None:
-                new_file.download_progress = int(round(
+                derived_progress = int(round(
                     (new_file.transferred_size * 100) / new_file.remote_size
                 ))
+                # Only an actual controller-owned publication record is an
+                # already committed user-visible snapshot. A later
+                # diagnostic denominator may legitimately describe an
+                # incomplete candidate, but it must not publish a lower
+                # percentage before that transaction reaches a terminal/reset
+                # boundary. Compatibility presentation floors still retain
+                # lifecycle state below, but do not get this percentage rule.
+                new_file.download_progress = (
+                    max(
+                        derived_progress,
+                        previous_download_progress if previous_download_progress is not None else 0,
+                    )
+                    if committed_publication_file_ids is not None and
+                    new_file.file_id in committed_publication_file_ids
+                    else derived_progress
+                )
             elif new_file.remote_size == 0:
                 # A zero-byte remote root has no meaningful pending-transfer
                 # percentage; avoid carrying a stale live percentage forward.
@@ -2832,10 +2851,35 @@ class ModelUpdater(_ControllerCoreAccess):
         return new_file.local_size == 0
 
     @staticmethod
+    def _pending_completion_provenance_identity(
+        controller: _ControllerCoreAccess, file_id: str,
+    ) -> Optional[tuple[int, str]]:
+        """Read the stale identity before pending-completion cleanup mutates it."""
+        identities = getattr(
+            controller, "_Controller__pending_completion_progress_floor_identities", None,
+        )
+        if isinstance(identities, dict) and file_id in identities:
+            identity = identities[file_id]
+        else:
+            publication = getattr(
+                controller, "_Controller__pending_completion_publications", {},
+            ).get(file_id)
+            identity = publication.job_identity \
+                if isinstance(publication, _PendingCompletionPublication) else None
+        if isinstance(identity, tuple) and len(identity) == 2 and \
+                type(identity[0]) is int and identity[0] >= 0 and \
+                isinstance(identity[1], str) and identity[1]:
+            return identity
+        return None
+
+    @staticmethod
     def _clear_pending_completion_progress_floor(
         controller: _ControllerCoreAccess, file_id: str,
     ) -> None:
         """Clear the floor and its retirement identity at a lifecycle boundary."""
+        expected_identity = ModelUpdater._pending_completion_provenance_identity(
+            controller, file_id,
+        )
         getattr(
             controller, "_Controller__pending_completion_progress_floors", {},
         ).pop(file_id, None)
@@ -2849,6 +2893,32 @@ class ModelUpdater(_ControllerCoreAccess):
             controller, "_Controller__pending_completion_publications", {},
         ).pop(file_id, None)
         ModelUpdater._clear_admitted_progress_publications(controller, file_id)
+        ModelUpdater._clear_published_file_job_identity(
+            controller, file_id, expected_identity,
+        )
+
+    @staticmethod
+    def _clear_published_file_job_identity(
+        controller: _ControllerCoreAccess, file_id: str,
+        expected_job_identity: Optional[tuple[int, str]],
+    ) -> None:
+        """Clear one consumed Model identity only if it still matches."""
+        if not isinstance(expected_job_identity, tuple) or len(expected_job_identity) != 2 or \
+                type(expected_job_identity[0]) is not int or expected_job_identity[0] < 0 or \
+                not isinstance(expected_job_identity[1], str) or not expected_job_identity[1]:
+            return
+        model = getattr(controller, "_Controller__model", None)
+        clear_provenance = getattr(model, "clear_published_file_job_identity_if_matches", None)
+        if callable(clear_provenance):
+            model_lock = getattr(controller, "_Controller__model_lock", None)
+            try:
+                if model_lock is not None and callable(getattr(model_lock, "__enter__", None)):
+                    with model_lock:
+                        clear_provenance(file_id, expected_job_identity)
+                else:
+                    clear_provenance(file_id, expected_job_identity)
+            except (AttributeError, TypeError):
+                pass
 
     @staticmethod
     def _clear_admitted_progress_publications(
@@ -2866,6 +2936,9 @@ class ModelUpdater(_ControllerCoreAccess):
         controller: _ControllerCoreAccess, file_id: str,
     ) -> None:
         """Retire a floor while blocking old-model counters from re-seeding it."""
+        expected_identity = ModelUpdater._pending_completion_provenance_identity(
+            controller, file_id,
+        )
         getattr(
             controller, "_Controller__pending_completion_progress_floors", {},
         ).pop(file_id, None)
@@ -2881,6 +2954,9 @@ class ModelUpdater(_ControllerCoreAccess):
             controller, "_Controller__pending_completion_publications", {},
         ).pop(file_id, None)
         ModelUpdater._clear_admitted_progress_publications(controller, file_id)
+        ModelUpdater._clear_published_file_job_identity(
+            controller, file_id, expected_identity,
+        )
 
     @staticmethod
     def _pending_completion_progress_floor_invalidated(
@@ -2912,6 +2988,12 @@ class ModelUpdater(_ControllerCoreAccess):
             file_id for file_id, publication in publications.items()
             if file_id in pending_file_ids and
             isinstance(publication, _PendingCompletionPublication) and
+            isinstance(publication.job_identity, tuple) and
+            len(publication.job_identity) == 2 and
+            type(publication.job_identity[0]) is int and
+            publication.job_identity[0] >= 0 and
+            isinstance(publication.job_identity[1], str) and
+            bool(publication.job_identity[1]) and
             not ModelUpdater._pending_completion_progress_floor_invalidated(
                 controller, file_id,
             )
@@ -2956,9 +3038,51 @@ class ModelUpdater(_ControllerCoreAccess):
                     overlay_identity or retired_job_identity,
                 )
 
-        # Never synthesize a completion projection from a base ModelFile:
-        # base state may now be Local Only/DEFAULT after the accepted overlay
-        # was retired.  Only an identity-paired live admission is authority.
+        # LFTP retirement can be observed after the active overlay was
+        # deliberately retired by a local-only publication.  That published
+        # snapshot is still a committed browser-visible result of the exact
+        # job being retired, not a fresh ModelBuilder inference.  Promote it
+        # into the same pending-completion record so the next candidate cannot
+        # replace Local Only 100% with an incomplete DEFAULT/Stopped row.
+        #
+        # Keep this deliberately narrow: a real retired identity, a local-only
+        # effective record, and a terminal local-only progress value are all
+        # required.  Ordinary DEFAULT base files remain diagnostic input only.
+        if isinstance(retired_job_identity, tuple) and len(retired_job_identity) == 2 and \
+                type(retired_job_identity[0]) is int and retired_job_identity[0] >= 0 and \
+                isinstance(retired_job_identity[1], str) and retired_job_identity[1]:
+            model = getattr(self._controller, "_Controller__model", None)
+            published_reader = getattr(model, "published_file_with_job_identity", None)
+            if callable(published_reader):
+                try:
+                    model_lock = getattr(self._controller, "_Controller__model_lock", None)
+                    if model_lock is not None and callable(getattr(model_lock, "__enter__", None)):
+                        with model_lock:
+                            published_result = published_reader(file_id)
+                    else:
+                        published_result = published_reader(file_id)
+                    if isinstance(published_result, tuple) and len(published_result) == 2:
+                        published, published_identity = published_result
+                    else:
+                        published = None
+                        published_identity = None
+                except (AttributeError, TypeError, ValueError):
+                    published = None
+                    published_identity = None
+                if published_identity == retired_job_identity and \
+                        isinstance(published, ModelFile) and not published.explicitly_stopped and \
+                        published.local_present and not published.remote_has_transferable_content and \
+                        published.download_progress == 100:
+                    return (
+                        (published.download_progress, published.transferred_size),
+                        True,
+                        retired_job_identity,
+                    )
+
+        # Never synthesize a completion projection from an arbitrary base
+        # ModelFile: it may now be Local Only/DEFAULT after the accepted
+        # projection was retired.  The committed published snapshot above and
+        # identity-paired live admissions are the only handoff authorities.
         return None, False, None
 
     def _clear_replaced_admitted_progress_publications(
@@ -6695,6 +6819,11 @@ class ModelUpdater(_ControllerCoreAccess):
                         )
                     )
 
+                def pending_completion_publication_file_ids() -> set[str]:
+                    return self._pending_completion_publication_file_ids(
+                        controller, pending_completion_file_ids(),
+                    )
+
                 def discard_pending_completion_file(file_id: str) -> None:
                     controller._Controller__pending_completion_file_names = {
                         file_name
@@ -7154,6 +7283,7 @@ class ModelUpdater(_ControllerCoreAccess):
                                         floor[0],
                                         floor[1],
                                         pending_completion_presentation_file_ids(),
+                                        pending_completion_publication_file_ids(),
                                     )
                             elif not self._pending_completion_progress_floor_invalidated(
                                     controller, new_file.file_id,
@@ -7163,6 +7293,7 @@ class ModelUpdater(_ControllerCoreAccess):
                                     new_file,
                                     pending_completion_file_ids(),
                                     pending_completion_presentation_file_ids(),
+                                    pending_completion_publication_file_ids(),
                                 )
                     elif diff.change == ModelDiff.Change.REMOVED and old_file is not None:
                         remember_pending_completion_floor(old_file)
@@ -7177,6 +7308,7 @@ class ModelUpdater(_ControllerCoreAccess):
                                 floor[0],
                                 floor[1],
                                 pending_completion_presentation_file_ids(),
+                                pending_completion_publication_file_ids(),
                             )
 
                     if diff.change == ModelDiff.Change.ADDED:
