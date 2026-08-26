@@ -10976,11 +10976,37 @@ class TestModelUpdater(unittest.TestCase):
         published = controller._Controller__model.get_file(file_id)
         self.assertEqual(99, published.transferred_size)
         self.assertEqual(99, published.download_progress)
+        self.assertEqual(ModelFile.State.DOWNLOADING, published.state)
         self.assertIn((file_name, None, None), controller._Controller__pending_completion_file_names)
         self.assertEqual(
             (99, 99),
             controller._Controller__pending_completion_progress_floors[file_id],
         )
+
+    def test_pending_completion_floor_preservation_keeps_accepted_overlay_state(self):
+        file_name = "pending.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        old_file = ModelFile(file_name, False)
+        old_file.remote_size = 100
+        old_file.transferred_size = 93
+        old_file.download_progress = 93
+        old_file.state = ModelFile.State.DOWNLOADING
+
+        replacement = ModelFile(file_name, False)
+        replacement.remote_size = 100
+        replacement.local_size = 93
+        replacement.state = ModelFile.State.DEFAULT
+
+        ModelUpdater._preserve_pending_completion_progress_floor(
+            old_file,
+            replacement,
+            {file_id},
+            {file_id},
+        )
+
+        self.assertEqual(93, replacement.transferred_size)
+        self.assertEqual(93, replacement.download_progress)
+        self.assertEqual(ModelFile.State.DOWNLOADING, replacement.state)
 
     def test_fresh_empty_lftp_poll_releases_valid_partial_pget_to_resumable_default(self):
         """A sidecar-backed partial is resumable, never an inferred Stop."""

@@ -2675,6 +2675,7 @@ class ModelUpdater(_ControllerCoreAccess):
         old_file: ModelFile,
         new_file: ModelFile,
         pending_completion_file_ids: set[str],
+        presentation_floor_file_ids: Optional[set[str]] = None,
     ) -> None:
         """Keep a pending completion row from publishing a lower checkpoint.
 
@@ -2690,6 +2691,7 @@ class ModelUpdater(_ControllerCoreAccess):
             pending_completion_file_ids,
             old_file.download_progress,
             old_file.transferred_size,
+            presentation_floor_file_ids,
         )
 
     @staticmethod
@@ -6638,6 +6640,11 @@ class ModelUpdater(_ControllerCoreAccess):
                                     old_file,
                                     new_file,
                                     pending_completion_file_ids(),
+                                    getattr(
+                                        controller,
+                                        "_Controller__pending_completion_progress_floor_overlay_ids",
+                                        set(),
+                                    ),
                                 )
                     elif diff.change == ModelDiff.Change.REMOVED and old_file is not None:
                         remember_pending_completion_floor(old_file)
