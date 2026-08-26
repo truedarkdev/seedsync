@@ -3373,6 +3373,9 @@ class Controller:
         }
 
     def _model_file_page_record_with_overlay(self, file: ModelFile) -> dict[str, object]:
+        # Root publication is materialized by Model at the mutation/version
+        # boundary.  Retain the live root's shallow structural fields while
+        # applying only the already-committed effective counters.
         record = self._model_file_page_record(file)
         record.update(self._model_file_progress_presentation(file))
         return record
@@ -3383,8 +3386,8 @@ class Controller:
         LFTP counters supplement a previously established ModelFile state; they
         never manufacture Queue/Stop capabilities or a lifecycle state.
         """
-        overlay = self.__model.active_progress_overlay(file.file_id)
-        if overlay is None:
+        published = self.__model.published_file(file.file_id)
+        if published is None:
             return {
                 "download_progress": file.download_progress,
                 "transferred_size": file.transferred_size,
@@ -3392,10 +3395,10 @@ class Controller:
                 "eta": file.eta,
             }
         return {
-            "download_progress": overlay.download_progress,
-            "transferred_size": overlay.transferred_size,
-            "downloading_speed": overlay.downloading_speed,
-            "eta": overlay.eta,
+            "download_progress": published.download_progress,
+            "transferred_size": published.transferred_size,
+            "downloading_speed": published.downloading_speed,
+            "eta": published.eta,
         }
 
     @staticmethod
@@ -4444,7 +4447,14 @@ class Controller:
         model_files: list[ModelFile] = []
         identifiers = self.__model.get_file_ids()
         for identifier in identifiers:
-            model_files.append(copy.deepcopy(self.__model.get_file(identifier)))
+            published = self.__model.published_file(identifier)
+            snapshot = copy.deepcopy(self.__model.get_file(identifier))
+            if published is not None:
+                snapshot.download_progress = published.download_progress
+                snapshot.transferred_size = published.transferred_size
+                snapshot.downloading_speed = published.downloading_speed
+                snapshot.eta = published.eta
+            model_files.append(snapshot)
         return model_files
 
     def __get_path_pair(self, path_pair_id: Optional[str]) -> Optional[PathPair]:

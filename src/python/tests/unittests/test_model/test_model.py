@@ -24,6 +24,37 @@ class DummyModelListener(IModelListener):
 
 
 class TestLftpModel(unittest.TestCase):
+    def test_published_root_snapshot_keeps_effective_overlay_across_replacement(self):
+        file = ModelFile("active", False)
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        self.model.add_file(file)
+        self.assertEqual(
+            ({file.file_id}, "accepted"),
+            self.model.publish_active_lftp_root_counters(
+                {file.file_id: ActiveProgressOverlay(53, 530, 12, 3)},
+                {file.file_id: (1, "get")}, lambda _: True,
+            ),
+        )
+        replacement = ModelFile("active", False)
+        replacement.state = ModelFile.State.DOWNLOADING
+        replacement.is_stoppable = True
+        replacement.download_progress = 1
+        replacement.transferred_size = 10
+        self.model.apply_with_active_progress_retained(
+            lambda: self.model.update_file(replacement)
+        )
+
+        published = self.model.published_file(file.file_id)
+
+        self.assertIsNotNone(published)
+        assert published is not None
+        self.assertEqual(53, published.download_progress)
+        self.assertEqual(530, published.transferred_size)
+        self.assertEqual(12, published.downloading_speed)
+        self.assertEqual(3, published.eta)
+        self.assertIsNot(published, replacement)
+
     def test_lftp_root_counter_publish_rejects_stale_lifecycle_and_clears_projection(self):
         file = ModelFile("active", False)
         file.state = ModelFile.State.DOWNLOADING

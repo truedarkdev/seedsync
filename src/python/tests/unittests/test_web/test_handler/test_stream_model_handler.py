@@ -3,13 +3,150 @@ import unittest
 from unittest.mock import MagicMock
 
 from controller import Controller
-from model import ModelFile
+from model import ActiveProgressOverlay, Model, ModelFile
 from tests.unittests.test_web.test_serialize.test_serialize import parse_stream
 from web.handler.stream_model import ModelStreamHandler, WebResponseModelListener
 from web.serialize import SerializeModel
 
 
 class TestWebResponseModelListener(unittest.TestCase):
+    def test_legacy_directory_events_keep_children_and_retirement_correction_order(self):
+        model = Model()
+        listener = WebResponseModelListener()
+        model.add_listener(listener)
+        root = ModelFile("active", True)
+        root.add_child(ModelFile("child", False))
+        root.state = ModelFile.State.DOWNLOADING
+        root.is_stoppable = True
+        model.add_file(root)
+        added = listener.get_next_event()
+        model.publish_active_lftp_root_counters(
+            {root.file_id: ActiveProgressOverlay(90, 900, 12, 3)},
+            {root.file_id: (1, "get")}, lambda _: True,
+        )
+        self.assertIsNone(listener.get_next_event())
+
+        replacement = ModelFile("active", True)
+        replacement.add_child(ModelFile("child", False))
+        replacement.state = ModelFile.State.DOWNLOADING
+        replacement.is_stoppable = True
+        model.apply_with_active_progress_retained(lambda: model.update_file(replacement))
+        stale_update = listener.get_next_event()
+        model.restore_active_progress_overlays({}, {})
+        correction = listener.get_next_event()
+
+        self.assertEqual(SerializeModel.UpdateEvent.Change.ADDED, added.change)
+        self.assertEqual(SerializeModel.UpdateEvent.Change.UPDATED, stale_update.change)
+        self.assertEqual(SerializeModel.UpdateEvent.Change.UPDATED, correction.change)
+        for event in (added, stale_update, correction):
+            data = json.loads(parse_stream(SerializeModel().update_event(event))["data"])
+            file_data = data["new_file"]
+            self.assertEqual(1, len(file_data["children"]))
+            self.assertEqual("child", file_data["children"][0]["name"])
+        corrected = json.loads(parse_stream(SerializeModel().update_event(correction))["data"])
+        self.assertEqual(replacement.download_progress, corrected["new_file"]["download_progress"])
+
+    def test_legacy_retirement_emits_final_lifecycle_snapshot_after_retained_overlay(self):
+        for scenario in ("terminal", "zero_reset", "explicit_stop", "retirement"):
+            with self.subTest(scenario=scenario):
+                model = Model()
+                file = ModelFile("active.bin", False)
+                file.state = ModelFile.State.DOWNLOADING
+                file.is_stoppable = True
+                model.add_file(file)
+                listener = WebResponseModelListener()
+                model.add_listener(listener)
+                model.publish_active_lftp_root_counters(
+                    {file.file_id: ActiveProgressOverlay(90, 900, 12, 3)},
+                    {file.file_id: (1, "get")}, lambda _: True,
+                )
+                listener.get_next_event()  # live overlay publication
+
+                replacement = ModelFile("active.bin", False)
+                if scenario == "terminal":
+                    replacement.state = ModelFile.State.DOWNLOADED
+                elif scenario == "zero_reset":
+                    replacement.state = ModelFile.State.DOWNLOADING
+                    replacement.is_stoppable = True
+                    replacement.download_progress = 0
+                    replacement.transferred_size = 0
+                elif scenario == "explicit_stop":
+                    replacement.explicitly_stopped = True
+                else:
+                    replacement.state = ModelFile.State.DOWNLOADING
+                    replacement.is_stoppable = True
+                    replacement.download_progress = 10
+                    replacement.transferred_size = 100
+                model.apply_with_active_progress_retained(lambda: model.update_file(replacement))
+                stale_replacement = listener.get_next_event()
+                model.restore_active_progress_overlays({}, {})
+                correction = listener.get_next_event()
+
+                self.assertEqual(90, stale_replacement.new_file.download_progress)
+                self.assertIsNotNone(correction)
+                data = json.loads(parse_stream(SerializeModel().update_event(correction))["data"])
+                self.assertEqual(replacement.state.name.lower(), data["new_file"]["state"])
+                self.assertEqual(replacement.download_progress, data["new_file"]["download_progress"])
+                self.assertEqual(replacement.transferred_size, data["new_file"]["transferred_size"])
+
+    def test_legacy_correction_waits_through_later_progress_until_terminal_retirement(self):
+        model = Model()
+        file = ModelFile("active.bin", False)
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        model.add_file(file)
+        listener = WebResponseModelListener()
+        model.add_listener(listener)
+        model.publish_active_lftp_root_counters(
+            {file.file_id: ActiveProgressOverlay(90, 900, 12, 3)},
+            {file.file_id: (1, "get")}, lambda _: True,
+        )
+        live_replacement = ModelFile("active.bin", False)
+        live_replacement.state = ModelFile.State.DOWNLOADING
+        live_replacement.is_stoppable = True
+        model.apply_with_active_progress_retained(lambda: model.update_file(live_replacement))
+        listener.get_next_event()  # queued retained-overlay lifecycle replacement
+        model.publish_active_lftp_root_counters(
+            {file.file_id: ActiveProgressOverlay(95, 950, 13, 2)},
+            {file.file_id: (1, "get")}, lambda _: True,
+        )
+        self.assertIsNone(listener.get_next_event())
+
+        terminal = ModelFile("active.bin", False)
+        terminal.state = ModelFile.State.DOWNLOADED
+        model.apply_with_active_progress_retained(lambda: model.update_file(terminal))
+        listener.get_next_event()  # terminal replacement still carries retained progress
+        model.restore_active_progress_overlays({}, {})
+        correction = listener.get_next_event()
+
+        self.assertIsNotNone(correction)
+        data = json.loads(parse_stream(SerializeModel().update_event(correction))["data"])
+        self.assertEqual("downloaded", data["new_file"]["state"])
+        self.assertIsNone(data["new_file"]["download_progress"])
+        self.assertIsNone(listener.get_next_event())
+
+    def test_suppressed_removal_discards_retained_overlay_before_readding_identity(self):
+        model = Model()
+        file = ModelFile("active.bin", False)
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        model.add_file(file)
+        model.publish_active_lftp_root_counters(
+            {file.file_id: ActiveProgressOverlay(90, 900, 12, 3)},
+            {file.file_id: (1, "get")}, lambda _: True,
+        )
+        model.apply_with_active_progress_retained(lambda: model.remove_file(file.file_id))
+        replacement = ModelFile("active.bin", False)
+        model.add_file(replacement)
+
+        published = model.published_file(replacement.file_id)
+
+        self.assertIsNotNone(published)
+        assert published is not None
+        self.assertIsNone(model.active_progress_overlay(replacement.file_id))
+        self.assertIsNone(published.download_progress)
+        self.assertIsNone(published.transferred_size)
+
     def test_file_added_queues_added_event(self):
         listener = WebResponseModelListener()
         file = ModelFile("test.txt", False)
@@ -122,7 +259,7 @@ class TestModelStreamHandler(unittest.TestCase):
 
         self.assertIn("event: model-removed", result)
 
-    def test_updated_event_serializes_current_active_progress_overlay(self):
+    def test_updated_event_keeps_queued_effective_progress_snapshot(self):
         self.controller._model_file_progress_presentation.return_value = {
             "download_progress": 53,
             "transferred_size": 53,
@@ -143,9 +280,9 @@ class TestModelStreamHandler(unittest.TestCase):
 
         self.assertEqual(48, result["old_file"]["download_progress"])
         self.assertEqual(48, result["old_file"]["transferred_size"])
-        self.assertEqual(53, result["new_file"]["download_progress"])
-        self.assertEqual(53, result["new_file"]["transferred_size"])
-        self.controller._model_file_progress_presentation.assert_called_once_with(new_file)
+        self.assertEqual(48, result["new_file"]["download_progress"])
+        self.assertEqual(48, result["new_file"]["transferred_size"])
+        self.controller._model_file_progress_presentation.assert_not_called()
 
     def test_updated_event_keeps_base_when_progress_overlay_is_unavailable(self):
         self.controller._model_file_progress_presentation.return_value = None

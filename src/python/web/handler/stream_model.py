@@ -158,10 +158,10 @@ class ModelStreamHandler(IStreamHandler):
                         )
                     except Exception:
                         pass
-                return self.serialize.update_event(
-                    event,
-                    self.controller._model_file_progress_presentation,
-                )
+                # Model listeners receive immutable effective-publication
+                # snapshots.  Resolving overlays here would mix an old queued
+                # lifecycle record with a later live-progress value.
+                return self.serialize.update_event(event)
             else:
                 return None
 

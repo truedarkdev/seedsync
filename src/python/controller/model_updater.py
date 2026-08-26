@@ -6026,20 +6026,10 @@ class ModelUpdater(_ControllerCoreAccess):
                 """Apply one diff without exposing an accepted live overlay's base."""
                 if not direct_published_overlays:
                     return operation()
-                clear_overlays = getattr(model, "clear_active_progress_overlays", None)
-                if not callable(clear_overlays):
+                retain_overlays = getattr(model, "apply_with_active_progress_retained", None)
+                if not callable(retain_overlays):
                     return operation()
-                try:
-                    setattr(model, "clear_active_progress_overlays", lambda: None)
-                except Exception:
-                    return operation()
-                try:
-                    return operation()
-                finally:
-                    try:
-                        setattr(model, "clear_active_progress_overlays", clear_overlays)
-                    except Exception:
-                        pass
+                return retain_overlays(operation)
 
             def clear_overlays_for_replacement() -> None:
                 """Clear/rebase only after the replacement restore decision."""

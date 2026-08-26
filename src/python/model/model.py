@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import logging
+import copy
 from abc import ABC, abstractmethod
 from bisect import insort
 from dataclasses import dataclass
@@ -88,6 +89,82 @@ class Model:
         # Kept with the live-only values so a later status can never be
         # mistaken for a continuation of a cleared LFTP job.
         self.__active_progress_overlay_job_identities: Dict[str, tuple[int, str]] = {}
+        self.__suppress_active_progress_clear = 0
+        self.__legacy_overlay_correction_file_ids: Set[str] = set()
+        self.__legacy_overlay_correction_old_files: Dict[str, ModelFile] = {}
+        # Transport must not combine a queued base ModelFile with whichever
+        # live overlay happens to exist when an SSE writer eventually runs.
+        # Keep the effective root record materialized at the same mutation
+        # boundary as its version notification.  These snapshots are runtime
+        # publication state only; scans remain authoritative for ModelFiles.
+        self.__published_files_by_id: Dict[str, ModelFile] = {}
+
+    def __refresh_published_file(self, file: ModelFile) -> ModelFile:
+        """Materialize one immutable-effective root for asynchronous readers."""
+        # Progress pulses can be frequent and roots may have very large trees.
+        # Publication is intentionally shallow for the scoped hot path.
+        # Legacy callbacks use a separate full-tree freeze only for lifecycle
+        # events, never for per-pulse overlay publication.
+        published = ModelFile(file.name, file.is_dir)
+        published.state = file.state
+        published.remote_size = file.remote_size
+        published.local_size = file.local_size
+        published.remote_present = file.remote_present
+        published.local_present = file.local_present
+        published.remote_has_transferable_content = file.remote_has_transferable_content
+        published.transferred_size = file.transferred_size
+        published.display_size_total = file.display_size_total
+        published.display_transferred_size = file.display_transferred_size
+        published.download_progress = file.download_progress
+        published.downloading_speed = file.downloading_speed
+        published.eta = file.eta
+        published.is_extractable = file.is_extractable
+        published.is_stoppable = file.is_stoppable
+        published.explicitly_stopped = file.explicitly_stopped
+        published.complete_local_coverage = file.complete_local_coverage
+        published.resume_checkpoint_present = file.resume_checkpoint_present
+        if file.local_created_timestamp is not None:
+            published.local_created_timestamp = file.local_created_timestamp
+        if file.local_modified_timestamp is not None:
+            published.local_modified_timestamp = file.local_modified_timestamp
+        if file.remote_created_timestamp is not None:
+            published.remote_created_timestamp = file.remote_created_timestamp
+        if file.remote_modified_timestamp is not None:
+            published.remote_modified_timestamp = file.remote_modified_timestamp
+        published.downloaded_timestamp = file.downloaded_timestamp
+        published.validation_progress = file.validation_progress
+        published.validation_error = file.validation_error
+        published.corrupt_chunks = file.corrupt_chunks
+        published.final_move_succeeded = file.final_move_succeeded
+        published.path_pair_id = file.path_pair_id
+        published.path_pair_name = file.path_pair_name
+        overlay = self.__active_progress_overlays.get(file.file_id)
+        if overlay is not None:
+            published.download_progress = overlay.download_progress
+            published.transferred_size = overlay.transferred_size
+            published.downloading_speed = overlay.downloading_speed
+            published.eta = overlay.eta
+        self.__published_files_by_id[file.file_id] = published
+        return published
+
+    def published_file(self, file_id: str) -> Optional[ModelFile]:
+        """Return the model-owned effective root published at its last revision.
+
+        Callers must hold the controller model lock.  The returned object is a
+        private immutable-by-convention transport snapshot, never a live root.
+        """
+        return self.__published_files_by_id.get(file_id)
+
+    def __full_effective_file(self, file: ModelFile) -> ModelFile:
+        """Freeze a recursive legacy callback record outside the hot path."""
+        published = copy.deepcopy(file)
+        overlay = self.__active_progress_overlays.get(file.file_id)
+        if overlay is not None:
+            published.download_progress = overlay.download_progress
+            published.transferred_size = overlay.transferred_size
+            published.downloading_speed = overlay.downloading_speed
+            published.eta = overlay.eta
+        return published
 
     @property
     def version(self) -> int:
@@ -191,6 +268,36 @@ class Model:
             if callable(publication_callback):
                 publication_callback(scope_version, global_version, scope_id, file_id)
 
+    def __notify_legacy_publication_change(
+            self, old_file: Optional[ModelFile], new_file: ModelFile,
+    ) -> None:
+        """Send legacy consumers the same committed projection as scoped ones."""
+        if old_file is None:
+            return
+        with self.__listeners_lock:
+            listeners = list(self.__listeners)
+        for listener in listeners:
+            listener.file_updated(old_file, new_file)
+
+    def __notify_legacy_overlay_correction_if_needed(
+            self, file_id: str, file: Optional[ModelFile],
+    ) -> None:
+        """Correct only a queued retained-overlay lifecycle replacement."""
+        if file_id not in self.__legacy_overlay_correction_file_ids:
+            return
+        # A later healthy status can replace the live overlay before the
+        # replacement lifecycle settles.  That is still active progress, not
+        # the terminal/base correction the queued legacy record requires.
+        if file_id in self.__active_progress_overlays:
+            return
+        self.__legacy_overlay_correction_file_ids.discard(file_id)
+        old_file = self.__legacy_overlay_correction_old_files.pop(file_id, None)
+        if file is None:
+            return
+        self.__notify_legacy_publication_change(
+            old_file, self.__full_effective_file(file),
+        )
+
     def notify_summary_changed(self) -> None:
         """Wake compact-summary listeners without inventing a file mutation.
 
@@ -236,16 +343,46 @@ class Model:
         """Return the live overlay job identities for one updater transaction."""
         return dict(self.__active_progress_overlay_job_identities)
 
+    def apply_with_active_progress_retained(self, operation: Callable[[], object]) -> object:
+        """Apply a replacement mutation without publishing an interim base.
+
+        ModelUpdater uses this only after it has admitted the same live job
+        for restoration across an authoritative replacement.  The normal
+        mutation methods still own their notifications; their publication
+        snapshots retain the admitted overlay until the explicit restore or
+        retirement decision immediately following the replacement.
+        """
+        retained_before = {
+            file_id: self.__full_effective_file(file)
+            for file_id, file in self.__files_by_id.items()
+            if file_id in self.__active_progress_overlays
+        }
+        self.__suppress_active_progress_clear += 1
+        try:
+            return operation()
+        finally:
+            self.__suppress_active_progress_clear -= 1
+            for file_id, old_file in retained_before.items():
+                if file_id in self.__active_progress_overlays and file_id in self.__files_by_id:
+                    self.__legacy_overlay_correction_file_ids.add(file_id)
+                    self.__legacy_overlay_correction_old_files[file_id] = old_file
+
     def clear_active_progress_overlays(self) -> None:
         """Discard live-only values and publish each affected root's base state."""
+        if self.__suppress_active_progress_clear:
+            return
         removed_file_ids = set(self.__active_progress_overlays)
         self.__active_progress_overlays = {}
         self.__active_progress_overlay_job_identities = {}
         for file_id in sorted(removed_file_ids):
             file = self.__files_by_id.get(file_id)
             if file is None:
+                self.__notify_legacy_overlay_correction_if_needed(file_id, None)
                 continue
+            old_published = self.__published_files_by_id.get(file_id)
+            published = self.__refresh_published_file(file)
             global_version, scope_version = self.__advance_version(file)
+            self.__notify_legacy_overlay_correction_if_needed(file_id, file)
             self.__notify_versioned_change(file, global_version, scope_version)
 
     def clear_active_progress_overlays_except(self, preserved_file_ids: Set[str]) -> set[str]:
@@ -266,8 +403,12 @@ class Model:
         for file_id in sorted(removed_file_ids):
             file = self.__files_by_id.get(file_id)
             if file is None:
+                self.__notify_legacy_overlay_correction_if_needed(file_id, None)
                 continue
+            old_published = self.__published_files_by_id.get(file_id)
+            published = self.__refresh_published_file(file)
             global_version, scope_version = self.__advance_version(file)
+            self.__notify_legacy_overlay_correction_if_needed(file_id, file)
             self.__notify_versioned_change(file, global_version, scope_version)
         return removed_file_ids
 
@@ -307,8 +448,12 @@ class Model:
         for file_id in sorted(changed):
             file = self.__files_by_id.get(file_id)
             if file is None:
+                self.__notify_legacy_overlay_correction_if_needed(file_id, None)
                 continue
+            old_published = self.__published_files_by_id.get(file_id)
+            published = self.__refresh_published_file(file)
             global_version, scope_version = self.__advance_version(file)
+            self.__notify_legacy_overlay_correction_if_needed(file_id, file)
             self.__notify_versioned_change(file, global_version, scope_version)
         return changed
 
@@ -329,8 +474,12 @@ class Model:
         self.__active_progress_overlay_job_identities.pop(file_id, None)
         file = self.__files_by_id.get(file_id)
         if file is None:
+            self.__notify_legacy_overlay_correction_if_needed(file_id, None)
             return True
+        old_published = self.__published_files_by_id.get(file_id)
+        published = self.__refresh_published_file(file)
         global_version, scope_version = self.__advance_version(file)
+        self.__notify_legacy_overlay_correction_if_needed(file_id, file)
         self.__notify_versioned_change(file, global_version, scope_version)
         return True
 
@@ -339,9 +488,10 @@ class Model:
     ) -> set[str]:
         """Atomically replace live-only progress and notify scoped readers.
 
-        This intentionally does not call the legacy ``file_updated`` listener
-        contract: those listeners retain ModelFile references and require an
-        immutable tree replacement. Scoped listeners receive only versions.
+        Ordinary progress pulses intentionally do not call the legacy
+        ``file_updated`` contract: that path requires recursive immutable
+        records.  A retained-overlay lifecycle retirement is the exception
+        and emits one corrective full-tree update through the clear path.
         """
         normalized = {
             file_id: overlay for file_id, overlay in overlays.items()
@@ -356,7 +506,10 @@ class Model:
         self.__active_progress_overlay_job_identities = {}
         for file_id in sorted(changed):
             file = self.__files_by_id[file_id]
+            old_published = self.__published_files_by_id.get(file_id)
+            published = self.__refresh_published_file(file)
             global_version, scope_version = self.__advance_version(file)
+            self.__notify_legacy_overlay_correction_if_needed(file_id, file)
             self.__notify_versioned_change(file, global_version, scope_version)
         return changed
 
@@ -423,8 +576,12 @@ class Model:
         for file_id in sorted(changed):
             file = self.__files_by_id.get(file_id)
             if file is None:
+                self.__notify_legacy_overlay_correction_if_needed(file_id, None)
                 continue
+            old_published = self.__published_files_by_id.get(file_id)
+            published = self.__refresh_published_file(file)
             global_version, scope_version = self.__advance_version(file)
+            self.__notify_legacy_overlay_correction_if_needed(file_id, file)
             self.__notify_versioned_change(file, global_version, scope_version)
         return changed, "accepted"
 
@@ -478,11 +635,13 @@ class Model:
         if file.name not in self.__file_ids_by_name:
             self.__file_ids_by_name[file.name] = set()
         self.__file_ids_by_name[file.name].add(file_id)
+        published = self.__refresh_published_file(self.__files_by_id[file_id])
+        legacy_published = self.__full_effective_file(self.__files_by_id[file_id])
         global_version, scope_version = self.__advance_version(file)
         with self.__listeners_lock:
             listeners = list(self.__listeners)
         for listener in listeners:
-            listener.file_added(self.__files_by_id[file_id])
+            listener.file_added(legacy_published)
         self.__notify_versioned_change(self.__files_by_id[file_id], global_version, scope_version)
 
     def __resolve_file_id(self, identifier: str) -> str:
@@ -504,17 +663,27 @@ class Model:
         self.clear_active_progress_overlays()
         file_id = self.__resolve_file_id(filename)
         file = self.__files_by_id[file_id]
+        published = self.__published_files_by_id.get(file_id) or self.__refresh_published_file(file)
+        legacy_published = self.__full_effective_file(file)
         self.logger.debug("LftpModel: Removing file '{}'".format(self.__format_file_for_log(file)))
         del self.__files_by_id[file_id]
         self.__ordered_file_ids.remove(file_id)
         self.__file_ids_by_name[file.name].remove(file_id)
         if not self.__file_ids_by_name[file.name]:
             del self.__file_ids_by_name[file.name]
+        self.__published_files_by_id.pop(file_id, None)
+        # A suppressed replacement can remove the root before its retained
+        # overlay reaches a clear path.  It must never attach to a later root
+        # that reuses the same canonical identity.
+        self.__active_progress_overlays.pop(file_id, None)
+        self.__active_progress_overlay_job_identities.pop(file_id, None)
+        self.__legacy_overlay_correction_file_ids.discard(file_id)
+        self.__legacy_overlay_correction_old_files.pop(file_id, None)
         global_version, scope_version = self.__advance_version(file)
         with self.__listeners_lock:
             listeners = list(self.__listeners)
         for listener in listeners:
-            listener.file_removed(file)
+            listener.file_removed(legacy_published)
         self.__notify_versioned_change(file, global_version, scope_version)
 
     def update_file(self, file: ModelFile) -> None:
@@ -529,13 +698,17 @@ class Model:
         if file_id not in self.__files_by_id:
             raise ModelError("File does not exist in the model")
         old_file = self.__files_by_id[file_id]
+        old_published = self.__published_files_by_id.get(file_id) or self.__refresh_published_file(old_file)
+        legacy_old_published = self.__full_effective_file(old_file)
         new_file = file
         self.__files_by_id[file_id] = new_file
+        new_published = self.__refresh_published_file(new_file)
+        legacy_new_published = self.__full_effective_file(new_file)
         global_version, scope_version = self.__advance_version(new_file)
         with self.__listeners_lock:
             listeners = list(self.__listeners)
         for listener in listeners:
-            listener.file_updated(old_file, new_file)
+            listener.file_updated(legacy_old_published, legacy_new_published)
         self.__notify_versioned_change(new_file, global_version, scope_version)
 
     def get_file(self, name: str) -> ModelFile:
