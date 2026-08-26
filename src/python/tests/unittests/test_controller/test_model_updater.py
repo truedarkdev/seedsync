@@ -8000,7 +8000,7 @@ class TestModelUpdater(unittest.TestCase):
             "pair-a": MagicMock(), "pair-b": MagicMock(),
         }
         controller._Controller__progress_publication_epoch = 0
-        builder.has_only_live_progress_with_active_scan = MagicMock(return_value=True)
+        builder.has_only_live_progress_with_active_scan = MagicMock(return_value=False)
         builder.authorize_authoritative_pair_delta = MagicMock(return_value=True)
         stale = LftpJobStatus(
             2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
@@ -8020,6 +8020,74 @@ class TestModelUpdater(unittest.TestCase):
         assert published is not None
         self.assertEqual(51, published.download_progress)
         self.assertEqual(60, published.transferred_size)
+
+    def test_admitted_same_identity_floor_survives_fallback_then_reset_restarts(self):
+        """Fallback publication keeps an accepted floor, but a new/reset job may restart."""
+        remote = SystemFile("active.bin", 100, False, mtime_ns=1)
+        local = SystemFile("active.bin", 40, False, is_staging=True, mtime_ns=1)
+        local.status_sidecar_ready = True
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        initial = LftpJobStatus(
+            4, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        initial.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 10, 8)
+        builder.set_lftp_statuses([initial])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        active_scan = SystemFile("active.bin", 40, False, is_staging=True, mtime_ns=1)
+        active_scan.status_sidecar_ready = True
+        progressed = LftpJobStatus(
+            4, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        progressed.total_transfer_state = LftpJobStatus.TransferState(80, 100, 80, 10, 8)
+        reset = LftpJobStatus(
+            4, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        reset.total_transfer_state = LftpJobStatus.TransferState(0, 100, 0, 8, 11)
+        low = LftpJobStatus(
+            4, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        low.total_transfer_state = LftpJobStatus.TransferState(5, 100, 5, 8, 11)
+        controller._Controller__lftp.status.side_effect = [
+            [progressed], [reset], [low],
+        ]
+        controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(datetime.now(), [active_scan]),
+            ScannerResult(datetime.now(), [active_scan]),
+            ScannerResult(datetime.now(), [active_scan]),
+        ]
+        builder.has_pending_active_transfer_delta = MagicMock(return_value=False)
+        builder.has_only_live_progress_with_active_scan = MagicMock(
+            side_effect=[True, False, False],
+        )
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        self.assertEqual(80, live_model.active_progress_overlay("active.bin").transferred_size)
+        self.assertIn(
+            ("active.bin", (4, LftpJobStatus.Type.PGET.value)),
+            controller._Controller__admitted_progress_publications,
+        )
+
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+        self.assertEqual(0, live_model.get_file("active.bin").transferred_size)
+        self.assertIsNone(live_model.active_progress_overlay("active.bin"))
+
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+        self.assertEqual(5, live_model.get_file("active.bin").transferred_size)
+        self.assertIsNone(live_model.active_progress_overlay("active.bin"))
+        self.assertNotIn(
+            ("active.bin", (4, LftpJobStatus.Type.PGET.value)),
+            controller._Controller__admitted_progress_publications,
+        )
 
     def test_candidate_replacement_clears_terminal_reset_and_explicit_stop_overlay(self):
         """Updater adoption must not resurrect a revoked direct PGET projection."""

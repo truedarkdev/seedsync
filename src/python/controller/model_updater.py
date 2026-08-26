@@ -5691,6 +5691,10 @@ class ModelUpdater(_ControllerCoreAccess):
         direct_published_overlays: dict[str, ActiveProgressOverlay] = {}
         direct_published_job_identities: dict[str, tuple[int, str]] = {}
         direct_published_target_file_id: Optional[str] = None
+        replacement_source_overlays: dict[str, ActiveProgressOverlay] = {}
+        replacement_source_job_identities: dict[str, tuple[int, str]] = {}
+        replacement_source_captured = False
+        replacement_source_is_direct = False
         direct_target_file_id: Optional[str] = None
         direct_job_identities: dict[str, tuple[int, str]] = {}
         late_older_overlay_preserved = False
@@ -5883,6 +5887,50 @@ class ModelUpdater(_ControllerCoreAccess):
                         deferred_rejected_overlay_clear = True
                         changed = set()
                     else:
+                        # Keep the controller-owned identity floor in front of
+                        # the direct Model admission.  A prior full rebuild
+                        # may have cleared the live overlay while the exact
+                        # running job is still current; accepting the stale
+                        # status directly in that gap would lower the root
+                        # before the next replacement can apply its floor.
+                        admitted = getattr(
+                            controller, "_Controller__admitted_progress_publications", None,
+                        )
+                        if isinstance(admitted, dict):
+                            for file_id, identity in direct_job_identities.items():
+                                status = next(
+                                    (candidate for candidate in lftp_statuses
+                                     if getattr(candidate, "file_id", None) == file_id),
+                                    None,
+                                )
+                                transfer_state = getattr(status, "total_transfer_state", None)
+                                reset_sample = (
+                                    type(getattr(transfer_state, "size_local", None)) is int and
+                                    getattr(transfer_state, "size_local") <= 0
+                                ) or (
+                                    type(getattr(transfer_state, "percent_local", None)) is int and
+                                    getattr(transfer_state, "percent_local") <= 0
+                                )
+                                key = (file_id, identity)
+                                if reset_sample:
+                                    admitted.pop(key, None)
+                                    continue
+                                floor = admitted.get(key)
+                                overlay = direct_overlays.get(file_id)
+                                if not isinstance(floor, ActiveProgressOverlay) or \
+                                        not isinstance(overlay, ActiveProgressOverlay):
+                                    continue
+                                progress = overlay.download_progress
+                                if type(floor.download_progress) is int and \
+                                        (type(progress) is not int or floor.download_progress > progress):
+                                    progress = floor.download_progress
+                                transferred_size = overlay.transferred_size
+                                if type(floor.transferred_size) is int and \
+                                        (type(transferred_size) is not int or floor.transferred_size > transferred_size):
+                                    transferred_size = floor.transferred_size
+                                direct_overlays[file_id] = ActiveProgressOverlay(
+                                    progress, transferred_size, overlay.downloading_speed, overlay.eta,
+                                )
                         changed, direct_outcome = model.publish_active_lftp_root_counters(
                             direct_overlays, direct_job_identities,
                             lambda file_id: getattr(
@@ -6435,7 +6483,8 @@ class ModelUpdater(_ControllerCoreAccess):
                 lifecycle reset or uncertainty deliberately leaves the
                 replacement's base state visible.
                 """
-                if not direct_published_overlays or not direct_published_job_identities or \
+                capture_replacement_overlay_source()
+                if not replacement_source_overlays or not replacement_source_job_identities or \
                         not (lftp_status_poll_healthy and lftp_status_snapshot_fresh and
                              lftp_status_source == "fresh_healthy"):
                     return {}, {}
@@ -6451,8 +6500,8 @@ class ModelUpdater(_ControllerCoreAccess):
                     file_id = getattr(status, "file_id", None)
                     if isinstance(file_id, str):
                         raw_statuses_by_file_id.setdefault(file_id, []).append(status)
-                for file_id, overlay in direct_published_overlays.items():
-                    identity = direct_published_job_identities.get(file_id)
+                for file_id, overlay in replacement_source_overlays.items():
+                    identity = replacement_source_job_identities.get(file_id)
                     if not isinstance(identity, tuple) or len(identity) != 2 or \
                             type(identity[0]) is not int or identity[0] < 0 or \
                             not isinstance(identity[1], str) or not identity[1] or \
@@ -6476,6 +6525,20 @@ class ModelUpdater(_ControllerCoreAccess):
                             (getattr(raw_status, "id", None), getattr(
                                 getattr(raw_status, "type", None), "value", None,
                             )) != identity:
+                        continue
+                    transfer_state = getattr(raw_status, "total_transfer_state", None)
+                    if (
+                            type(getattr(transfer_state, "size_local", None)) is int and
+                            getattr(transfer_state, "size_local") <= 0
+                    ) or (
+                            type(getattr(transfer_state, "percent_local", None)) is int and
+                            getattr(transfer_state, "percent_local") <= 0
+                    ):
+                        # A zero counter is an explicit same-name reset, not
+                        # evidence that the prior job's floor is still live.
+                        self._clear_admitted_progress_publications(
+                            controller, file_id, identity,
+                        )
                         continue
                     try:
                         replacement = new_model.get_file(file_id)
@@ -6506,9 +6569,107 @@ class ModelUpdater(_ControllerCoreAccess):
                     replacement_identities[file_id] = identity
                 return replacement_overlays, replacement_identities
 
+            def capture_replacement_overlay_source() -> None:
+                """Snapshot the latest accepted projection before replacement.
+
+                A full/candidate build can follow a tick that did not accept a
+                new direct projection.  In that case the live Model overlay is
+                still the newest accepted counter, and must remain available
+                for the same-identity replacement checks below.
+                """
+                nonlocal replacement_source_captured, replacement_source_is_direct
+                if replacement_source_captured:
+                    return
+                replacement_source_captured = True
+                if direct_published_overlays and direct_published_job_identities:
+                    replacement_source_is_direct = True
+                    replacement_source_overlays.update(direct_published_overlays)
+                    replacement_source_job_identities.update(direct_published_job_identities)
+                    return
+                with controller._Controller__model_lock:
+                    overlay_reader = getattr(model, "active_progress_overlays_snapshot", None)
+                    identity_reader = getattr(
+                        model, "active_progress_overlay_job_identities_snapshot", None,
+                    )
+                    if not callable(overlay_reader) or not callable(identity_reader):
+                        return
+                    try:
+                        overlays = overlay_reader()
+                        identities = identity_reader()
+                    except (AttributeError, TypeError):
+                        overlays = {}
+                        identities = {}
+                    if isinstance(overlays, dict) and isinstance(identities, dict):
+                        replacement_source_overlays.update(overlays)
+                        replacement_source_job_identities.update(identities)
+                # The admission map is the same identity-scoped projection
+                # used by the direct path.  It survives a full replacement
+                # that clears the Model overlay, but is retired by Stop,
+                # Queue/replacement, completion, or an explicit zero reset.
+                admitted = getattr(
+                    controller, "_Controller__admitted_progress_publications", None,
+                )
+                if isinstance(admitted, dict):
+                    for key, overlay in admitted.items():
+                        if not isinstance(key, tuple) or len(key) != 2 or \
+                                not isinstance(key[0], str) or \
+                                not isinstance(key[1], tuple) or len(key[1]) != 2 or \
+                                type(key[1][0]) is not int or key[1][0] < 0 or \
+                                not isinstance(key[1][1], str) or not key[1][1] or \
+                                not isinstance(overlay, ActiveProgressOverlay):
+                            continue
+                        file_id, identity = key
+                        existing_identity = replacement_source_job_identities.get(file_id)
+                        if existing_identity is not None and existing_identity != identity:
+                            continue
+                        existing = replacement_source_overlays.get(file_id)
+                        if isinstance(existing, ActiveProgressOverlay):
+                            progress = existing.download_progress
+                            if type(overlay.download_progress) is int and \
+                                    (type(progress) is not int or overlay.download_progress > progress):
+                                progress = overlay.download_progress
+                            transferred_size = existing.transferred_size
+                            if type(overlay.transferred_size) is int and \
+                                    (type(transferred_size) is not int or overlay.transferred_size > transferred_size):
+                                transferred_size = overlay.transferred_size
+                            overlay = ActiveProgressOverlay(
+                                progress, transferred_size,
+                                existing.downloading_speed, existing.eta,
+                            )
+                        replacement_source_overlays[file_id] = overlay
+                        replacement_source_job_identities[file_id] = identity
+
+            def floor_replacement_base_counters() -> None:
+                """Carry a prior accepted counter into a safe replacement base.
+
+                A fallback build cannot restore a live-only overlay after its
+                clear/adopt boundary.  For the unchanged identity, render its
+                accepted counters into the candidate instead; lifecycle state
+                and completion proof remain candidate-owned.
+                """
+                if replacement_source_is_direct:
+                    return
+                overlays, identities = direct_overlays_for_replacement()
+                for file_id, overlay in overlays.items():
+                    try:
+                        replacement = new_model.get_file(file_id)
+                    except (AttributeError, ModelError):
+                        continue
+                    progress = overlay.download_progress
+                    if type(progress) is int and 0 < progress < 100:
+                        candidate_progress = getattr(replacement, "download_progress", None)
+                        if type(candidate_progress) is not int or candidate_progress < progress:
+                            replacement.download_progress = progress
+                    transferred_size = overlay.transferred_size
+                    if type(transferred_size) is int and transferred_size > 0:
+                        candidate_transferred_size = getattr(replacement, "transferred_size", None)
+                        if type(candidate_transferred_size) is not int or \
+                                candidate_transferred_size < transferred_size:
+                            replacement.transferred_size = transferred_size
+
             def restore_direct_overlays_after_replacement() -> None:
                 overlays, identities = direct_overlays_for_replacement()
-                if not direct_published_overlays:
+                if not replacement_source_overlays:
                     return
                 restore_overlays = getattr(
                     controller._Controller__model, "restore_active_progress_overlays", None,
@@ -6518,7 +6679,8 @@ class ModelUpdater(_ControllerCoreAccess):
 
             def apply_model_replacement(operation: Callable[[], object]) -> object:
                 """Apply one diff without exposing an accepted live overlay's base."""
-                if not direct_published_overlays:
+                capture_replacement_overlay_source()
+                if not replacement_source_overlays:
                     return operation()
                 retain_overlays = getattr(model, "apply_with_active_progress_retained", None)
                 if not callable(retain_overlays):
@@ -6527,7 +6689,8 @@ class ModelUpdater(_ControllerCoreAccess):
 
             def clear_overlays_for_replacement() -> None:
                 """Clear/rebase only after the replacement restore decision."""
-                if not direct_published_overlays:
+                capture_replacement_overlay_source()
+                if not replacement_source_overlays:
                     model.clear_active_progress_overlays()
                     return
                 apply_model_replacement(lambda: model.clear_active_progress_overlays())
@@ -7721,6 +7884,7 @@ class ModelUpdater(_ControllerCoreAccess):
                             model_builder, authoritative_pair_build, pair_fallback_committer,
                             record_candidate_lifecycle_fallback,
                     ), controller._Controller__model_lock:
+                        floor_replacement_base_counters()
                         clear_overlays_for_replacement()
                         controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
                         pair_adopter(
@@ -7797,6 +7961,7 @@ class ModelUpdater(_ControllerCoreAccess):
         if global_full_build_triggered:
             try:
                 with controller._Controller__model_lock:
+                    floor_replacement_base_counters()
                     clear_overlays_for_replacement()
                     controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
                     model_builder.adopt_applied_model(
