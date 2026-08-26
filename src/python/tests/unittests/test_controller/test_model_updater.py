@@ -7618,6 +7618,274 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(90, live_model.get_file("root").transferred_size)
         self.assertIsNone(live_model.active_progress_overlay("root"))
 
+    def test_accepted_pget_overlay_survives_candidate_lower_base_replacement(self):
+        """A live PGET overlay must not flicker to its lower candidate base."""
+        def system_file(name, size, path_pair_id, *, is_staging=False):
+            file = SystemFile(name, size, False, is_staging=is_staging)
+            file.path_pair_id = path_pair_id
+            file.status_sidecar_ready = is_staging
+            return file
+
+        old = system_file("old.bin", 10, "pair-a")
+        remote = system_file("active.bin", 100, "pair-b")
+        local = system_file("active.bin", 40, "pair-b", is_staging=True)
+        builder = ModelBuilder()
+        builder.set_local_files([old, local])
+        builder.set_remote_files([old, remote])
+        builder.set_unknown_local_path_pair_ids({"pair-b"})
+        cached_status = LftpJobStatus(
+            2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        cached_status.path_pair_id = "pair-b"
+        cached_status.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 10, 8)
+        builder.set_lftp_statuses([cached_status])
+        live_model = builder.build_model()
+        file_id = ModelFile.build_file_id("active.bin", "pair-b")
+
+        replacement_local = system_file("new.bin", 30, "pair-a")
+        replacement_remote = system_file("new.bin", 30, "pair-a")
+        final_local = ScannerResult(
+            datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {
+            "pair-a": MagicMock(), "pair-b": MagicMock(),
+        }
+        controller._Controller__progress_publication_epoch = 0
+        builder.has_only_live_progress_with_active_scan = MagicMock(return_value=True)
+        builder.authorize_authoritative_pair_delta = MagicMock(return_value=True)
+        running = LftpJobStatus(
+            2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        running.path_pair_id = "pair-b"
+        running.total_transfer_state = LftpJobStatus.TransferState(75, 100, 75, 10, 8)
+        controller._Controller__lftp.status.return_value = [running]
+        controller._Controller__active_scan_process.pop_latest_result.return_value = final_local
+
+        observed = []
+
+        class Listener:
+            def model_version_changed(self, _scope_version, _path_pair_id, changed_file_id):
+                if changed_file_id != file_id:
+                    return
+                file = live_model.get_file(file_id)
+                overlay = live_model.active_progress_overlay(file_id)
+                observed.append(
+                    overlay.transferred_size if overlay is not None else file.transferred_size,
+                )
+
+            def file_updated(self, _old_file, _new_file):
+                pass
+
+            def file_added(self, _file):
+                pass
+
+            def file_removed(self, _file):
+                pass
+
+        live_model.add_listener(Listener())
+
+        ModelUpdater(controller).update()
+
+        self.assertIn(ModelFile.build_file_id("new.bin", "pair-a"), live_model.get_file_ids())
+        self.assertTrue(observed)
+        self.assertEqual([75] * len(observed), observed)
+        self.assertEqual(40, live_model.get_file(file_id).transferred_size)
+        self.assertEqual(75, live_model.active_progress_overlay(file_id).transferred_size)
+
+    def test_candidate_replacement_clears_terminal_reset_and_explicit_stop_overlay(self):
+        """Updater adoption must not resurrect a revoked direct PGET projection."""
+        def system_file(name, size, path_pair_id, *, is_staging=False):
+            file = SystemFile(name, size, False, is_staging=is_staging)
+            file.path_pair_id = path_pair_id
+            file.status_sidecar_ready = is_staging
+            return file
+
+        def run_replacement(mutate):
+            old = system_file("old.bin", 10, "pair-a")
+            remote = system_file("active.bin", 100, "pair-a")
+            local = system_file("active.bin", 40, "pair-a", is_staging=True)
+            builder = ModelBuilder()
+            builder.set_local_files([old, local])
+            builder.set_remote_files([old, remote])
+            status = LftpJobStatus(
+                2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+                "active.bin", "",
+            )
+            status.path_pair_id = "pair-a"
+            status.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 10, 8)
+            builder.set_lftp_statuses([status])
+            live_model = builder.build_model()
+            file_id = ModelFile.build_file_id("active.bin", "pair-a")
+            replacement_local = system_file("active.bin", 47, "pair-a", is_staging=True)
+            replacement_remote = system_file("active.bin", 100, "pair-a")
+            final_local = ScannerResult(
+                datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
+                is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+            )
+            final_remote = ScannerResult(
+                datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
+                is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+            )
+            controller, _ = self._make_progressive_update_controller(
+                final_remote, local_scan=final_local,
+                model_builder=builder, model=live_model,
+            )
+            controller._Controller__path_pairs_by_id = {"pair-a": MagicMock()}
+            controller._Controller__progress_publication_epoch = 0
+            builder.has_only_live_progress_with_active_scan = MagicMock(return_value=True)
+            builder.authorize_authoritative_pair_delta = MagicMock(return_value=True)
+            running = LftpJobStatus(
+                2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+                "active.bin", "",
+            )
+            running.path_pair_id = "pair-a"
+            running.total_transfer_state = LftpJobStatus.TransferState(75, 100, 75, 10, 8)
+            controller._Controller__lftp.status.return_value = [running]
+            controller._Controller__active_scan_process.pop_latest_result.return_value = final_local
+            original_build = builder.build_authoritative_pair_roots
+
+            def build_candidate(*args, **kwargs):
+                candidate = original_build(*args, **kwargs)
+                mutate(candidate.model.get_file(file_id))
+                return candidate
+
+            builder.build_authoritative_pair_roots = build_candidate
+            ModelUpdater(controller).update()
+            return live_model, file_id, controller
+
+        for label, mutate in (
+                ("terminal", lambda file: setattr(file, "state", ModelFile.State.DOWNLOADED)),
+                ("zero-reset", lambda file: (
+                    setattr(file, "state", ModelFile.State.DEFAULT),
+                    setattr(file, "local_size", 0),
+                    setattr(file, "transferred_size", 0),
+                    setattr(file, "download_progress", 0),
+                )),
+                ("explicit-stop", lambda file: setattr(file, "explicitly_stopped", True)),
+        ):
+            with self.subTest(label=label):
+                live_model, file_id, controller = run_replacement(mutate)
+                self.assertIsNone(live_model.active_progress_overlay(file_id))
+                self.assertNotIn(file_id, controller._Controller__persist.downloaded_file_names)
+                self.assertFalse(controller._Controller__pending_completion_file_names)
+
+    def test_candidate_replacement_fail_closed_for_ambiguous_or_stale_status(self):
+        """A replacement never restores a projection without fresh identity authority."""
+        def system_file(name, size, path_pair_id, *, is_staging=False):
+            file = SystemFile(name, size, False, is_staging=is_staging)
+            file.path_pair_id = path_pair_id
+            file.status_sidecar_ready = is_staging
+            return file
+
+        def run_case(case):
+            old = system_file("old.bin", 10, "pair-a")
+            remote = system_file("active.bin", 100, "pair-a")
+            local = system_file("active.bin", 40, "pair-a", is_staging=True)
+            builder = ModelBuilder()
+            builder.set_local_files([old, local])
+            builder.set_remote_files([old, remote])
+            initial = LftpJobStatus(
+                2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+                "active.bin", "",
+            )
+            initial.path_pair_id = "pair-a"
+            initial.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 10, 8)
+            builder.set_lftp_statuses([initial])
+            live_model = builder.build_model()
+            file_id = ModelFile.build_file_id("active.bin", "pair-a")
+            replacement_local = system_file("active.bin", 47, "pair-a", is_staging=True)
+            replacement_remote = system_file("active.bin", 100, "pair-a")
+            final_local = ScannerResult(
+                datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
+                is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+            )
+            final_remote = ScannerResult(
+                datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
+                is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+            )
+            controller, _ = self._make_progressive_update_controller(
+                None, local_scan=None, model_builder=builder, model=live_model,
+            )
+            controller._Controller__path_pairs_by_id = {"pair-a": MagicMock()}
+            controller._Controller__progress_publication_epoch = 0
+            builder.has_only_live_progress_with_active_scan = MagicMock(return_value=True)
+            builder.authorize_authoritative_pair_delta = MagicMock(return_value=True)
+
+            def status(job_id=2, status_type=LftpJobStatus.Type.PGET):
+                value = LftpJobStatus(
+                    job_id, status_type, LftpJobStatus.State.RUNNING,
+                    "active.bin", "",
+                )
+                value.path_pair_id = "pair-a"
+                value.total_transfer_state = LftpJobStatus.TransferState(75, 100, 75, 10, 8)
+                return value
+
+            first = status()
+            second = status()
+            if case == "unhealthy":
+                controller._Controller__lftp.status.side_effect = [[first], [second]]
+            elif case == "cached":
+                controller._Controller__lftp.status.return_value = [first]
+            elif case in {"duplicate-raw", "duplicate-filtered"}:
+                duplicate = status()
+                controller._Controller__lftp.status.side_effect = [[first], [second, duplicate]]
+            elif case == "empty-retired":
+                controller._Controller__lftp.status.side_effect = [[first], []]
+            elif case == "replacement-id":
+                controller._Controller__lftp.status.side_effect = [[first], [status(3)]]
+            else:
+                controller._Controller__lftp.status.side_effect = [[first], [status(status_type=LftpJobStatus.Type.GET)]]
+            active_scan = ScannerResult(
+                datetime.now(), [local], scanned_path_pair_ids={"pair-a"},
+            )
+            controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+                active_scan, final_local,
+            ]
+            controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
+                None, final_remote,
+            ]
+            controller._Controller__local_scan_process.pop_latest_result.side_effect = [
+                None, final_local,
+            ]
+            if case == "cached":
+                # Leave the accepted first snapshot in the controller cache;
+                # the second tick deliberately uses it without a fresh poll.
+                ModelUpdater(controller).update()
+                controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=60)
+                ModelUpdater(controller).update()
+            else:
+                ModelUpdater(controller).update()
+                if case == "unhealthy":
+                    controller._Controller__lftp.last_status_poll_healthy = False
+                if case == "duplicate-filtered":
+                    controller._Controller__malformed_status_only_file_ids = {file_id}
+                ModelUpdater(controller).update()
+            return live_model, file_id, controller
+
+        for case in (
+                "unhealthy", "cached", "duplicate-raw", "duplicate-filtered",
+                "empty-retired", "replacement-id", "replacement-type",
+        ):
+            with self.subTest(case=case):
+                live_model, file_id, controller = run_case(case)
+                self.assertIsNone(live_model.active_progress_overlay(file_id))
+                self.assertNotIn(file_id, controller._Controller__persist.downloaded_file_names)
+
+
     def test_direct_admission_exception_without_full_build_still_clears_immediately(self):
         builder = ModelBuilder()
         builder.set_remote_files([SystemFile("root", 100, False)])

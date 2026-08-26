@@ -5928,6 +5928,124 @@ class ModelUpdater(_ControllerCoreAccess):
                 if type(generation) is int and generation >= 0 and callable(setter):
                     setter(generation)
 
+            def direct_overlays_for_replacement() -> tuple[
+                    dict[str, ActiveProgressOverlay], dict[str, tuple[int, str]]]:
+                """Retain an accepted direct projection across one replacement.
+
+                A model replacement may be rendered from the lower scan/base
+                checkpoint even though the same PGET is still authoritative.
+                Restore only when the replacement and the fresh status poll
+                independently prove that exact live, stoppable job.  Any
+                lifecycle reset or uncertainty deliberately leaves the
+                replacement's base state visible.
+                """
+                if not direct_published_overlays or not direct_published_job_identities or \
+                        not (lftp_status_poll_healthy and lftp_status_snapshot_fresh and
+                             lftp_status_source == "fresh_healthy"):
+                    return {}, {}
+                replacement_overlays: dict[str, ActiveProgressOverlay] = {}
+                replacement_identities: dict[str, tuple[int, str]] = {}
+                statuses_by_file_id: dict[str, list[LftpJobStatus]] = {}
+                for status in lftp_statuses:
+                    file_id = getattr(status, "file_id", None)
+                    if isinstance(file_id, str):
+                        statuses_by_file_id.setdefault(file_id, []).append(status)
+                raw_statuses_by_file_id: dict[str, list[object]] = {}
+                for status in raw_lftp_statuses:
+                    file_id = getattr(status, "file_id", None)
+                    if isinstance(file_id, str):
+                        raw_statuses_by_file_id.setdefault(file_id, []).append(status)
+                for file_id, overlay in direct_published_overlays.items():
+                    identity = direct_published_job_identities.get(file_id)
+                    if not isinstance(identity, tuple) or len(identity) != 2 or \
+                            type(identity[0]) is not int or identity[0] < 0 or \
+                            not isinstance(identity[1], str) or not identity[1] or \
+                            not isinstance(overlay, ActiveProgressOverlay):
+                        continue
+                    statuses = statuses_by_file_id.get(file_id, [])
+                    raw_statuses = raw_statuses_by_file_id.get(file_id, [])
+                    if len(statuses) != 1 or len(raw_statuses) != 1:
+                        continue
+                    status = statuses[0]
+                    raw_status = raw_statuses[0]
+                    if status.state != LftpJobStatus.State.RUNNING or \
+                            raw_status.state != LftpJobStatus.State.RUNNING or \
+                            type(getattr(status, "id", None)) is not int or \
+                            type(getattr(raw_status, "id", None)) is not int or \
+                            getattr(status, "id", -1) < 0 or \
+                            getattr(raw_status, "id", -1) < 0 or \
+                            (getattr(status, "id", None), getattr(
+                                getattr(status, "type", None), "value", None,
+                            )) != identity or \
+                            (getattr(raw_status, "id", None), getattr(
+                                getattr(raw_status, "type", None), "value", None,
+                            )) != identity:
+                        continue
+                    try:
+                        replacement = new_model.get_file(file_id)
+                    except (AttributeError, ModelError):
+                        continue
+                    if replacement.state != ModelFile.State.DOWNLOADING or \
+                            replacement.is_stoppable is not True or \
+                            replacement.explicitly_stopped or \
+                            replacement.display_size_total is not None or \
+                            replacement.display_transferred_size is not None or \
+                            replacement.complete_local_coverage or \
+                            (replacement.download_progress is not None and
+                             replacement.download_progress >= 100) or \
+                            replacement.local_size == 0 or \
+                            (replacement.transferred_size == 0 and
+                             replacement.download_progress == 0):
+                        continue
+                    stop_checker = getattr(controller, "_Controller__is_explicitly_stopped", None)
+                    if callable(stop_checker):
+                        try:
+                            if stop_checker(replacement.full_path, replacement.path_pair_id):
+                                continue
+                        except Exception:
+                            continue
+                    else:
+                        continue
+                    replacement_overlays[file_id] = overlay
+                    replacement_identities[file_id] = identity
+                return replacement_overlays, replacement_identities
+
+            def restore_direct_overlays_after_replacement() -> None:
+                overlays, identities = direct_overlays_for_replacement()
+                if not direct_published_overlays:
+                    return
+                restore_overlays = getattr(
+                    controller._Controller__model, "restore_active_progress_overlays", None,
+                )
+                if callable(restore_overlays):
+                    restore_overlays(overlays, identities)
+
+            def apply_model_replacement(operation: Callable[[], object]) -> object:
+                """Apply one diff without exposing an accepted live overlay's base."""
+                if not direct_published_overlays:
+                    return operation()
+                clear_overlays = getattr(model, "clear_active_progress_overlays", None)
+                if not callable(clear_overlays):
+                    return operation()
+                try:
+                    setattr(model, "clear_active_progress_overlays", lambda: None)
+                except Exception:
+                    return operation()
+                try:
+                    return operation()
+                finally:
+                    try:
+                        setattr(model, "clear_active_progress_overlays", clear_overlays)
+                    except Exception:
+                        pass
+
+            def clear_overlays_for_replacement() -> None:
+                """Clear/rebase only after the replacement restore decision."""
+                if not direct_published_overlays:
+                    model.clear_active_progress_overlays()
+                    return
+                apply_model_replacement(lambda: model.clear_active_progress_overlays())
+
             # A small set of completion side effects is applied directly to
             # the model objects from this build.  If those setters invalidate
             # the builder cache, retain their exact event tokens for adoption;
@@ -6542,13 +6660,13 @@ class ModelUpdater(_ControllerCoreAccess):
 
                     if diff.change == ModelDiff.Change.ADDED:
                         assert new_file is not None
-                        model.add_file(new_file)
+                        apply_model_replacement(lambda: model.add_file(new_file))
                     elif diff.change == ModelDiff.Change.REMOVED:
                         assert old_file is not None
-                        model.remove_file(old_file.file_id)
+                        apply_model_replacement(lambda: model.remove_file(old_file.file_id))
                     elif diff.change == ModelDiff.Change.UPDATED:
                         assert new_file is not None
-                        model.update_file(new_file)
+                        apply_model_replacement(lambda: model.update_file(new_file))
 
                     if (
                         diff.change == ModelDiff.Change.REMOVED
@@ -6988,7 +7106,7 @@ class ModelUpdater(_ControllerCoreAccess):
                             model_builder, authoritative_pair_build, pair_fallback_committer,
                             record_candidate_lifecycle_fallback,
                     ), controller._Controller__model_lock:
-                        controller._Controller__model.clear_active_progress_overlays()
+                        clear_overlays_for_replacement()
                         controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
                         pair_adopter(
                             controller._Controller__model,
@@ -6996,6 +7114,7 @@ class ModelUpdater(_ControllerCoreAccess):
                             applied_builder_invalidation_tokens,
                         )
                         synchronize_applied_model_overlay_generation()
+                        restore_direct_overlays_after_replacement()
                         authoritative_pair_delta_applied = True
                         progressive_source_buckets_adopted = True
                         refresh_identities = getattr(
@@ -7063,7 +7182,7 @@ class ModelUpdater(_ControllerCoreAccess):
         if global_full_build_triggered:
             try:
                 with controller._Controller__model_lock:
-                    controller._Controller__model.clear_active_progress_overlays()
+                    clear_overlays_for_replacement()
                     controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
                     model_builder.adopt_applied_model(
                         new_model,
@@ -7071,6 +7190,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         applied_builder_invalidation_tokens,
                     )
                     synchronize_applied_model_overlay_generation()
+                    restore_direct_overlays_after_replacement()
                     refresh_identities = getattr(
                         controller, "_refresh_model_file_command_identities_locked", None
                     )
