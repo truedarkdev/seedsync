@@ -2728,13 +2728,6 @@ class ModelUpdater(_ControllerCoreAccess):
         if ModelUpdater._pending_completion_floor_reset(new_file):
             return
 
-        # A parsed PGET sidecar is physical proof that the retired transfer is
-        # incomplete and resumable.  It releases the pending-completion
-        # presentation transaction at the caller's lifecycle boundary rather
-        # than allowing a Builder snapshot to do so speculatively.
-        if new_file.resume_checkpoint_present and not new_file.explicitly_stopped:
-            return
-
         # A pending completion can be invalidated when a healthy local scan
         # proves that the file reset/disappeared.  Keep that genuine reset
         # visible instead of copying the prior transfer checkpoint into the
@@ -2839,8 +2832,6 @@ class ModelUpdater(_ControllerCoreAccess):
     def _pending_completion_floor_reset(new_file: ModelFile) -> bool:
         """Recognize explicit stop/zero evidence that revokes a retired floor."""
         if new_file.explicitly_stopped:
-            return True
-        if new_file.resume_checkpoint_present:
             return True
         if new_file.remote_size is None or new_file.remote_size <= 0:
             return False
@@ -4699,7 +4690,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 retired_job_identities = {}
         # Revoke stale admitted projections before completion capture.  A
         # newer active job must win even when no pending floor exists yet.
-        self._clear_replaced_admitted_progress_publications(lftp_statuses)
+        self._clear_replaced_admitted_progress_publications(raw_lftp_statuses)
         completion_snapshot_evictions = self._handle_lftp_completion_detection(
             current_downloading_file_names,
             lftp_status_poll_healthy or bool(lftp_statuses),
@@ -4712,7 +4703,7 @@ class ModelUpdater(_ControllerCoreAccess):
             lftp_status_source=lftp_status_source,
             lftp_status_poll_correlation=lftp_status_poll_correlation,
         )
-        self._clear_replaced_pending_completion_floors(lftp_statuses)
+        self._clear_replaced_pending_completion_floors(raw_lftp_statuses)
         controller._Controller__active_downloading_file_names = current_downloading_file_names
         if controller._Controller__malformed_status_only_file_ids != previous_malformed_status_only_file_ids:
             controller._Controller__next_lftp_status_poll_at = None
@@ -6587,20 +6578,12 @@ class ModelUpdater(_ControllerCoreAccess):
                 return callable(identity_proof) and identity_proof(file_id) is True
 
             def candidate_has_resumable_checkpoint(file_id: str) -> bool:
-                """Recognize physical proof that a retired transfer is incomplete.
+                """Require this update's physical active-scan sidecar proof.
 
-                The candidate can still carry ModelBuilder's recent LFTP
-                snapshot, so inspect the authoritative active-scan result as
-                well as the built root.  A valid sidecar means the row must
-                return to its ordinary Queue-resumable lifecycle rather than
-                retaining a completion publication indefinitely.
+                Candidate fields can be reconstructed from a retained Builder
+                snapshot after the sidecar has disappeared.  They are useful
+                diagnostics but cannot revoke the retired-job publication.
                 """
-                try:
-                    candidate_file = new_model.get_file(file_id)
-                except ModelError:
-                    candidate_file = None
-                if bool(getattr(candidate_file, "resume_checkpoint_present", False)):
-                    return True
                 if latest_active_scan is None or bool(getattr(latest_active_scan, "failed", False)):
                     return False
                 for scanned_file in getattr(latest_active_scan, "files", ()):
@@ -7054,9 +7037,46 @@ class ModelUpdater(_ControllerCoreAccess):
                 for pending_file_id in pending_completion_file_ids():
                     if not candidate_has_resumable_checkpoint(pending_file_id):
                         continue
+                    release_identity = self._pending_completion_provenance_identity(
+                        controller, pending_file_id,
+                    )
+                    # A current Builder snapshot can belong to a newer job
+                    # with the same file id. Passive sidecar release is only
+                    # safe when this pending transaction retained its own
+                    # exact retirement provenance.
+                    if release_identity is None:
+                        continue
+                    # Presentation filtering may hide a malformed-status row,
+                    # but it cannot erase a newer authoritative transport
+                    # identity. Include pending Queue display rows as well;
+                    # their synthetic identities are rejected below.
+                    replacement_active = any(
+                        getattr(status, "file_id", None) == pending_file_id and
+                        getattr(status, "state", None) in (
+                            LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING,
+                        ) and type(getattr(status, "id", None)) is int and
+                        getattr(status, "id") >= 0 and
+                        isinstance(getattr(getattr(status, "type", None), "value", None), str) and
+                        bool(getattr(status.type, "value", None)) and
+                        (status.id, status.type.value) != release_identity
+                        for status in list(raw_lftp_statuses) + list(displayed_lftp_statuses)
+                    )
+                    if replacement_active:
+                        continue
                     self._clear_pending_completion_progress_floor(
                         controller, pending_file_id,
                     )
+                    evict_snapshots = getattr(
+                        model_builder,
+                        "evict_recent_live_transfer_snapshots_for_completed_file_ids",
+                        None,
+                    )
+                    if callable(evict_snapshots):
+                        evict_snapshots(
+                            {pending_file_id},
+                            retired_job_identities={pending_file_id: release_identity},
+                            release_resumable_checkpoint_file_ids={pending_file_id},
+                        )
                     try:
                         recovery_file = new_model.get_file(pending_file_id)
                     except ModelError:

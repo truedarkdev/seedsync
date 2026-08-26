@@ -5794,6 +5794,7 @@ class ModelBuilder:
             self, completed_file_ids: Set[str],
             preserve_file_ids: Optional[Set[str]] = None,
             retired_job_identities: Optional[Mapping[str, tuple[int, str]]] = None,
+            release_resumable_checkpoint_file_ids: Optional[Set[str]] = None,
     ) -> None:
         """Discard live progress only after an authoritative completion handoff.
 
@@ -5817,6 +5818,10 @@ class ModelBuilder:
         )
         preserved_file_ids = {
             file_id for file_id in (preserve_file_ids or set())
+            if isinstance(file_id, str)
+        }
+        release_checkpoint_file_ids = {
+            file_id for file_id in (release_resumable_checkpoint_file_ids or set())
             if isinstance(file_id, str)
         }
         root_file_ids_to_evict: set[str] = set()
@@ -5854,7 +5859,9 @@ class ModelBuilder:
                     # or inherit the wrong lifecycle's snapshot.
                     if not expected_identities or snapshot_identity not in expected_identities:
                         continue
-                if self.__is_pending_staging_pget_snapshot(file_id, snapshot):
+                if self.__is_pending_staging_pget_snapshot(file_id, snapshot) and \
+                        file_id not in release_checkpoint_file_ids and \
+                        snapshot.root_file_id not in release_checkpoint_file_ids:
                     # A healthy status retirement only starts the physical
                     # completion handoff.  Keep the accepted same-job PGET
                     # floor while its staging target is still incomplete;

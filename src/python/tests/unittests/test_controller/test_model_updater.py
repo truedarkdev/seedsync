@@ -9195,8 +9195,8 @@ class TestModelUpdater(unittest.TestCase):
         self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
         self.assertNotIn(file_id, controller._Controller__persist.downloaded_file_names)
 
-    def test_v092_pending_completion_retains_latest_same_job_floor_until_scan_catches_up(self):
-        """Retirement must not expose a lower staging checkpoint as Stopped."""
+    def test_v092_pending_completion_rejects_stale_builder_sidecar_checkpoint(self):
+        """A retained candidate sidecar flag is not fresh physical release proof."""
         remote = SystemFile("pending.bin", 100, False, mtime_ns=1)
         local = SystemFile("pending.bin", 93, False, is_staging=True, mtime_ns=1)
         local.status_sidecar_ready = True
@@ -9218,6 +9218,15 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__prev_downloading_file_names = {
             ("pending.bin", None, None),
         }
+        file_id = ModelFile.build_file_id("pending.bin", None)
+        identity = (running.id, running.type.value)
+        controller._Controller__pending_completion_file_names = {("pending.bin", None, None)}
+        controller._Controller__pending_completion_progress_floors = {file_id: (99, 99)}
+        controller._Controller__pending_completion_progress_floor_identities = {file_id: identity}
+        controller._Controller__pending_completion_progress_floor_overlay_ids = {file_id}
+        controller._Controller__pending_completion_publications = {
+            file_id: _PendingCompletionPublication(ActiveProgressOverlay(99, 99, None, None), identity),
+        }
         controller._Controller__lftp.status.return_value = []
         controller._Controller__lftp.last_status_poll_healthy = True
         controller._Controller__move_from_staging = MagicMock()
@@ -9232,8 +9241,8 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__move_from_staging.assert_not_called()
         self.assertNotIn("pending.bin", controller._Controller__persist.downloaded_file_names)
 
-    def test_v092_pending_completion_retains_floor_when_staging_first_appears_in_active_scan(self):
-        """Completion eviction waits for the same-tick active staging source."""
+    def test_v092_pending_completion_fresh_active_sidecar_releases_and_evicts_snapshot(self):
+        """Fresh physical sidecar proof releases the retired job exactly once."""
         remote = SystemFile("pending.bin", 100, False, mtime_ns=1)
         running = LftpJobStatus(
             1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
@@ -9252,6 +9261,15 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__prev_downloading_file_names = {
             ("pending.bin", None, None),
         }
+        file_id = ModelFile.build_file_id("pending.bin", None)
+        identity = (running.id, running.type.value)
+        controller._Controller__pending_completion_file_names = {("pending.bin", None, None)}
+        controller._Controller__pending_completion_progress_floors = {file_id: (99, 99)}
+        controller._Controller__pending_completion_progress_floor_identities = {file_id: identity}
+        controller._Controller__pending_completion_progress_floor_overlay_ids = {file_id}
+        controller._Controller__pending_completion_publications = {
+            file_id: _PendingCompletionPublication(ActiveProgressOverlay(99, 99, None, None), identity),
+        }
         controller._Controller__lftp.status.return_value = []
         controller._Controller__lftp.last_status_poll_healthy = True
         staged = SystemFile("pending.bin", 93, False, is_staging=True, mtime_ns=1)
@@ -9264,9 +9282,8 @@ class TestModelUpdater(unittest.TestCase):
         ModelUpdater(controller).update()
 
         file = live_model.get_file("pending.bin")
-        self.assertEqual(ModelFile.State.DOWNLOADING, file.state)
-        self.assertEqual(99, file.transferred_size)
-        self.assertIn(
+        self.assertEqual(ModelFile.State.DEFAULT, file.state)
+        self.assertNotIn(
             "pending.bin",
             builder._ModelBuilder__recent_live_transfer_snapshots,
         )
@@ -12117,12 +12134,18 @@ class TestModelUpdater(unittest.TestCase):
         later_incomplete.transferred_size = 980
         later_incomplete.download_progress = 98
         later_incomplete.state = ModelFile.State.DEFAULT
+        # Builder may carry a stale parsed-sidecar flag after the physical
+        # sidecar has disappeared. It is diagnostic until this update's
+        # active scan proves the exact sidecar again.
+        later_incomplete.resume_checkpoint_present = True
         ModelUpdater._apply_pending_completion_progress_floor(
             later_incomplete, {file_id}, 100, 1000, {file_id}, publication_file_ids,
         )
         self.assertEqual(ModelFile.State.DOWNLOADING, later_incomplete.state)
         self.assertEqual(100, later_incomplete.download_progress)
         self.assertNotEqual("stopped", Controller._model_record_visible_state(later_incomplete))
+        self.assertIn(file_id, controller._Controller__pending_completion_publications)
+        self.assertEqual(identity, model.published_file_job_identity(file_id))
 
     def test_no_diff_terminal_completion_clears_provenance_before_late_same_identity_retirement(self):
         """A no-diff terminal handoff cannot be reused by a late retirement."""
@@ -12394,10 +12417,19 @@ class TestModelUpdater(unittest.TestCase):
         replacement.transferred_size = 320
         replacement.download_progress = 32
         replacement.state = ModelFile.State.DEFAULT
+        replacement.resume_checkpoint_present = True
         candidate = Model()
         candidate.add_file(replacement)
         builder.has_changes = MagicMock(return_value=True)
         builder.build_model = MagicMock(return_value=candidate)
+        active_replacement = SystemFile(file_name, 320, False, is_staging=True, mtime_ns=1)
+        active_replacement.status_sidecar_ready = True
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [active_replacement], scanned_path_pair_ids={None}, is_scan_final=True,
+        )
+        # Presentation filtering must not hide B from passive-release
+        # replacement fencing.
+        controller._Controller__malformed_status_only_file_ids = {file_id}
 
         with patch(
                 "controller.model_updater.ModelDiffUtil.diff_models",
