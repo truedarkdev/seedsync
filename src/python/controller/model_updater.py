@@ -4995,10 +4995,13 @@ class ModelUpdater(_ControllerCoreAccess):
         retry_now = datetime.now()
         # A pending completion can become move-authoritative without changing
         # the rendered model: for example, the physical scan proof may arrive
-        # before the matching Path Pair reconciliation is recorded.  Wake one
+        # before the matching Path Pair reconciliation is recorded.  Wake a
         # full build on that false-to-true edge so the pending lifecycle pass
-        # can re-evaluate it.  Keep this edge-triggered and fail-closed; the
-        # regular pending loop remains the only place that can attempt a move.
+        # can re-evaluate it.  The retained ids are acknowledgements from that
+        # lifecycle pass, not from this pre-build observation: authority can
+        # change while the candidate is being built, and acknowledging the
+        # wake early would suppress the one later build that sees its stable
+        # authority snapshot.
         current_pending_completion_ids = {
             ModelFile.build_file_id(file_name, path_pair_id)
             for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
@@ -5066,7 +5069,6 @@ class ModelUpdater(_ControllerCoreAccess):
             if pending_completion_authority_available(file_id):
                 if file_id not in pending_authority_rebuild_ids:
                     authority_wake_ids.add(file_id)
-                pending_authority_rebuild_ids.add(file_id)
             else:
                 pending_authority_rebuild_ids.discard(file_id)
         if authority_wake_ids:
@@ -6348,22 +6350,34 @@ class ModelUpdater(_ControllerCoreAccess):
                 try:
                     pending_file = new_model.get_file(file_id)
                 except ModelError:
+                    pending_authority_rebuild_ids.discard(file_id)
                     return False
                 path_pair_id = pending_file.path_pair_id
                 if path_pair_id not in reconciled_local_path_pair_ids or \
                         path_pair_id not in reconciled_remote_path_pair_ids:
+                    pending_authority_rebuild_ids.discard(file_id)
                     return False
                 if not lftp_status_poll_healthy or not bool(getattr(
                         controller, "_Controller__lftp_idle_status_authoritative", False
                 )):
+                    pending_authority_rebuild_ids.discard(file_id)
                     return False
                 if file_id in active_lftp_status_file_ids or (
                         path_pair_id is not None and
                         pending_file.name in active_unscoped_lftp_status_names
                 ):
+                    pending_authority_rebuild_ids.discard(file_id)
                     return False
-                return candidate_verified_staging_identity(file_id) and \
+                # This is the sole acknowledgement point for the wake. It
+                # records that this candidate evaluated a stable completion
+                # authority snapshot; identity and coverage are deliberately
+                # separate physical-move gates. Otherwise an authoritative
+                # but incomplete staging tree would request a rebuild on
+                # every quiet update instead of waiting for fresh scan input.
+                pending_authority_rebuild_ids.add(file_id)
+                authorized = candidate_verified_staging_identity(file_id) and \
                     candidate_complete_local_coverage(file_id)
+                return authorized
 
             def candidate_has_actionable_unrelated_retry(file_id: str) -> bool:
                 """Keep a stale durable marker from invalidating a pair candidate.

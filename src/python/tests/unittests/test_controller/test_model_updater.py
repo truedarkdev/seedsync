@@ -9745,6 +9745,81 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual({file_id}, controller._Controller__persist.downloaded_file_names)
         self.assertNotIn(file_id, controller._Controller__persist.stopped_file_names)
 
+    def test_v092_pending_completion_wake_is_acknowledged_after_candidate_authority(self):
+        """A pre-build wake must not consume an authority change mid-build."""
+        controller = self._make_v092_pending_completion_controller()
+        builder = controller._Controller__model_builder
+        file_id = ModelFile.build_file_id("pending.bin", None)
+        original_build_model = builder.build_model
+        lose_idle_authority_once = True
+
+        def build_after_idle_authority_is_lost():
+            nonlocal lose_idle_authority_once
+            # The pre-build check sees the previous idle observation, but the
+            # lifecycle candidate must use the later authoritative state.
+            if lose_idle_authority_once:
+                controller._Controller__lftp_idle_status_authoritative = False
+                lose_idle_authority_once = False
+            return original_build_model()
+
+        with patch.object(builder, "request_rebuild", wraps=builder.request_rebuild) as request_rebuild, \
+                patch.object(builder, "build_model", side_effect=build_after_idle_authority_is_lost), \
+                patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+
+            self.assertEqual(1, request_rebuild.call_count)
+            controller._Controller__move_from_staging.assert_not_called()
+            self.assertNotIn(
+                file_id, controller._Controller__pending_completion_authority_rebuild_ids,
+            )
+
+            # The next stable idle authority observation needs exactly one
+            # catch-up build and exactly one pending final-move attempt.
+            controller._Controller__lftp_idle_status_authoritative = True
+            ModelUpdater(controller).update()
+
+        self.assertEqual(2, request_rebuild.call_count)
+        controller._Controller__move_from_staging.assert_called_once_with("pending.bin", None)
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        self.assertEqual({file_id}, controller._Controller__persist.downloaded_file_names)
+
+    def test_v092_pending_completion_authority_wake_waits_for_new_physical_proof(self):
+        """An evaluated but incomplete candidate must not wake every quiet tick."""
+        controller = self._make_v092_pending_completion_controller(complete=False)
+        builder = controller._Controller__model_builder
+        file_id = ModelFile.build_file_id("pending.bin", None)
+
+        with patch.object(builder, "request_rebuild", wraps=builder.request_rebuild) as request_rebuild, \
+                patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+            self.assertEqual(1, request_rebuild.call_count)
+            controller._Controller__move_from_staging.assert_not_called()
+            self.assertIn(
+                file_id, controller._Controller__pending_completion_authority_rebuild_ids,
+            )
+
+            # The same authority snapshot with an incomplete physical tree is
+            # already evaluated; only a new candidate/authority edge may wake
+            # another full build.
+            ModelUpdater(controller).update()
+            self.assertEqual(1, request_rebuild.call_count)
+            controller._Controller__move_from_staging.assert_not_called()
+
+            controller._Controller__reconciled_local_path_pair_ids = set()
+            ModelUpdater(controller).update()
+            self.assertNotIn(
+                file_id, controller._Controller__pending_completion_authority_rebuild_ids,
+            )
+
+            controller._Controller__reconciled_local_path_pair_ids = {None}
+            ModelUpdater(controller).update()
+
+        self.assertEqual(2, request_rebuild.call_count)
+        controller._Controller__move_from_staging.assert_not_called()
+        self.assertIn(
+            ("pending.bin", None, None), controller._Controller__pending_completion_file_names,
+        )
+
     def test_v092_pending_completion_failure_retries_after_existing_delay(self):
         controller = self._make_v092_pending_completion_controller()
         controller._Controller__move_from_staging.side_effect = [
