@@ -118,6 +118,49 @@ class TestLftpJobStatusParser(unittest.TestCase):
         statuses = parser.parse(output)
         self.assertEqual(0, len(statuses))
 
+    def test_bracketed_status_command_echo_is_rejected(self):
+        parser = LftpJobStatusParser()
+
+        with self.assertRaises(LftpJobStatusParserError):
+            parser.parse("[2] jobs -v &\n")
+
+    def test_malformed_queue_header_remains_an_empty_snapshot(self):
+        output = (
+            "jobs -v\n"
+            "[0] queue (not-a-queue-url)\n"
+            "not-a-queue-header\n"
+        )
+        parser = LftpJobStatusParser()
+
+        self.assertEqual([], parser.parse(output))
+
+    def test_valid_active_snapshot_is_preserved(self):
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/remote\n"
+            "Queue is running.\n"
+            "[1] mirror -c /remote/sample-directory /local/staging/ -- 10/20 (50%)\n"
+        )
+        parser = LftpJobStatusParser()
+
+        statuses = parser.parse(output)
+
+        self.assertEqual(1, len(statuses))
+        self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
+        self.assertEqual("sample-directory", statuses[0].name)
+
+    def test_genuine_empty_snapshot_remains_empty(self):
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/remote\n"
+            "[0] Done (queue (sftp://someone:@localhost))\n"
+        )
+        parser = LftpJobStatusParser()
+
+        self.assertEqual([], parser.parse(output))
+
     def test_queue_command_echo_before_jobs_marker_is_rejected(self):
         output = (
             "queue mirror -c \"/remote/sample-directory\" \"/local/staging/\"\n"

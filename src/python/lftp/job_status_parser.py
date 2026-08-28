@@ -41,6 +41,7 @@ class LftpJobStatusParser:
     __QUEUE_DONE_REGEX = r"^\[(?P<id>\d+)\]\sDone\s\(queue\s\(.+\)\)"
     __QUEUE_COMMAND_ECHO_REGEX = r"^queue\s+(?:mirror|pget|get)(?:\s|$)"
     __STATUS_COMMAND_ECHO_MARKER = "jobs -v"
+    __STATUS_COMMAND_ECHO_BRACKETED_LINE_REGEX = re.compile(r"^\[\d+\]\s+jobs -v(?:\s+&)?$")
     __STATUS_COMMAND_ECHO_STRUCTURED_LINE_REGEX = re.compile(
         r"^(?:"
         r"\[\d+\]\s+(?:queue|pget|get|mirror|Done)\b|"
@@ -171,6 +172,10 @@ class LftpJobStatusParser:
                 "\x1b[?2004l",
             }
         ]
+        if any(LftpJobStatusParser.__STATUS_COMMAND_ECHO_BRACKETED_LINE_REGEX.match(line) for line in lines):
+            raise LftpJobStatusParserError(
+                "Lftp status output contained a bracketed status command echo"
+            )
         # A queue command echoed before the status command is still part of
         # the captured framing. Check it before slicing away the preamble so
         # it cannot become a healthy empty snapshot.
