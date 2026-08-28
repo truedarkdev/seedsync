@@ -10052,11 +10052,19 @@ class Controller:
                         file
                     )
                     continue
-                try:
-                    artifact_paths, artifact_root = self.__delete_local_artifact_plan(file)
-                except LftpError as error:
-                    _notify_failure(command, str(error), 409, file)
-                    continue
+                if file.is_dir:
+                    try:
+                        self.__canonical_relative_transfer_path(file)
+                    except LftpError as error:
+                        _notify_failure(command, str(error), 409, file)
+                        continue
+                    artifact_paths, artifact_root = (), None
+                else:
+                    try:
+                        artifact_paths, artifact_root = self.__delete_local_artifact_plan(file)
+                    except LftpError as error:
+                        _notify_failure(command, str(error), 409, file)
+                        continue
 
                 delete_primary = file.local_size is not None
                 if file.local_size is None:

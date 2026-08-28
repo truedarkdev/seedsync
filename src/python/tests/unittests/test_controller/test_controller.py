@@ -7818,6 +7818,214 @@ class TestController(unittest.TestCase):
             file_name="dup"
         )
 
+    def test_process_commands_delete_local_staged_directory_skips_file_artifact_planner(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            staged_directory = os.path.join(staging_root, "sample-directory")
+            os.makedirs(os.path.join(staged_directory, "nested"))
+            Path(os.path.join(staged_directory, "nested", "payload.bin")).write_bytes(b"payload")
+            Path(os.path.join(staged_directory, "nested", "payload.bin.lftp")).write_bytes(b"partial")
+            Path(os.path.join(staged_directory, "nested", "payload.bin.lftp-pget-status")).write_text(
+                "status", encoding="utf-8"
+            )
+
+            file = ModelFile("sample-directory", True)
+            file.path_pair_id = "movies"
+            file.local_size = 10
+            file.state = ModelFile.State.DEFAULT
+            self.controller._Controller__model.get_file.return_value = file
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(local_path=final_root)
+            }
+            self.controller._Controller__path_pair_staging_paths = {
+                "movies": staging_root
+            }
+            callback = MagicMock()
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+            command.add_callback(callback)
+
+            with patch.object(Controller, "_Controller__delete_local_artifact_plan") as artifact_plan, \
+                    patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+                process = MagicMock()
+                process.is_alive.return_value = False
+                process.propagate_exception.return_value = None
+                delete_local_process.return_value = process
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+                self.controller._Controller__cleanup_commands()
+
+            artifact_plan.assert_not_called()
+            delete_local_process.assert_called_once_with(
+                local_path=staging_root,
+                file_name="sample-directory",
+            )
+            process.start.assert_called_once_with()
+            callback.on_success.assert_called_once_with()
+            callback.on_failure.assert_not_called()
+
+    def test_process_commands_delete_local_malformed_directory_fails_and_continues(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            os.makedirs(final_root)
+            os.makedirs(staging_root)
+
+            malformed = ModelFile("../malformed", True)
+            malformed.path_pair_id = "movies"
+            malformed.local_size = 10
+            normal = ModelFile("normal.bin", False)
+            normal.path_pair_id = "movies"
+            normal.local_size = 10
+            model_files = {malformed.file_id: malformed, normal.file_id: normal}
+            self.controller._Controller__model.get_file.side_effect = model_files.__getitem__
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(local_path=final_root)
+            }
+            self.controller._Controller__path_pair_staging_paths = {
+                "movies": staging_root
+            }
+            malformed_callback = MagicMock()
+            normal_callback = MagicMock()
+            malformed_command = Controller.Command(
+                Controller.Command.Action.DELETE_LOCAL, malformed.file_id
+            )
+            malformed_command.add_callback(malformed_callback)
+            normal_command = Controller.Command(
+                Controller.Command.Action.DELETE_LOCAL, normal.file_id
+            )
+            normal_command.add_callback(normal_callback)
+
+            with patch.object(
+                Controller,
+                "_Controller__delete_local_artifact_plan",
+                return_value=((), None),
+            ) as artifact_plan, patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+                process = MagicMock()
+                process.is_alive.return_value = False
+                process.propagate_exception.return_value = None
+                delete_local_process.return_value = process
+                self.controller.queue_command(malformed_command)
+                self.controller.queue_command(normal_command)
+                self.controller._Controller__process_commands()
+                self.controller._Controller__cleanup_commands()
+
+            malformed_callback.on_success.assert_not_called()
+            malformed_callback.on_failure.assert_called_once()
+            self.assertEqual(409, malformed_callback.on_failure.call_args.args[1])
+            artifact_plan.assert_called_once_with(normal)
+            delete_local_process.assert_called_once_with(
+                local_path=final_root,
+                file_name="normal.bin",
+            )
+            process.start.assert_called_once_with()
+            normal_callback.on_success.assert_called_once_with()
+            normal_callback.on_failure.assert_not_called()
+
+    def test_process_commands_delete_local_directory_keeps_split_root_rejection(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            os.makedirs(os.path.join(final_root, "sample-directory"))
+            os.makedirs(os.path.join(staging_root, "sample-directory"))
+
+            file = ModelFile("sample-directory", True)
+            file.path_pair_id = "movies"
+            file.local_size = 10
+            file.state = ModelFile.State.DEFAULT
+            self.controller._Controller__model.get_file.return_value = file
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(local_path=final_root)
+            }
+            self.controller._Controller__path_pair_staging_paths = {
+                "movies": staging_root
+            }
+            callback = MagicMock()
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+            command.add_callback(callback)
+
+            with patch.object(Controller, "_Controller__delete_local_artifact_plan") as artifact_plan, \
+                    patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+
+            artifact_plan.assert_not_called()
+            delete_local_process.assert_not_called()
+            callback.on_success.assert_not_called()
+            callback.on_failure.assert_called_once()
+            self.assertEqual(409, callback.on_failure.call_args.args[1])
+
+    def test_process_commands_delete_local_directory_keeps_active_root_rejection(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            os.makedirs(os.path.join(staging_root, "sample-directory"))
+
+            file = ModelFile("sample-directory", True)
+            file.path_pair_id = "movies"
+            file.local_size = 10
+            file.state = ModelFile.State.DEFAULT
+            self.controller._Controller__model.get_file.return_value = file
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(local_path=final_root)
+            }
+            self.controller._Controller__path_pair_staging_paths = {
+                "movies": staging_root
+            }
+            self.controller._Controller__last_lftp_statuses = [
+                SimpleNamespace(file_id=file.file_id, state=LftpJobStatus.State.RUNNING)
+            ]
+            callback = MagicMock()
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+            command.add_callback(callback)
+
+            with patch.object(Controller, "_Controller__delete_local_artifact_plan") as artifact_plan, \
+                    patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+
+            artifact_plan.assert_not_called()
+            delete_local_process.assert_not_called()
+            callback.on_success.assert_not_called()
+            callback.on_failure.assert_called_once()
+            self.assertEqual(409, callback.on_failure.call_args.args[1])
+
+    def test_process_commands_delete_local_regular_file_still_uses_artifact_planner(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            file = ModelFile("sample.bin", False)
+            file.path_pair_id = "movies"
+            file.local_size = 10
+            file.state = ModelFile.State.DEFAULT
+            self.controller._Controller__model.get_file.return_value = file
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(local_path=final_root)
+            }
+            self.controller._Controller__path_pair_staging_paths = {
+                "movies": staging_root
+            }
+
+            with patch.object(
+                Controller,
+                "_Controller__delete_local_artifact_plan",
+                return_value=(("artifact",), staging_root),
+            ) as artifact_plan, patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+                process = MagicMock()
+                delete_local_process.return_value = process
+                command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+
+            artifact_plan.assert_called_once_with(file)
+            delete_local_process.assert_called_once_with(
+                local_path=final_root,
+                file_name="sample.bin",
+                artifact_paths=("artifact",),
+                artifact_root=staging_root,
+            )
+            process.start.assert_called_once_with()
+
     def test_cleanup_commands_delete_local_reports_success_after_process_completion(self):
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
