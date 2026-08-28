@@ -485,8 +485,13 @@ export class ViewFileService {
         const remoteHasTransferableContent: boolean =
             modelFile.remote_has_transferable_content === true;
         const rawTransferredSize: number = modelFile.transferred_size;
-        let transferredSize: number = rawTransferredSize;
-        if (transferredSize == null) {
+        const hasUnknownDownloadingProgress: boolean = modelFile.state === ModelFile.State.DOWNLOADING
+            && modelFile.display_size_total == null
+            && modelFile.display_transferred_size == null
+            && rawTransferredSize == null
+            && modelFile.download_progress == null;
+        let transferredSize: number | null = rawTransferredSize;
+        if (transferredSize == null && !hasUnknownDownloadingProgress) {
             transferredSize = localSize;
         }
         // A live transfer state is authoritative presentation evidence even
@@ -519,9 +524,11 @@ export class ViewFileService {
             displaySizeTotal > 0
             && (transferredSize > 0 || (modelFile.download_progress != null && modelFile.download_progress > 0))
         );
-        let percentDownloaded: number = 0;
+        let percentDownloaded: number | null = 0;
         // Prefer the live transfer percentage for active downloads; fall back to size ratios otherwise.
-        if (hasDisplayUnion && displaySizeTotal > 0) {
+        if (hasUnknownDownloadingProgress) {
+            percentDownloaded = null;
+        } else if (hasDisplayUnion && displaySizeTotal > 0) {
             percentDownloaded = Math.round(100.0 * transferredSize / displaySizeTotal);
         } else if (modelFile.state === ModelFile.State.DOWNLOADING && modelFile.download_progress != null) {
             percentDownloaded = modelFile.download_progress;

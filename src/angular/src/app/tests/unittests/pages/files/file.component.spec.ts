@@ -416,6 +416,61 @@ describe("Testing file component", () => {
         expect(composition.query(By.css(".size_info")).nativeElement.textContent).toContain("of");
     });
 
+    it("should render unavailable downloading progress as an indeterminate accessible bar", () => {
+        fixture.componentInstance.file = createViewFile({
+            status: ViewFile.Status.DOWNLOADING,
+            percentDownloaded: null,
+            transferredSize: null,
+            displaySizeTotal: 1024
+        });
+        fixture.componentInstance.options = of(null) as any;
+
+        fixture.detectChanges();
+
+        const progress = fixture.debugElement.query(By.css(".progress-bar")).nativeElement as HTMLElement;
+        expect(progress.classList.contains("progress-bar-indeterminate")).toBe(true);
+        expect(progress.classList.contains("progress-bar-striped")).toBe(true);
+        expect(progress.classList.contains("progress-bar-animated")).toBe(true);
+        expect(progress.style.width).toBe("100%");
+        expect(progress.hasAttribute("aria-valuenow")).toBe(false);
+        expect(progress.getAttribute("aria-valuenow")).toBeNull();
+        expect(progress.getAttribute("aria-label")).toBe("Download progress unavailable");
+        expect(progress.textContent.trim()).toBe("");
+        expect(fixture.debugElement.query(By.css(".progress-percent"))).toBeNull();
+        expect(fixture.debugElement.query(By.css(".progress-unavailable")).nativeElement.textContent.trim())
+            .toBe("Progress unavailable");
+        expect(fixture.debugElement.query(By.css(".size_info")).nativeElement.textContent.trim())
+            .toBe("Progress unavailable");
+        expect(fixture.nativeElement.textContent).not.toContain("?");
+        expect(fixture.debugElement.query(By.css(".speed-eta span"))).toBeNull();
+        expect(fixture.debugElement.query(By.css(".eta span"))).toBeNull();
+    });
+
+    it("should render recovered and terminal progress as determinate bars", () => {
+        const cases = [
+            {percentDownloaded: 18, expectedWidth: "18%", expectedLabel: null},
+            {percentDownloaded: 100, expectedWidth: "100%", expectedLabel: null}
+        ];
+
+        for (const testCase of cases) {
+            fixture.componentRef.setInput("file", createViewFile({
+                status: ViewFile.Status.DOWNLOADING,
+                percentDownloaded: testCase.percentDownloaded,
+                transferredSize: testCase.percentDownloaded,
+                displaySizeTotal: 100
+            }));
+            fixture.componentRef.setInput("options", of(null) as any);
+            fixture.detectChanges();
+
+            const progress = fixture.debugElement.query(By.css(".progress-bar")).nativeElement as HTMLElement;
+            expect(progress.classList.contains("progress-bar-indeterminate")).toBe(false);
+            expect(progress.style.width).toBe(testCase.expectedWidth);
+            expect(progress.getAttribute("aria-valuenow")).toBe(String(testCase.percentDownloaded));
+            expect(progress.getAttribute("aria-label")).toBe(testCase.expectedLabel);
+            expect(progress.textContent.trim()).toBe(`${testCase.percentDownloaded}%`);
+        }
+    });
+
     it("should clear the active action when resetActiveAction is called", () => {
         component.activeAction = FileAction.STOP;
 

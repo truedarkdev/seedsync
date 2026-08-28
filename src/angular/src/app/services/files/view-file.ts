@@ -16,9 +16,9 @@ interface IViewFile {
     localPresent: boolean;
     remoteHasTransferableContent: boolean;
     isLocalOnly: boolean;
-    transferredSize: number;
+    transferredSize: number | null;
     displaySizeTotal: number;
-    percentDownloaded: number;
+    percentDownloaded: number | null;
     status: ViewFile.Status;
     downloadingSpeed: number;
     eta: number;
@@ -99,9 +99,9 @@ export class ViewFile extends ViewFileRecord implements IViewFile {
     localPresent: boolean;
     remoteHasTransferableContent: boolean;
     isLocalOnly: boolean;
-    transferredSize: number;
+    transferredSize: number | null;
     displaySizeTotal: number;
-    percentDownloaded: number;
+    percentDownloaded: number | null;
     status: ViewFile.Status;
     downloadingSpeed: number;
     eta: number;

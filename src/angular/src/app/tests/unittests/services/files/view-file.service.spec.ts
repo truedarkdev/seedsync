@@ -275,7 +275,7 @@ describe("Testing view file service", () => {
                 local_size: 24,
                 remote_size: 100,
                 transferred_size: null,
-                expected: 24
+                expected: null
             }
         ];
 
@@ -305,6 +305,120 @@ describe("Testing view file service", () => {
             tick();
         }
         expect(count).toBe(testVectors.length);
+    }));
+
+    it("should keep active progress indeterminate when all progress authority is absent", fakeAsync(() => {
+        const observed: ViewFile[] = [];
+        viewService.files.subscribe(files => {
+            if (files.size === 1) {
+                observed.push(files.get(0));
+            }
+        });
+        tick();
+
+        for (const localSize of [11, 4]) {
+            mockModelService._files.next(Immutable.Map<string, ModelFile>().set("same-file", new ModelFile({
+                file_id: "same-file",
+                name: "same-file",
+                state: ModelFile.State.DOWNLOADING,
+                local_size: localSize,
+                remote_size: 100,
+                remote_present: true,
+                local_present: true,
+                remote_has_transferable_content: true,
+                transferred_size: null,
+                download_progress: null,
+                display_size_total: null,
+                display_transferred_size: null
+            })));
+            tick();
+        }
+
+        expect(observed.map(file => file.localSize)).toEqual([11, 4]);
+        expect(observed.map(file => file.transferredSize)).toEqual([null, null]);
+        expect(observed.map(file => file.percentDownloaded)).toEqual([null, null]);
+        expect(observed.every(file => file.status === ViewFile.Status.DOWNLOADING)).toBe(true);
+        expect(observed.every(file => file.displaySizeTotal === 100)).toBe(true);
+    }));
+
+    it("should recover determinate progress from raw or paired display authority", fakeAsync(() => {
+        let latest: ViewFile = null;
+        viewService.files.subscribe(files => {
+            if (files.size === 1) {
+                latest = files.get(0);
+            }
+        });
+        tick();
+
+        const models = [
+            {
+                transferred_size: 18,
+                download_progress: null,
+                display_size_total: null,
+                display_transferred_size: null,
+                expectedTransferred: 18,
+                expectedPercent: 18
+            },
+            {
+                transferred_size: null,
+                download_progress: null,
+                display_size_total: 200,
+                display_transferred_size: 30,
+                expectedTransferred: 30,
+                expectedPercent: 15
+            }
+        ];
+
+        for (const model of models) {
+            mockModelService._files.next(Immutable.Map<string, ModelFile>().set("same-file", new ModelFile({
+                file_id: "same-file",
+                name: "same-file",
+                state: ModelFile.State.DOWNLOADING,
+                local_size: 4,
+                remote_size: 100,
+                remote_present: true,
+                local_present: true,
+                remote_has_transferable_content: true,
+                transferred_size: model.transferred_size,
+                download_progress: model.download_progress,
+                display_size_total: model.display_size_total,
+                display_transferred_size: model.display_transferred_size
+            })));
+            tick();
+
+            expect(latest.transferredSize).toBe(model.expectedTransferred);
+            expect(latest.percentDownloaded).toBe(model.expectedPercent);
+        }
+    }));
+
+    it("should keep terminal downloaded progress at 100 when counters are unavailable", fakeAsync(() => {
+        mockModelService._files.next(Immutable.Map<string, ModelFile>().set("complete", new ModelFile({
+            file_id: "complete",
+            name: "complete",
+            state: ModelFile.State.DOWNLOADED,
+            local_size: 100,
+            remote_size: 100,
+            remote_present: true,
+            local_present: true,
+            remote_has_transferable_content: true,
+            transferred_size: null,
+            download_progress: null,
+            display_size_total: null,
+            display_transferred_size: null,
+            complete_local_coverage: true
+        })));
+        tick();
+
+        let latest: ViewFile = null;
+        viewService.files.subscribe(files => {
+            if (files.size === 1) {
+                latest = files.get(0);
+            }
+        });
+        tick();
+
+        expect(latest.status).toBe(ViewFile.Status.DOWNLOADED);
+        expect(latest.percentDownloaded).toBe(100);
     }));
 
     it("should correctly set the ViewFile status", fakeAsync(() => {
@@ -426,7 +540,7 @@ describe("Testing view file service", () => {
         let testVectors = [
             [24, 100, ModelFile.State.DEFAULT, 60, 60],
             [24, 100, ModelFile.State.DOWNLOADING, 60, 60],
-            [24, 100, ModelFile.State.DOWNLOADING, null, 24],
+            [24, 100, ModelFile.State.DOWNLOADING, null, null],
             [null, 100, ModelFile.State.DOWNLOADING, 60, 60],
             [0, 0, ModelFile.State.DEFAULT, 60, 0]
         ];

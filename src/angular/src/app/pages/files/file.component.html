@@ -98,17 +98,22 @@
             </span>
             <!-- for mobile layout -->
             <div class="speed-eta">
-                <span *ngIf="file.status === ViewFile.Status.DOWNLOADING">eta: {{file.eta | eta}}</span>
+                <span *ngIf="file.status === ViewFile.Status.DOWNLOADING && file.percentDownloaded != null">
+                    eta: {{file.eta | eta}}
+                </span>
             </div>
         </div>
         <!-- for desktop layout -->
         <div class="eta">
-            <span *ngIf="file.status === ViewFile.Status.DOWNLOADING">{{file.eta | eta}}</span>
+            <span *ngIf="file.status === ViewFile.Status.DOWNLOADING && file.percentDownloaded != null">
+                {{file.eta | eta}}
+            </span>
         </div>
         <div class="size">
             <div class="progress-composition">
                 <div class="progress">
                     <div class="progress-bar" role="progressbar"
+                         [class.progress-bar-indeterminate]="file.percentDownloaded == null"
                          [class.progress-bar-animated]="
                             file.status === ViewFile.Status.DOWNLOADING ||
                             file.status === ViewFile.Status.EXTRACTING
@@ -118,16 +123,26 @@
                             file.status === ViewFile.Status.EXTRACTING
                          "
                          [attr.aria-valuenow]="file.percentDownloaded" aria-valuemin="0" aria-valuemax="100"
+                         [attr.aria-label]="file.percentDownloaded == null ? 'Download progress unavailable' : null"
                          [style.width]="
-                            min(file.percentDownloaded,100) + '%'
+                            file.percentDownloaded == null ? '100%' : min(file.percentDownloaded,100) + '%'
                          ">
-                        {{file.percentDownloaded}}%
+                        <ng-container *ngIf="file.percentDownloaded != null">
+                            {{file.percentDownloaded}}%
+                        </ng-container>
                     </div>
                 </div>
                 <div class="progress-meta">
-                    <span class="progress-percent" aria-hidden="true">{{file.percentDownloaded}}%</span>
+                    <span *ngIf="file.percentDownloaded != null" class="progress-percent" aria-hidden="true">
+                        {{file.percentDownloaded}}%
+                    </span>
                     <div class="size_info">
-                        {{file.transferredSize | fileSize:3}} of {{file.displaySizeTotal | fileSize:3}}
+                        <ng-container *ngIf="file.percentDownloaded != null; else progressUnavailable">
+                            {{file.transferredSize | fileSize:3}} of {{file.displaySizeTotal | fileSize:3}}
+                        </ng-container>
+                        <ng-template #progressUnavailable>
+                            <span class="progress-unavailable">Progress unavailable</span>
+                        </ng-template>
                     </div>
                 </div>
             </div>
