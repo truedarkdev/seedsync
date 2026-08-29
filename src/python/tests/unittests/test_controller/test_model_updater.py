@@ -26,6 +26,7 @@ from controller.model_updater import (
     _fresh_unique_replacement_statuses,
     _record_active_delta_rejection_summary,
     _record_lftp_status_breadcrumb,
+    _record_lftp_status_membership_transition,
     _ProgressiveScanAccumulator,
     _JointProgressiveReconciler,
     _filter_progressive_remote_state,
@@ -56,7 +57,7 @@ from common.performance_diagnostics import (
     MODEL_REBUILD_REASON_MOVE_RETRY_DUE,
     PerformanceDiagnosticsCollector,
 )
-from common.breadcrumb_trace import BreadcrumbTraceCollector, trace_session_digest
+from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation, trace_session_digest
 from common.exclude_patterns import ExactPathExclusion
 from controller.scan.scanner_process import ScannerProcess, ScannerResult
 from lftp import LftpJobStatus
@@ -6204,6 +6205,235 @@ class TestModelUpdater(unittest.TestCase):
         controller._lftp_status_authority_context.assert_not_called()
         self.assertEqual([], trace.snapshot()["entries"])
 
+    @staticmethod
+    def _membership_trace_controller(trace):
+        return SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__record_breadcrumb=lambda **kwargs: trace.record(
+                "model_updater", kwargs["message"], kwargs["details"],
+                **{key: value for key, value in kwargs.items() if key not in {"message", "details"}},
+            ),
+        )
+
+    @staticmethod
+    def _membership_trace_events(trace):
+        return [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "lftp_status_membership_transition"
+        ]
+
+    @staticmethod
+    def _membership_token_fields(token):
+        return dict(part.split("=", 1) for part in token.split("|"))
+
+    def test_lftp_membership_trace_gate_precedes_private_status_identity(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"transfer.lftp.membership": "off"}},
+        )
+        controller = self._membership_trace_controller(trace)
+
+        class ExplodingStatus:
+            @property
+            def file_id(self):
+                raise AssertionError("disabled trace must not read status identity")
+
+            @property
+            def job_correlation(self):
+                raise AssertionError("disabled trace must not read job identity")
+
+        _record_lftp_status_membership_transition(
+            controller, [], [ExplodingStatus()], [], previous_malformed_ids=set(),
+            current_malformed_ids=set(), source="fresh_healthy", fresh=True,
+            healthy=True,
+        )
+        self.assertEqual([], trace.snapshot()["entries"])
+
+    def test_lftp_membership_trace_has_distinct_info_policy_from_status_poll(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={
+                "default": "off",
+                "rules": {"transfer.lftp": "off", "transfer.lftp.membership": "info"},
+            },
+        )
+        controller = self._membership_trace_controller(trace)
+        status = SimpleNamespace(
+            file_id="private-target", job_correlation="lftp-job:0123456789abcdef",
+            state=LftpJobStatus.State.RUNNING,
+        )
+
+        _record_lftp_status_membership_transition(
+            controller, [], [status], [status], previous_malformed_ids=set(),
+            current_malformed_ids=set(), source="fresh_healthy", fresh=True,
+            healthy=True,
+        )
+
+        event = self._membership_trace_events(trace)[0]
+        self.assertEqual("transfer.lftp.membership", event["category"])
+        self.assertEqual("info", event["level"])
+
+    def test_lftp_membership_trace_is_opaque_bounded_deterministic_and_edge_triggered(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=None,
+            policy={"default": "off", "rules": {"transfer.lftp.membership": "info"}},
+        )
+        controller = self._membership_trace_controller(trace)
+        statuses = [SimpleNamespace(
+            file_id="private-name/path-{}".format(index),
+            job_correlation="lftp-job:{:016x}".format(index), state=LftpJobStatus.State.RUNNING,
+        ) for index in range(128)]
+        _record_lftp_status_membership_transition(
+            controller, [], statuses, statuses, previous_malformed_ids=set(),
+            current_malformed_ids=set(), source="fresh_healthy", fresh=True,
+            healthy=True, poll_correlation="lftp-poll:0123456789abcdef",
+        )
+        events = self._membership_trace_events(trace)
+        self.assertEqual(8, len(events))
+        self.assertEqual(128, events[0]["details"]["transition_count"])
+        self.assertEqual(8, events[0]["details"]["chunk_count"])
+        tokens = [token for event in events for token in event["details"]["transitions"]]
+        self.assertEqual(128, len(tokens))
+        self.assertEqual(tokens, sorted(tokens))
+        self.assertEqual(opaque_trace_correlation("|".join(tokens)), events[0]["details"]["transition_set_digest"])
+        self.assertEqual({events[0]["details"]["transition_set_digest"]}, {
+            event["details"]["transition_set_digest"] for event in events
+        })
+        self.assertEqual(list(range(8)), [event["details"]["chunk_index"] for event in events])
+        self.assertTrue(all(0 < len(event["details"]["transitions"]) <= 16 for event in events))
+        self.assertTrue(all(token.isascii() and len(token) <= 160 for token in tokens))
+        self.assertNotIn("<truncated>", str(events))
+        self.assertNotIn("private-name", str(events))
+        self.assertTrue(all("lftp-job:" in token for token in tokens))
+        self.assertTrue(all(event["flow_id"] == "lftp-poll:0123456789abcdef" for event in events))
+        _record_lftp_status_membership_transition(
+            controller, statuses, statuses, statuses, previous_malformed_ids=set(),
+            current_malformed_ids=set(), source="fresh_healthy", fresh=True,
+            healthy=True, poll_correlation="lftp-poll:fedcba9876543210",
+        )
+        self.assertEqual(8, len(self._membership_trace_events(trace)))
+
+    def test_lftp_membership_trace_invalid_identity_is_opaque_and_inactive(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"transfer.lftp.membership": "info"}},
+        )
+        controller = self._membership_trace_controller(trace)
+        statuses = [
+            SimpleNamespace(file_id="private/path-sentinel", job_correlation="private-raw-id", state=LftpJobStatus.State.RUNNING),
+            SimpleNamespace(file_id="private/path-state", job_correlation="lftp-job:0123456789abcdef", state=object()),
+            SimpleNamespace(file_id=None, job_correlation="lftp-job:fedcba9876543210", state=LftpJobStatus.State.QUEUED),
+        ]
+        _record_lftp_status_membership_transition(
+            controller, [], statuses, statuses, previous_malformed_ids=set(),
+            current_malformed_ids=set(), source="fresh_healthy", fresh=True, healthy=True,
+        )
+        transitions = self._membership_trace_events(trace)[0]["details"]["transitions"]
+        self.assertEqual(1, len(transitions))
+        fields = self._membership_token_fields(transitions[0])
+        self.assertEqual("u", fields["t"])
+        self.assertEqual("0", fields["c"])
+        self.assertIn("i", fields["n"])
+        self.assertNotIn("private/path", str(self._membership_trace_events(trace)))
+        self.assertNotIn("private-raw-id", str(self._membership_trace_events(trace)))
+
+    def test_lftp_membership_trace_classifies_state_replacement_duplicate_malformed_invalid_and_removal(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=32,
+            policy={"default": "off", "rules": {"transfer.lftp.membership": "info"}},
+        )
+        controller = self._membership_trace_controller(trace)
+
+        def status(job, state=LftpJobStatus.State.RUNNING):
+            return SimpleNamespace(file_id="private-target", job_correlation=job, state=state)
+
+        def emit(previous, raw, filtered=None, malformed=None, previous_malformed=None):
+            before = len(self._membership_trace_events(trace))
+            _record_lftp_status_membership_transition(
+                controller, previous, raw, raw if filtered is None else filtered,
+                previous_malformed_ids=set(previous_malformed or ()),
+                current_malformed_ids=set(malformed or ()),
+                source="fresh_healthy", fresh=True, healthy=True,
+            )
+            entries = self._membership_trace_events(trace)
+            return entries[before]["details"]["transitions"] if len(entries) > before else []
+
+        queued = status("lftp-job:0123456789abcdef", LftpJobStatus.State.QUEUED)
+        running = status("lftp-job:0123456789abcdef")
+        replacement = status("lftp-job:fedcba9876543210")
+        second_job = status("lftp-job:1111111111111111")
+        duplicate = [replacement, replacement]
+        queued_transition = emit([], [queued])[0]
+        queued_fields = self._membership_token_fields(queued_transition)
+        self.assertEqual("added", queued_fields["x"])
+        self.assertEqual("0", queued_fields["c"])
+        running_transition = emit([queued], [running])[0]
+        running_fields = self._membership_token_fields(running_transition)
+        self.assertEqual("queued_to_running", running_fields["x"])
+        self.assertEqual("0", running_fields["p"])
+        self.assertEqual("1", running_fields["c"])
+        replaced = emit([running], [replacement])
+        self.assertIn("replaced", {self._membership_token_fields(token)["x"] for token in replaced})
+        initial_duplicate = emit([], [replacement, second_job])
+        self.assertEqual(
+            {"lftp-job:1111111111111111", "lftp-job:fedcba9876543210"},
+            {fields["j"] for fields in map(self._membership_token_fields, initial_duplicate)
+             if fields["x"] == "job_added"},
+        )
+        second_only = emit([replacement], [replacement, second_job])
+        second_only_fields = [self._membership_token_fields(token) for token in second_only]
+        self.assertEqual(
+            {"lftp-job:1111111111111111"},
+            {fields["j"] for fields in second_only_fields if fields["x"] == "job_added"},
+        )
+        self.assertEqual("duplicate", self._membership_token_fields(emit([replacement], duplicate)[0])["x"])
+        self.assertEqual("malformed", self._membership_token_fields(emit(duplicate, duplicate, [], {"private-target"})[0])["x"])
+        unchanged_malformed_count = len(self._membership_trace_events(trace))
+        self.assertEqual([], emit(duplicate, duplicate, [], {"private-target"}, {"private-target"}))
+        self.assertEqual(unchanged_malformed_count, len(self._membership_trace_events(trace)))
+        invalid = status("private-invalid-job")
+        invalid_fields = self._membership_token_fields(emit([], [invalid])[0])
+        self.assertEqual("u", invalid_fields["t"])
+        self.assertEqual("0", invalid_fields["c"])
+        self.assertIn("i", invalid_fields["n"])
+        invalid_unchanged_count = len(self._membership_trace_events(trace))
+        self.assertEqual([], emit([invalid], [invalid]))
+        self.assertEqual(invalid_unchanged_count, len(self._membership_trace_events(trace)))
+        self.assertEqual("removed", self._membership_token_fields(emit([invalid], [])[0])["x"])
+
+    def test_lftp_membership_trace_recorder_failure_is_isolated(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"transfer.lftp.membership": "info"}},
+        )
+        controller = self._membership_trace_controller(trace)
+        controller._Controller__record_breadcrumb = MagicMock(side_effect=RuntimeError("trace sink"))
+        status = SimpleNamespace(
+            file_id="private-target", job_correlation="lftp-job:0123456789abcdef",
+            state=LftpJobStatus.State.RUNNING,
+        )
+        _record_lftp_status_membership_transition(
+            controller, [], [status], [status], previous_malformed_ids=set(),
+            current_malformed_ids=set(), source="fresh_healthy", fresh=True, healthy=True,
+        )
+
+    def test_lftp_membership_trace_status_property_failure_is_isolated(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"transfer.lftp.membership": "info"}},
+        )
+        controller = self._membership_trace_controller(trace)
+
+        class ExplodingStatus:
+            @property
+            def file_id(self):
+                raise RuntimeError("unexpected status property")
+
+        _record_lftp_status_membership_transition(
+            controller, [], [ExplodingStatus()], [], previous_malformed_ids=set(),
+            current_malformed_ids=set(), source="fresh_healthy", fresh=True, healthy=True,
+        )
+        event = self._membership_trace_events(trace)[0]
+        fields = self._membership_token_fields(event["details"]["transitions"][0])
+        self.assertEqual("u", fields["t"])
+        self.assertEqual("0", fields["c"])
+
     def test_lftp_status_authority_context_distinguishes_pending_done_and_idle(self):
         controller = Controller.__new__(Controller)
         controller._Controller__work_state_lock = RLock()
@@ -6578,7 +6808,11 @@ class TestModelUpdater(unittest.TestCase):
             max_entries=16,
             policy={
                 "default": "off",
-                "rules": {"transfer.lftp": "debug", "completion.gate": "info"},
+                "rules": {
+                    "transfer.lftp": "debug",
+                    "transfer.lftp.membership": "info",
+                    "completion.gate": "info",
+                },
             },
         )
         active_entry = ("sample-transfer.bin", None, None)
@@ -6643,7 +6877,7 @@ class TestModelUpdater(unittest.TestCase):
         )
         running.total_transfer_state = LftpJobStatus.TransferState(10, 10, 100, 100, 0)
         controller._Controller__lftp.backend_name = "lftp"
-        controller._Controller__lftp.status.side_effect = [[running], []]
+        controller._Controller__lftp.status.side_effect = [[running], [running], []]
         # Use the production snapshot/accessor seam with the fixture's
         # synchronous backend shape; only the PTY executor is bypassed.
         controller._Controller__uses_async_lftp_owner = MagicMock(return_value=False)
@@ -6681,9 +6915,16 @@ class TestModelUpdater(unittest.TestCase):
         first_correlation = first_status["details"]["poll_correlation"]
         self.assertEqual("fresh_healthy", first_status["details"]["source"])
         self.assertEqual(1, first_status["details"]["active_count"])
+        first_membership = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "lftp_status_membership_transition"
+        )
+        self.assertEqual(1, len(first_membership["details"]["transitions"]))
+        self.assertIn("|c=1|", first_membership["details"]["transitions"][0])
+        self.assertNotIn("queued", first_membership["details"]["transitions"][0])
 
-        # The active cadence is deliberately forced due to make the second
-        # update a fresh PTY poll rather than a cached tick.
+        # The active cadence is deliberately forced so the second update is a
+        # fresh no-op poll with a distinct correlation.
         controller._Controller__next_lftp_status_poll_at = None
         controller._Controller__lftp_idle_status_authoritative = False
         updater.update()
@@ -6693,8 +6934,26 @@ class TestModelUpdater(unittest.TestCase):
             if entry["message"] == "lftp_status_poll"
         ]
         self.assertEqual(2, len(status_events))
+        no_op_correlation = status_events[-1]["details"]["poll_correlation"]
+        self.assertNotEqual(first_correlation, no_op_correlation)
+        self.assertEqual("fresh_healthy", status_events[-1]["details"]["outcome"])
+        membership_events = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "lftp_status_membership_transition"
+        ]
+        self.assertEqual(1, len(membership_events))
+
+        controller._Controller__next_lftp_status_poll_at = None
+        controller._Controller__lftp_idle_status_authoritative = False
+        updater.update()
+
+        status_events = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "lftp_status_poll"
+        ]
+        self.assertEqual(3, len(status_events))
         second_correlation = status_events[-1]["details"]["poll_correlation"]
-        self.assertNotEqual(first_correlation, second_correlation)
+        self.assertNotEqual(no_op_correlation, second_correlation)
         self.assertEqual("fresh_healthy_empty", status_events[-1]["details"]["outcome"])
         self.assertEqual(0, status_events[-1]["details"]["filtered_status_count"])
 
@@ -6702,6 +6961,16 @@ class TestModelUpdater(unittest.TestCase):
         linked_messages = {entry["message"] for entry in linked}
         self.assertIn("lftp_status_poll", linked_messages)
         self.assertIn("completion_pending_registered", linked_messages)
+        completion = next(
+            entry for entry in linked if entry["message"] == "completion_pending_registered"
+        )
+        self.assertEqual("lftp_job_finished", completion["details"]["reason"])
+        membership = next(
+            entry for entry in linked if entry["message"] == "lftp_status_membership_transition"
+        )
+        self.assertEqual(second_correlation, membership["flow_id"])
+        self.assertIn("|x=removed", membership["details"]["transitions"][0])
+        self.assertIn("|f=0|", membership["details"]["transitions"][0])
         self.assertTrue(all(
             entry["details"].get("poll_correlation") == second_correlation
             for entry in linked

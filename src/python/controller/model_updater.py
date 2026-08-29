@@ -454,6 +454,7 @@ def _progress_counter_bucket(value: object) -> str:
 
 
 _LFTP_STATUS_TRACE_CATEGORY = "transfer.lftp"
+_LFTP_STATUS_MEMBERSHIP_TRACE_CATEGORY = "transfer.lftp.membership"
 _LFTP_STATUS_TRACE_STAGE = "lftp_status"
 _LFTP_STATUS_TRACE_SCHEMA = "lftp_status_authority.v1"
 _LFTP_STATUS_TRACE_CORRELATION = "lftp-status-aggregate"
@@ -704,6 +705,73 @@ def _record_lftp_status_breadcrumb(
             except Exception:
                 pass
 
+def _record_lftp_status_membership_transition(
+        controller: object, previous_statuses: Sequence[object], raw_statuses: Sequence[object],
+        filtered_statuses: Sequence[object], *, previous_malformed_ids: set[str],
+        current_malformed_ids: set[str], source: str, fresh: bool, healthy: bool,
+        poll_correlation: Optional[str] = None,
+) -> None:
+    if getattr(getattr(controller, "_Controller__lftp", None), "backend_name", "lftp") == "rclone":
+        return
+    source = source if isinstance(source, str) and source in _COMPLETION_GATE_LFTP_SOURCES else "unknown"
+    level = "warning" if not healthy or source in _LFTP_STATUS_TRACE_WARNING_OUTCOMES else "info"
+    if not _controller_breadcrumb_effectively_enabled(
+            controller, _LFTP_STATUS_MEMBERSHIP_TRACE_CATEGORY, level,
+    ):
+        return
+    try:
+        recorder = getattr(controller, "_Controller__record_breadcrumb", None)
+        def view(statuses: Sequence[object], malformed_ids: set[str]) -> dict[object, list[object]]:
+            rows: dict[object, list[object]] = {}
+            for status in statuses:
+                try:
+                    file_id, candidate_job, state = (getattr(status, key, None) for key in ("file_id", "job_correlation", "state"))
+                    valid_job = type(candidate_job) is str and candidate_job.startswith("lftp-job:") and len(candidate_job) == 25 and all(c in "0123456789abcdef" for c in candidate_job[9:])
+                    state_name = "queued" if state is LftpJobStatus.State.QUEUED else "running" if state is LftpJobStatus.State.RUNNING else "invalid"
+                    key = file_id if type(file_id) is str and file_id and valid_job and state_name != "invalid" else None
+                except Exception:
+                    candidate_job, valid_job, state_name, key = None, False, "invalid", None
+                row = rows.setdefault(key, [0, False, set(), set(), key is None, key in malformed_ids])
+                row[0] += 1
+                row[1] |= key is not None and key not in malformed_ids and state_name == "running"
+                cast(set[str], row[2]).add(state_name); cast(set[str], row[3]).add(candidate_job if valid_job else "unknown")
+            return rows
+
+        prior, raw, filtered = (view(statuses, malformed) for statuses, malformed in ((previous_statuses, previous_malformed_ids), (raw_statuses, current_malformed_ids), (filtered_statuses, current_malformed_ids)))
+        tokens: list[str] = []
+        def mask(classes: tuple[str, ...]) -> str:
+            return "".join(code for code, name in (("d", "duplicate"), ("m", "malformed"), ("i", "invalid")) if name in classes) or ("a" if classes == ("absent",) else "v")
+        for file_id in sorted(set(prior) | set(raw) | set(filtered), key=opaque_trace_correlation):
+            before, current, post = prior.get(file_id), raw.get(file_id), filtered.get(file_id)
+            bc = ("absent",) if before is None else tuple(name for name, present in (("duplicate", before[0] > 1), ("malformed", before[5]), ("invalid", before[4])) if present) or ("valid",)
+            cc = ("absent",) if current is None else tuple(name for name, present in (("duplicate", current[0] > 1), ("malformed", current[5]), ("invalid", current[4])) if present) or ("valid",)
+            bj, cj = sorted(cast(set[str], before[3])) if before else [], sorted(cast(set[str], current[3])) if current else []
+            bs, cs = sorted(cast(set[str], before[2])) if before else [], sorted(cast(set[str], current[2])) if current else []
+            ba, ca, rm, fm = bool(before and before[1]), bool(post and post[1]), current is not None, post is not None
+            if (bool(before) != rm or ba != ca or bc != cc or bj != cj or bs != cs or bool(before and not before[5]) != fm):
+                if before is None and current is not None: transition = "added"
+                elif before is not None and current is None: transition = "removed"
+                elif "invalid" in bc or "invalid" in cc: transition = "invalid"
+                elif bj != cj: transition = "replaced"
+                elif rm and not fm: transition = "malformed" if "malformed" in cc else "filtered"
+                elif bs == ["queued"] and cs == ["running"]: transition = "queued_to_running"
+                elif bs == ["running"] and cs == ["queued"]: transition = "running_to_queued"
+                elif bc != cc: transition = next((x for x in ("duplicate", "malformed") if x in bc or x in cc), "classified")
+                else: transition = "active_changed"
+                target = "u" if file_id is None else opaque_trace_correlation(file_id)
+                prefix = f"t={target}|r={int(rm)}|f={int(fm)}|p={int(ba)}|c={int(ca)}|b={mask(bc)}|n={mask(cc)}"
+                tokens.append(f"{prefix}|j={(cj or bj or ['unknown'])[0]}|x={transition}")
+                tokens.extend(f"{prefix}|j={job}|x=job_added" for job in (sorted(set(cj) - set(bj) - {"unknown"}) if file_id is not None and current and (before or current[0] > 1) else ()))
+                tokens.extend(f"{prefix}|j={job}|x=job_removed" for job in (sorted(set(bj) - set(cj) - {"unknown"}) if file_id is not None and before and (current or before[0] > 1) else ()))
+        tokens.sort()
+        if tokens:
+            safe_poll = _safe_lftp_status_poll_correlation(poll_correlation)
+            chunk_count = (len(tokens) + 15) // 16
+            for chunk_index in range(chunk_count):
+                details: dict[str, object] = {"schema": "lftp_status_membership.v2", "phase": "status_membership", "chunk_index": chunk_index, "chunk_count": chunk_count, "transition_count": len(tokens), "transition_set_digest": opaque_trace_correlation("|".join(tokens)), "source": source, "fresh": bool(fresh), "healthy": bool(healthy), "idle_authoritative": bool(getattr(controller, "_Controller__lftp_idle_status_authoritative", False)), "raw_status_count": min(len(raw_statuses), _LFTP_STATUS_TRACE_COUNT_LIMIT), "raw_status_count_overflow": len(raw_statuses) > _LFTP_STATUS_TRACE_COUNT_LIMIT, "filtered_status_count": min(len(filtered_statuses), _LFTP_STATUS_TRACE_COUNT_LIMIT), "filtered_status_count_overflow": len(filtered_statuses) > _LFTP_STATUS_TRACE_COUNT_LIMIT, "poll_correlation": safe_poll, "transitions": tokens[chunk_index * 16:(chunk_index + 1) * 16]}
+                recorder(stage="lftp_status_membership", message="lftp_status_membership_transition", details=details, event_type="state_transition", category=_LFTP_STATUS_MEMBERSHIP_TRACE_CATEGORY, level=level, corr_id="lftp:" + opaque_trace_correlation(_LFTP_STATUS_TRACE_CORRELATION), flow_id=safe_poll, trace_scope="flow")
+    except Exception:
+        pass
 
 def _record_root_progress_status(
         controller: object,
@@ -4612,6 +4680,16 @@ class ModelUpdater(_ControllerCoreAccess):
         # pending-dispatch augmentation can add synthetic queued statuses.
         post_filter_lftp_statuses = lftp_statuses
         post_filter_lftp_status_count = len(post_filter_lftp_statuses)
+
+        _record_lftp_status_membership_transition(
+            controller, pre_poll_lftp_statuses, raw_lftp_statuses,
+            post_filter_lftp_statuses,
+            previous_malformed_ids=previous_malformed_status_only_file_ids,
+            current_malformed_ids=controller._Controller__malformed_status_only_file_ids,
+            source=lftp_status_source, fresh=lftp_status_snapshot_fresh,
+            healthy=lftp_status_poll_healthy,
+            poll_correlation=lftp_status_poll_correlation,
+        )
 
         def replacement_statuses_by_file_id() -> dict[str, object]:
             """Return only fresh, unique raw/filtered status provenance.
