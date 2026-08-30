@@ -14530,12 +14530,22 @@ class TestController(unittest.TestCase):
             remote_base_dir_path="/remote/movies", local_base_dir_path=ANY,
         )
 
-    def test_recover_interrupted_downloads_keeps_nested_no_sidecar_partial_with_parent_mirror(self):
+    def test_recover_interrupted_downloads_does_not_mirror_nested_no_sidecar_partial(self):
         with tempfile.TemporaryDirectory() as staging_root:
             release_path = os.path.join(staging_root, "release", "season")
             os.makedirs(release_path)
-            Path(os.path.join(release_path, "movie.mkv.lftp")).write_bytes(b"partial")
-            remote_root = SystemFile("release", 10, True)
+            temp_path = os.path.join(release_path, "movie.mkv.lftp")
+            logical_size = 4 * 1024 ** 3
+            Path(temp_path).write_bytes(b"partial")
+            # Keep Windows CI physically small; POSIX filesystems provide the
+            # sparse logical-size discriminator used by the escaped run.
+            if os.name == "posix":
+                os.truncate(temp_path, logical_size)
+            remote_root = SystemFile("release", logical_size, True)
+            remote_season = SystemFile("season", logical_size, True)
+            remote_child = SystemFile("movie.mkv", logical_size, False)
+            remote_season.add_child(remote_child)
+            remote_root.add_child(remote_season)
             remote_root.path_pair_id = "movies"
             self.controller._Controller__persist.downloaded_file_names = set()
             self.controller._Controller__path_pairs_by_id = {
@@ -14544,6 +14554,33 @@ class TestController(unittest.TestCase):
             self.controller._Controller__path_pair_staging_paths = {"movies": staging_root}
 
             self.controller._Controller__recover_interrupted_downloads([remote_root])
+            self.assertTrue(os.path.exists(temp_path))
+            if os.name == "posix":
+                self.assertEqual(logical_size, os.path.getsize(temp_path))
+            self.assertEqual(logical_size, remote_child.size)
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+
+    def test_recover_interrupted_downloads_mirrors_nested_lftp_payload(self):
+        with tempfile.TemporaryDirectory() as staging_root:
+            release_path = os.path.join(staging_root, "release", "season")
+            os.makedirs(release_path)
+            payload_path = os.path.join(release_path, "notes.lftp")
+            Path(payload_path).write_bytes(b"payload")
+            remote_root = SystemFile("release", 7, True)
+            remote_season = SystemFile("season", 7, True)
+            remote_payload = SystemFile("notes.lftp", 7, False)
+            remote_season.add_child(remote_payload)
+            remote_root.add_child(remote_season)
+            remote_root.path_pair_id = "movies"
+            self.controller._Controller__persist.downloaded_file_names = set()
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+            }
+            self.controller._Controller__path_pair_staging_paths = {"movies": staging_root}
+
+            self.controller._Controller__recover_interrupted_downloads([remote_root])
+            self.assertTrue(os.path.exists(payload_path))
 
         self.controller._Controller__lftp.queue.assert_called_once_with(
             "release", True, remote_base_dir_path="/remote/movies", local_base_dir_path=ANY,

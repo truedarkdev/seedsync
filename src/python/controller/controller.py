@@ -7831,6 +7831,7 @@ class Controller:
             except OSError as error:
                 self.logger.warning("Failed to inspect staging path '%s': %s", staging_path, error)
                 continue
+            remote_files_for_pair = remote_files_by_pair.get(path_pair_id, {})
 
             # Root entries retain the historical directory-MIRROR recovery
             # behavior.  Add only nested pget temporary files: an exact
@@ -7858,13 +7859,16 @@ class Controller:
             except OSError:
                 pass
 
-            remote_files_for_pair = remote_files_by_pair.get(path_pair_id, {})
             for entry in staging_entries:
                 entry_path = self.__safe_recovery_staging_entry(staging_path, entry, False)
                 if entry.endswith(suffix):
                     if entry_path is None:
                         continue
                     file_name = entry[:-len(suffix)]
+                    remote_file = remote_files_for_pair.get(file_name)
+                    if getattr(remote_file, "is_dir", None) is not False or \
+                            remote_files_for_pair.get(entry) is not None:
+                        continue
                     # A direct target beside its historical temp form is an
                     # ambiguous legacy partial. Let neither artifact reach a
                     # resume command; LFTP cannot prove which bytes belong to
@@ -7878,30 +7882,43 @@ class Controller:
                     try:
                         directory_children = os.listdir(entry_path)
                         has_temp_children = any(child.endswith(suffix) for child in directory_children)
-                        # A nested PGET writes a matching sidecar beside its
-                        # ``.lftp`` target.  Its presence, even if an
-                        # interrupted write leaves the map invalid, means an
-                        # ancestor MIRROR would flatten it at the staging
-                        # root.  Only a valid map permits standalone resume.
-                        has_nested_pget_sidecar = False
+                        # A nested PGET temp is never safe to flatten into an
+                        # ancestor MIRROR.  A valid matching sidecar permits
+                        # standalone resume; a missing or invalid sidecar is
+                        # deliberately left untouched and fails closed.
+                        has_nested_pget_temp = False
+                        has_ambiguous_nested_suffix = False
                         for nested_root, _nested_dirs, nested_files in os.walk(entry_path, followlinks=False):
                             nested_relative_root = os.path.relpath(nested_root, staging_path)
                             for child in nested_files:
                                 if not child.endswith(suffix):
                                     continue
                                 has_temp_children = True
-                                sidecar_relative = os.path.join(
-                                    nested_relative_root, child + ".lftp-pget-status",
+                                relative_file = os.path.join(
+                                    nested_relative_root, child,
                                 ).replace(os.sep, "/")
-                                if self.__safe_recovery_staging_entry(
-                                        staging_path, sidecar_relative, False) is not None:
-                                    has_nested_pget_sidecar = True
+                                non_suffix_remote = remote_files_for_pair.get(
+                                    relative_file[:-len(suffix)],
+                                )
+                                suffix_remote = remote_files_for_pair.get(relative_file)
+                                is_non_suffix_leaf = non_suffix_remote is not None and \
+                                    getattr(non_suffix_remote, "is_dir", None) is False
+                                is_suffix_payload = suffix_remote is not None and \
+                                    getattr(suffix_remote, "is_dir", None) is False
+                                # A suffix local artifact is a PGET temp only
+                                # when the exact non-suffix remote leaf exists.
+                                # A suffix remote leaf alone is a real payload;
+                                # every other association is ambiguous.
+                                if is_non_suffix_leaf and suffix_remote is None:
+                                    has_nested_pget_temp = True
+                                elif not is_suffix_payload or non_suffix_remote is not None:
+                                    has_ambiguous_nested_suffix = True
                                     break
-                            if has_nested_pget_sidecar:
+                            if has_ambiguous_nested_suffix:
                                 break
                     except OSError:
                         continue
-                    if not has_temp_children or has_nested_pget_sidecar:
+                    if not has_temp_children or has_nested_pget_temp or has_ambiguous_nested_suffix:
                         continue
                     file_name = entry
                     is_dir = True
