@@ -390,6 +390,18 @@ class ModelBuilder:
             file for files in self.__local_files_by_pair.values() for file in files.values()
         )
 
+    def local_source_root_sample(self, limit: int) -> tuple[SystemFile, ...]:
+        """Return at most ``limit + 1`` roots for bounded diagnostics only."""
+        if type(limit) is not int or limit < 1:
+            return ()
+        roots: list[SystemFile] = []
+        for files in self.__local_files_by_pair.values():
+            for file in files.values():
+                roots.append(file)
+                if len(roots) > limit:
+                    return tuple(roots)
+        return tuple(roots)
+
     def local_library_inventory_snapshot(
             self,
     ) -> tuple[int, dict[Optional[str], _LocalLibraryInventory]]:

@@ -94,6 +94,107 @@ _SCAN_AUTHORITY_DIAGNOSTIC_ONLY_KEYS = frozenset({
 })
 _ACTIVE_DELTA_REJECTION_CORRELATION_TARGET_LIMIT = 16
 _ACTIVE_DELTA_REJECTION_CORRELATION_COUNT_LIMIT = 128
+_SCAN_ADOPTION_TRACE_CATEGORY = "scan.adoption"
+_SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT = 16
+
+
+def _scan_adoption_root_sample(
+        roots: Iterable[object], *, system: bool, population: str, scope: str,
+) -> tuple[dict[str, object], tuple[str, ...]]:
+    """Return a fixed-size opaque root sample without walking scan trees."""
+    values: list[str] = []
+    truncated = False
+    for root in islice(roots, _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT + 1):
+        if len(values) == _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT:
+            truncated = True
+            break
+        try:
+            if system and isinstance(root, SystemFile):
+                values.append(opaque_trace_correlation(
+                    ModelFile.build_file_id(root.name, root.path_pair_id),
+                ))
+            elif not system and isinstance(root, ModelFile):
+                values.append(opaque_trace_correlation(root.file_id))
+        except Exception:
+            values.append("invalid")
+    values.sort()
+    return ({
+        "population": population,
+        "scope": scope,
+        "root_present": bool(values),
+        "root_sample_count": count_bucket(len(values)),
+        "root_sample_truncated": truncated,
+        "root_sample_digest": opaque_trace_correlation("|".join(values)),
+    }, tuple(values))
+
+
+def _record_scan_adoption_breadcrumb(
+        controller: "Controller", *, local_scan_generation: object, local_scan_final: object,
+        local_scan_healthy: object, phase: str, source_roots: Optional[Iterable[object]] = None,
+        builder_roots: Optional[Iterable[object]] = None, model_roots: Optional[Iterable[object]] = None,
+        model_version: object = 0, source_adoption: str = "unknown",
+        publication_outcome: str = "pending", fast_path_rejection_reason: Optional[str] = None,
+) -> None:
+    """Record bounded, opaque scan-adoption evidence after an existing decision."""
+    if not _controller_breadcrumb_effectively_enabled(controller, _SCAN_ADOPTION_TRACE_CATEGORY, "info"):
+        return
+    generation = local_scan_generation if type(local_scan_generation) is int and local_scan_generation >= 0 else 0
+    summaries: dict[str, object] = {}
+    samples: dict[str, tuple[str, ...]] = {}
+    for name, roots, system, population, scope in (
+            ("source", source_roots, True, "accepted_source_scan", "local_scan"),
+            ("builder", builder_roots, True, "retained_local_builder", "local"),
+            ("published", model_roots, False, "published_model", "local+remote"),
+    ):
+        if roots is not None:
+            summaries[name], samples[name] = _scan_adoption_root_sample(
+                roots, system=system, population=population, scope=scope,
+            )
+
+    def sample_relation(left: str, right: str) -> Optional[str]:
+        if left not in samples or right not in samples:
+            return None
+        left_summary = summaries[left]
+        right_summary = summaries[right]
+        if not isinstance(left_summary, dict) or not isinstance(right_summary, dict):
+            return "unknown"
+        if left_summary["root_sample_truncated"] or right_summary["root_sample_truncated"]:
+            return "unknown_truncated"
+        left_values = set(samples[left])
+        right_values = set(samples[right])
+        if left_summary["population"] == right_summary["population"] and \
+                left_summary["scope"] == right_summary["scope"]:
+            return "equal" if left_values == right_values else "unknown"
+        if left_values.issubset(right_values):
+            return "subset"
+        if left_values.isdisjoint(right_values):
+            return "absent"
+        return "unknown"
+
+    correlation = opaque_trace_correlation(
+        "scan.adoption|{}".format(generation)
+    )
+    controller._Controller__record_breadcrumb(
+        stage="scan_adoption", message="scan_adoption", event_type="state_transition",
+        category=_SCAN_ADOPTION_TRACE_CATEGORY, level="info", trace_scope="aggregate",
+        corr_id="scan-adoption:{}".format(correlation), flow_id="scan-adoption:{}".format(correlation),
+        details={
+            "local_scan_generation": generation,
+            "local_scan_final": bool(local_scan_final),
+            "local_scan_healthy": local_scan_healthy if type(local_scan_healthy) is bool else None,
+            "local_scan_source": "local_scanner",
+            "phase": phase,
+            "source": summaries.get("source"),
+            "builder": summaries.get("builder"),
+            "published": summaries.get("published"),
+            "builder_to_published_sample_relation": sample_relation("builder", "published"),
+            "root_sample_correlation": next(iter(samples.get("source", ()) or samples.get("builder", ()) or samples.get("published", ())), None),
+            "published_model_version": model_version if type(model_version) is int else 0,
+            "source_adoption": source_adoption,
+            "publication_outcome": publication_outcome,
+            "fast_path_rejection_reason": fast_path_rejection_reason,
+        },
+    )
 
 
 def _fresh_unique_replacement_statuses(
@@ -4252,7 +4353,6 @@ class ModelUpdater(_ControllerCoreAccess):
                 not joint_unknown_local_ids.intersection(scoped_final_pair_ids)
             )) \
             and (not progressive_mode or progressive_scan_event_arrived)
-
         def final_event_comparison_proven(
                 side: str, result: Optional[ScannerResult],
         ) -> bool:
@@ -4873,11 +4973,24 @@ class ModelUpdater(_ControllerCoreAccess):
         })
 
         stage_timer.switch(DURATION_MODEL_UPDATE_BUILDER_SYNC)
+        scan_adoption_trace_enabled = _controller_breadcrumb_effectively_enabled(
+            controller, _SCAN_ADOPTION_TRACE_CATEGORY, "info",
+        )
+        previous_local_scan_generation = previous_scan_authority_snapshot.get(
+            "local_scan_generation",
+        )
+        local_scan_new_authority = latest_local_scan is not None and (
+            not progressive_mode
+            or bool(getattr(controller, "_Controller__progressive_local_scan_session_changed", False))
+            or type(previous_local_scan_generation) is not int
+            or scan_generation(latest_local_scan) != previous_local_scan_generation
+        )
         # Update model builder state.
         authoritative_pair_delta_builds: list[object] = []
         authoritative_pair_delta_staged_count = 0
         authoritative_pair_fallback_required = False
         authoritative_pair_fallback_reason: Optional[str] = None
+        local_scan_failed = False
         remote_files: list[SystemFile] = []
         if latest_remote_scan is not None:
             record_scan_result_attribution("remote", latest_remote_scan)
@@ -4957,6 +5070,21 @@ class ModelUpdater(_ControllerCoreAccess):
                         if not completed_ids:
                             completed_ids = set(getattr(latest_local_scan, "scanned_path_pair_ids", {None}))
                         inventory_completion(completed_ids)
+                if scan_adoption_trace_enabled and local_scan_new_authority:
+                    try:
+                        _record_scan_adoption_breadcrumb(
+                            controller,
+                            local_scan_generation=scan_generation(latest_local_scan),
+                            local_scan_final=local_final,
+                            local_scan_healthy=True,
+                            phase="source_accepted",
+                            source_roots=latest_local_scan.files,
+                            source_adoption=(
+                                "awaiting_joint" if progressive_mode else "accepted_current"
+                            ),
+                        )
+                    except Exception:
+                        controller.logger.debug("Ignoring scan adoption breadcrumb failure", exc_info=True)
                 raw_recovered_ids = getattr(latest_local_scan, "managed_extract_file_ids", [])
                 if isinstance(raw_recovered_ids, (list, tuple, set)):
                     recovered_items = cast(list[object] | tuple[object, ...] | set[object], raw_recovered_ids)
@@ -8216,6 +8344,38 @@ class ModelUpdater(_ControllerCoreAccess):
                         })
                         controller._Controller__scan_authority_publication_id = publication_id
                         controller._Controller__scan_authority_snapshot = dict(standing_snapshot)
+            if scan_adoption_trace_enabled and (
+                    global_full_build_triggered or authoritative_pair_delta_applied
+                    or progressive_source_buckets_adopted
+            ):
+                try:
+                    root_sampler = getattr(model_builder, "local_source_root_sample", None)
+                    builder_roots = root_sampler(_SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT) \
+                        if callable(root_sampler) else ()
+                    with controller._Controller__model_lock:
+                        model_roots = tuple(islice(
+                            controller._Controller__model.iter_files(),
+                            _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT + 1,
+                        ))
+                    fast_path_rejection_reason = "active_delta" if active_transfer_delta_rejected else (
+                        "pair_fallback" if pair_delta_fallback else None
+                    )
+                    _record_scan_adoption_breadcrumb(
+                        controller,
+                        local_scan_generation=standing_snapshot["local_scan_generation"],
+                        local_scan_final=standing_snapshot["final"],
+                        local_scan_healthy=(not local_scan_failed if local_scan_new_authority else None),
+                        phase="published",
+                        builder_roots=builder_roots,
+                        model_roots=model_roots,
+                        model_version=standing_snapshot["model_version"],
+                        source_adoption="accepted_current" if local_scan_new_authority \
+                        and local_final and not local_scan_failed else "prior_authority",
+                        publication_outcome=outcome,
+                        fast_path_rejection_reason=fast_path_rejection_reason,
+                    )
+                except Exception:
+                    controller.logger.debug("Ignoring scan adoption breadcrumb failure", exc_info=True)
             scan_authority_snapshot_changed = (
                 _scan_authority_semantic_snapshot(standing_snapshot)
                 != _scan_authority_semantic_snapshot(previous_scan_authority_snapshot)

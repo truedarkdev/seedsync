@@ -25,6 +25,7 @@ from controller.model_updater import (
     _active_delta_status_missing_provenance,
     _fresh_unique_replacement_statuses,
     _record_active_delta_rejection_summary,
+    _record_scan_adoption_breadcrumb,
     _record_lftp_status_breadcrumb,
     _record_lftp_status_membership_transition,
     _ProgressiveScanAccumulator,
@@ -68,6 +69,126 @@ from system.scanner import SystemScanner
 
 
 class TestModelUpdater(unittest.TestCase):
+    def test_scan_adoption_breadcrumb_is_opaque_and_identifies_root_loss(self):
+        source = SystemFile("private-root", 7, True)
+        source.path_pair_id = "private-pair"
+        source.add_child(SystemFile("private-leaf", 7))
+        model_root = ModelFile("private-root", True)
+        model_root.path_pair_id = "private-pair"
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"scan.adoption": "info"}},
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+        )
+        controller._Controller__record_breadcrumb = lambda **kwargs: trace.record(
+            "controller", kwargs.pop("message"), kwargs.pop("details"), **kwargs,
+        )
+
+        _record_scan_adoption_breadcrumb(
+            controller,
+            local_scan_generation=7,
+            local_scan_final=True,
+            local_scan_healthy=True,
+            phase="published",
+            source_roots=[source],
+            builder_roots=[source],
+            model_roots=[],
+            model_version=11,
+            source_adoption="accepted_current",
+            publication_outcome="publish",
+        )
+
+        event = trace.query_events(category="scan.adoption", limit=1)["events"][0]
+        self.assertEqual("scan_adoption", event["stage"])
+        self.assertEqual("scan.adoption", event["category"])
+        self.assertEqual("accepted_current", event["details"]["source_adoption"])
+        self.assertEqual("publish", event["details"]["publication_outcome"])
+        self.assertEqual(11, event["details"]["published_model_version"])
+        self.assertEqual("accepted_source_scan", event["details"]["source"]["population"])
+        self.assertEqual("local_scan", event["details"]["source"]["scope"])
+        self.assertEqual("retained_local_builder", event["details"]["builder"]["population"])
+        self.assertEqual("local", event["details"]["builder"]["scope"])
+        self.assertEqual("published_model", event["details"]["published"]["population"])
+        self.assertEqual("local+remote", event["details"]["published"]["scope"])
+        self.assertEqual("absent", event["details"]["builder_to_published_sample_relation"])
+        self.assertIsNotNone(event["details"]["root_sample_correlation"])
+        self.assertNotIn("private-root", str(event))
+        self.assertNotIn("private-pair", str(event))
+        self.assertNotIn("private-leaf", str(event))
+
+    def test_scan_adoption_breadcrumb_is_gated_before_iterating_roots(self):
+        class Roots:
+            def __iter__(self):
+                raise AssertionError("disabled scan adoption traversed roots")
+
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(
+                breadcrumb_trace=BreadcrumbTraceCollector(lambda: True, policy={"default": "off"}),
+            ),
+            _Controller__record_breadcrumb=MagicMock(),
+        )
+
+        _record_scan_adoption_breadcrumb(
+            controller,
+            local_scan_generation=1,
+            local_scan_final=True,
+            local_scan_healthy=True,
+            phase="source_accepted",
+            source_roots=Roots(),
+            builder_roots=Roots(),
+            model_roots=Roots(),
+        )
+        controller._Controller__record_breadcrumb.assert_not_called()
+
+    def test_scan_adoption_breadcrumb_bounds_root_samples_and_records_noop(self):
+        roots = []
+        for index in range(17):
+            root = SystemFile("root-{}".format(index), 0, True)
+            root.path_pair_id = "pair"
+            roots.append(root)
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"scan.adoption": "info"}},
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+        )
+        controller._Controller__record_breadcrumb = lambda **kwargs: trace.record(
+            "controller", kwargs.pop("message"), kwargs.pop("details"), **kwargs,
+        )
+
+        _record_scan_adoption_breadcrumb(
+            controller,
+            local_scan_generation=8,
+            local_scan_final=True,
+            local_scan_healthy=True,
+            phase="source_accepted",
+            source_roots=roots,
+            source_adoption="accepted_current",
+            publication_outcome="unchanged",
+        )
+
+        event = trace.query_events(category="scan.adoption", limit=1)["events"][0]
+        self.assertTrue(event["details"]["source"]["root_sample_truncated"])
+        self.assertEqual("5-16", event["details"]["source"]["root_sample_count"])
+        self.assertIsNone(event["details"]["builder"])
+        self.assertIsNone(event["details"]["builder_to_published_sample_relation"])
+        self.assertEqual("unchanged", event["details"]["publication_outcome"])
+
+    def test_model_builder_scan_adoption_root_sample_is_capped(self):
+        roots = []
+        for index in range(17):
+            root = SystemFile("root-{}".format(index), 0, True)
+            root.path_pair_id = "pair"
+            roots.append(root)
+        builder = ModelBuilder()
+        builder.set_local_files(roots)
+
+        sample = builder.local_source_root_sample(16)
+
+        self.assertEqual(17, len(sample))
+        self.assertEqual("root-0", sample[0].name)
+
     def test_replacement_status_adapter_fails_closed_for_progressive_and_active_delta_inputs(self):
         status = LftpJobStatus(
             7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
@@ -3450,6 +3571,137 @@ class TestModelUpdater(unittest.TestCase):
         model_builder.set_local_files.assert_not_called()
         model_builder.set_remote_files.assert_not_called()
         model_builder.build_model.assert_not_called()
+
+    def test_scan_adoption_progressive_publication_keeps_retained_local_generation(self):
+        local_token = "local-adoption"
+        remote_token = "remote-adoption"
+        local_final = self._progressive_final_result(local_token, generation=7)
+        remote_final = self._progressive_final_result(remote_token, generation=9)
+        builder = ModelBuilder()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False, model_builder=builder, model=Model(),
+        )
+        controller._Controller__remote_scan_process = self._progressive_process(
+            remote_token, [[], [remote_final]],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            local_token, [[local_final], []],
+        )
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        updater.update()
+
+        records = [
+            call.kwargs["details"] for call in controller._Controller__record_breadcrumb.call_args_list
+            if call.kwargs.get("message") == "scan_adoption"
+        ]
+        source = next(record for record in records if record["phase"] == "source_accepted")
+        published = next(record for record in records if record["phase"] == "published")
+        self.assertEqual(7, source["local_scan_generation"])
+        self.assertEqual("awaiting_joint", source["source_adoption"])
+        self.assertEqual("accepted_source_scan", source["source"]["population"])
+        self.assertIsNone(source["builder"])
+        self.assertIsNone(source["builder_to_published_sample_relation"])
+        self.assertEqual(7, published["local_scan_generation"])
+        self.assertEqual("accepted_current", published["source_adoption"])
+        self.assertEqual("retained_local_builder", published["builder"]["population"])
+        self.assertEqual("published_model", published["published"]["population"])
+        self.assertEqual("subset", published["builder_to_published_sample_relation"])
+
+    def test_scan_adoption_remote_only_publication_marks_local_authority_retained(self):
+        local = SystemFile("root", 1)
+        remote = SystemFile("root", 1)
+        refreshed_remote = SystemFile("root", 2)
+        builder = ModelBuilder()
+        builder.set_local_files([local])
+        builder.set_remote_files([remote])
+        controller, _ = self._make_progressive_update_controller(
+            ScannerResult(datetime.now(), [refreshed_remote], is_scan_final=True),
+            local_scan=None,
+            model_builder=builder,
+            model=builder.build_model(),
+        )
+
+        ModelUpdater(controller).update()
+
+        records = [
+            call.kwargs["details"] for call in controller._Controller__record_breadcrumb.call_args_list
+            if call.kwargs.get("message") == "scan_adoption"
+        ]
+        published = next(record for record in records if record["phase"] == "published")
+        self.assertEqual("prior_authority", published["source_adoption"])
+        self.assertIsNone(published["local_scan_healthy"])
+        self.assertEqual("local", published["builder"]["scope"])
+        self.assertEqual("local+remote", published["published"]["scope"])
+        self.assertEqual("subset", published["builder_to_published_sample_relation"])
+
+    def test_scan_adoption_source_population_excludes_retained_unselected_roots(self):
+        selected = SystemFile("selected", 1)
+        retained_unselected = SystemFile("retained", 1)
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"scan.adoption": "info"}},
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+        )
+        controller._Controller__record_breadcrumb = lambda **kwargs: trace.record(
+            "controller", kwargs.pop("message"), kwargs.pop("details"), **kwargs,
+        )
+
+        _record_scan_adoption_breadcrumb(
+            controller,
+            local_scan_generation=12,
+            local_scan_final=False,
+            local_scan_healthy=True,
+            phase="source_accepted",
+            source_roots=[selected],
+            source_adoption="awaiting_joint",
+        )
+
+        event = trace.query_events(category="scan.adoption", limit=1)["events"][0]
+        self.assertEqual("accepted_source_scan", event["details"]["source"]["population"])
+        self.assertIsNone(event["details"]["builder"])
+        self.assertIsNone(event["details"]["builder_to_published_sample_relation"])
+        self.assertNotIn(retained_unselected.name, str(event))
+
+    def test_scan_adoption_mixed_retained_local_population_is_subset_of_published(self):
+        retained_a = SystemFile("retained-a", 1)
+        retained_a.path_pair_id = "pair-a"
+        retained_b = SystemFile("retained-b", 1)
+        retained_b.path_pair_id = "pair-b"
+        remote = ModelFile("remote", True)
+        remote.path_pair_id = "pair-c"
+        local_a = ModelFile("retained-a", True)
+        local_a.path_pair_id = "pair-a"
+        local_b = ModelFile("retained-b", True)
+        local_b.path_pair_id = "pair-b"
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"scan.adoption": "info"}},
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+        )
+        controller._Controller__record_breadcrumb = lambda **kwargs: trace.record(
+            "controller", kwargs.pop("message"), kwargs.pop("details"), **kwargs,
+        )
+
+        _record_scan_adoption_breadcrumb(
+            controller,
+            local_scan_generation=13,
+            local_scan_final=True,
+            local_scan_healthy=True,
+            phase="published",
+            builder_roots=[retained_a, retained_b],
+            model_roots=[local_a, local_b, remote],
+            source_adoption="prior_authority",
+            publication_outcome="publish",
+        )
+
+        event = trace.query_events(category="scan.adoption", limit=1)["events"][0]
+        self.assertEqual("retained_local_builder", event["details"]["builder"]["population"])
+        self.assertEqual("published_model", event["details"]["published"]["population"])
+        self.assertEqual("subset", event["details"]["builder_to_published_sample_relation"])
 
     def test_progressive_unknown_authority_blocks_queue_exclusions_until_healthy_final(self):
         base_mtime_ns = 1_786_400_003_000_000_000
