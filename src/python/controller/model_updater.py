@@ -7882,9 +7882,6 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__context.status.controller.latest_remote_scan_time = latest_remote_scan.timestamp
             controller._Controller__context.status.controller.latest_remote_scan_failed = remote_scan_failed
             controller._Controller__context.status.controller.latest_remote_scan_error = latest_remote_scan.error_message
-            if remote_reconciliation_established and reconciliation_healthy \
-                    and not remote_scan_failed and not controller._Controller__startup_recovery_done:
-                controller._Controller__recover_interrupted_downloads(remote_files)
         if latest_local_scan is not None:
             controller._Controller__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp
         if global_full_build_triggered:
@@ -8106,6 +8103,20 @@ class ModelUpdater(_ControllerCoreAccess):
                 unknown_overlay_changed = overlay != progressive_unknown_before_event
                 progressive_unknown_after_event = set(overlay)
                 setter_unknown_local(overlay)
+
+        if remote_reconciliation_established and reconciliation_healthy \
+                and not remote_scan_failed and not controller._Controller__startup_recovery_done:
+            enabled_recovery_scopes = set(
+                getattr(controller, "_Controller__path_pairs_by_id", {}).keys()
+            ) or {None}
+            is_path_pair_reconciled = getattr(controller, "is_path_pair_reconciled", None)
+            if callable(is_path_pair_reconciled) and all(
+                    is_path_pair_reconciled(path_pair_id)
+                    for path_pair_id in enabled_recovery_scopes
+            ):
+                controller._Controller__recover_interrupted_downloads(
+                    list(model_builder.remote_source_roots_snapshot())
+                )
 
         # Emit one bounded authority decision after source adoption and the
         # safety overlay have both settled.  This is diagnostic evidence only:

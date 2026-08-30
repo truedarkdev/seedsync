@@ -3105,6 +3105,11 @@ class TestModelUpdater(unittest.TestCase):
             if remote_ids is not None:
                 controller._Controller__reconciled_remote_path_pair_ids = set(remote_ids)
         controller._record_path_pair_reconciliation = record_reconciliation
+        controller.is_path_pair_reconciled = lambda path_pair_id: (
+            path_pair_id in controller._Controller__reconciled_local_path_pair_ids and
+            path_pair_id in controller._Controller__reconciled_remote_path_pair_ids and
+            path_pair_id not in model_builder.unknown_local_path_pair_ids_snapshot()
+        )
         controller._Controller__remote_scan_process.pop_latest_result.return_value = remote_scan
         controller._Controller__local_scan_process.pop_latest_result.return_value = local_scan
         controller._Controller__active_scan_process.pop_latest_result.return_value = None
@@ -5373,6 +5378,255 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertIn(ModelFile.build_file_id("new.bin", "pair-a"), live_model.get_file_ids())
         builder.build_model.assert_called_once()
+
+    def test_startup_recovery_waits_for_unknown_then_uses_retained_remote_roots(self):
+        pair_id = "pair-a"
+        remote_root = SystemFile("remote-root", 10, True)
+        remote_root.path_pair_id = pair_id
+        local_root = SystemFile("remote-root", 10, True)
+        local_root.path_pair_id = pair_id
+        builder = ModelBuilder()
+        live_model = builder.build_model()
+
+        def scan(files, generation, unknown=()):
+            return ScannerResult(
+                datetime.now(), files, scanned_path_pair_ids={pair_id},
+                completed_path_pair_ids={pair_id}, is_progress=True,
+                is_scan_final=True, is_full_snapshot=True,
+                full_snapshot_path_pair_ids={pair_id}, generation=generation,
+                unknown_path_pair_ids=set(unknown),
+            )
+
+        controller, _ = self._make_progressive_update_controller(
+            scan([remote_root], 1), local_scan=scan([local_root], 1, {pair_id}),
+            model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {pair_id: MagicMock()}
+        controller._Controller__startup_recovery_done = False
+        recovery = MagicMock(side_effect=lambda _roots: setattr(
+            controller, "_Controller__startup_recovery_done", True,
+        ))
+        controller._Controller__recover_interrupted_downloads = recovery
+        controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
+            scan([remote_root], 1), scan([remote_root], 2), scan([remote_root], 3),
+        ]
+        controller._Controller__local_scan_process.pop_latest_result.side_effect = [
+            scan([local_root], 1, {pair_id}), scan([local_root], 2), scan([local_root], 3),
+        ]
+
+        updater = ModelUpdater(controller)
+        updater.update()
+        recovery.assert_not_called()
+
+        updater.update()
+
+        updater.update()
+
+        recovery.assert_called_once()
+        self.assertTrue(controller._Controller__startup_recovery_done)
+        recovered_roots = recovery.call_args.args[0]
+        self.assertEqual(["remote-root"], [root.name for root in recovered_roots])
+
+    def test_startup_recovery_waits_for_all_targeted_pairs_then_uses_global_roots(self):
+        roots = {}
+        for pair_id in ("pair-a", "pair-b"):
+            root = SystemFile("root-" + pair_id[-1], 10, True)
+            root.path_pair_id = pair_id
+            roots[pair_id] = root
+        builder = ModelBuilder()
+        live_model = builder.build_model()
+
+        def scan(pair_id):
+            return ScannerResult(
+                datetime.now(), [roots[pair_id]], scanned_path_pair_ids={pair_id},
+                completed_path_pair_ids={pair_id}, is_scan_final=True,
+                is_targeted_scan=True,
+            )
+
+        controller, _ = self._make_progressive_update_controller(
+            scan("pair-a"), local_scan=scan("pair-a"),
+            model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {
+            "pair-a": MagicMock(), "pair-b": MagicMock(),
+        }
+        controller._Controller__startup_recovery_done = False
+        recovery = MagicMock(side_effect=lambda _roots: setattr(
+            controller, "_Controller__startup_recovery_done", True,
+        ))
+        controller._Controller__recover_interrupted_downloads = recovery
+        controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
+            scan("pair-a"), scan("pair-b"),
+        ]
+        controller._Controller__local_scan_process.pop_latest_result.side_effect = [
+            scan("pair-a"), scan("pair-b"),
+        ]
+
+        updater = ModelUpdater(controller)
+        updater.update()
+        recovery.assert_not_called()
+
+        updater.update()
+
+        recovery.assert_called_once()
+        recovered_roots = recovery.call_args.args[0]
+        self.assertEqual({"root-a", "root-b"}, {root.name for root in recovered_roots})
+
+    def test_startup_recovery_distinguishes_empty_reconciled_from_unknown_pair(self):
+        pair_id = "pair-a"
+
+        def run_update(unknown):
+            builder = ModelBuilder()
+            live_model = builder.build_model()
+            local_scan = ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={pair_id},
+                completed_path_pair_ids={pair_id}, is_scan_final=True,
+                is_targeted_scan=True, unknown_path_pair_ids={pair_id} if unknown else set(),
+            )
+            remote_scan = ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={pair_id},
+                completed_path_pair_ids={pair_id}, is_scan_final=True,
+                is_targeted_scan=True,
+            )
+            controller, _ = self._make_progressive_update_controller(
+                remote_scan, local_scan=local_scan,
+                model_builder=builder, model=live_model,
+            )
+            controller._Controller__path_pairs_by_id = {pair_id: MagicMock()}
+            controller._Controller__startup_recovery_done = False
+            recovery = MagicMock()
+            controller._Controller__recover_interrupted_downloads = recovery
+            ModelUpdater(controller).update()
+            return recovery
+
+        with self.subTest("empty reconciled pair"):
+            recovery = run_update(False)
+            recovery.assert_called_once_with([])
+        with self.subTest("unknown pair"):
+            run_update(True).assert_not_called()
+
+    def test_startup_recovery_withholds_failed_or_nonfinal_remote_result(self):
+        pair_id = "pair-a"
+        for result_kwargs in (
+                {"failed": True, "error_message": "unavailable"},
+                {"is_scan_final": False},
+        ):
+            with self.subTest(result_kwargs=result_kwargs):
+                builder = ModelBuilder()
+                live_model = builder.build_model()
+                local_scan = ScannerResult(
+                    datetime.now(), [], scanned_path_pair_ids={pair_id},
+                    completed_path_pair_ids={pair_id}, is_scan_final=True,
+                )
+                remote_scan = ScannerResult(
+                    datetime.now(), [], scanned_path_pair_ids={pair_id},
+                    completed_path_pair_ids={pair_id}, **result_kwargs,
+                )
+                controller, _ = self._make_progressive_update_controller(
+                    remote_scan, local_scan=local_scan,
+                    model_builder=builder, model=live_model,
+                )
+                controller._Controller__path_pairs_by_id = {pair_id: MagicMock()}
+                controller._Controller__startup_recovery_done = False
+                recovery = MagicMock()
+                controller._Controller__recover_interrupted_downloads = recovery
+
+                ModelUpdater(controller).update()
+
+                recovery.assert_not_called()
+
+    def test_startup_recovery_orders_authority_before_trusted_final_exclusions(self):
+        pair_id = "pair-a"
+        root_id = ModelFile.build_file_id("release", pair_id)
+        retained_remote = SystemFile("release", 10, True)
+        retained_remote.path_pair_id = pair_id
+        retained_remote.add_child(SystemFile("final.mkv", 10, False, mtime_ns=1))
+        retained_local = SystemFile("release", 10, True)
+        retained_local.path_pair_id = pair_id
+        retained_local.add_child(SystemFile("final.mkv", 10, False, mtime_ns=1))
+        builder = ModelBuilder()
+        builder.set_remote_files([retained_remote])
+        builder.set_local_files([retained_local])
+        builder.set_unknown_local_path_pair_ids({pair_id})
+        live_model = builder.build_model()
+        self.assertEqual((), builder.get_trusted_final_leaf_paths(root_id))
+
+        events = []
+        for method_name in (
+                "set_remote_files",
+                "set_local_files",
+                "set_unknown_local_path_pair_ids",
+        ):
+            original = getattr(builder, method_name)
+
+            def record_call(*args, _name=method_name, _original=original, **kwargs):
+                events.append(_name)
+                return _original(*args, **kwargs)
+
+            setattr(builder, method_name, MagicMock(side_effect=record_call))
+
+        def scan(files):
+            return ScannerResult(
+                datetime.now(), files, scanned_path_pair_ids={pair_id},
+                completed_path_pair_ids={pair_id}, is_scan_final=True,
+            )
+
+        controller, _ = self._make_progressive_update_controller(
+            scan([retained_remote]), local_scan=None,
+            model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {pair_id: MagicMock()}
+        controller._Controller__startup_recovery_done = False
+        # The escaped r24 sequence retained prior healthy scan state, then
+        # received a final remote result while Final authority was still
+        # unknown locally.  Baseline recovery admitted this remote-only tick.
+        controller._Controller__last_remote_reconciliation_healthy = True
+        controller._Controller__last_local_reconciliation_healthy = True
+        controller._Controller__reconciled_local_path_pair_ids = {pair_id}
+        controller._Controller__reconciled_remote_path_pair_ids = {pair_id}
+
+        observed = {}
+
+        def recover(roots):
+            events.append("recovery")
+            observed["roots"] = list(roots)
+            observed["exclusions"] = builder.get_trusted_final_leaf_paths(root_id)
+            controller._Controller__startup_recovery_done = True
+
+        recovery = MagicMock(side_effect=recover)
+        controller._Controller__recover_interrupted_downloads = recovery
+        controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
+            scan([retained_remote]), scan([retained_remote]),
+        ]
+        controller._Controller__local_scan_process.pop_latest_result.side_effect = [
+            None, scan([retained_local]),
+        ]
+
+        ModelUpdater(controller).update()
+
+        recovery.assert_not_called()
+        self.assertEqual({pair_id}, builder.unknown_local_path_pair_ids_snapshot())
+
+        ModelUpdater(controller).update()
+
+        recovery.assert_called_once()
+        self.assertIn("set_remote_files", events, events)
+        self.assertIn("set_local_files", events, events)
+        self.assertLess(
+            events.index("set_local_files"), events.index("recovery"),
+        )
+        self.assertLess(
+            events.index("set_unknown_local_path_pair_ids"), events.index("recovery"),
+        )
+        self.assertEqual(["release"], [root.name for root in observed["roots"]])
+        recovered_leaf_names = {
+            leaf.name
+            for root in observed["roots"]
+            for leaf in root.iter_children()
+            if not leaf.is_dir
+        }
+        self.assertEqual({"final.mkv"}, recovered_leaf_names)
+        self.assertEqual(("final.mkv",), observed["exclusions"])
 
     def test_pair_final_with_pending_completion_uses_candidate_lifecycle(self):
         old = SystemFile("old.bin", 10, False)
