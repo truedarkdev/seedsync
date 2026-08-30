@@ -226,6 +226,13 @@ class LocalScanner(IScanner):
                         result = self.__scanner.scan_single_if_present(root_name)
                     finally:
                         self.__finish_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, filesystem_started)
+                    if result is None:
+                        # The manifest established that this root was present;
+                        # do not publish a complete snapshot that treats its
+                        # disappearance as authoritative absence.  Keep this
+                        # check before managed-extract pruning, where None is
+                        # a legitimate result for a successfully scanned root.
+                        raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
                     if result is not None and self.__managed_extract_folders_enabled:
                         managed_extract_started = self.__begin_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT)
                         try:
@@ -239,6 +246,11 @@ class LocalScanner(IScanner):
                         staging_result = self.__staging_scanner.scan_single_if_present(root_name)
                     finally:
                         self.__finish_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, filesystem_started)
+                    if staging_result is None:
+                        # Staging roots share the same manifest authority as
+                        # Final roots.  A vanished root must not be published
+                        # as a complete authoritative absence.
+                        raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
                     if staging_result is not None:
                         if self.__managed_extract_folders_enabled and self.__staging_path is not None:
                             managed_extract_started = self.__begin_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT)

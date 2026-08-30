@@ -59,6 +59,114 @@ class TestLocalScanner(unittest.TestCase):
         self.assertEqual({"root-a", "root-b"}, {file.name for event in events[1:-1] for file in event[0]})
         self.assertTrue(events[-1][2])
 
+    def test_progressive_scan_fails_when_manifest_root_disappears_before_scan(self):
+        target = os.path.join(self.temp_dir, "target")
+        hidden = self.temp_dir + ".hidden"
+        os.mkdir(target)
+        with open(os.path.join(target, "file.txt"), "w") as handle:
+            handle.write("content")
+
+        scanner = LocalScanner(self.temp_dir, use_temp_file=False, path_pair_id="pair")
+        events = []
+
+        def publish(files, _pair_id, _pair_name, root_names, complete):
+            events.append((files, root_names, complete))
+            if root_names is not None:
+                os.rename(target, hidden)
+
+        scanner.set_progress_callback(publish)
+        try:
+            with self.assertRaises(ScannerError) as error:
+                scanner.scan()
+        finally:
+            if os.path.isdir(hidden):
+                os.rename(hidden, target)
+
+        self.assertEqual(Localization.Error.LOCAL_SERVER_SCAN, str(error.exception))
+        self.assertTrue(error.exception.recoverable)
+        self.assertEqual({"target"}, events[0][1])
+        self.assertFalse(any(event[2] for event in events))
+
+    def test_progressive_scan_fails_when_manifest_staging_root_disappears_before_scan(self):
+        staging_dir = os.path.join(self.temp_dir, "staging")
+        target = os.path.join(staging_dir, "partial")
+        hidden = staging_dir + ".hidden"
+        os.mkdir(staging_dir)
+        os.mkdir(target)
+        with open(os.path.join(target, "file.txt"), "w") as handle:
+            handle.write("content")
+
+        scanner = LocalScanner(
+            self.temp_dir,
+            use_temp_file=False,
+            staging_path=staging_dir,
+            path_pair_id="pair",
+        )
+        events = []
+
+        def publish(files, _pair_id, _pair_name, root_names, complete):
+            events.append((files, root_names, complete))
+            if root_names is not None:
+                os.rename(target, hidden)
+
+        scanner.set_progress_callback(publish)
+        try:
+            with self.assertRaises(ScannerError) as error:
+                scanner.scan()
+        finally:
+            if os.path.isdir(hidden):
+                os.rename(hidden, target)
+
+        self.assertEqual(Localization.Error.LOCAL_SERVER_SCAN, str(error.exception))
+        self.assertTrue(error.exception.recoverable)
+        self.assertEqual({"partial"}, events[0][1])
+        self.assertFalse(any(event[2] for event in events))
+
+    @unittest.skipUnless(os.name == "posix", "Dangling symlink semantics require POSIX")
+    def test_progressive_scan_fails_closed_for_manifest_dangling_symlink(self):
+        os.symlink(os.path.join(self.temp_dir, "missing-target"), os.path.join(self.temp_dir, "dangling"))
+        scanner = LocalScanner(self.temp_dir, use_temp_file=False, path_pair_id="pair")
+        events = []
+        scanner.set_progress_callback(lambda files, _pair_id, _pair_name, roots, complete:
+                                      events.append((files, roots, complete)))
+
+        with self.assertRaises(ScannerError) as error:
+            scanner.scan()
+
+        self.assertTrue(error.exception.recoverable)
+        self.assertEqual({"dangling"}, events[0][1])
+        self.assertFalse(any(event[2] for event in events))
+
+    def test_progressive_scan_keeps_managed_extract_pruning_successful(self):
+        managed_dir = os.path.join(self.temp_dir, "managed")
+        os.mkdir(managed_dir)
+        with open(os.path.join(managed_dir, ".seedsync-extract.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "archive_name": "archive.zip",
+                    "archive_file_id": ModelFile.build_file_id("archive.zip", "pair"),
+                    "path_pair_id": "pair",
+                    "extracted_at": "2026-01-01T00:00:00",
+                },
+                handle,
+            )
+        with open(os.path.join(managed_dir, "episode.mkv"), "w", encoding="utf-8") as handle:
+            handle.write("hidden")
+        with open(os.path.join(self.temp_dir, "visible.txt"), "w") as handle:
+            handle.write("visible")
+
+        scanner = LocalScanner(self.temp_dir, use_temp_file=False, path_pair_id="pair")
+        events = []
+        scanner.set_progress_callback(lambda files, _pair_id, _pair_name, roots, complete:
+                                      events.append((files, roots, complete)))
+
+        files = scanner.scan()
+
+        self.assertEqual(["visible.txt"], [system_file.name for system_file in files])
+        self.assertTrue(events[-1][2])
+        self.assertEqual([ModelFile.build_file_id("archive.zip", "pair")], scanner.pop_managed_extract_file_ids())
+
     def test_progressive_scan_records_fixed_scanner_stage_durations(self):
         with open(os.path.join(self.temp_dir, "root.txt"), "w") as handle:
             handle.write("content")
