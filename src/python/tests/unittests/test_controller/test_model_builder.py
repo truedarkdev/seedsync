@@ -9179,7 +9179,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertTrue(root_entries[1]["details"]["lifecycle"]["explicit_stop"])
         self.assertEqual(first[0]["corr_id"], root_entries[1]["corr_id"])
 
-    def test_root_default_trace_identical_decision_dedupes(self):
+    def test_root_default_trace_identical_decision_records_each_build(self):
         remote_root = SystemFile("sample-directory", 20, True)
         remote_root.add_child(SystemFile("remote.bin", 20, False))
         local_root = SystemFile("sample-directory", 10, True)
@@ -9192,7 +9192,7 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.request_rebuild()
         self.model_builder.build_model()
 
-        self.assertEqual(1, len([
+        self.assertEqual(2, len([
             entry for entry in self.__trace_entries(collector, include_root_decisions=True)
             if entry["message"] == "root_default_decision"
         ]))

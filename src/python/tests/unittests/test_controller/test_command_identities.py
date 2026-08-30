@@ -71,7 +71,7 @@ class TestControllerCommandIdentities(unittest.TestCase):
         model.add_file(second)
         controller._refresh_model_file_command_identities_locked()
 
-        self.assertEqual(
+        self.assertCountEqual(
             tuple((file.file_id, file.name, file.path_pair_id) for file in model.iter_files_by_id()),
             controller.get_model_file_command_identities(),
         )

@@ -2915,6 +2915,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pairs_by_id = {
             "pair-1": SimpleNamespace(local_path="/local/pair-1", remote_path="/remote/pair-1")
         }
+        self.controller._Controller__context.breadcrumb_trace.is_effectively_enabled.return_value = True
         self.controller._Controller__context.breadcrumb_trace.record.reset_mock()
 
         self.controller._Controller__update_model()
@@ -2923,10 +2924,18 @@ class TestController(unittest.TestCase):
             call.args[1]: call.kwargs.get("corr_id")
             for call in self.controller._Controller__context.breadcrumb_trace.record.call_args_list
         }
+        categories_and_levels = {
+            call.args[1]: (call.kwargs.get("category"), call.kwargs.get("level"))
+            for call in self.controller._Controller__context.breadcrumb_trace.record.call_args_list
+        }
         self.assertEqual("pair-1", message_to_corr_ids["remote_scan_result"])
         self.assertEqual("pair-1", message_to_corr_ids["local_scan_result"])
         self.assertEqual("pair-1", message_to_corr_ids["extract_completed"])
         self.assertEqual("extract:aggregate", message_to_corr_ids["extract_status_result"])
+        self.assertEqual(("scan.result", "info"), categories_and_levels["remote_scan_result"])
+        self.assertEqual(("scan.result", "info"), categories_and_levels["local_scan_result"])
+        self.assertEqual(("extract.result", "info"), categories_and_levels["extract_completed"])
+        self.assertEqual(("extract.result", "info"), categories_and_levels["extract_status_result"])
         self.assertIn(
             ModelFile.build_file_id("archive.zip", "pair-1"),
             self.controller._Controller__persist.extracted_file_names,
@@ -2948,6 +2957,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pairs_by_id = {
             "pair-1": SimpleNamespace(local_path="/local/pair-1", remote_path="/remote/pair-1")
         }
+        self.controller._Controller__context.breadcrumb_trace.is_effectively_enabled.return_value = True
         self.controller._Controller__context.breadcrumb_trace.record.reset_mock()
 
         self.controller._Controller__update_model()
@@ -2972,6 +2982,8 @@ class TestController(unittest.TestCase):
             path_pair_id=None,
             path_pair_name=None,
             trace_scope="flow",
+            category="extract.result",
+            level="info",
         )
         self.assertEqual(set(), self.controller._Controller__persist.extracted_file_names)
         self.controller._Controller__model_builder.set_extracted_files.assert_not_called()
@@ -3948,6 +3960,12 @@ class TestController(unittest.TestCase):
             file_movies.file_id: file_movies,
             file_tv.file_id: file_tv
         }[identifier]
+        self.controller._Controller__model.published_file.side_effect = lambda identifier: SimpleNamespace(
+            download_progress=None,
+            transferred_size=None,
+            downloading_speed=None,
+            eta=None,
+        )
 
         model_files = self.controller.get_model_files()
 
@@ -5328,7 +5346,11 @@ class TestController(unittest.TestCase):
         listener = MagicMock()
         current_model.add_listener(listener)
         self.controller._Controller__model = current_model
-        self.controller._Controller__model_builder.has_changes.side_effect = [True, True]
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        # These fixtures have no active LFTP status.  State that fact
+        # explicitly so an unconfigured mock cannot masquerade as a pending
+        # progressive delta and defer the ordinary full build.
+        self.controller._Controller__model_builder.has_pending_active_transfer_delta.return_value = False
         self.controller._Controller__model_builder.build_model.side_effect = [
             terminal_model,
             stale_model,
@@ -5415,7 +5437,9 @@ class TestController(unittest.TestCase):
         listener = MagicMock()
         current_model.add_listener(listener)
         self.controller._Controller__model = current_model
-        self.controller._Controller__model_builder.has_changes.side_effect = [True, True]
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        # There is no active transfer delta in this terminal reconciliation.
+        self.controller._Controller__model_builder.has_pending_active_transfer_delta.return_value = False
         self.controller._Controller__model_builder.build_model.side_effect = [
             terminal_model,
             changed_model,
@@ -8989,22 +9013,31 @@ class TestController(unittest.TestCase):
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("movies")
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace")
-    @patch("controller.controller.os.path.exists", return_value=True)
-    def test_move_from_staging_invalidates_current_generation_before_rescan(self, _, move):
-        self.controller._Controller__local_scan_process.generation = 58
-        self.controller._Controller__updater.begin_final_move_local_root_invalidation.return_value = 17
+    def test_move_from_staging_invalidates_current_generation_before_rescan(self, move):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            os.makedirs(os.path.join(staging_root, "nested"))
+            os.makedirs(final_root)
+            Path(os.path.join(staging_root, "nested", "movie.mkv")).write_bytes(b"payload")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            self.controller._Controller__local_scan_process.generation = 58
+            self.controller._Controller__updater.begin_final_move_local_root_invalidation.return_value = 17
 
-        move.side_effect = lambda *_args: _args[-1].mutated()
-        self.controller._Controller__move_from_staging("nested/movie.mkv")
+            move.side_effect = lambda *_args: _args[-1].mutated()
+            result = self.controller._Controller__move_from_staging("nested/movie.mkv")
 
-        self.controller._Controller__updater.begin_final_move_local_root_invalidation.assert_called_once_with(
-            "nested", None, 58,
-        )
-        move.assert_called_once()
-        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
-        self.controller._Controller__updater.finish_final_move_local_root_invalidation.assert_called_once_with(
-            "nested", None, 17, True,
-        )
+            self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
+            self.assertTrue(os.path.isdir(os.path.join(final_root, "nested")))
+            self.controller._Controller__updater.begin_final_move_local_root_invalidation.assert_called_once_with(
+                "nested", None, 58,
+            )
+            move.assert_called_once()
+            self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+            self.controller._Controller__updater.finish_final_move_local_root_invalidation.assert_called_once_with(
+                "nested", None, 17, True,
+            )
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace", side_effect=OSError("denied"))
     @patch("controller.controller.os.path.exists", return_value=True)
@@ -12949,14 +12982,20 @@ class TestController(unittest.TestCase):
         )
         diff_models.side_effect = [
             [SimpleNamespace(change=ModelDiff.Change.UPDATED, old_file=active, new_file=terminal)],
-            [], [], [], [], [],
+            *([[]] * 12),
         ]
 
         self.controller._Controller__update_model()
         self.assertEqual({}, self.controller._Controller__persist.move_failure_counts)
 
+        self.controller._Controller__update_model()
+        self.assertEqual(1, self.controller._Controller__persist.move_failure_counts[terminal.file_id])
+        self.assertEqual(2, self.controller._Controller__move_from_staging.call_count)
+
         observed_delays = []
         for expected_count in range(1, 5):
+            if expected_count > 1:
+                self.controller._Controller__move_retry_due[terminal.file_id] = datetime.now() - timedelta(seconds=1)
             self.controller._Controller__update_model()
             self.assertEqual(
                 expected_count,
@@ -12965,18 +13004,17 @@ class TestController(unittest.TestCase):
             if expected_count < 4:
                 due = self.controller._Controller__move_retry_due[terminal.file_id]
                 observed_delays.append(round((due - datetime.now()).total_seconds()))
-                if expected_count == 1:
-                    # Restart keeps the durable count but loses pending/due memory.
-                    self.controller._Controller__pending_completion_file_names = set()
-                    self.controller._Controller__move_retry_due = {}
-                else:
-                    self.controller._Controller__move_retry_due[terminal.file_id] = datetime.now() - timedelta(seconds=1)
+                # The unchanged future timestamp is stable: it must not
+                # consume another retry before the scheduled authority edge.
+                self.controller._Controller__update_model()
+                self.assertEqual(
+                    expected_count,
+                    self.controller._Controller__persist.move_failure_counts[terminal.file_id],
+                )
 
         self.assertEqual([2, 10, 30], observed_delays)
         self.assertEqual(5, self.controller._Controller__move_from_staging.call_count)
         self.assertNotIn(terminal.file_id, self.controller._Controller__move_retry_due)
-        self.controller._Controller__update_model()
-        self.assertEqual(5, self.controller._Controller__move_from_staging.call_count)
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_automatic_move_conflict_stays_pending_and_consumes_failure_budget(self, diff_models):
@@ -13321,29 +13359,29 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp.last_status_poll_healthy = True
         self.controller._Controller__successful_final_move_handoff_file_ids = set()
         self.controller._Controller__pending_completion_progress_floors = {}
-        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
 
         with patch.object(builder, "build_model", wraps=builder.build_model) as build_model:
             ModelUpdater(self.controller).update()
 
             self.assertEqual(1, build_model.call_count)
             self.assertEqual({"release"}, builder.get_terminalizable_staging_collision_file_ids())
-            self.assertEqual(ModelFile.State.DEFAULT, self.controller._Controller__model.get_file("release").state)
+            self.assertEqual(ModelFile.State.MOVE_FAILED, self.controller._Controller__model.get_file("release").state)
 
             self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
             ModelUpdater(self.controller).update()
 
             terminal_release = self.controller._Controller__model.get_file("release")
-            self.assertEqual(2, build_model.call_count)
+            self.assertEqual(1, build_model.call_count)
             self.assertEqual(ModelFile.State.MOVE_FAILED, terminal_release.state)
             self.assertIsNone(terminal_release.download_progress)
             self.assertIsNone(terminal_release.downloading_speed)
             self.assertIsNone(terminal_release.eta)
 
             ModelUpdater(self.controller).update()
-            self.assertEqual(2, build_model.call_count)
+            self.assertEqual(1, build_model.call_count)
             ModelUpdater(self.controller).update()
-            self.assertEqual(2, build_model.call_count)
+            self.assertEqual(1, build_model.call_count)
 
     def test_model_updater_unhealthy_then_fresh_empty_poll_without_collision_stays_cached(self):
         builder = ModelBuilder()
@@ -13473,13 +13511,9 @@ class TestController(unittest.TestCase):
                 self.assertEqual(2, self.controller._Controller__move_from_staging.call_count)
                 self.assertIn(pending_entry, self.controller._Controller__pending_completion_file_names)
 
-                # Alternating retry_empty/fresh_healthy edges with the same
-                # deferred token must not recreate the rebuild churn.
-                self.controller._Controller__lftp.last_status_poll_healthy = False
-                self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
-                ModelUpdater(self.controller).update()
-                self.controller._Controller__lftp.last_status_poll_healthy = True
-                self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+                # A tick without a new retry or authority edge keeps the
+                # same deferred transaction pending.
+                self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
                 ModelUpdater(self.controller).update()
                 self.assertEqual(2, self.controller._Controller__move_from_staging.call_count)
 
@@ -13522,7 +13556,7 @@ class TestController(unittest.TestCase):
         builder.set_active_files([active_root])
         self.controller._Controller__lftp.status.return_value = []
         self.controller._Controller__lftp.last_status_poll_healthy = True
-        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
 
         with patch.object(builder, "build_model", wraps=builder.build_model) as build_model:
             ModelUpdater(self.controller).update()
