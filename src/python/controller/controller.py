@@ -389,6 +389,14 @@ class _LftpOperation:
     download_start_lifecycle_before: Optional[DownloadStartLifecycleEntry] = None
 
 
+@dataclass(frozen=True)
+class _LftpQueueResult:
+    """Backend result paired with the prompt outcome from the same PTY command."""
+
+    result: object
+    command_prompt_timed_out: bool
+
+
 _LFTP_STATUS_AUTHORITY_COUNT_LIMIT = 32
 
 _TRANSFER_STOP_TRACE_CATEGORY = "transfer.stop"
@@ -1290,8 +1298,20 @@ class Controller:
         executor = self.__ensure_lftp_executor()
         if executor is None:
             return False
+
+        submitted_operation = operation
+        if action == "queue":
+            def queue_operation() -> _LftpQueueResult:
+                result = operation()
+                # Capture before this worker future completes. A later PTY
+                # operation must not overwrite the Queue breadcrumb outcome.
+                return _LftpQueueResult(
+                    result,
+                    getattr(self.__lftp, "last_command_timed_out", False) is True,
+                )
+            submitted_operation = queue_operation
         try:
-            future = executor.submit(operation)
+            future = executor.submit(submitted_operation)
         except RuntimeError:
             return False
         future.add_done_callback(lambda _future: self.wake_process())
@@ -1302,16 +1322,14 @@ class Controller:
             if not isinstance(operations, list):
                 operations = []
                 self.__lftp_operations = operations
-            operations.append(
-                _LftpOperation(
-                    action,
-                    future,
-                    file_id,
-                    operation_sequence,
-                    pending_dispatch,
-                    download_start_lifecycle_before,
-                )
-            )
+            operations.append(_LftpOperation(
+                action,
+                future,
+                file_id,
+                operation_sequence,
+                pending_dispatch,
+                download_start_lifecycle_before,
+            ))
             if action == "queue":
                 # A pre-Queue status can only describe the preceding
                 # lifecycle. Keep its work running for the single-worker PTY
@@ -1455,8 +1473,14 @@ class Controller:
                 remaining.append(operation)
                 continue
             future_outcome = "accepted"
+            command_prompt_timed_out = False
             try:
-                result = operation.future.result()
+                completed_result = operation.future.result()
+                if isinstance(completed_result, _LftpQueueResult):
+                    result = completed_result.result
+                    command_prompt_timed_out = completed_result.command_prompt_timed_out
+                else:
+                    result = completed_result
                 failed = operation.action in ("queue", "stop") and result is False
                 if failed:
                     future_outcome = "rejected"
@@ -1509,6 +1533,7 @@ class Controller:
                     "future_outcome": "success" if future_outcome == "accepted" else (
                         "backend_rejection" if future_outcome == "rejected" else future_outcome
                     ),
+                    "command_prompt_timed_out": command_prompt_timed_out,
                     "status_acknowledgement": "not_observed" if not failed else "not_applicable",
                     "result": "accepted" if not failed else "rejected",
                 }, flow_id=fractional_queue_flow_id(
@@ -8232,7 +8257,13 @@ class Controller:
                     continue
                 future_outcome = "success"
                 try:
-                    accepted = operation.future.result() is not False
+                    completed_result = operation.future.result()
+                    result = (
+                        completed_result.result
+                        if isinstance(completed_result, _LftpQueueResult)
+                        else completed_result
+                    )
+                    accepted = result is not False
                 except Exception:
                     accepted = False
                     future_outcome = "error"

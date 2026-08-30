@@ -870,6 +870,11 @@ class Lftp:
         return self.__last_status_poll_healthy
 
     @property
+    def last_command_timed_out(self) -> bool:
+        """Expose the most recent command's prompt outcome for opt-in diagnostics only."""
+        return self.__last_command_timed_out
+
+    @property
     def last_status_poll_failure_reason(self) -> Optional[str]:
         """Return the fixed safe category for the most recent status poll."""
         reason = getattr(self, "_Lftp__last_status_poll_failure_reason", None)

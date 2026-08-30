@@ -459,6 +459,7 @@ class TestLftp(unittest.TestCase):
         self.assertFalse(lftp.last_status_poll_healthy)
         self.assertEqual("timeout", lftp.last_status_poll_failure_reason)
         self.assertTrue(lftp._Lftp__last_command_timed_out)
+        self.assertTrue(lftp.last_command_timed_out)
         self.assertEqual(7, lftp._Lftp__process.delaybeforesend)
         lftp._Lftp__process.send.assert_called_once_with("jobs -v\n")
         lftp._Lftp__process.sendline.assert_not_called()

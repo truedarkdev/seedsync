@@ -6427,6 +6427,34 @@ class TestController(unittest.TestCase):
         self.assertEqual("backend_rejection", entry["details"]["future_outcome"])
         self.assertEqual("backend_rejected", entry["details"]["reason"])
 
+    def test_async_queue_rejection_stays_rejected_during_idle_reconciliation(self):
+        file = ModelFile("async-rejected", False)
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__pending_queue_dispatches = {
+            file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
+        }
+
+        self.assertTrue(self.controller._Controller__submit_lftp_operation(
+            "queue", lambda: False, file.file_id, 1,
+        ))
+        operation = self.controller._Controller__lftp_operations[0]
+        operation.future.result(timeout=1)
+
+        self.assertEqual(
+            set(), self.controller._reconcile_pending_queue_dispatches_from_fresh_status([]),
+        )
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+        time.sleep(0.05)
+        entry = next(
+            entry for entry in trace.snapshot()["entries"] if entry["message"] == "queue_status_ack"
+        )
+        self.assertEqual("backend_rejection", entry["details"]["future_outcome"])
+        self.assertEqual("rejected", entry["details"]["result"])
+
     def test_process_commands_queue_pending_guard_clears_after_authoritative_lifecycle_exit(self):
         file = ModelFile("lifecycle", False)
         file.remote_size = 10
@@ -6551,6 +6579,62 @@ class TestController(unittest.TestCase):
         self.assertEqual("success", next(
             entry for entry in entries if entry["message"] == "queue_future_outcome"
         )["details"]["future_outcome"])
+
+    def test_queue_future_trace_captures_prompt_timeout_before_later_command(self):
+        file = ModelFile("ambiguous-queue", False)
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+
+        def timed_out_queue():
+            self.controller._Controller__lftp.last_command_timed_out = True
+
+        self.assertTrue(self.controller._Controller__submit_lftp_operation(
+            "queue", timed_out_queue, file.file_id, 1,
+        ))
+        operation = self.controller._Controller__lftp_operations[0]
+        operation.future.result(timeout=1)
+        # Model the next serialized PTY command completing before the
+        # controller consumes the Queue future. The breadcrumb must retain
+        # the Queue command's own outcome rather than this newer value.
+        self.controller._Controller__lftp.last_command_timed_out = False
+
+        self.controller._Controller__drain_lftp_operations()
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+        time.sleep(0.05)
+        outcome = next(
+            entry for entry in trace.snapshot()["entries"] if entry["message"] == "queue_future_outcome"
+        )
+        self.assertEqual("success", outcome["details"]["future_outcome"])
+        self.assertTrue(outcome["details"]["command_prompt_timed_out"])
+
+    def test_queue_future_trace_keeps_prompt_success_before_later_timeout(self):
+        file = ModelFile("successful-queue", False)
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__lftp.last_command_timed_out = True
+
+        def successful_queue():
+            self.controller._Controller__lftp.last_command_timed_out = False
+
+        self.assertTrue(self.controller._Controller__submit_lftp_operation(
+            "queue", successful_queue, file.file_id, 1,
+        ))
+        operation = self.controller._Controller__lftp_operations[0]
+        operation.future.result(timeout=1)
+        self.controller._Controller__lftp.last_command_timed_out = True
+
+        self.controller._Controller__drain_lftp_operations()
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+        time.sleep(0.05)
+        outcome = next(
+            entry for entry in trace.snapshot()["entries"] if entry["message"] == "queue_future_outcome"
+        )
+        self.assertEqual("success", outcome["details"]["future_outcome"])
+        self.assertFalse(outcome["details"]["command_prompt_timed_out"])
 
     def test_pending_autoqueue_dispatch_with_other_active_status_stays_ambiguous(self):
         file = ModelFile("fallback-autoqueue", False)
