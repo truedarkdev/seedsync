@@ -150,6 +150,53 @@ class TestLftpJobStatusParser(unittest.TestCase):
         self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
         self.assertEqual("sample-directory", statuses[0].name)
 
+    def test_mirror_exclusion_keeps_path_arguments_separate_from_flags(self):
+        commands = (
+            (
+                "Queue is stopped.\n"
+                "Commands queued:\n"
+                "1. mirror -c --exclude \"^child\\\\-a\\\\.bin$\" "
+                "\"/remote/sample-directory\" \"/local/staging/\"\n",
+                LftpJobStatus.State.QUEUED,
+            ),
+            (
+                "Queue is running.\n"
+                "[1] mirror -c --exclude \"^child\\\\-a\\\\.bin$\" "
+                "\"/remote/sample-directory\" \"/local/staging/\" -- 10/20 (50%)\n",
+                LftpJobStatus.State.RUNNING,
+            ),
+            (
+                "Queue is running.\n"
+                "[1] mirror -c --exclude ^child\\\\-a\\\\.bin$ "
+                "/remote/sample-directory /local/staging/ -- 10/20 (50%)\n",
+                LftpJobStatus.State.RUNNING,
+            ),
+            (
+                "Queue is stopped.\n"
+                "Commands queued:\n"
+                "1. mirror -c --exclude-glob \"Sample/*\" --exclude \"^nested/child\\\\.bin$\" "
+                "\"/remote/sample-directory\" \"/local/staging/\"\n",
+                LftpJobStatus.State.QUEUED,
+            ),
+        )
+
+        for command, state in commands:
+            with self.subTest(state=state):
+                output = (
+                    "jobs -v\n"
+                    "[0] queue (sftp://someone:@localhost)\n"
+                    "sftp://someone:@localhost/remote\n"
+                    + command
+                )
+
+                statuses = LftpJobStatusParser().parse(output)
+
+                self.assertEqual(1, len(statuses))
+                self.assertEqual(state, statuses[0].state)
+                self.assertEqual("/remote/sample-directory", statuses[0].remote_path)
+                self.assertEqual("/local/staging/", statuses[0].local_path)
+                self.assertEqual("sample-directory", statuses[0].name)
+
     def test_genuine_empty_snapshot_remains_empty(self):
         output = (
             "jobs -v\n"

@@ -37,6 +37,13 @@ class LftpJobStatusParser:
     __TIME_UNITS_REGEX = r"(?P<eta_d>\d*d)?(?P<eta_h>\d*h)?(?P<eta_m>\d*m)?(?P<eta_s>\d*s)?"
 
     __QUOTED_FILE_NAME_REGEX = r"`(?P<name>.*)'"
+    # Directory queueing emits only these mirror options before the remote and
+    # local positional paths. `jobs -v` may render an exclusion argument
+    # without the quotes used by the queue command, so neither form may be
+    # mistaken for a positional remote path.
+    __MIRROR_KNOWN_OPTION_REGEX = (
+        r'(?:-c|--exclude(?:-glob)?\s+(?:"(?:\\.|[^"\\])*"|(?:\\.|[^\s])+))'
+    )
 
     __QUEUE_DONE_REGEX = r"^\[(?P<id>\d+)\]\sDone\s\(queue\s\(.+\)\)"
     __QUEUE_COMMAND_ECHO_REGEX = r"^queue\s+(?:mirror|pget|get)(?:\s|$)"
@@ -242,6 +249,21 @@ class LftpJobStatusParser:
         pget_header_m = re.compile(pget_header_pattern)
 
         # mirror header (downloading)
+        mirror_known_options_header_pattern = (r"^\[(?P<id>\d+)\]\s+"
+                                               r"mirror\s+"
+                                               r"(?P<flags>{option}(?:\s+{option})*)\s+"
+                                               r"(?P<lq>['\"]|)(?P<remote>.+)(?P=lq)\s+"  # greedy on purpose
+                                               r"(?P<rq>['\"]|)(?P<local>.+)(?P=rq)\s+"  # greedy on purpose
+                                               r"--\s+"
+                                               r"(?P<szlocal>\d+\.?\d*\s?({sz})?)"  # size=0 has no units
+                                               r"\/"
+                                               r"(?P<szremote>\d+\.?\d*\s?({sz})?)\s+"  # size=0 has no units
+                                               r"\((?P<pctlocal>\d+)%\)"
+                                               r"(\s+(?P<speed>\d+\.?\d*\s?({sz}))\/s)?$")\
+            .format(option=LftpJobStatusParser.__MIRROR_KNOWN_OPTION_REGEX,
+                    sz=LftpJobStatusParser.__SIZE_UNITS_REGEX)
+        mirror_known_options_header_m = re.compile(mirror_known_options_header_pattern)
+
         mirror_header_pattern = (r"^\[(?P<id>\d+)\]\s+"
                                  r"mirror\s+"
                                  r"(?P<flags>.*?)\s+"
@@ -257,6 +279,14 @@ class LftpJobStatusParser:
         mirror_header_m = re.compile(mirror_header_pattern)
 
         # mirror header (connecting or receiving file list)
+        mirror_known_options_fl_header_pattern = (r"^\[(?P<id>\d+)\]\s+"
+                                                  r"mirror\s+"
+                                                  r"(?P<flags>{option}(?:\s+{option})*)\s+"
+                                                  r"(?P<lq>['\"]|)(?P<remote>.+)(?P=lq)\s+"  # greedy on purpose
+                                                  r"(?P<rq>['\"]|)(?P<local>.+)(?P=rq)$")\
+            .format(option=LftpJobStatusParser.__MIRROR_KNOWN_OPTION_REGEX)
+        mirror_known_options_fl_header_m = re.compile(mirror_known_options_fl_header_pattern)
+
         mirror_fl_header_pattern = (r"^\[(?P<id>\d+)\]\s+"
                                     r"mirror\s+"
                                     r"(?P<flags>.*?)\s+"
@@ -369,7 +399,9 @@ class LftpJobStatusParser:
             if not (
                 prev_job is not None or
                 pget_header_m.match(line) or
+                mirror_known_options_header_m.match(line) or
                 mirror_header_m.match(line) or
+                mirror_known_options_fl_header_m.match(line) or
                 mirror_fl_header_m.match(line)
             ):
                 if orphan_progress_m.match(line) or partial_progress_m.match(line) or chunk_wrap_m.match(line):
@@ -475,7 +507,7 @@ class LftpJobStatusParser:
                 continue
 
             # Search for mirror header
-            result = mirror_header_m.search(line)
+            result = mirror_known_options_header_m.search(line) or mirror_header_m.search(line)
             if result:
                 id_ = int(result.group("id"))
                 name = os.path.basename(os.path.normpath(result.group("remote")))
@@ -510,7 +542,7 @@ class LftpJobStatusParser:
 
             # Search for mirror connecting header
             # Note: this must be after the more restrictive mirror header above
-            result = mirror_fl_header_m.search(line)
+            result = mirror_known_options_fl_header_m.search(line) or mirror_fl_header_m.search(line)
             if result:
                 # There may be a 'Connecting' or 'cd' line ahead, but not always
                 if lines and (
@@ -735,6 +767,13 @@ class LftpJobStatusParser:
                                         r"(?P<lq>[\'\"]|)(?P<remote>.+)(?P=lq)\s+"  # greedy on purpose
                                         r"(?P<rq>[\'\"]|)(?P<local>.+)(?P=rq)$")  # greedy on purpose
                 queue_mirror_m = re.compile(queue_mirror_pattern)
+                queue_mirror_known_options_pattern = (r"^(?P<id>\d+)\.\s+"
+                                                      r"mirror\s+"
+                                                      r"(?P<flags>{option}(?:\s+{option})*)\s+"
+                                                      r"(?P<lq>[\'\"]|)(?P<remote>.+)(?P=lq)\s+"  # greedy on purpose
+                                                      r"(?P<rq>[\'\"]|)(?P<local>.+)(?P=rq)$")\
+                    .format(option=LftpJobStatusParser.__MIRROR_KNOWN_OPTION_REGEX)
+                queue_mirror_known_options_m = re.compile(queue_mirror_known_options_pattern)
                 while lines:
                     line = lines[0]
                     if re.match(r"^\d+\.", line):
@@ -755,7 +794,10 @@ class LftpJobStatusParser:
                             continue
 
                         result_pget = queue_pget_m.match(line)
-                        result_mirror = queue_mirror_m.match(line)
+                        result_mirror = (
+                            queue_mirror_known_options_m.match(line) or
+                            queue_mirror_m.match(line)
+                        )
                         if result_pget:
                             type_ = (LftpJobStatus.Type.GET
                                      if result_pget.group("command") == "get"

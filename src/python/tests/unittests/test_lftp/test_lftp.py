@@ -367,6 +367,31 @@ class TestLftp(unittest.TestCase):
         self.assertEqual("TV", statuses[0].path_pair_name)
         self.assertTrue(lftp.last_status_poll_healthy)
 
+    def test_status_annotates_parsed_mirror_with_jobs_rendered_exclusion(self):
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/remote\n"
+            "Queue is running.\n"
+            "[1] mirror -c --exclude ^child\\\\-a\\\\.bin$ "
+            "/remote/pair-a/sample-directory /local/pair-a/staging/ -- 10/20 (50%)\n"
+        )
+        status = LftpJobStatusParser().parse(output)[0]
+        lftp = self._build_test_lftp()
+        lftp._Lftp__path_pairs_by_id = {
+            "pair-a": {
+                "name": "Pair A",
+                "remote_path": "/remote/pair-a",
+                "local_path": "/local/pair-a",
+            },
+        }
+
+        lftp._Lftp__annotate_status_path_pairs([status])
+
+        self.assertEqual("pair-a", status.path_pair_id)
+        self.assertEqual("Pair A", status.path_pair_name)
+        self.assertEqual("sample-directory", status.name)
+
     def test_status_leaves_cross_pair_remote_and_local_matches_unscoped(self):
         lftp = self._build_test_lftp()
         lftp._Lftp__path_pairs_by_id = {
