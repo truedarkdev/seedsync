@@ -91,6 +91,69 @@ class TestMultiPathActiveScanner(unittest.TestCase):
         self.assertEqual(1, len(files))
         self.assertEqual("dup", files[0].name)
 
+    def test_scan_breadcrumb_records_single_pair_fallback_without_runtime_identity(self):
+        scanner = MultiPathActiveScanner({"movies": self.movies_dir})
+        self.addCleanup(scanner.close)
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner.set_breadcrumb_trace(trace)
+        scanner._MultiPathActiveScanner__active_files = [("dup", None, None)]
+
+        self.assertEqual(1, len(scanner.scan()))
+
+        events = [
+            event for event in trace.record.call_args_list
+            if event.args[1] == "active_scanner_map_selection"
+        ]
+        self.assertEqual(1, len(events))
+        details = events[0].args[2]
+        self.assertEqual("multipath_active_scanner.v1", details["schema"])
+        self.assertEqual(1, details["scanner_map_size"])
+        self.assertEqual("one", details["scanner_map_cardinality"])
+        self.assertEqual("unscoped", details["input_scope"])
+        self.assertTrue(details["fallback_used"])
+        self.assertEqual("selected", details["scanner_result"])
+        self.assertEqual("single_pair_fallback", details["reason"])
+        self.assertNotIn("dup", repr(events[0]))
+        self.assertNotIn(self.temp_dir, repr(events[0]))
+
+    def test_scan_breadcrumb_records_missing_scanner_for_stale_scoped_pair(self):
+        scanner = MultiPathActiveScanner({"movies": self.movies_dir, "tv": self.tv_dir})
+        self.addCleanup(scanner.close)
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner.set_breadcrumb_trace(trace)
+        scanner.logger = MagicMock()
+        scanner._MultiPathActiveScanner__active_files = [("dup", "stale", "Stale")]
+
+        self.assertEqual([], scanner.scan())
+
+        events = [
+            event for event in trace.record.call_args_list
+            if event.args[1] == "active_scanner_map_selection"
+        ]
+        self.assertEqual(1, len(events))
+        details = events[0].args[2]
+        self.assertEqual(2, details["scanner_map_size"])
+        self.assertEqual("multiple", details["scanner_map_cardinality"])
+        self.assertEqual("scoped", details["input_scope"])
+        self.assertFalse(details["fallback_used"])
+        self.assertEqual("missing", details["scanner_result"])
+        self.assertEqual("path_pair_missing", details["reason"])
+        self.assertNotIn("stale", repr(events[0]))
+
+    def test_scan_breadcrumb_disabled_keeps_scanner_routing_without_diagnostic_work(self):
+        scanner = MultiPathActiveScanner({"movies": self.movies_dir})
+        self.addCleanup(scanner.close)
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = False
+        scanner.set_breadcrumb_trace(trace)
+        scanner._MultiPathActiveScanner__active_files = [("dup", None, None)]
+
+        self.assertEqual(1, len(scanner.scan()))
+
+        trace.record.assert_not_called()
+
     def test_scan_uses_temp_file_when_final_active_path_is_missing(self):
         scanner = MultiPathActiveScanner({"movies": self.movies_dir}, use_temp_file=True)
         self.addCleanup(scanner.close)

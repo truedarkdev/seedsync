@@ -11,7 +11,71 @@ from common import overrides, Constants
 from common.lftp_status import MAX_LFTP_PGET_STATUS_BYTES, parse_lftp_pget_status_bytes
 from model import ModelFile
 from system import SystemFile, SystemScanner, SystemScannerError
-from system.scanner import _record_lftp_sidecar_breadcrumb, lftp_sidecar_target_identity
+from system.scanner import (
+    _breadcrumb_effectively_enabled,
+    _record_lftp_sidecar_breadcrumb,
+    lftp_sidecar_target_identity,
+)
+
+
+MULTIPATH_ACTIVE_TRACE_CATEGORY = "transfer.lftp"
+MULTIPATH_ACTIVE_TRACE_SCHEMA = "multipath_active_scanner.v1"
+
+
+def _record_active_scanner_selection(
+        breadcrumb_trace: object,
+        scanner_map_size: int,
+        input_scope: str,
+        fallback_used: bool,
+        scanner_result: str,
+        reason: str,
+) -> None:
+    """Record fixed active-scanner routing facts without runtime identities."""
+    if not _breadcrumb_effectively_enabled(breadcrumb_trace, MULTIPATH_ACTIVE_TRACE_CATEGORY, "info"):
+        return
+    try:
+        recorder = getattr(breadcrumb_trace, "record", None)
+        if not callable(recorder):
+            return
+        scanner_map_size = max(0, min(int(scanner_map_size), 2_147_483_647))
+        if input_scope not in {"scoped", "unscoped"}:
+            input_scope = "unknown"
+        if scanner_result not in {"selected", "missing"}:
+            scanner_result = "missing"
+        if reason not in {
+                "path_pair_match", "single_pair_fallback", "path_pair_missing",
+                "unscoped_without_single_pair",
+        }:
+            reason = "unknown"
+        recorder(
+            "multipath_active_scanner",
+            "active_scanner_map_selection",
+            {
+                "schema": MULTIPATH_ACTIVE_TRACE_SCHEMA,
+                "scanner_map_size": scanner_map_size,
+                "scanner_map_cardinality": "zero" if scanner_map_size == 0 else
+                "one" if scanner_map_size == 1 else "multiple",
+                "input_scope": input_scope,
+                "fallback_used": fallback_used is True,
+                "scanner_result": scanner_result,
+                "reason": reason,
+            },
+            stage="multipath_active_scanner_selection",
+            event_type="diagnostic",
+            category=MULTIPATH_ACTIVE_TRACE_CATEGORY,
+            level="info",
+            _coalesce_key="multipath_active_scanner|{}|{}|{}|{}|{}".format(
+                scanner_map_size,
+                input_scope,
+                str(fallback_used is True).lower(),
+                scanner_result,
+                reason,
+            ),
+            trace_scope="flow",
+        )
+    except Exception:
+        # Breadcrumb diagnostics must never alter scanner routing.
+        return
 
 
 class _StatusFileScanner(SystemScanner):
@@ -79,8 +143,20 @@ class MultiPathActiveScanner(IScanner):
         results: List[SystemFile] = []
         for file_name, path_pair_id, path_pair_name in self.__active_files:
             scanner = self.__scanners.get(path_pair_id) if path_pair_id is not None else None
-            if scanner is None and path_pair_id is None and len(self.__scanners) == 1:
+            fallback_used = scanner is None and path_pair_id is None and len(self.__scanners) == 1
+            if fallback_used:
                 scanner = next(iter(self.__scanners.values()))
+            _record_active_scanner_selection(
+                self.__breadcrumb_trace,
+                len(self.__scanners),
+                "scoped" if path_pair_id is not None else "unscoped",
+                fallback_used,
+                "selected" if scanner is not None else "missing",
+                "single_pair_fallback" if fallback_used else
+                "path_pair_match" if scanner is not None else
+                "path_pair_missing" if path_pair_id is not None else
+                "unscoped_without_single_pair",
+            )
             if scanner is None:
                 self.logger.warning(
                     "Skipping active scan for '%s': no scanner for path pair '%s'",

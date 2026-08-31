@@ -6426,6 +6426,7 @@ class TestController(unittest.TestCase):
         self.assertEqual("queue_dispatch", entry["message"])
         self.assertEqual("backend_rejection", entry["details"]["future_outcome"])
         self.assertEqual("backend_rejected", entry["details"]["reason"])
+        self.assertEqual("backend_rejection", entry["details"]["outcome"])
 
     def test_async_queue_rejection_stays_rejected_during_idle_reconciliation(self):
         file = ModelFile("async-rejected", False)
@@ -6579,6 +6580,49 @@ class TestController(unittest.TestCase):
         self.assertEqual("success", next(
             entry for entry in entries if entry["message"] == "queue_future_outcome"
         )["details"]["future_outcome"])
+        status_ack = next(
+            entry for entry in entries if entry["message"] == "queue_status_ack"
+        )
+        self.assertEqual("fresh_idle_without_active_status", status_ack["details"]["retirement_reason"])
+
+    def test_queue_worker_start_future_outcome_and_retirement_share_opaque_flow(self):
+        file = ModelFile("private-queue-target.mkv", False)
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__pending_queue_dispatches = {
+            file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
+        }
+
+        self.assertTrue(self.controller._Controller__submit_lftp_operation(
+            "queue", lambda: True, file.file_id, 1,
+        ))
+        operation = self.controller._Controller__lftp_operations[0]
+        operation.future.result(timeout=1)
+        self.controller._Controller__drain_lftp_operations()
+        retired = self.controller._reconcile_pending_queue_dispatches_from_fresh_status([])
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+        self.assertEqual({(file.name, None, None)}, retired)
+        expected_correlation = "fractional-mtime:{}".format(
+            opaque_trace_correlation(file.file_id),
+        )
+        retrieved = trace.query_events(
+            correlation_id=expected_correlation, category_prefix="queue.",
+        )["events"]
+        messages = [entry["message"] for entry in retrieved]
+        self.assertEqual(
+            ["queue_worker_start", "queue_future_outcome", "queue_status_ack"],
+            messages,
+        )
+        self.assertEqual({expected_correlation}, {entry["corr_id"] for entry in retrieved})
+        self.assertEqual(1, len({entry["flow_id"] for entry in retrieved}))
+        self.assertEqual("accepted", next(
+            entry for entry in retrieved if entry["message"] == "queue_future_outcome"
+        )["details"]["outcome"])
+        for entry in retrieved:
+            self.assertIsNone(entry["file_id"])
+            self.assertNotIn("private-queue-target.mkv", str(entry))
 
     def test_queue_future_trace_captures_prompt_timeout_before_later_command(self):
         file = ModelFile("ambiguous-queue", False)
@@ -6608,6 +6652,7 @@ class TestController(unittest.TestCase):
         )
         self.assertEqual("success", outcome["details"]["future_outcome"])
         self.assertTrue(outcome["details"]["command_prompt_timed_out"])
+        self.assertEqual("prompt_timeout", outcome["details"]["outcome"])
 
     def test_queue_future_trace_keeps_prompt_success_before_later_timeout(self):
         file = ModelFile("successful-queue", False)
@@ -6635,6 +6680,32 @@ class TestController(unittest.TestCase):
         )
         self.assertEqual("success", outcome["details"]["future_outcome"])
         self.assertFalse(outcome["details"]["command_prompt_timed_out"])
+
+    def test_queue_future_trace_classifies_exception_as_distinct_outcome(self):
+        file = ModelFile("private-exception-target.mkv", False)
+        future = Future()
+        future.set_exception(LftpError("private backend failure"))
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__lftp_operation_sequences = {file.file_id: 1}
+        self.controller._Controller__lftp_operations = [
+            _LftpOperation("queue", future, file.file_id, 1),
+        ]
+
+        self.controller._Controller__drain_lftp_operations()
+
+        outcome = next(
+            entry for entry in trace.query_events(
+                correlation_id="fractional-mtime:{}".format(
+                    opaque_trace_correlation(file.file_id),
+                ),
+                category_prefix="queue.",
+            )["events"] if entry["message"] == "queue_future_outcome"
+        )
+        self.assertEqual("exception", outcome["details"]["outcome"])
+        self.assertEqual("error", outcome["details"]["future_outcome"])
+        self.assertNotIn("private-exception-target.mkv", str(outcome))
 
     def test_pending_autoqueue_dispatch_with_other_active_status_stays_ambiguous(self):
         file = ModelFile("fallback-autoqueue", False)

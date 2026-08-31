@@ -9,7 +9,7 @@ import json
 import threading
 
 from common import overrides, PersistError, Config, PathPair
-from common.breadcrumb_trace import BreadcrumbTraceCollector
+from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation
 from controller import AutoQueue, AutoQueuePersist, IAutoQueuePersistListener, AutoQueuePattern
 from controller.auto_queue import AutoQueuePersistListener
 from controller import Controller
@@ -669,6 +669,59 @@ class TestAutoQueue(unittest.TestCase):
         self.assertEqual({"state_not_downloaded": 1}, details["extract_blocked_reason_counts"])
         self.assertEqual(1, len(details["blocked_samples"]))
         self.assertEqual("state_not_downloaded", details["blocked_samples"][0]["reason"])
+
+    def test_auto_queue_candidate_breadcrumbs_are_opaque_and_correlated(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="show*"))
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=32)
+        self.context.breadcrumb_trace = trace
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        selected = ModelFile("show.s01e01.mkv", False)
+        selected.remote_size = 100
+        blocked = ModelFile("private-unmatched.mkv", False)
+        blocked.remote_size = 100
+        self.model_listener.file_added(selected)
+        self.model_listener.file_added(blocked)
+
+        auto_queue.process()
+
+        events = trace.query_events(category="auto_queue")["events"]
+        candidates = [
+            event for event in events if event["message"] == "auto_queue_candidate"
+            and event["details"]["lane"] == "queue"
+        ]
+        self.assertEqual(2, len(candidates))
+        by_decision = {event["details"]["decision"]: event for event in candidates}
+        self.assertEqual("eligible", by_decision["selected"]["details"]["reason"])
+        self.assertEqual("pattern_no_match", by_decision["blocked"]["details"]["reason"])
+        expected_correlation = "fractional-mtime:{}".format(
+            opaque_trace_correlation(selected.file_id),
+        )
+        self.assertEqual(expected_correlation, by_decision["selected"]["corr_id"])
+        self.assertTrue(by_decision["selected"]["flow_id"].startswith("autoq:1:queue:"))
+        self.assertNotIn("show.s01e01.mkv", str(events))
+        self.assertNotIn("private-unmatched.mkv", str(events))
+        self.assertNotIn("file_id", by_decision["blocked"]["details"])
+        self.assertNotIn("file_name", by_decision["blocked"]["details"])
+
+    def test_auto_queue_candidate_breadcrumb_is_gated_before_identity_hashing(self):
+        auto_queue = AutoQueue(self.context, AutoQueuePersist(), self.controller)
+        disabled = BreadcrumbTraceCollector(
+            lambda: True, max_entries=16, policy={"default": "off"},
+        )
+        auto_queue._AutoQueue__breadcrumb_trace = disabled.create_emitter()
+        candidate = ModelFile("private-candidate.mkv", False)
+
+        with patch(
+                "controller.auto_queue.opaque_trace_correlation",
+                side_effect=AssertionError("disabled candidate trace hashed identity"),
+        ):
+            auto_queue._AutoQueue__record_candidate_decision(
+                "queue", candidate, "selected", "eligible",
+            )
+
+        self.assertEqual([], disabled.snapshot()["entries"])
 
     def test_auto_queue_breadcrumb_gate_skips_lazy_details_and_emits_when_enabled(self):
         auto_queue = AutoQueue(self.context, AutoQueuePersist(), self.controller)

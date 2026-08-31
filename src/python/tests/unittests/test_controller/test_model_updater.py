@@ -28,6 +28,7 @@ from controller.model_updater import (
     _record_scan_adoption_breadcrumb,
     _record_lftp_status_breadcrumb,
     _record_lftp_status_membership_transition,
+    _record_pending_queue_overlay_publications,
     _ProgressiveScanAccumulator,
     _JointProgressiveReconciler,
     _filter_progressive_remote_state,
@@ -69,6 +70,44 @@ from system.scanner import SystemScanner
 
 
 class TestModelUpdater(unittest.TestCase):
+    def test_pending_queue_overlay_breadcrumb_links_synthetic_status_to_flow(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.exclusion": "info"}},
+            max_entries=16,
+        )
+        file = ModelFile("private-overlay-target.mkv", False)
+        dispatch = PendingQueueDispatch(0.0, file.name, None, False, 7)
+        synthetic_status = LftpJobStatus(
+            -7, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, file.name, "",
+        )
+        flow_id = "fractional-queue:opaque-flow"
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__pending_queue_dispatches={file.file_id: dispatch},
+            _Controller__fractional_queue_flow_id=lambda file_id, sequence: flow_id,
+            _Controller__record_breadcrumb=lambda **kwargs: trace.record(
+                "model_updater", kwargs.pop("message"), kwargs.pop("details"), **kwargs,
+            ),
+            logger=MagicMock(),
+        )
+
+        _record_pending_queue_overlay_publications(controller, [], [synthetic_status])
+
+        result = trace.query_events(
+            correlation_id="fractional-mtime:{}".format(
+                opaque_trace_correlation(file.file_id),
+            ),
+            category_prefix="queue.",
+        )
+        self.assertEqual(1, len(result["events"]))
+        event = result["events"][0]
+        self.assertEqual("queue_overlay_published", event["message"])
+        self.assertEqual(flow_id, event["flow_id"])
+        self.assertEqual("synthetic_pending_queue_published", event["details"]["phase"])
+        self.assertTrue(event["details"]["operation_sequence_present"])
+        self.assertNotIn("private-overlay-target.mkv", str(event))
+
     def test_scan_adoption_breadcrumb_is_opaque_and_identifies_root_loss(self):
         source = SystemFile("private-root", 7, True)
         source.path_pair_id = "private-pair"
@@ -6510,6 +6549,136 @@ class TestModelUpdater(unittest.TestCase):
         model_builder.set_local_files.assert_not_called()
         model_builder.set_unknown_local_path_pair_ids.assert_called_once_with({None})
         model_builder.build_model.assert_not_called()
+
+    def _progressive_identity_fixture(self, partial_model, *, live_pair_id="pair-a"):
+        """Build a pair-scoped progressive tick around a supplied partial model."""
+        pair_id = "pair-a"
+        live_root = ModelFile("identity-root", False)
+        live_root.path_pair_id = live_pair_id
+        live_root.remote_size = 10
+        live_model = Model()
+        live_model.add_file(live_root)
+
+        remote_root = SystemFile("identity-root", 11)
+        remote_root.path_pair_id = pair_id
+        local_root = SystemFile("identity-root", 11)
+        local_root.path_pair_id = pair_id
+        remote_scan = ScannerResult(
+            datetime.now(), [remote_root], scanned_path_pair_ids={pair_id},
+            is_progress=True, completed_path_pair_ids=set(), is_scan_final=False,
+            unknown_path_pair_ids={pair_id}, session_token="remote-identity",
+        )
+        local_scan = ScannerResult(
+            datetime.now(), [local_root], scanned_path_pair_ids={pair_id},
+            is_progress=True, completed_path_pair_ids=set(), is_scan_final=False,
+            unknown_path_pair_ids={pair_id}, session_token="local-identity",
+        )
+        controller, model_builder = self._make_progressive_update_controller(
+            remote_scan, local_scan=local_scan, authoritative=False,
+            model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {pair_id: MagicMock()}
+        model_builder.build_progressive_roots = MagicMock(return_value=partial_model)
+        # Match ModelBuilder.request_rebuild(): an explicit invalidation makes
+        # the ordinary full-build predicate true in this same updater tick.
+        model_builder.request_rebuild.side_effect = lambda: setattr(
+            model_builder.has_changes, "return_value", True,
+        )
+        return controller, model_builder, live_model, ModelFile.build_file_id(
+            live_root.name, pair_id,
+        )
+
+    def test_progressive_delta_rejects_unique_same_name_candidate_with_different_id(self):
+        pairless_candidate = ModelFile("identity-root", False)
+        pairless_candidate.remote_size = 99
+        partial_model = MagicMock()
+        partial_model.get_file.return_value = pairless_candidate
+        controller, model_builder, live_model, live_id = self._progressive_identity_fixture(
+            partial_model,
+        )
+        model_builder.build_model.return_value = live_model
+        # The partial lookup claims the requested canonical key, but returns a
+        # legacy unique-name fallback whose dynamic identity is pairless.
+        partial_model.get_file_ids.return_value = {live_id}
+        update_file = MagicMock(wraps=live_model.update_file)
+        live_model.update_file = update_file
+
+        ModelUpdater(controller).update()
+
+        model_builder.build_progressive_roots.assert_called_once()
+        partial_model.get_file.assert_called_once_with(live_id)
+        model_builder.request_rebuild.assert_called_once_with()
+        model_builder.build_model.assert_called_once_with()
+        update_file.assert_not_called()
+        self.assertNotEqual(live_id, pairless_candidate.file_id)
+
+    def test_progressive_delta_updates_same_exact_canonical_id(self):
+        pair_id = "pair-a"
+        candidate = ModelFile("identity-root", False)
+        candidate.path_pair_id = pair_id
+        candidate.remote_size = 99
+        partial_model = MagicMock()
+        partial_model.get_file.return_value = candidate
+        partial_model.get_file_ids.return_value = {candidate.file_id}
+        controller, model_builder, live_model, live_id = self._progressive_identity_fixture(
+            partial_model,
+        )
+        model_builder.build_model.return_value = live_model
+        update_file = MagicMock(wraps=live_model.update_file)
+        live_model.update_file = update_file
+
+        ModelUpdater(controller).update()
+
+        model_builder.build_progressive_roots.assert_called_once()
+        model_builder.request_rebuild.assert_not_called()
+        update_file.assert_called_once_with(candidate)
+        self.assertEqual(live_id, candidate.file_id)
+        self.assertEqual(99, live_model.get_file(live_id).remote_size)
+
+    def test_progressive_delta_adds_exact_pair_root_beside_same_name_other_pair(self):
+        candidate = ModelFile("identity-root", False)
+        candidate.path_pair_id = "pair-a"
+        candidate.remote_size = 99
+        partial_model = MagicMock()
+        partial_model.get_file.return_value = candidate
+        partial_model.get_file_ids.return_value = {candidate.file_id}
+        controller, model_builder, live_model, live_id = self._progressive_identity_fixture(
+            partial_model, live_pair_id="pair-b",
+        )
+        update_file = MagicMock(wraps=live_model.update_file)
+        live_model.update_file = update_file
+
+        ModelUpdater(controller).update()
+
+        model_builder.build_progressive_roots.assert_called_once()
+        model_builder.request_rebuild.assert_not_called()
+        update_file.assert_not_called()
+        self.assertEqual(live_id, live_model.get_file(live_id).file_id)
+        self.assertIn(ModelFile.build_file_id("identity-root", "pair-b"), live_model.get_file_ids())
+
+    def test_progressive_delta_rejects_duplicate_same_name_candidates_across_pairs(self):
+        candidate_a = ModelFile("identity-root", False)
+        candidate_a.path_pair_id = "pair-b"
+        candidate_b = ModelFile("identity-root", False)
+        candidate_b.path_pair_id = "pair-c"
+        partial_model = Model()
+        partial_model.add_file(candidate_a)
+        partial_model.add_file(candidate_b)
+        controller, model_builder, live_model, live_id = self._progressive_identity_fixture(
+            partial_model,
+        )
+        model_builder.build_model.return_value = live_model
+        update_file = MagicMock(wraps=live_model.update_file)
+        live_model.update_file = update_file
+
+        ModelUpdater(controller).update()
+
+        model_builder.build_progressive_roots.assert_called_once()
+        model_builder.request_rebuild.assert_called_once_with()
+        update_file.assert_not_called()
+        self.assertEqual(live_id, live_model.get_file(live_id).file_id)
+        self.assertNotEqual(live_id, candidate_a.file_id)
+        self.assertNotEqual(live_id, candidate_b.file_id)
 
     def test_partial_progressive_delta_does_not_mask_pending_full_builder_change(self):
         partial = self._progressive_result(final=False, unknown={None})

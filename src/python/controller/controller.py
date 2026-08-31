@@ -1301,7 +1301,21 @@ class Controller:
 
         submitted_operation = operation
         if action == "queue":
+            queue_flow_id = _fractional_queue_flow_id(
+                self, file_id, operation_sequence,
+            ) if isinstance(file_id, str) else None
+
             def queue_operation() -> _LftpQueueResult:
+                if isinstance(file_id, str):
+                    _record_fractional_queue_trace(
+                        self, file_id, "queue_worker_start", lambda: {
+                            "schema": "fractional_mtime_redownload.queue_worker.v1",
+                            "phase": "executor_start",
+                            "dispatch_mode": "async_future",
+                            "operation_sequence_present": type(operation_sequence) is int and
+                            operation_sequence > 0,
+                        }, flow_id=queue_flow_id,
+                    )
                 result = operation()
                 # Capture before this worker future completes. A later PTY
                 # operation must not overwrite the Queue breadcrumb outcome.
@@ -1527,9 +1541,15 @@ class Controller:
                         message="transfer_stop_queue_backend_outcome",
                     )
             if operation.action == "queue" and operation_file_id is not None:
+                queue_outcome = (
+                    "prompt_timeout" if command_prompt_timed_out else
+                    "backend_rejection" if future_outcome == "rejected" else
+                    "exception" if future_outcome == "error" else "accepted"
+                )
                 record_fractional_queue_trace(self, operation_file_id, "queue_future_outcome", lambda: {
                     "schema": "fractional_mtime_redownload.queue_future.v2",
                     "dispatch_mode": "async_future",
+                    "outcome": queue_outcome,
                     "future_outcome": "success" if future_outcome == "accepted" else (
                         "backend_rejection" if future_outcome == "rejected" else future_outcome
                     ),
@@ -8073,6 +8093,7 @@ class Controller:
                             _record_fractional_queue_trace(self, file_id, "startup_recovery_queue_dispatch", lambda: {
                                 "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
                                 "dispatch_mode": "async_future",
+                                "outcome": "backend_rejection",
                                 "future_outcome": "backend_rejection",
                                 "status_acknowledgement": "not_applicable",
                                 "result": "rejected",
@@ -8141,7 +8162,20 @@ class Controller:
             try:
                 self.__model.get_file(file_id)
             except ModelError:
+                dispatch = pending[file_id]
                 del pending[file_id]
+                _record_fractional_queue_trace(
+                    self, file_id, "queue_pending_dispatch_retired", lambda: {
+                        "schema": "fractional_mtime_redownload.queue_pending.v1",
+                        "phase": "pending_dispatch_retired",
+                        "retirement_reason": "model_missing",
+                        "operation_sequence_present": type(
+                            dispatch.operation_sequence
+                        ) is int and dispatch.operation_sequence > 0,
+                    }, flow_id=_fractional_queue_flow_id(
+                        self, file_id, dispatch.operation_sequence,
+                    ),
+                )
                 continue
 
     def _reconcile_pending_queue_dispatches_from_fresh_status(
@@ -8217,6 +8251,7 @@ class Controller:
                     "status_acknowledgement": "running",
                     "future_outcome": "not_observed",
                     "result": "accepted",
+                    "retirement_reason": "running_status_observed",
                 }, flow_id=fractional_queue_flow_id(
                     self, file_id, dispatch.operation_sequence,
                 ))
@@ -8275,6 +8310,7 @@ class Controller:
                         "status_acknowledgement": "rejected",
                         "future_outcome": future_outcome,
                         "result": "rejected",
+                        "retirement_reason": "queue_future_rejected",
                     }, flow_id=fractional_queue_flow_id(
                         self, file_id, dispatch.operation_sequence,
                     ))
@@ -8289,6 +8325,7 @@ class Controller:
                 "status_acknowledgement": "idle_completion",
                 "future_outcome": future_outcome if matching_queue_operations else "not_observed",
                 "result": "accepted",
+                "retirement_reason": "fresh_idle_without_active_status",
             }, flow_id=fractional_queue_flow_id(
                 self, file_id, dispatch.operation_sequence,
             ))
@@ -9468,6 +9505,7 @@ class Controller:
                                 _record_fractional_queue_trace(self, file.file_id, "queue_dispatch", lambda: {
                                     "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                                     "dispatch_mode": "async_future",
+                                    "outcome": "backend_rejection",
                                     "future_outcome": "backend_rejection",
                                     "status_acknowledgement": "not_applicable",
                                     "exclusions_present": exclusions_present,
@@ -9626,6 +9664,9 @@ class Controller:
                         _record_fractional_queue_trace(self, file.file_id, "queue_dispatch", lambda: {
                             "schema": "fractional_mtime_redownload.queue_dispatch.v2",
                             "dispatch_mode": "async_future" if self.__uses_async_lftp_owner() else "sync_backend",
+                            "outcome": (
+                                "backend_rejection" if sync_backend_rejected else "exception"
+                            ),
                             "future_outcome": "backend_rejection" if sync_backend_rejected else "error",
                             "status_acknowledgement": "not_applicable",
                             "exclusions_present": exclusions_present,

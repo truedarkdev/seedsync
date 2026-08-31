@@ -33,6 +33,8 @@ LFTP_SIDECAR_TRACE_SCHEMA = "lftp.sidecar.v1"
 LFTP_SIDECAR_TRACE_CLASSIFICATIONS = frozenset({
     "missing", "valid", "unsafe", "orphan", "ambiguous", "stale", "malformed",
 })
+LFTP_PATH_PAIR_TRACE_CATEGORY = "transfer.lftp"
+LFTP_PATH_PAIR_TRACE_SCHEMA = "lftp.path_pair_annotation.v1"
 redact_credentials = redact_sensitive_text
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -112,6 +114,69 @@ def _record_lftp_sidecar_breadcrumb(
         )
     except Exception:
         # Breadcrumb diagnostics must never alter Queue admission.
+        return
+
+
+def _record_lftp_path_pair_annotation(
+        breadcrumb_trace: object,
+        status: LftpJobStatus,
+        remote_match_count: int,
+        local_match_count: int,
+        result: str,
+        reason: str,
+) -> None:
+    """Record a bounded path-pair selection outcome without runtime paths."""
+    if not _breadcrumb_effectively_enabled(breadcrumb_trace, LFTP_PATH_PAIR_TRACE_CATEGORY, "info"):
+        return
+    try:
+        recorder = getattr(breadcrumb_trace, "record", None)
+        if not callable(recorder):
+            return
+        remote_match_count = min(max(int(remote_match_count), 0), 2)
+        local_match_count = min(max(int(local_match_count), 0), 2)
+        if result not in {"selected", "unscoped"}:
+            result = "unscoped"
+        if reason not in {
+                "matched", "remote_only", "remote_no_match", "remote_multiple_matches",
+                "local_conflict",
+        }:
+            reason = "unknown"
+        job_correlation = getattr(status, "job_correlation", None)
+        if not isinstance(job_correlation, str):
+            job_correlation = None
+        details = {
+            "schema": LFTP_PATH_PAIR_TRACE_SCHEMA,
+            "remote_match_count": remote_match_count,
+            "remote_match_cardinality": "zero" if remote_match_count == 0 else
+            "one" if remote_match_count == 1 else "multiple",
+            "local_match_count": local_match_count,
+            "local_match_cardinality": "zero" if local_match_count == 0 else
+            "one" if local_match_count == 1 else "multiple",
+            "result": result,
+            "reason": reason,
+        }
+        recorder(
+            "lftp",
+            "lftp_path_pair_annotation",
+            details,
+            stage="lftp_path_pair_annotation",
+            event_type="diagnostic",
+            category=LFTP_PATH_PAIR_TRACE_CATEGORY,
+            level="info",
+            corr_id=job_correlation,
+            _coalesce_key=opaque_trace_correlation(
+                "lftp.path_pair_annotation|{}|{}|{}|{}|{}".format(
+                    job_correlation or "none",
+                    remote_match_count,
+                    local_match_count,
+                    result,
+                    reason,
+                ),
+            ),
+            trace_scope="flow",
+        )
+    except Exception:
+        # Breadcrumb diagnostics must never alter status polling or annotation.
         return
 
 
@@ -980,7 +1045,30 @@ class Lftp:
             # A unique remote match still supplies an exact pair-relative
             # identity in that case.  Retain the existing rejection when the
             # local path resolves to another configured pair.
-            if len(remote_matches) != 1 or (local_matches and remote_matches != local_matches):
+            if len(remote_matches) == 0:
+                annotation_result = "unscoped"
+                annotation_reason = "remote_no_match"
+            elif len(remote_matches) > 1:
+                annotation_result = "unscoped"
+                annotation_reason = "remote_multiple_matches"
+            elif local_matches and remote_matches != local_matches:
+                annotation_result = "unscoped"
+                annotation_reason = "local_conflict"
+            elif not local_matches:
+                annotation_result = "selected"
+                annotation_reason = "remote_only"
+            else:
+                annotation_result = "selected"
+                annotation_reason = "matched"
+            _record_lftp_path_pair_annotation(
+                getattr(self, "_Lftp__breadcrumb_trace", None),
+                status,
+                len(remote_matches),
+                len(local_matches),
+                annotation_result,
+                annotation_reason,
+            )
+            if annotation_result != "selected":
                 continue
             pair_id = next(iter(remote_matches))
             pair = self.__path_pairs_by_id[pair_id]

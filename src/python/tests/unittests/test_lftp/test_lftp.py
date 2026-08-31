@@ -450,6 +450,170 @@ class TestLftp(unittest.TestCase):
                 self.assertIsNone(status.path_pair_id)
                 self.assertIsNone(status.path_pair_name)
 
+    def test_status_path_pair_breadcrumb_classifies_zero_one_and_multiple_remote_matches(self):
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        lftp = self._build_test_lftp()
+        lftp.set_breadcrumb_trace(trace)
+        lftp._Lftp__path_pairs_by_id = {
+            "first": {
+                "name": "First",
+                "remote_path": "/remote/first",
+                "local_path": "/local/first",
+            },
+            "second": {
+                "name": "Second",
+                "remote_path": "/remote/second",
+                "local_path": "/local/second",
+            },
+            "broad": {
+                "name": "Broad",
+                "remote_path": "/remote",
+                "local_path": "/local/broad",
+            },
+        }
+        statuses = [
+            LftpJobStatus(
+                job_id=1, job_type=LftpJobStatus.Type.PGET,
+                state=LftpJobStatus.State.RUNNING, name="zero", flags="-c",
+                remote_path="/other/zero", local_path="/other/zero",
+            ),
+            LftpJobStatus(
+                job_id=2, job_type=LftpJobStatus.Type.PGET,
+                state=LftpJobStatus.State.RUNNING, name="one", flags="-c",
+                remote_path="/remote/second/one", local_path="/local/second/one",
+            ),
+            LftpJobStatus(
+                job_id=3, job_type=LftpJobStatus.Type.PGET,
+                state=LftpJobStatus.State.RUNNING, name="many", flags="-c",
+                remote_path="/remote/first/many", local_path="/other/many",
+            ),
+        ]
+
+        lftp._Lftp__annotate_status_path_pairs(statuses)
+
+        events = [
+            event for event in trace.record.call_args_list
+            if event.args[1] == "lftp_path_pair_annotation"
+        ]
+        self.assertEqual(3, len(events))
+        details = [event.args[2] for event in events]
+        self.assertEqual(
+            [
+                ("zero", "zero", "unscoped", "remote_no_match"),
+                ("multiple", "one", "unscoped", "remote_multiple_matches"),
+                ("multiple", "zero", "unscoped", "remote_multiple_matches"),
+            ],
+            [
+                (
+                    item["remote_match_cardinality"], item["local_match_cardinality"],
+                    item["result"], item["reason"],
+                ) for item in details
+            ],
+        )
+        for event in events:
+            self.assertEqual("transfer.lftp", event.kwargs["category"])
+            self.assertEqual("info", event.kwargs["level"])
+            self.assertNotIn("/remote", repr(event))
+            self.assertNotIn("/local", repr(event))
+
+    def test_status_path_pair_breadcrumb_distinguishes_local_only_and_conflict(self):
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        lftp = self._build_test_lftp()
+        lftp.set_breadcrumb_trace(trace)
+        lftp._Lftp__path_pairs_by_id = {
+            "movies": {
+                "name": "Movies",
+                "remote_path": "/remote/movies",
+                "local_path": "/local/movies",
+            },
+            "tv": {
+                "name": "TV",
+                "remote_path": "/remote/tv",
+                "local_path": "/local/tv",
+            },
+        }
+        remote_only = LftpJobStatus(
+            job_id=4, job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING, name="staging", flags="-c",
+            remote_path="/remote/movies/staging", local_path="/staging/staging.lftp",
+        )
+        local_conflict = LftpJobStatus(
+            job_id=5, job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING, name="conflict", flags="-c",
+            remote_path="/remote/movies/conflict", local_path="/local/tv/conflict.lftp",
+        )
+
+        lftp._Lftp__annotate_status_path_pairs([remote_only, local_conflict])
+
+        events = [
+            event for event in trace.record.call_args_list
+            if event.args[1] == "lftp_path_pair_annotation"
+        ]
+        self.assertEqual(
+            [("selected", "remote_only"), ("unscoped", "local_conflict")],
+            [(event.args[2]["result"], event.args[2]["reason"]) for event in events],
+        )
+        self.assertEqual("movies", remote_only.path_pair_id)
+        self.assertIsNone(local_conflict.path_pair_id)
+
+    def test_status_path_pair_breadcrumb_disabled_does_not_build_diagnostic_identity(self):
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = False
+        lftp = self._build_test_lftp()
+        lftp.set_breadcrumb_trace(trace)
+        lftp._Lftp__path_pairs_by_id = {
+            "movies": {
+                "name": "Movies",
+                "remote_path": "/remote/movies",
+                "local_path": "/local/movies",
+            },
+        }
+        status = LftpJobStatus(
+            job_id=6, job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING, name="sample", flags="-c",
+            remote_path="/remote/movies/sample", local_path="/local/movies/sample.lftp",
+        )
+
+        with patch("lftp.lftp.opaque_trace_correlation", side_effect=AssertionError("gate missed")):
+            lftp._Lftp__annotate_status_path_pairs([status])
+
+        trace.record.assert_not_called()
+        self.assertEqual("movies", status.path_pair_id)
+
+    def test_status_path_pair_breadcrumb_collector_retrieves_opaque_job_correlation(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp": "info"}},
+        )
+        lftp = self._build_test_lftp()
+        lftp.set_breadcrumb_trace(trace)
+        lftp._Lftp__path_pairs_by_id = {
+            "movies": {
+                "name": "Movies",
+                "remote_path": "/remote/movies",
+                "local_path": "/local/movies",
+            },
+        }
+        status = LftpJobStatus(
+            job_id=7, job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING, name="sample", flags="-c",
+            remote_path="/remote/movies/sample", local_path="/local/movies/sample.lftp",
+        )
+
+        lftp._Lftp__annotate_status_path_pairs([status])
+
+        events = [
+            event for event in trace.snapshot()["entries"]
+            if event["message"] == "lftp_path_pair_annotation"
+        ]
+        self.assertEqual(1, len(events))
+        self.assertEqual("selected", events[0]["details"]["result"])
+        self.assertEqual(status.job_correlation, events[0]["corr_id"])
+        self.assertNotIn("sample", repr(events[0]))
+
     def test_status_marks_poll_unhealthy_when_jobs_command_times_out(self):
         lftp = self._build_status_poll_test_lftp(send_side_effect=pexpect.exceptions.TIMEOUT("timeout"))
 

@@ -8,6 +8,7 @@ from threading import Lock
 import os
 
 from common import overrides, Constants, Context, Persist, PersistError, Serializable
+from common.breadcrumb_trace import opaque_trace_correlation
 from common.performance_diagnostics import DURATION_AUTO_QUEUE_PROCESS
 from model import IModelListener, ModelFile
 from .controller import Controller
@@ -627,6 +628,11 @@ class AutoQueue:
                 }
             )
 
+            for file, _pattern in files_to_queue:
+                self.__record_candidate_decision("queue", file, "selected", "eligible")
+            for file, _pattern in files_to_extract:
+                self.__record_candidate_decision("extract", file, "selected", "eligible")
+
             ###
             # Send commands
             ###
@@ -707,6 +713,7 @@ class AutoQueue:
     def __record_breadcrumb(
             self, message: str,
             details: dict[str, object] | Callable[[], dict[str, object]],
+            *, corr_id: str = "auto_queue", flow_id: Optional[str] = None,
     ) -> None:
         if not _breadcrumb_effectively_enabled(self.__breadcrumb_trace, "auto_queue", "info"):
             return
@@ -718,9 +725,45 @@ class AutoQueue:
             details,
             stage="auto_queue",
             event_type="state_transition",
-            corr_id="auto_queue",
+            corr_id=corr_id,
+            flow_id=flow_id,
             category="auto_queue",
             level="info",
+        )
+
+    def __record_candidate_decision(
+            self, lane: str, file: ModelFile, decision: str, reason: str,
+    ) -> None:
+        """Record one bounded, identity-free AutoQueue candidate decision."""
+        if not _breadcrumb_effectively_enabled(self.__breadcrumb_trace, "auto_queue", "info"):
+            return
+        if lane not in {"queue", "extract"} or decision not in {"selected", "blocked"}:
+            return
+        candidate_correlation = opaque_trace_correlation(file.file_id)
+        self.__record_breadcrumb(
+            "auto_queue_candidate",
+            lambda: {
+                "schema": "auto_queue_candidate.v1",
+                "cycle": self.__cycle_sequence,
+                "lane": lane,
+                "decision": decision,
+                "reason": reason,
+                "candidate_correlation": candidate_correlation,
+                "state": getattr(file.state, "name", "unknown").lower()
+                if isinstance(getattr(file.state, "name", None), str) else "unknown",
+                "is_dir": file.is_dir is True,
+                "remote_available": file.remote_size is not None,
+                "remote_transferable": file.remote_has_transferable_content is True,
+                "local_present": file.local_present is True,
+                "patterns_only": self.__patterns_only,
+            },
+            # Queue dispatch uses the same opaque correlation, allowing a
+            # bounded retrieval to join AutoQueue's decision with its later
+            # submission and status evidence without retaining the file ID.
+            corr_id="fractional-mtime:{}".format(candidate_correlation),
+            flow_id="autoq:{}:{}:{}".format(
+                self.__cycle_sequence, lane, candidate_correlation,
+            ),
         )
 
     def __refresh_queue_state(self) -> None:
@@ -913,11 +956,11 @@ class AutoQueue:
                 reason = self.__extract_block_reason(file)
 
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            self.__record_candidate_decision(lane, file, "blocked", reason)
             if len(samples) < 3:
                 samples.append({
                     "lane": lane,
-                    "file_id": file.file_id,
-                    "file_name": file.name,
+                    "candidate_correlation": opaque_trace_correlation(file.file_id),
                     "reason": reason,
                 })
 

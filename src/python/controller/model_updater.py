@@ -493,6 +493,72 @@ def _controller_breadcrumb_effectively_enabled(
     )
 
 
+def _record_pending_queue_overlay_publications(
+        controller: object,
+        authoritative_statuses: Sequence[object],
+        displayed_statuses: Sequence[object],
+) -> None:
+    """Link display-only Queue rows to their pending operation flow."""
+    category = "queue.exclusion"
+    if not _controller_breadcrumb_effectively_enabled(controller, category, "info"):
+        return
+    pending = getattr(controller, "_Controller__pending_queue_dispatches", None)
+    recorder = getattr(controller, "_Controller__record_breadcrumb", None)
+    if not isinstance(pending, dict) or not callable(recorder):
+        return
+    authoritative_ids = {
+        status.file_id for status in authoritative_statuses
+        if isinstance(getattr(status, "file_id", None), str)
+    }
+    synthetic_ids = {
+        status.file_id for status in displayed_statuses
+        if isinstance(getattr(status, "file_id", None), str)
+        and status.file_id not in authoritative_ids
+    }
+    if not synthetic_ids:
+        return
+    flow_factory = getattr(controller, "_Controller__fractional_queue_flow_id", None)
+    for file_id in islice(synthetic_ids, 128):
+        dispatch = pending.get(file_id)
+        if dispatch is None:
+            continue
+        operation_sequence = getattr(dispatch, "operation_sequence", None)
+        flow_id = None
+        if callable(flow_factory):
+            try:
+                flow_id = flow_factory(file_id, operation_sequence)
+            except Exception:
+                flow_id = None
+        try:
+            recorder(
+                stage="queue_fractional_mtime",
+                message="queue_overlay_published",
+                details={
+                    "schema": "fractional_mtime_redownload.queue_overlay.v1",
+                    "phase": "synthetic_pending_queue_published",
+                    "overlay": "pending_queue",
+                    "representation": "synthetic_queued_status",
+                    "operation_sequence_present": type(operation_sequence) is int and
+                    operation_sequence > 0,
+                },
+                event_type="diagnostic",
+                category=category,
+                level="info",
+                corr_id="fractional-mtime:{}".format(
+                    opaque_trace_correlation(file_id),
+                ),
+                flow_id=flow_id,
+                trace_scope="flow",
+            )
+        except Exception:
+            logger = getattr(controller, "logger", None)
+            if logger is not None:
+                try:
+                    logger.debug("Ignoring pending Queue overlay breadcrumb failure", exc_info=True)
+                except Exception:
+                    pass
+
+
 def _lftp_status_lineage_trace_enabled(controller: object) -> bool:
     """Check all lineage consumers before reading the poll token."""
     context = getattr(controller, "_Controller__context", None)
@@ -4842,6 +4908,9 @@ class ModelUpdater(_ControllerCoreAccess):
         pending_statuses = getattr(controller, "_lftp_statuses_with_pending_dispatches", None)
         displayed_lftp_statuses = pending_statuses(lftp_statuses) \
             if callable(pending_statuses) else lftp_statuses
+        _record_pending_queue_overlay_publications(
+            controller, lftp_statuses, displayed_lftp_statuses,
+        )
         retired_queue_dispatches: set[tuple[str, Optional[str], Optional[str]]] = set()
         if lftp_status_snapshot_fresh and lftp_status_poll_healthy:
             reconcile_pending_queues = getattr(
@@ -5759,8 +5828,18 @@ class ModelUpdater(_ControllerCoreAccess):
                 current_tree_count = getattr(model, "tree_file_count", 0)
                 next_tree_count = current_tree_count if type(current_tree_count) is int else 0
                 def apply_progressive_delta() -> None:
-                    nonlocal progressive_delta_applied, next_tree_count
+                    nonlocal progressive_delta_applied, next_tree_count, progressive_delta_eligible
                     for file_id in delta_file_ids:
+                        # ``Model.get_file`` retains unique bare-name lookup
+                        # compatibility for legacy callers.  A progressive
+                        # delta is canonical path-pair authority, though: it
+                        # may only update the exact root it selected.  Let
+                        # the ordinary full reconciliation own any partial
+                        # candidate that cannot prove that identity.
+                        if file_id not in partial_model.get_file_ids():
+                            progressive_delta_eligible = False
+                            model_builder.request_rebuild()
+                            continue
                         try:
                             new_file = partial_model.get_file(file_id)
                         except ModelError:
@@ -5768,13 +5847,16 @@ class ModelUpdater(_ControllerCoreAccess):
                             # prove their absence. Final reconciliation owns
                             # removals and marker pruning.
                             continue
-                        try:
-                            old_file = model.get_file(file_id)
-                        except ModelError:
+                        if new_file.file_id != file_id:
+                            progressive_delta_eligible = False
+                            model_builder.request_rebuild()
+                            continue
+                        if file_id not in model.get_file_ids():
                             model.add_file(new_file)
                             next_tree_count += tree_file_count(new_file)
                             progressive_delta_applied = True
                         else:
+                            old_file = model.get_file(file_id)
                             if old_file != new_file:
                                 model.update_file(new_file)
                                 next_tree_count += tree_file_count(new_file) - tree_file_count(old_file)
