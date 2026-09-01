@@ -246,6 +246,21 @@ class TestModelBuilder(unittest.TestCase):
         entries = self.__trace_entries(collector, include_root_decisions=True)
         self.assertEqual(1, len(entries)); self.assertEqual("visible_model", entries[0]["details"]["reason"])
 
+    def test_remote_publication_records_one_entry_for_nested_visible_model_root(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8, policy={"default": "off", "rules": {"model.publication": "info"}})
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        root = ModelFile("sample-directory", True); root.path_pair_id = "pair-a"; root.remote_present = True
+        nested = ModelFile("nested", True); nested.path_pair_id = "pair-a"; nested.remote_present = True
+        nested.add_child(ModelFile("sample.bin", False))
+        root.add_child(nested)
+
+        self.model_builder._ModelBuilder__record_published_model_tree(root)
+
+        entries = self.__trace_entries(collector, include_root_decisions=True)
+        self.assertEqual(1, len(entries))
+        self.assertEqual("visible_model", entries[0]["details"]["reason"])
+        self.assertEqual("present", entries[0]["details"]["remote"])
+
     def test_remote_publication_marks_remote_empty_tree_as_suppressed(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=8, policy={"default": "off", "rules": {"model.publication": "info"}})
         self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())

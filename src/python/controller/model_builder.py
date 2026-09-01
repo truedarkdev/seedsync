@@ -7142,17 +7142,13 @@ class ModelBuilder:
             self.logger.debug("Ignoring remote publication breadcrumb failure", exc_info=True)
 
     def __record_published_model_tree(self, root_file: ModelFile) -> None:
-        """Record only files that survived final visibility arbitration."""
+        """Record the root that survived final visibility arbitration."""
         if not self.__is_model_publication_trace_enabled():
             return
-        frontier = [root_file]
-        while frontier:
-            model_file = frontier.pop()
-            self.__record_remote_publication_breadcrumb(
-                self.__model_publication_identity(model_file), model_file,
-                "published", "visible_model",
-            )
-            frontier.extend(model_file.iter_children())
+        self.__record_remote_publication_breadcrumb(
+            self.__model_publication_identity(root_file), root_file,
+            "published", "visible_model",
+        )
 
     @staticmethod
     def __model_publication_identity(model_file: ModelFile) -> str:
