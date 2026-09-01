@@ -63,12 +63,96 @@ class TestModelApi(unittest.TestCase):
         entries = enabled.snapshot()["entries"]
         self.assertEqual(["scoped_stream_atomic_registered", "scoped_stream_initial_page_emitted"],
                          [entry["message"] for entry in entries])
-        self.assertEqual({"phase", "scope_kind", "record_count_bucket", "model_version", "next_page", "stream_linkage"},
+        self.assertEqual({
+            "phase", "scope_kind", "record_count_bucket", "model_version", "next_page", "stream_linkage",
+            "scan_publication_id", "scan_global_version", "scan_local_generation",
+            "scan_remote_generation", "scan_outcome", "scan_reason",
+        },
                          set(entries[0]["details"]))
         self.assertEqual("5+", entries[0]["details"]["record_count_bucket"])
         self.assertEqual("linked", entries[0]["details"]["stream_linkage"])
+        self.assertEqual(None, entries[0]["details"]["scan_publication_id"])
+        self.assertEqual(None, entries[0]["details"]["scan_global_version"])
+        self.assertEqual("unknown", entries[0]["details"]["scan_outcome"])
+        self.assertEqual("unknown", entries[0]["details"]["scan_reason"])
         self.assertNotIn("private-pair", str(entries))
         self.assertNotIn("private", str(entries))
+
+    def test_scoped_stream_breadcrumb_atomically_joins_authority_without_transporting_it(self):
+        self.model.add_file(self._file("root", "pair-a"))
+        self.controller._Controller__scan_authority_snapshot = {
+            "publication_id": 17, "model_version": 29,
+            "local_scan_generation": 11, "remote_scan_generation": 13,
+            "outcome": "adopt", "reason": "source_buckets_adopted",
+            "path_pair_id": "private-pair", "private_path": "/private/path",
+        }
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model_stream": "debug"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+
+        stream = ModelApiHandler(self.controller)._ModelApiHandler__handle_stream("pair-a")
+        body = next(stream)
+        stream.close()
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(["scoped_stream_atomic_registered", "scoped_stream_initial_page_emitted"],
+                         [entry["message"] for entry in entries])
+        authority = {
+            "scan_publication_id": 17, "scan_global_version": 29,
+            "scan_local_generation": 11, "scan_remote_generation": 13,
+            "scan_outcome": "adopt", "scan_reason": "source_buckets_adopted",
+        }
+        self.assertEqual(authority, {
+            key: entries[0]["details"][key] for key in authority
+        })
+        self.assertEqual(authority, {
+            key: entries[1]["details"][key] for key in authority
+        })
+        self.assertNotIn("_scan_authority_projection", body)
+        self.assertNotIn("private-pair", body)
+        self.assertNotIn("private/path", body)
+        rest = self.client.get("/server/model/v1/pairs/pair-a/roots").json
+        self.assertNotIn("_scan_authority_projection", rest)
+        self.assertNotIn("publication_id", rest)
+        self.assertNotIn("private-pair", str(rest))
+
+    def test_scoped_stream_authority_projection_is_gated_and_bounded(self):
+        self.model.add_file(self._file("root", "pair-a"))
+        self.controller._Controller__scan_authority_snapshot = {
+            "publication_id": -1, "model_version": 2_147_483_648,
+            "local_scan_generation": "invalid", "remote_scan_generation": -3,
+            "outcome": "private-outcome", "reason": "private-reason",
+        }
+        disabled = BreadcrumbTraceCollector(lambda: True, policy={"default": "off"})
+        self.controller._Controller__context.breadcrumb_trace = disabled
+        with patch("controller.controller._bounded_scan_authority_stream_projection") as projection:
+            stream = ModelApiHandler(self.controller)._ModelApiHandler__handle_stream("pair-a")
+            next(stream)
+            stream.close()
+        projection.assert_not_called()
+
+        enabled = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model_stream": "debug"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = enabled
+        stream = ModelApiHandler(self.controller)._ModelApiHandler__handle_stream("pair-a")
+        body = next(stream)
+        stream.close()
+        self.assertEqual({
+            "scan_publication_id": None, "scan_global_version": None,
+            "scan_local_generation": None, "scan_remote_generation": None,
+            "scan_outcome": "unknown", "scan_reason": "unknown",
+        }, {
+            key: enabled.snapshot()["entries"][0]["details"][key] for key in (
+                "scan_publication_id", "scan_global_version",
+                "scan_local_generation", "scan_remote_generation",
+                "scan_outcome", "scan_reason",
+            )
+        })
+        self.assertNotIn("private-outcome", str(enabled.snapshot()))
+        self.assertNotIn("private-reason", str(enabled.snapshot()))
+        self.assertNotIn("_scan_authority_projection", body)
 
     def test_scoped_stream_records_registration_before_initial_page_emission(self):
         self.model.add_file(self._file("root", "pair-a"))

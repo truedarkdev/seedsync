@@ -102,6 +102,47 @@ _SCAN_AUTHORITY_DIAGNOSTIC_ONLY_KEYS = frozenset({
     "remote_scan_generation",
 })
 
+_SCAN_AUTHORITY_STREAM_PROJECTION_KEY = "_scan_authority_projection"
+_SCAN_AUTHORITY_STREAM_MAX_COUNTER = 2_147_483_647
+_SCAN_AUTHORITY_STREAM_OUTCOMES = frozenset({
+    "adopt", "publish", "reject", "no_op",
+})
+_SCAN_AUTHORITY_STREAM_REASONS = frozenset({
+    "no_scan_event",
+    "pair_delta_adopted",
+    "source_buckets_adopted",
+    "source_buckets_adopted_after_pair_fallback",
+    "published_after_active_delta_rejection",
+    "published_after_pair_fallback",
+    "published",
+    "active_delta_rejected",
+    "pair_delta_fallback",
+    "joint_not_final",
+    "comparison_proven_noop",
+    "unknown_overlay_retained",
+    "no_change",
+})
+
+
+def _bounded_scan_authority_stream_projection(snapshot: object) -> dict[str, object]:
+    """Return the bounded, identity-free scan authority stream projection."""
+    source = snapshot if isinstance(snapshot, dict) else {}
+
+    def bounded_counter(value: object) -> Optional[int]:
+        return value if type(value) is int and 0 <= value <= _SCAN_AUTHORITY_STREAM_MAX_COUNTER else None
+
+    def bounded_enum(value: object, allowed: frozenset[str]) -> str:
+        return value if type(value) is str and value in allowed else "unknown"
+
+    return {
+        "publication_id": bounded_counter(source.get("publication_id")),
+        "model_version": bounded_counter(source.get("model_version")),
+        "local_scan_generation": bounded_counter(source.get("local_scan_generation")),
+        "remote_scan_generation": bounded_counter(source.get("remote_scan_generation")),
+        "outcome": bounded_enum(source.get("outcome"), _SCAN_AUTHORITY_STREAM_OUTCOMES),
+        "reason": bounded_enum(source.get("reason"), _SCAN_AUTHORITY_STREAM_REASONS),
+    }
+
 
 def _scan_authority_semantic_snapshot(snapshot: object) -> dict[str, object]:
     """Exclude per-publication diagnostic identity from semantic comparisons."""
@@ -3619,7 +3660,7 @@ class Controller:
         next_cursor_file_id = None
         if has_successor and page_files:
             next_cursor_file_id = page_files[-1].file_id
-        return {
+        page = {
             "model_version": version,
             # Private handler correlation captured by the same model-lock
             # snapshot as this scoped page. It is stripped before transport.
@@ -3635,6 +3676,16 @@ class Controller:
             "next_cursor_file_id": next_cursor_file_id,
             "next_cursor_sort_key": (page_files[-1].file_id,) if next_cursor_file_id else None,
         }
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        if _breadcrumb_effectively_enabled(breadcrumb_trace, "model_stream", "debug"):
+            # Capture only the standing aggregate authority projection while
+            # this page still shares the controller model-lock snapshot.  It
+            # remains an internal breadcrumb handoff and is never transported.
+            page[_SCAN_AUTHORITY_STREAM_PROJECTION_KEY] = \
+                _bounded_scan_authority_stream_projection(
+                    getattr(self, "_Controller__scan_authority_snapshot", {}),
+                )
+        return page
 
     def get_model_page(
         self,
@@ -3922,6 +3973,9 @@ class Controller:
         records = page.get("records")
         record_count = len(records) if isinstance(records, list) else 0
         version = page.get("model_version")
+        authority = _bounded_scan_authority_stream_projection(
+            page.get(_SCAN_AUTHORITY_STREAM_PROJECTION_KEY),
+        )
         try:
             details = {
                 "phase": phase,
@@ -3929,10 +3983,16 @@ class Controller:
                 "record_count_bucket": "0" if record_count < 1 else "1" if record_count == 1 else "2-4" if record_count <= 4 else "5+",
                 "model_version": version if type(version) is int and version >= 0 else None,
                 "next_page": type(page.get("next_cursor")) is str,
-                # A valid model version is the only stream-to-publication
-                # linkage this handshake can prove without retaining scope
-                # or record identities.
+                # Preserve the scoped-page version separately from the
+                # aggregate scan publication, without retaining scope or
+                # record identities.
                 "stream_linkage": "linked" if type(version) is int and version >= 0 else "unlinked",
+                "scan_publication_id": authority["publication_id"],
+                "scan_global_version": authority["model_version"],
+                "scan_local_generation": authority["local_scan_generation"],
+                "scan_remote_generation": authority["remote_scan_generation"],
+                "scan_outcome": authority["outcome"],
+                "scan_reason": authority["reason"],
             }
             breadcrumb_trace.record(
                 "model_stream", "scoped_stream_{}".format(phase), details,

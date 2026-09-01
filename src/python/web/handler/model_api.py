@@ -571,6 +571,7 @@ class ModelApiHandler(IHandler):
     @classmethod
     def __public_page(
         cls, page: dict[str, object], query_signature: str, *, preserve_global_model_version: bool = False,
+        preserve_stream_authority_projection: bool = False,
     ) -> dict[str, object]:
         next_cursor_file_id = page.pop("next_cursor_file_id", None)
         next_cursor_sort_key = page.pop("next_cursor_sort_key", None)
@@ -587,11 +588,13 @@ class ModelApiHandler(IHandler):
         )
         if not preserve_global_model_version:
             page.pop("_global_model_version", None)
+        if not preserve_stream_authority_projection:
+            page.pop("_scan_authority_projection", None)
         return page
 
     def __get_page(
         self, scope_id: str, parent_file_id: Optional[str], *, add_listener: Optional[ScopedModelListener] = None,
-        preserve_global_model_version: bool = False,
+        preserve_global_model_version: bool = False, preserve_stream_authority_projection: bool = False,
     ) -> dict[str, object]:
         limit = self.__read_limit()
         sort_mode, status_filter, name_filter, query_signature = self.__read_query()
@@ -614,6 +617,7 @@ class ModelApiHandler(IHandler):
             return {"error": "invalid_model_cursor"}
         return self.__public_page(
             page, query_signature, preserve_global_model_version=True,
+            preserve_stream_authority_projection=preserve_stream_authority_projection,
         )
 
     def __handle_summary(self) -> HTTPResponse:
@@ -701,6 +705,7 @@ class ModelApiHandler(IHandler):
         listener = ScopedModelListener(scope_id)
         page = self.__get_page(
             scope_id, None, add_listener=listener, preserve_global_model_version=True,
+            preserve_stream_authority_projection=True,
         )
         if page.get("error"):
             listener.close()
@@ -722,6 +727,7 @@ class ModelApiHandler(IHandler):
                 last_keepalive_at = time.monotonic()
                 if callable(trace_scoped_stream):
                     trace_scoped_stream("initial_page_emitted", scope_id, page)
+                page.pop("_scan_authority_projection", None)
                 yield self.__sse(
                     "scoped", "model-page", page, version if isinstance(version, int) else None,
                     global_model_version if isinstance(global_model_version, int) else None,
