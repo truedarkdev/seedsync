@@ -5827,6 +5827,12 @@ class ModelUpdater(_ControllerCoreAccess):
             with controller._Controller__model_lock:
                 current_tree_count = getattr(model, "tree_file_count", 0)
                 next_tree_count = current_tree_count if type(current_tree_count) is int else 0
+                # A progressive wave may carry several roots.  Both lookups
+                # return defensive sets, so take one authoritative snapshot
+                # per wave instead of rebuilding the complete live-ID set
+                # under this lock for every root.
+                partial_file_ids = partial_model.get_file_ids()
+                model_file_ids = model.get_file_ids()
                 def apply_progressive_delta() -> None:
                     nonlocal progressive_delta_applied, next_tree_count, progressive_delta_eligible
                     for file_id in delta_file_ids:
@@ -5836,7 +5842,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         # may only update the exact root it selected.  Let
                         # the ordinary full reconciliation own any partial
                         # candidate that cannot prove that identity.
-                        if file_id not in partial_model.get_file_ids():
+                        if file_id not in partial_file_ids:
                             progressive_delta_eligible = False
                             model_builder.request_rebuild()
                             continue
@@ -5851,8 +5857,9 @@ class ModelUpdater(_ControllerCoreAccess):
                             progressive_delta_eligible = False
                             model_builder.request_rebuild()
                             continue
-                        if file_id not in model.get_file_ids():
+                        if file_id not in model_file_ids:
                             model.add_file(new_file)
+                            model_file_ids.add(file_id)
                             next_tree_count += tree_file_count(new_file)
                             progressive_delta_applied = True
                         else:

@@ -6635,6 +6635,50 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(live_id, candidate.file_id)
         self.assertEqual(99, live_model.get_file(live_id).remote_size)
 
+    def test_progressive_delta_snapshots_ids_once_for_multi_root_wave(self):
+        """A multi-root delta must not copy the live IDs once per root."""
+        pair_id = "pair-a"
+        first = ModelFile("identity-root", False)
+        first.path_pair_id = pair_id
+        first.remote_size = 99
+        second = ModelFile("second-root", False)
+        second.path_pair_id = pair_id
+        second.remote_size = 88
+        partial_model = Model()
+        partial_model.add_file(first)
+        partial_model.add_file(second)
+        controller, model_builder, live_model, _ = self._progressive_identity_fixture(
+            partial_model,
+        )
+
+        def scan_root(name):
+            root = SystemFile(name, 11)
+            root.path_pair_id = pair_id
+            return root
+
+        scan_kwargs = {
+            "scanned_path_pair_ids": {pair_id}, "is_progress": True,
+            "completed_path_pair_ids": set(), "is_scan_final": False,
+            "unknown_path_pair_ids": {pair_id}, "session_token": "multi-root",
+        }
+        controller._Controller__remote_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [scan_root("identity-root"), scan_root("second-root")], **scan_kwargs,
+        )
+        controller._Controller__local_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [scan_root("identity-root"), scan_root("second-root")], **scan_kwargs,
+        )
+        partial_model.get_file_ids = MagicMock(wraps=partial_model.get_file_ids)
+        live_file_ids = live_model.get_file_ids()
+        live_model.get_file_ids = MagicMock(return_value=live_file_ids)
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(1, partial_model.get_file_ids.call_count)
+        self.assertEqual(1, live_model.get_file_ids.call_count)
+        self.assertEqual(99, live_model.get_file(first.file_id).remote_size)
+        self.assertEqual(88, live_model.get_file(second.file_id).remote_size)
+        self.assertIn(second.file_id, live_file_ids)
+
     def test_progressive_delta_adds_exact_pair_root_beside_same_name_other_pair(self):
         candidate = ModelFile("identity-root", False)
         candidate.path_pair_id = "pair-a"
