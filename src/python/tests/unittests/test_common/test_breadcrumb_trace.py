@@ -1042,6 +1042,18 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertFalse(collector.is_effectively_enabled("transfer.child", "debug"))
         self.assertTrue(collector.is_effectively_enabled("transfer.child", "error"))
 
+    def test_explicit_policy_gate_does_not_inherit_default(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "info", "rules": {"model.publication": "info"}},
+        )
+        emitter = collector.create_emitter()
+
+        self.assertTrue(collector.is_explicitly_configured("model.publication.child"))
+        self.assertTrue(emitter.is_explicitly_configured("model.publication.child"))
+        self.assertFalse(collector.is_explicitly_configured("model.lifecycle"))
+        self.assertFalse(emitter.is_explicitly_configured("model.lifecycle"))
+
     def test_effective_gate_denies_off_events_and_off_configured_categories(self):
         default_off = BreadcrumbTraceCollector(lambda: True, policy={"default": "off"})
         rule_off = BreadcrumbTraceCollector(

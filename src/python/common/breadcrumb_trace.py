@@ -78,6 +78,23 @@ class _EffectiveBreadcrumbPolicy:
         configured_rank = _POLICY_LEVEL_RANK.get(configured_level, _POLICY_LEVEL_RANK["info"])
         return event_rank <= configured_rank
 
+    def has_explicit_rule(self, category: object) -> bool:
+        """Return whether a category is covered by a configured rule.
+
+        This deliberately differs from :meth:`allows`: callers use it for
+        unusually high-volume diagnostics that must never inherit the policy
+        default merely because tracing is enabled elsewhere.
+        """
+        if not isinstance(category, str):
+            category = str(category)
+        category_parts = category.split(".") if category else [""]
+        return any(
+            BreadcrumbTraceCollector._BreadcrumbTraceCollector__category_match_score(
+                pattern, category, category_parts,
+            ) >= 0
+            for pattern, _level in self.__rules
+        )
+
     def __resolve(self, category: str) -> str:
         category_parts = category.split(".") if category else [""]
         selected = self.__default
@@ -163,6 +180,13 @@ class BreadcrumbTraceEmitter:
             return False
         policy = self.__current_effective_policy()
         return policy is not None and policy.allows(category, level)
+
+    def is_explicitly_configured(self, category: object) -> bool:
+        """Return whether ``category`` has an explicit policy rule."""
+        if not self.is_enabled():
+            return False
+        policy = self.__current_effective_policy()
+        return policy is not None and policy.has_explicit_rule(category)
 
     def record(self, source: str, message: str, details: object = None, **metadata: Any) -> str:
         if not self.is_enabled():
@@ -319,6 +343,9 @@ class BreadcrumbTraceNoopEmitter:
         return False
 
     def is_effectively_enabled(self, category: object, level: object = "info") -> bool:
+        return False
+
+    def is_explicitly_configured(self, category: object) -> bool:
         return False
 
     def record(self, source: str, message: str, details: object = None, **metadata: Any) -> str:
@@ -689,6 +716,10 @@ class BreadcrumbTraceCollector:
     def is_effectively_enabled(self, category: object, level: object = "info") -> bool:
         """Return the system/category/level gate before constructing a breadcrumb."""
         return self.is_enabled() and self.__effective_policy.allows(category, level)
+
+    def is_explicitly_configured(self, category: object) -> bool:
+        """Return whether ``category`` has an explicit policy rule."""
+        return self.is_enabled() and self.__effective_policy.has_explicit_rule(category)
 
     def sync_enabled_state(self) -> bool:
         enabled = self.__read_enabled_state()

@@ -398,6 +398,31 @@ class TestBreadcrumbTraceHandler(BaseTestWebApp):
         alias = self.test_app.get("/server/breadcrumbs/events?limit=1", expect_errors=True)
         self.assertEqual(404, alias.status_int)
 
+    def test_v1_filters_explicit_model_publication_and_reports_policy_drop(self):
+        self.context.config.general.breadcrumb_trace_enabled = True
+        self.context.breadcrumb_trace.apply_policy({
+            "default": "off", "rules": {"model.publication": "info"},
+        })
+        correlation_id = opaque_trace_correlation("pair-a:sample-child")
+        self.context.breadcrumb_trace.record(
+            "model_builder", "remote_publication",
+            {"schema": "model.remote_publication.v1", "result": "remote_dropped"},
+            category="model.publication", corr_id=correlation_id,
+        )
+
+        response = self.test_app.get(
+            "/server/breadcrumbs/v1/events?category_prefix=model.publication"
+            "&correlation_id={}&limit=4".format(correlation_id),
+        )
+        self.assertEqual(200, response.status_int)
+        payload = json.loads(response.text)
+        self.assertEqual(1, len(payload["events"]))
+        self.assertEqual("remote_publication", payload["events"][0]["message"])
+        self.assertEqual("remote_dropped", payload["events"][0]["details"]["result"])
+        self.assertEqual(0, payload["drops"]["policy"])
+        self.assertEqual(0, payload["evictions"])
+        self.assertFalse(payload["gap"])
+
     def test_v1_policy_validate_apply_reset_and_compare_and_swap_conflict(self):
         candidate = {"policy": {"default": "warning", "rules": {"transfer": "debug"}}}
         validated = self.test_app.post_json("/server/breadcrumbs/v1/policy/validate", candidate)

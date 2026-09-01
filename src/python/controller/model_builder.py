@@ -304,6 +304,9 @@ class ModelBuilder:
         self.__stop_resume_trace_breadcrumb: Optional[BreadcrumbTraceEmitter] = None
         self.__stop_resume_trace_last_signatures: OrderedDict[tuple[str, str], str] = OrderedDict()
         self.__stop_resume_trace_last_enabled = False
+        self.__model_publication_trace_last_enabled = False
+        self.__model_publication_trace_epoch = 0
+        self.__model_publication_trace_build_kind = "full"
         self.__target_archive_trace_last_signature: Optional[str] = None
         self.__performance_diagnostics: object | None = None
 
@@ -678,6 +681,13 @@ class ModelBuilder:
 
     def set_stop_resume_trace_breadcrumb(self, emitter: Optional[BreadcrumbTraceEmitter]) -> None:
         """Attach the shared opt-in bounded breadcrumb emitter."""
+        if emitter is not self.__stop_resume_trace_breadcrumb:
+            self.__model_publication_trace_last_enabled = False
+            for signature_key in [
+                    key for key in self.__stop_resume_trace_last_signatures
+                    if key[1] == "remote_publication"
+            ]:
+                self.__stop_resume_trace_last_signatures.pop(signature_key, None)
         self.__stop_resume_trace_breadcrumb = emitter
 
     def record_lifecycle_candidate_publication(self, candidate: Model, build_kind: str) -> set[str]:
@@ -780,6 +790,29 @@ class ModelBuilder:
             return effective("model.presentation", "info") is True
         except Exception:
             return False
+
+    def __is_model_publication_trace_enabled(self) -> bool:
+        """Require an explicit policy rule for bounded per-file diagnostics."""
+        emitter = self.__stop_resume_trace_breadcrumb
+        if emitter is None:
+            enabled = False
+        elif not _breadcrumb_effectively_enabled(emitter, "model.publication", "info"):
+            enabled = False
+        else:
+            configured = getattr(emitter, "is_explicitly_configured", None)
+            try:
+                enabled = callable(configured) and configured("model.publication") is True
+            except Exception:
+                enabled = False
+        if enabled and not self.__model_publication_trace_last_enabled:
+            self.__model_publication_trace_epoch += 1
+            for signature_key in [
+                    key for key in self.__stop_resume_trace_last_signatures
+                    if key[1] == "remote_publication"
+            ]:
+                self.__stop_resume_trace_last_signatures.pop(signature_key, None)
+        self.__model_publication_trace_last_enabled = enabled
+        return enabled
 
     @staticmethod
     def __queue_exclusion_mtime_category(
@@ -4513,6 +4546,9 @@ class ModelBuilder:
         partial.__stop_resume_trace_breadcrumb = self.__stop_resume_trace_breadcrumb
         partial.__stop_resume_trace_last_signatures = OrderedDict(self.__stop_resume_trace_last_signatures)
         partial.__stop_resume_trace_last_enabled = self.__stop_resume_trace_last_enabled
+        partial.__model_publication_trace_last_enabled = self.__model_publication_trace_last_enabled
+        partial.__model_publication_trace_epoch = self.__model_publication_trace_epoch
+        partial.__model_publication_trace_build_kind = "partial_candidate"
         selected_pair_ids = {
             file.path_pair_id for file in local_files + remote_files
         }
@@ -4688,6 +4724,9 @@ class ModelBuilder:
         partial.__stop_resume_trace_breadcrumb = self.__stop_resume_trace_breadcrumb
         partial.__stop_resume_trace_last_signatures = OrderedDict(self.__stop_resume_trace_last_signatures)
         partial.__stop_resume_trace_last_enabled = self.__stop_resume_trace_last_enabled
+        partial.__model_publication_trace_last_enabled = self.__model_publication_trace_last_enabled
+        partial.__model_publication_trace_epoch = self.__model_publication_trace_epoch
+        partial.__model_publication_trace_build_kind = "partial_candidate"
         partial.__target_archive_trace_last_signature = self.__target_archive_trace_last_signature
         partial.__performance_diagnostics = self.__performance_diagnostics
         partial.__local_files_by_pair = {path_pair_id: dict(next_local)}
@@ -5519,6 +5558,9 @@ class ModelBuilder:
         partial.__stop_resume_trace_breadcrumb = self.__stop_resume_trace_breadcrumb
         partial.__stop_resume_trace_last_signatures = OrderedDict(self.__stop_resume_trace_last_signatures)
         partial.__stop_resume_trace_last_enabled = self.__stop_resume_trace_last_enabled
+        partial.__model_publication_trace_last_enabled = self.__model_publication_trace_last_enabled
+        partial.__model_publication_trace_epoch = self.__model_publication_trace_epoch
+        partial.__model_publication_trace_build_kind = "partial_candidate"
         selected_pair_ids = {
             self.__file_id_path_pair_id(file_id) for file_id in root_file_ids
         }
@@ -6267,6 +6309,9 @@ class ModelBuilder:
         # model generation or an active/authoritative partial builder.
         build_local_predicate_cache: dict[tuple[object, ...], bool] = {}
         live_transferred_file_ids: set[str] = set()
+        # Model publication is a high-volume diagnostic. Snapshot its explicit
+        # opt-in once so a disabled build does not enter per-node trace code.
+        model_publication_trace_enabled = self.__is_model_publication_trace_enabled()
         effective_local_files = self.__build_effective_local_files()
         self.__cached_unresolved_staging_collision_file_ids = {
             file_id
@@ -6461,6 +6506,10 @@ class ModelBuilder:
                 and local is None
                 and not model_file.remote_has_transferable_content
             ):
+                if model_publication_trace_enabled:
+                    self.__record_remote_publication_breadcrumb(
+                        file_id, model_file, "suppressed", "remote_empty_tree",
+                    )
                 continue
 
             if self.__is_stop_resume_trace_enabled():
@@ -6555,6 +6604,8 @@ class ModelBuilder:
             seen_file_ids.add(built_root_file.model_file.file_id)
             seen_file_ids.update(built_root_file.seen_file_ids)
             model.add_file(built_root_file.model_file)
+            if model_publication_trace_enabled:
+                self.__record_published_model_tree(built_root_file.model_file)
 
         self.__sweep_recent_live_transfer_snapshots(seen_file_ids)
         model.set_tree_file_count(len(seen_file_ids))
@@ -7052,6 +7103,64 @@ class ModelBuilder:
                 # Treat an unrepresentable value as unknown rather than
                 # breaking model refresh.
                 model_file.downloaded_timestamp = None
+    def __record_remote_publication_breadcrumb(
+            self, file_id: str, model_file: ModelFile, result: str, reason: str,
+    ) -> None:
+        """Bounded, opaque evidence for a final model visibility decision."""
+        if not self.__is_model_publication_trace_enabled():
+            return
+        details = {
+            "schema": "model.remote_publication.v1",
+            "pair_scope": "scoped" if model_file.path_pair_id else "unscoped",
+            "remote": "present" if model_file.remote_present else "absent",
+            "local": "present" if model_file.local_present else "absent",
+            "transferable": bool(model_file.remote_has_transferable_content),
+            "snapshot_kind": "model",
+            "snapshot_provenance": self.__model_publication_trace_build_kind,
+            "trace_epoch": self.__model_publication_trace_epoch,
+            "result": result,
+            "reason": reason,
+            "remote_decision": "suppressed" if result == "suppressed" else
+            "retained" if model_file.remote_present else "dropped",
+        }
+        signature = json.dumps(details, sort_keys=True)
+        signature_key = (file_id, "remote_publication")
+        if self.__stop_resume_trace_last_signatures.get(signature_key) == "retained:" + signature:
+            return
+        try:
+            outcome = self.__stop_resume_trace_breadcrumb.record(
+                "model_builder", "remote_publication", details,
+                stage="model_remote_publication", event_type="diagnostic",
+                category="model.publication", level="info",
+                corr_id=opaque_trace_correlation(file_id), trace_scope="flow",
+                _coalesce_key=self.__lifecycle_trace_coalesce_key(
+                    "remote_publication", "model_remote_publication", file_id, details,
+                ),
+            )
+            self.__remember_trace_signature(signature_key, signature, outcome == "retained")
+        except Exception:
+            self.logger.debug("Ignoring remote publication breadcrumb failure", exc_info=True)
+
+    def __record_published_model_tree(self, root_file: ModelFile) -> None:
+        """Record only files that survived final visibility arbitration."""
+        if not self.__is_model_publication_trace_enabled():
+            return
+        frontier = [root_file]
+        while frontier:
+            model_file = frontier.pop()
+            self.__record_remote_publication_breadcrumb(
+                self.__model_publication_identity(model_file), model_file,
+                "published", "visible_model",
+            )
+            frontier.extend(model_file.iter_children())
+
+    @staticmethod
+    def __model_publication_identity(model_file: ModelFile) -> str:
+        """Rebuild the canonical identity without invoking ModelFile's hot property."""
+        full_path = model_file.full_path
+        if model_file.path_pair_id is None:
+            return full_path
+        return json.dumps([model_file.path_pair_id, full_path], separators=(",", ":"))
 
     @staticmethod
     def __update_transferred_size(

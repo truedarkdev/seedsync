@@ -168,6 +168,94 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
         return collector
 
+    def test_remote_publication_breadcrumb_is_gated_opaque_and_deduplicated(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=2, policy={"default": "off", "rules": {"model.publication": "info"}})
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        file = ModelFile("private-child.bin", False); file.path_pair_id = "pair-a"; file.remote_present = True
+        self.model_builder._ModelBuilder__record_remote_publication_breadcrumb(file.file_id, file, "published", "visible_model")
+        self.model_builder._ModelBuilder__record_remote_publication_breadcrumb(file.file_id, file, "published", "visible_model")
+        entries = self.__trace_entries(collector, include_root_decisions=True)
+        self.assertEqual(1, len(entries)); self.assertNotIn("private-child.bin", str(entries[0]))
+
+    def test_remote_publication_records_drop_and_isolates_pairs(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8, policy={"default": "off", "rules": {"model.publication": "info"}})
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        first = ModelFile("same-name.bin", False); first.path_pair_id = "pair-a"
+        second = ModelFile("same-name.bin", False); second.path_pair_id = "pair-b"
+        self.model_builder._ModelBuilder__record_remote_publication_breadcrumb(first.file_id, first, "published", "visible_model")
+        self.model_builder._ModelBuilder__record_remote_publication_breadcrumb(second.file_id, second, "published", "visible_model")
+        entries = self.__trace_entries(collector, include_root_decisions=True)
+        self.assertEqual(2, len(entries)); self.assertEqual({"dropped"}, {entry["details"]["remote_decision"] for entry in entries})
+        self.assertEqual(2, len({entry["corr_id"] for entry in entries}))
+
+    def test_remote_publication_respects_bounded_retention(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=1, policy={"default": "off", "rules": {"model.publication": "info"}})
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        for name in ("first.bin", "second.bin"):
+            model_file = ModelFile(name, False); model_file.path_pair_id = "pair-a"
+            self.model_builder._ModelBuilder__record_remote_publication_breadcrumb(
+                model_file.file_id, model_file, "published", "visible_model",
+            )
+
+        snapshot = collector.snapshot()
+        self.assertEqual(1, len(snapshot["entries"]))
+
+    def test_remote_publication_requires_rule_and_reemits_after_rule_reenable(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8, policy={"default": "info"})
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        model_file = ModelFile("sample.bin", False); model_file.path_pair_id = "pair-a"; model_file.remote_present = True
+        recorder = self.model_builder._ModelBuilder__record_remote_publication_breadcrumb
+        recorder(model_file.file_id, model_file, "published", "visible_model")
+        self.assertEqual([], self.__trace_entries(collector, include_root_decisions=True))
+        collector.apply_policy({"default": "off", "rules": {"model.publication": "info"}}); recorder(model_file.file_id, model_file, "published", "visible_model")
+        self.assertEqual(1, len(self.__trace_entries(collector, include_root_decisions=True)))
+        collector.apply_policy({"default": "off"}); self.assertFalse(self.model_builder._ModelBuilder__is_model_publication_trace_enabled())
+        collector.apply_policy({"default": "off", "rules": {"model.publication": "info"}}); recorder(model_file.file_id, model_file, "published", "visible_model")
+        self.assertEqual(2, len(self.__trace_entries(collector, include_root_decisions=True)))
+
+    def test_remote_publication_reemits_after_emitter_replacement(self):
+        first_collector = BreadcrumbTraceCollector(lambda: True, policy={"default": "off", "rules": {"model.publication": "info"}})
+        model_file = ModelFile("sample.bin", False); model_file.path_pair_id = "pair-a"; model_file.remote_present = True
+        self.model_builder.set_stop_resume_trace_breadcrumb(first_collector.create_emitter())
+        recorder = self.model_builder._ModelBuilder__record_remote_publication_breadcrumb
+        recorder(model_file.file_id, model_file, "published", "visible_model")
+        self.assertEqual(1, len(self.__trace_entries(first_collector, include_root_decisions=True)))
+
+        second_collector = BreadcrumbTraceCollector(lambda: True, policy={"default": "off", "rules": {"model.publication": "info"}})
+        self.model_builder.set_stop_resume_trace_breadcrumb(second_collector.create_emitter())
+        recorder(model_file.file_id, model_file, "published", "visible_model")
+        self.assertEqual(1, len(self.__trace_entries(second_collector, include_root_decisions=True)))
+
+    def test_remote_publication_disabled_build_skips_per_node_trace_calls(self):
+        collector = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"})
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        remote = SystemFile("sample.bin", 7); remote.path_pair_id = "pair-a"
+        self.model_builder.set_remote_files([remote])
+
+        recorder_path = "controller.model_builder.ModelBuilder._ModelBuilder__record_remote_publication_breadcrumb"
+        with patch(recorder_path, autospec=True) as recorder:
+            self.model_builder.build_model()
+
+        recorder.assert_not_called()
+
+    def test_remote_publication_records_only_final_visible_model_nodes(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8, policy={"default": "off", "rules": {"model.publication": "info"}})
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        remote = SystemFile("sample.bin", 7); remote.path_pair_id = "pair-a"; self.model_builder.set_remote_files([remote])
+        self.model_builder.build_model()
+        entries = self.__trace_entries(collector, include_root_decisions=True)
+        self.assertEqual(1, len(entries)); self.assertEqual("visible_model", entries[0]["details"]["reason"])
+
+    def test_remote_publication_marks_remote_empty_tree_as_suppressed(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8, policy={"default": "off", "rules": {"model.publication": "info"}})
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        remote = SystemFile("empty", 0, True); remote.path_pair_id = "pair-a"; self.model_builder.set_remote_files([remote])
+        model = self.model_builder.build_model()
+        self.assertEqual(set(), model.get_file_ids())
+        entries = self.__trace_entries(collector, include_root_decisions=True)
+        self.assertEqual(1, len(entries)); self.assertEqual("suppressed", entries[0]["details"]["result"])
+        self.assertEqual("suppressed", entries[0]["details"]["remote_decision"])
+
     @staticmethod
     def __trace_entries(
             collector: BreadcrumbTraceCollector,
