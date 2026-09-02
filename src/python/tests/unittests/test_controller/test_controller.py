@@ -467,6 +467,24 @@ class TestController(unittest.TestCase):
         self.assertTrue(self.controller.wait_for_process_wake(observed_generation, 1))
         self.controller._Controller__lftp_executor.shutdown(wait=True)
 
+    def test_async_lftp_status_forwards_opt_in_poll_correlation_to_real_lftp(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        backend = Lftp.__new__(Lftp)
+        backend.status = MagicMock(return_value=[])
+        backend._Lftp__last_status_poll_healthy = True
+        self.controller._Controller__lftp = backend
+
+        self.assertIsNone(self.controller._get_lftp_status_snapshot())
+        correlation = self.controller._Controller__lftp_status_poll_correlation
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+        self.assertEqual(([], True), self.controller._get_lftp_status_snapshot())
+
+        backend.status.assert_called_once_with(trace_poll_correlation=correlation)
+        self.assertRegex(correlation, r"^lftp-poll:[0-9a-f]{16}$")
+
     def test_async_lftp_poll_trace_keeps_submitted_token_after_lifecycle_clear(self):
         self.controller._Controller__lftp.backend_name = "lftp"
         trace = BreadcrumbTraceCollector(

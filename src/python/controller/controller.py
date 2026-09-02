@@ -1678,10 +1678,20 @@ class Controller:
             _breadcrumb_effectively_enabled(trace, category, level)
             for category, level in (
                 ("model.progress", "debug"),
+                ("transfer.lftp.status", "debug"),
+                ("transfer.lftp.status", "warning"),
                 ("transfer.lftp", "debug"),
                 ("transfer.lftp", "warning"),
                 ("completion.gate", "info"),
             )
+        )
+
+    def __lftp_status_poll_command_trace_enabled(self) -> bool:
+        """Keep PTY phase tracing opt-in independently from model lineage."""
+        trace = getattr(getattr(self, "_Controller__context", None), "breadcrumb_trace", None)
+        return any(
+            _breadcrumb_effectively_enabled(trace, "transfer.lftp.status", level)
+            for level in ("debug", "warning")
         )
 
     def __begin_lftp_status_poll_lineage(self) -> Optional[str]:
@@ -1699,6 +1709,10 @@ class Controller:
             self, correlation: object, phase: str, details: Optional[dict[str, object]] = None,
     ) -> None:
         """Best-effort timing marker; never participates in LFTP ownership."""
+        if not isinstance(correlation, str) or not correlation.startswith("lftp-poll:") or \
+                len(correlation) != len("lftp-poll:") + 16 or \
+                any(character not in "0123456789abcdef" for character in correlation[len("lftp-poll:"):]):
+            return
         trace = getattr(getattr(self, "_Controller__context", None), "breadcrumb_trace", None)
         recorder = getattr(trace, "record_progress_lineage", None)
         if callable(recorder):
@@ -1727,7 +1741,10 @@ class Controller:
             try:
                 if callable(record_lineage):
                     record_lineage(correlation, "status_start")
-                statuses = self.__lftp.status()
+                statuses = self.__lftp.status(trace_poll_correlation=correlation) if \
+                    isinstance(self.__lftp, Lftp) and isinstance(correlation, str) and \
+                    self.__lftp_status_poll_command_trace_enabled() else \
+                    self.__lftp.status()
                 if callable(record_lineage):
                     record_lineage(correlation, "status_finish")
             except Exception:
@@ -1745,11 +1762,14 @@ class Controller:
                 correlation = None
             if callable(record_lineage):
                 record_lineage(correlation, "status_submit")
+            command_trace_enabled = self.__lftp_status_poll_command_trace_enabled()
             def poll() -> tuple[list[LftpJobStatus], bool]:
                 if callable(record_lineage):
                     record_lineage(correlation, "status_start")
                 try:
-                    statuses = self.__lftp.status()
+                    statuses = self.__lftp.status(trace_poll_correlation=correlation) if \
+                        isinstance(self.__lftp, Lftp) and isinstance(correlation, str) and \
+                        command_trace_enabled else self.__lftp.status()
                     if callable(record_lineage):
                         record_lineage(correlation, "status_finish")
                     return (list(statuses or []), bool(getattr(self.__lftp, "last_status_poll_healthy", True)))
@@ -3143,7 +3163,10 @@ class Controller:
             trace = getattr(self.__context, "breadcrumb_trace", None)
             recorder = getattr(trace, "record_progress_lineage", None)
             enabled = getattr(trace, "is_effectively_enabled", None)
-            if callable(recorder) and callable(enabled) and enabled("model.progress", "debug"):
+            if callable(recorder) and callable(enabled) and enabled("model.progress", "debug") and \
+                    isinstance(lineage_correlation, str) and lineage_correlation.startswith("lftp-poll:") and \
+                    len(lineage_correlation) == len("lftp-poll:") + 16 and \
+                    all(character in "0123456789abcdef" for character in lineage_correlation[len("lftp-poll:"):]):
                 elapsed_ms = max(0, (time.monotonic_ns() - lineage_started_ns) // 1_000_000)
                 bucket = "0-4" if elapsed_ms <= 4 else "5-19" if elapsed_ms <= 19 else \
                     "20-99" if elapsed_ms <= 99 else "100-499" if elapsed_ms <= 499 else \

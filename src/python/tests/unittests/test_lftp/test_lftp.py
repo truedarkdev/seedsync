@@ -17,6 +17,7 @@ import pytest
 from tests.utils import TestUtils, requires_live_ssh
 from common import ConfigError
 from common.breadcrumb_trace import BreadcrumbTraceCollector
+from common.exclude_patterns import ExactPathExclusion
 from lftp import Lftp, LftpJobStatus, LftpError, LftpJobStatusParser, LftpJobStatusParserError
 
 
@@ -193,6 +194,91 @@ class TestLftp(unittest.TestCase):
         self.assertTrue(all(event["details"]["output_class"] == "empty" for event in events))
         self.assertTrue(all(event["flow_id"] == "fractional-queue:0123456789abcdef" for event in events))
         self.assertNotIn("/private", repr(events))
+
+    def test_queue_command_breadcrumb_includes_only_bounded_scale_metrics(self):
+        lftp = self._build_status_poll_test_lftp()
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.command": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        lftp.queue(
+            "private-directory", True,
+            exclude_patterns=["private-glob", "another-private-glob"],
+            trace_flow_id="fractional-queue:0123456789abcdef",
+        )
+
+        events = trace.snapshot()["entries"]
+        self.assertEqual(["2-4", "2-4"], [event["details"]["exclude_count_bucket"] for event in events])
+        self.assertTrue(all(event["details"]["argument_count_bucket"] == "5-16" for event in events))
+        self.assertTrue(all(event["details"]["submission_byte_length_bucket"] != "unknown" for event in events))
+        self.assertNotIn("private-directory", repr(events))
+        self.assertNotIn("private-glob", repr(events))
+
+    def test_queue_command_breadcrumb_bounds_large_exact_exclusion_scale(self):
+        lftp = self._build_status_poll_test_lftp()
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.command": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        lftp.queue(
+            "private-directory", True,
+            exclude_patterns=[ExactPathExclusion("private-{:04d}.bin".format(index)) for index in range(300)],
+            trace_flow_id="fractional-queue:0123456789abcdef",
+        )
+
+        events = trace.snapshot()["entries"]
+        self.assertTrue(all(event["details"]["exclude_count_bucket"] == "257+" for event in events))
+        self.assertEqual({"8192-32767"}, {event["details"]["submission_byte_length_bucket"] for event in events})
+        self.assertNotIn("private-directory", repr(events))
+        self.assertNotIn("private-0000.bin", repr(events))
+
+    def test_status_poll_breadcrumb_is_opt_in_and_joins_the_opaque_poll_token(self):
+        lftp = self._build_status_poll_test_lftp()
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        statuses = lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef")
+
+        self.assertEqual([], statuses)
+        events = trace.snapshot()["entries"]
+        self.assertEqual(["submitted", "jobs_read", "prompt_ready", "parse_complete"],
+                         [event["details"]["phase"] for event in events])
+        self.assertTrue(all(event["corr_id"] == "lftp-poll:0123456789abcdef" for event in events))
+        self.assertTrue(all(event["flow_id"] == "lftp-poll:0123456789abcdef" for event in events))
+        self.assertTrue(all(event["details"]["read_buffer_byte_length_bucket"] == "0" for event in events))
+        self.assertNotIn("jobs -v", repr(events))
+
+    def test_status_poll_breadcrumb_disabled_adds_no_trace_reads(self):
+        lftp = self._build_status_poll_test_lftp()
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8, policy={"default": "off", "rules": {}})
+        lftp.set_breadcrumb_trace(trace)
+
+        self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
+
+        self.assertEqual([], trace.snapshot()["entries"])
+
+    def test_status_poll_breadcrumb_warning_policy_keeps_only_failure_phase(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__process.expect.side_effect = pexpect.exceptions.TIMEOUT("synthetic")
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "warning"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
+
+        events = trace.snapshot()["entries"]
+        self.assertEqual(["prompt_timeout"], [event["details"]["phase"] for event in events])
+        self.assertEqual(["warning"], [event["level"] for event in events])
+        self.assertNotIn("jobs -v", repr(events))
 
     def test_queue_command_breadcrumb_warns_on_send_timeout_when_debug_is_disabled(self):
         lftp = self._build_status_poll_test_lftp()

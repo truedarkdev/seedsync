@@ -39,6 +39,15 @@ LFTP_COMMAND_TRACE_CATEGORY = "transfer.lftp.command"
 LFTP_COMMAND_TRACE_SCHEMA = "lftp.command_boundary.v1"
 LFTP_COMMAND_TRACE_KINDS = frozenset({"get", "mirror", "pget"})
 LFTP_COMMAND_TRACE_PHASES = frozenset({"submitted", "prompt_ready", "prompt_timeout", "process_eof", "backend_error"})
+LFTP_STATUS_POLL_TRACE_CATEGORY = "transfer.lftp.status"
+LFTP_STATUS_POLL_TRACE_SCHEMA = "lftp.status_poll.v1"
+LFTP_STATUS_POLL_TRACE_PHASES = frozenset({
+    "submitted", "jobs_read", "prompt_ready", "prompt_timeout", "process_eof", "command_error",
+    "backend_error", "parse_complete", "parse_error",
+})
+LFTP_STATUS_POLL_TRACE_FAILURE_PHASES = frozenset({
+    "prompt_timeout", "process_eof", "command_error", "backend_error", "parse_error",
+})
 redact_credentials = redact_sensitive_text
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -195,6 +204,53 @@ def _safe_lftp_queue_trace_flow(value: object) -> Optional[str]:
     return value
 
 
+def _safe_lftp_status_poll_correlation(value: object) -> Optional[str]:
+    """Accept the fixed opaque poll token shared with model lineage."""
+    prefix = "lftp-poll:"
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return None
+    suffix = value[len(prefix):]
+    if len(suffix) != 16 or any(character not in "0123456789abcdef" for character in suffix):
+        return None
+    return value
+
+
+def _lftp_trace_count_bucket(value: object) -> str:
+    if not isinstance(value, int) or value < 0:
+        return "unknown"
+    if value == 0:
+        return "0"
+    if value == 1:
+        return "1"
+    if value <= 4:
+        return "2-4"
+    if value <= 16:
+        return "5-16"
+    if value <= 64:
+        return "17-64"
+    if value <= 256:
+        return "65-256"
+    return "257+"
+
+
+def _lftp_trace_bytes_bucket(value: object) -> str:
+    if not isinstance(value, int) or value < 0:
+        return "unknown"
+    if value == 0:
+        return "0"
+    if value <= 127:
+        return "1-127"
+    if value <= 511:
+        return "128-511"
+    if value <= 2047:
+        return "512-2047"
+    if value <= 8191:
+        return "2048-8191"
+    if value <= 32767:
+        return "8192-32767"
+    return "32768+"
+
+
 def _record_lftp_command_breadcrumb(
         breadcrumb_trace: object,
         command_kind: object,
@@ -203,6 +259,7 @@ def _record_lftp_command_breadcrumb(
         *,
         process_alive: object,
         output: object = None,
+        command_metrics: Optional[tuple[int, int, int]] = None,
 ) -> None:
     """Record the privacy-safe Queue/PTy boundary, never its command or output."""
     if command_kind not in LFTP_COMMAND_TRACE_KINDS or phase not in LFTP_COMMAND_TRACE_PHASES:
@@ -225,6 +282,7 @@ def _record_lftp_command_breadcrumb(
         else:
             output_class = "other"
         corr_seed = safe_flow_id if safe_flow_id is not None else "{}:{}".format(command_kind, phase)
+        argument_count, exclude_count, command_byte_length = command_metrics or (-1, -1, -1)
         recorder(
             "lftp",
             "lftp_command_boundary",
@@ -236,6 +294,11 @@ def _record_lftp_command_breadcrumb(
                 "phase": phase,
                 "process_alive": process_alive is True,
                 "output_class": output_class,
+                "argument_count_bucket": _lftp_trace_count_bucket(argument_count),
+                "exclude_count_bucket": _lftp_trace_count_bucket(exclude_count),
+                # Do not use a ``command``-named key: the generic sanitizer
+                # correctly treats that as command content rather than this safe bucket.
+                "submission_byte_length_bucket": _lftp_trace_bytes_bucket(command_byte_length),
             },
             stage="lftp_command_boundary",
             event_type="failure" if level == "warning" else "state_transition",
@@ -252,6 +315,64 @@ def _record_lftp_command_breadcrumb(
         )
     except Exception:
         # Diagnostics must not affect PTY ownership or transfer admission.
+        return
+
+
+def _record_lftp_status_poll_breadcrumb(
+        breadcrumb_trace: object, correlation: object, phase: object, *,
+        process_alive: object, output: object = None, failure_reason: object = None,
+        status_count: object = None,
+) -> None:
+    """Record bounded PTY status phases without command, output, or path data."""
+    safe_correlation = _safe_lftp_status_poll_correlation(correlation)
+    if safe_correlation is None or phase not in LFTP_STATUS_POLL_TRACE_PHASES:
+        return
+    level = "warning" if phase in LFTP_STATUS_POLL_TRACE_FAILURE_PHASES else "debug"
+    if not _breadcrumb_effectively_enabled(breadcrumb_trace, LFTP_STATUS_POLL_TRACE_CATEGORY, level):
+        return
+    if not isinstance(failure_reason, str) or failure_reason not in LFTP_STATUS_POLL_FAILURE_REASONS:
+        failure_reason = "none"
+    output_text = "" if output is None else str(output)
+    if not output_text:
+        output_class = "empty"
+    elif "Connecting..." in output_text:
+        output_class = "connecting"
+    elif Lftp.__detect_errors_from_output(output_text):
+        output_class = "backend_error"
+    else:
+        output_class = "other"
+    try:
+        recorder = getattr(breadcrumb_trace, "record", None)
+        if not callable(recorder):
+            return
+        recorder(
+            "lftp", "lftp_status_poll",
+            {
+                "schema": LFTP_STATUS_POLL_TRACE_SCHEMA,
+                "phase": phase,
+                "process_alive": process_alive is True,
+                "output_class": output_class,
+                "read_buffer_byte_length_bucket": _lftp_trace_bytes_bucket(
+                    len(output_text.encode("utf-8", "surrogateescape")),
+                ),
+                "failure_reason": failure_reason,
+                "status_count_bucket": _lftp_trace_count_bucket(status_count),
+            },
+            stage="lftp_status_poll",
+            event_type="state_transition",
+            category=LFTP_STATUS_POLL_TRACE_CATEGORY,
+            level=level,
+            corr_id=safe_correlation,
+            flow_id=safe_correlation,
+            _coalesce_key=opaque_trace_correlation(
+                "lftp.status|{}|{}|{}|{}".format(
+                    safe_correlation, phase, output_class, failure_reason,
+                ),
+            ),
+            trace_scope="flow",
+        )
+    except Exception:
+        # Diagnostics must not affect PTY ownership, status freshness, or transfer admission.
         return
 
 
@@ -675,7 +796,9 @@ class Lftp:
                       status_poll: bool = False,
                       low_latency: bool = False,
                       trace_command_kind: Optional[str] = None,
-                      trace_flow_id: Optional[str] = None) -> str:
+                      trace_flow_id: Optional[str] = None,
+                      trace_command_metrics: Optional[tuple[int, int, int]] = None,
+                      trace_status_poll_correlation: Optional[str] = None) -> str:
         self.__last_command_timed_out = False
         restore_delaybeforesend = None
         restore_delayafterread = None
@@ -683,6 +806,7 @@ class Lftp:
         status_poll_timeout_seconds = None
         log_command_output = self.__log_command_output and not status_poll
         command_trace_enabled = trace_command_kind in LFTP_COMMAND_TRACE_KINDS
+        safe_status_poll_correlation = _safe_lftp_status_poll_correlation(trace_status_poll_correlation)
 
         def record_command_trace(phase: str, output: object = None) -> None:
             if not command_trace_enabled:
@@ -694,6 +818,25 @@ class Lftp:
             _record_lftp_command_breadcrumb(
                 getattr(self, "_Lftp__breadcrumb_trace", None), trace_command_kind,
                 phase, trace_flow_id, process_alive=process_alive, output=output,
+                command_metrics=trace_command_metrics,
+            )
+
+        def record_status_trace(phase: str, output: object = None,
+                                failure_reason: object = None, status_count: object = None) -> None:
+            if safe_status_poll_correlation is None:
+                return
+            trace = getattr(self, "_Lftp__breadcrumb_trace", None)
+            level = "warning" if phase in LFTP_STATUS_POLL_TRACE_FAILURE_PHASES else "debug"
+            if not _breadcrumb_effectively_enabled(trace, LFTP_STATUS_POLL_TRACE_CATEGORY, level):
+                return
+            try:
+                process_alive = self.__process.isalive()
+            except Exception:
+                process_alive = False
+            _record_lftp_status_poll_breadcrumb(
+                trace, safe_status_poll_correlation, phase,
+                process_alive=process_alive, output=output, failure_reason=failure_reason,
+                status_count=status_count,
             )
         if status_poll:
             status_poll_timeout_seconds = STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS if timeout_seconds == 0 else timeout_seconds
@@ -715,8 +858,10 @@ class Lftp:
                 else:
                     self.__process.sendline(command)
                 record_command_trace("submitted")
+                record_status_trace("submitted")
             except pexpect.exceptions.TIMEOUT:
                 record_command_trace("prompt_timeout")
+                record_status_trace("prompt_timeout", failure_reason="timeout")
                 if status_poll:
                     self.__last_command_timed_out = True
                     self.__last_status_poll_failure_reason = "timeout"
@@ -725,6 +870,7 @@ class Lftp:
                 raise
             except pexpect.exceptions.EOF:
                 record_command_trace("process_eof")
+                record_status_trace("process_eof", failure_reason="eof")
                 if status_poll:
                     self.__last_command_timed_out = True
                     self.__last_status_poll_failure_reason = "eof"
@@ -751,6 +897,7 @@ class Lftp:
                             except pexpect.exceptions.EOF:
                                 self.__last_command_timed_out = True
                                 self.__last_status_poll_failure_reason = "eof"
+                                record_status_trace("process_eof", failure_reason="eof")
                                 self.logger.error("Lftp process died unexpectedly (EOF)")
                                 raise LftpError("Lftp process terminated: {}".format(
                                     self.__normalize_output(self.__decode_spawn_output(self.__process.before))
@@ -758,11 +905,13 @@ class Lftp:
                     except pexpect.exceptions.ExceptionPexpect as exc:
                         self.__last_command_timed_out = True
                         self.__last_status_poll_failure_reason = "command_error"
+                        record_status_trace("command_error", failure_reason="command_error")
                         self.logger.warning("Ignoring status poll failure: {}".format(exc))
                         return ""
                     except OSError as exc:
                         self.__last_command_timed_out = True
                         self.__last_status_poll_failure_reason = "command_error"
+                        record_status_trace("command_error", failure_reason="command_error")
                         self.logger.warning("Ignoring status poll failure: {}".format(exc))
                         return ""
                     if not prompt_reached:
@@ -796,6 +945,13 @@ class Lftp:
                     after = self.__decode_spawn_output(self.__process.after).strip()
                     self.logger.debug("after: {}".format(after))
 
+            if status_poll:
+                record_status_trace("jobs_read", out)
+                if prompt_reached:
+                    record_status_trace("prompt_ready", out)
+                else:
+                    record_status_trace("prompt_timeout", out, failure_reason="timeout")
+
             if status_poll and "Connecting..." in out:
                 self.__status_poll_needs_connection_grace = True
             if status_poll and not prompt_reached and "Connecting..." in out:
@@ -808,6 +964,7 @@ class Lftp:
                 except pexpect.exceptions.EOF:
                     self.__last_command_timed_out = True
                     self.__last_status_poll_failure_reason = "eof"
+                    record_status_trace("process_eof", failure_reason="eof")
                     self.logger.error("Lftp process died unexpectedly (EOF) during status poll recovery")
                     raise LftpError("Lftp process terminated during status poll recovery")
                 finally:
@@ -819,6 +976,7 @@ class Lftp:
             # let's try and detect some errors
             if self.__detect_errors_from_output(out):
                 record_command_trace("backend_error", out)
+                record_status_trace("backend_error", out, failure_reason="command_error")
                 # we need to consume the actual output so that
                 # it doesn't get passed onto next command
                 error_out = out
@@ -1050,20 +1208,46 @@ class Lftp:
     def sftp_connect_program(self, program: str):
         self.__set(Lftp.__SET_SFTP_CONNECT_PROGRAM, program)
 
-    def status(self) -> Optional[List[LftpJobStatus]]:
+    def status(self, trace_poll_correlation: Optional[str] = None) -> Optional[List[LftpJobStatus]]:
         """
         Return a status list of queued and running jobs, or None when
         parsing failed but the error is still within the tolerated threshold.
         :return:
         """
         self.__last_status_poll_failure_reason = None
+        safe_trace_poll_correlation = _safe_lftp_status_poll_correlation(trace_poll_correlation)
+
+        def record_status_result(phase: str, output: object = None, status_count: object = None) -> None:
+            if safe_trace_poll_correlation is None:
+                return
+            trace = getattr(self, "_Lftp__breadcrumb_trace", None)
+            level = "warning" if phase in LFTP_STATUS_POLL_TRACE_FAILURE_PHASES else "debug"
+            if not _breadcrumb_effectively_enabled(trace, LFTP_STATUS_POLL_TRACE_CATEGORY, level):
+                return
+            try:
+                process_alive = self.__process.isalive()
+            except Exception:
+                process_alive = False
+            _record_lftp_status_poll_breadcrumb(
+                trace, safe_trace_poll_correlation, phase,
+                process_alive=process_alive, output=output,
+                failure_reason=self.__last_status_poll_failure_reason, status_count=status_count,
+            )
         try:
-            out = self.__run_command("jobs -v", timeout_seconds=0, require_prompt_ready=False, status_poll=True)  # type: ignore[arg-type]
+            status_command_kwargs: dict[str, object] = {
+                "timeout_seconds": 0,
+                "require_prompt_ready": False,
+                "status_poll": True,
+            }
+            if safe_trace_poll_correlation is not None:
+                status_command_kwargs["trace_status_poll_correlation"] = safe_trace_poll_correlation
+            out = self.__run_command("jobs -v", **status_command_kwargs)  # type: ignore[arg-type]
         except pexpect.exceptions.TIMEOUT:
             self.__consecutive_status_errors = 0
             self.__last_command_timed_out = True
             self.__last_status_poll_failure_reason = "timeout"
             self.__last_status_poll_healthy = False
+            record_status_result("prompt_timeout")
             self.logger.warning("Lftp timeout exception")
             return []
         except pexpect.exceptions.EOF:
@@ -1071,6 +1255,7 @@ class Lftp:
             self.__last_command_timed_out = True
             self.__last_status_poll_failure_reason = "eof"
             self.__last_status_poll_healthy = False
+            record_status_result("process_eof")
             self.logger.error("Lftp process died unexpectedly (EOF) during status poll")
             return []
         except LftpError as exc:
@@ -1079,6 +1264,7 @@ class Lftp:
             if self.__last_status_poll_failure_reason not in {"eof", "timeout"}:
                 self.__last_status_poll_failure_reason = "command_error"
             self.__last_status_poll_healthy = False
+            record_status_result("command_error")
             self.logger.warning("Ignoring status poll failure: {}".format(exc))
             return []
         timed_out = self.__last_command_timed_out
@@ -1087,10 +1273,12 @@ class Lftp:
             statuses = self.__job_status_parser.parse(out)
             self.__consecutive_status_errors = 0
             self.__last_status_poll_healthy = not timed_out
+            record_status_result("parse_complete", out, len(statuses))
         except LftpJobStatusParserError:
             self.__consecutive_status_errors += 1
             self.__last_status_poll_failure_reason = "parser_error"
             self.__last_status_poll_healthy = False
+            record_status_result("parse_error", out)
             if self.__consecutive_status_errors < MAX_CONSECUTIVE_STATUS_ERRORS:
                 self.logger.warning(f"Ignoring status error (count={self.__consecutive_status_errors})")
             else:
@@ -1111,10 +1299,12 @@ class Lftp:
                 statuses = self.__job_status_parser.parse(out)
                 self.__consecutive_status_errors = 0
                 self.__last_status_poll_healthy = not self.__last_command_timed_out
+                record_status_result("parse_complete", out, len(statuses))
             except LftpJobStatusParserError:
                 self.__consecutive_status_errors += 1
                 self.__last_status_poll_failure_reason = "parser_error"
                 self.__last_status_poll_healthy = False
+                record_status_result("parse_error", out)
                 if self.__consecutive_status_errors < MAX_CONSECUTIVE_STATUS_ERRORS:
                     self.logger.warning(f"Ignoring status error (count={self.__consecutive_status_errors})")
                 else:
@@ -1582,15 +1772,25 @@ class Lftp:
                 Lftp.__quote_command_argument(local_destination),
             ])
         command = " ".join(parts)
+        command_metrics = None
+        if _safe_lftp_queue_trace_flow(trace_flow_id) is not None and _breadcrumb_effectively_enabled(
+                getattr(self, "_Lftp__breadcrumb_trace", None), LFTP_COMMAND_TRACE_CATEGORY, "debug",
+        ):
+            command_metrics = (
+                len(parts), len(user_exclude_patterns) + len(exact_exclude_paths) if is_dir else 0,
+                len(command.encode("utf-8", "surrogateescape")),
+            )
         self.logger.debug("queue command: %s", command)
         if _safe_lftp_queue_trace_flow(trace_flow_id) is not None:
-            self.__run_command(
-                command,
-                require_prompt_ready=False,
-                low_latency=True,
-                trace_command_kind="mirror" if is_dir else ("get" if use_get else "pget"),
-                trace_flow_id=trace_flow_id,
-            )
+            trace_kwargs: dict[str, object] = {
+                "require_prompt_ready": False,
+                "low_latency": True,
+                "trace_command_kind": "mirror" if is_dir else ("get" if use_get else "pget"),
+                "trace_flow_id": trace_flow_id,
+            }
+            if command_metrics is not None:
+                trace_kwargs["trace_command_metrics"] = command_metrics
+            self.__run_command(command, **trace_kwargs)
         else:
             self.__run_command(
                 command,

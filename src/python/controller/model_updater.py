@@ -578,11 +578,14 @@ def _record_progress_lineage(
         controller: object, correlation: object, phase: str, details: Optional[Mapping[str, object]] = None,
 ) -> None:
     """Write bounded causal timing without changing an updater decision."""
+    safe_correlation = _safe_lftp_status_poll_correlation(correlation)
+    if safe_correlation is None:
+        return
     try:
         trace = getattr(getattr(controller, "_Controller__context", None), "breadcrumb_trace", None)
         recorder = getattr(trace, "record_progress_lineage", None)
         if callable(recorder):
-            recorder(correlation, phase, details)
+            recorder(safe_correlation, phase, details)
     except Exception:
         pass
 
