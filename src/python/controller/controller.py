@@ -8240,6 +8240,7 @@ class Controller:
 
     def _reconcile_pending_queue_dispatches_from_fresh_status(
             self, statuses: Sequence[LftpJobStatus] | Set[str],
+            idle_completion_proven_file_ids: Optional[Set[str]] = None,
     ) -> set[tuple[str, Optional[str], Optional[str]]]:
         """Retire acknowledged Queue intent when a fresh idle poll sees no job.
 
@@ -8379,6 +8380,20 @@ class Controller:
                     # completion candidate in the interim.
                     del pending[file_id]
                     continue
+            if idle_completion_proven_file_ids is not None and file_id not in idle_completion_proven_file_ids:
+                record_fractional_queue_trace(self, file_id, "queue_status_ack", lambda: {
+                    "schema": "fractional_mtime_redownload.queue_status_ack.v2",
+                    "status_acknowledgement": "ambiguous",
+                    "future_outcome": future_outcome if matching_queue_operations else "not_observed",
+                    "result": "pending",
+                    "reason": "physical_completion_unproven",
+                }, flow_id=fractional_queue_flow_id(
+                    self, file_id, dispatch.operation_sequence,
+                ))
+                # An empty status alone cannot distinguish an accepted Queue
+                # that never started from a fast completed GET. ModelUpdater
+                # supplies exact reconciled staging proof for the latter.
+                continue
             del pending[file_id]
             record_fractional_queue_trace(self, file_id, "queue_status_ack", lambda: {
                 "schema": "fractional_mtime_redownload.queue_status_ack.v2",

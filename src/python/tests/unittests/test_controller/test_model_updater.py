@@ -3268,10 +3268,10 @@ class TestModelUpdater(unittest.TestCase):
         )
         if defer_scans:
             controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
-                None, remote_result,
+                None, remote_result, None,
             ]
             controller._Controller__local_scan_process.pop_latest_result.side_effect = [
-                None, local_result,
+                None, local_result, None,
             ]
         file_id = ModelFile.build_file_id("fast-get.bin", None)
         controller._Controller__work_state_lock = RLock()
@@ -3391,10 +3391,18 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(ModelFile.State.QUEUED, live_model.get_file(file_id).state)
         self.assertEqual([], controller._Controller__last_lftp_statuses)
         self.assertEqual([], controller._Controller__active_downloading_file_names)
-        self.assertNotIn(file_id, controller._Controller__pending_queue_dispatches)
-        self.assertIn(("fast-get.bin", None, None), controller._Controller__pending_completion_file_names)
+        self.assertIn(file_id, controller._Controller__pending_queue_dispatches)
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
         controller._Controller__move_from_staging.assert_not_called()
+
+        controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
         ModelUpdater(controller).update()
+
+        self.assertIn(file_id, controller._Controller__pending_queue_dispatches)
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+        ModelUpdater(controller).update()
+
         self.assertEqual({None}, controller._Controller__reconciled_local_path_pair_ids)
         self.assertEqual({None}, controller._Controller__reconciled_remote_path_pair_ids)
         self.assertTrue(controller._Controller__model_builder.has_complete_local_coverage(file_id))
@@ -3404,11 +3412,11 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(
             (
                 True,
-                ModelFile.State.DOWNLOADED,
+                ModelFile.State.QUEUED,
                 100,
-                100,
-                [call("fast-get.bin", None)],
-                {file_id},
+                None,
+                [],
+                set(),
                 {},
             ),
             (
@@ -3425,6 +3433,8 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__local_scan_process.pop_latest_result.side_effect = None
         ModelUpdater(controller).update()
         controller._Controller__move_from_staging.assert_called_once_with("fast-get.bin", None)
+        self.assertEqual(ModelFile.State.DOWNLOADED, live_model.get_file(file_id).state)
+        self.assertEqual(100, live_model.get_file(file_id).transferred_size)
 
     def test_v092_fast_get_idle_without_exact_reconciliation_does_not_move_or_bind(self):
         controller, live_model, file_id = self._make_v092_fast_get_controller(
@@ -3437,6 +3447,32 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual({}, controller._Controller__persist.resume_source_identities)
         self.assertNotEqual(ModelFile.State.DOWNLOADED, live_model.get_file(file_id).state)
 
+    def test_v092_recovered_empty_status_keeps_accepted_queue_pending(self):
+        """Repeated empty recovery statuses cannot retire Queue without proof."""
+        controller, live_model, file_id = self._make_v092_fast_get_controller(
+            defer_scans=True,
+        )
+        queue_future = Future()
+        queue_future.set_result(None)
+        controller._Controller__lftp_operations = [
+            _LftpOperation("queue", queue_future, file_id, 7),
+        ]
+        controller._Controller__lftp_status_poll_retry_active = True
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(ModelFile.State.QUEUED, live_model.get_file(file_id).state)
+        self.assertIn(file_id, controller._Controller__pending_queue_dispatches)
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        self.assertFalse(controller._Controller__lftp_idle_status_authoritative)
+        self.assertIsNotNone(controller._Controller__next_lftp_status_poll_at)
+
+        controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+        ModelUpdater(controller).update()
+
+        self.assertIn(file_id, controller._Controller__pending_queue_dispatches)
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+
     def test_v092_fast_get_stop_before_idle_remains_stopped(self):
         controller, live_model, file_id = self._make_v092_fast_get_controller(stopped=True)
 
@@ -3447,8 +3483,8 @@ class TestModelUpdater(unittest.TestCase):
         self.assertIn(file_id, controller._Controller__persist.stopped_file_names)
         self.assertNotEqual(ModelFile.State.DOWNLOADED, live_model.get_file(file_id).state)
 
-    def test_v092_fast_get_stale_pre_queue_idle_does_not_force_post_dispatch_poll(self):
-        """A status result started before Queue must not retire the next lifecycle."""
+    def test_v092_fast_get_stale_pre_queue_idle_waits_for_scan_proof(self):
+        """A stale empty status must retain Queue until exact scan proof is visible."""
         controller, live_model, file_id = self._make_v092_fast_get_controller(
             defer_scans=True, pending_dispatch=False,
         )
@@ -3471,12 +3507,12 @@ class TestModelUpdater(unittest.TestCase):
         file = live_model.get_file(file_id)
         self.assertEqual(
             (
-                True,
-                ModelFile.State.DOWNLOADED,
+                False,
+                ModelFile.State.QUEUED,
                 100,
-                100,
-                [call("fast-get.bin", None)],
-                {file_id},
+                None,
+                [],
+                set(),
                 {},
                 set(),
                 1,

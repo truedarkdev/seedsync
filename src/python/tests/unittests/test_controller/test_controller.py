@@ -2318,7 +2318,7 @@ class TestController(unittest.TestCase):
         self.assertFalse(self.controller._Controller__temp_diag.call_args_list[-1].kwargs["lftp_status_snapshot_fresh"])
         self.controller._Controller__model_builder.build_model.assert_not_called()
 
-    def test_queue_forces_immediate_lftp_status_poll_after_idle_cooldown(self):
+    def test_queue_keeps_status_poll_active_when_idle_completion_is_unproven(self):
         file = ModelFile("movie.mkv", False)
         file.remote_size = 100
         file.state = ModelFile.State.DEFAULT
@@ -2343,7 +2343,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__update_model()
 
         self.controller._Controller__lftp.status.assert_called_once_with()
-        self.assertTrue(self.controller._Controller__lftp_idle_status_authoritative)
+        self.assertFalse(self.controller._Controller__lftp_idle_status_authoritative)
+        self.assertIsNotNone(self.controller._Controller__next_lftp_status_poll_at)
 
     def test_exit_ignores_lftp_teardown_failure_and_continues_shutdown(self):
         self.controller._Controller__started = True

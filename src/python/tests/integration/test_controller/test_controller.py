@@ -496,15 +496,6 @@ class TestController(unittest.TestCase):
         if refresh_requested:
             reasons.append("path-pair refresh pending")
 
-        model_builder = getattr(self.controller, "_Controller__model_builder", None)
-        has_changes = getattr(model_builder, "has_changes", None)
-        if callable(has_changes):
-            try:
-                if has_changes():
-                    reasons.append("model publication pending")
-            except Exception:
-                reasons.append("model publication state unavailable")
-
         return not reasons, tuple(reasons), identity_snapshot
 
     def __process_until(

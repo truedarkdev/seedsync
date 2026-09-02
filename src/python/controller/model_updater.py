@@ -2772,7 +2772,10 @@ class _ControllerCoreAccess:
     _Controller__MAX_MOVE_FAILURES: int
     _Controller__MOVE_RETRY_DELAYS: tuple[int, ...]
 
-    def _reconcile_pending_queue_dispatches_from_fresh_status(self, statuses: list[LftpJobStatus]) -> None: ...
+    def _reconcile_pending_queue_dispatches_from_fresh_status(
+            self, statuses: list[LftpJobStatus],
+            idle_completion_proven_file_ids: Optional[set[str]] = None,
+    ) -> set[tuple[str, Optional[str], Optional[str]]]: ...
     def _confirm_fresh_healthy_download_starts(self, statuses: list[LftpJobStatus]) -> None: ...
     def _complete_download_start_lifecycle(self, file_id: str) -> None: ...
     def _record_download_completion(self, file: ModelFile) -> None: ...
@@ -4917,13 +4920,48 @@ class ModelUpdater(_ControllerCoreAccess):
                 controller, "_reconcile_pending_queue_dispatches_from_fresh_status", None
             )
             if callable(reconcile_pending_queues):
-                reconciled_dispatches = reconcile_pending_queues(lftp_statuses)
+                idle_completion_proven_file_ids: Optional[set[str]] = None
+                if not lftp_statuses:
+                    pending_dispatches = getattr(controller, "_Controller__pending_queue_dispatches", {})
+                    if isinstance(pending_dispatches, dict):
+                        idle_completion_proven_file_ids = set()
+                        is_reconciled = getattr(controller, "is_path_pair_reconciled", None)
+                        has_complete_coverage = getattr(model_builder, "has_complete_local_coverage", None)
+                        has_verified_staging_identity = getattr(
+                            model_builder, "has_verified_complete_staging_remote_identity", None,
+                        )
+                        if callable(is_reconciled) and callable(has_complete_coverage) and \
+                                callable(has_verified_staging_identity):
+                            for file_id, dispatch in pending_dispatches.items():
+                                if not isinstance(file_id, str):
+                                    continue
+                                path_pair_id = getattr(dispatch, "path_pair_id", None)
+                                try:
+                                    if is_reconciled(path_pair_id) and \
+                                            has_complete_coverage(file_id) is True and \
+                                            has_verified_staging_identity(file_id) is True:
+                                        idle_completion_proven_file_ids.add(file_id)
+                                except Exception:
+                                    continue
+                reconciled_dispatches = reconcile_pending_queues(
+                    lftp_statuses, idle_completion_proven_file_ids,
+                )
                 if isinstance(reconciled_dispatches, set):
                     retired_queue_dispatches = {
                         entry for entry in reconciled_dispatches
                         if isinstance(entry, tuple) and len(entry) == 3 and
                         isinstance(entry[0], str)
                     }
+                if not lftp_statuses and isinstance(
+                        getattr(controller, "_Controller__pending_queue_dispatches", None), dict
+                ) and controller._Controller__pending_queue_dispatches:
+                    # No completion proof means the optimistic Queue remains
+                    # the owner. Reuse the existing status cadence until LFTP
+                    # reports a lifecycle row or scanners prove completion.
+                    controller._Controller__lftp_idle_status_authoritative = False
+                    controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(
+                        seconds=controller._Controller__lftp_status_poll_retry_seconds,
+                    )
             confirm_download_starts = getattr(controller, "_confirm_fresh_healthy_download_starts", None)
             if callable(confirm_download_starts):
                 confirm_download_starts(lftp_statuses)
