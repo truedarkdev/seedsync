@@ -959,6 +959,7 @@ class Lftp:
                 try:
                     connecting_grace_timeout = max(status_poll_timeout_seconds or 0, 5.0)
                     self.__process.expect(self.__expect_pattern, timeout=connecting_grace_timeout)
+                    record_status_trace("prompt_ready")
                 except pexpect.exceptions.TIMEOUT:
                     pass
                 except pexpect.exceptions.EOF:
@@ -1293,7 +1294,9 @@ class Lftp:
                 "jobs -v",
                 timeout_seconds=connection_grace_timeout,
                 require_prompt_ready=False,
-                status_poll=True
+                status_poll=True,
+                **({"trace_status_poll_correlation": safe_trace_poll_correlation}
+                   if safe_trace_poll_correlation is not None else {})
             )
             try:
                 statuses = self.__job_status_parser.parse(out)
@@ -1776,9 +1779,13 @@ class Lftp:
         if _safe_lftp_queue_trace_flow(trace_flow_id) is not None and _breadcrumb_effectively_enabled(
                 getattr(self, "_Lftp__breadcrumb_trace", None), LFTP_COMMAND_TRACE_CATEGORY, "debug",
         ):
+            try:
+                command_byte_length = len(command.encode("utf-8", "surrogateescape"))
+            except UnicodeEncodeError:
+                command_byte_length = -1
             command_metrics = (
                 len(parts), len(user_exclude_patterns) + len(exact_exclude_paths) if is_dir else 0,
-                len(command.encode("utf-8", "surrogateescape")),
+                command_byte_length,
             )
         self.logger.debug("queue command: %s", command)
         if _safe_lftp_queue_trace_flow(trace_flow_id) is not None:

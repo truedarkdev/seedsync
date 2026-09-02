@@ -236,6 +236,19 @@ class TestLftp(unittest.TestCase):
         self.assertNotIn("private-directory", repr(events))
         self.assertNotIn("private-0000.bin", repr(events))
 
+    def test_queue_command_breadcrumb_handles_unencodable_metric_input(self):
+        lftp = self._build_status_poll_test_lftp()
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.command": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        lftp.queue("surrogate-\ud800", True, trace_flow_id="fractional-queue:0123456789abcdef")
+
+        events = trace.snapshot()["entries"]
+        self.assertTrue(all(event["details"]["submission_byte_length_bucket"] == "unknown" for event in events))
+
     def test_status_poll_breadcrumb_is_opt_in_and_joins_the_opaque_poll_token(self):
         lftp = self._build_status_poll_test_lftp()
         trace = BreadcrumbTraceCollector(
@@ -279,6 +292,50 @@ class TestLftp(unittest.TestCase):
         self.assertEqual(["prompt_timeout"], [event["details"]["phase"] for event in events])
         self.assertEqual(["warning"], [event["level"] for event in events])
         self.assertNotIn("jobs -v", repr(events))
+
+    def test_status_poll_connection_grace_retry_keeps_correlation(self):
+        lftp = self._build_test_lftp()
+        lftp._Lftp__job_status_parser = MagicMock()
+        lftp._Lftp__job_status_parser.parse.return_value = []
+        lftp._Lftp__status_poll_needs_connection_grace = True
+
+        self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
+
+        self.assertEqual(
+            [
+                call("jobs -v", timeout_seconds=0, require_prompt_ready=False, status_poll=True,
+                     trace_status_poll_correlation="lftp-poll:0123456789abcdef"),
+                call("jobs -v", timeout_seconds=5.0, require_prompt_ready=False, status_poll=True,
+                     trace_status_poll_correlation="lftp-poll:0123456789abcdef"),
+            ],
+            lftp._Lftp__run_command.call_args_list,
+        )
+
+    def test_status_poll_connecting_recovery_records_prompt_ready(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__process.before = b"Connecting..."
+        lftp._Lftp__process.after = pexpect.TIMEOUT
+        lftp._Lftp__process.expect.side_effect = [
+            pexpect.exceptions.TIMEOUT("timeout"),
+            pexpect.exceptions.TIMEOUT("timeout"),
+            None,
+        ]
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        with patch("lftp.lftp.time.monotonic", side_effect=[0.0, 0.01, 1.01]), patch("lftp.lftp.time.sleep"):
+            lftp._Lftp__run_command(
+                "jobs -v", timeout_seconds=0, require_prompt_ready=False, status_poll=True,
+                trace_status_poll_correlation="lftp-poll:0123456789abcdef",
+            )
+
+        self.assertEqual(
+            ["submitted", "jobs_read", "prompt_timeout", "prompt_ready"],
+            [event["details"]["phase"] for event in trace.snapshot()["entries"]],
+        )
 
     def test_queue_command_breadcrumb_warns_on_send_timeout_when_debug_is_disabled(self):
         lftp = self._build_status_poll_test_lftp()
@@ -1417,6 +1474,14 @@ class TestLftp(unittest.TestCase):
         unit_only_methods = {
             "test_queue_uses_override_paths",
             "test_queue_command_breadcrumb_is_opt_in_and_opaque",
+            "test_queue_command_breadcrumb_includes_only_bounded_scale_metrics",
+            "test_queue_command_breadcrumb_bounds_large_exact_exclusion_scale",
+            "test_queue_command_breadcrumb_handles_unencodable_metric_input",
+            "test_status_poll_breadcrumb_is_opt_in_and_joins_the_opaque_poll_token",
+            "test_status_poll_breadcrumb_disabled_adds_no_trace_reads",
+            "test_status_poll_breadcrumb_warning_policy_keeps_only_failure_phase",
+            "test_status_poll_connection_grace_retry_keeps_correlation",
+            "test_status_poll_connecting_recovery_records_prompt_ready",
             "test_queue_command_breadcrumb_warns_on_send_timeout_when_debug_is_disabled",
             "test_queue_forwards_only_a_valid_opaque_command_trace_flow",
             "test_queue_sidecar_breadcrumb_classifies_missing_and_is_gated",
