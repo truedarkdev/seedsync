@@ -4959,10 +4959,29 @@ class Controller:
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
         return _breadcrumb_effectively_enabled(breadcrumb_trace, "queue.exclusion", "info")
 
+    def __lftp_command_trace_is_enabled(self) -> bool:
+        """Require an explicit command-boundary rule before forwarding Queue flow metadata."""
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        explicitly_configured = getattr(breadcrumb_trace, "is_explicitly_configured", None)
+        if not callable(explicitly_configured):
+            return False
+        try:
+            if explicitly_configured("transfer.lftp.command") is not True:
+                return False
+        except Exception:
+            return False
+        return (
+            _breadcrumb_effectively_enabled(breadcrumb_trace, "transfer.lftp.command", "debug") or
+            _breadcrumb_effectively_enabled(breadcrumb_trace, "transfer.lftp.command", "warning")
+        )
+
     def __fractional_queue_flow_id(self, file_id: str, operation_sequence: object) -> Optional[str]:
         if type(operation_sequence) is not int or operation_sequence < 1:
             return None
-        if not self.__fractional_queue_trace_is_enabled():
+        if not (
+                self.__fractional_queue_trace_is_enabled() or
+                self.__lftp_command_trace_is_enabled()
+        ):
             return None
         return "fractional-queue:{}".format(
             opaque_trace_correlation("queue:{}:{}".format(file_id, operation_sequence))
@@ -9507,10 +9526,13 @@ class Controller:
                         # serialization so its causal evidence joins the
                         # eventual manual Queue dispatch/future/status flow.
                         operation_sequence = self.__next_lftp_operation_sequence(file.file_id)
+                        queue_trace_flow_id = _fractional_queue_flow_id(
+                            self, file.file_id, operation_sequence,
+                        )
                         exclude_patterns = self.__transfer_exclude_patterns(
                             file.file_id,
                             file.is_dir,
-                            _fractional_queue_flow_id(self, file.file_id, operation_sequence),
+                            queue_trace_flow_id,
                         )
                         if exclude_patterns:
                             queue_kwargs["exclude_patterns"] = exclude_patterns
@@ -9531,6 +9553,9 @@ class Controller:
                                 queue_kwargs["expected_size"] = source_identity[0]
                             if allow_legacy_get_resume:
                                 queue_kwargs["allow_legacy_get_resume"] = True
+                        if self.__uses_async_lftp_owner() and queue_trace_flow_id is not None and \
+                                self.__lftp_command_trace_is_enabled():
+                            queue_kwargs["trace_flow_id"] = queue_trace_flow_id
                         lifecycle_before_queue = self.__download_start_lifecycle_snapshot(file.file_id)
                         dispatch = PendingQueueDispatch(
                             time.monotonic(), file.full_path, file.path_pair_id, file.is_dir, operation_sequence,

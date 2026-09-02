@@ -171,6 +171,67 @@ class TestLftp(unittest.TestCase):
             "queue pget -c \"/remote/movies/dup\" -o \"/local/movies/\""
         )
 
+    def test_queue_command_breadcrumb_is_opt_in_and_opaque(self):
+        lftp = self._build_status_poll_test_lftp()
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.command": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        lftp._Lftp__run_command(
+            "queue pget -c \"/private/source\" -o \"/private/destination\"",
+            require_prompt_ready=False,
+            trace_command_kind="pget",
+            trace_flow_id="fractional-queue:0123456789abcdef",
+        )
+
+        events = trace.snapshot()["entries"]
+        self.assertEqual(["submitted", "prompt_ready"], [event["details"]["phase"] for event in events])
+        self.assertEqual(["pget", "pget"], [event["details"]["transfer_kind"] for event in events])
+        self.assertTrue(all(event["details"]["process_alive"] for event in events))
+        self.assertTrue(all(event["details"]["output_class"] == "empty" for event in events))
+        self.assertTrue(all(event["flow_id"] == "fractional-queue:0123456789abcdef" for event in events))
+        self.assertNotIn("/private", repr(events))
+
+    def test_queue_command_breadcrumb_warns_on_send_timeout_when_debug_is_disabled(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__process.sendline.side_effect = pexpect.exceptions.TIMEOUT("synthetic")
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.command": "warning"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        with self.assertRaises(pexpect.exceptions.TIMEOUT):
+            lftp._Lftp__run_command(
+                "queue pget -c \"/private/source\" -o \"/private/destination\"",
+                require_prompt_ready=False,
+                trace_command_kind="pget",
+                trace_flow_id="fractional-queue:0123456789abcdef",
+            )
+
+        events = trace.snapshot()["entries"]
+        self.assertEqual(["prompt_timeout"], [event["details"]["phase"] for event in events])
+        self.assertEqual(["pget"], [event["details"]["transfer_kind"] for event in events])
+        self.assertNotIn("/private", repr(events))
+
+    def test_queue_forwards_only_a_valid_opaque_command_trace_flow(self):
+        lftp = self._build_test_lftp()
+
+        lftp.queue(
+            "sample.bin", False,
+            trace_flow_id="fractional-queue:0123456789abcdef",
+        )
+
+        lftp._Lftp__run_command.assert_called_once_with(
+            "queue pget -c \"/remote/default/sample.bin\" -o \"/local/default/\"",
+            require_prompt_ready=False,
+            low_latency=True,
+            trace_command_kind="pget",
+            trace_flow_id="fractional-queue:0123456789abcdef",
+        )
+
     def test_queue_sidecar_breadcrumb_classifies_missing_and_is_gated(self):
         lftp = self._build_test_lftp()
         trace = MagicMock()
@@ -1269,6 +1330,9 @@ class TestLftp(unittest.TestCase):
     def setUp(self):
         unit_only_methods = {
             "test_queue_uses_override_paths",
+            "test_queue_command_breadcrumb_is_opt_in_and_opaque",
+            "test_queue_command_breadcrumb_warns_on_send_timeout_when_debug_is_disabled",
+            "test_queue_forwards_only_a_valid_opaque_command_trace_flow",
             "test_queue_sidecar_breadcrumb_classifies_missing_and_is_gated",
             "test_queue_sidecar_breadcrumb_classifies_rejection_and_valid_artifact",
             "test_queue_sidecar_breadcrumb_disabled_preserves_dispatch",
