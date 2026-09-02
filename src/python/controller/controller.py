@@ -1762,7 +1762,13 @@ class Controller:
                 correlation = None
             if callable(record_lineage):
                 record_lineage(correlation, "status_submit")
-            command_trace_enabled = self.__lftp_status_poll_command_trace_enabled()
+            # Narrow controller fixtures bind this snapshot seam without the
+            # diagnostic helper.  Missing instrumentation must retain the
+            # legacy, argument-free status poll rather than failing a poll.
+            trace_enabled = getattr(
+                self, "_Controller__lftp_status_poll_command_trace_enabled", None,
+            )
+            command_trace_enabled = bool(trace_enabled()) if callable(trace_enabled) else False
             def poll() -> tuple[list[LftpJobStatus], bool]:
                 if callable(record_lineage):
                     record_lineage(correlation, "status_start")

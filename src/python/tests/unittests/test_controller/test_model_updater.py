@@ -3529,6 +3529,9 @@ class TestModelUpdater(unittest.TestCase):
                 controller._Controller__lftp.status.call_count,
             ),
         )
+        # This narrow fixture intentionally omits the optional diagnostics
+        # helper; status polling must retain the historical call shape.
+        controller._Controller__lftp.status.assert_called_once_with()
 
     def test_v092_fast_get_stale_idle_alone_does_not_handoff_completion(self):
         controller, live_model, file_id = self._make_v092_fast_get_controller(defer_scans=True)
