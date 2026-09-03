@@ -9,12 +9,14 @@ import threading
 import time
 import tempfile
 import unittest
-from concurrent.futures import Future
+from concurrent.futures import CancelledError, Future
 from pathlib import Path
 from queue import Queue
 from threading import Lock
 from unittest.mock import ANY, MagicMock, mock_open, patch
 from types import SimpleNamespace
+
+import pexpect
 
 from controller import AutoQueue, AutoQueuePersist, Controller, ControllerPersist, ModelBuilder
 from controller.model_updater import (
@@ -25,7 +27,8 @@ from controller.validate import ValidateProcess
 from controller.scan import MultiPathActiveScanner, ScannerProcess, ScannerResult
 from controller.controller import (
     ControllerError, DeferredQueueIntent, DownloadStartLifecycleEntry, PendingQueueDispatch,
-    _LftpOperation, _MoveMutationOutcome, _MoveMutationTracker,
+    _LftpOperation, _LftpQueueResult, _MoveMutationOutcome, _MoveMutationTracker,
+    _lftp_executor_exception_family,
 )
 from controller.persist_keys import KEY_SEP, persist_key
 from common import AppError, Config, PathPairError, PathPairManager
@@ -797,6 +800,248 @@ class TestController(unittest.TestCase):
         self.assertTrue(started.is_set())
         self.controller._Controller__lftp.force_close.assert_called_once_with()
         self.assertIsNone(self.controller._Controller__lftp_executor)
+
+    def test_lftp_executor_trace_is_explicit_opt_in_without_disabled_timing(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        executor = MagicMock()
+        executor.submit.return_value = Future()
+        self.controller._Controller__lftp_executor = executor
+        operation = lambda: True
+
+        with patch("controller.controller.secrets.token_hex") as token_hex:
+            self.assertTrue(self.controller._Controller__submit_lftp_operation(
+                "queue", operation, "sample.bin", 1,
+            ))
+
+        token_hex.assert_not_called()
+        # Queue already wraps its backend callable for legacy outcome handling;
+        # disabled executor tracing must not add the diagnostic wrapper.
+        self.assertEqual("queue_operation", executor.submit.call_args.args[0].__name__)
+        self.assertEqual([], [
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("category") == "transfer.lftp.executor"
+        ])
+
+    def test_lftp_executor_trace_records_local_lifecycle(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"transfer.lftp.executor": "info"}},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        executor = MagicMock()
+        future = Future()
+        submitted = []
+        executor.submit.side_effect = lambda operation: submitted.append(operation) or future
+        self.controller._Controller__lftp_executor = executor
+
+        with patch("controller.controller.secrets.token_hex", return_value="0123456789abcdef"):
+            self.assertTrue(self.controller._Controller__submit_lftp_operation(
+                "queue", lambda: True, "sample.bin", 1,
+            ))
+            submitted[0]()
+            future.set_result(_LftpQueueResult(True, False))
+            self.controller._Controller__drain_lftp_operations()
+
+        entries = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("category") == "transfer.lftp.executor"
+        ]
+        self.assertEqual(
+            ["enqueue_attempt", "enqueue_returned", "worker_enter", "worker_return", "harvest"],
+            [entry["details"]["phase"] for entry in entries],
+        )
+        self.assertEqual({"lftp-executor:0123456789abcdef"}, {entry["corr_id"] for entry in entries})
+        self.assertTrue(all("sample.bin" not in str(entry) for entry in entries))
+
+    def test_lftp_executor_trace_records_submit_failure_and_worker_exception(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"transfer.lftp.executor": "info"}},
+            max_entries=32,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        executor = MagicMock()
+        executor.submit.side_effect = RuntimeError("executor unavailable")
+        self.controller._Controller__lftp_executor = executor
+        with patch("controller.controller.secrets.token_hex", return_value="1111111111111111"):
+            self.assertFalse(self.controller._Controller__submit_lftp_operation("stop", lambda: True))
+
+        failed = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["details"]["phase"] == "enqueue_failed"
+        )
+        self.assertEqual("runtime", failed["details"]["exception_family"])
+
+        future = Future()
+        submitted = []
+        executor.submit.side_effect = lambda operation: submitted.append(operation) or future
+        self.controller._Controller__lftp_operations = []
+        def fail_worker():
+            raise LftpError("backend failure")
+        with patch("controller.controller.secrets.token_hex", return_value="2222222222222222"):
+            self.assertTrue(self.controller._Controller__submit_lftp_operation("stop", fail_worker))
+            with self.assertRaises(LftpError):
+                submitted[0]()
+            future.set_exception(LftpError("backend failure"))
+            self.controller._Controller__drain_lftp_operations()
+
+        exception = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["details"]["phase"] == "worker_exception" and entry["corr_id"].endswith("2222222222222222")
+        )
+        self.assertEqual("runtime", exception["details"]["exception_family"])
+
+    def test_lftp_executor_trace_warning_policy_retains_only_failure_observation(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"transfer.lftp.executor": "warning"}},
+            max_entries=8,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        executor = MagicMock()
+        executor.submit.side_effect = RuntimeError("unavailable")
+        self.controller._Controller__lftp_executor = executor
+
+        with patch("controller.controller.secrets.token_hex", return_value="abcdef0123456789"):
+            self.assertFalse(self.controller._Controller__submit_lftp_operation("stop", lambda: True))
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(["enqueue_failed"], [entry["details"]["phase"] for entry in entries])
+        self.assertEqual("runtime", entries[0]["details"]["exception_family"])
+
+    def test_lftp_executor_worker_exception_families_use_only_the_approved_enum(self):
+        errors = (
+            (TimeoutError(), "timeout"),
+            (pexpect.exceptions.TIMEOUT("timeout"), "timeout"),
+            (OSError("os error"), "os_error"),
+            (pexpect.exceptions.EOF("eof"), "eof"),
+            (LftpJobStatusParserError("parser"), "parser"),
+            (RuntimeError("runtime"), "runtime"),
+            (CancelledError(), "cancelled"),
+            (ValueError("unclassified"), "unknown"),
+        )
+        self.assertTrue(all(
+            _lftp_executor_exception_family(error) == expected
+            for error, expected in errors
+        ))
+
+    def test_lftp_executor_diagnostic_failure_preserves_worker_exception(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"transfer.lftp.executor": "info"}},
+            max_entries=8,
+        )
+        trace.record = MagicMock(side_effect=RuntimeError("diagnostic sink failure"))
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        future = Future()
+        submitted = []
+        executor = MagicMock()
+        executor.submit.side_effect = lambda operation: submitted.append(operation) or future
+        self.controller._Controller__lftp_executor = executor
+        expected = RuntimeError("worker failure")
+
+        def fail_worker():
+            raise expected
+
+        with patch("controller.controller.secrets.token_hex", return_value="7777777777777777"):
+            self.assertTrue(self.controller._Controller__submit_lftp_operation("status", fail_worker))
+
+        with self.assertRaisesRegex(RuntimeError, "worker failure"):
+            submitted[0]()
+
+    def test_lftp_executor_trace_allows_fast_worker_observation_without_claiming_order(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"transfer.lftp.executor": "info"}},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        completed = Future()
+
+        def submit_and_run(operation):
+            self.assertTrue(operation())
+            completed.set_result(True)
+            return completed
+
+        executor = MagicMock()
+        executor.submit.side_effect = submit_and_run
+        self.controller._Controller__lftp_executor = executor
+        with patch("controller.controller.secrets.token_hex", return_value="3333333333333333"), \
+                patch("controller.controller.time.monotonic_ns", side_effect=(1, 2, 3, 4)):
+            self.assertTrue(self.controller._Controller__submit_lftp_operation("stop", lambda: True))
+            self.controller._Controller__drain_lftp_operations()
+
+        phases = [
+            entry["details"]["phase"] for entry in trace.snapshot()["entries"]
+            if entry.get("category") == "transfer.lftp.executor"
+        ]
+        self.assertLess(phases.index("worker_enter"), phases.index("enqueue_returned"))
+        self.assertIn("harvest", phases)
+
+    def test_lftp_executor_trace_keeps_operations_and_retention_isolated(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"transfer.lftp.executor": "info"}},
+            max_entries=4,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        futures = [Future(), Future()]
+        submitted = []
+        executor = MagicMock()
+        executor.submit.side_effect = lambda operation: submitted.append(operation) or futures[len(submitted) - 1]
+        self.controller._Controller__lftp_executor = executor
+
+        with patch("controller.controller.secrets.token_hex", side_effect=("4444444444444444", "5555555555555555")):
+            self.assertTrue(self.controller._Controller__submit_lftp_operation("queue", lambda: True, "first.bin", 1))
+            self.assertTrue(self.controller._Controller__submit_lftp_operation("queue", lambda: True, "second.bin", 2))
+            for operation, future in zip(submitted, futures):
+                self.assertTrue(operation())
+                future.set_result(_LftpQueueResult(True, False))
+            self.controller._Controller__drain_lftp_operations()
+
+        entries = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("category") == "transfer.lftp.executor"
+        ]
+        self.assertLessEqual(len(entries), 4)
+        self.assertTrue(all("first.bin" not in str(entry) and "second.bin" not in str(entry) for entry in entries))
+        correlations = {entry["corr_id"] for entry in entries}
+        self.assertTrue(correlations <= {
+            "lftp-executor:4444444444444444", "lftp-executor:5555555555555555",
+        })
+
+    def test_lftp_executor_trace_records_cancelled_status_harvest(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"transfer.lftp.executor": "info"}},
+            max_entries=8,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        future = Future()
+        executor = MagicMock()
+        executor.submit.return_value = future
+        self.controller._Controller__lftp_executor = executor
+
+        with patch("controller.controller.secrets.token_hex", return_value="6666666666666666"):
+            self.assertTrue(self.controller._Controller__submit_lftp_operation("status", lambda: []))
+            self.assertTrue(future.cancel())
+
+        harvest = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["details"]["phase"] == "harvest"
+        )
+        self.assertEqual("cancelled", harvest["details"]["outcome"])
+        self.assertEqual("cancelled", harvest["details"]["exception_family"])
 
     def test_failed_queue_completion_removes_current_pending_dispatch(self):
         file_id = ModelFile.build_file_id("movie.mkv", None)

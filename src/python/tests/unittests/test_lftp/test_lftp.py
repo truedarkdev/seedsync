@@ -19,6 +19,7 @@ from common import ConfigError
 from common.breadcrumb_trace import BreadcrumbTraceCollector
 from common.exclude_patterns import ExactPathExclusion
 from lftp import Lftp, LftpJobStatus, LftpError, LftpJobStatusParser, LftpJobStatusParserError
+from lftp.lftp import _lftp_diagnostic_exception_family
 
 
 # noinspection PyPep8Naming,SpellCheckingInspection
@@ -185,6 +186,7 @@ class TestLftp(unittest.TestCase):
             require_prompt_ready=False,
             trace_command_kind="pget",
             trace_flow_id="fractional-queue:0123456789abcdef",
+            trace_pty_correlation="lftp-pty:0123456789abcdef",
         )
 
         events = trace.snapshot()["entries"]
@@ -194,6 +196,101 @@ class TestLftp(unittest.TestCase):
         self.assertTrue(all(event["details"]["output_class"] == "empty" for event in events))
         self.assertTrue(all(event["flow_id"] == "fractional-queue:0123456789abcdef" for event in events))
         self.assertNotIn("/private", repr(events))
+
+    def test_pty_queue_breadcrumb_requires_explicit_rule_and_records_no_payload(self):
+        lftp = self._build_status_poll_test_lftp()
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8, policy={"default": "info"})
+        lftp.set_breadcrumb_trace(trace)
+
+        lftp._Lftp__run_command(
+            "queue pget -c \"/private/source\" -o \"/private/destination\"",
+            require_prompt_ready=False,
+            trace_command_kind="pget",
+            trace_flow_id="fractional-queue:0123456789abcdef",
+            trace_pty_correlation="lftp-pty:0123456789abcdef",
+        )
+
+        self.assertEqual([], trace.snapshot()["entries"])
+
+    def test_pty_queue_breadcrumb_records_write_and_prompt_boundaries_without_payload(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__process.sendline.return_value = 3
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.pty": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        lftp._Lftp__run_command(
+            "queue pget -c \"/private/source\" -o \"/private/destination\"",
+            require_prompt_ready=False,
+            trace_command_kind="pget",
+            trace_flow_id="fractional-queue:0123456789abcdef",
+            trace_pty_correlation="lftp-pty:0123456789abcdef",
+        )
+
+        events = trace.snapshot()["entries"]
+        self.assertEqual(["pre_write", "write", "prompt"], [event["details"]["phase"] for event in events])
+        self.assertEqual("sendline", events[1]["details"]["send_mode"])
+        self.assertTrue(all(event["details"]["process_alive"] for event in events))
+        self.assertNotIn("/private", repr(events))
+
+    def test_pty_queue_breadcrumb_warning_mode_retains_send_failures_without_payload_reads(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__process.sendline.side_effect = pexpect.exceptions.TIMEOUT("synthetic")
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.pty": "warning"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        with self.assertRaises(pexpect.exceptions.TIMEOUT):
+            lftp._Lftp__run_command(
+                "queue pget -c \"/private/source\" -o \"/private/destination\"",
+                require_prompt_ready=False, trace_command_kind="pget",
+                trace_flow_id="fractional-queue:0123456789abcdef",
+                trace_pty_correlation="lftp-pty:0123456789abcdef",
+            )
+
+        events = trace.snapshot()["entries"]
+        self.assertEqual(["write"], [event["details"]["phase"] for event in events])
+        self.assertEqual("send_error", events[0]["details"]["prompt_outcome"])
+        self.assertEqual("timeout", events[0]["details"]["exception_family"])
+        self.assertNotIn("/private", repr(events))
+
+    def test_pty_queue_breadcrumb_records_os_error_before_reraising(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__process.sendline.side_effect = OSError("synthetic")
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.pty": "warning"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        with self.assertRaises(OSError):
+            lftp._Lftp__run_command(
+                "queue pget -c \"/private/source\" -o \"/private/destination\"",
+                require_prompt_ready=False, trace_command_kind="pget",
+                trace_pty_correlation="lftp-pty:0123456789abcdef",
+            )
+
+        event = trace.snapshot()["entries"][0]
+        self.assertEqual("send_error", event["details"]["prompt_outcome"])
+        self.assertEqual("os_error", event["details"]["exception_family"])
+
+    def test_pty_setup_failures_preserve_queue_dispatch_without_a_trace_token(self):
+        lftp = self._build_test_lftp()
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.pty": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        with patch("lftp.lftp.secrets.token_hex", side_effect=RuntimeError("rng unavailable")):
+            lftp.queue("sample.bin", False)
+
+        _, kwargs = lftp._Lftp__run_command.call_args
+        self.assertNotIn("trace_pty_correlation", kwargs)
 
     def test_queue_command_breadcrumb_includes_only_bounded_scale_metrics(self):
         lftp = self._build_status_poll_test_lftp()
@@ -261,12 +358,79 @@ class TestLftp(unittest.TestCase):
 
         self.assertEqual([], statuses)
         events = trace.snapshot()["entries"]
-        self.assertEqual(["submitted", "jobs_read", "prompt_ready", "parse_complete"],
+        self.assertEqual(["submitted", "jobs_read", "prompt_ready", "parse_complete", "health"],
                          [event["details"]["phase"] for event in events])
         self.assertTrue(all(event["corr_id"] == "lftp-poll:0123456789abcdef" for event in events))
         self.assertTrue(all(event["flow_id"] == "lftp-poll:0123456789abcdef" for event in events))
         self.assertTrue(all(event["details"]["read_buffer_byte_length_bucket"] == "0" for event in events))
+        self.assertEqual("health", events[-1]["details"]["boundary"])
+        self.assertTrue(events[-1]["details"]["healthy"])
         self.assertNotIn("jobs -v", repr(events))
+
+    def test_status_poll_breadcrumb_exposes_independent_boundary_outcomes(self):
+        lftp = self._build_status_poll_test_lftp()
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef")
+
+        events = trace.snapshot()["entries"]
+        self.assertEqual(
+            ["send", "read", "prompt", "parse", "health"],
+            [event["details"]["boundary"] for event in events],
+        )
+        self.assertEqual("healthy", events[-1]["details"]["outcome"])
+        self.assertTrue(all(event["corr_id"] == "lftp-poll:0123456789abcdef" for event in events))
+        self.assertTrue(all("exception_family" not in event["details"] for event in events))
+
+    def test_status_poll_parser_failure_records_parser_family_and_preserves_result(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__job_status_parser.parse.side_effect = LftpJobStatusParserError("private parser detail")
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        self.assertIsNone(lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
+
+        events = trace.snapshot()["entries"]
+        parse_error = next(event for event in events if event["details"]["phase"] == "parse_error")
+        health = next(event for event in events if event["details"]["phase"] == "health")
+        self.assertEqual("parser", parse_error["details"]["exception_family"])
+        self.assertFalse(health["details"]["healthy"])
+        self.assertNotIn("private parser detail", repr(events))
+
+    def test_status_poll_trace_failure_does_not_change_unexpected_exception_propagation(self):
+        lftp = self._build_status_poll_test_lftp()
+        expected = RuntimeError("status worker failure")
+        lftp._Lftp__run_command = MagicMock(side_effect=expected)
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        trace.record = MagicMock(side_effect=RuntimeError("diagnostic sink failure"))
+        lftp.set_breadcrumb_trace(trace)
+
+        with self.assertRaisesRegex(RuntimeError, "status worker failure"):
+            lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef")
+
+    def test_status_exception_families_use_only_the_approved_enum(self):
+        errors = (
+            (pexpect.exceptions.TIMEOUT("timeout"), "timeout"),
+            (OSError("os error"), "os_error"),
+            (pexpect.exceptions.EOF("eof"), "eof"),
+            (LftpJobStatusParserError("parser"), "parser"),
+            (RuntimeError("runtime"), "runtime"),
+            (ValueError("unclassified"), "unknown"),
+        )
+        self.assertTrue(all(
+            _lftp_diagnostic_exception_family(error) == expected
+            for error, expected in errors
+        ))
 
     def test_status_poll_breadcrumb_disabled_adds_no_trace_reads(self):
         lftp = self._build_status_poll_test_lftp()
@@ -289,8 +453,9 @@ class TestLftp(unittest.TestCase):
         self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
 
         events = trace.snapshot()["entries"]
-        self.assertEqual(["prompt_timeout"], [event["details"]["phase"] for event in events])
-        self.assertEqual(["warning"], [event["level"] for event in events])
+        self.assertEqual(["prompt_timeout", "health"], [event["details"]["phase"] for event in events])
+        self.assertFalse(events[-1]["details"]["healthy"])
+        self.assertEqual(["warning", "warning"], [event["level"] for event in events])
         self.assertNotIn("jobs -v", repr(events))
 
     def test_status_poll_connection_grace_retry_keeps_correlation(self):
@@ -1474,10 +1639,18 @@ class TestLftp(unittest.TestCase):
         unit_only_methods = {
             "test_queue_uses_override_paths",
             "test_queue_command_breadcrumb_is_opt_in_and_opaque",
+            "test_pty_queue_breadcrumb_requires_explicit_rule_and_records_no_payload",
+            "test_pty_queue_breadcrumb_records_write_and_prompt_boundaries_without_payload",
+            "test_pty_queue_breadcrumb_warning_mode_retains_send_failures_without_payload_reads",
+            "test_pty_queue_breadcrumb_records_os_error_before_reraising",
             "test_queue_command_breadcrumb_includes_only_bounded_scale_metrics",
             "test_queue_command_breadcrumb_bounds_large_exact_exclusion_scale",
             "test_queue_command_breadcrumb_handles_unencodable_metric_input",
             "test_status_poll_breadcrumb_is_opt_in_and_joins_the_opaque_poll_token",
+            "test_status_poll_breadcrumb_exposes_independent_boundary_outcomes",
+            "test_status_poll_parser_failure_records_parser_family_and_preserves_result",
+            "test_status_poll_trace_failure_does_not_change_unexpected_exception_propagation",
+            "test_status_exception_families_use_only_the_approved_enum",
             "test_status_poll_breadcrumb_disabled_adds_no_trace_reads",
             "test_status_poll_breadcrumb_warning_policy_keeps_only_failure_phase",
             "test_status_poll_connection_grace_retry_keeps_correlation",

@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple, cast
 from threading import Condition, Event, Lock, RLock
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError
 from queue import Queue
 from enum import Enum
 from datetime import datetime, timedelta
@@ -25,6 +25,8 @@ import secrets
 import re
 import sys
 from dataclasses import dataclass
+
+import pexpect
 
 # my libs
 from .scan import (
@@ -428,6 +430,10 @@ class _LftpOperation:
     operation_sequence: int = 0
     pending_dispatch: Optional[PendingQueueDispatch] = None
     download_start_lifecycle_before: Optional[DownloadStartLifecycleEntry] = None
+    # Executor observations are deliberately independent from Queue/file/model
+    # lineages.  These fields are populated only after the explicit diagnostic
+    # category gate has passed.
+    executor_correlation: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -439,6 +445,79 @@ class _LftpQueueResult:
 
 
 _LFTP_STATUS_AUTHORITY_COUNT_LIMIT = 32
+
+_LFTP_EXECUTOR_TRACE_CATEGORY = "transfer.lftp.executor"
+_LFTP_EXECUTOR_TRACE_SCHEMA = "lftp.executor.v1"
+_LFTP_EXECUTOR_ACTIONS = frozenset({"queue", "stop", "status", "reconfigure", "unknown"})
+_LFTP_EXECUTOR_OUTCOMES = frozenset({
+    "attempted", "enqueued", "failed", "running", "returned", "exception",
+    "accepted", "rejected", "error", "cancelled", "unknown",
+})
+_LFTP_EXECUTOR_EXCEPTION_FAMILIES = frozenset({
+    "timeout", "os_error", "eof", "parser", "runtime", "cancelled", "unknown",
+})
+_LFTP_EXECUTOR_PHASES = frozenset({
+    "enqueue_attempt", "enqueue_returned", "enqueue_failed", "worker_enter",
+    "worker_return", "worker_exception", "harvest",
+})
+
+
+def _lftp_executor_trace_enabled(trace: object, level: Optional[str] = None) -> bool:
+    """Require an explicit executor rule before allocating observations."""
+    explicit = getattr(trace, "is_explicitly_configured", None)
+    if not callable(explicit):
+        return False
+    try:
+        if explicit(_LFTP_EXECUTOR_TRACE_CATEGORY) is not True:
+            return False
+        if level is not None:
+            return _breadcrumb_effectively_enabled(trace, _LFTP_EXECUTOR_TRACE_CATEGORY, level)
+        # A warning-only policy may need a local token before a later failure;
+        # success observations remain filtered by their own info level.
+        return any(
+            _breadcrumb_effectively_enabled(trace, _LFTP_EXECUTOR_TRACE_CATEGORY, candidate)
+            for candidate in ("debug", "info", "warning")
+        )
+    except Exception:
+        return False
+
+
+def _lftp_executor_action(value: object) -> str:
+    return value if isinstance(value, str) and value in _LFTP_EXECUTOR_ACTIONS else "unknown"
+
+
+def _lftp_executor_outcome(value: object) -> str:
+    return value if isinstance(value, str) and value in _LFTP_EXECUTOR_OUTCOMES else "unknown"
+
+
+def _lftp_executor_exception_family(error: object) -> str:
+    if error is None:
+        return "unknown"
+    if isinstance(error, pexpect.exceptions.TIMEOUT):
+        return "timeout"
+    if isinstance(error, pexpect.exceptions.EOF):
+        return "eof"
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, OSError):
+        return "os_error"
+    if isinstance(error, LftpJobStatusParserError):
+        return "parser"
+    if isinstance(error, CancelledError):
+        return "cancelled"
+    if isinstance(error, (RuntimeError, LftpError)):
+        return "runtime"
+    return "unknown"
+
+
+def _lftp_executor_correlation(value: object) -> Optional[str]:
+    prefix = "lftp-executor:"
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return None
+    suffix = value[len(prefix):]
+    if len(suffix) != 16 or any(character not in "0123456789abcdef" for character in suffix):
+        return None
+    return value
 
 _TRANSFER_STOP_TRACE_CATEGORY = "transfer.stop"
 _TRANSFER_STOP_TRACE_SCHEMA = "transfer_stop.v1"
@@ -1318,6 +1397,55 @@ class Controller:
         backend_name = getattr(self.__lftp, "backend_name", None)
         return isinstance(self.__lftp, Lftp) or backend_name == "lftp"
 
+    def __record_lftp_executor_observation(
+            self,
+            correlation: object,
+            action: object,
+            phase: object,
+            outcome: object,
+            *,
+            error: object = None,
+            exception_family: Optional[str] = None,
+    ) -> None:
+        """Record executor lifecycle without carrying transfer identities."""
+        safe_correlation = _lftp_executor_correlation(correlation)
+        if safe_correlation is None or phase not in _LFTP_EXECUTOR_PHASES:
+            return
+        level = "warning" if phase in {"enqueue_failed", "worker_exception"} else "info"
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        if not _lftp_executor_trace_enabled(breadcrumb_trace, level):
+            return
+        try:
+            if error is not None or exception_family is not None:
+                exception_family = exception_family or _lftp_executor_exception_family(error)
+                if exception_family not in _LFTP_EXECUTOR_EXCEPTION_FAMILIES:
+                    exception_family = "unknown"
+            recorder = getattr(breadcrumb_trace, "record", None)
+            if not callable(recorder):
+                return
+            details = {
+                "schema": _LFTP_EXECUTOR_TRACE_SCHEMA,
+                "phase": phase,
+                "action": _lftp_executor_action(action),
+                "outcome": _lftp_executor_outcome(outcome),
+            }
+            if exception_family is not None:
+                details["exception_family"] = exception_family
+            recorder(
+                "controller",
+                "lftp_executor_observation",
+                details,
+                stage="lftp_executor",
+                event_type="failure" if level == "warning" else "diagnostic",
+                category=_LFTP_EXECUTOR_TRACE_CATEGORY,
+                level=level,
+                corr_id=safe_correlation,
+                trace_scope="flow",
+            )
+        except Exception:
+            # Executor diagnostics must never affect PTY ownership or transfer state.
+            return
+
     def __ensure_lftp_executor(self) -> Optional[ThreadPoolExecutor]:
         if not self.__uses_async_lftp_owner() or getattr(self, "_Controller__lftp_executor_closing", False):
             return None
@@ -1365,11 +1493,76 @@ class Controller:
                     getattr(self.__lftp, "last_command_timed_out", False) is True,
                 )
             submitted_operation = queue_operation
+
+        # The default path submits the original callable unchanged.
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        executor_trace_enabled = _lftp_executor_trace_enabled(breadcrumb_trace)
+        executor_correlation: Optional[str] = None
+        submit_callable = submitted_operation
+        if executor_trace_enabled:
+            try:
+                executor_correlation = "lftp-executor:{}".format(secrets.token_hex(8))
+            except Exception:
+                executor_trace_enabled = False
+            if executor_trace_enabled:
+                self.__record_lftp_executor_observation(
+                    executor_correlation, action, "enqueue_attempt", "attempted",
+                )
+
+                def observed_operation() -> object:
+                    self.__record_lftp_executor_observation(
+                        executor_correlation, action, "worker_enter", "running",
+                    )
+                    try:
+                        result = submitted_operation()
+                    except BaseException as exc:
+                        self.__record_lftp_executor_observation(
+                            executor_correlation, action, "worker_exception", "exception", error=exc,
+                        )
+                        raise
+                    self.__record_lftp_executor_observation(
+                        executor_correlation, action, "worker_return", "returned",
+                    )
+                    return result
+
+                submit_callable = observed_operation
+
         try:
-            future = executor.submit(submitted_operation)
-        except RuntimeError:
+            future = executor.submit(submit_callable)
+        except RuntimeError as exc:
+            if executor_trace_enabled:
+                self.__record_lftp_executor_observation(
+                    executor_correlation, action, "enqueue_failed", "failed", error=exc,
+                )
             return False
-        future.add_done_callback(lambda _future: self.wake_process())
+        if executor_trace_enabled:
+            self.__record_lftp_executor_observation(
+                executor_correlation, action, "enqueue_returned", "enqueued",
+            )
+
+        def on_lftp_future_done(done_future: Future[object]) -> None:
+            if action == "status" and executor_trace_enabled:
+                harvest_error = None
+                harvest_outcome = "accepted"
+                if done_future.cancelled():
+                    harvest_outcome = "cancelled"
+                else:
+                    try:
+                        done_future.exception()
+                    except BaseException as exc:
+                        harvest_error = exc
+                        harvest_outcome = "error"
+                self.__record_lftp_executor_observation(
+                    executor_correlation,
+                    action,
+                    "harvest",
+                    harvest_outcome,
+                    error=harvest_error,
+                    exception_family="cancelled" if harvest_outcome == "cancelled" else None,
+                )
+            self.wake_process()
+
+        future.add_done_callback(on_lftp_future_done)
         if action == "status":
             self.__lftp_status_future = future
         else:
@@ -1384,6 +1577,7 @@ class Controller:
                 operation_sequence,
                 pending_dispatch,
                 download_start_lifecycle_before,
+                executor_correlation,
             ))
             if action == "queue":
                 # A pre-Queue status can only describe the preceding
@@ -1529,6 +1723,7 @@ class Controller:
                 continue
             future_outcome = "accepted"
             command_prompt_timed_out = False
+            harvest_error: Optional[BaseException] = None
             try:
                 completed_result = operation.future.result()
                 if isinstance(completed_result, _LftpQueueResult):
@@ -1543,7 +1738,20 @@ class Controller:
                 result = None
                 failed = True
                 future_outcome = "error"
+                harvest_error = exc
                 self.logger.warning("Asynchronous lftp %s failed: %s", operation.action, exc)
+            executor_harvest_outcome = (
+                "rejected" if future_outcome == "rejected" else
+                "error" if future_outcome == "error" else "accepted"
+            )
+            self.__record_lftp_executor_observation(
+                getattr(operation, "executor_correlation", None),
+                getattr(operation, "action", "unknown"),
+                "harvest",
+                executor_harvest_outcome,
+                error=harvest_error,
+                exception_family=None,
+            )
             operation_file_id = getattr(operation, "file_id", None)
             if operation.action in ("queue", "stop") and operation_file_id is not None:
                 marker_observed = operation_file_id in self.__persist.stopped_file_names
