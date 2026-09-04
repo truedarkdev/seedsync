@@ -256,6 +256,9 @@ class ControllerHandler(IHandler):
             file_identifier,
             timeout=self._ACTION_TIMEOUT
         )
+        self.__controller.record_queue_http_wait_trace(
+            file_identifier, completed, callback.success,
+        )
         if not completed:
             return HTTPResponse(body="Operation timed out", status=504)
         if callback.success:

@@ -984,6 +984,25 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(404, response.status_code)
         self.assertEqual("missing", response.text)
 
+    def test_queue_wait_trace_forwards_completed_outcomes(self):
+        def succeed(command: Controller.Command):
+            command.callbacks[0].on_success()
+
+        self.controller.queue_command = MagicMock(side_effect=succeed)
+        self.assertEqual(200, self.test_app.post("/server/command/queue/test1").status_code)
+        self.controller.record_queue_http_wait_trace.assert_called_once_with("test1", True, True)
+
+        def fail(command: Controller.Command):
+            command.callbacks[0].on_failure("missing", 404)
+
+        self.controller.record_queue_http_wait_trace.reset_mock()
+        self.controller.queue_command = MagicMock(side_effect=fail)
+        self.assertEqual(
+            404,
+            self.test_app.post("/server/command/queue/test2", expect_errors=True).status_code,
+        )
+        self.controller.record_queue_http_wait_trace.assert_called_once_with("test2", True, False)
+
     def test_queue_times_out_when_callback_never_completes(self):
         self.controller.queue_command = MagicMock()
 
@@ -995,6 +1014,7 @@ class TestControllerHandler(BaseTestWebApp):
         command = self.controller.queue_command.call_args[0][0]
         self.assertEqual(Controller.Command.Action.QUEUE, command.action)
         self.assertEqual("test1", command.filename)
+        self.controller.record_queue_http_wait_trace.assert_called_once_with("test1", False, None)
 
     def test_validate_times_out_when_callback_never_completes(self):
         self.controller.queue_command = MagicMock()

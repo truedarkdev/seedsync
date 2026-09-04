@@ -4622,11 +4622,13 @@ class Controller:
         if startup_validation_error is not None:
             self.logger.warning("Rejecting command because controller startup config is incomplete: %s",
                                 startup_validation_error)
-            for callback in command.callbacks:
+            for callback_index, callback in enumerate(command.callbacks):
+                self.__record_queue_callback_trace(command, callback_index, "failure", 400)
                 callback.on_failure(startup_validation_error, 400)
             return
         if self.__path_pair_runtime_error is not None:
-            for callback in command.callbacks:
+            for callback_index, callback in enumerate(command.callbacks):
+                self.__record_queue_callback_trace(command, callback_index, "failure", 503)
                 callback.on_failure(self.__path_pair_runtime_error, 503)
             return
         if getattr(command, "flow_id", None) is None:
@@ -4640,7 +4642,8 @@ class Controller:
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
         if self.__path_pair_relocation_reserved(path_pair_id):
-            for callback in command.callbacks:
+            for callback_index, callback in enumerate(command.callbacks):
+                self.__record_queue_callback_trace(command, callback_index, "failure", 409)
                 callback.on_failure("Path pair relocation is in progress", 409)
             return
         is_delete_command = self.__is_delete_command_action(command.action)
@@ -5191,6 +5194,36 @@ class Controller:
         except Exception:
             # Diagnostics must never alter Queue admission or dispatch.
             self.logger.debug("Ignoring Queue readiness breadcrumb failure", exc_info=True)
+
+    def __record_queue_callback_trace(
+            self, command: "Controller.Command", callback_index: int,
+            outcome: str, error_code: int = 0,
+    ) -> None:
+        """Record a bounded Queue callback entry without callback payloads."""
+        if command.action != Controller.Command.Action.QUEUE:
+            return
+        self.__record_queue_readiness_trace(command.filename, "queue_callback", {
+            "schema": "queue_readiness.v1",
+            "phase": "entry",
+            "outcome": outcome,
+            "callback_index": callback_index,
+            "callback_count": len(command.callbacks),
+            "error_code": error_code if type(error_code) is int else 0,
+        })
+
+    def record_queue_http_wait_trace(
+            self, file_id: str, completed: bool, callback_success: object,
+    ) -> None:
+        """Record the Queue HTTP wait result without request identity."""
+        outcome = "timeout"
+        if completed:
+            outcome = "success" if callback_success is True else \
+                "failure" if callback_success is False else "unknown"
+        self.__record_queue_readiness_trace(file_id, "queue_http_wait", {
+            "schema": "queue_readiness.v1",
+            "phase": "wait_return",
+            "outcome": outcome,
+        })
 
     def __fractional_queue_trace_is_enabled(self) -> bool:
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
@@ -8827,12 +8860,13 @@ class Controller:
                 intent.stop_requested = True
         return retired
 
-    @staticmethod
     def __notify_queue_failure_callbacks(
-            command: "Controller.Command", reason: str, error_code: int = 409,
+            self, command: "Controller.Command", reason: str, error_code: int = 409,
     ) -> None:
         """Deliver one terminal Queue failure to each callback on a command."""
-        for callback in list(command.callbacks):
+        callbacks = list(command.callbacks)
+        for callback_index, callback in enumerate(callbacks):
+            self.__record_queue_callback_trace(command, callback_index, "failure", error_code)
             try:
                 callback.on_failure("Queue preflight cancelled: {}".format(reason), error_code)
             except Exception:
@@ -8840,15 +8874,14 @@ class Controller:
                 # remaining deferred waiters from being notified.
                 pass
 
-    @staticmethod
     def __notify_deferred_queue_failure(
-            intent: DeferredQueueIntent, reason: str, error_code: int = 409,
+            self, intent: DeferredQueueIntent, reason: str, error_code: int = 409,
     ) -> None:
         """Notify a retired Queue intent exactly once at its caller boundary."""
         if intent.failure_notified:
             return
         intent.failure_notified = True
-        Controller.__notify_queue_failure_callbacks(intent.command, reason, error_code)
+        self.__notify_queue_failure_callbacks(intent.command, reason, error_code)
 
     def __queue_scoped_rescan_ready(self, intent: DeferredQueueIntent) -> bool:
         if not intent.rescan_requested:
@@ -9268,7 +9301,8 @@ class Controller:
                 event_type="failure",
                 file=_file,
             )
-            for _callback in _command.callbacks:
+            for _callback_index, _callback in enumerate(_command.callbacks):
+                self.__record_queue_callback_trace(_command, _callback_index, "failure", _error_code)
                 _callback.on_failure(_msg, _error_code)
 
         deferred_commands: list[Controller.Command] = []
@@ -9398,7 +9432,7 @@ class Controller:
                     # preflight intent; it must never start a second compare,
                     # rescan, or LFTP admission.
                     if deferred_queue_intent.failure_notified:
-                        Controller.__notify_queue_failure_callbacks(
+                        self.__notify_queue_failure_callbacks(
                             command,
                             "preflight was already rejected",
                         )
@@ -10814,7 +10848,8 @@ class Controller:
             ):
                 self.__validate_process.clear(file.file_id)
             if not self.__is_delete_command_action(command.action):
-                for callback in command.callbacks:
+                for callback_index, callback in enumerate(command.callbacks):
+                    self.__record_queue_callback_trace(command, callback_index, "success")
                     callback.on_success()
                 self.__record_command_breadcrumb(
                     command=command,

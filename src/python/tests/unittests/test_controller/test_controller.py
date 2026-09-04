@@ -6692,6 +6692,135 @@ class TestController(unittest.TestCase):
         self.assertEqual("backend_rejected", entry["details"]["reason"])
         self.assertEqual("backend_rejection", entry["details"]["outcome"])
 
+    def test_queue_callback_trace_records_success_at_callback_entry(self):
+        file = ModelFile("callback-success", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=32,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        callback.on_success.assert_called_once_with()
+        entries = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "queue_callback"
+        ]
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertEqual(
+            {
+                "schema": "queue_readiness.v1",
+                "phase": "entry",
+                "outcome": "success",
+                "callback_index": 0,
+                "callback_count": 1,
+                "error_code": 0,
+            },
+            entry["details"],
+        )
+        self.assertIsNone(entry["file_id"])
+        self.assertIsNone(entry["path_pair_id"])
+        self.assertNotIn("callback-success", str(entry))
+
+    def test_queue_callback_trace_records_failure_at_callback_entry(self):
+        file = ModelFile("callback-failure", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.queue.side_effect = LftpError("queue failed")
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=32,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        callback.on_failure.assert_called_once_with("Transfer backend error: queue failed", 500)
+        entries = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "queue_callback"
+        ]
+        self.assertEqual(1, len(entries))
+        self.assertEqual(
+            {
+                "schema": "queue_readiness.v1",
+                "phase": "entry",
+                "outcome": "failure",
+                "callback_index": 0,
+                "callback_count": 1,
+                "error_code": 500,
+            },
+            entries[0]["details"],
+        )
+        self.assertNotIn("callback-failure", str(entries[0]))
+
+    def test_queue_callback_trace_is_default_off(self):
+        file = ModelFile("callback-disabled", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off"},
+            max_entries=32,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        callback.on_success.assert_called_once_with()
+        self.assertEqual([], trace.snapshot()["entries"])
+
+    def test_queue_http_wait_trace_records_only_fixed_outcomes(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=32,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+
+        self.controller.record_queue_http_wait_trace("wait-success", True, True)
+        self.controller.record_queue_http_wait_trace("wait-failure", True, False)
+        self.controller.record_queue_http_wait_trace("wait-timeout", False, None)
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(3, len(entries))
+        self.assertEqual(
+            ["success", "failure", "timeout"],
+            [entry["details"]["outcome"] for entry in entries],
+        )
+        self.assertTrue(all(entry["message"] == "queue_http_wait" for entry in entries))
+        self.assertTrue(all(entry["file_id"] is None for entry in entries))
+        self.assertTrue(all(entry["path_pair_id"] is None for entry in entries))
+        self.assertNotIn("wait-success", str(entries))
+        self.assertNotIn("wait-failure", str(entries))
+        self.assertNotIn("wait-timeout", str(entries))
+
+    def test_queue_http_wait_trace_is_default_off(self):
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "off"}, max_entries=8)
+        self.controller._Controller__context.breadcrumb_trace = trace
+
+        self.controller.record_queue_http_wait_trace("wait-disabled", False, None)
+
+        self.assertEqual([], trace.snapshot()["entries"])
+
     def test_async_queue_rejection_stays_rejected_during_idle_reconciliation(self):
         file = ModelFile("async-rejected", False)
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
