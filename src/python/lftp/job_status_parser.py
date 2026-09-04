@@ -43,7 +43,7 @@ class LftpJobStatusParser:
     # without the quotes used by the queue command, so neither form may be
     # mistaken for a positional remote path.
     __MIRROR_KNOWN_OPTION_REGEX = (
-        r'(?:-c|--exclude(?:-glob)?\s+(?:"(?:\\.|[^"\\])*"|(?:\\.|[^\s])+))'
+        r'(?:-c|--exclude(?:-glob)?\s+(?:"(?:\\.|[^"\\])*"|(?:\\.|[^\\\s])+))'
     )
 
     __QUEUE_DONE_REGEX = r"^\[(?P<id>\d+)\]\sDone\s\(queue\s\(.+\)\)"

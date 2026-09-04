@@ -1,6 +1,9 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 from collections import deque
+import os
+import subprocess
+import sys
 import unittest
 
 from lftp import LftpJobStatusParser, LftpJobStatus, LftpJobStatusParserError
@@ -240,6 +243,123 @@ class TestLftpJobStatusParser(unittest.TestCase):
                 self.assertEqual("/remote/sample-directory", statuses[0].remote_path)
                 self.assertEqual("/local/staging/", statuses[0].local_path)
                 self.assertEqual("sample-directory", statuses[0].name)
+
+    def test_mirror_known_options_parse_running_connecting_and_queued_rows(self):
+        rows = (
+            (
+                "Queue is running.\n"
+                "[1] mirror -c --exclude sample\\ pattern "
+                "/remote/sample-directory /local/staging/ -- 10/20 (50%)",
+                LftpJobStatus.State.RUNNING,
+                "-c --exclude sample\\ pattern",
+            ),
+            (
+                "Queue is running.\n"
+                "[1] mirror -c --exclude sample\\ pattern "
+                "/remote/sample-directory /local/staging/\n"
+                "Getting file list",
+                LftpJobStatus.State.RUNNING,
+                "-c --exclude sample\\ pattern",
+            ),
+            (
+                "Queue is stopped.\n"
+                "Commands queued:\n"
+                "1. mirror -c --exclude sample\\ pattern "
+                "/remote/sample-directory /local/staging/",
+                LftpJobStatus.State.QUEUED,
+                "-c --exclude sample\\ pattern",
+            ),
+        )
+
+        for row, state, flags in rows:
+            with self.subTest(state=state):
+                output = (
+                    "jobs -v\n"
+                    "[0] queue (sftp://someone:@localhost)\n"
+                    "sftp://someone:@localhost/remote\n"
+                    + row
+                )
+
+                statuses = LftpJobStatusParser().parse(output)
+
+                self.assertEqual(1, len(statuses))
+                self.assertEqual(state, statuses[0].state)
+                self.assertEqual(flags, statuses[0]._LftpJobStatus__flags)
+                self.assertEqual("/remote/sample-directory", statuses[0].remote_path)
+                self.assertEqual("/local/staging/", statuses[0].local_path)
+                self.assertEqual("sample-directory", statuses[0].name)
+
+    def test_mirror_unquoted_exclusion_preserves_escaped_space_backslash_and_quote(self):
+        for exclusion in (r"sample\ pattern", r"sample\\pattern", r"sample\"pattern"):
+            with self.subTest(exclusion=exclusion):
+                output = (
+                    "jobs -v\n"
+                    "[0] queue (sftp://someone:@localhost)\n"
+                    "sftp://someone:@localhost/remote\n"
+                    "Queue is running.\n"
+                    "[1] mirror -c --exclude {} /remote/sample-directory "
+                    "/local/staging/ -- 10/20 (50%)\n"
+                ).format(exclusion)
+
+                statuses = LftpJobStatusParser().parse(output)
+
+                self.assertEqual(1, len(statuses))
+                self.assertEqual(
+                    "-c --exclude {}".format(exclusion),
+                    statuses[0]._LftpJobStatus__flags,
+                )
+                self.assertEqual("/remote/sample-directory", statuses[0].remote_path)
+                self.assertEqual("/local/staging/", statuses[0].local_path)
+
+    def test_mirror_unquoted_single_trailing_backslash_keeps_fallback_semantics(self):
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/remote\n"
+            "Queue is running.\n"
+            "[1] mirror --exclude sample\\ /remote/sample-directory "
+            "/local/staging/ -- 10/20 (50%)\n"
+        )
+
+        statuses = LftpJobStatusParser().parse(output)
+
+        self.assertEqual(1, len(statuses))
+        self.assertEqual("--exclude", statuses[0]._LftpJobStatus__flags)
+        self.assertEqual("sample\\ /remote/sample-directory", statuses[0].remote_path)
+        self.assertEqual("/local/staging/", statuses[0].local_path)
+        self.assertEqual("sample-directory", statuses[0].name)
+
+    def test_long_malformed_unquoted_exclusion_returns_empty_snapshot_in_bounded_subprocess(self):
+        malformed = "\\" * 48
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/remote\n"
+            "Queue is running.\n"
+            "[1] mirror --exclude {}"
+        ).format(malformed)
+        python_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        child = (
+            "from lftp import LftpJobStatusParser; "
+            "statuses = LftpJobStatusParser().parse({!r}); "
+            "assert statuses == [], statuses; print('[]')"
+        ).format(output)
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = os.pathsep.join(
+            path for path in (python_root, environment.get("PYTHONPATH")) if path
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-c", child],
+            cwd=python_root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=2,
+        )
+
+        self.assertEqual("[]", result.stdout.strip())
 
     def test_genuine_empty_snapshot_remains_empty(self):
         output = (
