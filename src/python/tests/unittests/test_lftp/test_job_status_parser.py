@@ -1,5 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+from collections import deque
 import unittest
 
 from lftp import LftpJobStatusParser, LftpJobStatus, LftpJobStatusParserError
@@ -149,6 +150,49 @@ class TestLftpJobStatusParser(unittest.TestCase):
         self.assertEqual(1, len(statuses))
         self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
         self.assertEqual("sample-directory", statuses[0].name)
+
+    def test_queue_parser_consumes_status_lines_fifo_from_deque(self):
+        lines = deque([
+            "[0] queue (sftp://someone:@localhost)",
+            "sftp://someone:@localhost/remote",
+            "Queue is stopped.",
+            "Commands queued:",
+            "1. mirror -c /remote/first /local/staging/",
+            "2. mirror -c /remote/second /local/staging/",
+        ])
+
+        statuses = LftpJobStatusParser._LftpJobStatusParser__parse_queue(lines)
+
+        self.assertEqual([1, 2], [status.id for status in statuses])
+        self.assertEqual(["first", "second"], [status.name for status in statuses])
+        self.assertEqual([], list(lines))
+
+    def test_large_queued_snapshot_preserves_every_command_in_order(self):
+        queued_count = 1024
+        queued_commands = "\n".join(
+            "{}. mirror -c /remote/sample-directory-{:04d} /local/staging/".format(index, index)
+            for index in range(1, queued_count + 1)
+        )
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/remote\n"
+            "Queue is stopped.\n"
+            "Commands queued:\n"
+            + queued_commands
+        )
+
+        statuses = LftpJobStatusParser().parse(output)
+
+        self.assertEqual(queued_count, len(statuses))
+        self.assertEqual(
+            list(range(1, queued_count + 1)),
+            [status.id for status in statuses],
+        )
+        self.assertEqual(
+            ["sample-directory-{:04d}".format(index) for index in range(1, queued_count + 1)],
+            [status.name for status in statuses],
+        )
 
     def test_mirror_exclusion_keeps_path_arguments_separate_from_flags(self):
         commands = (

@@ -2,7 +2,8 @@
 
 import os
 import re
-from typing import List
+from collections import deque
+from typing import Deque, List
 import logging
 
 from common import AppError
@@ -209,7 +210,7 @@ class LftpJobStatusParser:
         lines = list(filter(lambda s: s != "jobs -v", lines))
         # remove any remaining log line
         lines = filter(lambda s: not re.match(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}.*\s->\s.*$", s), lines)
-        lines = list(lines)
+        lines = deque(lines)
         has_wrong_type_failure = any(self.__is_wrong_type_failure_line(line) for line in lines)
         try:
             statuses += self.__parse_queue(lines)
@@ -234,7 +235,7 @@ class LftpJobStatusParser:
         return any(line.startswith(prefix) for prefix in LftpJobStatusParser.__WRONG_TYPE_FAILURE_PREFIXES)
 
     @staticmethod
-    def __parse_jobs(lines: List[str]) -> List[LftpJobStatus]:
+    def __parse_jobs(lines: Deque[str]) -> List[LftpJobStatus]:
         jobs: list[LftpJobStatus] = []
         logger = logging.getLogger("LftpJobStatusParser")
 
@@ -393,7 +394,7 @@ class LftpJobStatusParser:
 
         prev_job = None
         while lines:
-            line = lines.pop(0)
+            line = lines.popleft()
 
             # First line must be a valid job header
             if not (
@@ -415,7 +416,7 @@ class LftpJobStatusParser:
                 # Next line must be the sftp line
                 if len(lines) < 1 or "sftp" not in lines[0]:
                     raise ValueError("Missing the 'sftp' line for pget header '{}'".format(line))
-                lines.pop(0)  # pop the 'sftp' line
+                lines.popleft()  # pop the 'sftp' line
 
                 # Data line may not exist. Peek before consuming so a following
                 # job header stays in the outer loop when no chunk data exists.
@@ -427,7 +428,7 @@ class LftpJobStatusParser:
                         chunk_at2_m.search(lines[0]) or
                         chunk_got_m.search(lines[0])
                 ):
-                    line = lines.pop(0)  # data line
+                    line = lines.popleft()  # data line
                     result_at = chunk_at_m.search(line)
                     result_at2 = chunk_at2_m.search(line)
                     result_got = chunk_got_m.search(line)
@@ -549,7 +550,7 @@ class LftpJobStatusParser:
                         lines[0].startswith("Getting file list") or
                         lines[0].startswith("cd ")
                 ):
-                    lines.pop(0)  # pop the connecting line
+                    lines.popleft()  # pop the connecting line
                 id_ = int(result.group("id"))
                 name = os.path.basename(os.path.normpath(result.group("remote")))
                 flags = result.group("flags")
@@ -577,7 +578,7 @@ class LftpJobStatusParser:
                 # outer loop when this transfer emitted no chunk data.
                 if not lines or not lines[0].startswith("`"):
                     continue
-                line = lines.pop(0)
+                line = lines.popleft()
                 result_at = chunk_at_m.search(line)
                 result_at2 = chunk_at2_m.search(line)
                 result_got = chunk_got_m.search(line)
@@ -654,7 +655,7 @@ class LftpJobStatusParser:
                             lines[0].startswith("cd ") or \
                             lines[0] == "{}:".format(name) or \
                             lines[0].startswith("mkdir "):
-                        lines.pop(0)
+                        lines.popleft()
                 # Continue the outer loop
                 continue
 
@@ -669,7 +670,7 @@ class LftpJobStatusParser:
             if result:
                 # Also ignore the following chunk data line when lftp emits one.
                 if lines and lines[0].startswith("`"):
-                    lines.pop(0)
+                    lines.popleft()
                 # Continue the outer loop
                 continue
 
@@ -680,14 +681,14 @@ class LftpJobStatusParser:
                 # Also ignore the next one or two lines
                 if not lines or not lines[0].startswith("file:"):
                     raise ValueError("Missing 'file:' line for chmod '{}'".format(name))
-                lines.pop(0)
+                lines.popleft()
                 if lines:
                     result_chmod = chmod_pattern_m.search(lines[0])
                     if result_chmod:
                         name_chmod = result_chmod.group("name")
                         if name != name_chmod:
                             raise ValueError("Mismatch in names chmod '{}'".format(name))
-                        lines.pop(0)
+                        lines.popleft()
                 # Continue the outer loop
                 continue
 
@@ -712,14 +713,14 @@ class LftpJobStatusParser:
         return jobs
 
     @staticmethod
-    def __parse_queue(lines: List[str]) -> List[LftpJobStatus]:
+    def __parse_queue(lines: Deque[str]) -> List[LftpJobStatus]:
         queue: list[LftpJobStatus] = []
 
         queue_done_m = re.compile(LftpJobStatusParser.__QUEUE_DONE_REGEX)
         if len(lines) == 1:
             if not queue_done_m.match(lines[0]):
                 raise ValueError("Unrecognized line '{}'".format(lines[0]))
-            lines.pop(0)
+            lines.popleft()
 
         if lines:
             # Look for the header lines
@@ -728,28 +729,28 @@ class LftpJobStatusParser:
             header1_pattern = r"^\[\d+\] queue \((?:sftp|ftp|ftps)://.*@.*\)(?:\s+--\s+(?:\d+\.\d+|\d+)\s(?:{})\/s)?$"\
                               .format(LftpJobStatusParser.__SIZE_UNITS_REGEX)
             header2_pattern = "^(?:sftp|ftp|ftps)://.*@.*$"
-            line = lines.pop(0)
+            line = lines.popleft()
             if not re.match(header1_pattern, line):
                 raise ValueError("Missing queue header line 1: {}".format(line))
-            line = lines.pop(0)
+            line = lines.popleft()
             if not re.match(header2_pattern, line):
                 raise ValueError("Missing queue header line 2: {}".format(line))
             if not lines:
                 raise ValueError("Missing queue status")
 
             # Look for 'Now executing' lines
-            line = lines.pop(0)
+            line = lines.popleft()
             if re.match("Queue is stopped.", line):
                 # Nothing to do
                 pass
             elif re.match("Now executing:", line):
                 # Remove any more lines associated with 'now executing'
                 while lines and re.match(r"^-\[\d+\]", lines[0]):
-                    lines.pop(0)
+                    lines.popleft()
 
             # Look for the actual queue
             if lines and re.match("Commands queued:", lines[0]):
-                lines.pop(0)
+                lines.popleft()
                 if not lines:
                     raise ValueError("Missing queued commands")
 
@@ -778,7 +779,7 @@ class LftpJobStatusParser:
                     line = lines[0]
                     if re.match(r"^\d+\.", line):
                         # header line
-                        lines.pop(0)
+                        lines.popleft()
 
                         if "jobs -v" in line:
                             logging.getLogger("LftpJobStatusParser").warning(
@@ -790,7 +791,7 @@ class LftpJobStatusParser:
                                 re.match(r"^\[\d+\]", lines[0]) or
                                 queue_done_m.match(lines[0])
                             ):
-                                lines.pop(0)
+                                lines.popleft()
                             continue
 
                         result_pget = queue_pget_m.match(line)
@@ -816,7 +817,7 @@ class LftpJobStatusParser:
                                 re.match(r"^\[\d+\]", lines[0]) or
                                 queue_done_m.match(lines[0])
                             ):
-                                lines.pop(0)
+                                lines.popleft()
                             continue
                         id_ = int(result.group("id"))
                         name = os.path.basename(os.path.normpath(result.group("remote")))
@@ -831,13 +832,13 @@ class LftpJobStatusParser:
                         queue.append(status)
                     elif re.match(r"^cd\s.*$", line):
                         # 'cd' line after pget, ignore
-                        lines.pop(0)
+                        lines.popleft()
                     else:
                         # no match, exit loop
                         break
 
             # Look for the done line
             if lines and queue_done_m.match(lines[0]):
-                lines.pop(0)
+                lines.popleft()
 
         return queue
