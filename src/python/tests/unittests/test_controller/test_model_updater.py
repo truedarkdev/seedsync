@@ -37,7 +37,9 @@ from controller.model_updater import (
     _remote_reconciliation_established,
     _pop_scan_updates,
     _sync_remote_scan_root_fingerprint_hints,
+    _ModelUpdateDurationSpan,
     _ModelUpdateStageTimer,
+    _ModelUpdateTimedModelLock,
     _MoveRetryRebuildGate,
     _filter_actionable_move_retry_ids,
     _request_model_rebuild,
@@ -50,6 +52,12 @@ from common.performance_diagnostics import (
     COUNTER_CANDIDATE_PAIR_FALLBACK,
     COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED,
     DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
+    DURATION_MODEL_UPDATE_FINALIZATION_FULL_ADOPTION,
+    DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF,
+    DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD,
+    DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT,
+    DURATION_MODEL_UPDATE_FINALIZATION_PAIR_ADOPTION,
+    DURATION_MODEL_UPDATE_FINALIZATION_PAIR_CANDIDATE_COMPOSITION,
     DURATION_MODEL_UPDATE_SCAN_INTAKE,
     DURATION_MODEL_UPDATE_STATE_PREPARATION,
     DURATION_MODEL_UPDATE_LOCK_HOLD,
@@ -766,6 +774,117 @@ class TestModelUpdater(unittest.TestCase):
             ("begin", DURATION_MODEL_UPDATE_BUILD_FINALIZATION),
             ("finish", DURATION_MODEL_UPDATE_BUILD_FINALIZATION),
         ], diagnostics.events)
+
+    def test_finalization_duration_spans_close_on_exception_inside_the_original_model_lock(self):
+        events = []
+
+        class Diagnostics:
+            def begin_duration(self, metric):
+                events.append(("begin", metric))
+                return (metric,)
+
+            def finish_duration(self, metric, token):
+                events.append(("finish", metric))
+
+        class Lock:
+            def __enter__(self):
+                events.append(("lock", "entered"))
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                events.append(("lock", "exited"))
+                return False
+
+        diagnostics = Diagnostics()
+        with self.assertRaisesRegex(RuntimeError, "expected"):
+            with _ModelUpdateTimedModelLock(Lock(), diagnostics):
+                with _ModelUpdateDurationSpan(
+                        diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF,
+                ):
+                    raise RuntimeError("expected")
+
+        self.assertEqual([
+            ("begin", DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT),
+            ("lock", "entered"),
+            ("finish", DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT),
+            ("begin", DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD),
+            ("begin", DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF),
+            ("finish", DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF),
+            ("finish", DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD),
+            ("lock", "exited"),
+        ], events)
+
+    def test_timed_model_lock_releases_when_diagnostic_setup_or_finish_raises(self):
+        class DiagnosticFailure(BaseException):
+            pass
+
+        for failure_phase in ("begin", "finish"):
+            events = []
+
+            class Diagnostics:
+                def begin_duration(self, metric):
+                    events.append(("begin", metric))
+                    if (
+                            failure_phase == "begin"
+                            and metric == DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD
+                    ):
+                        raise DiagnosticFailure("begin failure")
+                    return (metric,)
+
+                def finish_duration(self, metric, token):
+                    events.append(("finish", metric))
+                    if (
+                            failure_phase == "finish"
+                            and metric == DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD
+                    ):
+                        raise DiagnosticFailure("finish failure")
+
+            class Lock:
+                def __enter__(self):
+                    events.append(("lock", "entered"))
+                    return self
+
+                def __exit__(self, exc_type, exc_value, traceback):
+                    events.append(("lock", "exited"))
+                    return False
+
+            with self.assertRaises(DiagnosticFailure):
+                with _ModelUpdateTimedModelLock(Lock(), Diagnostics()):
+                    pass
+            self.assertEqual(1, events.count(("lock", "entered")))
+            self.assertEqual(1, events.count(("lock", "exited")))
+
+    def test_timed_model_lock_does_not_release_an_unentered_lock(self):
+        class LockFailure(BaseException):
+            pass
+
+        events = []
+
+        class Diagnostics:
+            def begin_duration(self, metric):
+                events.append(("begin", metric))
+                return (metric,)
+
+            def finish_duration(self, metric, token):
+                events.append(("finish", metric))
+
+        class Lock:
+            def __enter__(self):
+                events.append(("lock", "enter failed"))
+                raise LockFailure()
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                events.append(("lock", "exited"))
+                return False
+
+        with self.assertRaises(LockFailure):
+            with _ModelUpdateTimedModelLock(Lock(), Diagnostics()):
+                pass
+        self.assertEqual([
+            ("begin", DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT),
+            ("lock", "enter failed"),
+            ("finish", DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT),
+        ], events)
 
     def test_update_records_fixed_choice_and_scan_cardinalities_without_scan_identity_labels(self):
         remote = ScannerResult(
@@ -4672,10 +4791,18 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(frozenset({"pair-b"}), builder.unknown_local_path_pair_ids_snapshot())
         builder.build_model.assert_not_called()
         self.assertFalse(builder.has_changes())
-        counters = controller._Controller__context.performance_diagnostics.snapshot()["counters"]
+        diagnostics_snapshot = controller._Controller__context.performance_diagnostics.snapshot()
+        counters = diagnostics_snapshot["counters"]
         self.assertEqual(1, counters["model_update_choice_progressive"])
         self.assertEqual(0, counters["model_update_choice_active"])
         self.assertEqual(0, counters["model_update_choice_full"])
+        durations = diagnostics_snapshot["durations"]
+        self.assertEqual(1, durations[
+            DURATION_MODEL_UPDATE_FINALIZATION_PAIR_CANDIDATE_COMPOSITION
+        ]["count"])
+        self.assertEqual(1, durations[DURATION_MODEL_UPDATE_FINALIZATION_PAIR_ADOPTION]["count"])
+        self.assertNotIn(DURATION_MODEL_UPDATE_FINALIZATION_FULL_ADOPTION, durations)
+        self.assertEqual(1, durations[DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF]["count"])
 
     def test_targeted_progressive_final_clears_stale_inventory_when_roots_are_unchanged(self):
         """A selected pair completion publishes even when its roots match standing authority."""

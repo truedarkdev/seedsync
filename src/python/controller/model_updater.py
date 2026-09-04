@@ -49,6 +49,16 @@ from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE,
     DURATION_MODEL_UPDATE_LOCK_HOLD,
     DURATION_MODEL_UPDATE_LOCK_WAIT,
+    DURATION_MODEL_UPDATE_FINALIZATION_COMMAND_IDENTITY_REFRESH,
+    DURATION_MODEL_UPDATE_FINALIZATION_FULL_ADOPTION,
+    DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF,
+    DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
+    DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD,
+    DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT,
+    DURATION_MODEL_UPDATE_FINALIZATION_OVERLAY_CLEAR,
+    DURATION_MODEL_UPDATE_FINALIZATION_OVERLAY_REBASE,
+    DURATION_MODEL_UPDATE_FINALIZATION_PAIR_ADOPTION,
+    DURATION_MODEL_UPDATE_FINALIZATION_PAIR_CANDIDATE_COMPOSITION,
     DURATION_MODEL_UPDATE_SCAN_INTAKE,
     DURATION_MODEL_UPDATE_STATE_PREPARATION,
     DURATION_MODEL_UPDATE_STATUS_INGESTION,
@@ -1308,6 +1318,82 @@ class _ModelUpdateStageTimer:
             diagnostics.finish_duration(metric, started_at)
         except Exception:
             pass
+
+
+class _ModelUpdateDurationSpan:
+    """Best-effort fixed-name span for nested finalization attribution."""
+
+    def __init__(self, diagnostics: object | None, metric: str) -> None:
+        self.__diagnostics = diagnostics
+        self.__metric = metric
+        self.__started_at: object = None
+
+    def __enter__(self) -> "_ModelUpdateDurationSpan":
+        diagnostics = self.__diagnostics
+        if diagnostics is None:
+            return self
+        try:
+            self.__started_at = diagnostics.begin_duration(self.__metric)
+        except Exception:
+            self.__started_at = None
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        diagnostics = self.__diagnostics
+        started_at = self.__started_at
+        self.__started_at = None
+        if diagnostics is not None and started_at is not None:
+            try:
+                diagnostics.finish_duration(self.__metric, started_at)
+            except Exception:
+                pass
+        return False
+
+
+class _ModelUpdateTimedModelLock:
+    """Preserve an existing lock context while timing wait and hold."""
+
+    def __init__(self, model_lock: object, diagnostics: object | None) -> None:
+        self.__model_lock = model_lock
+        self.__diagnostics = diagnostics
+        self.__wait_span = _ModelUpdateDurationSpan(
+            diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT,
+        )
+        self.__hold_span = _ModelUpdateDurationSpan(
+            diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD,
+        )
+
+    def __enter__(self) -> object:
+        self.__wait_span.__enter__()
+        try:
+            entered = self.__model_lock.__enter__()
+        except BaseException as exc:
+            self.__wait_span.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        try:
+            self.__wait_span.__exit__(None, None, None)
+            self.__hold_span.__enter__()
+        except BaseException as exc:
+            # The original raw ``with model_lock`` releases a lock it has
+            # entered even when setup immediately after entry fails.  Keep
+            # that guarantee for diagnostic control-flow failures too.
+            self.__model_lock.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        return entered
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        # Finish while the original lock remains held.  The wrapped context
+        # still owns its normal release and exception-suppression semantics.
+        diagnostic_error: Optional[BaseException] = None
+        try:
+            self.__hold_span.__exit__(exc_type, exc_value, traceback)
+        except BaseException as error:
+            diagnostic_error = error
+        finally:
+            suppressed = bool(self.__model_lock.__exit__(exc_type, exc_value, traceback))
+        if diagnostic_error is not None:
+            raise diagnostic_error
+        return suppressed
 
 
 class _ProgressiveScanAccumulator:
@@ -6004,7 +6090,9 @@ class ModelUpdater(_ControllerCoreAccess):
 
             if pair_safe:
                 try:
-                    with controller._Controller__model_lock:
+                    with _ModelUpdateTimedModelLock(
+                            controller._Controller__model_lock, diagnostics,
+                    ):
                         def root_exists(file_id: str) -> bool:
                             try:
                                 model.get_file(file_id)
@@ -6028,10 +6116,13 @@ class ModelUpdater(_ControllerCoreAccess):
                             for file_id in previous_root_ids:
                                 next_tree_count -= tree_file_count(model.get_file(file_id))
                             next_tree_count += sum(tree_file_count(file) for file in selected_roots)
-                            authoritative_pair_candidate = Model.compose_candidate(
-                                model, previous_root_ids, selected_roots, max(0, next_tree_count),
-                                pair_build.model.downloaded_timestamp_overlay_generation,
-                            )
+                            with _ModelUpdateDurationSpan(
+                                    diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_PAIR_CANDIDATE_COMPOSITION,
+                            ):
+                                authoritative_pair_candidate = Model.compose_candidate(
+                                    model, previous_root_ids, selected_roots, max(0, next_tree_count),
+                                    pair_build.model.downloaded_timestamp_overlay_generation,
+                                )
                             authoritative_pair_build = pair_build
                 except Exception:
                     pair_safe = False
@@ -6725,7 +6816,10 @@ class ModelUpdater(_ControllerCoreAccess):
                 generation = getattr(new_model, "downloaded_timestamp_overlay_generation", None)
                 setter = getattr(model, "set_downloaded_timestamp_overlay_generation", None)
                 if type(generation) is int and generation >= 0 and callable(setter):
-                    setter(generation)
+                    with _ModelUpdateDurationSpan(
+                            diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_OVERLAY_REBASE,
+                    ):
+                        setter(generation)
 
             def apply_model_replacement(operation: Callable[[], object]) -> object:
                 """Use the Model's one progress-provenance publication boundary."""
@@ -6743,10 +6837,16 @@ class ModelUpdater(_ControllerCoreAccess):
                     # Every changed root has already crossed its authoritative
                     # replacement boundary.  Clearing now publishes that new
                     # base, rather than the old raw counters that preceded it.
-                    model.clear_active_progress_overlays()
+                    with _ModelUpdateDurationSpan(
+                            diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_OVERLAY_CLEAR,
+                    ):
+                        model.clear_active_progress_overlays()
                     deferred_rejected_overlay_clear = False
                     return
-                apply_model_replacement(lambda: model.clear_active_progress_overlays())
+                with _ModelUpdateDurationSpan(
+                        diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_OVERLAY_CLEAR,
+                ):
+                    apply_model_replacement(lambda: model.clear_active_progress_overlays())
 
             # A small set of completion side effects is applied directly to
             # the model objects from this build.  If those setters invalidate
@@ -6920,7 +7020,11 @@ class ModelUpdater(_ControllerCoreAccess):
             with _CandidateLifecycleFallback(
                     model_builder, authoritative_pair_build, pair_fallback_committer,
                     record_candidate_lifecycle_fallback,
-            ), controller._Controller__model_lock:
+            ), _ModelUpdateTimedModelLock(
+                    controller._Controller__model_lock, diagnostics,
+            ), _ModelUpdateDurationSpan(
+                    diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF,
+            ):
                 def pending_completion_file_ids():
                     return {
                         ModelFile.build_file_id(file_name, path_pair_id)
@@ -7819,16 +7923,19 @@ class ModelUpdater(_ControllerCoreAccess):
                         lifecycle_active_model_ids = active_model_ids.union(
                             self._rendered_descendant_file_ids(new_model)
                         )
-                    stale_move_failure_ids = {
-                        file_id for file_id in persist.move_failure_counts
-                        if file_id in self._safe_stale_marker_ids(
-                            set(persist.move_failure_counts),
-                            active_model_ids,
-                            active_model_names,
-                            pending_ids,
-                            enabled_path_pair_ids,
-                        )
-                    }
+                    with _ModelUpdateDurationSpan(
+                            diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
+                    ):
+                        stale_move_failure_ids = {
+                            file_id for file_id in persist.move_failure_counts
+                            if file_id in self._safe_stale_marker_ids(
+                                set(persist.move_failure_counts),
+                                active_model_ids,
+                                active_model_names,
+                                pending_ids,
+                                enabled_path_pair_ids,
+                            )
+                        }
                     if stale_move_failure_ids:
                         for file_id in stale_move_failure_ids:
                             persist.move_failure_counts.pop(file_id, None)
@@ -7843,13 +7950,16 @@ class ModelUpdater(_ControllerCoreAccess):
                             file_id for file_id, failures in persist.move_failure_counts.items()
                             if failures >= controller._Controller__MAX_MOVE_FAILURES
                         })
-                    remove_downloaded_file_names = self._safe_stale_marker_ids(
-                        set(persist.downloaded_file_names),
-                        lifecycle_active_model_ids,
-                        active_model_names,
-                        pending_ids,
-                        enabled_path_pair_ids,
-                    )
+                    with _ModelUpdateDurationSpan(
+                            diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
+                    ):
+                        remove_downloaded_file_names = self._safe_stale_marker_ids(
+                            set(persist.downloaded_file_names),
+                            lifecycle_active_model_ids,
+                            active_model_names,
+                            pending_ids,
+                            enabled_path_pair_ids,
+                        )
                     if remove_downloaded_file_names:
                         controller.logger.info("Removing from downloaded list: {}".format(remove_downloaded_file_names))
                         persist.downloaded_file_names.difference_update(remove_downloaded_file_names)
@@ -7876,13 +7986,16 @@ class ModelUpdater(_ControllerCoreAccess):
                         })
 
                     downloaded_timestamps = getattr(persist, "downloaded_timestamps", {})
-                    stale_downloaded_timestamp_ids = self._safe_stale_marker_ids(
-                        set(downloaded_timestamps),
-                        lifecycle_active_model_ids,
-                        active_model_names,
-                        pending_ids,
-                        enabled_path_pair_ids,
-                    )
+                    with _ModelUpdateDurationSpan(
+                            diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
+                    ):
+                        stale_downloaded_timestamp_ids = self._safe_stale_marker_ids(
+                            set(downloaded_timestamps),
+                            lifecycle_active_model_ids,
+                            active_model_names,
+                            pending_ids,
+                            enabled_path_pair_ids,
+                        )
                     if stale_downloaded_timestamp_ids:
                         for file_id in stale_downloaded_timestamp_ids:
                             downloaded_timestamps.pop(file_id, None)
@@ -7892,13 +8005,16 @@ class ModelUpdater(_ControllerCoreAccess):
                             if self._normalize_scoped_persist_key(file_id, enabled_path_pair_ids) == file_id
                         })
 
-                    stale_extracted_file_names = self._safe_stale_marker_ids(
-                        set(persist.extracted_file_names),
-                        active_model_ids,
-                        active_model_names,
-                        pending_ids,
-                        enabled_path_pair_ids,
-                    )
+                    with _ModelUpdateDurationSpan(
+                            diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
+                    ):
+                        stale_extracted_file_names = self._safe_stale_marker_ids(
+                            set(persist.extracted_file_names),
+                            active_model_ids,
+                            active_model_names,
+                            pending_ids,
+                            enabled_path_pair_ids,
+                        )
                     if stale_extracted_file_names:
                         controller.logger.info(
                             "Removing stale extracted markers: %s",
@@ -7907,13 +8023,16 @@ class ModelUpdater(_ControllerCoreAccess):
                         persist.extracted_file_names.difference_update(stale_extracted_file_names)
                         model_builder.set_extracted_files(persist.extracted_file_names)
 
-                    stale_final_move_succeeded_file_names = self._safe_stale_marker_ids(
-                        set(persist.final_move_succeeded_file_names),
-                        lifecycle_active_model_ids,
-                        active_model_names,
-                        pending_ids,
-                        enabled_path_pair_ids,
-                    )
+                    with _ModelUpdateDurationSpan(
+                            diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
+                    ):
+                        stale_final_move_succeeded_file_names = self._safe_stale_marker_ids(
+                            set(persist.final_move_succeeded_file_names),
+                            lifecycle_active_model_ids,
+                            active_model_names,
+                            pending_ids,
+                            enabled_path_pair_ids,
+                        )
                     if stale_final_move_succeeded_file_names:
                         controller.logger.info(
                             "Removing stale final-move markers: %s",
@@ -7944,7 +8063,11 @@ class ModelUpdater(_ControllerCoreAccess):
                     with _CandidateLifecycleFallback(
                             model_builder, authoritative_pair_build, pair_fallback_committer,
                             record_candidate_lifecycle_fallback,
-                    ), controller._Controller__model_lock:
+                    ), _ModelUpdateTimedModelLock(
+                            controller._Controller__model_lock, diagnostics,
+                    ), _ModelUpdateDurationSpan(
+                            diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_PAIR_ADOPTION,
+                    ):
                         clear_overlays_for_replacement()
                         controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
                         pair_adopter(
@@ -7959,7 +8082,11 @@ class ModelUpdater(_ControllerCoreAccess):
                             controller, "_refresh_model_file_command_identities_locked", None
                         )
                         if callable(refresh_identities):
-                            refresh_identities()
+                            with _ModelUpdateDurationSpan(
+                                    diagnostics,
+                                    DURATION_MODEL_UPDATE_FINALIZATION_COMMAND_IDENTITY_REFRESH,
+                            ):
+                                refresh_identities()
                 except Exception:
                     retire_deferred_rejected_overlay()
                     raise
@@ -8016,7 +8143,11 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp
         if global_full_build_triggered:
             try:
-                with controller._Controller__model_lock:
+                with _ModelUpdateTimedModelLock(
+                        controller._Controller__model_lock, diagnostics,
+                ), _ModelUpdateDurationSpan(
+                        diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_FULL_ADOPTION,
+                ):
                     clear_overlays_for_replacement()
                     controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
                     model_builder.adopt_applied_model(
@@ -8029,7 +8160,11 @@ class ModelUpdater(_ControllerCoreAccess):
                         controller, "_refresh_model_file_command_identities_locked", None
                     )
                     if callable(refresh_identities):
-                        refresh_identities()
+                        with _ModelUpdateDurationSpan(
+                                diagnostics,
+                                DURATION_MODEL_UPDATE_FINALIZATION_COMMAND_IDENTITY_REFRESH,
+                        ):
+                            refresh_identities()
             except Exception:
                 retire_deferred_rejected_overlay()
                 raise

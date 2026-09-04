@@ -34,6 +34,16 @@ from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE,
     DURATION_MODEL_UPDATE_LOCK_HOLD,
     DURATION_MODEL_UPDATE_LOCK_WAIT,
+    DURATION_MODEL_UPDATE_FINALIZATION_COMMAND_IDENTITY_REFRESH,
+    DURATION_MODEL_UPDATE_FINALIZATION_FULL_ADOPTION,
+    DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF,
+    DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
+    DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD,
+    DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT,
+    DURATION_MODEL_UPDATE_FINALIZATION_OVERLAY_CLEAR,
+    DURATION_MODEL_UPDATE_FINALIZATION_OVERLAY_REBASE,
+    DURATION_MODEL_UPDATE_FINALIZATION_PAIR_ADOPTION,
+    DURATION_MODEL_UPDATE_FINALIZATION_PAIR_CANDIDATE_COMPOSITION,
     DURATION_MODEL_SUMMARY_SERIALIZATION,
     DURATION_MODEL_SCOPED_SERIALIZATION,
     DURATION_MODEL_SUMMARY_SSE_EMISSION,
@@ -74,6 +84,16 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
         collector = PerformanceDiagnosticsCollector(lambda: enabled[0])
         for metric in (
             DURATION_MODEL_UPDATE_LOCK_HOLD,
+            DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT,
+            DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD,
+            DURATION_MODEL_UPDATE_FINALIZATION_PAIR_CANDIDATE_COMPOSITION,
+            DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF,
+            DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
+            DURATION_MODEL_UPDATE_FINALIZATION_OVERLAY_CLEAR,
+            DURATION_MODEL_UPDATE_FINALIZATION_OVERLAY_REBASE,
+            DURATION_MODEL_UPDATE_FINALIZATION_PAIR_ADOPTION,
+            DURATION_MODEL_UPDATE_FINALIZATION_FULL_ADOPTION,
+            DURATION_MODEL_UPDATE_FINALIZATION_COMMAND_IDENTITY_REFRESH,
             DURATION_MODEL_SUMMARY_SERIALIZATION,
             DURATION_MODEL_SCOPED_SERIALIZATION,
             DURATION_MODEL_SUMMARY_SSE_EMISSION,
@@ -85,8 +105,8 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
         self.assertEqual(0, collector.snapshot()["counters"]["model_update_choice_full"])
 
         enabled[0] = True
-        started = collector.begin_duration(DURATION_MODEL_UPDATE_LOCK_HOLD)
-        collector.finish_duration(DURATION_MODEL_UPDATE_LOCK_HOLD, started)
+        started = collector.begin_duration(DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF)
+        collector.finish_duration(DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF, started)
         collector.increment("model_update_choice_full")
         collector.increment("active_transfer_delta_publications")
         collector.increment("active_transfer_delta_root_visits", 2)
@@ -97,7 +117,7 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
             "untrusted_label_/private/path": 9,
         })
         snapshot = collector.snapshot()
-        self.assertEqual(1, snapshot["durations"][DURATION_MODEL_UPDATE_LOCK_HOLD]["count"])
+        self.assertEqual(1, snapshot["durations"][DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF]["count"])
         self.assertEqual(1, snapshot["counters"]["model_update_choice_full"])
         self.assertEqual(1, snapshot["counters"]["active_transfer_delta_publications"])
         self.assertEqual(2, snapshot["counters"]["active_transfer_delta_root_visits"])
