@@ -68,6 +68,9 @@ class QueueGate:
     target_pair_name: str
     target_root_id: str
     target_root_name: str
+    expected_pair_local_path: str | None = None
+    expected_root_relative_path: str | None = None
+    require_pending_transfer: bool = False
     passed: bool = False
 
     def preflight(self, get: Callable[[str], object]) -> Mapping[str, object]:
@@ -77,6 +80,8 @@ class QueueGate:
         pair = next((item for item in pairs if item.get("id") == self.target_pair_id), None)
         if pair is None or pair.get("name") != self.target_pair_name or pair.get("auto_queue") is not False:
             raise ObserverSchemaError("target pair is not isolated")
+        if self.expected_pair_local_path is not None and pair.get("local_path") != self.expected_pair_local_path:
+            raise ObserverSchemaError("target pair local path changed")
         if any(item.get("auto_queue") is True for item in pairs):
             raise ObserverSchemaError("a competing pair has AutoQueue enabled")
         if autoqueue_enabled(get("/server/config/get")):
@@ -85,6 +90,20 @@ class QueueGate:
         root = next((item for item in roots if str(item.get("file_id")) == self.target_root_id), None)
         if root is None or root.get("name") != self.target_root_name:
             raise ObserverSchemaError("target root identity changed")
+        if self.expected_root_relative_path is not None and root.get("full_path") != self.expected_root_relative_path:
+            raise ObserverSchemaError("target root relative path changed")
+        if self.require_pending_transfer:
+            expected_flags = {
+                "remote_present": True,
+                "remote_has_transferable_content": True,
+                "local_present": True,
+                "complete_local_coverage": False,
+                "final_move_succeeded": False,
+                "explicitly_stopped": False,
+            }
+            for field_name, expected_value in expected_flags.items():
+                if root.get(field_name) is not expected_value:
+                    raise ObserverSchemaError("target lifecycle is not queue-ready: {}".format(field_name))
         status = controller_status(get("/server/status"))
         # Enforce that every emitted dry-run observation is JSON-safe before enabling Queue.
         evidence = {"pair_id": self.target_pair_id, "root_found": True,

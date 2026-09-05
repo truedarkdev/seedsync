@@ -45,3 +45,36 @@ def test_wrong_path_pair_envelope_blocks_queue_and_serializes_no_sink():
         gate.queue(sent.append)
     assert sent == []
     assert observer.error_artifact(observer.ObserverSchemaError("x"))["schema"] == "incoming-recovery-observer-error.v1"
+
+
+def test_pending_transfer_gate_requires_exact_local_paths_and_safe_lifecycle_before_queue():
+    gate = observer.QueueGate(
+        PAIR, "Pr0n", ROOT, "Incoming",
+        expected_pair_local_path="/mounts/pr0n", expected_root_relative_path="Incoming",
+        require_pending_transfer=True,
+    )
+    ready = responses()
+    ready["/server/path-pairs"]["data"][0]["local_path"] = "/mounts/pr0n"
+    ready["/server/model/v1/pairs/pair-1/roots?limit=200"]["records"][0].update({
+        "full_path": "Incoming",
+        "remote_present": True,
+        "remote_has_transferable_content": True,
+        "local_present": True,
+        "complete_local_coverage": False,
+        "final_move_succeeded": False,
+        "explicitly_stopped": False,
+    })
+    gate.preflight(lambda path: ready[path])
+
+    blocked = observer.QueueGate(
+        PAIR, "Pr0n", ROOT, "Incoming",
+        expected_pair_local_path="/mounts/pr0n", expected_root_relative_path="Incoming",
+        require_pending_transfer=True,
+    )
+    ready["/server/model/v1/pairs/pair-1/roots?limit=200"]["records"][0]["complete_local_coverage"] = True
+    with pytest.raises(observer.ObserverSchemaError, match="complete_local_coverage"):
+        blocked.preflight(lambda path: ready[path])
+    sent = []
+    with pytest.raises(observer.ObserverSchemaError, match="blocked"):
+        blocked.queue(sent.append)
+    assert sent == []
