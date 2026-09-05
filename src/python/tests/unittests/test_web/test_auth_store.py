@@ -166,7 +166,7 @@ class TestApiKeyStore(unittest.TestCase):
             tamper_cases.append(lambda: self._tamper_recovery_deadline(deadline_path))
             tamper_cases.append(lambda: self._tamper_recovery_history(history_path, recovery_version))
             tamper_cases.append(lambda: self._tamper_recovery_key(store_path, recovery["record"].id))
-            tamper_cases.append(lambda: self._tamper_recovery_session(store_path, recovery["record"].id))
+            tamper_cases.append(lambda: self._tamper_remaining_session_binding(store_path))
             tamper_cases.append(lambda: self._tamper_migration_marker(marker_path))
             for tamper in tamper_cases:
                 restore_baseline()
@@ -243,16 +243,17 @@ class TestApiKeyStore(unittest.TestCase):
         for record in payload["api_keys"]:
             if record["id"] == recovery_key_id:
                 record["revoked_at"] = "2026-09-05T00:00:00+00:00"
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-
-    @staticmethod
-    def _tamper_recovery_session(path, recovery_key_id):
-        payload = json.loads(open(path, encoding="utf-8").read())
         payload["ui_sessions"] = [
             session for session in payload["ui_sessions"]
             if session.get("api_key_id") != recovery_key_id
         ]
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    @staticmethod
+    def _tamper_remaining_session_binding(path):
+        payload = json.loads(open(path, encoding="utf-8").read())
+        payload["ui_sessions"][0]["api_key_secret_hash"] = "not-an-active-key-hash"
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
 
