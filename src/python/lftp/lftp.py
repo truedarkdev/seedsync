@@ -30,8 +30,10 @@ from .job_status_parser import LftpJobStatus, LftpJobStatusParser, LftpJobStatus
 MAX_CONSECUTIVE_STATUS_ERRORS = 10
 MAX_KILL_MATCH_ATTEMPTS = 20
 STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS = 1.0
+STATUS_POLL_TERMINAL_DRAIN_MAX_BYTES = 256 * 1024
+STATUS_POLL_TERMINAL_DRAIN_READ_BYTES = 64 * 1024
 LFTP_STATUS_POLL_FAILURE_REASONS = frozenset({
-    "timeout", "eof", "command_error", "parser_error", "unhealthy_snapshot",
+    "timeout", "eof", "command_error", "parser_error", "terminal_backlog", "unhealthy_snapshot",
 })
 LFTP_SIDECAR_TRACE_CATEGORY = "lftp.sidecar"
 LFTP_SIDECAR_TRACE_SCHEMA = "lftp.sidecar.v1"
@@ -57,10 +59,11 @@ _PRIVATE_STATUS_FRAME_CAPTURE_MAX_BYTES = 64 * 1024
 LFTP_STATUS_POLL_TRACE_SCHEMA = "lftp.status_poll.v1"
 LFTP_STATUS_POLL_TRACE_PHASES = frozenset({
     "submitted", "jobs_read", "prompt_ready", "prompt_timeout", "process_eof", "command_error",
-    "backend_error", "parse_started", "parse_complete", "parse_error", "health",
+    "backend_error", "terminal_backlog", "parse_started", "parse_complete", "parse_error", "health",
 })
 LFTP_STATUS_POLL_TRACE_FAILURE_PHASES = frozenset({
     "prompt_timeout", "process_eof", "command_error", "backend_error", "parse_error",
+    "terminal_backlog",
 })
 redact_credentials = redact_sensitive_text
 _P = ParamSpec("_P")
@@ -561,6 +564,7 @@ def _record_lftp_status_poll_breadcrumb(
             "process_eof": "prompt",
             "command_error": "prompt",
             "backend_error": "read",
+            "terminal_backlog": "read",
             "parse_started": "parse",
             "parse_complete": "parse",
             "parse_error": "parse",
@@ -1016,6 +1020,96 @@ class Lftp:
             self.logger.error("Lftp process died unexpectedly (EOF) before {}".format(context))
             raise LftpError("Lftp process terminated before {}: {}".format(context, out))
 
+    def __drain_status_poll_terminal(self) -> Optional[str]:
+        """Discard stale PTY output before one authoritative status command.
+
+        The single LFTP executor is the only reader.  A background mirror can
+        otherwise fill its terminal between polls; pexpect then searches a
+        retained prompt before it reads output produced by the new ``jobs -v``.
+        Drain only from the existing owner, with a fixed per-poll cap.  A cap
+        result is intentionally unhealthy and sends no command; the next
+        scheduled poll resumes draining the same terminal rather than spinning.
+        """
+        process = self.__process
+        remaining = STATUS_POLL_TERMINAL_DRAIN_MAX_BYTES
+        evidence_tail = ""
+        saw_backend_error = False
+        saw_host_key_prompt = False
+
+        def observe(value: object) -> None:
+            nonlocal evidence_tail, saw_backend_error, saw_host_key_prompt
+            if not isinstance(value, (str, bytes)):
+                return
+            text = self.__decode_spawn_output(value)
+            # Detect first so a known marker at the head of a large chunk is
+            # not hidden by the bounded cross-chunk tail retained below.
+            combined = evidence_tail + text
+            saw_host_key_prompt = saw_host_key_prompt or self.__detect_ssh_host_key_prompt(combined)
+            saw_backend_error = saw_backend_error or self.__detect_errors_from_output(combined)
+            # Keep only enough private in-memory context to recognize an
+            # existing error across a chunk boundary.  Never log this output.
+            evidence_tail = combined[-1024:]
+
+        def terminal_error() -> Optional[str]:
+            if saw_host_key_prompt:
+                self.__pending_error = "Lftp status terminal reported a backend error"
+                return "command_error"
+            if saw_backend_error:
+                # Keep the established redacted pending-error contract even
+                # though this boundary intentionally discards the raw frame.
+                self.logger.error("Lftp status terminal reported a backend error")
+                self.__pending_error = "Lftp status terminal reported a backend error"
+                return "command_error"
+            return None
+
+        def replace_retained(value: Union[str, bytes]) -> None:
+            """Keep pexpect's public and private retained input state aligned."""
+            buffer_type = self.__process.buffer_type
+            buffer = buffer_type()
+            buffer.write(value)
+            self.__process._buffer = buffer
+            before = buffer_type()
+            before.write(value)
+            self.__process._before = before
+
+        # ``expect`` searches its retained buffer before it reads the PTY.
+        # Preserve ``before``: a prior timed status poll deliberately keeps a
+        # partial Connecting/error response there for the existing recovery
+        # path.  A matched prompt is retained in ``after`` and trailing output
+        # in ``buffer``, so drain only that stale boundary plus the PTY fd.
+        retained = getattr(process, "_buffer", None)
+        buffered = retained.getvalue() if hasattr(retained, "getvalue") else ""
+        if isinstance(buffered, (str, bytes)):
+            consumed = buffered[:remaining]
+            observe(consumed)
+            remaining -= len(consumed)
+            replace_retained(buffered[len(consumed):])
+        else:
+            replace_retained(process.buffer_type().getvalue())
+        process.after = None
+        if terminal_error() is not None:
+            return "command_error"
+        if remaining <= 0:
+            return "terminal_backlog"
+
+        while remaining > 0:
+            try:
+                chunk = process.read_nonblocking(
+                    size=min(STATUS_POLL_TERMINAL_DRAIN_READ_BYTES, remaining), timeout=0,
+                )
+            except pexpect.exceptions.TIMEOUT:
+                return terminal_error()
+            except pexpect.exceptions.EOF:
+                return "eof"
+            if not isinstance(chunk, (str, bytes)) or not chunk:
+                return terminal_error()
+            observe(chunk)
+            remaining -= len(chunk)
+            error = terminal_error()
+            if error is not None:
+                return error
+        return "terminal_backlog"
+
     @with_check_process
     def __run_command(self,
                       command: str,
@@ -1102,6 +1196,24 @@ class Lftp:
             if require_prompt_ready:
                 self.__ensure_prompt_ready("running command")
                 pty_readiness = "ready"
+            if status_poll:
+                terminal_failure = self.__drain_status_poll_terminal()
+                if terminal_failure is not None:
+                    self.__last_command_timed_out = True
+                    self.__last_status_poll_failure_reason = terminal_failure
+                    record_status_trace(
+                        "terminal_backlog" if terminal_failure == "terminal_backlog" else
+                        ("process_eof" if terminal_failure == "eof" else "command_error"),
+                        failure_reason=terminal_failure,
+                        boundary="read",
+                        boundary_state={
+                            "prior_prompt": pty_readiness,
+                            "send_admitted": False,
+                            "prompt_reached": "unknown",
+                            "retained_before": "unknown",
+                        },
+                    )
+                    return ""
             if pty_debug_enabled:
                 record_pty_trace("pre_write")
             if log_command_output:

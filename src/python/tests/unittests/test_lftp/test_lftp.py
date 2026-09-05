@@ -4,24 +4,30 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
+import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import stat
 from pathlib import Path
 from unittest.mock import MagicMock
 from unittest.mock import call
 from unittest.mock import patch
+from io import StringIO
 
 import pexpect
 import pytest
+from pexpect.expect import Expecter, searcher_re
 
 from tests.utils import TestUtils, requires_live_ssh
 from common import ConfigError
 from common.breadcrumb_trace import BreadcrumbTraceCollector
 from common.exclude_patterns import ExactPathExclusion
+from common.lftp_status import MAX_LFTP_PGET_STATUS_BYTES, parse_lftp_pget_status_bytes
 from lftp import Lftp, LftpJobStatus, LftpError, LftpJobStatusParser, LftpJobStatusParserError
 from lftp.lftp import _lftp_diagnostic_exception_family
 import lftp.lftp as lftp_mod
@@ -155,13 +161,105 @@ class TestLftp(unittest.TestCase):
         process.isalive.return_value = True
         process.before = b""
         process.after = b"prompt>"
+        process.buffer_type = StringIO
+        process._buffer = StringIO()
+        process._before = StringIO()
+        process.searchwindowsize = None
         process.delaybeforesend = 7
         process.delayafterread = 11
         process.expect.return_value = None
+        process.read_nonblocking.side_effect = pexpect.exceptions.TIMEOUT("empty terminal")
         if send_side_effect is not None:
             process.send.side_effect = send_side_effect
         lftp._Lftp__process = process
         return lftp
+
+    def test_status_poll_discards_stale_terminal_prompt_before_sending(self):
+        lftp = self._build_status_poll_test_lftp()
+        process = lftp._Lftp__process
+        process._buffer.write("stale prompt>")
+        process._before.write("stale prompt>")
+        process.before = ""
+        process.read_nonblocking.side_effect = ["background progress", pexpect.exceptions.TIMEOUT("empty")]
+
+        def assert_fresh_boundary(command):
+            self.assertEqual("", process._buffer.getvalue())
+            self.assertEqual("", process._before.getvalue())
+            self.assertIsNone(process.after)
+            self.assertEqual("jobs -v\n", command)
+
+        process.send.side_effect = assert_fresh_boundary
+
+        self.assertEqual([], lftp.status())
+
+        process.send.assert_called_once_with("jobs -v\n")
+        self.assertTrue(lftp.last_status_poll_healthy)
+        self.assertIsNone(lftp.last_status_poll_failure_reason)
+
+        # Pexpect 4.9 repopulates _buffer from _before before searching.  The
+        # drain must leave both empty, or the stale prompt reappears here.
+        expecter = Expecter(process, searcher_re([re.compile("stale prompt>")]))
+        self.assertIsNone(expecter.existing_data())
+
+    def test_status_poll_terminal_backlog_is_unhealthy_and_does_not_send(self):
+        lftp = self._build_status_poll_test_lftp()
+        process = lftp._Lftp__process
+        process._buffer.write("x" * (lftp_mod.STATUS_POLL_TERMINAL_DRAIN_MAX_BYTES + 1))
+        process._before.write("x" * (lftp_mod.STATUS_POLL_TERMINAL_DRAIN_MAX_BYTES + 1))
+
+        self.assertEqual([], lftp.status())
+
+        process.send.assert_not_called()
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("terminal_backlog", lftp.last_status_poll_failure_reason)
+        self.assertEqual(1, len(process._buffer.getvalue()))
+        self.assertEqual(1, len(process._before.getvalue()))
+
+        self.assertEqual([], lftp.status())
+        process.send.assert_called_once_with("jobs -v\n")
+        self.assertTrue(lftp.last_status_poll_healthy)
+
+    def test_status_poll_terminal_backend_error_is_visible_without_sending(self):
+        lftp = self._build_status_poll_test_lftp()
+        process = lftp._Lftp__process
+        process._buffer.write("Login failed:" + "x" * (lftp_mod.STATUS_POLL_TERMINAL_DRAIN_READ_BYTES + 1))
+        process._before.write("Login failed:" + "x" * (lftp_mod.STATUS_POLL_TERMINAL_DRAIN_READ_BYTES + 1))
+
+        self.assertEqual([], lftp.status())
+
+        process.send.assert_not_called()
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("command_error", lftp.last_status_poll_failure_reason)
+        self.assertEqual("Lftp status terminal reported a backend error", lftp._Lftp__pending_error)
+        lftp.logger.error.assert_called_once_with("Lftp status terminal reported a backend error")
+        with self.assertRaisesRegex(LftpError, "Lftp status terminal reported a backend error"):
+            lftp.raise_pending_error()
+
+    def test_status_poll_terminal_host_key_error_spanning_chunks_does_not_send(self):
+        lftp = self._build_status_poll_test_lftp()
+        process = lftp._Lftp__process
+        process.read_nonblocking.side_effect = [
+            "The authenticity of ",
+            "host example cannot be established" + "x" * (lftp_mod.STATUS_POLL_TERMINAL_DRAIN_READ_BYTES + 1),
+        ]
+
+        self.assertEqual([], lftp.status())
+
+        process.send.assert_not_called()
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("command_error", lftp.last_status_poll_failure_reason)
+        self.assertEqual("Lftp status terminal reported a backend error", lftp._Lftp__pending_error)
+
+    def test_status_poll_terminal_eof_is_unhealthy_without_sending(self):
+        lftp = self._build_status_poll_test_lftp()
+        process = lftp._Lftp__process
+        process.read_nonblocking.side_effect = pexpect.exceptions.EOF("closed")
+
+        self.assertEqual([], lftp.status())
+
+        process.send.assert_not_called()
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("eof", lftp.last_status_poll_failure_reason)
 
     def test_queue_uses_override_paths(self):
         lftp = self._build_test_lftp()
@@ -1908,6 +2006,11 @@ class TestLftp(unittest.TestCase):
             "test_status_marks_poll_unhealthy_when_jobs_command_echo_interleaves_with_progress",
             "test_status_marks_poll_unhealthy_when_jobs_command_raises_exception_pexpect",
             "test_status_marks_poll_unhealthy_when_jobs_command_raises_oserror",
+            "test_status_poll_discards_stale_terminal_prompt_before_sending",
+            "test_status_poll_terminal_backlog_is_unhealthy_and_does_not_send",
+            "test_status_poll_terminal_backend_error_is_visible_without_sending",
+            "test_status_poll_terminal_host_key_error_spanning_chunks_does_not_send",
+            "test_status_poll_terminal_eof_is_unhealthy_without_sending",
             "test_status_logs_bounded_summary_when_verbose",
             "test_status_uses_short_timeout_budget_for_jobs_command",
             "test_run_command_logs_verbose_output_when_not_status_poll",
@@ -2179,6 +2282,215 @@ class TestLftp(unittest.TestCase):
         self.assertEqual("a", statuses[0].name)
         self.assertEqual(LftpJobStatus.Type.MIRROR, statuses[0].type)
         self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
+
+    @requires_live_ssh
+    @pytest.mark.timeout(30)
+    def test_status_poll_terminal_drain_keeps_419_exclusion_sftp_mirror_progressing(self):
+        """Exercise the status-owner drain against the real local SFTP fixture.
+
+        This deliberately has no reader outside ``Lftp``.  It samples queued
+        PTY and SFTP response pipes without consuming them, then proves that
+        authoritative ``jobs -v`` parsing and canonical local bytes continue
+        advancing across the scheduled polls.
+        """
+        if not os.path.isdir("/proc"):
+            self.skipTest("requires Linux /proc pipe inspection")
+        try:
+            import fcntl
+            import termios
+        except ImportError:
+            self.skipTest("requires POSIX FIONREAD support")
+
+        target_name = "terminal-drain-419"
+        remote_target = os.path.join(self.remote_dir, target_name)
+        os.mkdir(remote_target)
+        payload = b"terminal-drain-fixture" * 4096
+        for index in range(4):
+            with open(os.path.join(remote_target, "payload-{:02d}.bin".format(index)), "wb") as handle:
+                # Keep physical coverage active after the first long jobs-v
+                # header, rather than allowing admission to finish the whole
+                # fixture before the scheduled status window begins.
+                for _ in range(384):
+                    handle.write(payload)
+
+        # Match the production-shaped 4/4/16 connection contract.  Exact
+        # neutral leaf exclusions make ``jobs -v`` render the long header
+        # without exposing any real names in the test evidence.
+        self.lftp.num_parallel_files = 4
+        self.lftp.num_connections_per_root_file = 4
+        self.lftp.num_connections_per_dir_file = 4
+        self.lftp.num_max_total_connections = 16
+        self.lftp.rate_limit = "512K"
+        self.lftp.set_verbose_logging(False)
+        exclusions = [
+            ExactPathExclusion("trusted-final-{:03d}-{}".format(index, "x" * 64))
+            for index in range(419)
+        ]
+
+        original_run_command = self.lftp._Lftp__run_command
+        commands = []
+
+        def record_command(command, *args, **kwargs):
+            commands.append((command, bool(kwargs.get("status_poll"))))
+            return original_run_command(command, *args, **kwargs)
+
+        self.lftp._Lftp__run_command = record_command
+        self.addCleanup(setattr, self.lftp, "_Lftp__run_command", original_run_command)
+
+        def fionread_fd(fd):
+            value = bytearray(struct.calcsize("I"))
+            fcntl.ioctl(fd, termios.FIONREAD, value, True)
+            return struct.unpack("I", value)[0]
+
+        def descendant_ssh_pids(parent_pid):
+            pending = [parent_pid]
+            descendants = []
+            while pending:
+                current = pending.pop()
+                for entry in os.scandir("/proc"):
+                    if not entry.name.isdecimal():
+                        continue
+                    try:
+                        with open(os.path.join(entry.path, "status"), encoding="utf-8") as status_file:
+                            fields = dict(
+                                line.split(":", 1) for line in status_file if ":" in line
+                            )
+                        if int(fields.get("PPid", "-1").strip()) != current:
+                            continue
+                        pending.append(int(entry.name))
+                        with open(os.path.join(entry.path, "comm"), encoding="utf-8") as comm_file:
+                            if comm_file.read().strip() == "ssh":
+                                descendants.append(int(entry.name))
+                    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+                        continue
+            return descendants
+
+        def linked_pipe_bytes(lftp_pid):
+            try:
+                ssh_pids = descendant_ssh_pids(lftp_pid)
+                ssh_pipes = {
+                    os.readlink(os.path.join("/proc", str(pid), "fd", fd))
+                    for pid in ssh_pids for fd in os.listdir(os.path.join("/proc", str(pid), "fd"))
+                    if os.path.islink(os.path.join("/proc", str(pid), "fd", fd))
+                    and os.readlink(os.path.join("/proc", str(pid), "fd", fd)).startswith("pipe:[")
+                }
+                values = []
+                for fd_name in os.listdir(os.path.join("/proc", str(lftp_pid), "fd")):
+                    fd_path = os.path.join("/proc", str(lftp_pid), "fd", fd_name)
+                    if os.readlink(fd_path) not in ssh_pipes:
+                        continue
+                    descriptor = None
+                    try:
+                        descriptor = os.open(fd_path, os.O_RDONLY | os.O_NONBLOCK)
+                        values.append(fionread_fd(descriptor))
+                    except OSError:
+                        continue
+                    finally:
+                        if descriptor is not None:
+                            os.close(descriptor)
+                return tuple(values), len(ssh_pids)
+            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+                return (), 0
+
+        def canonical_local_bytes():
+            """Return pget coverage plus allocated payload/sidecar bytes.
+
+            LFTP may preallocate a sparse MIRROR target before its contents
+            arrive.  A valid pget sidecar is the authoritative coverage
+            signal; file allocation remains a structural secondary value.
+            """
+            root = os.path.join(self.local_dir, target_name)
+            allocated_payload = 0
+            allocated_sidecars = 0
+            sidecar_coverage = 0
+            for directory, _subdirs, names in os.walk(root):
+                for name in names:
+                    path = os.path.join(directory, name)
+                    allocated_bytes = os.stat(path).st_blocks * 512
+                    if name.endswith(".lftp-pget-status"):
+                        allocated_sidecars += allocated_bytes
+                        with open(path, "rb") as handle:
+                            parsed = parse_lftp_pget_status_bytes(
+                                handle.read(MAX_LFTP_PGET_STATUS_BYTES + 1)
+                            )
+                        self.assertIsNotNone(parsed)
+                        sidecar_coverage += parsed.covered_size
+                    else:
+                        allocated_payload += allocated_bytes
+            return sidecar_coverage, allocated_payload, allocated_sidecars
+
+        self.lftp.queue(target_name, True, exclude_patterns=exclusions)
+        mirror_commands = [command for command, status_poll in commands if not status_poll]
+        self.assertEqual(1, len(mirror_commands))
+        self.assertEqual(419, mirror_commands[0].count("--exclude "))
+
+        process = self.lftp._Lftp__process
+        samples = []
+        deadline = time.monotonic() + 18
+        while time.monotonic() < deadline and len(samples) < 6:
+            pty_before = fionread_fd(process.child_fd)
+            pipe_before, ssh_count = linked_pipe_bytes(process.pid)
+            statuses = self.lftp.status()
+            covered_bytes, allocated_payload, sidecar_bytes = canonical_local_bytes()
+            pty_after = fionread_fd(process.child_fd)
+            pipe_after, _ = linked_pipe_bytes(process.pid)
+            samples.append({
+                "covered": covered_bytes,
+                "allocated_payload": allocated_payload,
+                "sidecars": sidecar_bytes,
+                "pty_before": pty_before,
+                "pty_after": pty_after,
+                "pipe_before": pipe_before,
+                "pipe_after": pipe_after,
+                "ssh": ssh_count,
+                "healthy": self.lftp._Lftp__last_status_poll_healthy,
+                "membership": len(statuses or []),
+            })
+            time.sleep(0.9)
+
+        self.assertTrue(samples, "no status samples")
+        self.assertTrue(all(sample["healthy"] for sample in samples), samples)
+        self.assertGreaterEqual(len(samples), 6, samples)
+        self.assertTrue(any(sample["membership"] for sample in samples), samples)
+        self.assertTrue(any(sample["ssh"] for sample in samples), samples)
+        self.assertTrue(any(sample["pipe_before"] or sample["pipe_after"] for sample in samples), samples)
+        progress_samples = [
+            index for index in range(1, len(samples))
+            if samples[index]["covered"] > samples[index - 1]["covered"]
+        ]
+        self.assertGreaterEqual(len(progress_samples), 2, samples)
+        self.assertTrue(
+            any(
+                pipe_values and sum(pipe_values) < len(pipe_values) * 65536
+                for index in progress_samples for pipe_values in (
+                    samples[index]["pipe_before"], samples[index]["pipe_after"],
+                )
+            ),
+            samples,
+        )
+        self.assertGreater(samples[-1]["covered"], samples[0]["covered"], samples)
+        if os.environ.get("SEEDSYNC_LFTP_DRAIN_REPORT") == "1":
+            print("TERMINAL_DRAIN_REPORT=" + json.dumps([
+                {
+                    "covered": sample["covered"],
+                    "payload_allocated": sample["allocated_payload"],
+                    "sidecar_allocated": sample["sidecars"],
+                    "pipe_before_total": sum(sample["pipe_before"]),
+                    "pipe_after_total": sum(sample["pipe_after"]),
+                    "ssh": sample["ssh"],
+                    "membership": sample["membership"],
+                    "healthy": sample["healthy"],
+                }
+                for sample in samples
+            ], sort_keys=True))
+        # A final owner-issued jobs-v remains authoritative after the bounded
+        # drain; no separate PTY reader is used by this test.
+        final_statuses = self.lftp.status()
+        self.assertTrue(final_statuses)
+        status_commands = [command for command, status_poll in commands if status_poll]
+        self.assertGreaterEqual(len(status_commands), len(samples) + 1)
+        self.assertEqual({"jobs -v"}, set(status_commands))
+        self.assertTrue(self.lftp._Lftp__last_status_poll_healthy)
 
     @requires_live_ssh
     def test_queue_file_with_spaces(self):
