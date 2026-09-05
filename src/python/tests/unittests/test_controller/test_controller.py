@@ -11508,8 +11508,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp.queue.assert_not_called()
         callback.on_failure.assert_not_called()
         self.assertEqual("initial_rescan", self.controller._Controller__deferred_queue_intents[root.file_id].phase)
-        self.assertTrue(self.controller._Controller__local_scan_process.force_scan.called)
-        self.assertTrue(self.controller._Controller__remote_scan_process.force_scan.called)
+        self.assertTrue(self.controller._Controller__local_scan_process.prioritize_scan.called)
+        self.assertTrue(self.controller._Controller__remote_scan_process.prioritize_scan.called)
 
     def test_manual_directory_scan_deferral_does_not_build_disabled_readiness_details(self):
         trace = BreadcrumbTraceCollector(
@@ -11573,8 +11573,10 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp.queue.assert_not_called()
         callback.on_success.assert_not_called()
         callback.on_failure.assert_not_called()
-        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("pair-a")
-        self.controller._Controller__remote_scan_process.force_scan.assert_called_once_with("pair-a")
+        self.controller._Controller__local_scan_process.prioritize_scan.assert_called_once_with("pair-a")
+        self.controller._Controller__remote_scan_process.prioritize_scan.assert_called_once_with("pair-a")
+        self.controller._Controller__local_scan_process.force_scan.assert_not_called()
+        self.controller._Controller__remote_scan_process.force_scan.assert_not_called()
 
     def test_manual_directory_queue_initial_fence_requires_later_tokens_on_both_sides(self):
         file = self._seed_manual_directory_scan_readiness_fixture()
@@ -11641,8 +11643,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
         self.controller._Controller__process_commands()
 
-        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("pair-a")
-        self.controller._Controller__remote_scan_process.force_scan.assert_called_once_with("pair-a")
+        self.controller._Controller__local_scan_process.prioritize_scan.assert_called_once_with("pair-a")
+        self.controller._Controller__remote_scan_process.prioritize_scan.assert_called_once_with("pair-a")
         self.controller._Controller__lftp.queue.assert_called_once_with(
             file.name,
             True,
@@ -11676,7 +11678,7 @@ class TestController(unittest.TestCase):
 
     def test_manual_directory_queue_initial_scan_request_failure_rejects_once(self):
         file = self._seed_manual_directory_scan_readiness_fixture()
-        self.controller._Controller__local_scan_process.force_scan.side_effect = RuntimeError(
+        self.controller._Controller__local_scan_process.prioritize_scan.side_effect = RuntimeError(
             "local scan wake failed",
         )
         callback = MagicMock()
@@ -12454,7 +12456,7 @@ class TestController(unittest.TestCase):
             local_base_dir_path="/local/incomplete",
         )
 
-    def test_queue_scoped_rescan_force_failure_rejects_without_dispatch(self):
+    def test_queue_scoped_rescan_priority_failure_rejects_without_dispatch(self):
         file = ModelFile("sample-directory", True)
         file.path_pair_id = "pair-a"
         file.remote_size = 10
@@ -12471,7 +12473,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
         self.controller._Controller__model_builder.has_unresolved_staging_collision.return_value = True
         self.controller._Controller__model_builder.get_terminalizable_staging_collision_file_ids.return_value = set()
-        self.controller._Controller__local_scan_process.force_scan.side_effect = RuntimeError("scan wake failed")
+        self.controller._Controller__local_scan_process.prioritize_scan.side_effect = RuntimeError("scan priority failed")
         callback = MagicMock()
         command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
         command.add_callback(callback)

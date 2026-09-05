@@ -8881,8 +8881,20 @@ class Controller:
         self.__last_local_reconciliation_healthy = False
         self.__last_remote_reconciliation_healthy = False
         try:
-            self.__local_scan_process.force_scan(pair_id)
-            self.__remote_scan_process.force_scan(pair_id)
+            if pair_id is None:
+                # The legacy root has no scoped identity to prioritize. Keep
+                # its existing whole-root scan contract.
+                self.__local_scan_process.force_scan(pair_id)
+                self.__remote_scan_process.force_scan(pair_id)
+            else:
+                # A manual Queue owns an HTTP callback deadline. An ordinary
+                # force request can remain behind a healthy full scan long
+                # enough for that deadline to expire. Prioritize only this
+                # pair: local gets its reserved slot and remote replaces a
+                # full worker with the targeted generation before its normal
+                # follow-up.
+                self.__local_scan_process.prioritize_scan(pair_id)
+                self.__remote_scan_process.prioritize_scan(pair_id)
         except Exception:
             self.logger.debug("Queue collision scoped rescan request failed", exc_info=True)
             intent.rescan_generations = None
