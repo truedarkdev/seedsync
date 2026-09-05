@@ -4310,6 +4310,48 @@ class TestModelBuilder(unittest.TestCase):
         # matching final leaf and leave the remote-only delta downloadable.
         self.assertEqual(("E06.mkv",), self.model_builder.get_trusted_final_leaf_paths("release"))
 
+    def test_queue_exclusion_rejects_fixture_shaped_fractional_final_mtimes(self):
+        """A same-second but fractional Final scan must fail closed for Queue.
+
+        The representative Incoming fixture has 238 ordinary trusted leaves
+        plus a quoted/bracketed name and a nested semicolon name.  Its remote
+        and Final files are created independently, so they can share epoch
+        seconds while retaining different fractional mtimes.  Those leaves
+        are not safe exact exclusions unless the Final mtime is whole-second
+        aligned (the LFTP portability allowance) or exactly equals remote.
+        """
+        base_mtime_ns = 1_788_989_138_000_000_000
+        relative_paths = ["trusted/leaf-{:03d}.bin".format(index) for index in range(1, 239)]
+        relative_paths.extend((
+            "trusted/odd ' space [brackets].bin",
+            "trusted/nested/semicolon;name.bin",
+        ))
+
+        remote_root = SystemFile("Incoming", len(relative_paths) * 8192, True)
+        local_root = SystemFile("Incoming", len(relative_paths) * 8192, True)
+
+        def add_leaf(root: SystemFile, relative_path: str, mtime_ns: int) -> None:
+            parent = root
+            parts = relative_path.split("/")
+            for part in parts[:-1]:
+                existing = next((child for child in parent.iter_children() if child.name == part), None)
+                if existing is None:
+                    existing = SystemFile(part, 0, True)
+                    parent.add_child(existing)
+                parent = existing
+            parent.add_child(SystemFile(parts[-1], 8192, False, mtime_ns=mtime_ns))
+
+        for index, relative_path in enumerate(relative_paths):
+            # Both values lie in the same epoch second, but neither is exact
+            # and the Final value is deliberately not whole-second aligned.
+            add_leaf(remote_root, relative_path, base_mtime_ns + 100_000 + index)
+            add_leaf(local_root, relative_path, base_mtime_ns + 600_000 + index)
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("Incoming"))
+
     def test_queue_exclusion_rejects_changed_uncertain_or_colliding_final_leaf(self):
         base_mtime_ns = 1_786_400_003_000_000_000
 

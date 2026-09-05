@@ -1,5 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import hashlib
+import json
 import logging
 import re
 import os
@@ -50,6 +52,8 @@ LFTP_STATUS_POLL_TRACE_CATEGORY = "transfer.lftp.status"
 # emitted to the container's stderr so a parser stall cannot prevent a host
 # observer from recovering the pre-parse boundary through Docker logs.
 _PREPARSE_STDERR_REMAINING = 256
+_PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 3
+_PRIVATE_STATUS_FRAME_CAPTURE_MAX_BYTES = 64 * 1024
 LFTP_STATUS_POLL_TRACE_SCHEMA = "lftp.status_poll.v1"
 LFTP_STATUS_POLL_TRACE_PHASES = frozenset({
     "submitted", "jobs_read", "prompt_ready", "prompt_timeout", "process_eof", "command_error",
@@ -311,6 +315,87 @@ def _record_lftp_preparse_stderr(correlation: object, output: object, process_al
         return
 
 
+def _lftp_private_status_frame_capture(
+        correlation: object, output: object, process_alive: object, trace: object,
+        boundary: dict[str, object],
+) -> None:
+    """Atomically publish a few parser inputs in an explicitly mounted private directory.
+
+    This is an opt-in, local diagnosis path.  It intentionally emits no logger or
+    breadcrumb record: status output can contain paths and credentials, while the
+    paired JSON manifest holds only bounded structural framing facts.
+    """
+    global _PRIVATE_STATUS_FRAME_CAPTURE_REMAINING
+    capture_dir = os.environ.get("SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR")
+    if not capture_dir or _PRIVATE_STATUS_FRAME_CAPTURE_REMAINING <= 0:
+        return
+    safe_correlation = _safe_lftp_status_poll_correlation(correlation)
+    if safe_correlation is None or not _breadcrumb_effectively_enabled(
+            trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug"):
+        return
+    try:
+        if not os.path.isdir(capture_dir):
+            return
+        output_bytes = ("" if output is None else str(output)).encode("utf-8", "surrogateescape")
+        token = "{}-{}".format(
+            hashlib.sha256(safe_correlation.encode("ascii")).hexdigest()[:16],
+            secrets.token_hex(4),
+        )
+        capture_path = os.path.join(capture_dir, "lftp-status-{}".format(token))
+        temporary_path = os.path.join(capture_dir, ".lftp-status-{}.tmp".format(token))
+        captured = output_bytes[:_PRIVATE_STATUS_FRAME_CAPTURE_MAX_BYTES]
+        manifest = {
+            "schema": "seedsync.lftp.private-status-frame.v1",
+            "correlation": safe_correlation,
+            "process_alive": process_alive is True,
+            "original_byte_count": len(output_bytes),
+            "captured_byte_count": len(captured),
+            "truncated": len(captured) != len(output_bytes),
+            "sha256": hashlib.sha256(output_bytes).hexdigest(),
+            "boundary": boundary,
+        }
+        os.mkdir(temporary_path, 0o700)
+        raw_fd = os.open(os.path.join(temporary_path, "frame.bin"),
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            offset = 0
+            while offset < len(captured):
+                written = os.write(raw_fd, captured[offset:])
+                if written <= 0:
+                    raise OSError("private frame capture write made no progress")
+                offset += written
+        finally:
+            os.close(raw_fd)
+        manifest_fd = os.open(os.path.join(temporary_path, "manifest.json"),
+                              os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
+            offset = 0
+            while offset < len(manifest_bytes):
+                written = os.write(manifest_fd, manifest_bytes[offset:])
+                if written <= 0:
+                    raise OSError("private frame manifest write made no progress")
+                offset += written
+        finally:
+            os.close(manifest_fd)
+        os.replace(temporary_path, capture_path)
+        _PRIVATE_STATUS_FRAME_CAPTURE_REMAINING -= 1
+    except (OSError, TypeError, UnicodeError, ValueError):
+        # Capture must never change polling, parsing, or transfer behavior.
+        return
+
+
+def _lftp_boundary_byte_count(value: object) -> int:
+    """Return a structural byte count without decoding status content."""
+    if value is None:
+        return 0
+    if isinstance(value, bytes):
+        return len(value)
+    if isinstance(value, str):
+        return len(value.encode("utf-8", "surrogateescape"))
+    return -1
+
+
 def _lftp_pty_trace_enabled(trace: object, level: str) -> bool:
     """PTY boundaries require their own explicit opt-in rule."""
     explicit = getattr(trace, "is_explicitly_configured", None)
@@ -416,6 +501,7 @@ def _record_lftp_command_breadcrumb(
                 "output_class": output_class,
                 "argument_count_bucket": _lftp_trace_count_bucket(argument_count),
                 "exclude_count_bucket": _lftp_trace_count_bucket(exclude_count),
+                "exact_exclusion_count": exclude_count,
                 # Do not use a ``command``-named key: the generic sanitizer
                 # correctly treats that as command content rather than this safe bucket.
                 "submission_byte_length_bucket": _lftp_trace_bytes_bucket(command_byte_length),
@@ -1438,6 +1524,20 @@ class Lftp:
                                 if failure_reason is None else failure_reason),
                 status_count=status_count, exception=exception, healthy=healthy,
             )
+
+        def capture_private_frame(output: object, process_alive: object) -> None:
+            process = getattr(self, "_Lftp__process", None)
+            _lftp_private_status_frame_capture(
+                safe_trace_poll_correlation, output, process_alive,
+                getattr(self, "_Lftp__breadcrumb_trace", None),
+                {
+                    "pexpect_version": str(getattr(pexpect, "__version__", "unknown")),
+                    "command_timed_out": self.__last_command_timed_out is True,
+                    "before_byte_count": _lftp_boundary_byte_count(getattr(process, "before", None)),
+                    "after_byte_count": _lftp_boundary_byte_count(getattr(process, "after", None)),
+                    "buffer_byte_count": _lftp_boundary_byte_count(getattr(process, "buffer", None)),
+                },
+            )
         try:
             status_command_kwargs: dict[str, object] = {
                 "timeout_seconds": 0,
@@ -1503,6 +1603,7 @@ class Lftp:
             self.__consecutive_status_errors += 1
             self.__last_status_poll_failure_reason = "parser_error"
             self.__last_status_poll_healthy = False
+            capture_private_frame(out, preparse_process_alive)
             record_status_result("parse_error", out, exception=exc)
             if self.__consecutive_status_errors < MAX_CONSECUTIVE_STATUS_ERRORS:
                 self.logger.warning(f"Ignoring status error (count={self.__consecutive_status_errors})")
@@ -1541,6 +1642,7 @@ class Lftp:
                 self.__consecutive_status_errors += 1
                 self.__last_status_poll_failure_reason = "parser_error"
                 self.__last_status_poll_healthy = False
+                capture_private_frame(out, preparse_process_alive)
                 record_status_result("parse_error", out, exception=exc)
                 if self.__consecutive_status_errors < MAX_CONSECUTIVE_STATUS_ERRORS:
                     self.logger.warning(f"Ignoring status error (count={self.__consecutive_status_errors})")

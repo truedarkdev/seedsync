@@ -1,5 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import hashlib
+import json
 import logging
 import os
 import shutil
@@ -7,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import stat
 from pathlib import Path
 from unittest.mock import MagicMock
 from unittest.mock import call
@@ -310,6 +313,7 @@ class TestLftp(unittest.TestCase):
 
         events = trace.snapshot()["entries"]
         self.assertEqual(["2-4", "2-4"], [event["details"]["exclude_count_bucket"] for event in events])
+        self.assertEqual([2, 2], [event["details"]["exact_exclusion_count"] for event in events])
         self.assertTrue(all(event["details"]["argument_count_bucket"] == "5-16" for event in events))
         self.assertTrue(all(event["details"]["submission_byte_length_bucket"] != "unknown" for event in events))
         self.assertNotIn("private-directory", repr(events))
@@ -331,6 +335,7 @@ class TestLftp(unittest.TestCase):
 
         events = trace.snapshot()["entries"]
         self.assertTrue(all(event["details"]["exclude_count_bucket"] == "257+" for event in events))
+        self.assertTrue(all(event["details"]["exact_exclusion_count"] == 300 for event in events))
         self.assertEqual({"8192-32767"}, {event["details"]["submission_byte_length_bucket"] for event in events})
         self.assertNotIn("private-directory", repr(events))
         self.assertNotIn("private-0000.bin", repr(events))
@@ -524,6 +529,85 @@ class TestLftp(unittest.TestCase):
                 write.assert_not_called()
         finally:
             lftp_mod._PREPARSE_STDERR_REMAINING = original_remaining
+
+    def test_private_status_frame_capture_is_disabled_before_any_file_io(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        with patch.dict(os.environ, {}, clear=True), patch("lftp.lftp.os.open") as open_file:
+            lftp_mod._lftp_private_status_frame_capture(
+                "lftp-poll:0123456789abcdef", "private status output", True, trace, {},
+            )
+        open_file.assert_not_called()
+
+    def test_private_status_frame_capture_writes_capped_atomic_private_pair(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        original_remaining = lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING
+        output = "private-status-" + ("x" * lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_MAX_BYTES)
+        try:
+            with tempfile.TemporaryDirectory() as capture_dir, \
+                    patch.dict(os.environ, {
+                        "SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": capture_dir,
+                    }, clear=True):
+                lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 1
+                lftp_mod._lftp_private_status_frame_capture(
+                    "lftp-poll:0123456789abcdef", output, True, trace,
+                    {"pexpect_version": "test", "before_byte_count": 1,
+                     "after_byte_count": 2, "buffer_byte_count": 3},
+                )
+                captures = list(Path(capture_dir).iterdir())
+                self.assertEqual(1, len(captures))
+                self.assertTrue(captures[0].is_dir())
+                raw_path = captures[0] / "frame.bin"
+                manifest_path = captures[0] / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_MAX_BYTES, raw_path.stat().st_size)
+                self.assertEqual(len(output.encode("utf-8")), manifest["original_byte_count"])
+                self.assertTrue(manifest["truncated"])
+                self.assertEqual(hashlib.sha256(output.encode("utf-8")).hexdigest(), manifest["sha256"])
+                self.assertEqual("test", manifest["boundary"]["pexpect_version"])
+                self.assertEqual(0o600, stat.S_IMODE(raw_path.stat().st_mode))
+                self.assertEqual(0o600, stat.S_IMODE(manifest_path.stat().st_mode))
+        finally:
+            lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = original_remaining
+
+    def test_status_captures_private_frame_on_parser_failure_before_error_reporting(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__run_command = MagicMock(return_value="private status output")
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        with patch("lftp.lftp._lftp_private_status_frame_capture") as capture:
+            def fail_after_capture(output):
+                self.assertEqual("private status output", output)
+                capture.assert_not_called()
+                raise LftpJobStatusParserError("test failure")
+
+            lftp._Lftp__job_status_parser.parse.side_effect = fail_after_capture
+            self.assertIsNone(lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
+
+        self.assertEqual("lftp-poll:0123456789abcdef", capture.call_args.args[0])
+        self.assertEqual("private status output", capture.call_args.args[1])
+
+    def test_status_success_does_not_consume_private_frame_capture(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__run_command = MagicMock(return_value="ordinary status output")
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        with patch("lftp.lftp._lftp_private_status_frame_capture") as capture:
+            self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
+        capture.assert_not_called()
 
     def test_status_poll_trace_failure_does_not_change_unexpected_exception_propagation(self):
         lftp = self._build_status_poll_test_lftp()
@@ -1794,6 +1878,10 @@ class TestLftp(unittest.TestCase):
             "test_queue_command_breadcrumb_handles_unencodable_metric_input",
             "test_status_poll_breadcrumb_is_opt_in_and_joins_the_opaque_poll_token",
             "test_status_poll_breadcrumb_exposes_independent_boundary_outcomes",
+            "test_private_status_frame_capture_is_disabled_before_any_file_io",
+            "test_private_status_frame_capture_writes_capped_atomic_private_pair",
+            "test_status_captures_private_frame_on_parser_failure_before_error_reporting",
+            "test_status_success_does_not_consume_private_frame_capture",
             "test_status_poll_parser_failure_records_parser_family_and_preserves_result",
             "test_status_poll_trace_failure_does_not_change_unexpected_exception_propagation",
             "test_status_exception_families_use_only_the_approved_enum",

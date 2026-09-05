@@ -629,3 +629,21 @@ class TestLftpQueueCommand(unittest.TestCase):
         self.assertIn('--exclude-glob "*.nfo"', command)
         self.assertIn('--exclude "^E06\\\\.mkv$"', command)
         self.assertIn('--exclude "^nested/\\\\[E07\\\\]\\\\*\\\\?,comma\\\\\\\\name\\\\.mkv$"', command)
+
+    def test_queue_dir_serializes_fixture_shaped_exact_final_paths(self):
+        """Keep a 240-leaf Incoming exclusion command path-safe and exact."""
+        lftp = self._make_lftp()
+        paths = ["trusted/leaf-{:03d}.bin".format(index) for index in range(1, 239)]
+        paths.extend((
+            "trusted/odd ' space [brackets].bin",
+            "trusted/nested/semicolon;name.bin",
+        ))
+
+        lftp.queue("Incoming", True, exclude_patterns=[ExactPathExclusion(path) for path in paths])
+
+        command = lftp._Lftp__run_command.call_args[0][0]
+        self.assertEqual(240, command.count("--exclude "))
+        self.assertNotIn("--exclude-glob", command)
+        self.assertIn("trusted/odd", command)
+        self.assertIn("brackets", command)
+        self.assertIn("trusted/nested/semicolon;name", command)

@@ -11326,6 +11326,21 @@ class TestController(unittest.TestCase):
             exclusions,
         )
 
+    def test_transfer_exclusions_construct_fixture_shaped_exact_leaf_set(self):
+        """Queue keeps all 240 valid Incoming Final leaves typed and distinct."""
+        trusted_paths = ["trusted/leaf-{:03d}.bin".format(index) for index in range(1, 239)]
+        trusted_paths.extend((
+            "trusted/odd ' space [brackets].bin",
+            "trusted/nested/semicolon;name.bin",
+        ))
+        self.controller._Controller__exclude_patterns = ""
+        self.controller._Controller__model_builder.get_trusted_final_leaf_paths.return_value = tuple(trusted_paths)
+
+        exclusions = self.controller._Controller__transfer_exclude_patterns("Incoming", True)
+
+        self.assertEqual(240, len(exclusions))
+        self.assertEqual([ExactPathExclusion(path) for path in trusted_paths], exclusions)
+
     def test_fractional_queue_exclusion_serialization_trace_is_target_correlated(self):
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
         self.controller._Controller__context.breadcrumb_trace = trace
@@ -11350,6 +11365,7 @@ class TestController(unittest.TestCase):
         self.assertTrue(details["configured_patterns_present"])
         self.assertTrue(details["exact_leaf_candidates_present"])
         self.assertTrue(details["exact_exclusions_serialized"])
+        self.assertEqual(2, details["exact_exclusion_count"])
         self.assertFalse(details["serialization_skipped"])
         self.assertTrue(details["serialized_exclusions_present"])
         self.assertNotIn("configured_pattern_count", details)
@@ -12840,6 +12856,7 @@ class TestController(unittest.TestCase):
         self.assertFalse(details["exact_leaf_candidates_present"])
         self.assertTrue(details["configured_patterns_present"])
         self.assertFalse(details["exact_exclusions_serialized"])
+        self.assertEqual(0, details["exact_exclusion_count"])
         self.assertTrue(details["serialized_exclusions_present"])
         self.assertEqual("configured_only", details["result"])
 
