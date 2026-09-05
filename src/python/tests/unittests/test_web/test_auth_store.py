@@ -27,6 +27,26 @@ def _read_history_entries(file_path):
 
 
 class TestApiKeyStore(unittest.TestCase):
+    def _create_completed_migration_claim(self, temp_dir):
+        binding = {
+            "migration_id": "original-v0.8.6-to-current-v1",
+            "backup": "migration-backups/recovery-lineage",
+            "receipt_sha256": "a" * 64,
+            "backup_manifest_sha256": "b" * 64,
+        }
+        store_path = os.path.join(temp_dir, "api-keys.json")
+        store = ApiKeyStore(file_path=store_path)
+        store.bind_completed_migration_claim_transition(binding)
+        version = store.effective_browser_handover_version(Config())
+        self.assertTrue(store.begin_completed_migration_claim_transaction())
+        created = store.create_initial_admin_api_key_if_available(version, "migration-admin")
+        self.assertIsNotNone(created)
+        assert created is not None
+        store.create_remembered_browser_session_for_api_key(created["record"].id)
+        store.complete_completed_migration_claim_transition(created["record"].id, version)
+        store.finish_completed_migration_claim_transaction()
+        return binding, store_path, version
+
     def test_unchanged_store_saves_coalesce_history_snapshots(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store_path = os.path.join(temp_dir, "api-keys.json")
@@ -77,6 +97,171 @@ class TestApiKeyStore(unittest.TestCase):
                 completed_migration_claimed_browser_handover_version(temp_dir)
             )
             self.assertFalse(restarted.get_browser_handover_state(Config())["open"])
+
+    def test_completed_migration_recovery_claim_preserves_marker_version_and_survives_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            binding, store_path, marker_version = self._create_completed_migration_claim(temp_dir)
+            recovery_version = "recovery-v1"
+            config = Config()
+            config.general.browser_handover_recovery_version = recovery_version
+            restarted = ApiKeyStore.from_file(store_path)
+            restarted.bind_completed_migration_claimed_handover_version(marker_version)
+            self.assertTrue(restarted.activate_browser_handover(config)["open"])
+            recovery = restarted.create_initial_admin_api_key_if_available(recovery_version, "recovery-admin")
+            self.assertIsNotNone(recovery)
+            assert recovery is not None
+            restarted.create_remembered_browser_session_for_api_key(recovery["record"].id)
+
+            raw_store = json.loads(open(store_path, encoding="utf-8").read())
+            self.assertEqual(marker_version, raw_store["browser_handover_claimed_version"])
+            validate_completed_migration_claimed_auth_state(temp_dir, binding)
+
+            raw_store["browser_handover_claimed_version"] = recovery_version
+            with open(store_path, "w", encoding="utf-8") as handle:
+                json.dump(raw_store, handle)
+            if os.name == "posix":
+                os.chmod(store_path, 0o600)
+            validate_completed_migration_claimed_auth_state(temp_dir, binding)
+
+    def test_completed_migration_recovery_lineage_rejects_tampering(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            binding, store_path, marker_version = self._create_completed_migration_claim(temp_dir)
+            recovery_version = "recovery-v1"
+            config = Config()
+            config.general.browser_handover_recovery_version = recovery_version
+            restarted = ApiKeyStore.from_file(store_path)
+            restarted.bind_completed_migration_claimed_handover_version(marker_version)
+            self.assertTrue(restarted.activate_browser_handover(config)["open"])
+            recovery = restarted.create_initial_admin_api_key_if_available(recovery_version, "recovery-admin")
+            self.assertIsNotNone(recovery)
+            assert recovery is not None
+            restarted.create_remembered_browser_session_for_api_key(recovery["record"].id)
+
+            raw_store = json.loads(open(store_path, encoding="utf-8").read())
+            raw_store["browser_handover_claimed_version"] = recovery_version
+            with open(store_path, "w", encoding="utf-8") as handle:
+                json.dump(raw_store, handle)
+            if os.name == "posix":
+                os.chmod(store_path, 0o600)
+            validate_completed_migration_claimed_auth_state(temp_dir, binding)
+
+            deadline_path = os.path.join(temp_dir, "browser-handover-deadline.json")
+            marker_path = os.path.join(temp_dir, "migration-claimed-auth.json")
+            history_path = os.path.splitext(store_path)[0] + ".history.jsonl"
+            baseline = {
+                path: open(path, "rb").read()
+                for path in (store_path, deadline_path, marker_path, history_path)
+            }
+
+            def restore_baseline():
+                for path, content in baseline.items():
+                    with open(path, "wb") as handle:
+                        handle.write(content)
+                if os.name == "posix":
+                    for path in (store_path, deadline_path, marker_path):
+                        os.chmod(path, 0o600)
+
+            tamper_cases = []
+            tamper_cases.append(lambda: self._tamper_recovery_version(store_path))
+            tamper_cases.append(lambda: self._tamper_recovery_deadline(deadline_path))
+            tamper_cases.append(lambda: self._tamper_recovery_history(history_path, recovery_version))
+            tamper_cases.append(lambda: self._tamper_recovery_key(store_path, recovery["record"].id))
+            tamper_cases.append(lambda: self._tamper_recovery_session(store_path, recovery["record"].id))
+            tamper_cases.append(lambda: self._tamper_migration_marker(marker_path))
+            for tamper in tamper_cases:
+                restore_baseline()
+                tamper()
+                with self.assertRaises(ValueError):
+                    validate_completed_migration_claimed_auth_state(temp_dir, binding)
+
+    def test_completed_migration_recovery_accepts_latest_proven_version(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            binding, store_path, marker_version = self._create_completed_migration_claim(temp_dir)
+            restarted = ApiKeyStore.from_file(store_path)
+            restarted.bind_completed_migration_claimed_handover_version(marker_version)
+            for version in ("recovery-v1", "recovery-v2"):
+                config = Config()
+                config.general.browser_handover_recovery_version = version
+                self.assertTrue(restarted.activate_browser_handover(config)["open"])
+                created = restarted.create_initial_admin_api_key_if_available(version, version)
+                self.assertIsNotNone(created)
+                assert created is not None
+                restarted.create_remembered_browser_session_for_api_key(created["record"].id)
+
+            payload = json.loads(open(store_path, encoding="utf-8").read())
+            self.assertEqual(marker_version, payload["browser_handover_claimed_version"])
+            payload["browser_handover_claimed_version"] = "recovery-v2"
+            with open(store_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            if os.name == "posix":
+                os.chmod(store_path, 0o600)
+            validate_completed_migration_claimed_auth_state(temp_dir, binding)
+
+    def test_ordinary_recovery_claim_still_updates_ordinary_claimed_version(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            store = ApiKeyStore(file_path=store_path)
+            self.assertIsNotNone(store.create_initial_admin_api_key_if_available("initial", "admin"))
+            config = Config()
+            config.general.browser_handover_recovery_version = "ordinary-recovery"
+            self.assertTrue(store.activate_browser_handover(config)["open"])
+            self.assertIsNotNone(
+                store.create_initial_admin_api_key_if_available("ordinary-recovery", "recovery-admin")
+            )
+            payload = json.loads(open(store_path, encoding="utf-8").read())
+            self.assertEqual("ordinary-recovery", payload["browser_handover_claimed_version"])
+
+    @staticmethod
+    def _tamper_recovery_version(path):
+        payload = json.loads(open(path, encoding="utf-8").read())
+        payload["browser_handover_claimed_version"] = "unproven-recovery"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    @staticmethod
+    def _tamper_recovery_deadline(path):
+        payload = json.loads(open(path, encoding="utf-8").read())
+        payload["seen_recovery_versions"] = []
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    @staticmethod
+    def _tamper_recovery_history(path, recovery_version):
+        entries = _read_history_entries(path.replace(".history.jsonl", ".json"))
+        for entry in entries:
+            details = entry.get("details", {})
+            if details.get("browser_handover_version") == recovery_version:
+                details["browser_handover_version"] = "tampered"
+        with open(path, "w", encoding="utf-8") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry))
+                handle.write("\n")
+
+    @staticmethod
+    def _tamper_recovery_key(path, recovery_key_id):
+        payload = json.loads(open(path, encoding="utf-8").read())
+        for record in payload["api_keys"]:
+            if record["id"] == recovery_key_id:
+                record["revoked_at"] = "2026-09-05T00:00:00+00:00"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    @staticmethod
+    def _tamper_recovery_session(path, recovery_key_id):
+        payload = json.loads(open(path, encoding="utf-8").read())
+        payload["ui_sessions"] = [
+            session for session in payload["ui_sessions"]
+            if session.get("api_key_id") != recovery_key_id
+        ]
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+
+    @staticmethod
+    def _tamper_migration_marker(path):
+        payload = json.loads(open(path, encoding="utf-8").read())
+        payload["receipt_sha256"] = "0" * 64
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
 
     def test_blank_config_does_not_reopen_claimed_browser_handover(self):
         config = Config()

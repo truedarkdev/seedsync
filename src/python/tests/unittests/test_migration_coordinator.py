@@ -709,6 +709,33 @@ class TestMigrationCoordinator(unittest.TestCase):
                 self.assertEqual(MigrationState.COMPLETE, decision.state)
                 self.assertEqual("claimed", decision.completed_auth_phase)
 
+    def test_completed_claim_survives_a_proven_recovery_claim_on_restart(self) -> None:
+        coordinator, _ = self._complete_migrated_browser_claim(self.root)
+        marker_version = coordinator.completed_claimed_auth_handover_version()
+        store_path = self.root / "api-keys.json"
+        runtime = ApiKeyStore.from_file(store_path)
+        runtime.bind_completed_migration_claimed_handover_version(marker_version)
+        config = Config()
+        config.general.browser_handover_recovery_version = "recovery-v1"
+        self.assertTrue(runtime.activate_browser_handover(config)["open"])
+        recovery = runtime.create_initial_admin_api_key_if_available("recovery-v1", "recovery-admin")
+        self.assertIsNotNone(recovery)
+        assert recovery is not None
+        runtime.create_remembered_browser_session_for_api_key(recovery["record"].id)
+
+        # Emulate the persisted state created by versions that replaced the
+        # original marker-bound value during an approved recovery claim.
+        payload = json.loads(store_path.read_text(encoding="utf-8"))
+        payload["browser_handover_claimed_version"] = "recovery-v1"
+        store_path.write_text(json.dumps(payload), encoding="utf-8")
+        if os.name == "posix":
+            os.chmod(store_path, 0o600)
+
+        restarted = MigrationCoordinator(self.root).require_normal_startup()
+
+        self.assertEqual(MigrationState.COMPLETE, restarted.state)
+        self.assertEqual("claimed", restarted.completed_auth_phase)
+
     def test_claimed_completed_migration_allows_intentionally_empty_path_pairs_after_restart(self) -> None:
         self._complete_migrated_browser_claim(self.root)
         manager = PathPairManager(str(self.root))

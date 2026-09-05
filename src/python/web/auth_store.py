@@ -652,7 +652,13 @@ def validate_completed_migration_claimed_auth_state(config_dir: str | Path, bind
         store = ApiKeyStore.from_str(store_bytes.decode("utf-8"))
     except (PersistError, UnicodeDecodeError, ValueError) as error:
         raise _completed_migration_claim_error() from error
-    if raw_store.get("version") != 3 or raw_store.get("browser_handover_claimed_version") != version:
+    stored_version = raw_store.get("browser_handover_claimed_version")
+    if (
+        raw_store.get("version") != 3
+        or not isinstance(stored_version, str)
+        or not stored_version.strip()
+        or len(stored_version) > 160
+    ):
         raise _completed_migration_claim_error()
     keys = raw_store.get("api_keys")
     sessions = raw_store.get("ui_sessions")
@@ -683,6 +689,8 @@ def validate_completed_migration_claimed_auth_state(config_dir: str | Path, bind
         raise _completed_migration_claim_error()
     initial_claim = False
     remembered_claim = False
+    recovery_claim_key_ids: set[str] = set()
+    recovery_remembered_key_ids: set[str] = set()
     allowed_events = {
         "store_loaded", "store_saved", "bootstrap_proof_created", "bootstrap_proof_cleared",
         "bootstrap_exchange_created", "bootstrap_exchange_cleared", "api_key_created",
@@ -705,10 +713,56 @@ def validate_completed_migration_claimed_auth_state(config_dir: str | Path, bind
         ):
             raise _completed_migration_claim_error()
         if entry["event"] == "api_key_created" and entry["reason"] == "initial_admin_created":
-            initial_claim = details.get("api_key_id") == key_id and details.get("browser_handover_version") == version
+            initial_claim = initial_claim or (
+                details.get("api_key_id") == key_id and details.get("browser_handover_version") == version
+            )
+            if details.get("browser_handover_version") == stored_version:
+                candidate_key_id = details.get("api_key_id")
+                if isinstance(candidate_key_id, str):
+                    recovery_claim_key_ids.add(candidate_key_id)
         if entry["event"] == "ui_session_created" and entry["reason"] == "remembered_browser_session_created":
             remembered_claim = remembered_claim or details.get("api_key_id") == key_id
+            candidate_key_id = details.get("api_key_id")
+            if isinstance(candidate_key_id, str):
+                recovery_remembered_key_ids.add(candidate_key_id)
     if not initial_claim or not remembered_claim:
+        raise _completed_migration_claim_error()
+    if stored_version == version:
+        return
+
+    recovery_key_ids = set()
+    for candidate_key_id in recovery_claim_key_ids & recovery_remembered_key_ids:
+        record = store.get_api_key(candidate_key_id)
+        if record is None or record.is_revoked or "admin" not in record.scopes:
+            continue
+        if any(
+            session.get("remembered") is True
+            and session.get("api_key_id") == candidate_key_id
+            and session.get("api_key_secret_hash") == active_hashes[candidate_key_id]
+            for session in sessions
+        ):
+            recovery_key_ids.add(candidate_key_id)
+    deadline_bytes = _read_completed_migration_auth_file(
+        root, "browser-handover-deadline.json", private=True,
+        max_bytes=_BROWSER_HANDOVER_STATE_MAX_BYTES,
+    )
+    try:
+        deadline = _strict_completed_migration_json(deadline_bytes) if deadline_bytes is not None else None
+        seen_versions = deadline.get("seen_recovery_versions") if isinstance(deadline, dict) else None
+        deadline_valid = (
+            isinstance(deadline, dict)
+            and set(deadline) == {"schema", "active", "seen_recovery_versions"}
+            and deadline.get("schema") == 2
+            and deadline.get("active") is None
+            and isinstance(seen_versions, list)
+            and len(seen_versions) <= _BROWSER_HANDOVER_SEEN_RECOVERY_VERSION_LIMIT
+            and len(set(seen_versions)) == len(seen_versions)
+            and all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) for value in seen_versions)
+            and hashlib.sha256(stored_version.encode("utf-8")).hexdigest() in seen_versions
+        )
+    except (TypeError, ValueError):
+        deadline_valid = False
+    if not recovery_key_ids or not deadline_valid:
         raise _completed_migration_claim_error()
 
 
@@ -1218,7 +1272,8 @@ class ApiKeyStore(Persist):
         with self.__state_lock:
             if not self.can_claim_initial_admin(version):
                 return False
-            self.__browser_handover_claimed_version = version
+            if not self.__completed_migration_claimed_handover_version:
+                self.__browser_handover_claimed_version = version
             self.save()
             if self.__completed_migration_claim_transaction is None:
                 self.finalize_browser_handover_claim(version)
@@ -1240,7 +1295,8 @@ class ApiKeyStore(Persist):
                 return None
 
             result = self.__create_api_key_record(name, ["admin"])
-            self.__browser_handover_claimed_version = version
+            if not self.__completed_migration_claimed_handover_version:
+                self.__browser_handover_claimed_version = version
             self.clear_bootstrap_proof(reason="admin_api_key_created")
             self.clear_bootstrap_exchange(reason="admin_api_key_created")
             self.save()
