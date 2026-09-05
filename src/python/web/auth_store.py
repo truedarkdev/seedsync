@@ -730,16 +730,11 @@ def validate_completed_migration_claimed_auth_state(config_dir: str | Path, bind
     if stored_version == version:
         return
 
-    recovery_key_ids = set()
-    for candidate_key_id in recovery_claim_key_ids & recovery_remembered_key_ids:
-        record = store.get_api_key(candidate_key_id)
-        if record is None or record.is_revoked or "admin" not in record.scopes:
-            continue
-        # A remembered session proves the historical recovery claim through
-        # its append-only audit entry.  Its browser-local lifetime is not a
-        # perpetual migration-integrity prerequisite: normal startup must not
-        # regress merely because that session later expires or is removed.
-        recovery_key_ids.add(candidate_key_id)
+    recovery_key_ids = recovery_claim_key_ids & recovery_remembered_key_ids
+    # Recovery-key and session creation are historical claim evidence.  A
+    # completed migration remains valid after that recovery credential is
+    # retired, provided the marker-bound initial administrator above remains
+    # active and every retained session still binds to an active key.
     deadline_bytes = _read_completed_migration_auth_file(
         root, "browser-handover-deadline.json", private=True,
         max_bytes=_BROWSER_HANDOVER_STATE_MAX_BYTES,

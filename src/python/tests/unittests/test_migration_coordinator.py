@@ -736,7 +736,7 @@ class TestMigrationCoordinator(unittest.TestCase):
         self.assertEqual(MigrationState.COMPLETE, restarted.state)
         self.assertEqual("claimed", restarted.completed_auth_phase)
 
-    def test_missing_historical_recovery_session_allows_normal_startup_without_side_effects(self) -> None:
+    def test_retired_historical_recovery_credentials_allow_normal_startup_without_side_effects(self) -> None:
         coordinator, _ = self._complete_migrated_browser_claim(self.root)
         marker_version = coordinator.completed_claimed_auth_handover_version()
         store_path = self.root / "api-keys.json"
@@ -753,6 +753,9 @@ class TestMigrationCoordinator(unittest.TestCase):
         payload = json.loads(store_path.read_text(encoding="utf-8"))
         payload["browser_handover_claimed_version"] = "recovery-v1"
         payload["ui_sessions"] = []
+        payload["api_keys"] = [
+            record for record in payload["api_keys"] if record.get("id") != recovery["record"].id
+        ]
         store_path.write_text(json.dumps(payload), encoding="utf-8")
         if os.name == "posix":
             os.chmod(store_path, 0o600)
