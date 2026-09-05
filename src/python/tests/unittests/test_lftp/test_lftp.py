@@ -2893,7 +2893,7 @@ class TestLftpPromptClassification(unittest.TestCase):
         self.assertEqual(6, process.expect.call_count)
 
     @patch("lftp.lftp.pexpect.spawn", create=True)
-    def test_init_disables_pty_command_echo_after_setup(self, spawn):
+    def test_init_disables_pty_command_echo_at_spawn(self, spawn):
         process = MagicMock()
         process.isalive.return_value = True
         process.expect.return_value = None
@@ -2901,7 +2901,8 @@ class TestLftpPromptClassification(unittest.TestCase):
 
         Lftp(address="localhost", port=22, user="seedsynctest", password=None)
 
-        process.setecho.assert_called_once_with(False)
+        self.assertFalse(process.setecho.called)
+        self.assertFalse(spawn.call_args.kwargs["echo"])
 
     @patch("lftp.lftp.pexpect.spawn", create=True)
     def test_init_preserves_env_while_forcing_wide_columns(self, spawn):

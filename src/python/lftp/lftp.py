@@ -702,7 +702,7 @@ class Lftp:
 
     def __password_prompt_pattern(self, open_command: str) -> str:
         return (
-            r"(?i)\A[ \t]*{}\r\n(?:(?:\x1b\[\?2004[hl])+\r)?"
+            r"(?i)\A(?:[ \t]*{}\r\n(?:(?:\x1b\[\?2004[hl])+\r)?)?"
             r"(?:password:|\S+@\S+'s password:)[ \t]*\Z"
         ).format(re.escape(open_command))
 
@@ -769,7 +769,12 @@ class Lftp:
                 "-u", "{},".format(self.__user),
                 "{}://{}".format(self.__scheme, self.__address),
             ]
-        self.__process = pexpect.spawn("/usr/bin/lftp", args, env=spawn_env, dimensions=(24, 10000))  # type: ignore[arg-type]
+        # Echo must be disabled while pexpect creates the PTY.  Changing it after
+        # lftp starts is too late: readline/background output can restore or use
+        # the original terminal mode and splice control commands into status.
+        self.__process = pexpect.spawn(
+            "/usr/bin/lftp", args, env=spawn_env, dimensions=(24, 10000), echo=False
+        )  # type: ignore[arg-type]
         try:
             if password_in_argv or not self.__password:
                 try:
@@ -785,13 +790,6 @@ class Lftp:
                 self.__expect_pattern = Lftp.__INITIAL_PROMPT_PATTERN
                 self.__setup()
                 self.__connect_with_native_password_prompt()
-            # LFTP writes background progress to the same PTY that accepts
-            # control commands. Terminal echo can splice `jobs -v` or queue
-            # commands into those progress lines, producing a corrupt but
-            # superficially parseable status snapshot. Commands are already
-            # logged explicitly when verbose logging is enabled, so their PTY
-            # echo is neither required nor safe.
-            self.__process.setecho(False)
         except Exception:
             self.__cleanup_failed_initialization()
             raise
@@ -834,9 +832,9 @@ class Lftp:
 
         password = self.__password
         try:
-            # The password is a prompt response, never an lftp command. Disable PTY echo
-            # first so it cannot enter pexpect output, readline history, or verbose logs.
-            self.__process.setecho(False)
+            # Spawn-time echo suppression is retained for the password response.
+            # Do not toggle it here: the PTY's false baseline protects the secret
+            # and also keeps later control commands out of status output.
             self.__process.sendline(password)
             match = self.__process.expect(
                 [Lftp.__PASSWORD_RESPONSE_PATTERN, self.__expect_pattern], timeout=self.__timeout
@@ -853,15 +851,6 @@ class Lftp:
             raise LftpError("Lftp process terminated while submitting password: {}".format(out))
         finally:
             self.__password = None
-            try:
-                self.__process.setecho(True)
-            except (OSError, pexpect.exceptions.ExceptionPexpect):
-                try:
-                    if self.__process.isalive():
-                        self.__process.close(force=True)
-                except (OSError, pexpect.exceptions.ExceptionPexpect):
-                    pass
-                raise LftpError("Unable to restore lftp PTY echo after password prompt")
 
     def __redact_password(self, value: str) -> str:
         redacted = redact_credentials(value)

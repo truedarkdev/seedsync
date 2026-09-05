@@ -1,4 +1,7 @@
 import re
+import os
+import shutil
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -9,13 +12,14 @@ from lftp import Lftp, LftpError
 
 
 class FakeSpawn:
-    def __init__(self, command, args, env=None, dimensions=None, get_responses=None, password_prompt=False,
+    def __init__(self, command, args, env=None, dimensions=None, echo=True, get_responses=None, password_prompt=False,
                  password_response_exception=None, open_exception=None, open_before=b"",
                  repeated_password_prompt=False, restore_echo_exception=None):
         self.command = command
         self.args = list(args)
         self.env = env
         self.dimensions = dimensions
+        self.echo = echo
         self.sendlines = []
         self._get_responses = get_responses or {}
         self._last_command = None
@@ -75,9 +79,9 @@ def make_lftp(get_responses=None, password_prompt=False, password_response_excep
               open_before=b"", repeated_password_prompt=False, restore_echo_exception=None, **kwargs):
     created = []
 
-    def fake_spawn(command, args, env=None, dimensions=None):
+    def fake_spawn(command, args, env=None, dimensions=None, echo=True):
         fake = FakeSpawn(
-            command, args, env=env, dimensions=dimensions, get_responses=get_responses,
+            command, args, env=env, dimensions=dimensions, echo=echo, get_responses=get_responses,
             password_prompt=password_prompt, password_response_exception=password_response_exception,
             open_exception=open_exception, open_before=open_before,
             repeated_password_prompt=repeated_password_prompt, restore_echo_exception=restore_echo_exception,
@@ -110,6 +114,8 @@ class TestLftpSpawn(unittest.TestCase):
         pattern = lftp._Lftp__password_prompt_pattern(open_command)
         observed = open_command + "\r\n\x1b[?2004l\rPassword: "
 
+        self.assertIsNotNone(re.search(pattern, "Password: "))
+        self.assertIsNotNone(re.search(pattern, "bob@host's password:\t"))
         self.assertIsNotNone(re.search(pattern, observed))
         self.assertIsNotNone(re.search(pattern, " " + observed))
         self.assertIsNotNone(re.search(pattern, open_command + "\r\nPassword: "))
@@ -185,7 +191,8 @@ class TestLftpSpawn(unittest.TestCase):
             'open -p 22 --user "bob" "sftp://host.example.com"', fake.sendlines[-2]
         )
         self.assertEqual('special,password:with spaces and "quotes" ü', fake.sendlines[-1])
-        self.assertEqual([False, True, False], fake.echo_calls)
+        self.assertFalse(fake.echo)
+        self.assertEqual([], fake.echo_calls)
         self.assertTrue(all('special,password:with spaces and "quotes" ü' not in command for command in fake.sendlines[:-1]))
         self.assertIsNone(_lftp._Lftp__password)
 
@@ -212,7 +219,8 @@ class TestLftpSpawn(unittest.TestCase):
         self.assertEqual([], fake.args)
         self.assertIn('open -p 2121 --user "bob" "ftp://host.example.com"', fake.sendlines)
         self.assertEqual("secret", fake.sendlines[-1])
-        self.assertEqual([False, True, False], fake.echo_calls)
+        self.assertFalse(fake.echo)
+        self.assertEqual([], fake.echo_calls)
 
         settings = sent_settings(fake)
         self.assertEqual("true", settings.get("ftp:ssl-force"))
@@ -274,7 +282,24 @@ class TestLftpSpawn(unittest.TestCase):
 
         self.assertEqual(["-p", "22", "-u", "bob,", "sftp://host.example.com"], fake.args)
         self.assertNotIn('open -p 22 --user "bob" "sftp://host.example.com"', fake.sendlines)
-        self.assertEqual([False], fake.echo_calls)
+        self.assertFalse(fake.echo)
+        self.assertEqual([], fake.echo_calls)
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("lftp"), "requires local lftp and a POSIX PTY")
+    def test_spawn_echo_false_survives_background_job_status(self):
+        process = pexpect.spawn("/usr/bin/lftp", echo=False, encoding="utf-8", timeout=10, dimensions=(24, 10000))
+        prompt = r"lftp.*>[ \t]*"
+        try:
+            process.expect(prompt)
+            self.assertFalse(process.getecho())
+            process.sendline("sleep 2 &")
+            time.sleep(0.2)
+            process.send("jobs -v\n")
+            process.expect(prompt)
+            self.assertFalse(process.getecho())
+            self.assertFalse(process.before.lstrip().startswith("jobs -v"))
+        finally:
+            process.close(force=True)
 
     def test_lftp_secure_spawn_removes_ambient_password_variable(self):
         with patch.dict(lftp_mod.os.environ, {"LFTP_PASSWORD": "ambient-secret", "OTHER": "keep"}, clear=True):
@@ -297,7 +322,7 @@ class TestLftpSpawn(unittest.TestCase):
         self.assertEqual(["-p", "22", "-u", "bob,secret", "sftp://host.example.com"], fake.args)
         self.assertTrue(any("legacy lftp password argv" in entry.lower() for entry in logs.output))
 
-    def test_lftp_password_failure_restores_echo_and_redacts_output(self):
+    def test_lftp_password_failure_preserves_spawn_echo_and_redacts_output(self):
         secret = "special,password:with spaces"
         with self.assertRaises(LftpError) as error:
             make_lftp(
@@ -307,7 +332,8 @@ class TestLftpSpawn(unittest.TestCase):
             )
 
         self.assertNotIn(secret, str(error.exception))
-        self.assertEqual([False, True], make_lftp.last_fake.echo_calls)
+        self.assertFalse(make_lftp.last_fake.echo)
+        self.assertEqual([], make_lftp.last_fake.echo_calls)
         self.assertEqual([True], make_lftp.last_fake.close_force_calls)
 
     def test_repeated_password_prompt_fails_without_waiting_for_timeout(self):
@@ -320,20 +346,8 @@ class TestLftpSpawn(unittest.TestCase):
 
         self.assertIn("rejected the password", str(error.exception))
         self.assertNotIn(secret, str(error.exception))
-        self.assertEqual([False, True], make_lftp.last_fake.echo_calls)
-        self.assertEqual([True], make_lftp.last_fake.close_force_calls)
-
-    def test_echo_restore_failure_forces_close_and_sanitizes_error(self):
-        secret = "prompt-secret"
-        with self.assertRaises(LftpError) as error:
-            make_lftp(
-                address="host.example.com", port=22, user="bob", password=secret,
-                password_prompt=True, restore_echo_exception=OSError("echo failure"),
-            )
-
-        self.assertIn("echo", str(error.exception).lower())
-        self.assertNotIn(secret, str(error.exception))
-        self.assertEqual([False, True], make_lftp.last_fake.echo_calls)
+        self.assertFalse(make_lftp.last_fake.echo)
+        self.assertEqual([], make_lftp.last_fake.echo_calls)
         self.assertEqual([True], make_lftp.last_fake.close_force_calls)
 
     def test_lftp_initialization_cleanup_clears_password_and_forces_close(self):
