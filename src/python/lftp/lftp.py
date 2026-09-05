@@ -3,7 +3,9 @@
 import logging
 import re
 import os
+import select
 import stat
+import sys
 import time
 import secrets
 from functools import wraps
@@ -44,6 +46,10 @@ LFTP_PTY_TRACE_CATEGORY = "transfer.lftp.pty"
 LFTP_PTY_TRACE_SCHEMA = "lftp.pty_boundary.v1"
 LFTP_PTY_TRACE_PHASES = frozenset({"pre_write", "write", "prompt"})
 LFTP_STATUS_POLL_TRACE_CATEGORY = "transfer.lftp.status"
+# This opt-in is intentionally process-start configuration.  Its records are
+# emitted to the container's stderr so a parser stall cannot prevent a host
+# observer from recovering the pre-parse boundary through Docker logs.
+_PREPARSE_STDERR_REMAINING = 256
 LFTP_STATUS_POLL_TRACE_SCHEMA = "lftp.status_poll.v1"
 LFTP_STATUS_POLL_TRACE_PHASES = frozenset({
     "submitted", "jobs_read", "prompt_ready", "prompt_timeout", "process_eof", "command_error",
@@ -261,6 +267,48 @@ def _lftp_trace_bytes_bucket(value: object) -> str:
     if value <= 32767:
         return "8192-32767"
     return "32768+"
+
+
+def _record_lftp_preparse_stderr(correlation: object, output: object, process_alive: object,
+                                 trace: object) -> None:
+    """Emit one bounded, host-retrievable parser-entry record when explicitly enabled.
+
+    This deliberately shares the existing opt-in status category and opaque poll
+    correlation.  It never serializes status content, commands, paths, or names.
+    """
+    global _PREPARSE_STDERR_REMAINING
+    if os.environ.get("SEEDSYNC_LFTP_PREPARSE_STDERR") != "1" or \
+            _PREPARSE_STDERR_REMAINING <= 0:
+        return
+    safe_correlation = _safe_lftp_status_poll_correlation(correlation)
+    if safe_correlation is None or not _breadcrumb_effectively_enabled(
+            trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug"):
+        return
+    output_text = "" if output is None else str(output)
+    try:
+        byte_count = len(output_text.encode("utf-8", "surrogateescape"))
+    except UnicodeEncodeError:
+        byte_count = -1
+    record = (
+        "seedsync_lftp_preparse corr={} phase=parse_started bytes={} lines={} process_alive={}\n".format(
+            safe_correlation,
+            _lftp_trace_bytes_bucket(byte_count),
+            _lftp_trace_count_bucket(len(output_text.splitlines())),
+            1 if process_alive is True else 0,
+        )
+    ).encode("ascii")
+    _PREPARSE_STDERR_REMAINING -= 1
+    try:
+        stderr_fd = sys.stderr.fileno()
+        # Do not let a congested Docker log pipe become another status-poll
+        # stall.  One small write is attempted only when immediately writable;
+        # a missing record is an explicit diagnostic limitation, never a retry.
+        if stderr_fd not in select.select([], [stderr_fd], [], 0)[1]:
+            return
+        os.write(stderr_fd, record)
+    except (AttributeError, OSError, ValueError):
+        # Independent diagnostics must never affect the poll or transfer.
+        return
 
 
 def _lftp_pty_trace_enabled(trace: object, level: str) -> bool:
@@ -1424,6 +1472,14 @@ class Lftp:
         timed_out = self.__last_command_timed_out
         statuses: Optional[List[LftpJobStatus]] = None
         try:
+            try:
+                preparse_process_alive = self.__process.isalive()
+            except Exception:
+                preparse_process_alive = False
+            _record_lftp_preparse_stderr(
+                safe_trace_poll_correlation, out, preparse_process_alive,
+                getattr(self, "_Lftp__breadcrumb_trace", None),
+            )
             record_status_result("parse_started", out)
             statuses = self.__job_status_parser.parse(out)
             self.__consecutive_status_errors = 0
@@ -1454,6 +1510,14 @@ class Lftp:
                    if safe_trace_poll_correlation is not None else {})
             )
             try:
+                try:
+                    preparse_process_alive = self.__process.isalive()
+                except Exception:
+                    preparse_process_alive = False
+                _record_lftp_preparse_stderr(
+                    safe_trace_poll_correlation, out, preparse_process_alive,
+                    getattr(self, "_Lftp__breadcrumb_trace", None),
+                )
                 record_status_result("parse_started", out)
                 statuses = self.__job_status_parser.parse(out)
                 self.__consecutive_status_errors = 0

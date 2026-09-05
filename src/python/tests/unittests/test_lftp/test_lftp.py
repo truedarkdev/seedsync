@@ -21,6 +21,7 @@ from common.breadcrumb_trace import BreadcrumbTraceCollector
 from common.exclude_patterns import ExactPathExclusion
 from lftp import Lftp, LftpJobStatus, LftpError, LftpJobStatusParser, LftpJobStatusParserError
 from lftp.lftp import _lftp_diagnostic_exception_family
+import lftp.lftp as lftp_mod
 
 
 # noinspection PyPep8Naming,SpellCheckingInspection
@@ -439,22 +440,85 @@ class TestLftp(unittest.TestCase):
             policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
         )
         lftp.set_breadcrumb_trace(trace)
-        worker = threading.Thread(
-            target=lftp.status,
-            kwargs={"trace_poll_correlation": "lftp-poll:0123456789abcdef"},
-        )
-        worker.start()
-        self.assertTrue(entered.wait(timeout=1))
-        phases = [entry["details"]["phase"] for entry in trace.snapshot()["entries"]]
-        self.assertIn("parse_started", phases)
-        self.assertNotIn("parse_complete", phases)
-        self.assertNotIn("parse_error", phases)
-        self.assertNotIn("health", phases)
-        self.assertNotIn("jobs -v", repr(trace.snapshot()))
+        stderr = MagicMock()
+        stderr.fileno.return_value = 19
+        original_remaining = lftp_mod._PREPARSE_STDERR_REMAINING
+        try:
+            with patch.dict(os.environ, {"SEEDSYNC_LFTP_PREPARSE_STDERR": "1"}, clear=True), \
+                    patch("lftp.lftp.sys.stderr", stderr), \
+                    patch("lftp.lftp.select.select", return_value=([], [19], [])), \
+                    patch("lftp.lftp.os.write") as write:
+                worker = threading.Thread(
+                    target=lftp.status,
+                    kwargs={"trace_poll_correlation": "lftp-poll:0123456789abcdef"},
+                )
+                worker.start()
+                self.assertTrue(entered.wait(timeout=1))
+                phases = [entry["details"]["phase"] for entry in trace.snapshot()["entries"]]
+                self.assertIn("parse_started", phases)
+                self.assertNotIn("parse_complete", phases)
+                self.assertNotIn("parse_error", phases)
+                self.assertNotIn("health", phases)
+                self.assertNotIn("jobs -v", repr(trace.snapshot()))
+                self.assertIn(
+                    b"seedsync_lftp_preparse corr=lftp-poll:0123456789abcdef",
+                    write.call_args.args[1],
+                )
 
-        release.set()
-        worker.join(timeout=1)
-        self.assertFalse(worker.is_alive())
+                release.set()
+                worker.join(timeout=1)
+                self.assertFalse(worker.is_alive())
+        finally:
+            lftp_mod._PREPARSE_STDERR_REMAINING = original_remaining
+
+    def test_status_preparse_stderr_is_explicitly_gated_and_joins_poll_correlation(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__run_command = MagicMock(return_value="one\ntwo\nthree")
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+        stderr = MagicMock()
+        stderr.fileno.return_value = 19
+        original_remaining = lftp_mod._PREPARSE_STDERR_REMAINING
+        try:
+            with patch.dict(os.environ, {}, clear=True), patch("lftp.lftp.sys.stderr", stderr), \
+                    patch("lftp.lftp.os.write") as write:
+                self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
+                write.assert_not_called()
+
+            with patch.dict(os.environ, {"SEEDSYNC_LFTP_PREPARSE_STDERR": "1"}, clear=True), \
+                    patch("lftp.lftp.sys.stderr", stderr), \
+                    patch("lftp.lftp.select.select", return_value=([], [19], [])), \
+                    patch("lftp.lftp.os.write") as write:
+                self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
+        finally:
+            lftp_mod._PREPARSE_STDERR_REMAINING = original_remaining
+
+        self.assertEqual(1, write.call_count)
+        line = write.call_args.args[1].decode("ascii").strip()
+        self.assertRegex(
+            line,
+            r"^seedsync_lftp_preparse corr=lftp-poll:0123456789abcdef "
+            r"phase=parse_started bytes=1-127 lines=2-4 process_alive=1$",
+        )
+        self.assertNotIn("one", line)
+
+    def test_status_preparse_stderr_requires_status_trace_policy(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__run_command = MagicMock(return_value="private-output")
+        lftp.set_breadcrumb_trace(BreadcrumbTraceCollector(lambda: True, max_entries=8, policy={"default": "off"}))
+        stderr = MagicMock()
+        original_remaining = lftp_mod._PREPARSE_STDERR_REMAINING
+        try:
+            with patch.dict(os.environ, {"SEEDSYNC_LFTP_PREPARSE_STDERR": "1"}, clear=True), \
+                    patch("lftp.lftp.sys.stderr", stderr), \
+                    patch("lftp.lftp.os.write") as write:
+                self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
+                write.assert_not_called()
+        finally:
+            lftp_mod._PREPARSE_STDERR_REMAINING = original_remaining
 
     def test_status_poll_trace_failure_does_not_change_unexpected_exception_propagation(self):
         lftp = self._build_status_poll_test_lftp()
