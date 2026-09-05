@@ -90,7 +90,10 @@ if TYPE_CHECKING:
     from .controller import Controller
 
 
-_ACTIVE_LFTP_STATUS_POLL_INTERVAL = timedelta(milliseconds=100)
+# LFTP needs an idle window to service its SFTP pipes between interactive
+# ``jobs -v`` status commands.  A one-second active cadence remains responsive
+# while avoiding a continuous command stream on the single PTY owner.
+_ACTIVE_LFTP_STATUS_POLL_INTERVAL = timedelta(seconds=1)
 _COMPLETION_GATE_LFTP_SOURCES = frozenset({
     "cached_error", "cached_idle", "cached_inflight", "cached_retry",
     "cached_unhealthy", "error_empty", "fresh_healthy", "fresh_unhealthy",
