@@ -1060,7 +1060,7 @@ class TestScannerProcess(unittest.TestCase):
         self.assertEqual({"pair-6"}, process._ScannerProcess__drain_priority_target_path_pair_ids())
         self.assertIsNone(process._ScannerProcess__drain_scan_target_path_pair_ids())
 
-    def test_inline_full_scan_reserves_selected_pair_inside_active_generation(self):
+    def test_inline_full_scan_queues_selected_pair_for_successor_generation(self):
         scanner = DummyScanner()
         scanner.prioritize_path_pair = MagicMock()
         process = ScannerProcess(scanner=scanner, interval_in_ms=1000, verbose=False)
@@ -1070,8 +1070,8 @@ class TestScannerProcess(unittest.TestCase):
 
         process.prioritize_scan("pair-6")
 
-        scanner.prioritize_path_pair.assert_called_once_with("pair-6")
-        self.assertFalse(process._ScannerProcess__has_pending_priority_targets())
+        scanner.prioritize_path_pair.assert_not_called()
+        self.assertTrue(process._ScannerProcess__has_pending_priority_targets())
 
     def test_inline_initial_priority_runs_target_then_skips_interval_for_full_followup(self):
         process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=1000, verbose=False)

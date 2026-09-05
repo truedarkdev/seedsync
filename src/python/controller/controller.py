@@ -8890,9 +8890,9 @@ class Controller:
                 # A manual Queue owns an HTTP callback deadline. An ordinary
                 # force request can remain behind a healthy full scan long
                 # enough for that deadline to expire. Prioritize only this
-                # pair: local gets its reserved slot and remote replaces a
-                # full worker with the targeted generation before its normal
-                # follow-up.
+                # pair through each scanner coordinator: an inline full scan
+                # schedules a targeted successor generation, while a recycled
+                # worker can replace the full worker before its normal follow-up.
                 self.__local_scan_process.prioritize_scan(pair_id)
                 self.__remote_scan_process.prioritize_scan(pair_id)
         except Exception:

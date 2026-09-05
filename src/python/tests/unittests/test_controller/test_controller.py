@@ -12252,6 +12252,172 @@ class TestController(unittest.TestCase):
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
 
+    def test_queue_scoped_rescan_inline_priority_publishes_fresh_successor(self):
+        """Inline priority during generation N publishes a successor before readiness."""
+        pair_id = "pair-a"
+
+        class BarrierScanner:
+            def __init__(self, side):
+                self.side = side
+                self.scan_count = 0
+                self.lock = threading.Lock()
+                self.second_scan_started = threading.Event()
+                self.release_second_scan = threading.Event()
+                self.third_scan_started = threading.Event()
+                self.release_third_scan = threading.Event()
+                self.priority_received = threading.Event()
+                self.target_path_pair_ids = None
+
+            def set_base_logger(self, _logger):
+                pass
+
+            def set_scan_target_path_pair_ids(self, path_pair_ids):
+                self.target_path_pair_ids = path_pair_ids
+
+            def set_progress_callback(self, _callback):
+                pass
+
+            def pop_malformed_status_only_file_ids(self):
+                return []
+
+            def pop_managed_extract_file_ids(self):
+                return []
+
+            def scanned_path_pair_ids(self):
+                return {pair_id}
+
+            def prioritize_path_pair(self, selected_pair_id):
+                self.assert_pair_id(selected_pair_id)
+                self.priority_received.set()
+
+            def assert_pair_id(self, selected_pair_id):
+                if selected_pair_id != pair_id:
+                    raise AssertionError("unexpected priority pair")
+
+            def scan(self):
+                with self.lock:
+                    self.scan_count += 1
+                    scan_count = self.scan_count
+                if scan_count in (2, 3):
+                    (self.second_scan_started if scan_count == 2 else self.third_scan_started).set()
+                    release = self.release_second_scan if scan_count == 2 else self.release_third_scan
+                    if not release.wait(2):
+                        raise AssertionError("successor scan was not released")
+                root = SystemFile("sample-directory", 10, True)
+                root.path_pair_id = pair_id
+                root.path_pair_name = "Pair A"
+                return [root]
+
+        local_scanner = BarrierScanner("local")
+        remote_scanner = BarrierScanner("remote")
+        local_published = threading.Event()
+        remote_published = threading.Event()
+        local_process = ScannerProcess(
+            scanner=local_scanner, interval_in_ms=60000, verbose=False,
+            result_available_callback=local_published.set,
+        )
+        remote_process = ScannerProcess(
+            scanner=remote_scanner, interval_in_ms=60000, verbose=False,
+            result_available_callback=remote_published.set,
+        )
+
+        def close_process(process):
+            process.terminate()
+            process.join(2)
+            process.close_queues()
+
+        self.addCleanup(close_process, local_process)
+        self.addCleanup(close_process, remote_process)
+        self.controller._Controller__local_scan_process = local_process
+        self.controller._Controller__remote_scan_process = remote_process
+        self.controller._Controller__path_pairs_by_id = {
+            pair_id: SimpleNamespace(remote_path="/remote", local_path="/local"),
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            pair_id: "/local/incomplete",
+        }
+        self.controller._Controller__model_builder.has_unresolved_staging_collision.return_value = True
+        self.controller._Controller__model_builder.get_terminalizable_staging_collision_file_ids.return_value = set()
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = ()
+
+        local_process.start()
+        remote_process.start()
+        self.assertTrue(local_published.wait(2))
+        self.assertTrue(remote_published.wait(2))
+
+        local_result = _pop_scan_updates(self.controller, "local", local_process)
+        remote_result = _pop_scan_updates(self.controller, "remote", remote_process)
+        self.assertIsNotNone(local_result)
+        self.assertIsNotNone(remote_result)
+        self.controller._record_path_pair_reconciliation({pair_id}, {pair_id})
+        self.controller._record_path_pair_scan_tokens(local_result, remote_result)
+        self.assertEqual(1, local_process.generation)
+        self.assertEqual(1, remote_process.generation)
+
+        local_published.clear()
+        remote_published.clear()
+        local_process.force_scan()
+        remote_process.force_scan()
+        self.assertTrue(local_scanner.second_scan_started.wait(2))
+        self.assertTrue(remote_scanner.second_scan_started.wait(2))
+        self.assertEqual(2, local_process.generation)
+        self.assertEqual(2, remote_process.generation)
+
+        file = ModelFile("sample-directory", True)
+        file.path_pair_id = pair_id
+        file.remote_size = 10
+        file.remote_has_transferable_content = True
+        self.controller._Controller__model.get_file.return_value = file
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+        self.assertEqual(
+            (
+                (local_process.session_token, 2),
+                (remote_process.session_token, 2),
+            ),
+            intent.rescan_generations,
+        )
+        self.assertFalse(local_scanner.priority_received.is_set())
+        self.assertFalse(remote_scanner.priority_received.is_set())
+        self.assertTrue(local_process._ScannerProcess__has_pending_priority_targets())
+        self.assertTrue(remote_process._ScannerProcess__has_pending_priority_targets())
+
+        local_scanner.release_second_scan.set()
+        remote_scanner.release_second_scan.set()
+        self.assertTrue(local_published.wait(2))
+        self.assertTrue(remote_published.wait(2))
+        self.assertTrue(local_scanner.third_scan_started.wait(2))
+        self.assertTrue(remote_scanner.third_scan_started.wait(2))
+        self.assertEqual(3, local_process.generation)
+        self.assertEqual(3, remote_process.generation)
+        self.assertEqual({pair_id}, local_scanner.target_path_pair_ids)
+        self.assertEqual({pair_id}, remote_scanner.target_path_pair_ids)
+        local_published.clear()
+        remote_published.clear()
+        local_scanner.release_third_scan.set()
+        remote_scanner.release_third_scan.set()
+        self.assertTrue(local_published.wait(2))
+        self.assertTrue(remote_published.wait(2))
+        local_result = _pop_scan_updates(self.controller, "local", local_process)
+        remote_result = _pop_scan_updates(self.controller, "remote", remote_process)
+        self.assertIsNotNone(local_result)
+        self.assertIsNotNone(remote_result)
+        self.assertEqual(3, local_result.generation)
+        self.assertEqual(3, remote_result.generation)
+        self.controller._record_path_pair_reconciliation({pair_id}, {pair_id})
+        self.controller._record_path_pair_scan_tokens(local_result, remote_result)
+
+        self.assertTrue(self.controller._Controller__queue_scoped_rescan_ready(intent))
+        self.assertIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_success.assert_not_called()
+        callback.on_failure.assert_not_called()
+
     def test_real_scanner_replacement_rejects_old_session_result(self):
         pair_id = "pair-a"
         self.controller._Controller__path_pairs_by_id = {pair_id: SimpleNamespace()}

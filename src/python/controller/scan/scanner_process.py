@@ -1451,14 +1451,13 @@ class ScannerProcess:
                 {"scanner": self.__scanner.__class__.__name__},
                 path_pair_id=path_pair_id,
             )
-            prioritize = getattr(self.__scanner, "prioritize_path_pair", None)
             if self.__inline_scan_active.is_set():
                 active_targets = self.__inline_scan_target_path_pair_ids
-                if active_targets is None and callable(prioritize):
-                    prioritize(path_pair_id)
-                    return
                 if active_targets is not None and path_pair_id in active_targets:
                     return
+                # An active full scan has no safe in-place target boundary.
+                # Queue the pair below so the coordinator admits it as a
+                # successor generation after the current scan publishes.
             with self.__priority_target_lock:
                 self.__priority_target_path_pair_ids.add(path_pair_id)
             if self.__scan_generation == 0:

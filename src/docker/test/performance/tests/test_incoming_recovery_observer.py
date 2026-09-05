@@ -1,6 +1,7 @@
 from pathlib import Path
 import importlib.util
 from io import BytesIO
+import json
 import sys
 from urllib.error import HTTPError
 import pytest
@@ -145,3 +146,275 @@ def test_pending_transfer_gate_requires_exact_local_paths_and_safe_lifecycle_bef
     with pytest.raises(observer.ObserverSchemaError, match="blocked"):
         blocked.queue(sent.append)
     assert sent == []
+
+
+def test_json_sink_persists_sanitized_preflight_success_and_failure(tmp_path):
+    artifact_path = tmp_path / "observer.jsonl"
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", artifact_path=artifact_path)
+    gate.preflight(lambda path: responses()[path])
+
+    bad = responses()
+    bad["/server/path-pairs"] = {"data": "private-response-body", "headers": "Bearer secret"}
+    blocked = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", artifact_path=artifact_path)
+    with pytest.raises(observer.ObserverSchemaError):
+        blocked.preflight(lambda path: bad[path])
+
+    records = [json.loads(line) for line in artifact_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["outcome"] for record in records] == ["success", "failure"]
+    serialized = artifact_path.read_text(encoding="utf-8")
+    assert PAIR not in serialized
+    assert "private-response-body" not in serialized
+    assert "Bearer secret" not in serialized
+    assert "/server/path-pairs" not in serialized
+
+
+def test_queue_http_error_is_persisted_and_reraised_without_private_data(tmp_path):
+    artifact_path = tmp_path / "queue.jsonl"
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", artifact_path=artifact_path)
+    gate.preflight(lambda path: responses()[path])
+
+    def send(_path):
+        raise HTTPError(
+            "http://private/server/command/queue/secret", 409, "Conflict",
+            {"Authorization": "Bearer header-secret"},
+            BytesIO(b"Queue preflight cancelled: initial_scan_authority_deadline body-secret"),
+        )
+
+    with pytest.raises(HTTPError):
+        gate.queue(send)
+
+    serialized = artifact_path.read_text(encoding="utf-8")
+    assert "body-secret" not in serialized
+    assert "header-secret" not in serialized
+    assert "private/server" not in serialized
+    records = [json.loads(line) for line in serialized.splitlines()]
+    assert records[-1]["event"] == "queue"
+    assert records[-1]["outcome"] == "failure"
+    assert records[-1]["queue_evidence"]["body_reason"] == "preflight_cancelled_unrecognized"
+
+
+def test_queue_timeout_is_persisted_and_reraised_and_first_failure_is_retained(tmp_path):
+    artifact_path = tmp_path / "timeout.jsonl"
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", artifact_path=artifact_path)
+    gate.preflight(lambda path: responses()[path])
+    calls = []
+
+    def send(_path):
+        calls.append(True)
+        raise TimeoutError("timeout body should not be retained")
+
+    with pytest.raises(TimeoutError):
+        gate.queue(send)
+    first = gate.first_failure_evidence
+    assert first is gate.last_queue_evidence
+    with pytest.raises(observer.ObserverSchemaError, match="already attempted"):
+        gate.queue(send)
+    assert len(calls) == 1
+    assert "timeout body should not be retained" not in artifact_path.read_text(encoding="utf-8")
+
+
+def test_repeated_preflight_does_not_reset_one_post_attempt():
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming")
+    sent = []
+    get = lambda path: responses()[path]
+    gate.preflight(get)
+    gate.queue(lambda path: sent.append(path) or object())
+    gate.preflight(get)
+    with pytest.raises(observer.ObserverSchemaError, match="already attempted"):
+        gate.queue(lambda path: sent.append(path) or object())
+    assert len(sent) == 1
+
+
+def test_fixed_get_sampler_persists_before_each_next_get_without_overlap(tmp_path):
+    artifact_path = tmp_path / "samples.jsonl"
+    active = 0
+    max_active = 0
+    order = []
+
+    def get(path):
+        nonlocal active, max_active
+        assert active == 0
+        active += 1
+        max_active = max(max_active, active)
+        order.append(path)
+        active -= 1
+        return {"private": "response-body"}
+
+    sampler = observer.FixedGetSampler(
+        ("/server/private?token=secret", "/server/status"), artifact_sink=artifact_path,
+    )
+    records = sampler.sample(get)
+    assert [record["outcome"] for record in records] == ["success", "success"]
+    assert max_active == 1
+    assert order == ["/server/private?token=secret", "/server/status"]
+    persisted = artifact_path.read_text(encoding="utf-8")
+    assert "token=secret" not in persisted
+    assert "response-body" not in persisted
+    phases = [(json.loads(line)["phase"], json.loads(line)["request_index"])
+              for line in persisted.splitlines()]
+    assert phases == [("before", 0), ("after", 0), ("before", 1), ("after", 1)]
+
+
+class PrivateResponse409:
+    status = 409
+
+
+class PrivateResponse500:
+    code = 500
+
+
+class FailingSink:
+    def __call__(self, _artifact):
+        raise RuntimeError("sink-private-detail")
+
+
+class FailsAfterGetSink:
+    def __init__(self):
+        self.records = []
+
+    def __call__(self, artifact):
+        if artifact.get("phase") == "after":
+            raise RuntimeError("after-sink-private-detail")
+        self.records.append(artifact)
+
+
+def test_sampler_fails_closed_before_get_when_boundary_capture_fails():
+    calls = []
+    sampler = observer.FixedGetSampler(("/server/status",), artifact_sink=FailingSink())
+    with pytest.raises(observer.ObserverCaptureError, match="before request"):
+        sampler.sample(lambda path: calls.append(path))
+    assert calls == []
+    assert sampler.capture_failure == {
+        "schema": "incoming-recovery-observer-capture-failure.v1",
+        "phase": "get_before", "kind": "artifact_sink_failure",
+    }
+
+
+def test_sampler_reports_post_get_capture_failure_and_stops_before_next_get():
+    sink = FailsAfterGetSink()
+    calls = []
+    sampler = observer.FixedGetSampler(("/server/one", "/server/two"), artifact_sink=sink)
+    records = sampler.sample(lambda path: calls.append(path) or {"private": "body"})
+    assert calls == ["/server/one"]
+    assert records == [{
+        "schema": "incoming-recovery-observer-sample.v1", "event": "get",
+        "phase": "after", "outcome": "capture_failure", "request_index": 0,
+        "response_kind": "mapping",
+        "capture_failure": {
+            "schema": "incoming-recovery-observer-capture-failure.v1",
+            "phase": "get_success", "kind": "artifact_sink_failure",
+        },
+    }]
+    assert "after-sink-private-detail" not in str(records)
+
+
+def test_sampler_stops_after_get_exception_when_failure_capture_fails():
+    sink = FailsAfterGetSink()
+    calls = []
+    sampler = observer.FixedGetSampler(("/server/one", "/server/two"), artifact_sink=sink)
+
+    def get(path):
+        calls.append(path)
+        raise TimeoutError("transport-private-detail")
+
+    records = sampler.sample(get)
+    assert calls == ["/server/one"]
+    assert records[0]["outcome"] == "capture_failure"
+    assert records[0]["error"]["error_type"] == "timeout"
+    assert records[0]["capture_failure"] == {
+        "schema": "incoming-recovery-observer-capture-failure.v1",
+        "phase": "get_failure", "kind": "artifact_sink_failure",
+    }
+    assert "transport-private-detail" not in str(records)
+
+
+@pytest.mark.parametrize(
+    ("response", "reason"),
+    [(PrivateResponse409(), "unrecognized_409_response"), (PrivateResponse500(), "http_500")],
+)
+def test_error_status_response_is_persisted_as_failure_with_safe_first_evidence(tmp_path, response, reason):
+    artifact_path = tmp_path / "status-response.jsonl"
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", artifact_path=artifact_path)
+    gate.preflight(lambda path: responses()[path])
+    gate.queue(lambda _path: response)
+
+    record = json.loads(artifact_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert record["event"] == "queue"
+    assert record["outcome"] == "failure"
+    assert record["first_failure"] is True
+    assert record["queue_evidence"]["status_code"] in (409, 500)
+    assert record["queue_evidence"]["body_reason"] == reason
+    serialized = artifact_path.read_text(encoding="utf-8")
+    assert "PrivateResponse" not in serialized
+
+
+def test_failing_sink_does_not_mask_schema_failure():
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", artifact_sink=FailingSink())
+    bad = responses()
+    bad["/server/path-pairs"] = {"data": "malformed"}
+    with pytest.raises(observer.ObserverSchemaError, match="data must be a list"):
+        gate.preflight(lambda path: bad[path])
+    assert gate.capture_failure == {
+        "schema": "incoming-recovery-observer-capture-failure.v1",
+        "phase": "preflight_failure", "kind": "artifact_sink_failure",
+    }
+
+
+def test_failing_sink_does_not_mask_queue_error_or_allow_a_second_post():
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", artifact_sink=[])
+    gate.preflight(lambda path: responses()[path])
+    gate.artifact_sink = FailingSink()
+    sent = []
+
+    def send(path):
+        sent.append(path)
+        raise TimeoutError("timeout-private-detail")
+
+    with pytest.raises(TimeoutError):
+        gate.queue(send)
+    assert gate.queue_attempted is True
+    assert gate.capture_failure == {
+        "schema": "incoming-recovery-observer-capture-failure.v1",
+        "phase": "queue_failure", "kind": "artifact_sink_failure",
+    }
+    with pytest.raises(observer.ObserverSchemaError, match="already attempted"):
+        gate.queue(send)
+    assert len(sent) == 1
+    assert "timeout-private-detail" not in str(gate.capture_failure)
+
+
+def test_failing_sink_does_not_mask_queue_http_error():
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", artifact_sink=[])
+    gate.preflight(lambda path: responses()[path])
+    gate.artifact_sink = FailingSink()
+    sent = []
+
+    def send(path):
+        sent.append(path)
+        raise HTTPError("http://private", 409, "Conflict", None, BytesIO(b"private-body"))
+
+    with pytest.raises(HTTPError):
+        gate.queue(send)
+    assert gate.queue_attempted is True
+    assert gate.capture_failure == {
+        "schema": "incoming-recovery-observer-capture-failure.v1",
+        "phase": "queue_failure", "kind": "artifact_sink_failure",
+    }
+    with pytest.raises(observer.ObserverSchemaError, match="already attempted"):
+        gate.queue(send)
+    assert len(sent) == 1
+
+
+def test_custom_exception_and_response_names_are_not_persisted(tmp_path):
+    class BearerPrivateException(Exception):
+        pass
+
+    artifact_path = tmp_path / "names.jsonl"
+    sampler = observer.FixedGetSampler(("/server/status",), artifact_sink=artifact_path)
+    sampler.sample(lambda _path: (_ for _ in ()).throw(BearerPrivateException("secret")))
+    sampler = observer.FixedGetSampler(("/server/status",), artifact_sink=artifact_path)
+    sampler.sample(lambda _path: PrivateResponse409())
+    serialized = artifact_path.read_text(encoding="utf-8")
+    assert "BearerPrivateException" not in serialized
+    assert "PrivateResponse409" not in serialized
+    assert "secret" not in serialized
