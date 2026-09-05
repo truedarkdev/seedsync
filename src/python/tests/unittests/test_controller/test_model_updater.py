@@ -3476,6 +3476,7 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__restore_failed_queue_lifecycle = (
             Controller._Controller__restore_failed_queue_lifecycle.__get__(controller, Controller)
         )
+        controller._Controller__record_lftp_executor_observation = MagicMock()
         controller._Controller__drain_lftp_operations = (
             Controller._Controller__drain_lftp_operations.__get__(controller, Controller)
         )
@@ -12988,6 +12989,41 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotIn(file_id, controller._Controller__persist.stopped_file_names)
         controller._Controller__lftp.queue.assert_not_called()
         self.assertEqual("default", Controller._model_record_visible_state(retired))
+
+    def test_unhealthy_parser_membership_does_not_retire_a_running_partial(self):
+        """A damaged status frame is not evidence that a ModelUpdater job ended."""
+        file_name = "damaged-membership.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        remote = SystemFile(file_name, 10, False)
+        staged = SystemFile(file_name, 9, False, is_staging=True)
+        staged.status_sidecar_ready = True
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(9, 10, 90, 1, 0)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([staged])
+        builder.set_lftp_statuses([running])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=builder.build_model(),
+        )
+        controller._Controller__prev_downloading_file_names = {(file_name, None, None)}
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [staged], is_scan_final=True,
+        )
+        controller._Controller__lftp.status.return_value = None
+        controller._Controller__lftp.last_status_poll_healthy = False
+        controller._Controller__lftp.last_status_poll_failure_reason = "parser_error"
+
+        ModelUpdater(controller).update()
+
+        published = controller._Controller__model.get_file(file_id)
+        self.assertEqual(ModelFile.State.DOWNLOADING, published.state)
+        self.assertEqual(90, published.download_progress)
+        self.assertNotIn((file_name, None, None), controller._Controller__pending_completion_file_names)
+        self.assertNotIn(file_id, controller._Controller__persist.stopped_file_names)
+        controller._Controller__lftp.queue.assert_not_called()
 
     def test_fresh_empty_lftp_poll_honors_explicit_stop_despite_valid_sidecar(self):
         file_name = "pending.bin"

@@ -47,7 +47,7 @@ LFTP_STATUS_POLL_TRACE_CATEGORY = "transfer.lftp.status"
 LFTP_STATUS_POLL_TRACE_SCHEMA = "lftp.status_poll.v1"
 LFTP_STATUS_POLL_TRACE_PHASES = frozenset({
     "submitted", "jobs_read", "prompt_ready", "prompt_timeout", "process_eof", "command_error",
-    "backend_error", "parse_complete", "parse_error", "health",
+    "backend_error", "parse_started", "parse_complete", "parse_error", "health",
 })
 LFTP_STATUS_POLL_TRACE_FAILURE_PHASES = frozenset({
     "prompt_timeout", "process_eof", "command_error", "backend_error", "parse_error",
@@ -426,6 +426,7 @@ def _record_lftp_status_poll_breadcrumb(
             "process_eof": "prompt",
             "command_error": "prompt",
             "backend_error": "read",
+            "parse_started": "parse",
             "parse_complete": "parse",
             "parse_error": "parse",
             "health": "health",
@@ -1423,6 +1424,7 @@ class Lftp:
         timed_out = self.__last_command_timed_out
         statuses: Optional[List[LftpJobStatus]] = None
         try:
+            record_status_result("parse_started", out)
             statuses = self.__job_status_parser.parse(out)
             self.__consecutive_status_errors = 0
             self.__last_status_poll_healthy = not timed_out
@@ -1452,6 +1454,7 @@ class Lftp:
                    if safe_trace_poll_correlation is not None else {})
             )
             try:
+                record_status_result("parse_started", out)
                 statuses = self.__job_status_parser.parse(out)
                 self.__consecutive_status_errors = 0
                 self.__last_status_poll_healthy = not self.__last_command_timed_out

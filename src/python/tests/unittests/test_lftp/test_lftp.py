@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -358,7 +359,7 @@ class TestLftp(unittest.TestCase):
 
         self.assertEqual([], statuses)
         events = trace.snapshot()["entries"]
-        self.assertEqual(["submitted", "jobs_read", "prompt_ready", "parse_complete", "health"],
+        self.assertEqual(["submitted", "jobs_read", "prompt_ready", "parse_started", "parse_complete", "health"],
                          [event["details"]["phase"] for event in events])
         self.assertTrue(all(event["corr_id"] == "lftp-poll:0123456789abcdef" for event in events))
         self.assertTrue(all(event["flow_id"] == "lftp-poll:0123456789abcdef" for event in events))
@@ -379,7 +380,7 @@ class TestLftp(unittest.TestCase):
 
         events = trace.snapshot()["entries"]
         self.assertEqual(
-            ["send", "read", "prompt", "parse", "health"],
+            ["send", "read", "prompt", "parse", "parse", "health"],
             [event["details"]["boundary"] for event in events],
         )
         self.assertEqual("healthy", events[-1]["details"]["outcome"])
@@ -403,6 +404,57 @@ class TestLftp(unittest.TestCase):
         self.assertEqual("parser", parse_error["details"]["exception_family"])
         self.assertFalse(health["details"]["healthy"])
         self.assertNotIn("private parser detail", repr(events))
+
+    def test_status_poll_marks_malformed_known_option_queue_membership_unhealthy(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__job_status_parser = LftpJobStatusParser()
+        lftp._Lftp__run_command = MagicMock(return_value=(
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/remote\n"
+            "Queue is stopped.\n"
+            "Commands queued:\n"
+            "1. mirror --exclude\n"
+            "[2] mirror -c --exclude child /remote/sample /local/staging/ -- 10/20 (50%)\n"
+        ))
+
+        self.assertIsNone(lftp.status())
+
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("parser_error", lftp.last_status_poll_failure_reason)
+
+    def test_status_poll_pre_parse_record_is_retrievable_without_an_exit_record(self):
+        lftp = self._build_status_poll_test_lftp()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def wait_for_release(_output):
+            entered.set()
+            self.assertTrue(release.wait(timeout=1))
+            return []
+
+        lftp._Lftp__job_status_parser.parse.side_effect = wait_for_release
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+        worker = threading.Thread(
+            target=lftp.status,
+            kwargs={"trace_poll_correlation": "lftp-poll:0123456789abcdef"},
+        )
+        worker.start()
+        self.assertTrue(entered.wait(timeout=1))
+        phases = [entry["details"]["phase"] for entry in trace.snapshot()["entries"]]
+        self.assertIn("parse_started", phases)
+        self.assertNotIn("parse_complete", phases)
+        self.assertNotIn("parse_error", phases)
+        self.assertNotIn("health", phases)
+        self.assertNotIn("jobs -v", repr(trace.snapshot()))
+
+        release.set()
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
 
     def test_status_poll_trace_failure_does_not_change_unexpected_exception_propagation(self):
         lftp = self._build_status_poll_test_lftp()
@@ -1116,6 +1168,23 @@ class TestLftp(unittest.TestCase):
         self.assertFalse(lftp.last_status_poll_healthy)
         self.assertEqual("parser_error", lftp.last_status_poll_failure_reason)
         self.assertEqual(1, lftp._Lftp__consecutive_status_errors)
+
+    def test_status_marks_poll_unhealthy_when_valid_queue_precedes_damaged_membership(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__job_status_parser = LftpJobStatusParser()
+        lftp._Lftp__run_command = MagicMock(return_value=(
+            "jobs -v\n"
+            "[0] queue (sftp://example:@localhost)\n"
+            "sftp://example:@localhost/remote\n"
+            "Queue is running.\n"
+            "[1] mirror --exclude " + ("\\" * 240)
+        ))
+
+        statuses = lftp.status()
+
+        self.assertIsNone(statuses)
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("parser_error", lftp.last_status_poll_failure_reason)
 
     def test_status_marks_poll_unhealthy_when_jobs_command_raises_exception_pexpect(self):
         lftp = self._build_status_poll_test_lftp()

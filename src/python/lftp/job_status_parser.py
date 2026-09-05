@@ -15,6 +15,10 @@ class LftpJobStatusParserError(AppError):
     pass
 
 
+class _LftpKnownOptionsMirrorHeaderError(ValueError):
+    """A malformed known-option row cannot become authoritative membership."""
+
+
 redact_credentials = redact_sensitive_text
 
 
@@ -38,14 +42,6 @@ class LftpJobStatusParser:
     __TIME_UNITS_REGEX = r"(?P<eta_d>\d*d)?(?P<eta_h>\d*h)?(?P<eta_m>\d*m)?(?P<eta_s>\d*s)?"
 
     __QUOTED_FILE_NAME_REGEX = r"`(?P<name>.*)'"
-    # Directory queueing emits only these mirror options before the remote and
-    # local positional paths. `jobs -v` may render an exclusion argument
-    # without the quotes used by the queue command, so neither form may be
-    # mistaken for a positional remote path.
-    __MIRROR_KNOWN_OPTION_REGEX = (
-        r'(?:-c|--exclude(?:-glob)?\s+(?:"(?:\\.|[^"\\])*"|(?:\\.|[^\\\s])+))'
-    )
-
     __QUEUE_DONE_REGEX = r"^\[(?P<id>\d+)\]\sDone\s\(queue\s\(.+\)\)"
     __QUEUE_COMMAND_ECHO_REGEX = r"^queue\s+(?:mirror|pget|get)(?:\s|$)"
     __STATUS_COMMAND_ECHO_MARKER = "jobs -v"
@@ -60,6 +56,16 @@ class LftpJobStatusParser:
         r")"
     )
     __STATUS_COMMAND_ECHO_TOKEN_REGEX = re.compile(r"(?<![\w/])jobs -v(?![\w/])")
+    __MIRROR_HEADER_PREFIX_REGEX = re.compile(r"^\[(?P<id>\d+)\]\s+mirror\s+")
+    __MIRROR_QUEUE_HEADER_PREFIX_REGEX = re.compile(r"^(?P<id>\d+)\.\s+mirror\s+")
+    __MIRROR_PROGRESS_SUFFIX_REGEX = re.compile(
+        r"^\s+(?P<szlocal>\d+\.?\d*\s?(?:{sz})?)\/"
+        r"(?P<szremote>\d+\.?\d*\s?(?:{sz})?)\s+"
+        r"\((?P<pctlocal>\d+)%\)"
+        r"(?:\s+(?P<speed>\d+\.?\d*\s?(?:{sz}))\/s)?\s*$".format(
+            sz=__SIZE_UNITS_REGEX,
+        )
+    )
 
     def __init__(self):
         self.logger = logging.getLogger("LftpJobStatusParser")
@@ -168,6 +174,130 @@ class LftpJobStatusParser:
                 return True
         return False
 
+    @staticmethod
+    def __split_rendered_command_words(text: str) -> list[tuple[str, int, int]]:
+        """Split LFTP's rendered command once while retaining escaped text."""
+        words: list[tuple[str, int, int]] = []
+        index = 0
+        while index < len(text):
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index >= len(text):
+                break
+            start = index
+            value: list[str] = []
+            quote: str | None = None
+            while index < len(text):
+                character = text[index]
+                if character in "'\"" and (quote == character or (quote is None and index == start)):
+                    quote = None if quote == character else character
+                    index += 1
+                    continue
+                if character == "\\" and index + 1 < len(text):
+                    value.extend((character, text[index + 1]))
+                    index += 2
+                    continue
+                if quote is None and character.isspace():
+                    break
+                value.append(character)
+                index += 1
+            if quote is not None:
+                raise _LftpKnownOptionsMirrorHeaderError("Unterminated quoted mirror argument")
+            words.append(("".join(value), start, index))
+        return words
+
+    @classmethod
+    def __parse_known_options_mirror_header(
+            cls, line: str, prefix_pattern: re.Pattern[str],
+    ) -> tuple[int, str, str, str, tuple[str, str, str, str | None] | None] | None:
+        """Parse the directory form emitted by Queue without regex backtracking.
+
+        Exact-final recovery emits many ``--exclude`` arguments.  Those status
+        lines used to fall through to the broad legacy mirror regex when a
+        connecting/listing or malformed form did not match.  Scan the known
+        option grammar once and fail the snapshot closed when it is incomplete.
+        """
+        prefix = prefix_pattern.match(line)
+        if prefix is None:
+            return None
+        remainder = line[prefix.end():]
+        if "--exclude" not in remainder:
+            return None
+        words = cls.__split_rendered_command_words(remainder)
+        known_options = {"--exclude", "--exclude-glob"}
+        if not any(word in known_options for word, _, _ in words):
+            return None
+
+        positionals: list[tuple[str, int, int]] = []
+        index = 0
+        separator: int | None = None
+        while index < len(words):
+            word, start, end = words[index]
+            if positionals and (word == "-c" or word in known_options):
+                raise _LftpKnownOptionsMirrorHeaderError("Mirror options must precede positional paths")
+            if word == "-c":
+                index += 1
+                continue
+            if word in known_options:
+                if index + 1 >= len(words):
+                    raise _LftpKnownOptionsMirrorHeaderError("Mirror option is missing its argument")
+                candidate = words[index + 1]
+                # LFTP has historically rendered one trailing backslash form
+                # ambiguously.  Preserve its legacy positional interpretation
+                # without giving the broad regex this known-option header.
+                following = words[index + 2: index + 4]
+                if "\\ " in candidate[0] and (
+                        len(following) == 1 or
+                        (len(following) == 2 and following[0][0] != "--" and following[1][0] == "--")
+                ):
+                    positionals.append(candidate)
+                    index += 2
+                    continue
+                index += 2
+                continue
+            if word == "--" and len(positionals) >= 2:
+                separator = index
+                break
+            if word.startswith("-"):
+                if positionals:
+                    # Legacy status rendering can leave an unquoted path
+                    # fragment such as ``-o`` between the two absolute paths.
+                    # Exact known options were rejected above once positional
+                    # parsing began; retain other fragments as path text.
+                    positionals.append((word, start, end))
+                    index += 1
+                    continue
+                raise _LftpKnownOptionsMirrorHeaderError("Unsupported mirror option in known-option status header")
+            positionals.append((word, start, end))
+            index += 1
+        if len(positionals) > 2:
+            path_starts = [
+                offset for offset, (word, _, _) in enumerate(positionals) if word.startswith("/")
+            ]
+            if len(path_starts) < 2 or path_starts[0] != 0:
+                raise _LftpKnownOptionsMirrorHeaderError("Known-option mirror header has ambiguous positional paths")
+            local_start = path_starts[-1]
+            remote_words = positionals[:local_start]
+            local_words = positionals[local_start:]
+            positionals = [
+                (" ".join(word for word, _, _ in remote_words), remote_words[0][1], remote_words[-1][2]),
+                (" ".join(word for word, _, _ in local_words), local_words[0][1], local_words[-1][2]),
+            ]
+        if len(positionals) != 2:
+            raise _LftpKnownOptionsMirrorHeaderError("Known-option mirror header is missing positional paths")
+        if separator is None:
+            progress = None
+        else:
+            suffix = line[prefix.end() + words[separator][2]:]
+            result = cls.__MIRROR_PROGRESS_SUFFIX_REGEX.match(suffix)
+            if result is None:
+                raise _LftpKnownOptionsMirrorHeaderError("Malformed mirror progress suffix")
+            progress = (
+                result.group("szlocal"), result.group("szremote"), result.group("pctlocal"), result.group("speed"),
+            )
+        flags = remainder[:positionals[0][1]].strip()
+        return int(prefix.group("id")), flags, positionals[0][0], positionals[1][0], progress
+
     def parse(self, output: str) -> List[LftpJobStatus]:
         statuses: list[LftpJobStatus] = []
         lines = [s.strip() for s in output.splitlines()]
@@ -214,6 +344,10 @@ class LftpJobStatusParser:
         has_wrong_type_failure = any(self.__is_wrong_type_failure_line(line) for line in lines)
         try:
             statuses += self.__parse_queue(lines)
+        except _LftpKnownOptionsMirrorHeaderError as e:
+            self.logger.warning("LftpJobStateParser rejecting malformed known-option queue output: {}".format(str(e)))
+            self.logger.debug("Bad status output:\n{}".format(redact_credentials(output)))
+            raise LftpJobStatusParserError("Lftp status output had incomplete queue membership") from e
         except ValueError as e:
             self.logger.warning("LftpJobStateParser skipping bad queue output: {}".format(str(e)))
             self.logger.debug("Bad status output:\n{}".format(redact_credentials(output)))
@@ -223,6 +357,7 @@ class LftpJobStatusParser:
         except ValueError as e:
             self.logger.warning("LftpJobStateParser skipping bad job output: {}".format(str(e)))
             self.logger.debug("Bad status output:\n{}".format(redact_credentials(output)))
+            raise LftpJobStatusParserError("Lftp status output had incomplete job membership") from e
         if has_wrong_type_failure and statuses and not any(
             status.state == LftpJobStatus.State.RUNNING for status in statuses
         ):
@@ -249,22 +384,9 @@ class LftpJobStatusParser:
                                r"(?P<rq>['\"]|)(?P<local>.+)(?P=rq)$")  # greedy on purpose
         pget_header_m = re.compile(pget_header_pattern)
 
-        # mirror header (downloading)
-        mirror_known_options_header_pattern = (r"^\[(?P<id>\d+)\]\s+"
-                                               r"mirror\s+"
-                                               r"(?P<flags>{option}(?:\s+{option})*)\s+"
-                                               r"(?P<lq>['\"]|)(?P<remote>.+)(?P=lq)\s+"  # greedy on purpose
-                                               r"(?P<rq>['\"]|)(?P<local>.+)(?P=rq)\s+"  # greedy on purpose
-                                               r"--\s+"
-                                               r"(?P<szlocal>\d+\.?\d*\s?({sz})?)"  # size=0 has no units
-                                               r"\/"
-                                               r"(?P<szremote>\d+\.?\d*\s?({sz})?)\s+"  # size=0 has no units
-                                               r"\((?P<pctlocal>\d+)%\)"
-                                               r"(\s+(?P<speed>\d+\.?\d*\s?({sz}))\/s)?$")\
-            .format(option=LftpJobStatusParser.__MIRROR_KNOWN_OPTION_REGEX,
-                    sz=LftpJobStatusParser.__SIZE_UNITS_REGEX)
-        mirror_known_options_header_m = re.compile(mirror_known_options_header_pattern)
-
+        # Mirror headers without Queue's known exclusion options use the
+        # established compatibility regex below.  Known-option headers are
+        # consumed by __parse_known_options_mirror_header before this point.
         mirror_header_pattern = (r"^\[(?P<id>\d+)\]\s+"
                                  r"mirror\s+"
                                  r"(?P<flags>.*?)\s+"
@@ -280,14 +402,6 @@ class LftpJobStatusParser:
         mirror_header_m = re.compile(mirror_header_pattern)
 
         # mirror header (connecting or receiving file list)
-        mirror_known_options_fl_header_pattern = (r"^\[(?P<id>\d+)\]\s+"
-                                                  r"mirror\s+"
-                                                  r"(?P<flags>{option}(?:\s+{option})*)\s+"
-                                                  r"(?P<lq>['\"]|)(?P<remote>.+)(?P=lq)\s+"  # greedy on purpose
-                                                  r"(?P<rq>['\"]|)(?P<local>.+)(?P=rq)$")\
-            .format(option=LftpJobStatusParser.__MIRROR_KNOWN_OPTION_REGEX)
-        mirror_known_options_fl_header_m = re.compile(mirror_known_options_fl_header_pattern)
-
         mirror_fl_header_pattern = (r"^\[(?P<id>\d+)\]\s+"
                                     r"mirror\s+"
                                     r"(?P<flags>.*?)\s+"
@@ -395,14 +509,20 @@ class LftpJobStatusParser:
         prev_job = None
         while lines:
             line = lines.popleft()
+            known_options_mirror = LftpJobStatusParser.__parse_known_options_mirror_header(
+                line, LftpJobStatusParser.__MIRROR_HEADER_PREFIX_REGEX,
+            )
+
+            if LftpJobStatusParser.__is_wrong_type_failure_line(line) or \
+                    line.startswith("mirror: Access failed:"):
+                continue
 
             # First line must be a valid job header
             if not (
                 prev_job is not None or
                 pget_header_m.match(line) or
-                mirror_known_options_header_m.match(line) or
+                known_options_mirror is not None or
                 mirror_header_m.match(line) or
-                mirror_known_options_fl_header_m.match(line) or
                 mirror_fl_header_m.match(line)
             ):
                 if orphan_progress_m.match(line) or partial_progress_m.match(line) or chunk_wrap_m.match(line):
@@ -507,8 +627,35 @@ class LftpJobStatusParser:
                 prev_job = status
                 continue
 
+            if known_options_mirror is not None:
+                id_, flags, remote_path, local_path, progress = known_options_mirror
+                status = LftpJobStatus(job_id=id_,
+                                       job_type=LftpJobStatus.Type.MIRROR,
+                                       state=LftpJobStatus.State.RUNNING,
+                                       name=os.path.basename(os.path.normpath(remote_path)),
+                                       flags=flags,
+                                       remote_path=remote_path,
+                                       local_path=local_path)
+                if progress is not None:
+                    size_local = LftpJobStatusParser._size_to_bytes(progress[0])
+                    size_remote = LftpJobStatusParser._size_to_bytes(progress[1])
+                    percent_local = int(progress[2])
+                    speed = LftpJobStatusParser._size_to_bytes(progress[3]) if progress[3] else None
+                    transfer_state = LftpJobStatus.TransferState(
+                        size_local, size_remote, percent_local, speed, None,
+                    )
+                    LftpJobStatusParser.__set_record_provenance(status, "got", transfer_state)
+                    status.total_transfer_state = transfer_state
+                else:
+                    LftpJobStatusParser.__set_record_provenance(
+                        status, "none", LftpJobStatus.TransferState(None, None, None, None, None),
+                    )
+                jobs.append(status)
+                prev_job = status
+                continue
+
             # Search for mirror header
-            result = mirror_known_options_header_m.search(line) or mirror_header_m.search(line)
+            result = mirror_header_m.search(line)
             if result:
                 id_ = int(result.group("id"))
                 name = os.path.basename(os.path.normpath(result.group("remote")))
@@ -543,7 +690,7 @@ class LftpJobStatusParser:
 
             # Search for mirror connecting header
             # Note: this must be after the more restrictive mirror header above
-            result = mirror_known_options_fl_header_m.search(line) or mirror_fl_header_m.search(line)
+            result = mirror_fl_header_m.search(line)
             if result:
                 # There may be a 'Connecting' or 'cd' line ahead, but not always
                 if lines and (
@@ -768,13 +915,6 @@ class LftpJobStatusParser:
                                         r"(?P<lq>[\'\"]|)(?P<remote>.+)(?P=lq)\s+"  # greedy on purpose
                                         r"(?P<rq>[\'\"]|)(?P<local>.+)(?P=rq)$")  # greedy on purpose
                 queue_mirror_m = re.compile(queue_mirror_pattern)
-                queue_mirror_known_options_pattern = (r"^(?P<id>\d+)\.\s+"
-                                                      r"mirror\s+"
-                                                      r"(?P<flags>{option}(?:\s+{option})*)\s+"
-                                                      r"(?P<lq>[\'\"]|)(?P<remote>.+)(?P=lq)\s+"  # greedy on purpose
-                                                      r"(?P<rq>[\'\"]|)(?P<local>.+)(?P=rq)$")\
-                    .format(option=LftpJobStatusParser.__MIRROR_KNOWN_OPTION_REGEX)
-                queue_mirror_known_options_m = re.compile(queue_mirror_known_options_pattern)
                 while lines:
                     line = lines[0]
                     if re.match(r"^\d+\.", line):
@@ -794,11 +934,20 @@ class LftpJobStatusParser:
                                 lines.popleft()
                             continue
 
-                        result_pget = queue_pget_m.match(line)
-                        result_mirror = (
-                            queue_mirror_known_options_m.match(line) or
-                            queue_mirror_m.match(line)
+                        known_options_mirror = LftpJobStatusParser.__parse_known_options_mirror_header(
+                            line, LftpJobStatusParser.__MIRROR_QUEUE_HEADER_PREFIX_REGEX,
                         )
+                        if known_options_mirror is not None:
+                            id_, flags, remote, local, _ = known_options_mirror
+                            queue.append(LftpJobStatus(
+                                job_id=id_, job_type=LftpJobStatus.Type.MIRROR,
+                                state=LftpJobStatus.State.QUEUED,
+                                name=os.path.basename(os.path.normpath(remote)), flags=flags,
+                                remote_path=remote, local_path=local,
+                            ))
+                            continue
+                        result_pget = queue_pget_m.match(line)
+                        result_mirror = queue_mirror_m.match(line)
                         if result_pget:
                             type_ = (LftpJobStatus.Type.GET
                                      if result_pget.group("command") == "get"
