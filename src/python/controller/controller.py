@@ -420,6 +420,14 @@ class DeferredQueueIntent:
     # the fixed failure reason on the intent so the next controller turn can
     # retire it instead of waiting indefinitely.
     rescan_failure_reason: Optional[str] = None
+    # Runtime-only deadline for the initial authority fence.  This is never
+    # persisted as transfer intent; it only bounds how long Queue callbacks
+    # can wait for a scan result that may never arrive.
+    rescan_deadline_monotonic: Optional[float] = None
+    # Controller processes commands before it publishes newly available scan
+    # results. Consume one short grace tick before terminalizing so a result
+    # that arrived by the deadline can become authoritative in that phase.
+    rescan_deadline_grace_consumed: bool = False
 
 
 @dataclass
@@ -560,6 +568,10 @@ class Controller:
     __AUXILIARY_WORKER_IDLE_GRACE_IN_SECS = 2.0
     _ACTIVE_PROCESS_INTERVAL_SECONDS = 0.1
     _IDLE_HEALTH_INTERVAL_SECONDS = 10.0
+    # Reuse the established controller setup/API wait bound for the initial
+    # scan authority handoff.  A later collision rescan keeps its existing
+    # generation/failure policy and is intentionally not covered here.
+    _DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS = Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
 
     __context: Context
     __persist: ControllerPersist
@@ -2692,6 +2704,51 @@ class Controller:
         def record(side: str, result: Optional[object]) -> None:
             if result is None:
                 return
+
+            def mark_initial_rescan_failure(
+                    affected_pair_ids: set[object], reason: str,
+                    require_fresh_token: bool = True,
+            ) -> None:
+                """Terminalize only intents covered by this scan result."""
+                side_index = 0 if side == "local" else 1
+                result_session = getattr(result, "session_token", None)
+                result_generation = getattr(result, "generation", None)
+                has_result_token = type(result_session) is str and bool(result_session) and \
+                    type(result_generation) is int
+                for intent in self.__deferred_queue_intents_map().values():
+                    if intent.phase != "initial_rescan":
+                        continue
+                    if type(intent.path_pair_id) is str:
+                        if intent.path_pair_id not in affected_pair_ids:
+                            continue
+                    elif intent.path_pair_id is None:
+                        if None not in affected_pair_ids:
+                            continue
+                    else:
+                        continue
+                    generations = intent.rescan_generations
+                    baseline = generations[side_index] if isinstance(generations, tuple) and \
+                        len(generations) == 2 and isinstance(generations[side_index], tuple) and \
+                        len(generations[side_index]) == 2 else None
+                    if not isinstance(baseline, tuple) or type(baseline[0]) is not str or \
+                            type(baseline[1]) is not int:
+                        continue
+                    if require_fresh_token:
+                        if not has_result_token or result_session != baseline[0] or \
+                                result_generation <= baseline[1]:
+                            continue
+                    if intent.rescan_failure_reason is not None:
+                        continue
+                    intent.rescan_failure_reason = reason
+                    self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
+                        "schema": "queue_readiness.v1",
+                        "phase": "rescan_unknown",
+                        "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
+                        "outcome": "unknown",
+                        "reason": reason,
+                        "ready": False,
+                    })
+
             if bool(getattr(result, "failed", False)):
                 failure_scope: set[object] = set()
                 for attribute in (
@@ -2737,14 +2794,39 @@ class Controller:
                                 type(result_session) is not str or result_session != baseline[0] or \
                                 type(result_generation) is not int or result_generation <= baseline[1]:
                             continue
-                        intent.rescan_failure_reason = failure_reason
+                        if intent.rescan_failure_reason is None:
+                            intent.rescan_failure_reason = failure_reason
+                            self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
+                                "schema": "queue_readiness.v1",
+                                "phase": "rescan_unknown",
+                                "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
+                                "outcome": "failed",
+                                "reason": failure_reason,
+                                "ready": False,
+                            })
                 return
-            if not bool(getattr(result, "is_scan_final", True)) or \
-                    bool(getattr(result, "unknown_path_pair_ids", set())):
+            result_unknown_ids = getattr(result, "unknown_path_pair_ids", set())
+            unknown_pair_ids = result_unknown_ids if isinstance(result_unknown_ids, (set, frozenset, list, tuple)) \
+                else set()
+            if not bool(getattr(result, "is_scan_final", True)):
+                return
+            if unknown_pair_ids:
+                mark_initial_rescan_failure(
+                    set(unknown_pair_ids),
+                    "initial_{}_scan_unknown".format(side),
+                    require_fresh_token=True,
+                )
                 return
             session_token = getattr(result, "session_token", None)
             generation = getattr(result, "generation", None)
             if type(session_token) is not str or not session_token or type(generation) is not int:
+                raw_scanned = getattr(result, "scanned_path_pair_ids", set())
+                raw_completed = getattr(result, "completed_path_pair_ids", set())
+                affected_pair_ids = set()
+                if isinstance(raw_scanned, (set, frozenset, list, tuple)):
+                    affected_pair_ids.update(raw_scanned)
+                if isinstance(raw_completed, (set, frozenset, list, tuple)):
+                    affected_pair_ids.update(raw_completed)
                 return
             raw_scanned = getattr(result, "scanned_path_pair_ids", set())
             raw_completed = getattr(result, "completed_path_pair_ids", set())
@@ -2765,6 +2847,11 @@ class Controller:
                             # An aggregate with explicit per-pair evidence
                             # must not fall back to its newest drain-wide
                             # generation for an untouched pair.
+                            mark_initial_rescan_failure(
+                                {pair_id},
+                                "initial_{}_scan_token_missing".format(side),
+                                require_fresh_token=True,
+                            )
                             continue
                         side_tokens[pair_id] = pair_token
                     else:
@@ -3102,6 +3189,22 @@ class Controller:
         ):
             if isinstance(deadline, (int, float)):
                 delays.append(max(0.0, float(deadline) - now_monotonic))
+        # Deferred initial rescans are runtime-only, but their retained Queue
+        # callbacks still need a scheduler wake at the terminal deadline when
+        # neither scanner publishes a result nor another command arrives.
+        intents = getattr(self, "_Controller__deferred_queue_intents", None)
+        if isinstance(intents, dict):
+            for intent in intents.values():
+                if not isinstance(intent, DeferredQueueIntent) or intent.phase != "initial_rescan":
+                    continue
+                deadline = getattr(intent, "rescan_deadline_monotonic", None)
+                if type(deadline) is int or type(deadline) is float:
+                    if math.isfinite(float(deadline)):
+                        delays.append(max(0.0, float(deadline) - now_monotonic))
+                elif intent.rescan_requested:
+                    # Compatibility for an intent assembled by an older
+                    # runtime/test before the field was introduced.
+                    delays.append(self._DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS)
         return min(delays)
 
     def __consume_lftp_reconfigure_request(self) -> bool:
@@ -8718,6 +8821,22 @@ class Controller:
             return self.__deferred_queue_intents
         return cast(dict[str, DeferredQueueIntent], intents)
 
+    def __ensure_initial_rescan_deadline(
+            self, intent: DeferredQueueIntent,
+            now_monotonic: Optional[float] = None,
+    ) -> Optional[float]:
+        """Return a finite initial-rescan deadline, creating legacy state."""
+        deadline = getattr(intent, "rescan_deadline_monotonic", None)
+        if (type(deadline) is int or type(deadline) is float) and math.isfinite(float(deadline)):
+            return float(deadline)
+        if now_monotonic is None:
+            now_monotonic = time.monotonic()
+        if type(now_monotonic) not in (int, float) or not math.isfinite(float(now_monotonic)):
+            return None
+        deadline = float(now_monotonic) + self._DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS
+        intent.rescan_deadline_monotonic = deadline
+        return deadline
+
     def __queue_scoped_rescan(
             self, intent: DeferredQueueIntent, phase: str = "rescan",
     ) -> bool:
@@ -8768,6 +8887,7 @@ class Controller:
             self.logger.debug("Queue collision scoped rescan request failed", exc_info=True)
             intent.rescan_generations = None
             intent.rescan_requested = False
+            intent.rescan_deadline_monotonic = None
             intent.phase = "collision"
             self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
                 "schema": "queue_readiness.v1",
@@ -8780,6 +8900,9 @@ class Controller:
             return False
         intent.phase = phase
         intent.rescan_requested = True
+        if phase == "initial_rescan":
+            self.__ensure_initial_rescan_deadline(intent)
+            intent.rescan_deadline_grace_consumed = False
         if phase == "rescan":
             # Initial scan-authority readiness is not collision retry work.
             intent.scoped_rescan_attempts += 1
@@ -8862,6 +8985,16 @@ class Controller:
             if intent is not None:
                 intent.stop_requested = True
         return retired
+
+    def __take_queued_deferred_queue_waiters(self, file_id: str) -> list["Controller.Command"]:
+        """Remove exact Queue waiters so a terminal intent cannot be retried."""
+        waiters: list[Controller.Command] = []
+        with self.__command_queue.mutex:
+            for command in list(self.__command_queue.queue):
+                if command.action == Controller.Command.Action.QUEUE and command.filename == file_id:
+                    self.__command_queue.queue.remove(command)
+                    waiters.append(command)
+        return waiters
 
     def __notify_queue_failure_callbacks(
             self, command: "Controller.Command", reason: str, error_code: int = 409,
@@ -9015,6 +9148,62 @@ class Controller:
                 if failure_reason is not None:
                     if self.__retire_deferred_queue_intent(file_id, failure_reason):
                         self.__notify_deferred_queue_failure(intent, failure_reason)
+                    continue
+                # A scan result that was published before the boundary is
+                # authoritative even when this controller turn reached the
+                # deadline.  Admit it into the ordinary collision preflight
+                # rather than turning a healthy handoff into a timeout.
+                if self.__queue_scoped_rescan_ready(intent):
+                    intents.pop(file_id, None)
+                    intent.phase = "collision"
+                    intent.rescan_requested = False
+                    intent.rescan_generations = None
+                    intent.rescan_deadline_monotonic = None
+                    if id(intent.command) not in queued_commands:
+                        self.__command_queue.put(intent.command)
+                    continue
+                deadline = self.__ensure_initial_rescan_deadline(intent)
+                if deadline is not None and time.monotonic() >= deadline:
+                    if not intent.rescan_deadline_grace_consumed:
+                        intent.rescan_deadline_grace_consumed = True
+                        intent.rescan_deadline_monotonic = (
+                            time.monotonic() + self._ACTIVE_PROCESS_INTERVAL_SECONDS
+                        )
+                        self.__record_queue_readiness_trace(file_id, "queue_rescan_readiness", {
+                            "schema": "queue_readiness.v1",
+                            "phase": "rescan_deadline_grace",
+                            "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
+                            "outcome": "pending",
+                            "reason": "awaiting_scan_publication",
+                            "ready": False,
+                        })
+                        continue
+                    self.__record_queue_readiness_trace(file_id, "queue_rescan_readiness", {
+                        "schema": "queue_readiness.v1",
+                        "phase": "rescan_deadline",
+                        "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
+                        "outcome": "timeout",
+                        "reason": "initial_scan_authority_deadline",
+                        "ready": False,
+                    })
+                    # Snapshot old waiters before callbacks. A callback may
+                    # synchronously submit a new Queue request; that request
+                    # belongs to the next attempt and must remain queued.
+                    waiters = self.__take_queued_deferred_queue_waiters(file_id)
+                    self.__retire_deferred_queue_intent(
+                        file_id, "initial_scan_authority_deadline",
+                    )
+                    intent.rescan_deadline_monotonic = None
+                    # Claim restoration can legitimately take later turns.
+                    # The retained intent stays fail-closed in that case, but
+                    # its caller still receives one terminal result now.
+                    self.__notify_deferred_queue_failure(
+                        intent, "initial_scan_authority_deadline",
+                    )
+                    for waiter in waiters:
+                        self.__notify_queue_failure_callbacks(
+                            waiter, "initial_scan_authority_deadline",
+                        )
                     continue
             if intent.phase == "collision":
                 future = getattr(self, "_Controller__collision_compare_future", None)

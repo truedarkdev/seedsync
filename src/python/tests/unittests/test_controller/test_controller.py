@@ -11691,6 +11691,230 @@ class TestController(unittest.TestCase):
         callback.on_failure.assert_called_once()
         callback.on_success.assert_not_called()
 
+    def test_manual_directory_queue_initial_scan_deadline_retires_callback_once(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+        duplicate_callback = MagicMock()
+        duplicate_command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        duplicate_command.add_callback(duplicate_callback)
+
+        with patch.object(Controller, "_DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS", 0.0):
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+            self.assertIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+            intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+            intent.rescan_deadline_monotonic = 0.0
+            intent.rescan_deadline_grace_consumed = True
+
+            # No scan authority arrives.  The next controller turn reaches
+            # the deadline and owns the retained callback failures, including
+            # a duplicate already waiting in the command queue.
+            self.controller.queue_command(duplicate_command)
+            self.controller._Controller__process_commands()
+            self.controller._Controller__process_commands()
+
+        self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_success.assert_not_called()
+        callback.on_failure.assert_called_once_with(
+            "Queue preflight cancelled: initial_scan_authority_deadline", 409,
+        )
+        duplicate_callback.on_success.assert_not_called()
+        duplicate_callback.on_failure.assert_called_once_with(
+            "Queue preflight cancelled: initial_scan_authority_deadline", 409,
+        )
+        readiness = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "queue_rescan_readiness"
+        ]
+        self.assertEqual(
+            ["rescan_request", "rescan_deadline"],
+            [entry["details"]["phase"] for entry in readiness],
+        )
+        self.assertEqual("timeout", readiness[-1]["details"]["outcome"])
+
+    def test_manual_directory_queue_ready_authority_wins_deadline_boundary(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        with patch.object(Controller, "_DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS", 0.0):
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+            self.controller._Controller__scan_authority_tokens = {
+                "local": {"pair-a": ("local-test-session", 1)},
+                "remote": {"pair-a": ("remote-test-session", 1)},
+            }
+            self.controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+            self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+            self.controller._Controller__process_commands()
+            self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            file.name,
+            True,
+            remote_base_dir_path="/remote",
+            local_base_dir_path="/local/incomplete",
+        )
+        callback.on_success.assert_called_once_with()
+        callback.on_failure.assert_not_called()
+
+    def test_manual_directory_queue_deadline_notifies_when_claim_retirement_waits(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        with patch.object(Controller, "_DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS", 0.0), \
+                patch.object(
+                    self.controller, "_Controller__retire_deferred_queue_intent", return_value=False,
+                ):
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+            intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+            intent.rescan_deadline_monotonic = 0.0
+            intent.rescan_deadline_grace_consumed = True
+            self.controller._Controller__process_commands()
+
+        callback.on_success.assert_not_called()
+        callback.on_failure.assert_called_once_with(
+            "Queue preflight cancelled: initial_scan_authority_deadline", 409,
+        )
+
+    def test_manual_directory_queue_deadline_preserves_callback_retry(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        retry = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        callback = MagicMock()
+        callback.on_failure.side_effect = lambda *_: self.controller.queue_command(retry)
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        self.controller._Controller__deferred_queue_intents[
+            file.file_id
+        ].rescan_deadline_monotonic = 0.0
+        self.controller._Controller__deferred_queue_intents[
+            file.file_id
+        ].rescan_deadline_grace_consumed = True
+        self.controller._Controller__process_commands()
+
+        # The retry is consumed in the same drain, but it becomes a distinct
+        # fresh intent rather than being removed with the old waiters.
+        retry_intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+        self.assertIs(retry, retry_intent.command)
+        callback.on_failure.assert_called_once()
+
+    def test_manual_directory_queue_deadline_grace_allows_scan_publication(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+        intent.rescan_deadline_monotonic = 0.0
+        self.controller._Controller__process_commands()
+        self.assertTrue(intent.rescan_deadline_grace_consumed)
+        self.assertIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {"pair-a": ("local-test-session", 1)},
+            "remote": {"pair-a": ("remote-test-session", 1)},
+        }
+        self.controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+        self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+        self.controller._Controller__process_commands()
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            file.name,
+            True,
+            remote_base_dir_path="/remote",
+            local_base_dir_path="/local/incomplete",
+        )
+        callback.on_success.assert_called_once_with()
+
+    def test_manual_directory_queue_stale_initial_scan_unknown_waits_for_deadline(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        self.controller._record_path_pair_scan_tokens(
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-a"},
+                unknown_path_pair_ids={"pair-a"}, is_scan_final=True,
+                generation=0, session_token="local-test-session",
+            ),
+            None,
+        )
+        self.controller._Controller__process_commands()
+
+        self.assertIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        callback.on_failure.assert_not_called()
+
+    def test_manual_directory_queue_initial_scan_final_unknown_retires_once(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        self.controller._record_path_pair_scan_tokens(
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-a"},
+                unknown_path_pair_ids={"pair-a"}, is_scan_final=True,
+                generation=1, session_token="local-test-session",
+            ),
+            None,
+        )
+        self.controller._Controller__process_commands()
+
+        self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_success.assert_not_called()
+        callback.on_failure.assert_called_once_with(
+            "Queue preflight cancelled: initial_local_scan_unknown", 409,
+        )
+
+    def test_manual_directory_queue_initial_scan_missing_pair_token_retires_once(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        missing_token_result = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"},
+            completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            generation=1, session_token="local-test-session",
+        )
+        missing_token_result._scan_authority_tokens_by_pair = {}
+        self.controller._record_path_pair_scan_tokens(missing_token_result, None)
+        self.controller._Controller__process_commands()
+
+        self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_success.assert_not_called()
+        callback.on_failure.assert_called_once_with(
+            "Queue preflight cancelled: initial_local_scan_token_missing", 409,
+        )
+
     def test_manual_directory_queue_later_local_scan_failure_retires_without_dispatch(self):
         file = self._seed_manual_directory_scan_readiness_fixture()
         callback = MagicMock()
