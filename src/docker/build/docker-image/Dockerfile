@@ -22,7 +22,7 @@ RUN npx ng build --configuration production --output-path /build/dist/
 
 # Creates environment to run Seedsync python code
 # Installs all python dependencies
-FROM python:3.12-slim-bullseye AS seedsync_run_python_env
+FROM python:3.12-slim-bookworm AS seedsync_run_python_env
 
 # Install the runtime toolchain in a single layer. The package set stays
 # intentionally unpinned so rebuilds pick up security refreshes.
