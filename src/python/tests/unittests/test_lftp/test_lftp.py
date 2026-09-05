@@ -367,6 +367,11 @@ class TestLftp(unittest.TestCase):
         self.assertTrue(all(event["details"]["read_buffer_byte_length_bucket"] == "0" for event in events))
         self.assertEqual("health", events[-1]["details"]["boundary"])
         self.assertTrue(events[-1]["details"]["healthy"])
+        self.assertEqual("not_required", events[0]["details"]["prior_prompt"])
+        self.assertTrue(events[0]["details"]["send_admitted"])
+        self.assertEqual("unknown", events[0]["details"]["prompt_reached"])
+        self.assertTrue(events[1]["details"]["prompt_reached"])
+        self.assertEqual("unknown", events[1]["details"]["retained_before"])
         self.assertNotIn("jobs -v", repr(events))
 
     def test_status_poll_breadcrumb_exposes_independent_boundary_outcomes(self):
@@ -1126,8 +1131,12 @@ class TestLftp(unittest.TestCase):
 
     def test_status_marks_poll_unhealthy_when_jobs_command_times_out(self):
         lftp = self._build_status_poll_test_lftp(send_side_effect=pexpect.exceptions.TIMEOUT("timeout"))
+        lftp.set_breadcrumb_trace(BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        ))
 
-        statuses = lftp.status()
+        statuses = lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef")
 
         self.assertEqual([], statuses)
         self.assertFalse(lftp.last_status_poll_healthy)
@@ -1138,6 +1147,10 @@ class TestLftp(unittest.TestCase):
         lftp._Lftp__process.send.assert_called_once_with("jobs -v\n")
         lftp._Lftp__process.sendline.assert_not_called()
         lftp._Lftp__process.expect.assert_not_called()
+        event = next(event for event in lftp._Lftp__breadcrumb_trace.snapshot()["entries"]
+                     if event["details"]["phase"] == "prompt_timeout")
+        self.assertEqual("prompt_timeout", event["details"]["phase"])
+        self.assertEqual("timeout", event["details"]["exception_family"])
 
     def test_status_marks_poll_unhealthy_when_jobs_command_eof(self):
         lftp = self._build_status_poll_test_lftp(send_side_effect=pexpect.exceptions.EOF("eof"))

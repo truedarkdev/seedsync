@@ -443,6 +443,7 @@ def _record_lftp_status_poll_breadcrumb(
         process_alive: object, output: object = None, failure_reason: object = None,
         status_count: object = None, healthy: object = None,
         exception: object = None, boundary: object = None,
+        boundary_state: object = None,
 ) -> None:
     """Record bounded PTY status phases without command, output, or path data."""
     safe_correlation = _safe_lftp_status_poll_correlation(correlation)
@@ -493,6 +494,9 @@ def _record_lftp_status_poll_breadcrumb(
             "failure_reason": failure_reason,
             "status_count_bucket": _lftp_trace_count_bucket(status_count),
         }
+        if isinstance(boundary_state, dict):
+            details.update({key: value for key, value in boundary_state.items()
+                            if key in {"prior_prompt", "send_admitted", "prompt_reached", "retained_before"}})
         if isinstance(healthy, bool):
             details["healthy"] = healthy
             if phase == "health":
@@ -992,7 +996,7 @@ class Lftp:
         def record_status_trace(phase: str, output: object = None,
                                 failure_reason: object = None, status_count: object = None,
                                 exception: object = None, healthy: object = None,
-                                boundary: object = None) -> None:
+                                boundary: object = None, boundary_state: object = None) -> None:
             if safe_status_poll_correlation is None:
                 return
             trace = getattr(self, "_Lftp__breadcrumb_trace", None)
@@ -1008,7 +1012,7 @@ class Lftp:
                 trace, safe_status_poll_correlation, phase,
                 process_alive=process_alive, output=output, failure_reason=failure_reason,
                 status_count=status_count, exception=exception, healthy=healthy,
-                boundary=boundary,
+                boundary=boundary, boundary_state=boundary_state,
             )
         if status_poll:
             status_poll_timeout_seconds = STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS if timeout_seconds == 0 else timeout_seconds
@@ -1035,7 +1039,12 @@ class Lftp:
                 if pty_debug_enabled:
                     record_pty_trace("write")
                 record_command_trace("submitted")
-                record_status_trace("submitted")
+                record_status_trace("submitted", boundary_state={
+                    "prior_prompt": pty_readiness,
+                    "send_admitted": True,
+                    "prompt_reached": "unknown",
+                    "retained_before": "unknown",
+                })
             except pexpect.exceptions.TIMEOUT as exc:
                 record_pty_trace("write", "send_error", exc)
                 record_command_trace("prompt_timeout")
@@ -1131,7 +1140,12 @@ class Lftp:
                     self.logger.debug("after: {}".format(after))
 
             if status_poll:
-                record_status_trace("jobs_read", out)
+                record_status_trace("jobs_read", out, boundary_state={
+                    "prior_prompt": pty_readiness,
+                    "send_admitted": True,
+                    "prompt_reached": prompt_reached,
+                    "retained_before": "unknown",
+                })
                 if prompt_reached:
                     record_status_trace("prompt_ready", out)
                 else:
