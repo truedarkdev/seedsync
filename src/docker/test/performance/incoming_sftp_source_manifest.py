@@ -1,0 +1,810 @@
+"""Fail-closed, read-only SFTP source manifest capture for Incoming recovery.
+
+The application transfer path uses LFTP and cannot rely on an SSH shell.  This
+module therefore treats a bounded protocol runner as the transport boundary.
+The runner returns newline-delimited JSON records and an explicit terminal
+record; tests can inject that boundary while the default runner uses LFTP's
+native SFTP directory listing commands only.
+
+No remote path, entry name, credential, process stderr, or exception message
+is retained in a manifest artifact.  A manifest contains counts and one-way
+digests only.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import configparser
+import re
+import secrets
+import shlex
+import signal
+import subprocess
+import threading
+import time
+from typing import Callable, Iterable, Mapping, Sequence
+from urllib.parse import urlsplit
+
+
+class SourceManifestError(ValueError):
+    """A source manifest cannot be trusted or safely persisted."""
+
+    def __init__(self, reason: str):
+        self.reason = reason if reason in _FAILURE_REASONS else "protocol_failure"
+        super().__init__(self.reason)
+
+
+@dataclass(frozen=True)
+class SourceManifestEntry:
+    """One normalized remote entry from the read-only protocol boundary."""
+
+    path: str
+    kind: str = "file"
+    size: int = 0
+    mtime_ns: int = 0
+    mode: int = 0
+
+
+@dataclass(frozen=True)
+class SftpProcessResult:
+    """Bounded process output returned by an injected protocol runner."""
+
+    stdout: bytes | str
+    returncode: int = 0
+    timed_out: bool = False
+    truncated: bool = False
+    sentinel_seen: bool | None = None
+
+
+@dataclass(frozen=True)
+class SourceManifestSnapshot:
+    """Normalized, privacy-safe snapshot of a configured source root."""
+
+    schema: str
+    file_count: int
+    total_bytes: int
+    path_metadata_digest: str
+    root_digest: str
+
+    @property
+    def files(self) -> int:
+        return self.file_count
+
+    @property
+    def bytes(self) -> int:
+        return self.total_bytes
+
+    def as_artifact(self) -> Mapping[str, object]:
+        return {
+            "schema": self.schema,
+            "file_count": self.file_count,
+            "total_bytes": self.total_bytes,
+            "path_metadata_digest": self.path_metadata_digest,
+            "root_digest": self.root_digest,
+        }
+
+
+@dataclass(frozen=True)
+class SourceManifestStability:
+    """Comparison result for two complete source snapshots."""
+
+    stable: bool
+    reason: str
+    first: SourceManifestSnapshot
+    second: SourceManifestSnapshot
+
+    def as_artifact(self) -> Mapping[str, object]:
+        return {
+            "schema": "incoming-recovery-source-manifest-stability.v1",
+            "stable": self.stable,
+            "reason": self.reason,
+            "first": self.first.as_artifact(),
+            "second": self.second.as_artifact(),
+        }
+
+
+_SCHEMA = "incoming-recovery-source-manifest.v1"
+_STABILITY_REASONS = frozenset({"stable", "snapshot_changed"})
+_FAILURE_REASONS = frozenset({
+    "invalid_configuration", "protocol_failure", "process_failed", "process_timeout",
+    "output_truncated", "sentinel_missing", "sentinel_malformed", "record_malformed",
+    "root_listing_missing",
+    "root_escape", "duplicate_entry", "cycle_detected", "symlink_entry",
+    "special_entry", "special_name", "invalid_size", "invalid_metadata",
+    "too_many_entries", "output_too_large", "unstable_snapshot", "artifact_failure",
+})
+_ENTRY_KINDS = frozenset({"file", "directory"})
+_MAX_INTEGER = 2_147_483_647
+_MAX_BYTES = 2**63 - 1
+_SENTINEL = "source_manifest_complete"
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]")
+_SAFE_MODE_RE = re.compile(r"^[bcdlps-][rwxstST-]{9}$")
+_LFTP_LONG_RE = re.compile(
+    r"^(?P<mode>[bcdlps-][rwxstST-]{9})\s+\S+\s+\S+\s+\S+\s+"
+    r"(?P<size>\d+)\s+(?P<mtime>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)\s+(?P<name>.*)$"
+)
+
+
+def _fail(reason: str) -> SourceManifestError:
+    return SourceManifestError(reason)
+
+
+def _root_path(value: object) -> str:
+    if not isinstance(value, str) or not value or _CONTROL_RE.search(value):
+        raise _fail("invalid_configuration")
+    if "\\" in value or "//" in value:
+        raise _fail("invalid_configuration")
+    root = PurePosixPath(value)
+    parts = root.parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise _fail("invalid_configuration")
+    normalized = root.as_posix()
+    if normalized == "." or normalized.endswith("/"):
+        raise _fail("invalid_configuration")
+    return normalized
+
+
+def _safe_name(name: object) -> str:
+    if not isinstance(name, str) or not name or _CONTROL_RE.search(name):
+        raise _fail("special_name")
+    if name in (".", "..") or "/" in name or "\\" in name:
+        raise _fail("special_name")
+    # Shell/glob syntax is not needed by the protocol and makes accidental
+    # command interpretation or ambiguous listings unsafe.
+    if any(character in name for character in "*?[]{};|&$`\""):
+        raise _fail("special_name")
+    return name
+
+
+def _relative_entry_path(value: object, root: str) -> str:
+    if not isinstance(value, str) or not value or _CONTROL_RE.search(value):
+        raise _fail("special_name")
+    if "\\" in value:
+        raise _fail("root_escape")
+    path = PurePosixPath(value)
+    if any(part in ("", ".", "..") for part in path.parts):
+        raise _fail("root_escape")
+    if path.is_absolute():
+        absolute = path.as_posix()
+        if absolute == root:
+            raise _fail("record_malformed")
+        prefix = root + "/"
+        if not absolute.startswith(prefix):
+            raise _fail("root_escape")
+        relative = absolute[len(prefix):]
+    else:
+        relative = path.as_posix()
+    components = relative.split("/")
+    if not components or any(not component for component in components):
+        raise _fail("record_malformed")
+    for component in components:
+        _safe_name(component)
+    return relative
+
+
+def _metadata_value(value: object, *, allow_string: bool = False) -> int | str:
+    if allow_string and isinstance(value, str) and value and not _CONTROL_RE.search(value):
+        return value
+    if type(value) is int and 0 <= value <= _MAX_INTEGER:
+        return value
+    raise _fail("invalid_metadata")
+
+
+def _entry_from_record(record: object, root: str) -> SourceManifestEntry:
+    if not isinstance(record, Mapping):
+        raise _fail("record_malformed")
+    if record.get("record", "entry") != "entry":
+        raise _fail("record_malformed")
+    relative = _relative_entry_path(record.get("path"), root)
+    kind = record.get("kind")
+    if kind not in _ENTRY_KINDS:
+        if kind == "symlink":
+            raise _fail("symlink_entry")
+        if kind in {"block", "char", "fifo", "socket", "special"}:
+            raise _fail("special_entry")
+        raise _fail("record_malformed")
+    size_value = record.get("size")
+    if type(size_value) is not int or size_value < 0 or size_value > _MAX_BYTES:
+        raise _fail("invalid_size")
+    size = size_value
+    mtime_raw = record.get("mtime_ns")
+    if isinstance(mtime_raw, str) and mtime_raw and not _CONTROL_RE.search(mtime_raw):
+        mtime: int | str = mtime_raw
+    elif type(mtime_raw) is int and 0 <= mtime_raw <= _MAX_BYTES:
+        mtime = mtime_raw
+    else:
+        raise _fail("invalid_metadata")
+    mode = _metadata_value(record.get("mode"))
+    if kind == "directory" and size != 0:
+        raise _fail("invalid_size")
+    if kind == "file" and size < 0:
+        raise _fail("invalid_size")
+    if isinstance(mtime, str):
+        mtime_ns = int.from_bytes(hashlib.sha256(mtime.encode("utf-8")).digest()[:8], "big")
+    else:
+        mtime_ns = mtime
+    return SourceManifestEntry(relative, kind, size, mtime_ns, mode)
+
+
+def _encode_entry(entry: SourceManifestEntry) -> bytes:
+    return json.dumps({
+        "record": "entry", "path": entry.path, "kind": entry.kind,
+        "size": entry.size, "mtime_ns": entry.mtime_ns, "mode": entry.mode,
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _parse_protocol_output(output: bytes | str, root: str, *, max_entries: int) -> tuple[list[SourceManifestEntry], bool]:
+    if isinstance(output, str):
+        try:
+            raw = output.encode("utf-8")
+        except UnicodeEncodeError:
+            raise _fail("output_truncated")
+    elif isinstance(output, bytes):
+        raw = output
+    else:
+        raise _fail("protocol_failure")
+    if not raw or not raw.endswith(b"\n"):
+        raise _fail("output_truncated")
+    entries: list[SourceManifestEntry] = []
+    seen: set[str] = set()
+    seen_directories: set[str] = set()
+    sentinel = False
+    lines = raw.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if not line.endswith(b"\n") or len(line) > 16 * 1024:
+            raise _fail("output_truncated")
+        try:
+            record = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise _fail("record_malformed")
+        if not isinstance(record, Mapping):
+            raise _fail("record_malformed")
+        record_type = record.get("record")
+        if record_type == "entry":
+            if sentinel:
+                raise _fail("record_malformed")
+            entry = _entry_from_record(record, root)
+            if entry.path in seen:
+                raise _fail("duplicate_entry")
+            seen.add(entry.path)
+            if entry.kind == "directory":
+                if entry.path in seen_directories:
+                    raise _fail("cycle_detected")
+                seen_directories.add(entry.path)
+            entries.append(entry)
+            if len(entries) > max_entries:
+                raise _fail("too_many_entries")
+            continue
+        if record_type == "end":
+            if sentinel or index != len(lines) - 1:
+                raise _fail("sentinel_malformed")
+            if record.get("sentinel") != _SENTINEL:
+                raise _fail("sentinel_malformed")
+            if type(record.get("entry_count")) is not int or record["entry_count"] != len(entries):
+                raise _fail("sentinel_malformed")
+            if type(record.get("file_count")) is not int or record["file_count"] != sum(e.kind == "file" for e in entries):
+                raise _fail("sentinel_malformed")
+            if type(record.get("total_bytes")) is not int or record["total_bytes"] != sum(e.size for e in entries if e.kind == "file"):
+                raise _fail("sentinel_malformed")
+            sentinel = True
+            continue
+        raise _fail("record_malformed")
+    if not sentinel:
+        raise _fail("sentinel_missing")
+    return entries, True
+
+
+def _manifest_digest(entries: Sequence[SourceManifestEntry]) -> str:
+    digest = hashlib.sha256()
+    for entry in sorted((item for item in entries if item.kind == "file"), key=lambda item: item.path):
+        digest.update(_encode_entry(entry))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _redacted_artifact_error(exc: BaseException) -> Mapping[str, object]:
+    reason = exc.reason if isinstance(exc, SourceManifestError) else "protocol_failure"
+    return {"schema": "incoming-recovery-source-manifest-error.v1", "reason": reason}
+
+
+class ReadOnlySftpProtocolRunner:
+    """Run a native LFTP SFTP listing using only read-only commands.
+
+    ``remote`` must be a credential-free host target such as ``sftp://host``.
+    Credentials are supplied by the caller's existing LFTP environment or
+    configuration, never interpolated into a command string or artifact.
+    """
+
+    _COMMANDS = ("set", "open", "cd", "cls", "echo", "bye")
+
+    def __init__(
+        self,
+        remote: str | None = None,
+        *,
+        host: str | None = None,
+        port: int = 22,
+        executable: str = "lftp",
+        environment: Mapping[str, str] | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        known_hosts_file: str | os.PathLike[str] | None = None,
+    ):
+        if remote is not None:
+            if not isinstance(remote, str) or not remote.startswith("sftp://"):
+                raise _fail("invalid_configuration")
+            try:
+                parsed = urlsplit(remote)
+                uri_port = parsed.port
+            except ValueError:
+                raise _fail("invalid_configuration")
+            if (
+                parsed.scheme != "sftp" or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or uri_port is not None or parsed.path or parsed.query or parsed.fragment
+            ):
+                raise _fail("invalid_configuration")
+            host = "[" + parsed.hostname + "]" if ":" in parsed.hostname else parsed.hostname
+        if not isinstance(host, str) or not host or _CONTROL_RE.search(host):
+            raise _fail("invalid_configuration")
+        if any(character in host for character in "/\\@?#%"):
+            raise _fail("invalid_configuration")
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise _fail("invalid_configuration")
+        if ":" in host and not (host.startswith("[") and host.endswith("]")):
+            # Raw IPv6 is accepted only when bracketed in the host field so
+            # the generated SFTP URI remains unambiguous.
+            raise _fail("invalid_configuration")
+        self.executable = executable
+        self.environment = dict(environment or {})
+        if username is not None and (not isinstance(username, str) or not username or _CONTROL_RE.search(username)):
+            raise _fail("invalid_configuration")
+        if password is not None and (not isinstance(password, str) or _CONTROL_RE.search(password)):
+            raise _fail("invalid_configuration")
+        if password is not None and username is None:
+            raise _fail("invalid_configuration")
+        if known_hosts_file is not None:
+            if not isinstance(known_hosts_file, (str, os.PathLike)):
+                raise _fail("invalid_configuration")
+            known_hosts_file = os.fspath(known_hosts_file)
+            if not known_hosts_file or _CONTROL_RE.search(known_hosts_file):
+                raise _fail("invalid_configuration")
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.known_hosts_file = known_hosts_file
+        self.remote = "sftp://" + host
+
+    def __call__(self, root: str, *, timeout_seconds: float, max_output_bytes: int) -> SftpProcessResult:
+        # The root is quoted as an LFTP argument; it is never a shell command.
+        root_json = json.dumps(root)
+        connection = f"open"
+        if self.username is not None:
+            credentials = self.username + "," + (self.password or "")
+            connection += " -u " + json.dumps(credentials)
+        if self.port != 22:
+            connection += f" -p {self.port}"
+        connection += " " + json.dumps(self.remote)
+        connect_program = ""
+        if self.known_hosts_file is not None:
+            connect_program = (
+                "set sftp:connect-program "
+                + json.dumps(
+                    "ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile="
+                    + shlex.quote(self.known_hosts_file)
+                )
+                + "\n"
+            )
+        script = (
+            "set cmd:interactive false\n"
+            "set cmd:fail-exit yes\n"
+            "set net:max-retries 0\n"
+            f"set net:timeout {int(max(1, timeout_seconds))}\n"
+            + connect_program
+            + connection + "\n"
+            f"cd {root_json}\n"
+            "cls -lR --time-style=long-iso\n"
+            f"echo {_SENTINEL}\n"
+            "bye\n"
+        )
+        try:
+            completed = _run_bounded_process(
+                [self.executable, "--norc", "--quiet"], script.encode("utf-8"),
+                timeout_seconds, max_output_bytes,
+                environment=self.environment,
+            )
+        except (OSError, ValueError):
+            return SftpProcessResult(b"", returncode=-1)
+        if completed.timed_out or completed.truncated or completed.returncode != 0:
+            return completed
+        stdout = completed.stdout if isinstance(completed.stdout, bytes) else b""
+        try:
+            entries = _parse_lftp_listing(stdout, root)
+            protocol = b"".join(_encode_entry(entry) + b"\n" for entry in entries)
+            protocol += json.dumps({
+                "record": "end", "sentinel": _SENTINEL,
+                "entry_count": len(entries), "file_count": sum(e.kind == "file" for e in entries),
+                "total_bytes": sum(e.size for e in entries if e.kind == "file"),
+            }, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+            return SftpProcessResult(protocol, 0, sentinel_seen=True)
+        except SourceManifestError as exc:
+            return SftpProcessResult(
+                b"", completed.returncode,
+                truncated=exc.reason in {"output_truncated", "record_malformed", "sentinel_malformed"},
+                sentinel_seen=False if exc.reason.startswith("sentinel_") else None,
+            )
+
+
+def _run_bounded_process(
+    argv: Sequence[str], input_bytes: bytes, timeout_seconds: float, max_output_bytes: int,
+    *, environment: Mapping[str, str] | None = None,
+) -> SftpProcessResult:
+    """Run the protocol process while bounding retained stdout and stderr."""
+    process_environment = dict(os.environ)
+    process_environment.update(environment or {})
+    process = subprocess.Popen(
+        list(argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=process_environment, start_new_session=os.name != "nt",
+    )
+    stdout_chunks: list[bytes] = []
+    stdout_size = 0
+    stderr_size = 0
+    overflow = threading.Event()
+
+    def drain(stream: object, retain: bool) -> None:
+        nonlocal stdout_size, stderr_size
+        while True:
+            chunk = stream.read(65536)  # type: ignore[attr-defined]
+            if not chunk:
+                return
+            if retain:
+                stdout_size += len(chunk)
+                if stdout_size > max_output_bytes:
+                    overflow.set()
+                    return
+                stdout_chunks.append(chunk)
+            else:
+                stderr_size += len(chunk)
+                if stderr_size > max_output_bytes:
+                    overflow.set()
+                    return
+
+    stdout_thread = threading.Thread(target=drain, args=(process.stdout, True), daemon=True)
+    stderr_thread = threading.Thread(target=drain, args=(process.stderr, False), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    def kill_process() -> None:
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                return
+            except (OSError, ProcessLookupError):
+                pass
+        process.kill()
+
+    try:
+        if process.stdin is not None:
+            process.stdin.write(input_bytes)
+            process.stdin.close()
+        deadline = time.monotonic() + timeout_seconds
+        timed_out = False
+        while process.poll() is None:
+            if overflow.is_set():
+                kill_process()
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                kill_process()
+                break
+            time.sleep(0.01)
+        returncode = process.wait()
+    finally:
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+    if overflow.is_set():
+        return SftpProcessResult(bytes(stdout_chunks), returncode, truncated=True)
+    return SftpProcessResult(bytes(stdout_chunks), returncode, timed_out=timed_out)
+
+
+def _parse_lftp_listing(output: bytes, root: str) -> list[SourceManifestEntry]:
+    try:
+        text = output.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _fail("record_malformed")
+    entries: list[SourceManifestEntry] = []
+    current = root
+    sentinel_seen = False
+    root_header_seen = False
+    nonempty_lines = [line for line in text.splitlines() if line.strip()]
+    for line_index, raw_line in enumerate(nonempty_lines):
+        if raw_line == _SENTINEL:
+            if sentinel_seen or line_index != len(nonempty_lines) - 1:
+                raise _fail("sentinel_malformed")
+            sentinel_seen = True
+            continue
+        if not raw_line.strip() or raw_line.startswith("total "):
+            continue
+        match = _LFTP_LONG_RE.match(raw_line)
+        if match:
+            if not root_header_seen:
+                raise _fail("root_listing_missing")
+            mode = match.group("mode")
+            if not _SAFE_MODE_RE.match(mode):
+                raise _fail("special_entry")
+            marker = mode[0]
+            if marker == "l":
+                raise _fail("symlink_entry")
+            if marker not in "-d":
+                raise _fail("special_entry")
+            name = _safe_name(match.group("name"))
+            path = current + "/" + name
+            kind = "directory" if marker == "d" else "file"
+            size = int(match.group("size"))
+            if size > _MAX_BYTES:
+                raise _fail("invalid_size")
+            metadata = match.group("mtime")
+            mode_value = 0
+            for offset, triplet in enumerate((mode[1:4], mode[4:7], mode[7:10])):
+                bits = 0
+                if triplet[0] in "rR":
+                    bits |= 4
+                if triplet[1] in "wW":
+                    bits |= 2
+                if triplet[2] in "xXsStT":
+                    bits |= 1
+                mode_value |= bits << (6 - offset * 3)
+            entries.append(SourceManifestEntry(
+                _relative_entry_path(path, root), kind, 0 if kind == "directory" else size,
+                int.from_bytes(hashlib.sha256(metadata.encode("utf-8")).digest()[:8], "big"), mode_value,
+            ))
+            continue
+        if raw_line.endswith(":") and not raw_line.startswith(" "):
+            candidate = raw_line[:-1]
+            if candidate.startswith("/"):
+                header_path = PurePosixPath(candidate)
+            else:
+                header_path = PurePosixPath(root) / candidate
+            normalized = header_path.as_posix()
+            if normalized == root:
+                root_header_seen = True
+                current = normalized
+                continue
+            prefix = root + "/"
+            if not normalized.startswith(prefix):
+                raise _fail("root_escape")
+            relative_header = normalized[len(prefix):]
+            if any(part in ("", ".", "..") for part in PurePosixPath(relative_header).parts):
+                raise _fail("root_escape")
+            for component in relative_header.split("/"):
+                _safe_name(component)
+            current = normalized
+            continue
+        raise _fail("record_malformed")
+    if not sentinel_seen:
+        raise _fail("sentinel_missing")
+    if not root_header_seen:
+        raise _fail("root_listing_missing")
+    return entries
+
+
+class SourceManifestHarness:
+    """Capture and persist stable, read-only SFTP source manifests."""
+
+    def __init__(
+        self,
+        configured_root: str,
+        protocol_runner: Callable[..., object] | None = None,
+        *,
+        timeout_seconds: float = 30.0,
+        max_entries: int = 100_000,
+        max_output_bytes: int = 64 * 1024 * 1024,
+        remote: str | None = None,
+        host: str | None = None,
+        port: int = 22,
+        username: str | None = None,
+        password: str | None = None,
+        known_hosts_file: str | os.PathLike[str] | None = None,
+    ):
+        self.root = _root_path(configured_root)
+        if type(timeout_seconds) not in (int, float) or timeout_seconds <= 0 or timeout_seconds > 300:
+            raise _fail("invalid_configuration")
+        if type(max_entries) is not int or max_entries <= 0 or max_entries > 1_000_000:
+            raise _fail("invalid_configuration")
+        if type(max_output_bytes) is not int or max_output_bytes <= 0 or max_output_bytes > 512 * 1024 * 1024:
+            raise _fail("invalid_configuration")
+        self.timeout_seconds = float(timeout_seconds)
+        self.max_entries = max_entries
+        self.max_output_bytes = max_output_bytes
+        if protocol_runner is None and remote is None and host is None:
+            remote = os.environ.get("INCOMING_RECOVERY_SFTP_REMOTE")
+        if protocol_runner is None and remote is None and host is not None:
+            remote = "sftp://" + host
+        if protocol_runner is None and remote is not None:
+            protocol_runner = ReadOnlySftpProtocolRunner(
+                remote, host=host, port=port, username=username, password=password,
+                known_hosts_file=known_hosts_file,
+            )
+        self.protocol_runner = protocol_runner
+
+    def _run(self) -> SourceManifestSnapshot:
+        if self.protocol_runner is None:
+            raise _fail("invalid_configuration")
+        try:
+            result = self.protocol_runner(
+                self.root, timeout_seconds=self.timeout_seconds,
+                max_output_bytes=self.max_output_bytes,
+            )
+        except TypeError:
+            # Small injected runners are convenient in tests; the bounded
+            # keyword form remains the maintained contract.
+            try:
+                result = self.protocol_runner(self.root)
+            except Exception:
+                raise _fail("protocol_failure")
+        except Exception:
+            raise _fail("protocol_failure")
+        if isinstance(result, SftpProcessResult):
+            if result.timed_out:
+                raise _fail("process_timeout")
+            if result.truncated:
+                raise _fail("output_truncated")
+            if result.sentinel_seen is False:
+                raise _fail("sentinel_missing")
+            if result.returncode != 0:
+                raise _fail("process_failed")
+            output = result.stdout
+        elif isinstance(result, Mapping):
+            output = result.get("stdout")
+            if result.get("timed_out"):
+                raise _fail("process_timeout")
+            if result.get("truncated"):
+                raise _fail("output_truncated")
+            if result.get("sentinel_seen") is False:
+                raise _fail("sentinel_missing")
+            if type(result.get("returncode", 0)) is not int or result.get("returncode", 0) != 0:
+                raise _fail("process_failed")
+        elif isinstance(result, (bytes, str)):
+            output = result
+        elif isinstance(result, Iterable):
+            try:
+                records = list(result)
+            except Exception:
+                raise _fail("protocol_failure")
+            protocol_records = []
+            for item in records:
+                if isinstance(item, SourceManifestEntry):
+                    protocol_records.append(_encode_entry(item))
+                elif isinstance(item, Mapping):
+                    record = dict(item)
+                    record.setdefault("record", "entry")
+                    protocol_records.append(json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+                else:
+                    raise _fail("record_malformed")
+                if len(protocol_records) > self.max_entries:
+                    raise _fail("too_many_entries")
+            output = b"\n".join(protocol_records)
+            if protocol_records:
+                output += b"\n"
+            output += json.dumps({
+                "record": "end", "sentinel": _SENTINEL,
+                "entry_count": len(records),
+                "file_count": sum(
+                    isinstance(item, SourceManifestEntry) and item.kind == "file"
+                    or isinstance(item, Mapping) and item.get("kind") == "file"
+                    for item in records
+                ),
+                "total_bytes": sum(
+                    item.size if isinstance(item, SourceManifestEntry) and item.kind == "file"
+                    else item.get("size", 0) if isinstance(item, Mapping) and item.get("kind") == "file"
+                    else 0
+                    for item in records
+                ),
+            }, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+        else:
+            raise _fail("protocol_failure")
+        if isinstance(output, bytes) and len(output) > self.max_output_bytes:
+            raise _fail("output_too_large")
+        if isinstance(output, str) and len(output.encode("utf-8")) > self.max_output_bytes:
+            raise _fail("output_too_large")
+        try:
+            entries, _ = _parse_protocol_output(output, self.root, max_entries=self.max_entries)
+        except SourceManifestError:
+            raise
+        file_entries = [entry for entry in entries if entry.kind == "file"]
+        return SourceManifestSnapshot(
+            _SCHEMA, len(file_entries), sum(entry.size for entry in file_entries),
+            _manifest_digest(entries),
+            hashlib.sha256(self.root.encode("utf-8")).hexdigest(),
+        )
+
+    def snapshot(self) -> SourceManifestSnapshot:
+        return self._run()
+
+    capture = snapshot
+
+    def capture_stable(self, *, delay_seconds: float = 0.0) -> SourceManifestSnapshot:
+        first = self.snapshot()
+        if delay_seconds:
+            if delay_seconds < 0 or delay_seconds > 300:
+                raise _fail("invalid_configuration")
+            time.sleep(delay_seconds)
+        second = self.snapshot()
+        comparison = compare_source_snapshots(first, second)
+        if not comparison.stable:
+            raise _fail("unstable_snapshot")
+        return second
+
+    def compare_stability(
+        self, first: SourceManifestSnapshot, second: SourceManifestSnapshot,
+    ) -> SourceManifestStability:
+        return compare_source_snapshots(first, second)
+
+    def write_snapshot(self, snapshot: SourceManifestSnapshot, output_path: str | os.PathLike[str]) -> None:
+        if not isinstance(snapshot, SourceManifestSnapshot) or snapshot.schema != _SCHEMA:
+            raise _fail("artifact_failure")
+        _write_private_atomic(snapshot.as_artifact(), output_path)
+
+    def capture_stable_to(self, output_path: str | os.PathLike[str], *, delay_seconds: float = 0.0) -> SourceManifestSnapshot:
+        snapshot = self.capture_stable(delay_seconds=delay_seconds)
+        self.write_snapshot(snapshot, output_path)
+        return snapshot
+
+
+def compare_source_snapshots(first: SourceManifestSnapshot, second: SourceManifestSnapshot) -> SourceManifestStability:
+    if not isinstance(first, SourceManifestSnapshot) or not isinstance(second, SourceManifestSnapshot):
+        raise _fail("invalid_metadata")
+    stable = (
+        first.schema == second.schema == _SCHEMA
+        and first.file_count == second.file_count
+        and first.total_bytes == second.total_bytes
+        and first.path_metadata_digest == second.path_metadata_digest
+    )
+    return SourceManifestStability(stable, "stable" if stable else "snapshot_changed", first, second)
+
+
+def _write_private_atomic(payload: Mapping[str, object], output_path: str | os.PathLike[str]) -> None:
+    try:
+        destination = Path(output_path)
+        if not destination.name or destination.name in (".", ".."):
+            raise OSError
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        data = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        temporary = destination.with_name("." + destination.name + "." + secrets.token_hex(8) + ".tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, destination)
+            try:
+                directory_descriptor = os.open(destination.parent, os.O_RDONLY)
+            except OSError:
+                directory_descriptor = -1
+            if directory_descriptor >= 0:
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    except (OSError, TypeError, ValueError):
+        try:
+            if "temporary" in locals() and temporary.exists():
+                temporary.unlink()
+        except OSError:
+            pass
+        raise _fail("artifact_failure")
+
+
+# Names used by callers that prefer the longer, explicit role description.
+SftpSourceManifestHarness = SourceManifestHarness
+SftpSourceManifest = SourceManifestHarness
+SourceManifestCollector = SourceManifestHarness
+redacted_manifest_error = _redacted_artifact_error

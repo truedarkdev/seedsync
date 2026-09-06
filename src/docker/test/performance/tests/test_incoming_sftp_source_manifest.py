@@ -1,0 +1,197 @@
+import importlib.util
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+import pytest
+
+
+SPEC = importlib.util.spec_from_file_location(
+    "incoming_sftp_source_manifest",
+    Path(__file__).parents[1] / "incoming_sftp_source_manifest.py",
+)
+manifest = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = manifest
+assert SPEC.loader is not None
+SPEC.loader.exec_module(manifest)
+
+
+ROOT = "/fixture/incoming"
+
+
+def protocol(records):
+    payload = [dict(record) for record in records]
+    files = [record for record in payload if record.get("kind") == "file"]
+    payload.append({
+        "record": "end",
+        "sentinel": "source_manifest_complete",
+        "entry_count": len(records),
+        "file_count": len(files),
+        "total_bytes": sum(record.get("size", 0) for record in files),
+    })
+    return "".join(json.dumps(record, sort_keys=True) + "\n" for record in payload)
+
+
+def nested_records(count=400):
+    records = []
+    for index in range(count):
+        directory = f"branch-{index % 20:02d}/leaf-{index % 10:02d}"
+        records.append({
+            "record": "entry", "path": f"{directory}/file-{index:04d}.bin",
+            "kind": "file", "size": index + 1, "mtime_ns": index + 100,
+            "mode": 0o644,
+        })
+    return records
+
+
+def test_nested_fixture_is_deterministic_and_has_normalized_digest():
+    records = nested_records()
+    first = manifest.SourceManifestHarness(ROOT, lambda _root: protocol(records)).snapshot()
+    shuffled = list(reversed(records))
+    second = manifest.SourceManifestHarness(ROOT, lambda _root: protocol(shuffled)).snapshot()
+    assert first.file_count == 400
+    assert first.total_bytes == sum(range(1, 401))
+    assert first.path_metadata_digest == second.path_metadata_digest
+    assert first.root_digest == second.root_digest
+
+
+def test_injected_protocol_is_read_only_and_has_no_side_effect_commands():
+    calls = []
+
+    def runner(root, **limits):
+        calls.append((root, limits))
+        return protocol(nested_records(2))
+
+    harness = manifest.SourceManifestHarness(ROOT, runner)
+    snapshot = harness.snapshot()
+    assert snapshot.file_count == 2
+    assert calls[0][0] == ROOT
+    assert calls[0][1]["timeout_seconds"] == 30.0
+    assert calls[0][1]["max_output_bytes"] > 0
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        protocol(nested_records(1)).rsplit("{", 1)[0],
+        manifest.SftpProcessResult(protocol(nested_records(1)), returncode=1),
+        manifest.SftpProcessResult(protocol(nested_records(1)), truncated=True),
+        manifest.SftpProcessResult(protocol(nested_records(1)), timed_out=True),
+    ],
+)
+def test_incomplete_or_failed_protocol_output_is_rejected(result):
+    harness = manifest.SourceManifestHarness(ROOT, lambda _root: result)
+    with pytest.raises(manifest.SourceManifestError):
+        harness.snapshot()
+
+
+def test_missing_terminal_sentinel_is_rejected():
+    records = nested_records(1)
+    output = "".join(json.dumps(record) + "\n" for record in records)
+    with pytest.raises(manifest.SourceManifestError, match="sentinel_missing"):
+        manifest.SourceManifestHarness(ROOT, lambda _root: output).snapshot()
+
+
+def test_unstable_two_snapshot_capture_fails_closed_without_writing_output(tmp_path):
+    outputs = iter((protocol(nested_records(1)), protocol(nested_records(2))))
+    output_path = tmp_path / "source-manifest.json"
+    harness = manifest.SourceManifestHarness(ROOT, lambda _root: next(outputs))
+    with pytest.raises(manifest.SourceManifestError, match="unstable_snapshot"):
+        harness.capture_stable_to(output_path)
+    assert not output_path.exists()
+
+
+def test_duplicate_cycle_symlink_and_special_name_fail_closed():
+    records = nested_records(1)
+    cases = [
+        records + records,
+        [{"record": "entry", "path": "loop", "kind": "directory", "size": 0, "mtime_ns": 1, "mode": 0o755}] * 2,
+        [{"record": "entry", "path": "link", "kind": "symlink", "size": 0, "mtime_ns": 1, "mode": 0}],
+        [{"record": "entry", "path": "bad\nname", "kind": "file", "size": 1, "mtime_ns": 1, "mode": 0o644}],
+    ]
+    for case in cases:
+        with pytest.raises(manifest.SourceManifestError):
+            manifest.SourceManifestHarness(ROOT, lambda _root, case=case: protocol(case)).snapshot()
+
+
+def test_root_confinement_rejects_escape_and_accepts_configured_absolute_root():
+    record = {"record": "entry", "path": "/other/file", "kind": "file", "size": 1, "mtime_ns": 1, "mode": 0o644}
+    with pytest.raises(manifest.SourceManifestError, match="root_escape"):
+        manifest.SourceManifestHarness(ROOT, lambda _root: protocol([record])).snapshot()
+
+    record["path"] = ROOT + "/file"
+    snapshot = manifest.SourceManifestHarness(ROOT, lambda _root: protocol([record])).snapshot()
+    assert snapshot.file_count == 1
+
+
+def test_snapshot_output_is_private_atomic_and_redacts_root_and_names(tmp_path):
+    output = tmp_path / "manifest.json"
+    harness = manifest.SourceManifestHarness(
+        "/private/credential-root", lambda _root: protocol(nested_records(1)),
+    )
+    snapshot = harness.capture_stable()
+    harness.write_snapshot(snapshot, output)
+    if os.name != "nt":
+        assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    text = output.read_text(encoding="utf-8")
+    assert "/private/credential-root" not in text
+    assert "file-0000.bin" not in text
+    assert "path_metadata_digest" in json.loads(text)
+
+    error = manifest.redacted_manifest_error(manifest.SourceManifestError("special_name"))
+    assert "credential-root" not in str(error)
+    assert "file-0000.bin" not in str(error)
+
+
+def test_explicit_host_cannot_be_overridden_by_inherited_remote(monkeypatch):
+    monkeypatch.setenv("INCOMING_RECOVERY_SFTP_REMOTE", "sftp://wrong.invalid")
+    harness = manifest.SourceManifestHarness(ROOT, host="right.invalid", username="user")
+    assert harness.protocol_runner.host == "right.invalid"
+
+
+def test_bracketed_ipv6_uri_is_normalized_without_uri_credentials():
+    protocol = manifest.ReadOnlySftpProtocolRunner("sftp://[2001:db8::1]")
+    assert protocol.host == "[2001:db8::1]"
+
+
+def test_lftp_listing_requires_root_header_and_parses_colon_filename_before_header_logic():
+    listing = (
+        b"/fixture/incoming:\n"
+        b"-rw-r--r-- 1 user group 4 2026-01-01 00:00 legal:name:\n"
+        b"source_manifest_complete\n"
+    )
+    records = manifest._parse_lftp_listing(listing, ROOT)
+    assert records[0].path == "legal:name:"
+
+    with pytest.raises(manifest.SourceManifestError, match="root_listing_missing"):
+        manifest._parse_lftp_listing(b"source_manifest_complete\n", ROOT)
+    with pytest.raises(manifest.SourceManifestError, match="root_listing_missing"):
+        manifest._parse_lftp_listing(
+            b"-rw-r--r-- 1 user group 4 2026-01-01 00:00 file\nsource_manifest_complete\n",
+            ROOT,
+        )
+
+
+def test_remote_uri_is_host_only_and_credentials_are_separate():
+    for remote in (
+        "sftp://user@example.invalid", "sftp://example.invalid:22",
+        "sftp://example.invalid/root", "sftp://example.invalid?secret=1",
+        "sftp://user:password@example.invalid", "sftp://example.invalid#fragment",
+    ):
+        with pytest.raises(manifest.SourceManifestError, match="invalid_configuration"):
+            manifest.ReadOnlySftpProtocolRunner(remote)
+    runner = manifest.ReadOnlySftpProtocolRunner(
+        host="example.invalid", port=2222, username="user", password="secret",
+    )
+    assert runner.remote == "sftp://example.invalid"
+
+
+def test_bounded_process_stops_on_stdout_or_stderr_overflow():
+    result = manifest._run_bounded_process(
+        [sys.executable, "-c", "import sys; sys.stdout.write('x' * 100000); sys.stderr.write('e' * 100000)"],
+        b"", 5, 1024,
+    )
+    assert result.truncated is True
+    assert len(result.stdout) <= 1024
