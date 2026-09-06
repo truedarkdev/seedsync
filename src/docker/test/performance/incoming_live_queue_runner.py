@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 from pathlib import Path
 import sys
@@ -9,7 +10,18 @@ import urllib.request
 from urllib.error import HTTPError
 from urllib.parse import quote
 
-from incoming_recovery_observer import PassiveQueueCaller, QueueGate, QueueTransportResponse
+_helper_path = Path(__file__).with_name("incoming-recovery-observer.py")
+if not _helper_path.is_file():
+    _helper_path = Path(__file__).with_name("incoming_recovery_observer.py")
+_spec = importlib.util.spec_from_file_location("incoming_recovery_observer", _helper_path)
+if _spec is None or _spec.loader is None:
+    raise RuntimeError("maintained observer helper is unavailable")
+_observer = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _observer
+_spec.loader.exec_module(_observer)
+PassiveQueueCaller = _observer.PassiveQueueCaller
+QueueGate = _observer.QueueGate
+QueueTransportResponse = _observer.QueueTransportResponse
 
 
 class HttpAdapter:
