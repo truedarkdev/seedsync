@@ -294,3 +294,50 @@ def test_real_lftp_source_manifest_is_local_strict_and_stable(tmp_path, monkeypa
         assert fixture["root"] not in output_path.read_text(encoding="utf-8")
         assert "file-0000.bin" not in output_path.read_text(encoding="utf-8")
         assert "source_manifest_complete" not in output_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(("case", "expected_stage"), (
+    ("missing_root", "root"),
+    ("unreadable_root", "root"),
+    ("unreadable_child", "enumeration"),
+))
+def test_real_lftp_source_manifest_failure_phases_are_private(tmp_path, monkeypatch, case, expected_stage):
+    required = ("lftp", "ssh", "ssh-keygen", "ssh-keyscan", "sshd")
+    missing = [name for name in required if not _command_available(name)]
+    if missing:
+        pytest.skip("missing local integration tools: " + ", ".join(missing))
+
+    with _local_sftp_fixture() as fixture:
+        monkeypatch.setenv("HOME", fixture["home"])
+        monkeypatch.setenv("PATH", fixture["path_prefix"] + os.pathsep + os.environ["PATH"])
+        source_root = Path(fixture["root"])
+        inaccessible = source_root if case == "unreadable_root" else source_root / "blocked child"
+        if case == "unreadable_child":
+            inaccessible.mkdir()
+        if case != "missing_root":
+            inaccessible.chmod(0)
+        selected_root = "missing root" if case == "missing_root" else fixture["selected_root"]
+        connection_path = tmp_path / f"{case}-connection.json"
+        config_path = tmp_path / f"{case}-config.json"
+        artifact_path = tmp_path / f"{case}-artifact.json"
+        connection_path.write_text(json.dumps({
+            "host": fixture["host"], "port": fixture["port"],
+            "username": fixture["username"], "remote_path": fixture["remote_base"],
+        }), encoding="utf-8")
+        connection_path.chmod(0o600)
+        config_path.write_text(json.dumps({"source_manifest": {
+            "root": selected_root, "connection_config_path": str(connection_path),
+            "known_hosts_file": fixture["known_hosts_file"], "artifact_path": str(artifact_path),
+            "delay_seconds": 0.0,
+        }}), encoding="utf-8")
+        try:
+            with pytest.raises(manifest.SourceManifestError, match="process_failed") as raised:
+                runner.main(str(config_path), source_manifest=True)
+        finally:
+            if case != "missing_root":
+                inaccessible.chmod(0o700)
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        assert payload == manifest.redacted_manifest_error(raised.value)
+        assert payload["stage"] == expected_stage
+        assert fixture["root"] not in str(payload)
+        assert "blocked child" not in str(payload)

@@ -119,15 +119,15 @@ _FAILURE_REASONS = frozenset({
     "special_entry", "special_name", "invalid_size", "invalid_metadata",
     "too_many_entries", "output_too_large", "unstable_snapshot", "artifact_failure",
 })
-_FAILURE_STAGES = frozenset({"launch", "connection", "root", "listing", "sentinel", "parse"})
+_FAILURE_STAGES = frozenset({"launch", "connection", "open", "root", "listing", "enumeration", "completion", "sentinel", "parse"})
 _ENTRY_KINDS = frozenset({"file", "directory"})
 _MAX_INTEGER = 2_147_483_647
 _MAX_BYTES = 2**63 - 1
 _SENTINEL = "source_manifest_complete"
 _STAGE_MARKERS = (
-    "source_manifest_stage_started",
-    "source_manifest_stage_connected",
-    "source_manifest_stage_root",
+    "source_manifest_phase_open",
+    "source_manifest_phase_root",
+    "source_manifest_phase_enumeration",
 )
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]")
 _SAFE_MODE_RE = re.compile(r"^[bcdlps-][rwxstST-]{9}$")
@@ -429,11 +429,11 @@ class ReadOnlySftpProtocolRunner:
             "set net:max-retries 0\n"
             f"set net:timeout {int(max(1, timeout_seconds))}\n"
             + connect_program
-            + f"echo {_STAGE_MARKERS[0]}\n"
             + connection + "\n"
-            + f"echo {_STAGE_MARKERS[1]}\n"
+            + f"echo {_STAGE_MARKERS[0]}\n"
             f"cd {root_json}\n"
-            f"echo {_STAGE_MARKERS[2]}\n"
+            + f"echo {_STAGE_MARKERS[1]}\n"
+            + f"echo {_STAGE_MARKERS[2]}\n"
             "find -l .\n"
             "bye\n"
         )
@@ -665,7 +665,11 @@ def _failure_stage_from_output(output: bytes) -> str:
     for index, marker in enumerate(_STAGE_MARKERS):
         if marker in lines:
             marker_index = index
-    return ("launch", "connection", "root", "listing")[marker_index + 1]
+    if marker_index < 0:
+        return "launch"
+    # Markers are written immediately after open/cd and immediately before the
+    # recursive find.  They identify the operation that could have failed next.
+    return ("root", "enumeration", "enumeration")[marker_index]
 
 
 class SourceManifestHarness:

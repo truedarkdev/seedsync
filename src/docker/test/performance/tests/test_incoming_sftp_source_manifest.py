@@ -233,9 +233,9 @@ def test_lftp_listing_requires_root_header_and_parses_colon_filename_before_head
 
 def test_lftp_relative_listing_keeps_selected_nested_root_and_special_names():
     listing = (
-        b"source_manifest_stage_started\n"
-        b"source_manifest_stage_connected\n"
-        b"source_manifest_stage_root\n"
+        b"source_manifest_phase_open\n"
+        b"source_manifest_phase_root\n"
+        b"source_manifest_phase_enumeration\n"
         b"drwxr-xr-x                      - - ./\n"
         b"-rw-r--r-- user/group 4 2026-01-01 00:00 ./fixture/incoming/selected/child [1].bin\n"
         b"source_manifest_complete\n"
@@ -246,10 +246,10 @@ def test_lftp_relative_listing_keeps_selected_nested_root_and_special_names():
 
 def test_lftp_find_listing_requires_ordered_fixed_markers_and_discards_progress_path():
     listing = (
-        b"source_manifest_stage_started\n"
-        b"source_manifest_stage_connected\n"
+        b"source_manifest_phase_open\n"
+        b"source_manifest_phase_root\n"
         b"cd ok, cwd=/private/source/root\n"
-        b"source_manifest_stage_root\n"
+        b"source_manifest_phase_enumeration\n"
         b"drwxr-xr-x                      - - ./\n"
         b"-rw-r--r-- user/group 4 2026-01-01 00:00 ./nested/file.bin\n"
         b"source_manifest_complete\n"
@@ -259,8 +259,20 @@ def test_lftp_find_listing_requires_ordered_fixed_markers_and_discards_progress_
 
     with pytest.raises(manifest.SourceManifestError, match="sentinel_malformed"):
         manifest._parse_lftp_listing(listing.replace(
-            b"source_manifest_stage_connected\n", b"",
+            b"source_manifest_phase_root\n", b"",
         ), ROOT)
+
+
+def test_lftp_listing_strips_trusted_absolute_root_prefix_once():
+    absolute_root = "/home/remoteuser/files/nested/Incoming"
+    listing = (
+        b"source_manifest_phase_open\nsource_manifest_phase_root\n"
+        b"/home/remoteuser/files/nested/Incoming:\n"
+        b"-rw-r--r-- user/group 1 2026-01-01 00:00 child.bin\n"
+        b"source_manifest_phase_enumeration\n"
+        b"source_manifest_complete\n"
+    )
+    assert manifest._parse_lftp_listing(listing, absolute_root)[0].path == "child.bin"
 
 
 def test_lftp_high_bit_timestamp_hash_is_normalized_before_protocol_encoding():
@@ -269,8 +281,8 @@ def test_lftp_high_bit_timestamp_hash_is_normalized_before_protocol_encoding():
     assert raw > manifest._MAX_BYTES
     records = manifest._parse_lftp_listing(
         (
-            "source_manifest_stage_started\nsource_manifest_stage_connected\n"
-            "source_manifest_stage_root\ndrwxr-xr-x                      - - ./\n"
+            "source_manifest_phase_open\nsource_manifest_phase_root\n"
+            "source_manifest_phase_enumeration\ndrwxr-xr-x                      - - ./\n"
             f"-rw-r--r-- user/group 1 {timestamp} ./file.bin\nsource_manifest_complete\n"
         ).encode("utf-8"),
         ROOT,
@@ -285,13 +297,13 @@ def test_lftp_high_bit_timestamp_hash_is_normalized_before_protocol_encoding():
 
 def test_lftp_failure_stage_is_allowlisted_and_persisted_without_output():
     assert manifest._failure_stage_from_output(b"") == "launch"
-    assert manifest._failure_stage_from_output(b"source_manifest_stage_started\n") == "connection"
+    assert manifest._failure_stage_from_output(b"source_manifest_phase_open\n") == "root"
     assert manifest._failure_stage_from_output(
-        b"source_manifest_stage_started\nsource_manifest_stage_connected\n",
-    ) == "root"
+        b"source_manifest_phase_open\nsource_manifest_phase_root\n",
+    ) == "enumeration"
     assert manifest._failure_stage_from_output(
-        b"source_manifest_stage_started\nsource_manifest_stage_connected\nsource_manifest_stage_root\n",
-    ) == "listing"
+        b"source_manifest_phase_open\nsource_manifest_phase_root\nsource_manifest_phase_enumeration\n",
+    ) == "enumeration"
 
     harness = manifest.SourceManifestHarness(
         ROOT, lambda _root: manifest.SftpProcessResult(

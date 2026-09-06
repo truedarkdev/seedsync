@@ -187,11 +187,12 @@ def test_account_home_manifest_root_rejects_escape_and_double_prefix(root, base)
 
 def test_real_lftp_runner_adds_completion_only_after_the_process_finishes(monkeypatch):
     listing = (
-        "source_manifest_stage_started\n"
-        "source_manifest_stage_connected\n"
-        "source_manifest_stage_root\n"
+        "source_manifest_phase_open\n"
+        "source_manifest_phase_root\n"
+        "source_manifest_phase_enumeration\n"
         "drwxr-xr-x                      - - ./\n"
         "-rw-r--r-- 1 remoteuser remoteuser 3 2026-01-01 00:00 ./file.bin\n"
+        ""
     ).encode("utf-8")
 
     calls = []
@@ -221,6 +222,9 @@ def test_real_lftp_runner_adds_completion_only_after_the_process_finishes(monkey
     assert argv == ["lftp", "--norc"]
     assert "--quiet" not in script
     assert "find -l ." in script
+    assert "source_manifest_phase_open" in script
+    assert "source_manifest_phase_root" in script
+    assert "source_manifest_phase_enumeration" in script
     assert "source_manifest_complete" not in script
     assert all("private-password" not in str(argument) for argument in argv)
     assert all("sftp://" not in str(argument) for argument in argv)
@@ -228,14 +232,14 @@ def test_real_lftp_runner_adds_completion_only_after_the_process_finishes(monkey
 
     bare = runner.ReadOnlySftpProtocolRunner("sftp://seedbox.invalid")
     monkeypatch.setattr(runner._manifest, "_run_bounded_process", lambda *args, **kwargs: runner.SftpProcessResult(
-        b"source_manifest_stage_started\n", returncode=1,
+        b"source_manifest_phase_open\n", returncode=1,
     ))
     incomplete = bare("fixture/incoming", timeout_seconds=5, max_output_bytes=10_000)
-    assert incomplete.failure_stage == "connection"
+    assert incomplete.failure_stage == "root"
     assert incomplete.failure_reason == "process_failed"
     with pytest.raises(runner._manifest.SourceManifestError, match="process_failed") as raised:
         runner.SourceManifestHarness("fixture/incoming", lambda _root: incomplete).snapshot()
-    assert runner.redacted_manifest_error(raised.value)["stage"] == "connection"
+    assert runner.redacted_manifest_error(raised.value)["stage"] == "root"
 
 
 def test_source_manifest_failure_writes_only_private_allowlisted_classification(monkeypatch, tmp_path):
