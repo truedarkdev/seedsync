@@ -1073,6 +1073,50 @@ class TestScannerProcess(unittest.TestCase):
         scanner.prioritize_path_pair.assert_not_called()
         self.assertTrue(process._ScannerProcess__has_pending_priority_targets())
 
+    def test_inline_scoped_scan_coalesces_browser_priority_for_active_pair(self):
+        process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=1000, verbose=False)
+        self.addCleanup(process.close_queues)
+        process._ScannerProcess__inline_scan_active.set()
+        process._ScannerProcess__inline_scan_target_path_pair_ids = {"pair-6"}
+
+        process.prioritize_scan("pair-6")
+
+        self.assertEqual(set(), process._ScannerProcess__drain_priority_target_path_pair_ids())
+
+    def test_inline_scoped_scan_queues_same_pair_when_successor_is_required(self):
+        process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=1000, verbose=False)
+        self.addCleanup(process.close_queues)
+        process._ScannerProcess__inline_scan_active.set()
+        process._ScannerProcess__inline_scan_target_path_pair_ids = {"pair-6"}
+
+        process.prioritize_scan("pair-6", require_successor=True)
+
+        self.assertEqual({"pair-6"}, process._ScannerProcess__drain_priority_target_path_pair_ids())
+
+    def test_recycled_scoped_scan_coalesces_browser_priority_for_active_pair(self):
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=1000, verbose=False,
+            recycle_scan_worker=True,
+        )
+        self.addCleanup(process.close_queues)
+        process._ScannerProcess__scan_worker_target_path_pair_ids = {"pair-6"}
+
+        process.prioritize_scan("pair-6")
+
+        self.assertEqual(set(), process._ScannerProcess__drain_priority_target_path_pair_ids())
+
+    def test_recycled_scoped_scan_queues_same_pair_when_successor_is_required(self):
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=1000, verbose=False,
+            recycle_scan_worker=True,
+        )
+        self.addCleanup(process.close_queues)
+        process._ScannerProcess__scan_worker_target_path_pair_ids = {"pair-6"}
+
+        process.prioritize_scan("pair-6", require_successor=True)
+
+        self.assertEqual({"pair-6"}, process._ScannerProcess__drain_priority_target_path_pair_ids())
+
     def test_inline_initial_priority_runs_target_then_skips_interval_for_full_followup(self):
         process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=1000, verbose=False)
         self.addCleanup(process.close_queues)

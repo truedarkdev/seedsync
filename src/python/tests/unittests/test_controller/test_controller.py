@@ -11573,8 +11573,12 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp.queue.assert_not_called()
         callback.on_success.assert_not_called()
         callback.on_failure.assert_not_called()
-        self.controller._Controller__local_scan_process.prioritize_scan.assert_called_once_with("pair-a")
-        self.controller._Controller__remote_scan_process.prioritize_scan.assert_called_once_with("pair-a")
+        self.controller._Controller__local_scan_process.prioritize_scan.assert_called_once_with(
+            "pair-a", require_successor=True,
+        )
+        self.controller._Controller__remote_scan_process.prioritize_scan.assert_called_once_with(
+            "pair-a", require_successor=True,
+        )
         self.controller._Controller__local_scan_process.force_scan.assert_not_called()
         self.controller._Controller__remote_scan_process.force_scan.assert_not_called()
 
@@ -11643,8 +11647,12 @@ class TestController(unittest.TestCase):
         self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
         self.controller._Controller__process_commands()
 
-        self.controller._Controller__local_scan_process.prioritize_scan.assert_called_once_with("pair-a")
-        self.controller._Controller__remote_scan_process.prioritize_scan.assert_called_once_with("pair-a")
+        self.controller._Controller__local_scan_process.prioritize_scan.assert_called_once_with(
+            "pair-a", require_successor=True,
+        )
+        self.controller._Controller__remote_scan_process.prioritize_scan.assert_called_once_with(
+            "pair-a", require_successor=True,
+        )
         self.controller._Controller__lftp.queue.assert_called_once_with(
             file.name,
             True,

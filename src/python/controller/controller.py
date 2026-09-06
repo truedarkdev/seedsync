@@ -8893,8 +8893,8 @@ class Controller:
                 # pair through each scanner coordinator: an inline full scan
                 # schedules a targeted successor generation, while a recycled
                 # worker can replace the full worker before its normal follow-up.
-                self.__local_scan_process.prioritize_scan(pair_id)
-                self.__remote_scan_process.prioritize_scan(pair_id)
+                self.__local_scan_process.prioritize_scan(pair_id, require_successor=True)
+                self.__remote_scan_process.prioritize_scan(pair_id, require_successor=True)
         except Exception:
             self.logger.debug("Queue collision scoped rescan request failed", exc_info=True)
             intent.rescan_generations = None

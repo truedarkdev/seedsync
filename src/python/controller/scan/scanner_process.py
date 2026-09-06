@@ -1440,7 +1440,7 @@ class ScannerProcess:
         if callable(setter):
             setter(self.__pending_accepted_root_fingerprints)
 
-    def prioritize_scan(self, path_pair_id: str) -> None:
+    def prioritize_scan(self, path_pair_id: str, *, require_successor: bool = False) -> None:
         """Move one selected pair ahead of ordinary full-scan work."""
         if not isinstance(path_pair_id, str) or not path_pair_id:
             return
@@ -1451,13 +1451,13 @@ class ScannerProcess:
                 {"scanner": self.__scanner.__class__.__name__},
                 path_pair_id=path_pair_id,
             )
-            if self.__inline_scan_active.is_set():
+            if not require_successor and self.__inline_scan_active.is_set():
                 active_targets = self.__inline_scan_target_path_pair_ids
                 if active_targets is not None and path_pair_id in active_targets:
                     return
-                # An active full scan has no safe in-place target boundary.
-                # Queue the pair below so the coordinator admits it as a
-                # successor generation after the current scan publishes.
+            # Queue admission uses the active scoped scan as its authority
+            # baseline and therefore explicitly requests a successor. Browser
+            # stream priority retains its existing active-target coalescing.
             with self.__priority_target_lock:
                 self.__priority_target_path_pair_ids.add(path_pair_id)
             if self.__scan_generation == 0:
@@ -1466,9 +1466,10 @@ class ScannerProcess:
             self.__wake_event.set()
             return
         with self.__priority_target_lock:
-            active_targets = self.__scan_worker_target_path_pair_ids
-            if active_targets is not None and path_pair_id in active_targets:
-                return
+            if not require_successor:
+                active_targets = self.__scan_worker_target_path_pair_ids
+                if active_targets is not None and path_pair_id in active_targets:
+                    return
             self.__priority_target_path_pair_ids.add(path_pair_id)
         if self.__scan_generation == 0:
             self.__priority_requires_full_followup = True
