@@ -15,6 +15,13 @@ sys.modules[SPEC.name] = observer
 assert SPEC.loader is not None
 SPEC.loader.exec_module(observer)
 
+RUNNER_SPEC = importlib.util.spec_from_file_location(
+    "incoming_live_queue_runner", Path(__file__).parents[1] / "incoming_live_queue_runner.py")
+runner = importlib.util.module_from_spec(RUNNER_SPEC)
+sys.modules[RUNNER_SPEC.name] = runner
+assert RUNNER_SPEC.loader is not None
+RUNNER_SPEC.loader.exec_module(runner)
+
 PAIR = "pair-1"
 ROOT = '["pair-1","Incoming"]'
 
@@ -586,3 +593,14 @@ def test_queue_transport_non_200_is_persisted_and_tuple_is_rejected(tmp_path):
     with pytest.raises(observer.ObserverSchemaError, match="tuple"):
         other.queue(lambda _path: (409, 2.0, {}))
     assert other.queue_attempted is True
+
+
+def test_http_adapter_maps_http_error_to_real_queue_status_once(tmp_path):
+    key = tmp_path / "key"; key.write_text("private", encoding="utf-8")
+    body = BytesIO(b'{"message":"private"}')
+    def opener(_request, timeout):
+        assert timeout == 35
+        raise HTTPError("http://private", 504, "timeout", None, body)
+    result = runner.HttpAdapter(key, opener).request("/server/command/queue/x", "POST")
+    assert result.status == 504
+    assert result.body == b'{"message":"private"}'
