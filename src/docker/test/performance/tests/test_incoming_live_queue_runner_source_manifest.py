@@ -189,6 +189,46 @@ def test_source_manifest_config_alone_does_not_switch_queue_mode(monkeypatch, tm
     assert calls == ["queue", "preflight", "sampler", "sample"]
 
 
+def test_queue_mode_requires_durable_attempt_state_before_constructing_gate(monkeypatch, tmp_path):
+    config_path = tmp_path / "runner.json"
+    config_path.write_text(json.dumps({
+        "key_path": str(tmp_path / "key"), "pair_id": "pair", "pair_name": "pair",
+        "root_id": "root", "root_name": "root", "artifact_path": str(tmp_path / "artifact"),
+        "passive_paths": ["/server/status"],
+    }), encoding="utf-8")
+    monkeypatch.setattr(runner, "QueueGate", lambda *_args, **_kwargs: pytest.fail("gate must not be constructed"))
+    with pytest.raises(SystemExit, match="attempt_state_path"):
+        runner.main(str(config_path))
+
+
+@pytest.mark.parametrize("status", (409, 504))
+def test_queue_mode_returns_nonzero_for_non_success_queue_status(monkeypatch, tmp_path, status):
+    config_path = tmp_path / "runner.json"
+    config_path.write_text(json.dumps({
+        "key_path": str(tmp_path / "key"), "pair_id": "pair", "pair_name": "pair",
+        "root_id": "root", "root_name": "root", "artifact_path": str(tmp_path / "artifact"),
+        "attempt_state_path": str(tmp_path / "attempt.json"), "passive_paths": ["/server/status"],
+    }), encoding="utf-8")
+    constructed = {}
+
+    class FakeGate:
+        def __init__(self, *_args, **kwargs):
+            constructed.update(kwargs)
+
+    class FakeCaller:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self):
+            return runner.QueueTransportResponse(status)
+
+    monkeypatch.setattr(runner, "QueueGate", FakeGate)
+    monkeypatch.setattr(runner, "PassiveQueueCaller", FakeCaller)
+    monkeypatch.setenv("INCOMING_RECOVERY_ALLOW_QUEUE", "1")
+    assert runner.main(str(config_path)) == 1
+    assert constructed["attempt_state_path"] == str(tmp_path / "attempt.json")
+
+
 def test_source_manifest_flag_requires_config_and_config_is_not_argv_secret(monkeypatch, tmp_path):
     config_path = tmp_path / "runner.json"
     config_path.write_text(json.dumps({}), encoding="utf-8")

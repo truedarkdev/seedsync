@@ -66,9 +66,22 @@ class GuardedQueueRunner:
         if not callable(stop_passive):
             raise ObserverCaptureError("passive observer did not provide a stop boundary")
         try:
-            return self.gate.queue(self.send)
-        finally:
+            result = self.gate.queue(self.send)
+        except BaseException as queue_error:
+            try:
+                stop_passive()
+            except BaseException as stop_error:
+                # The Queue outcome is the primary operation evidence.  Keep a
+                # passive-capture failure as its cause without replacing it.
+                raise queue_error from stop_error
+            raise
+        try:
             stop_passive()
+        except BaseException:
+            # A successful Queue cannot be accepted without its required
+            # concurrent capture boundary.
+            raise
+        return result
 
 
 @dataclass
@@ -88,12 +101,18 @@ class PassiveQueueCaller:
         started = threading.Event()
         failures: list[BaseException] = []
 
-        def collect() -> None:
+        def collect(
+            started_boundary: threading.Event | None = None,
+            stop_event: threading.Event | None = None,
+        ) -> None:
             sampler = FixedGetSampler(self.passive_paths, artifact_path=self.artifact_path,
                                       continue_on_error=False)
             try:
-                started.set()
-                sampler.sample(self.get)
+                sampler.sample(
+                    self.get,
+                    before_request=started_boundary.set if started_boundary is not None else None,
+                    stop_event=stop_event,
+                )
             except BaseException as exc:
                 failures.append(exc)
 
@@ -103,13 +122,23 @@ class PassiveQueueCaller:
             collect()
             if failures:
                 raise ObserverCaptureError("passive sample failed before Queue")
-            thread = threading.Thread(target=collect, name="incoming-queue-passive", daemon=True)
+            # The second observer cannot authorize Queue merely because its
+            # thread was scheduled: it first persists its own GET boundary.
+            thread = threading.Thread(
+                target=collect, args=(started, stop), name="incoming-queue-passive",
+            )
             thread.start()
             if not started.wait(1):
+                thread.join()
+                if failures:
+                    raise ObserverCaptureError("passive sample failed before Queue") from failures[0]
                 raise ObserverCaptureError("passive observer did not start")
             def finish() -> None:
                 stop.set()
-                thread.join(timeout=1)
+                # The injected live GET has its own five-second transport
+                # bound.  Never return while a daemon observer could still
+                # modify evidence after the Queue outcome is reported.
+                thread.join()
                 if failures:
                     raise ObserverCaptureError("passive sample failed during Queue")
             return finish
@@ -548,10 +577,18 @@ class FixedGetSampler:
             return False
         return True
 
-    def sample(self, get: Callable[[str], object]) -> list[Mapping[str, object]]:
+    def sample(
+        self,
+        get: Callable[[str], object],
+        *,
+        before_request: Callable[[], None] | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> list[Mapping[str, object]]:
         records: list[Mapping[str, object]] = []
         self.last_records = records
         for index, path in enumerate(self.paths):
+            if stop_event is not None and stop_event.is_set():
+                break
             safe_endpoint = endpoint_class(path)
             # The next GET cannot begin until this record has been persisted.
             before_persisted = self._persist({
@@ -561,6 +598,8 @@ class FixedGetSampler:
             }, "get_before")
             if not before_persisted:
                 raise ObserverCaptureError("GET sampler artifact capture failed before request")
+            if before_request is not None:
+                before_request()
             started_ns = self.clock()
             try:
                 response = get(path)
@@ -1156,12 +1195,17 @@ class QueueGate:
                 handle.write('{"schema":"incoming-recovery-queue-attempt.v1","state":"queue_attempt_started"}\n')
                 handle.flush()
                 os.fsync(handle.fileno())
-        except Exception:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-            raise
+            if os.name == "posix":
+                directory = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        except Exception as exc:
+            # Never remove an exclusive marker after any persistence failure.
+            # An incomplete marker is intentionally consumed and makes a
+            # restart fail closed rather than risking a second Queue POST.
+            raise ObserverCaptureError("Queue durable attempt marker persistence failed") from exc
 
     def __post_init__(self) -> None:
         if self.artifact_sink is not None and self.artifact_path is not None:
@@ -1299,7 +1343,7 @@ class QueueGate:
             **queue_response_evidence(status, body),
             "scan_lifecycle": self.scan_lifecycle,
         }
-        status_failure = type(status) is int and status >= 400
+        status_failure = not 200 <= status < 300
         first_failure = False
         if status_failure:
             if self.first_failure_evidence is None:

@@ -3,6 +3,7 @@ import importlib.util
 from io import BytesIO
 import json
 import sys
+import threading
 from urllib.error import HTTPError
 import pytest
 
@@ -563,6 +564,19 @@ def test_guarded_queue_runner_rejects_a_timeout_shorter_than_the_handler_budget(
         runner.run()
 
 
+def test_guarded_queue_runner_preserves_queue_error_when_passive_stop_fails():
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming")
+    runner = observer.GuardedQueueRunner(
+        gate, lambda path: responses()[path],
+        lambda _path: (_ for _ in ()).throw(RuntimeError("queue failed")),
+        lambda: lambda: (_ for _ in ()).throw(ValueError("passive failed")),
+        {"INCOMING_RECOVERY_ALLOW_QUEUE": "1"},
+    )
+    with pytest.raises(RuntimeError, match="queue failed") as raised:
+        runner.run()
+    assert isinstance(raised.value.__cause__, ValueError)
+
+
 def test_passive_queue_caller_samples_before_and_during_one_post(tmp_path):
     events = []
     gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming")
@@ -577,6 +591,73 @@ def test_passive_queue_caller_samples_before_and_during_one_post(tmp_path):
         tmp_path / "passive.jsonl", {"INCOMING_RECOVERY_ALLOW_QUEUE": "1"})
     assert caller.run().status == 200
     assert events.count("post") == 1
+
+
+def test_passive_queue_caller_requires_persisted_second_boundary_before_post(monkeypatch, tmp_path):
+    events = []
+
+    class FakeSampler:
+        calls = 0
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def sample(self, _get, *, before_request=None, stop_event=None):
+            FakeSampler.calls += 1
+            if before_request is None:
+                events.append("first-sample")
+            else:
+                events.append("second-before-persisted")
+                before_request()
+            return []
+
+    monkeypatch.setattr(observer, "FixedGetSampler", FakeSampler)
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming")
+    caller = observer.PassiveQueueCaller(
+        gate, lambda path: responses()[path],
+        lambda _path: events.append("post") or observer.QueueTransportResponse(200),
+        ("/server/status",), tmp_path / "passive.jsonl", {"INCOMING_RECOVERY_ALLOW_QUEUE": "1"},
+    )
+    assert caller.run().status == 200
+    assert events.index("second-before-persisted") < events.index("post")
+
+
+def test_passive_queue_caller_stops_before_a_second_concurrent_get(tmp_path):
+    passive_calls = []
+    status_calls = 0
+    second_get_started = threading.Event()
+    release_second_get = threading.Event()
+    release_timer = []
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming")
+
+    def get(path):
+        nonlocal status_calls
+        if path == "/server/status":
+            status_calls += 1
+        if path in {"/server/status", "/server/config/get"} and status_calls >= 2:
+            passive_calls.append(path)
+            if path == "/server/status" and status_calls == 3:
+                second_get_started.set()
+                assert release_second_get.wait(1)
+        return responses()[path]
+
+    def send(_path):
+        assert second_get_started.wait(1)
+        timer = threading.Timer(0.02, release_second_get.set)
+        release_timer.append(timer)
+        timer.start()
+        return observer.QueueTransportResponse(200)
+
+    caller = observer.PassiveQueueCaller(
+        gate, get, send, ("/server/status", "/server/config/get"),
+        tmp_path / "passive.jsonl", {"INCOMING_RECOVERY_ALLOW_QUEUE": "1"},
+    )
+    assert caller.run().status == 200
+    for timer in release_timer:
+        timer.join()
+    # First synchronous sample has two GETs; the concurrent sample's first
+    # GET completes after Queue and must observe stop before another begins.
+    assert passive_calls == ["/server/status", "/server/config/get", "/server/status"]
 
 
 def test_queue_transport_non_200_is_persisted_and_tuple_is_rejected(tmp_path):
@@ -616,4 +697,18 @@ def test_durable_attempt_marker_precedes_transport_and_survives_restart(tmp_path
     resumed = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", attempt_state_path=marker)
     resumed.preflight(lambda path: responses()[path])
     with pytest.raises(observer.ObserverSchemaError, match="consumed"):
+        resumed.queue(lambda _path: pytest.fail("POST must not run"))
+
+
+def test_durable_marker_persistence_failure_remains_consumed_for_restart(monkeypatch, tmp_path):
+    marker = tmp_path / "attempt.json"
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", attempt_state_path=marker)
+    gate.preflight(lambda path: responses()[path])
+    monkeypatch.setattr(observer.os, "fsync", lambda _fd: (_ for _ in ()).throw(OSError("disk failure")))
+    with pytest.raises(observer.ObserverCaptureError, match="marker persistence"):
+        gate.queue(lambda _path: pytest.fail("POST must not run"))
+    assert marker.exists()
+    resumed = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", attempt_state_path=marker)
+    resumed.preflight(lambda path: responses()[path])
+    with pytest.raises(observer.ObserverSchemaError, match="already consumed"):
         resumed.queue(lambda _path: pytest.fail("POST must not run"))

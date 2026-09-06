@@ -444,9 +444,12 @@ def main(
             raise
         return 0
     adapter = HttpAdapter(Path(config["key_path"]))
+    attempt_state_path = config.get("attempt_state_path")
+    if not dry_run and (not isinstance(attempt_state_path, str) or not attempt_state_path):
+        raise SystemExit("Queue attempt_state_path is required")
     gate = QueueGate(config["pair_id"], config["pair_name"], config["root_id"],
         config["root_name"], require_pending_transfer=True, artifact_path=config["artifact_path"],
-        attempt_state_path=config.get("attempt_state_path"))
+        attempt_state_path=attempt_state_path)
     if dry_run:
         gate.preflight(adapter.request)
         _observer.FixedGetSampler(tuple(config["passive_paths"]), artifact_path=config["artifact_path"],
@@ -457,8 +460,8 @@ def main(
     caller = PassiveQueueCaller(gate, adapter.request,
         lambda path: adapter.request(path, "POST"), tuple(config["passive_paths"]),
         config["artifact_path"], os.environ, 35)
-    caller.run()
-    return 0
+    response = caller.run()
+    return 0 if 200 <= response.status < 300 else 1
 
 
 if __name__ == "__main__":
