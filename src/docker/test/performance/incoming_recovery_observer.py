@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 from urllib.error import HTTPError
@@ -54,6 +55,54 @@ class GuardedQueueRunner:
             return self.gate.queue(self.send)
         finally:
             stop_passive()
+
+
+@dataclass
+class PassiveQueueCaller:
+    """Source-controlled adapter that keeps sequential GET observation alive during Queue."""
+
+    gate: "QueueGate"
+    get: Callable[[str], object]
+    send: Callable[[str], object]
+    passive_paths: Sequence[str]
+    artifact_path: str | os.PathLike[str]
+    environment: Mapping[str, str]
+    client_timeout_seconds: int = 35
+
+    def run(self) -> object:
+        stop = threading.Event()
+        started = threading.Event()
+        failures: list[BaseException] = []
+
+        def collect() -> None:
+            sampler = FixedGetSampler(self.passive_paths, artifact_path=self.artifact_path,
+                                      continue_on_error=False)
+            try:
+                started.set()
+                sampler.sample(self.get)
+            except BaseException as exc:
+                failures.append(exc)
+
+        def start_passive() -> Callable[[], None]:
+            # Complete one sequential GET sample before the POST boundary, then
+            # continue a bounded second sample concurrently with that request.
+            collect()
+            if failures:
+                raise ObserverCaptureError("passive sample failed before Queue")
+            thread = threading.Thread(target=collect, name="incoming-queue-passive", daemon=True)
+            thread.start()
+            if not started.wait(1):
+                raise ObserverCaptureError("passive observer did not start")
+            def finish() -> None:
+                stop.set()
+                thread.join(timeout=1)
+                if failures:
+                    raise ObserverCaptureError("passive sample failed during Queue")
+            return finish
+
+        runner = GuardedQueueRunner(self.gate, self.get, self.send, start_passive,
+                                    self.environment, self.client_timeout_seconds)
+        return runner.run()
 
 
 _SCAN_AUTHORITY_OUTCOMES = frozenset({"adopt", "publish", "reject", "no_op"})

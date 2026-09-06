@@ -554,3 +554,19 @@ def test_guarded_queue_runner_rejects_a_timeout_shorter_than_the_handler_budget(
         {"INCOMING_RECOVERY_ALLOW_QUEUE": "1"}, 30)
     with pytest.raises(observer.ObserverSchemaError, match="timeout"):
         runner.run()
+
+
+def test_passive_queue_caller_samples_before_and_during_one_post(tmp_path):
+    events = []
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming")
+    def get(path):
+        events.append("get")
+        return responses()[path]
+    def send(_path):
+        assert events.count("get") >= 6  # QueueGate preflight plus first passive GET.
+        events.append("post")
+        return 200
+    caller = observer.PassiveQueueCaller(gate, get, send, ("/server/status",),
+        tmp_path / "passive.jsonl", {"INCOMING_RECOVERY_ALLOW_QUEUE": "1"})
+    assert caller.run() == 200
+    assert events.count("post") == 1
