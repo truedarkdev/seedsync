@@ -4700,6 +4700,43 @@ class TestModelUpdater(unittest.TestCase):
         self.assertTrue(controller._Controller__last_local_reconciliation_healthy)
         self.assertTrue(controller._Controller__last_remote_reconciliation_healthy)
 
+    def test_joint_noop_successor_records_fresh_pair_authority_tokens(self):
+        """A no-op successor still has to unblock deferred Queue authority."""
+        pair_id = "fixture-pair-a"
+        remote_session = "fixture-remote-session"
+        local_session = "fixture-local-session"
+
+        def result(session, generation):
+            file = SystemFile("root", 1)
+            file.path_pair_id = pair_id
+            return ScannerResult(
+                datetime.now(), [file], scanned_path_pair_ids={pair_id},
+                completed_path_pair_ids={pair_id}, is_scan_final=True,
+                is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id},
+                generation=generation, session_token=session,
+            )
+
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False,
+        )
+        controller._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
+        controller._Controller__deferred_queue_intents = {}
+        controller._record_path_pair_scan_tokens = lambda local, remote: \
+            Controller._record_path_pair_scan_tokens(controller, local, remote)
+        controller._Controller__remote_scan_process = self._progressive_process(
+            remote_session, [[result(remote_session, 8)]],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            local_session, [[result(local_session, 3)]],
+        )
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual((local_session, 3), controller._Controller__scan_authority_tokens["local"][pair_id])
+        self.assertEqual((remote_session, 8), controller._Controller__scan_authority_tokens["remote"][pair_id])
+        self.assertIn(pair_id, controller._Controller__reconciled_local_path_pair_ids)
+        self.assertIn(pair_id, controller._Controller__reconciled_remote_path_pair_ids)
+
     def test_later_progressive_final_event_republishes_against_standing_authority(self):
         remote_token = "remote-later-final"
         local_token = "local-later-final"

@@ -1117,6 +1117,75 @@ class TestScannerProcess(unittest.TestCase):
 
         self.assertEqual({"pair-6"}, process._ScannerProcess__drain_priority_target_path_pair_ids())
 
+    def test_recycled_same_pair_successor_finishing_between_polls_skips_cadence(self):
+        """A queued Queue successor must not wait a full cadence after exit."""
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=1000, verbose=False,
+            recycle_scan_worker=True,
+        )
+        self.addCleanup(process.close_queues)
+        worker = MagicMock()
+        worker.pid = 1
+        worker.is_alive.return_value = False
+        process._ScannerProcess__scan_worker = worker
+        process._ScannerProcess__scan_worker_started_at = datetime.now()
+        process._ScannerProcess__scan_worker_control_connection = _MessageConnection([])
+        process._ScannerProcess__scan_worker_target_path_pair_ids = {"pair-6"}
+        process._ScannerProcess__scan_generation = 6
+
+        # The request lands after the worker's last active poll.  The next
+        # poll therefore sees only its terminal state and must still honor
+        # the already-signalled successor without sleeping for 1000ms.
+        process.prioritize_scan("pair-6", require_successor=True)
+        started_at = time.monotonic()
+        process._ScannerProcess__poll_scan_worker()
+
+        self.assertLess(time.monotonic() - started_at, 0.2)
+        self.assertEqual({"pair-6"}, process._ScannerProcess__drain_priority_target_path_pair_ids())
+
+    def test_inline_same_pair_successor_runs_after_active_scan_without_cadence_delay(self):
+        """The local inline coordinator preserves the same successor contract."""
+        started = threading.Event()
+        successor_started = threading.Event()
+        release = threading.Event()
+        targets = []
+        scan_count = 0
+        scanner = DummyScanner()
+
+        def set_target(target):
+            targets.append(None if target is None else set(target))
+
+        def scan():
+            nonlocal scan_count
+            scan_count += 1
+            if scan_count == 1:
+                started.set()
+                self.assertTrue(release.wait(2))
+            else:
+                successor_started.set()
+            return []
+
+        scanner.set_scan_target_path_pair_ids = set_target
+        scanner.scan = scan
+        process = ScannerProcess(scanner=scanner, interval_in_ms=1000, verbose=False)
+        self.addCleanup(process.close_queues)
+        active = threading.Thread(target=process.run_loop)
+        active.start()
+        self.assertTrue(started.wait(2))
+        process.prioritize_scan("pair-6", require_successor=True)
+        release.set()
+        active.join(2)
+        self.assertFalse(active.is_alive())
+
+        successor = threading.Thread(target=process.run_loop)
+        successor.start()
+
+        self.assertTrue(successor_started.wait(0.2))
+        successor.join(2)
+        self.assertFalse(successor.is_alive())
+        self.assertEqual(1, targets.count({"pair-6"}))
+        self.assertLess(targets.index({"pair-6"}), len(targets) - 1)
+
     def test_inline_initial_priority_runs_target_then_skips_interval_for_full_followup(self):
         process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=1000, verbose=False)
         self.addCleanup(process.close_queues)

@@ -1165,6 +1165,16 @@ class ScannerProcess:
             return
 
         completed_target_path_pair_ids = self.__scan_worker_target_path_pair_ids
+        # A priority request can arrive after the previous poll observes a
+        # live worker but before this poll observes its exit.  In that race
+        # the active-worker branch never consumes the wake event, so merely
+        # retaining the successor target would still leave it behind the
+        # ordinary scan cadence.  Consume the already-recorded wake before
+        # deciding whether the completed worker may sleep.
+        assert self.__wake_event is not None
+        if self.__wake_event.wait(timeout=0):
+            self.__wake_event.clear()
+            self.__scan_worker_force_pending = True
         try:
             # The child has exited, so its terminal status must be retained;
             # allow a short pipe-delivery window before tearing the endpoint
