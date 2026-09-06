@@ -85,9 +85,12 @@ def _local_sftp_fixture():
     if not username or any(character in username for character in "\r\n"):
         raise RuntimeError("current user is not safe for a local sshd fixture")
 
-    with tempfile.TemporaryDirectory(prefix="seedsync-source-manifest-", dir="/tmp") as raw_dir:
+    with tempfile.TemporaryDirectory(prefix="seedsync-source-manifest-", dir=Path.home()) as raw_dir:
         workspace = Path(raw_dir)
-        source_root = workspace / "fixture" / "incoming"
+        remote_base = workspace.name + "/fixture"
+        selected_root = "nested selected/Incoming"
+        base_path = workspace / "fixture"
+        source_root = base_path / selected_root
         source_root.mkdir(parents=True)
         expected_bytes = 0
         for index in range(400):
@@ -211,6 +214,9 @@ def _local_sftp_fixture():
                 raise RuntimeError("local strict-known-host SSH probe failed")
             yield {
                 "root": str(source_root),
+                "remote_base": remote_base,
+                "absolute_base": str(base_path),
+                "selected_root": selected_root,
                 "host": "127.0.0.1",
                 "port": port,
                 "username": username,
@@ -232,7 +238,8 @@ def _local_sftp_fixture():
             log_handle.close()
 
 
-def test_real_lftp_source_manifest_is_local_strict_and_stable(tmp_path, monkeypatch):
+@pytest.mark.parametrize("base_mode", ("relative", "absolute"))
+def test_real_lftp_source_manifest_is_local_strict_and_stable(tmp_path, monkeypatch, base_mode):
     required = ("lftp", "ssh", "ssh-keygen", "ssh-keyscan", "sshd")
     missing = [name for name in required if not _command_available(name)]
     if missing:
@@ -250,6 +257,7 @@ def test_real_lftp_source_manifest_is_local_strict_and_stable(tmp_path, monkeypa
                     "host": fixture["host"],
                     "port": fixture["port"],
                     "username": fixture["username"],
+                    "remote_path": fixture["remote_base"] if base_mode == "relative" else fixture["absolute_base"],
                 },
             ),
             encoding="utf-8",
@@ -259,7 +267,7 @@ def test_real_lftp_source_manifest_is_local_strict_and_stable(tmp_path, monkeypa
             json.dumps(
                 {
                     "source_manifest": {
-                        "root": fixture["root"],
+                        "root": fixture["selected_root"],
                         "connection_config_path": str(connection_path),
                         "known_hosts_file": fixture["known_hosts_file"],
                         "artifact_path": str(output_path),

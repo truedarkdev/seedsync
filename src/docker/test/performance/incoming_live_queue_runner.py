@@ -68,6 +68,7 @@ def _read_protected_source_config(config_path: Path) -> dict[str, object]:
                 "port": lftp.getint("remote_port", fallback=22),
                 "username": lftp.get("remote_username"),
                 "password": lftp.get("remote_password"),
+                "remote_path": lftp.get("remote_path"),
             }
         if not isinstance(payload, dict):
             raise ValueError
@@ -129,7 +130,44 @@ def _source_manifest_connection(
         "username": username,
         "password": password,
         "known_hosts_file": str(known_hosts_path),
+        "remote_path": connection.get("remote_path"),
     }
+
+
+def _account_home_manifest_root(root: object, remote_path: object) -> str:
+    """Join a trusted configured base to one contained selected SFTP root."""
+    if not isinstance(root, str) or not isinstance(remote_path, str):
+        raise SystemExit("source_manifest root configuration is incomplete")
+    def parts(value: str, *, selected: bool) -> tuple[bool, tuple[str, ...]]:
+        if (
+            not value
+            or "\\" in value
+            or "//" in value
+            or "://" in value
+            or any(ch in value for ch in "?#")
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+        ):
+            raise SystemExit("source_manifest root configuration is invalid")
+        absolute = value.startswith("/")
+        if selected and absolute:
+            raise SystemExit("source_manifest root configuration is invalid")
+        result = tuple(part for part in value.split("/") if part)
+        if not result or any(not part or part in (".", "..") for part in result):
+            raise SystemExit("source_manifest root configuration is invalid")
+        return absolute, result
+    base_absolute, base = parts(remote_path, selected=False)
+    _, selected = parts(root, selected=True)
+    if not base:
+        raise SystemExit("source_manifest root configuration is invalid")
+    if not base_absolute and selected[:len(base)] == base:
+        if len(selected) == len(base):
+            raise SystemExit("source_manifest root configuration is invalid")
+        resolved = selected
+    else:
+        resolved = base + selected
+    if len(resolved) >= len(base) * 2 and resolved[:len(base) * 2] == base + base:
+        raise SystemExit("source_manifest root configuration is invalid")
+    return ("/" if base_absolute else "") + "/".join(resolved)
 
 
 class HttpAdapter:
@@ -169,6 +207,7 @@ def main(config_path: str, dry_run: bool = False, source_manifest: bool = False)
         connection = _source_manifest_connection(
             config, source_manifest_config, base_dir=Path(config_path).resolve().parent,
         )
+        root = _account_home_manifest_root(root, connection["remote_path"])
         harness = SourceManifestHarness(
             root,
             host=connection["host"], port=connection["port"],

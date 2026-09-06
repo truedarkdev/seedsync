@@ -19,7 +19,7 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(manifest)
 
 
-ROOT = "/fixture/incoming"
+ROOT = "fixture/incoming"
 
 
 def protocol(records):
@@ -117,27 +117,83 @@ def test_duplicate_cycle_symlink_and_special_name_fail_closed():
             manifest.SourceManifestHarness(ROOT, lambda _root, case=case: protocol(case)).snapshot()
 
 
-def test_root_confinement_rejects_escape_and_accepts_configured_absolute_root():
+def test_root_confinement_rejects_absolute_and_escape_paths():
     record = {"record": "entry", "path": "/other/file", "kind": "file", "size": 1, "mtime_ns": 1, "mode": 0o644}
     with pytest.raises(manifest.SourceManifestError, match="root_escape"):
         manifest.SourceManifestHarness(ROOT, lambda _root: protocol([record])).snapshot()
 
-    record["path"] = ROOT + "/file"
-    snapshot = manifest.SourceManifestHarness(ROOT, lambda _root: protocol([record])).snapshot()
-    assert snapshot.file_count == 1
+    record["path"] = "/fixture/incoming/file"
+    with pytest.raises(manifest.SourceManifestError, match="root_escape"):
+        manifest.SourceManifestHarness(ROOT, lambda _root: protocol([record])).snapshot()
+
+    absolute_root = "/fixture/incoming"
+    assert manifest.SourceManifestHarness(absolute_root, lambda _root: protocol([])).root == absolute_root
+    entry = manifest._entry_from_record({
+        "record": "entry", "path": "/fixture/incoming/file", "kind": "file", "size": 1,
+        "mtime_ns": 1, "mode": 0o644,
+    }, absolute_root)
+    assert entry.path == "file"
+    with pytest.raises(manifest.SourceManifestError, match="root_escape"):
+        manifest._entry_from_record({
+            "record": "entry", "path": "/fixture/incoming/fixture/incoming/file", "kind": "file", "size": 1,
+            "mtime_ns": 1, "mode": 0o644,
+        }, absolute_root)
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("child.bin", "child.bin"),
+        ("fixture/incoming/child.bin", "child.bin"),
+        ("fixture/incoming/nested/child.bin", "nested/child.bin"),
+        ("selected folder/child [final] (1)+$!.bin", "selected folder/child [final] (1)+$!.bin"),
+    ],
+)
+def test_account_home_relative_entry_paths_normalize_once(path, expected):
+    entry = manifest._entry_from_record({
+        "record": "entry", "path": path, "kind": "file", "size": 1,
+        "mtime_ns": 1, "mode": 0o644,
+    }, ROOT)
+    assert entry.path == expected
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/fixture/incoming/child.bin",
+        "../child.bin",
+        "fixture/incoming/../child.bin",
+        "fixture/incoming/fixture/incoming/child.bin",
+    ],
+)
+def test_account_home_relative_entry_paths_reject_absolute_traversal_and_double_prefix(path):
+    with pytest.raises(manifest.SourceManifestError, match="root_escape"):
+        manifest._entry_from_record({
+            "record": "entry", "path": path, "kind": "file", "size": 1,
+            "mtime_ns": 1, "mode": 0o644,
+        }, ROOT)
+
+
+def test_account_home_relative_duplicate_paths_fail_after_normalization():
+    records = [
+        {"record": "entry", "path": "child.bin", "kind": "file", "size": 1, "mtime_ns": 1, "mode": 0o644},
+        {"record": "entry", "path": "fixture/incoming/child.bin", "kind": "file", "size": 1, "mtime_ns": 1, "mode": 0o644},
+    ]
+    with pytest.raises(manifest.SourceManifestError, match="duplicate_entry"):
+        manifest.SourceManifestHarness(ROOT, lambda _root: protocol(records)).snapshot()
 
 
 def test_snapshot_output_is_private_atomic_and_redacts_root_and_names(tmp_path):
     output = tmp_path / "manifest.json"
     harness = manifest.SourceManifestHarness(
-        "/private/credential-root", lambda _root: protocol(nested_records(1)),
+        "private/credential-root", lambda _root: protocol(nested_records(1)),
     )
     snapshot = harness.capture_stable()
     harness.write_snapshot(snapshot, output)
     if os.name != "nt":
         assert stat.S_IMODE(output.stat().st_mode) == 0o600
     text = output.read_text(encoding="utf-8")
-    assert "/private/credential-root" not in text
+    assert "private/credential-root" not in text
     assert "file-0000.bin" not in text
     assert "path_metadata_digest" in json.loads(text)
 
@@ -159,7 +215,7 @@ def test_bracketed_ipv6_uri_is_normalized_without_uri_credentials():
 
 def test_lftp_listing_requires_root_header_and_parses_colon_filename_before_header_logic():
     listing = (
-        b"/fixture/incoming:\n"
+        b"fixture/incoming:\n"
         b"-rw-r--r-- 1 user group 4 2026-01-01 00:00 legal:name:\n"
         b"source_manifest_complete\n"
     )
@@ -173,6 +229,19 @@ def test_lftp_listing_requires_root_header_and_parses_colon_filename_before_head
             b"-rw-r--r-- 1 user group 4 2026-01-01 00:00 file\nsource_manifest_complete\n",
             ROOT,
         )
+
+
+def test_lftp_relative_listing_keeps_selected_nested_root_and_special_names():
+    listing = (
+        b"source_manifest_stage_started\n"
+        b"source_manifest_stage_connected\n"
+        b"source_manifest_stage_root\n"
+        b"drwxr-xr-x                      - - ./\n"
+        b"-rw-r--r-- user/group 4 2026-01-01 00:00 ./fixture/incoming/selected/child [1].bin\n"
+        b"source_manifest_complete\n"
+    )
+    records = manifest._parse_lftp_listing(listing, ROOT)
+    assert records[0].path == "selected/child [1].bin"
 
 
 def test_lftp_find_listing_requires_ordered_fixed_markers_and_discards_progress_path():

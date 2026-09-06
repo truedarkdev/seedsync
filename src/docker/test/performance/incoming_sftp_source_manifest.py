@@ -149,9 +149,11 @@ def _root_path(value: object) -> str:
     if "\\" in value or "//" in value:
         raise _fail("invalid_configuration")
     root = PurePosixPath(value)
-    parts = root.parts
+    parts = tuple(part for part in root.parts if part != "/")
     if not parts or any(part in ("", ".", "..") for part in parts):
         raise _fail("invalid_configuration")
+    for component in parts:
+        _safe_name(component)
     normalized = root.as_posix()
     if normalized == "." or normalized.endswith("/"):
         raise _fail("invalid_configuration")
@@ -162,10 +164,6 @@ def _safe_name(name: object) -> str:
     if not isinstance(name, str) or not name or _CONTROL_RE.search(name):
         raise _fail("special_name")
     if name in (".", "..") or "/" in name or "\\" in name:
-        raise _fail("special_name")
-    # Shell/glob syntax is not needed by the protocol and makes accidental
-    # command interpretation or ambiguous listings unsafe.
-    if any(character in name for character in "*?[]{};|&$`\""):
         raise _fail("special_name")
     return name
 
@@ -178,16 +176,23 @@ def _relative_entry_path(value: object, root: str) -> str:
     path = PurePosixPath(value)
     if any(part in ("", ".", "..") for part in path.parts):
         raise _fail("root_escape")
+    normalized = path.as_posix()
+    prefix = root + "/"
     if path.is_absolute():
-        absolute = path.as_posix()
-        if absolute == root:
-            raise _fail("record_malformed")
-        prefix = root + "/"
-        if not absolute.startswith(prefix):
+        # An absolute root may make LFTP emit its full selected-root prefix.
+        # Only that exact trusted prefix is accepted, once.
+        if not root.startswith("/") or normalized == root or not normalized.startswith(prefix):
             raise _fail("root_escape")
-        relative = absolute[len(prefix):]
+        relative = normalized[len(prefix):]
+    elif normalized == root:
+        raise _fail("record_malformed")
+    elif normalized.startswith(prefix):
+        relative = normalized[len(prefix):]
     else:
-        relative = path.as_posix()
+        relative = normalized
+    root_relative = root.lstrip("/")
+    if relative == root or relative.startswith(prefix) or relative == root_relative or relative.startswith(root_relative + "/"):
+        raise _fail("root_escape")
     components = relative.split("/")
     if not components or any(not component for component in components):
         raise _fail("record_malformed")
@@ -600,7 +605,7 @@ def _parse_lftp_listing(output: bytes, root: str) -> list[SourceManifestEntry]:
                 if relative in ("", "."):
                     find_root_seen = True
                     continue
-                path = root + "/" + relative
+                path = relative
                 find_root_seen = True
             mode = match.group("mode")
             if not _SAFE_MODE_RE.match(mode):
@@ -635,24 +640,12 @@ def _parse_lftp_listing(output: bytes, root: str) -> list[SourceManifestEntry]:
             continue
         if raw_line.endswith(":") and not raw_line.startswith(" "):
             candidate = raw_line[:-1]
-            if candidate.startswith("/"):
-                header_path = PurePosixPath(candidate)
-            else:
-                header_path = PurePosixPath(root) / candidate
-            normalized = header_path.as_posix()
-            if normalized == root:
+            if candidate in (".", root):
                 root_header_seen = True
-                current = normalized
+                current = root
                 continue
-            prefix = root + "/"
-            if not normalized.startswith(prefix):
-                raise _fail("root_escape")
-            relative_header = normalized[len(prefix):]
-            if any(part in ("", ".", "..") for part in PurePosixPath(relative_header).parts):
-                raise _fail("root_escape")
-            for component in relative_header.split("/"):
-                _safe_name(component)
-            current = normalized
+            relative_header = _relative_entry_path(candidate, root)
+            current = root + "/" + relative_header
             continue
         raise _fail("record_malformed")
     if not sentinel_seen:
