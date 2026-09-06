@@ -229,7 +229,7 @@ def test_repeated_preflight_does_not_reset_one_post_attempt():
     gate.preflight(get)
     with pytest.raises(observer.ObserverSchemaError, match="already attempted"):
         gate.queue(lambda path: sent.append(path) or object())
-    assert len(sent) == 1
+    assert len(sent) == 0
 
 
 def test_fixed_get_sampler_persists_before_each_next_get_without_overlap(tmp_path):
@@ -471,12 +471,12 @@ def test_failing_sink_does_not_mask_queue_error_or_allow_a_second_post():
         sent.append(path)
         raise TimeoutError("timeout-private-detail")
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(observer.ObserverCaptureError):
         gate.queue(send)
     assert gate.queue_attempted is True
     assert gate.capture_failure == {
         "schema": "incoming-recovery-observer-capture-failure.v1",
-        "phase": "queue_failure", "kind": "artifact_sink_failure",
+            "phase": "queue_attempt_started", "kind": "artifact_sink_failure",
     }
     with pytest.raises(observer.ObserverSchemaError, match="already attempted"):
         gate.queue(send)
@@ -494,12 +494,12 @@ def test_failing_sink_does_not_mask_queue_http_error():
         sent.append(path)
         raise HTTPError("http://private", 409, "Conflict", None, BytesIO(b"private-body"))
 
-    with pytest.raises(HTTPError):
+    with pytest.raises(observer.ObserverCaptureError):
         gate.queue(send)
     assert gate.queue_attempted is True
     assert gate.capture_failure == {
         "schema": "incoming-recovery-observer-capture-failure.v1",
-        "phase": "queue_failure", "kind": "artifact_sink_failure",
+            "phase": "queue_attempt_started", "kind": "artifact_sink_failure",
     }
     with pytest.raises(observer.ObserverSchemaError, match="already attempted"):
         gate.queue(send)
@@ -604,3 +604,16 @@ def test_http_adapter_maps_http_error_to_real_queue_status_once(tmp_path):
     result = runner.HttpAdapter(key, opener).request("/server/command/queue/x", "POST")
     assert result.status == 504
     assert result.body == b'{"message":"private"}'
+
+
+def test_durable_attempt_marker_precedes_transport_and_survives_restart(tmp_path):
+    marker = tmp_path / "attempt.json"
+    events = []
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", attempt_state_path=marker)
+    gate.preflight(lambda path: responses()[path])
+    gate.queue(lambda _path: events.append(marker.read_text()) or observer.QueueTransportResponse(200))
+    assert events and "queue_attempt_started" in events[0]
+    resumed = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", attempt_state_path=marker)
+    resumed.preflight(lambda path: responses()[path])
+    with pytest.raises(observer.ObserverSchemaError, match="consumed"):
+        resumed.queue(lambda _path: pytest.fail("POST must not run"))

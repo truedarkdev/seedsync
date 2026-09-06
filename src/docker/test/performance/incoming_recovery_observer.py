@@ -1140,7 +1140,28 @@ class QueueGate:
     queue_attempted: bool = False
     artifact_sink: object | None = None
     artifact_path: str | os.PathLike[str] | None = None
+    attempt_state_path: str | os.PathLike[str] | None = None
     capture_failure: Mapping[str, object] | None = None
+
+    def _consume_durable_attempt(self) -> None:
+        if self.attempt_state_path is None:
+            return
+        path = Path(self.attempt_state_path)
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as exc:
+            raise ObserverSchemaError("Queue durable attempt is already consumed") from exc
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write('{"schema":"incoming-recovery-queue-attempt.v1","state":"queue_attempt_started"}\n')
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            raise
 
     def __post_init__(self) -> None:
         if self.artifact_sink is not None and self.artifact_path is not None:
@@ -1228,6 +1249,12 @@ class QueueGate:
         # Set before invoking the injected transport so re-entry or any exception
         # cannot cause a second POST, including after a repeated preflight.
         self.queue_attempted = True
+        try:
+            self._consume_durable_attempt()
+            if not self._persist({"schema": "incoming-recovery-observer-event.v1", "event": "queue_attempt_started", "outcome": "success"}, "queue_attempt_started"):
+                raise ObserverCaptureError("Queue attempt marker capture failed")
+        except Exception:
+            raise
         try:
             response = send(queue_path(self.target_root_name, self.target_root_id, self.target_pair_id))
         except HTTPError as exc:
