@@ -45,13 +45,18 @@ class HttpAdapter:
             return QueueTransportResponse(error.code, error.read())
 
 
-def main(config_path: str) -> int:
-    if os.environ.get("INCOMING_RECOVERY_ALLOW_QUEUE") != "1":
-        raise SystemExit("Queue gate must be explicitly enabled")
+def main(config_path: str, dry_run: bool = False) -> int:
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     adapter = HttpAdapter(Path(config["key_path"]))
     gate = QueueGate(config["pair_id"], config["pair_name"], config["root_id"],
         config["root_name"], require_pending_transfer=True, artifact_path=config["artifact_path"])
+    if dry_run:
+        gate.preflight(adapter.request)
+        _observer.FixedGetSampler(tuple(config["passive_paths"]), artifact_path=config["artifact_path"],
+            continue_on_error=False).sample(adapter.request)
+        return 0
+    if os.environ.get("INCOMING_RECOVERY_ALLOW_QUEUE") != "1":
+        raise SystemExit("Queue gate must be explicitly enabled")
     caller = PassiveQueueCaller(gate, adapter.request,
         lambda path: adapter.request(path, "POST"), tuple(config["passive_paths"]),
         config["artifact_path"], os.environ, 35)
@@ -60,4 +65,4 @@ def main(config_path: str) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1]))
+    raise SystemExit(main(sys.argv[-1], "--dry-run" in sys.argv[1:-1]))
