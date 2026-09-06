@@ -275,7 +275,7 @@ def test_lftp_listing_strips_trusted_absolute_root_prefix_once():
     assert manifest._parse_lftp_listing(listing, absolute_root)[0].path == "child.bin"
 
 
-def test_lftp_high_bit_timestamp_hash_is_normalized_before_protocol_encoding():
+def test_lftp_high_bit_timestamp_hash_preserves_legacy_digest_provenance():
     timestamp = "2026-09-06 11:34:00"
     raw = int.from_bytes(hashlib.sha256(timestamp.encode("utf-8")).digest()[:8], "big")
     assert raw > manifest._MAX_BYTES
@@ -288,11 +288,38 @@ def test_lftp_high_bit_timestamp_hash_is_normalized_before_protocol_encoding():
         ROOT,
     )
     assert 0 <= records[0].mtime_ns <= manifest._MAX_BYTES
-    # The LFTP record is valid under the same JSON protocol range as normal entries.
-    assert manifest._entry_from_record({
-        "record": "entry", "path": "file.bin", "kind": "file", "size": 1,
-        "mtime_ns": records[0].mtime_ns, "mode": 0o644,
-    }, ROOT).mtime_ns == records[0].mtime_ns
+    assert records[0].legacy_mtime_ns == raw
+    protocol_record = json.loads(manifest._encode_protocol_entry(records[0]))
+    assert protocol_record["legacy_mtime_ns"] == raw
+    assert manifest._entry_from_record(protocol_record, ROOT).legacy_mtime_ns == raw
+    assert manifest._manifest_digest(records) != manifest._legacy_manifest_digest(records)
+
+
+def test_legacy_digest_is_deterministic_and_part_of_stability_gating():
+    raw = next(
+        value for value in range(manifest._MAX_BYTES + 1, manifest._MAX_BYTES + 1000)
+        if value & manifest._MAX_BYTES == 7
+    )
+    entry = manifest.SourceManifestEntry("private-name.bin", "file", 1, 7, 0o644, raw)
+    current = manifest._manifest_digest([entry])
+    legacy = manifest._legacy_manifest_digest([entry])
+    assert current != legacy
+    snapshot = manifest.SourceManifestSnapshot(manifest._SCHEMA, 1, 1, current, legacy, "0" * 64)
+    same = manifest.SourceManifestSnapshot(manifest._SCHEMA, 1, 1, current, legacy, "1" * 64)
+    changed_legacy = manifest.SourceManifestSnapshot(manifest._SCHEMA, 1, 1, current, current, "0" * 64)
+    assert manifest.compare_source_snapshots(snapshot, same).stable
+    assert not manifest.compare_source_snapshots(snapshot, changed_legacy).stable
+    artifact = snapshot.as_artifact()
+    assert artifact["legacy_path_metadata_digest"] == legacy
+    assert "private-name.bin" not in json.dumps(artifact)
+
+
+def test_protocol_rejects_inconsistent_legacy_timestamp_provenance():
+    with pytest.raises(manifest.SourceManifestError, match="invalid_metadata"):
+        manifest._entry_from_record({
+            "record": "entry", "path": "file.bin", "kind": "file", "size": 1,
+            "mtime_ns": 7, "legacy_mtime_ns": 8, "mode": 0o644,
+        }, ROOT)
 
 
 def test_lftp_failure_stage_is_allowlisted_and_persisted_without_output():

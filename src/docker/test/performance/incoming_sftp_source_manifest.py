@@ -47,6 +47,7 @@ class SourceManifestEntry:
     size: int = 0
     mtime_ns: int = 0
     mode: int = 0
+    legacy_mtime_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class SourceManifestSnapshot:
     file_count: int
     total_bytes: int
     path_metadata_digest: str
+    legacy_path_metadata_digest: str
     root_digest: str
 
     @property
@@ -86,6 +88,7 @@ class SourceManifestSnapshot:
             "file_count": self.file_count,
             "total_bytes": self.total_bytes,
             "path_metadata_digest": self.path_metadata_digest,
+            "legacy_path_metadata_digest": self.legacy_path_metadata_digest,
             "root_digest": self.root_digest,
         }
 
@@ -110,6 +113,7 @@ class SourceManifestStability:
 
 
 _SCHEMA = "incoming-recovery-source-manifest.v1"
+_MAX_LEGACY_UNSIGNED = (1 << 64) - 1
 _STABILITY_REASONS = frozenset({"stable", "snapshot_changed"})
 _FAILURE_REASONS = frozenset({
     "invalid_configuration", "protocol_failure", "process_failed", "process_timeout",
@@ -242,15 +246,25 @@ def _entry_from_record(record: object, root: str) -> SourceManifestEntry:
         raise _fail("invalid_size")
     if kind == "file" and size < 0:
         raise _fail("invalid_size")
+    legacy_raw = record.get("legacy_mtime_ns")
     if isinstance(mtime, str):
-        # LFTP's long listing exposes a stable timestamp string.  Normalize it
-        # to the same non-negative signed range accepted by the protocol.
-        mtime_ns = int.from_bytes(
+        if legacy_raw is not None:
+            raise _fail("invalid_metadata")
+        legacy_mtime_ns = int.from_bytes(
             hashlib.sha256(mtime.encode("utf-8")).digest()[:8], "big",
-        ) & _MAX_BYTES
+        )
+        mtime_ns = legacy_mtime_ns & _MAX_BYTES
     else:
         mtime_ns = mtime
-    return SourceManifestEntry(relative, kind, size, mtime_ns, mode)
+        if legacy_raw is None:
+            legacy_mtime_ns = None
+        elif type(legacy_raw) is int and 0 <= legacy_raw <= _MAX_LEGACY_UNSIGNED:
+            if legacy_raw & _MAX_BYTES != mtime_ns:
+                raise _fail("invalid_metadata")
+            legacy_mtime_ns = legacy_raw
+        else:
+            raise _fail("invalid_metadata")
+    return SourceManifestEntry(relative, kind, size, mtime_ns, mode, legacy_mtime_ns)
 
 
 def _encode_entry(entry: SourceManifestEntry) -> bytes:
@@ -258,6 +272,23 @@ def _encode_entry(entry: SourceManifestEntry) -> bytes:
         "record": "entry", "path": entry.path, "kind": entry.kind,
         "size": entry.size, "mtime_ns": entry.mtime_ns, "mode": entry.mode,
     }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _encode_protocol_entry(entry: SourceManifestEntry) -> bytes:
+    """Carry legacy timestamp provenance across the private process boundary.
+
+    The compatibility value remains in memory and the transient protocol only:
+    aggregate artifacts deliberately continue to contain digests, not entries.
+    The canonical digest encoder above stays byte-for-byte compatible with both
+    retained algorithms.
+    """
+    record = {
+        "record": "entry", "path": entry.path, "kind": entry.kind,
+        "size": entry.size, "mtime_ns": entry.mtime_ns, "mode": entry.mode,
+    }
+    if entry.legacy_mtime_ns is not None:
+        record["legacy_mtime_ns"] = entry.legacy_mtime_ns
+    return json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def _parse_protocol_output(output: bytes | str, root: str, *, max_entries: int) -> tuple[list[SourceManifestEntry], bool]:
@@ -325,6 +356,17 @@ def _manifest_digest(entries: Sequence[SourceManifestEntry]) -> str:
     digest = hashlib.sha256()
     for entry in sorted((item for item in entries if item.kind == "file"), key=lambda item: item.path):
         digest.update(_encode_entry(entry))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _legacy_manifest_digest(entries: Sequence[SourceManifestEntry]) -> str:
+    """Reproduce f966's unsigned timestamp digest without retaining entries."""
+    digest = hashlib.sha256()
+    for entry in sorted((item for item in entries if item.kind == "file"), key=lambda item: item.path):
+        legacy = SourceManifestEntry(entry.path, entry.kind, entry.size,
+            entry.legacy_mtime_ns if entry.legacy_mtime_ns is not None else entry.mtime_ns, entry.mode)
+        digest.update(_encode_entry(legacy))
         digest.update(b"\n")
     return digest.hexdigest()
 
@@ -698,7 +740,7 @@ class ReadOnlySftpProtocolRunner:
             # marker: it adds it only after LFTP exits and both output drains
             # have joined, so it cannot split or interleave a listing record.
             entries = _parse_lftp_listing(stdout.rstrip(b"\n") + b"\n" + _SENTINEL.encode("ascii") + b"\n", root)
-            protocol = b"".join(_encode_entry(entry) + b"\n" for entry in entries)
+            protocol = b"".join(_encode_protocol_entry(entry) + b"\n" for entry in entries)
             protocol += json.dumps({
                 "record": "end", "sentinel": _SENTINEL,
                 "entry_count": len(entries), "file_count": sum(e.kind == "file" for e in entries),
@@ -943,12 +985,14 @@ def _parse_lftp_listing(output: bytes, root: str) -> list[SourceManifestEntry]:
                 if triplet[2] in "xXsStT":
                     bits |= 1
                 mode_value |= bits << (6 - offset * 3)
+            legacy_mtime_ns = int.from_bytes(
+                hashlib.sha256(metadata.encode("utf-8")).digest()[:8], "big",
+            )
             entries.append(SourceManifestEntry(
                 _relative_entry_path(path, root), kind, 0 if kind == "directory" else size,
-                int.from_bytes(
-                    hashlib.sha256(metadata.encode("utf-8")).digest()[:8], "big",
-                ) & _MAX_BYTES,
+                legacy_mtime_ns & _MAX_BYTES,
                 mode_value,
+                legacy_mtime_ns,
             ))
             continue
         if raw_line.endswith(":") and not raw_line.startswith(" "):
@@ -1083,7 +1127,7 @@ class SourceManifestHarness:
             protocol_records = []
             for item in records:
                 if isinstance(item, SourceManifestEntry):
-                    protocol_records.append(_encode_entry(item))
+                    protocol_records.append(_encode_protocol_entry(item))
                 elif isinstance(item, Mapping):
                     record = dict(item)
                     record.setdefault("record", "entry")
@@ -1124,6 +1168,7 @@ class SourceManifestHarness:
         return SourceManifestSnapshot(
             _SCHEMA, len(file_entries), sum(entry.size for entry in file_entries),
             _manifest_digest(entries),
+            _legacy_manifest_digest(entries),
             hashlib.sha256(self.root.encode("utf-8")).hexdigest(),
         )
 
@@ -1179,6 +1224,7 @@ def compare_source_snapshots(first: SourceManifestSnapshot, second: SourceManife
         and first.file_count == second.file_count
         and first.total_bytes == second.total_bytes
         and first.path_metadata_digest == second.path_metadata_digest
+        and first.legacy_path_metadata_digest == second.legacy_path_metadata_digest
     )
     return SourceManifestStability(stable, "stable" if stable else "snapshot_changed", first, second)
 
