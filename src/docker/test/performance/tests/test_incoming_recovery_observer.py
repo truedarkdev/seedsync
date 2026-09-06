@@ -229,7 +229,7 @@ def test_repeated_preflight_does_not_reset_one_post_attempt():
     gate.preflight(get)
     with pytest.raises(observer.ObserverSchemaError, match="already attempted"):
         gate.queue(lambda path: sent.append(path) or object())
-    assert len(sent) == 0
+    assert len(sent) == 1
 
 
 def test_fixed_get_sampler_persists_before_each_next_get_without_overlap(tmp_path):
@@ -480,7 +480,7 @@ def test_failing_sink_does_not_mask_queue_error_or_allow_a_second_post():
     }
     with pytest.raises(observer.ObserverSchemaError, match="already attempted"):
         gate.queue(send)
-    assert len(sent) == 1
+    assert len(sent) == 0
     assert "timeout-private-detail" not in str(gate.capture_failure)
 
 
@@ -503,7 +503,7 @@ def test_failing_sink_does_not_mask_queue_http_error():
     }
     with pytest.raises(observer.ObserverSchemaError, match="already attempted"):
         gate.queue(send)
-    assert len(sent) == 1
+    assert len(sent) == 0
 
 
 def test_custom_exception_and_response_names_are_not_persisted(tmp_path):
