@@ -182,6 +182,54 @@ def _source_root_preflight_candidates(root: object, remote_path: object) -> tupl
     return resolved, None
 
 
+def _trusted_manifest_root(root: object, remote_path: object, trusted_absolute_root: object = None) -> str:
+    """Select a protected canonical absolute root when one is explicitly bound."""
+    resolved = _account_home_manifest_root(root, remote_path)
+    if trusted_absolute_root is None:
+        return resolved
+    if (
+        not isinstance(trusted_absolute_root, str)
+        or not trusted_absolute_root.startswith("/")
+        or trusted_absolute_root == "/"
+        or "\\" in trusted_absolute_root
+        or "//" in trusted_absolute_root
+        or "://" in trusted_absolute_root
+        or any(ch in trusted_absolute_root for ch in "?#")
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in trusted_absolute_root)
+    ):
+        raise SystemExit("source_manifest trusted absolute root is invalid")
+    trusted_parts = tuple(part for part in trusted_absolute_root.split("/") if part)
+    selected_parts = tuple(part for part in root.split("/") if part) if isinstance(root, str) else ()
+    if (
+        not trusted_parts
+        or not selected_parts
+        or any(part in (".", "..") for part in trusted_parts)
+        or len(trusted_parts) < len(selected_parts)
+        or trusted_parts[-len(selected_parts):] != selected_parts
+    ):
+        raise SystemExit("source_manifest trusted absolute root is invalid")
+    return "/" + "/".join(trusted_parts)
+
+
+def _source_root_preflight_candidates_with_trusted_root(root: object, remote_path: object, trusted_absolute_root: object = None) -> tuple[str | None, str | None]:
+    resolved = _account_home_manifest_root(root, remote_path)
+    explicit = _trusted_manifest_root(root, remote_path, trusted_absolute_root)
+    if trusted_absolute_root is not None:
+        return (None if resolved.startswith("/") else resolved), explicit
+    return _source_root_preflight_candidates(root, remote_path)
+
+
+def _require_private_trusted_root_config(config_path: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        mode = config_path.stat().st_mode & 0o777
+    except OSError:
+        raise SystemExit("source_manifest trusted absolute root config is unavailable")
+    if mode != 0o600:
+        raise SystemExit("source_manifest trusted absolute root requires private config")
+
+
 class HttpAdapter:
     """Keep secrets in the caller and return an explicit Queue status result."""
     def __init__(self, key_path: Path, opener=urllib.request.urlopen):
@@ -206,7 +254,8 @@ class HttpAdapter:
 def main(
     config_path: str, dry_run: bool = False, source_manifest: bool = False, source_root_preflight: bool = False,
 ) -> int:
-    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    config_file = Path(config_path)
+    config = json.loads(config_file.read_text(encoding="utf-8"))
     source_manifest_config = config.get("source_manifest")
     if source_manifest_config is not None and not isinstance(source_manifest_config, dict):
         raise SystemExit("source_manifest config must be an object")
@@ -218,13 +267,17 @@ def main(
         if source_manifest_config is None:
             raise SystemExit("source_manifest config is required")
         root = source_manifest_config.get("configured_root", source_manifest_config.get("root"))
+        if source_manifest_config.get("trusted_absolute_root") is not None:
+            _require_private_trusted_root_config(config_file)
         output_path = source_manifest_config.get("root_preflight_artifact_path")
         if not isinstance(root, str) or not isinstance(output_path, str):
             raise SystemExit("root preflight requires root and root_preflight_artifact_path")
         connection = _source_manifest_connection(
             config, source_manifest_config, base_dir=Path(config_path).resolve().parent,
         )
-        relative_root, trusted_absolute_root = _source_root_preflight_candidates(root, connection["remote_path"])
+        relative_root, trusted_absolute_root = _source_root_preflight_candidates_with_trusted_root(
+            root, connection["remote_path"], source_manifest_config.get("trusted_absolute_root"),
+        )
         transport = source_manifest_config.get("root_preflight_transport", "sftp_realpath")
         if transport == "sftp_realpath":
             askpass_program = str(Path(__file__).with_name("incoming_sftp_askpass.py").resolve())
@@ -254,13 +307,15 @@ def main(
         if source_manifest_config is None:
             raise SystemExit("source_manifest config is required")
         root = source_manifest_config.get("configured_root", source_manifest_config.get("root"))
+        if source_manifest_config.get("trusted_absolute_root") is not None:
+            _require_private_trusted_root_config(config_file)
         output_path = source_manifest_config.get("artifact_path", source_manifest_config.get("output_path"))
         if not isinstance(root, str) or not isinstance(output_path, str):
             raise SystemExit("source_manifest requires root and artifact_path")
         connection = _source_manifest_connection(
             config, source_manifest_config, base_dir=Path(config_path).resolve().parent,
         )
-        root = _account_home_manifest_root(root, connection["remote_path"])
+        root = _trusted_manifest_root(root, connection["remote_path"], source_manifest_config.get("trusted_absolute_root"))
         harness = SourceManifestHarness(
             root,
             host=connection["host"], port=connection["port"],

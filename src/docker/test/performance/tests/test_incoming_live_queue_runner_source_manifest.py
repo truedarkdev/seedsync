@@ -188,6 +188,37 @@ def test_account_home_manifest_root_rejects_escape_and_double_prefix(root, base)
         runner._account_home_manifest_root(root, base)
 
 
+def test_trusted_absolute_root_overrides_stale_relative_base_for_manifest_and_preflight():
+    trusted = "/home/remoteuser/canonical/Incoming"
+    assert runner._trusted_manifest_root("Incoming", "stale/base", trusted) == trusted
+    assert runner._source_root_preflight_candidates_with_trusted_root("Incoming", "stale/base", trusted) == (
+        "stale/base/Incoming", trusted,
+    )
+
+
+@pytest.mark.parametrize("trusted", (
+    "relative/Incoming", "/home/remoteuser/canonical/not-incoming", "/home/../canonical/Incoming",
+    "/home//canonical/Incoming", "/home/canonical/Incoming?query", "/home/canonical/Incoming#fragment",
+    "/home/canonical/Incoming\x01",
+))
+def test_trusted_absolute_root_rejects_unbound_value(trusted):
+    with pytest.raises(SystemExit, match="trusted absolute root"):
+        runner._trusted_manifest_root("Incoming", "stale/base", trusted)
+
+
+def test_trusted_absolute_root_requires_owner_private_runner_config(monkeypatch, tmp_path):
+    config_path = tmp_path / "runner.json"
+    config_path.write_text(json.dumps({"source_manifest": {
+        "root": "Incoming", "trusted_absolute_root": "/home/remoteuser/canonical/Incoming",
+        "connection_config_path": str(tmp_path / "connection.json"),
+        "root_preflight_artifact_path": str(tmp_path / "artifact.json"),
+    }}), encoding="utf-8")
+    monkeypatch.setattr(runner.os, "name", "posix")
+    config_path.chmod(0o644)
+    with pytest.raises(SystemExit, match="requires private config"):
+        runner.main(str(config_path), source_root_preflight=True)
+
+
 def test_real_lftp_runner_adds_completion_only_after_the_process_finishes(monkeypatch):
     listing = (
         "source_manifest_phase_open\n"
