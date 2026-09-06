@@ -4737,6 +4737,71 @@ class TestModelUpdater(unittest.TestCase):
         self.assertIn(pair_id, controller._Controller__reconciled_local_path_pair_ids)
         self.assertIn(pair_id, controller._Controller__reconciled_remote_path_pair_ids)
 
+    def test_model_updater_keeps_completed_pair_token_from_partial_local_drain(self):
+        """An unrelated local gap cannot hide a selected pair's fresh authority."""
+        pair_id = "fixture-pair-a"
+        other_pair_id = "fixture-pair-b"
+        builder = ModelBuilder()
+        model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=True, model_builder=builder, model=model,
+        )
+        local_process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+        remote_process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+        self.addCleanup(local_process.close_queues)
+        self.addCleanup(remote_process.close_queues)
+        controller._Controller__local_scan_process = local_process
+        controller._Controller__remote_scan_process = remote_process
+        controller._Controller__path_pairs_by_id = {
+            pair_id: MagicMock(), other_pair_id: MagicMock(),
+        }
+        controller._Controller__scan_authority_tokens = {
+            "local": {pair_id: (local_process.session_token, 2)},
+            "remote": {pair_id: (remote_process.session_token, 6)},
+        }
+        controller._record_path_pair_scan_tokens = (
+            Controller._record_path_pair_scan_tokens.__get__(controller, Controller)
+        )
+        controller._Controller__deferred_queue_intents = {}
+        controller._Controller__deferred_queue_intents_map = (
+            Controller._Controller__deferred_queue_intents_map.__get__(controller, Controller)
+        )
+
+        local_root = SystemFile("selected", 10, True)
+        local_root.path_pair_id = pair_id
+        local_process._ScannerProcess__publish_result(ScannerResult(
+            datetime.now(), [local_root], scanned_path_pair_ids={pair_id},
+            completed_path_pair_ids={pair_id}, is_progress=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id},
+            generation=3, session_token=local_process.session_token,
+        ))
+        local_process._ScannerProcess__publish_result(ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={other_pair_id},
+            unknown_path_pair_ids={other_pair_id}, is_progress=True,
+            generation=3, session_token=local_process.session_token,
+        ))
+        remote_root = SystemFile("selected", 10, True)
+        remote_root.path_pair_id = pair_id
+        remote_process._ScannerProcess__publish_result(ScannerResult(
+            datetime.now(), [remote_root], scanned_path_pair_ids={pair_id},
+            completed_path_pair_ids={pair_id}, is_progress=True, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id},
+            generation=7, session_token=remote_process.session_token,
+        ))
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(
+            (local_process.session_token, 3),
+            controller._Controller__scan_authority_tokens["local"][pair_id],
+        )
+        self.assertEqual(
+            (remote_process.session_token, 7),
+            controller._Controller__scan_authority_tokens["remote"][pair_id],
+        )
+        self.assertIn(pair_id, controller._Controller__reconciled_local_path_pair_ids)
+        self.assertNotIn(other_pair_id, controller._Controller__reconciled_local_path_pair_ids)
+
     def test_later_progressive_final_event_republishes_against_standing_authority(self):
         remote_token = "remote-later-final"
         local_token = "local-later-final"

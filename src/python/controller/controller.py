@@ -2810,9 +2810,21 @@ class Controller:
             result_unknown_ids = getattr(result, "unknown_path_pair_ids", set())
             unknown_pair_ids = result_unknown_ids if isinstance(result_unknown_ids, (set, frozenset, list, tuple)) \
                 else set()
-            if not bool(getattr(result, "is_scan_final", True)):
+            per_pair_tokens = getattr(result, "_scan_authority_tokens_by_pair", None)
+            has_per_pair_tokens = isinstance(per_pair_tokens, dict)
+            is_scan_final = bool(getattr(result, "is_scan_final", True))
+            # A progressive multi-pair drain can carry a lossless, completed
+            # snapshot for the selected pair while another pair remains
+            # incomplete.  ScannerProcess attaches an exact token for that
+            # completed pair; discarding the whole aggregate here stranded a
+            # deferred Queue behind unrelated local work.
+            if not is_scan_final and not has_per_pair_tokens:
                 return
-            if unknown_pair_ids:
+            # A final aggregate can truthfully terminalize the affected
+            # unknown pair.  A partial aggregate also carries unrelated
+            # incomplete pairs and a drain-wide generation, so it must not
+            # attribute that generation to another deferred Queue intent.
+            if unknown_pair_ids and is_scan_final:
                 mark_initial_rescan_failure(
                     set(unknown_pair_ids),
                     "initial_{}_scan_unknown".format(side),
@@ -2830,17 +2842,18 @@ class Controller:
                 if isinstance(raw_completed, (set, frozenset, list, tuple)):
                     affected_pair_ids.update(raw_completed)
                 return
-            raw_scanned = getattr(result, "scanned_path_pair_ids", set())
             raw_completed = getattr(result, "completed_path_pair_ids", set())
-            scanned = raw_scanned if isinstance(raw_scanned, set) else set()
             completed = raw_completed if isinstance(raw_completed, set) else set()
-            per_pair_tokens = getattr(result, "_scan_authority_tokens_by_pair", None)
-            has_per_pair_tokens = isinstance(per_pair_tokens, dict)
+            raw_scanned = getattr(result, "scanned_path_pair_ids", set())
+            scanned = raw_scanned if isinstance(raw_scanned, set) else set()
+            covered_pair_ids = completed if not is_scan_final else scanned | completed
             side_tokens = tokens.get(side)
             if not isinstance(side_tokens, dict):
                 side_tokens = {}
                 tokens[side] = side_tokens
-            for pair_id in scanned | completed:
+            for pair_id in covered_pair_ids:
+                if pair_id in unknown_pair_ids:
+                    continue
                 if pair_id is None or isinstance(pair_id, str):
                     if has_per_pair_tokens:
                         pair_token = per_pair_tokens.get(pair_id)

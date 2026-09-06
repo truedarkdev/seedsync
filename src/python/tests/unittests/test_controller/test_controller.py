@@ -12283,6 +12283,134 @@ class TestController(unittest.TestCase):
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
 
+    def test_partial_local_scanner_authority_releases_scoped_queue(self):
+        """A completed selected pair must not wait for an unrelated local pair."""
+        pair_id = "pair-a"
+        other_pair_id = "pair-b"
+        local_process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+        remote_process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+        self.addCleanup(local_process.close_queues)
+        self.addCleanup(remote_process.close_queues)
+        self.controller._Controller__local_scan_process = local_process
+        self.controller._Controller__remote_scan_process = remote_process
+        self.controller._Controller__path_pairs_by_id = {
+            pair_id: SimpleNamespace(remote_path="/remote", local_path="/local"),
+        }
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = set()
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {
+                pair_id: (local_process.session_token, 2),
+                other_pair_id: (local_process.session_token, 2),
+            },
+            "remote": {
+                pair_id: (remote_process.session_token, 6),
+                other_pair_id: (remote_process.session_token, 6),
+            },
+        }
+        unrelated_command = Controller.Command(Controller.Command.Action.QUEUE, "other")
+        unrelated_intent = DeferredQueueIntent(
+            unrelated_command, "other", other_pair_id, phase="initial_rescan", rescan_requested=True,
+            rescan_generations=(
+                (local_process.session_token, 2),
+                (remote_process.session_token, 6),
+            ),
+        )
+        self.controller._Controller__deferred_queue_intents = {
+            unrelated_intent.file_id: unrelated_intent,
+        }
+
+        selected_root = SystemFile("selected", 10, True)
+        selected_root.path_pair_id = pair_id
+        local_process._ScannerProcess__publish_result(ScannerResult(
+            datetime.now(), [selected_root], scanned_path_pair_ids={pair_id},
+            completed_path_pair_ids={pair_id}, is_progress=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id},
+            generation=3, session_token=local_process.session_token,
+        ))
+        # The same drain retains a distinct incomplete pair, so its aggregate
+        # is not globally final despite containing a complete local pair-A.
+        local_process._ScannerProcess__publish_result(ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={other_pair_id},
+            unknown_path_pair_ids={other_pair_id}, is_progress=True,
+            generation=3, session_token=local_process.session_token,
+        ))
+        remote_root = SystemFile("selected", 10, True)
+        remote_root.path_pair_id = pair_id
+        remote_process._ScannerProcess__publish_result(ScannerResult(
+            datetime.now(), [remote_root], scanned_path_pair_ids={pair_id},
+            completed_path_pair_ids={pair_id}, is_progress=True, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id},
+            generation=7, session_token=remote_process.session_token,
+        ))
+
+        local_result = _pop_scan_updates(self.controller, "local", local_process)
+        remote_result = _pop_scan_updates(self.controller, "remote", remote_process)
+        self.assertIsNotNone(local_result)
+        self.assertIsNotNone(remote_result)
+        self.assertFalse(local_result.is_scan_final)
+        self.assertEqual(
+            (local_process.session_token, 3),
+            local_result._scan_authority_tokens_by_pair[pair_id],
+        )
+
+        self.controller._record_path_pair_scan_tokens(local_result, remote_result)
+        self.controller._Controller__reconciled_local_path_pair_ids = {pair_id}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {pair_id}
+        command = Controller.Command(Controller.Command.Action.QUEUE, "selected")
+        intent = DeferredQueueIntent(
+            command, "selected", pair_id, phase="initial_rescan", rescan_requested=True,
+            rescan_generations=(
+                (local_process.session_token, 2),
+                (remote_process.session_token, 6),
+            ),
+        )
+
+        self.assertEqual(
+            (local_process.session_token, 3),
+            self.controller._Controller__scan_authority_tokens["local"][pair_id],
+        )
+        self.assertEqual(
+            (remote_process.session_token, 7),
+            self.controller._Controller__scan_authority_tokens["remote"][pair_id],
+        )
+        self.assertIsNone(unrelated_intent.rescan_failure_reason)
+        self.assertEqual(
+            (local_process.session_token, 2),
+            self.controller._Controller__scan_authority_tokens["local"].get(other_pair_id),
+        )
+        self.assertTrue(self.controller._Controller__queue_scoped_rescan_ready(intent))
+
+    def test_partial_scanner_authority_never_advances_unknown_or_unproven_pair(self):
+        pair_id = "pair-a"
+        session_token = "local-session"
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {pair_id: (session_token, 2)}, "remote": {},
+        }
+        partial_unknown = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={pair_id},
+            completed_path_pair_ids={pair_id}, unknown_path_pair_ids={pair_id},
+            is_progress=True, generation=3, session_token=session_token,
+        )
+        partial_unknown._scan_authority_tokens_by_pair = {
+            pair_id: (session_token, 3),
+        }
+        self.controller._record_path_pair_scan_tokens(partial_unknown, None)
+        self.assertEqual(
+            (session_token, 2),
+            self.controller._Controller__scan_authority_tokens["local"][pair_id],
+        )
+
+        partial_without_token = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={pair_id},
+            completed_path_pair_ids={pair_id}, is_progress=True, is_scan_final=False,
+            generation=4, session_token=session_token,
+        )
+        self.controller._record_path_pair_scan_tokens(partial_without_token, None)
+        self.assertEqual(
+            (session_token, 2),
+            self.controller._Controller__scan_authority_tokens["local"][pair_id],
+        )
+
     def test_queue_scoped_rescan_inline_priority_publishes_fresh_successor(self):
         """Inline priority during generation N publishes a successor before readiness."""
         pair_id = "pair-a"
