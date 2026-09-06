@@ -1563,7 +1563,9 @@ class Controller:
                     harvest_outcome = "cancelled"
                 else:
                     try:
-                        done_future.exception()
+                        harvest_error = done_future.exception()
+                        if harvest_error is not None:
+                            harvest_outcome = "error"
                     except BaseException as exc:
                         harvest_error = exc
                         harvest_outcome = "error"

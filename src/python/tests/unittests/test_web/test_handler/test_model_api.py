@@ -1,6 +1,8 @@
 import json
 import logging
 import unittest
+import threading
+import time
 from wsgiref.util import setup_testing_defaults
 from threading import RLock, Timer
 from types import SimpleNamespace
@@ -44,6 +46,53 @@ class TestModelApi(unittest.TestCase):
 
     def test_model_sse_keepalive_matches_global_stream_closure_cadence(self):
         self.assertEqual(5.0, ModelApiHandler._KEEPALIVE_INTERVAL_SECONDS)
+
+    def test_summary_fails_fast_while_model_publication_holds_lock(self):
+        """A read request must not consume the admission client's whole budget."""
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold_model_publication():
+            with self.controller._Controller__model_lock:
+                entered.set()
+                release.wait(2)
+
+        worker = threading.Thread(target=hold_model_publication)
+        worker.start()
+        self.assertTrue(entered.wait(1))
+        try:
+            started = time.monotonic()
+            response = self.client.get("/server/model/v1/summary", status=503)
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual("model_summary_busy", response.json["error"])
+        finally:
+            release.set()
+            worker.join(2)
+
+    def test_summary_releases_model_lock_before_serialization(self):
+        """JSON work must not extend the model publication critical section."""
+        handler = ModelApiHandler(self.controller)
+        self.controller.get_model_summary = MagicMock(return_value={"model_version": 1})
+        acquired = []
+
+        def serialize_after_release(*_args, **_kwargs):
+            def acquire_from_other_thread():
+                lock = self.controller._Controller__model_lock
+                result = lock.acquire(timeout=0.1)
+                acquired.append(result)
+                if result:
+                    lock.release()
+
+            worker = threading.Thread(target=acquire_from_other_thread)
+            worker.start()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            return bottle.HTTPResponse(body="{}", status=200)
+
+        with patch.object(handler, "_ModelApiHandler__json_response", side_effect=serialize_after_release):
+            handler._ModelApiHandler__handle_summary()
+
+        self.assertEqual([True], acquired)
 
     def test_scoped_stream_breadcrumb_is_opt_in_and_identity_free(self):
         page = {"records": [{"private": "record"}] * 9, "model_version": 4, "next_cursor": "private"}

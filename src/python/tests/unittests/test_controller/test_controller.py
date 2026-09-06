@@ -1043,6 +1043,29 @@ class TestController(unittest.TestCase):
         self.assertEqual("cancelled", harvest["details"]["outcome"])
         self.assertEqual("cancelled", harvest["details"]["exception_family"])
 
+    def test_lftp_executor_trace_records_failed_status_harvest(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"transfer.lftp.executor": "info"}},
+            max_entries=8,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        future = Future()
+        executor = MagicMock()
+        executor.submit.return_value = future
+        self.controller._Controller__lftp_executor = executor
+
+        with patch("controller.controller.secrets.token_hex", return_value="8888888888888888"):
+            self.assertTrue(self.controller._Controller__submit_lftp_operation("status", lambda: []))
+            future.set_exception(TimeoutError("status timed out"))
+
+        harvest = next(
+            entry for entry in trace.snapshot()["entries"] if entry["details"]["phase"] == "harvest"
+        )
+        self.assertEqual("error", harvest["details"]["outcome"])
+        self.assertEqual("timeout", harvest["details"]["exception_family"])
+
     def test_failed_queue_completion_removes_current_pending_dispatch(self):
         file_id = ModelFile.build_file_id("movie.mkv", None)
         operation_future = Future()

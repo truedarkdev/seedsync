@@ -621,7 +621,18 @@ class ModelApiHandler(IHandler):
         )
 
     def __handle_summary(self) -> HTTPResponse:
-        return self.__json_response(self.__controller.get_model_summary(), summary=True)
+        # A fresh multi-pair scan can hold the model publication boundary long
+        # enough to exceed clients' admission budget.  Fail explicitly rather
+        # than letting the web worker retain an ambiguous, timed-out request.
+        model_lock = getattr(self.__controller, "_Controller__model_lock", None)
+        if model_lock is not None and not model_lock.acquire(timeout=0.25):
+            return self.__json_response({"error": "model_summary_busy"}, status=503, summary=True)
+        try:
+            summary = self.__controller.get_model_summary()
+        finally:
+            if model_lock is not None:
+                model_lock.release()
+        return self.__json_response(summary, summary=True)
 
     def __handle_summary_stream(self) -> Iterator[str]:
         listener = SummaryModelListener()
