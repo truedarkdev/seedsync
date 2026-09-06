@@ -1503,6 +1503,19 @@ class ScannerProcess:
         with self.__priority_target_lock:
             return bool(self.__priority_target_path_pair_ids)
 
+    def priority_state(self, path_pair_id: object) -> str:
+        """Return the selected pair's bounded priority state for diagnostics."""
+        if not isinstance(path_pair_id, str) or not path_pair_id:
+            return "absent"
+        with self.__priority_target_lock:
+            if path_pair_id in self.__priority_target_path_pair_ids:
+                return "queued"
+            active_targets = self.__scan_worker_target_path_pair_ids if self.__recycle_scan_worker \
+                else self.__inline_scan_target_path_pair_ids
+            if active_targets is not None and path_pair_id in active_targets:
+                return "active"
+        return "absent"
+
     def __increment_diagnostic(self, counter: str) -> None:
         diagnostics = self.__performance_diagnostics
         if diagnostics is None:

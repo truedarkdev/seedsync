@@ -53,6 +53,14 @@ class WebResponseActionCallback(Controller.Command.ICallback):
 
 class ControllerHandler(IHandler):
     _ACTION_TIMEOUT = 30.0
+    _EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV = "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS"
+    _EXPERIMENTAL_QUEUE_ACTION_TIMEOUT = 605.0
+
+    @classmethod
+    def _queue_action_timeout(cls) -> float:
+        """Leave terminal-callback margin beyond the controlled 600s authority fence."""
+        return cls._EXPERIMENTAL_QUEUE_ACTION_TIMEOUT if \
+            os.environ.get(cls._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV) == "600" else cls._ACTION_TIMEOUT
     _MAX_BULK_ITEMS = 100
     _MAX_CONCURRENT_BULK_REQUESTS = 1
     _GUARDED_ACTIONS = {
@@ -254,7 +262,7 @@ class ControllerHandler(IHandler):
         callback, completed = self.__execute_action(
             Controller.Command.Action.QUEUE,
             file_identifier,
-            timeout=self._ACTION_TIMEOUT
+            timeout=self._queue_action_timeout()
         )
         self.__controller.record_queue_http_wait_trace(
             file_identifier, completed, callback.success,

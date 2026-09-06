@@ -622,6 +622,31 @@ def test_passive_queue_caller_requires_persisted_second_boundary_before_post(mon
     assert events.index("second-before-persisted") < events.index("post")
 
 
+def test_experimental_passive_sampler_repeats_sequentially_while_post_blocks(tmp_path):
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming")
+    status_calls = 0
+    repeated = threading.Event()
+
+    def get(path):
+        nonlocal status_calls
+        if path == "/server/status":
+            status_calls += 1
+            if status_calls >= 4:
+                repeated.set()
+        return responses()[path]
+
+    def send(_path):
+        assert repeated.wait(1)
+        return observer.QueueTransportResponse(200)
+
+    caller = observer.PassiveQueueCaller(
+        gate, get, send, ("/server/status",), tmp_path / "passive.jsonl",
+        {"INCOMING_RECOVERY_ALLOW_QUEUE": "1"}, passive_sample_interval_seconds=0.001,
+    )
+    assert caller.run().status == 200
+    assert status_calls >= 4
+
+
 def test_passive_queue_caller_stops_before_a_second_concurrent_get(tmp_path):
     passive_calls = []
     status_calls = 0

@@ -201,6 +201,96 @@ def test_queue_mode_requires_durable_attempt_state_before_constructing_gate(monk
         runner.main(str(config_path))
 
 
+def test_experimental_queue_timeout_requires_exact_environment_gate(monkeypatch, tmp_path):
+    config_path = tmp_path / "runner.json"
+    config_path.write_text(json.dumps({
+        "key_path": str(tmp_path / "key"), "pair_id": "pair", "pair_name": "pair",
+        "root_id": "root", "root_name": "root", "artifact_path": str(tmp_path / "artifact"),
+        "attempt_state_path": str(tmp_path / "attempt.json"), "passive_paths": ["/server/status"],
+    }), encoding="utf-8")
+    observed = {}
+
+    class FakeGate:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class FakeCaller:
+        def __init__(self, _gate, _get, _post, _paths, _artifact, _environment, timeout, interval):
+            observed["timeout"] = timeout
+            observed["interval"] = interval
+
+        def run(self):
+            return runner.QueueTransportResponse(409)
+
+    monkeypatch.setattr(runner, "QueueGate", FakeGate)
+    monkeypatch.setattr(runner, "PassiveQueueCaller", FakeCaller)
+    monkeypatch.setenv("INCOMING_RECOVERY_ALLOW_QUEUE", "1")
+    monkeypatch.setenv("INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS", "600 ")
+    assert runner.main(str(config_path)) == 1
+    assert observed == {"timeout": 35, "interval": 0.0}
+
+    observed.clear()
+    monkeypatch.setenv("INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS", "600")
+    assert runner.main(str(config_path)) == 1
+    assert observed["timeout"] == 610
+    assert observed["interval"] == 10.0
+
+
+def test_experimental_queue_timeout_uses_exact_environment_gate_without_config_switch(monkeypatch, tmp_path):
+    config_path = tmp_path / "runner.json"
+    config_path.write_text(json.dumps({
+        "key_path": str(tmp_path / "key"), "pair_id": "pair", "pair_name": "pair",
+        "root_id": "root", "root_name": "root", "artifact_path": str(tmp_path / "artifact"),
+        "attempt_state_path": str(tmp_path / "attempt.json"), "passive_paths": ["/server/status"],
+    }), encoding="utf-8")
+    observed = {}
+
+    class FakeGate:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class FakeCaller:
+        def __init__(self, _gate, _get, _post, _paths, _artifact, _environment, timeout, interval):
+            observed.update(timeout=timeout, interval=interval)
+
+        def run(self):
+            return runner.QueueTransportResponse(409)
+
+    monkeypatch.setattr(runner, "QueueGate", FakeGate)
+    monkeypatch.setattr(runner, "PassiveQueueCaller", FakeCaller)
+    monkeypatch.setenv("INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS", "600")
+    monkeypatch.setenv("INCOMING_RECOVERY_ALLOW_QUEUE", "1")
+    assert runner.main(str(config_path)) == 1
+    assert observed == {"timeout": 610, "interval": 10.0}
+
+
+def test_http_adapter_keeps_get_budget_while_experiment_post_has_terminal_margin(tmp_path):
+    key_path = tmp_path / "key"
+    key_path.write_text("private", encoding="utf-8")
+    calls = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def opener(request, timeout):
+        calls.append((request.method, timeout))
+        return Response()
+
+    adapter = runner.HttpAdapter(key_path, opener, post_timeout_seconds=610)
+    assert adapter.request("/server/status") == {}
+    assert adapter.request("/server/command/queue/value", "POST").status == 200
+    assert calls == [("GET", 5), ("POST", 610)]
+
+
 @pytest.mark.parametrize("status", (409, 504))
 def test_queue_mode_returns_nonzero_for_non_success_queue_status(monkeypatch, tmp_path, status):
     config_path = tmp_path / "runner.json"

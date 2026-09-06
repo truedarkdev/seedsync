@@ -28,6 +28,9 @@ PassiveQueueCaller = _observer.PassiveQueueCaller
 QueueGate = _observer.QueueGate
 QueueTransportResponse = _observer.QueueTransportResponse
 
+_EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV = "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS"
+_EXPERIMENTAL_POST_TIMEOUT_SECONDS = 610
+
 _manifest_path = Path(__file__).with_name("incoming_sftp_source_manifest.py")
 _manifest_spec = importlib.util.spec_from_file_location("incoming_sftp_source_manifest", _manifest_path)
 if _manifest_spec is None or _manifest_spec.loader is None:
@@ -337,15 +340,15 @@ def _require_private_trusted_root_config(config_path: Path) -> None:
 
 class HttpAdapter:
     """Keep secrets in the caller and return an explicit Queue status result."""
-    def __init__(self, key_path: Path, opener=urllib.request.urlopen):
-        self.key_path, self.opener = key_path, opener
+    def __init__(self, key_path: Path, opener=urllib.request.urlopen, *, post_timeout_seconds: int = 35):
+        self.key_path, self.post_timeout_seconds, self.opener = key_path, post_timeout_seconds, opener
 
     def request(self, path: str, method: str = "GET"):
         key = self.key_path.read_text(encoding="utf-8").strip()
         request = urllib.request.Request("http://127.0.0.1:8800" + path, method=method,
             headers={"Authorization": "Bearer " + key})
         try:
-            with self.opener(request, timeout=35 if method == "POST" else 5) as response:
+            with self.opener(request, timeout=self.post_timeout_seconds if method == "POST" else 5) as response:
                 body = response.read()
                 if method == "POST":
                     return QueueTransportResponse(response.status, body)
@@ -443,7 +446,13 @@ def main(
             harness.write_failure(exc, output_path)
             raise
         return 0
-    adapter = HttpAdapter(Path(config["key_path"]))
+    experimental_enabled = os.environ.get(_EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV) == "600"
+    # The controlled experiment needs its own terminal observation margin:
+    # Controller authority is 600s, handler callback wait is 605s, and the
+    # client remains alive through the final response/artifact boundary.
+    post_timeout = _EXPERIMENTAL_POST_TIMEOUT_SECONDS if experimental_enabled else 35
+    experimental_sample_interval = 10.0 if experimental_enabled else 0.0
+    adapter = HttpAdapter(Path(config["key_path"]), post_timeout_seconds=post_timeout)
     attempt_state_path = config.get("attempt_state_path")
     if not dry_run and (not isinstance(attempt_state_path, str) or not attempt_state_path):
         raise SystemExit("Queue attempt_state_path is required")
@@ -459,7 +468,7 @@ def main(
         raise SystemExit("Queue gate must be explicitly enabled")
     caller = PassiveQueueCaller(gate, adapter.request,
         lambda path: adapter.request(path, "POST"), tuple(config["passive_paths"]),
-        config["artifact_path"], os.environ, 35)
+        config["artifact_path"], os.environ, post_timeout, experimental_sample_interval)
     response = caller.run()
     return 0 if 200 <= response.status < 300 else 1
 

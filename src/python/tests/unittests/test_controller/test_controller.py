@@ -11924,6 +11924,85 @@ class TestController(unittest.TestCase):
             "Queue preflight cancelled: initial_local_scan_unknown", 409,
         )
 
+    def test_experimental_scan_token_trace_records_model_consumption_once_without_identity(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=8,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        command = Controller.Command(Controller.Command.Action.QUEUE, "private-file")
+        self.controller._Controller__deferred_queue_intents = {
+            "private-file": DeferredQueueIntent(
+                command, "private-file", "private-pair", phase="initial_rescan",
+                rescan_requested=True,
+                rescan_generations=(("session", 2), ("session", 2)),
+            )
+        }
+        result = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"private-pair"},
+            completed_path_pair_ids={"private-pair"}, generation=3,
+            session_token="session", is_scan_final=False,
+        )
+        result._scan_authority_tokens_by_pair = {"private-pair": ("session", 3)}
+        with patch.dict(os.environ, {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"}):
+            self.controller._record_path_pair_scan_tokens(result, None)
+            self.controller._record_path_pair_scan_tokens(result, None)
+
+        entries = trace.query_events(category_prefix="queue.readiness")["events"]
+        self.assertEqual(1, len(entries))
+        self.assertEqual("queue_authority_experiment", entries[0]["message"])
+        self.assertEqual("model_consumed_token_recorded", entries[0]["details"]["phase"])
+        self.assertEqual("local", entries[0]["details"]["side"])
+        self.assertNotIn("private-file", str(entries))
+        self.assertNotIn("private-pair", str(entries))
+
+    def test_initial_rescan_timeout_uses_only_the_exact_experimental_gate(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                Controller._DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS,
+                Controller._initial_rescan_timeout_seconds(),
+            )
+        with patch.dict(os.environ, {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"}):
+            self.assertEqual(600.0, Controller._initial_rescan_timeout_seconds())
+
+    def test_experimental_progress_buckets_are_monotonic_deduplicated_and_identity_free(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=8,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        intent = DeferredQueueIntent(
+            Controller.Command(Controller.Command.Action.QUEUE, "private-file"),
+            "private-file", "private-pair", phase="initial_rescan", rescan_requested=True,
+            rescan_deadline_monotonic=600.0,
+        )
+        local, remote = MagicMock(), MagicMock()
+        local.priority_state.return_value = "queued"
+        remote.priority_state.return_value = "active"
+        self.controller._Controller__local_scan_process = local
+        self.controller._Controller__remote_scan_process = remote
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.controller._Controller__record_initial_rescan_experiment_progress(intent, 0.0)
+        self.assertEqual([], trace.query_events(category_prefix="queue.readiness")["events"])
+
+        with patch.dict(os.environ, {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"}):
+            self.controller._Controller__record_initial_rescan_experiment_progress(intent, 0.0)
+            self.controller._Controller__record_initial_rescan_experiment_progress(intent, 10.0)
+            self.controller._Controller__record_initial_rescan_experiment_progress(intent, 10.0)
+            intent.rescan_deadline_grace_consumed = True
+            intent.rescan_deadline_monotonic = 10.1
+            self.controller._Controller__record_initial_rescan_experiment_progress(intent, 10.2)
+
+        entries = trace.query_events(category_prefix="queue.readiness")["events"]
+        self.assertEqual([0, 1], [entry["details"]["elapsed_bucket_10s"] for entry in entries])
+        self.assertTrue(all(entry["details"]["local_priority"] == "queued" for entry in entries))
+        self.assertTrue(all(entry["details"]["remote_priority"] == "active" for entry in entries))
+        self.assertNotIn("private-file", str(entries))
+        self.assertNotIn("private-pair", str(entries))
+
     def test_manual_directory_queue_initial_scan_missing_pair_token_retires_once(self):
         file = self._seed_manual_directory_scan_readiness_fixture()
         callback = MagicMock()

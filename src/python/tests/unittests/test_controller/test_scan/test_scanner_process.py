@@ -1117,6 +1117,29 @@ class TestScannerProcess(unittest.TestCase):
 
         self.assertEqual({"pair-6"}, process._ScannerProcess__drain_priority_target_path_pair_ids())
 
+    def test_priority_state_distinguishes_queued_active_and_absent_pairs(self):
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=1000, verbose=False,
+            recycle_scan_worker=True,
+        )
+        self.addCleanup(process.close_queues)
+        self.assertEqual("absent", process.priority_state("pair-6"))
+        process._ScannerProcess__scan_worker_target_path_pair_ids = {"pair-6"}
+        self.assertEqual("active", process.priority_state("pair-6"))
+        process.prioritize_scan("pair-6", require_successor=True)
+        self.assertEqual("queued", process.priority_state("pair-6"))
+        self.assertEqual("absent", process.priority_state(""))
+
+    def test_inline_priority_state_distinguishes_active_and_queued_successor(self):
+        process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=1000, verbose=False)
+        self.addCleanup(process.close_queues)
+        process._ScannerProcess__inline_scan_active.set()
+        process._ScannerProcess__inline_scan_target_path_pair_ids = {"pair-6"}
+
+        self.assertEqual("active", process.priority_state("pair-6"))
+        process.prioritize_scan("pair-6", require_successor=True)
+        self.assertEqual("queued", process.priority_state("pair-6"))
+
     def test_recycled_same_pair_successor_finishing_between_polls_skips_cadence(self):
         """A queued Queue successor must not wait a full cadence after exit."""
         process = ScannerProcess(

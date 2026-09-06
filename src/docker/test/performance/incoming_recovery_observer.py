@@ -95,6 +95,7 @@ class PassiveQueueCaller:
     artifact_path: str | os.PathLike[str]
     environment: Mapping[str, str]
     client_timeout_seconds: int = 35
+    passive_sample_interval_seconds: float = 0.0
 
     def run(self) -> object:
         stop = threading.Event()
@@ -105,14 +106,20 @@ class PassiveQueueCaller:
             started_boundary: threading.Event | None = None,
             stop_event: threading.Event | None = None,
         ) -> None:
-            sampler = FixedGetSampler(self.passive_paths, artifact_path=self.artifact_path,
-                                      continue_on_error=False)
             try:
-                sampler.sample(
-                    self.get,
-                    before_request=started_boundary.set if started_boundary is not None else None,
-                    stop_event=stop_event,
-                )
+                first_sample = True
+                while True:
+                    sampler = FixedGetSampler(self.passive_paths, artifact_path=self.artifact_path,
+                                              continue_on_error=False)
+                    sampler.sample(
+                        self.get,
+                        before_request=started_boundary.set if first_sample and started_boundary is not None else None,
+                        stop_event=stop_event,
+                    )
+                    first_sample = False
+                    if self.passive_sample_interval_seconds <= 0 or stop_event is None or \
+                            stop_event.wait(self.passive_sample_interval_seconds):
+                        return
             except BaseException as exc:
                 failures.append(exc)
 

@@ -36,6 +36,12 @@ class TestControllerHandler(BaseTestWebApp):
             )
         )
 
+    def test_queue_timeout_uses_only_the_exact_authorized_experiment_gate(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(ControllerHandler._ACTION_TIMEOUT, ControllerHandler._queue_action_timeout())
+        with patch.dict("os.environ", {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"}):
+            self.assertEqual(605.0, ControllerHandler._queue_action_timeout())
+
     @staticmethod
     def __model_file(name: str, file_id: str, path_pair_id: str = None):
         file = MagicMock()
