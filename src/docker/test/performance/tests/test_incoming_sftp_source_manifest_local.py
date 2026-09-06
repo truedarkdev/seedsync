@@ -378,20 +378,43 @@ def test_real_lftp_root_preflight_is_strict_and_resolves_landing_forms(tmp_path,
         connection_path = tmp_path / f"root-{base_mode}-{chroot}.json"
         output_path = tmp_path / f"root-{base_mode}-{chroot}.artifact.json"
         config_path = tmp_path / f"root-{base_mode}-{chroot}.config.json"
+        dummy_password = "local-fixture-session-password"
         connection_path.write_text(json.dumps({
             "host": fixture["host"], "port": fixture["port"], "username": fixture["username"],
+            "password": dummy_password,
             "remote_path": fixture["remote_base"] if base_mode == "relative" else fixture["absolute_base"],
         }), encoding="utf-8")
         connection_path.chmod(0o600)
+        askpass_path = tmp_path / "local-askpass"
+        askpass_path.write_text("#!/bin/sh\nexec python3 " + shlex.quote(str(PERFORMANCE_ROOT / "incoming_sftp_askpass.py")) + "\n", encoding="utf-8")
+        askpass_path.chmod(0o700)
         config_path.write_text(json.dumps({"source_manifest": {
             "root": fixture["selected_root"], "connection_config_path": str(connection_path),
             "known_hosts_file": fixture["known_hosts_file"], "root_preflight_artifact_path": str(output_path),
+            "root_preflight_transport": "sftp_realpath", "root_preflight_askpass_program": str(askpass_path),
         }}), encoding="utf-8")
+        captured = []
+        original_process = runner._manifest._run_bounded_process
+        def record_process(*args, **kwargs):
+            result = original_process(*args, **kwargs)
+            captured.append(result.stdout)
+            return result
+        monkeypatch.setattr(runner._manifest, "_run_bounded_process", record_process)
+        protocol = runner.ReadOnlySftpProtocolRunner(
+            host=fixture["host"], port=fixture["port"], username=fixture["username"],
+            password=dummy_password, known_hosts_file=fixture["known_hosts_file"],
+        )
+        assert protocol.root_preflight_process(None, timeout_seconds=10, max_output_bytes=65536).returncode == 0
+        # Exact LFTP output remains only in process memory.  LFTP 4.9.2
+        # includes this supplied credential even without `pwd -p`, proving
+        # why the production preflight must use SFTP realpath instead.
+        assert any(dummy_password.encode("utf-8") in output for output in captured)
         assert runner.main(str(config_path), source_root_preflight=True) == 0
         artifact = json.loads(output_path.read_text(encoding="utf-8"))
         assert artifact["schema"] == "incoming-recovery-source-root-preflight.v1"
         assert artifact["reason"] == "ok"
         assert artifact["ambiguity"] in {"unique", "equivalent"}
         assert fixture["root"] not in str(artifact)
+        assert dummy_password not in str(artifact)
         assert "file-0000.bin" not in str(artifact)
         assert "find" not in output_path.read_text(encoding="utf-8")

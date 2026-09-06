@@ -388,7 +388,7 @@ class RootOnlySftpPreflight:
     """Strict-host SFTP PWD/cd discriminator which never enumerates content."""
 
     def __init__(self, protocol: "ReadOnlySftpProtocolRunner", *, timeout_seconds: float = 30.0, max_output_bytes: int = 64 * 1024):
-        if not isinstance(protocol, ReadOnlySftpProtocolRunner):
+        if not callable(getattr(protocol, "root_preflight_process", None)) and not callable(getattr(protocol, "canonicalize", None)):
             raise _fail("invalid_configuration")
         if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 300:
             raise _fail("invalid_configuration")
@@ -457,6 +457,16 @@ class RootOnlySftpPreflight:
             raise _fail("pwd_path_invalid", "pwd")
 
     def _run_pwd(self, candidate: str | None = None) -> tuple[str | None, SourceManifestError | None]:
+        if callable(getattr(self.protocol, "canonicalize", None)):
+            try:
+                return self.protocol.canonicalize(
+                    "." if candidate is None else candidate,
+                    timeout_seconds=self.timeout_seconds, max_output_bytes=self.max_output_bytes,
+                ), None
+            except SourceManifestError as exc:
+                return None, exc
+            except Exception:
+                return None, _fail("protocol_failure", "root" if candidate is not None else "open")
         try:
             result = self.protocol.root_preflight_process(
                 candidate, timeout_seconds=self.timeout_seconds, max_output_bytes=self.max_output_bytes,
@@ -703,6 +713,78 @@ class ReadOnlySftpProtocolRunner:
                 failure_stage="parse",
                 failure_reason=exc.reason,
             )
+
+
+class ReadOnlySftpRealpathRunner:
+    """Strict-host SFTP canonicalization without LFTP URL rendering."""
+
+    def __init__(self, *, host: str, port: int, username: str, known_hosts_file: str | os.PathLike[str], askpass_program: str | os.PathLike[str], connection_config_path: str | os.PathLike[str], executable: str = "sftp", environment: Mapping[str, str] | None = None):
+        if not isinstance(host, str) or not host or _CONTROL_RE.search(host) or any(char in host for char in "/\\@?#%"):
+            raise _fail("invalid_configuration")
+        if type(port) is not int or not 1 <= port <= 65535 or not isinstance(username, str) or not username or _CONTROL_RE.search(username):
+            raise _fail("invalid_configuration")
+        self.host, self.port, self.username = host, port, username
+        self.known_hosts_file = os.fspath(known_hosts_file)
+        self.askpass_program = os.fspath(askpass_program)
+        self.connection_config_path = os.fspath(connection_config_path)
+        if not self.known_hosts_file or not self.askpass_program or not self.connection_config_path:
+            raise _fail("invalid_configuration")
+        self.executable, self.environment = executable, dict(environment or {})
+        self.ssh_program = "ssh"
+
+    def canonicalize(self, candidate: str, *, timeout_seconds: float, max_output_bytes: int) -> str:
+        if candidate != ".":
+            candidate = _root_path(candidate)
+        environment = dict(self.environment)
+        environment.update({
+            "SSH_ASKPASS": self.askpass_program,
+            "SSH_ASKPASS_REQUIRE": "force",
+            "DISPLAY": environment.get("DISPLAY", "incoming-recovery"),
+            "INCOMING_RECOVERY_SFTP_ASKPASS": "1",
+            "INCOMING_RECOVERY_SFTP_ASKPASS_CONFIG": self.connection_config_path,
+        })
+        remote_host = "[" + self.host + "]" if ":" in self.host and not self.host.startswith("[") else self.host
+        argv = [
+            self.executable, "-q", "-b", "-", "-S", self.ssh_program, "-P", str(self.port),
+            "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + self.known_hosts_file,
+            "-o", "NumberOfPasswordPrompts=1", self.username + "@" + remote_host,
+        ]
+        try:
+            command = "pwd\n" if candidate == "." else "cd " + json.dumps(candidate) + "\npwd\n"
+            result = _run_bounded_process(argv, (command + "bye\n").encode("utf-8"), timeout_seconds, max_output_bytes, environment=environment)
+        except (OSError, ValueError):
+            raise _fail("process_failed", "launch")
+        if result.timed_out:
+            raise _fail("process_timeout", "root")
+        if result.truncated:
+            raise _fail("output_truncated", "root")
+        if result.returncode != 0:
+            raise _fail("process_failed", "root")
+        try:
+            lines = result.stdout.decode("utf-8").splitlines() if isinstance(result.stdout, bytes) else []
+        except UnicodeDecodeError:
+            raise _fail("record_malformed", "root")
+        paths: list[str] = []
+        prefix = "Remote working directory: "
+        for line in lines:
+            if not line.startswith(prefix):
+                continue
+            path = line[len(prefix):]
+            if not path or _CONTROL_RE.search(path):
+                raise _fail("record_malformed", "root")
+            try:
+                normalized_path = path.rstrip("/") or "/"
+                # A chrooted account may legitimately report its landing
+                # directory as the remote root.  It is a canonical response,
+                # never a configured manifest root chosen by untrusted input.
+                if normalized_path != "/" and not normalized_path.startswith("/"):
+                    raise _fail("root_escape", "root")
+                paths.append("/" if normalized_path == "/" else _root_path(normalized_path))
+            except SourceManifestError:
+                raise _fail("root_escape", "root")
+        if len(paths) != 1:
+            raise _fail("record_malformed", "root")
+        return paths[0]
 
 
 def _run_bounded_process(

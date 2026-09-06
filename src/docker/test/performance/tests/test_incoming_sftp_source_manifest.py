@@ -487,3 +487,47 @@ def test_root_only_preflight_classifies_malformed_pwd_without_persisting_it(monk
     assert result.stage == "pwd"
     assert result.candidates == ()
     assert "secret" not in str(result.as_artifact())
+
+
+def test_sftp_canonical_root_uses_pwd_without_url_or_listing(monkeypatch):
+    calls = []
+    def fake_process(argv, input_bytes, timeout_seconds, max_output_bytes, *, environment):
+        calls.append((argv, input_bytes.decode("utf-8"), environment))
+        return manifest.SftpProcessResult(b"sftp> pwd\nRemote working directory: /canonical/root\n")
+    monkeypatch.setattr(manifest, "_run_bounded_process", fake_process)
+    protocol = manifest.ReadOnlySftpRealpathRunner(
+        host="remote.example", port=2222, username="user", known_hosts_file="known_hosts",
+        askpass_program="safe-askpass", connection_config_path="protected-settings",
+    )
+    assert protocol.canonicalize("safe root", timeout_seconds=5, max_output_bytes=4096) == "/canonical/root"
+    argv, script, environment = calls[0]
+    assert argv[:8] == ["sftp", "-q", "-b", "-", "-S", "ssh", "-P", "2222"]
+    assert "cd \"safe root\"" in script and "pwd" in script
+    assert "find" not in script and "realpath" not in script and "put" not in script and "rm " not in script
+    assert environment["SSH_ASKPASS"] == "safe-askpass"
+    assert environment["INCOMING_RECOVERY_SFTP_ASKPASS_CONFIG"] == "protected-settings"
+
+
+def test_sftp_canonical_root_accepts_chroot_root(monkeypatch):
+    monkeypatch.setattr(
+        manifest, "_run_bounded_process",
+        lambda *_args, **_kwargs: manifest.SftpProcessResult(b"Remote working directory: /\n"),
+    )
+    protocol = manifest.ReadOnlySftpRealpathRunner(
+        host="remote.example", port=2222, username="user", known_hosts_file="known_hosts",
+        askpass_program="safe-askpass", connection_config_path="protected-settings",
+    )
+    assert protocol.canonicalize(".", timeout_seconds=5, max_output_bytes=4096) == "/"
+
+
+def test_sftp_canonical_root_rejects_relative_server_response(monkeypatch):
+    monkeypatch.setattr(
+        manifest, "_run_bounded_process",
+        lambda *_args, **_kwargs: manifest.SftpProcessResult(b"Remote working directory: relative/root\n"),
+    )
+    protocol = manifest.ReadOnlySftpRealpathRunner(
+        host="remote.example", port=2222, username="user", known_hosts_file="known_hosts",
+        askpass_program="safe-askpass", connection_config_path="protected-settings",
+    )
+    with pytest.raises(manifest.SourceManifestError, match="root_escape"):
+        protocol.canonicalize(".", timeout_seconds=5, max_output_bytes=4096)

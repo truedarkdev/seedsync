@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 import json
+import os
+import subprocess
 import sys
 
 import pytest
@@ -162,6 +164,7 @@ def test_source_manifest_reads_existing_lftp_settings_through_protected_referenc
     assert connection == {
         "host": "seedbox.invalid", "port": 2222, "username": "remoteuser",
         "password": "private-password", "known_hosts_file": str(known_hosts_path), "remote_path": "fixture",
+        "connection_config_path": str(settings_path),
     }
 
 
@@ -307,12 +310,13 @@ def test_root_preflight_mode_uses_external_config_and_never_constructs_queue_or_
         def capture_to(self, path, **kwargs):
             calls.append(("capture", path, kwargs))
 
-    monkeypatch.setattr(runner, "ReadOnlySftpProtocolRunner", FakeProtocol)
+    monkeypatch.setattr(runner, "ReadOnlySftpRealpathRunner", FakeProtocol)
     monkeypatch.setattr(runner, "RootOnlySftpPreflight", FakePreflight)
     monkeypatch.setattr(runner, "SourceManifestHarness", lambda *args, **kwargs: pytest.fail("manifest must not run"))
     monkeypatch.setattr(runner, "QueueGate", lambda *args, **kwargs: pytest.fail("Queue must not be constructed"))
     assert runner.main(str(config_path), source_root_preflight=True) == 0
     assert calls[-1] == ("capture", str(artifact_path), {"relative_root": "fixture/Incoming", "trusted_absolute_root": None})
+    assert calls[0][1]["askpass_program"].endswith("incoming_sftp_askpass.py")
 
 
 def test_root_preflight_absolute_config_passes_only_trusted_absolute(monkeypatch, tmp_path):
@@ -331,7 +335,7 @@ def test_root_preflight_absolute_config_passes_only_trusted_absolute(monkeypatch
         "known_hosts_file": str(known_hosts_path), "root_preflight_artifact_path": str(tmp_path / "out.json"),
     }}), encoding="utf-8")
     captured = {}
-    monkeypatch.setattr(runner, "ReadOnlySftpProtocolRunner", lambda **_kwargs: object())
+    monkeypatch.setattr(runner, "ReadOnlySftpRealpathRunner", lambda **_kwargs: object())
     class FakePreflight:
         def __init__(self, *_args, **_kwargs): pass
         def capture_to(self, _path, **kwargs): captured.update(kwargs)
@@ -339,3 +343,78 @@ def test_root_preflight_absolute_config_passes_only_trusted_absolute(monkeypatch
     monkeypatch.setattr(runner, "QueueGate", lambda *args, **kwargs: pytest.fail("Queue must not be constructed"))
     assert runner.main(str(config_path), source_root_preflight=True) == 0
     assert captured == {"relative_root": None, "trusted_absolute_root": "/home/remoteuser/files/nested/Incoming"}
+
+
+def test_root_preflight_realpath_transport_uses_private_askpass_reference(monkeypatch, tmp_path):
+    config_path = tmp_path / "runner.json"
+    connection_path = tmp_path / "connection.json"
+    known_hosts_path = tmp_path / "known_hosts"
+    askpass_path = tmp_path / "askpass"
+    known_hosts_path.write_text("seedbox.invalid ssh-ed25519 AAAA\n", encoding="utf-8")
+    askpass_path.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    connection_path.write_text(json.dumps({
+        "host": "seedbox.invalid", "port": 2222, "username": "remoteuser",
+        "password": "private-password", "remote_path": "fixture",
+    }), encoding="utf-8")
+    if sys.platform != "win32":
+        connection_path.chmod(0o600)
+    config_path.write_text(json.dumps({"source_manifest": {
+        "root": "Incoming", "connection_config_path": str(connection_path),
+        "known_hosts_file": str(known_hosts_path), "root_preflight_artifact_path": str(tmp_path / "out.json"),
+        "root_preflight_transport": "sftp_realpath", "root_preflight_askpass_program": str(askpass_path),
+    }}), encoding="utf-8")
+    captured = {}
+    class FakeRealpath:
+        def __init__(self, **kwargs): captured.update(kwargs)
+    class FakePreflight:
+        def __init__(self, *_args, **_kwargs): pass
+        def capture_to(self, *_args, **_kwargs): pass
+    monkeypatch.setenv("INCOMING_RECOVERY_LOCAL_LFTP", "1")
+    monkeypatch.setattr(runner, "ReadOnlySftpRealpathRunner", FakeRealpath)
+    monkeypatch.setattr(runner, "RootOnlySftpPreflight", FakePreflight)
+    monkeypatch.setattr(runner, "QueueGate", lambda *_args, **_kwargs: pytest.fail("Queue must not be constructed"))
+    assert runner.main(str(config_path), source_root_preflight=True) == 0
+    assert captured["askpass_program"] == str(askpass_path)
+    assert captured["connection_config_path"] == str(connection_path)
+    assert captured["host"] == "seedbox.invalid"
+    assert "private-password" not in str(captured)
+
+
+def test_root_preflight_rejects_credentialed_lftp_transport(monkeypatch, tmp_path):
+    config_path = tmp_path / "runner.json"
+    connection_path = tmp_path / "connection.json"
+    known_hosts_path = tmp_path / "known_hosts"
+    known_hosts_path.write_text("seedbox.invalid ssh-ed25519 AAAA\n", encoding="utf-8")
+    connection_path.write_text(json.dumps({
+        "host": "seedbox.invalid", "port": 2222, "username": "remoteuser",
+        "password": "private-password", "remote_path": "fixture",
+    }), encoding="utf-8")
+    if sys.platform != "win32":
+        connection_path.chmod(0o600)
+    config_path.write_text(json.dumps({"source_manifest": {
+        "root": "Incoming", "connection_config_path": str(connection_path),
+        "known_hosts_file": str(known_hosts_path), "root_preflight_artifact_path": str(tmp_path / "out.json"),
+        "root_preflight_transport": "lftp_pwd",
+    }}), encoding="utf-8")
+    monkeypatch.setattr(runner, "QueueGate", lambda *_args, **_kwargs: pytest.fail("Queue must not be constructed"))
+    with pytest.raises(SystemExit, match="credential-safe"):
+        runner.main(str(config_path), source_root_preflight=True)
+
+
+def test_sftp_askpass_reads_protected_connection_only_to_its_stdout(tmp_path):
+    connection_path = tmp_path / "connection.json"
+    password = "fixture-password-only-in-child-pipe"
+    connection_path.write_text(json.dumps({
+        "host": "seedbox.invalid", "port": 2222, "username": "remoteuser", "password": password,
+        "remote_path": "fixture",
+    }), encoding="utf-8")
+    if sys.platform != "win32":
+        connection_path.chmod(0o600)
+    completed = subprocess.run(
+        [sys.executable, str(Path(__file__).parents[1] / "incoming_sftp_askpass.py")],
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={**os.environ, "INCOMING_RECOVERY_SFTP_ASKPASS": "1", "INCOMING_RECOVERY_SFTP_ASKPASS_CONFIG": str(connection_path)},
+    )
+    assert completed.returncode == 0
+    assert completed.stdout == password
+    assert completed.stderr == ""

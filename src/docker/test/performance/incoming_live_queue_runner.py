@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Externally configured, one-shot Incoming Queue caller for the maintained observer."""
 from __future__ import annotations
 
@@ -41,6 +42,7 @@ SourceManifestSnapshot = _manifest.SourceManifestSnapshot
 SourceManifestStability = _manifest.SourceManifestStability
 ReadOnlySftpProtocolRunner = _manifest.ReadOnlySftpProtocolRunner
 RootOnlySftpPreflight = _manifest.RootOnlySftpPreflight
+ReadOnlySftpRealpathRunner = _manifest.ReadOnlySftpRealpathRunner
 redacted_manifest_error = _manifest.redacted_manifest_error
 compare_source_snapshots = _manifest.compare_source_snapshots
 
@@ -132,6 +134,7 @@ def _source_manifest_connection(
         "password": password,
         "known_hosts_file": str(known_hosts_path),
         "remote_path": connection.get("remote_path"),
+        "connection_config_path": str(reference_path),
     }
 
 
@@ -222,10 +225,25 @@ def main(
             config, source_manifest_config, base_dir=Path(config_path).resolve().parent,
         )
         relative_root, trusted_absolute_root = _source_root_preflight_candidates(root, connection["remote_path"])
-        protocol = ReadOnlySftpProtocolRunner(
-            host=connection["host"], port=connection["port"], username=connection["username"],
-            password=connection["password"], known_hosts_file=connection["known_hosts_file"],
-        )
+        transport = source_manifest_config.get("root_preflight_transport", "sftp_realpath")
+        if transport == "sftp_realpath":
+            askpass_program = str(Path(__file__).with_name("incoming_sftp_askpass.py").resolve())
+            if "root_preflight_askpass_program" in source_manifest_config:
+                if os.environ.get("INCOMING_RECOVERY_LOCAL_LFTP") != "1":
+                    raise SystemExit("root preflight askpass override is local-only")
+                askpass_program = source_manifest_config["root_preflight_askpass_program"]
+            if not isinstance(askpass_program, str) or not askpass_program:
+                raise SystemExit("root preflight askpass program is invalid")
+            askpass_path = Path(askpass_program)
+            if not askpass_path.is_absolute():
+                askpass_path = Path(config_path).resolve().parent / askpass_path
+            protocol = ReadOnlySftpRealpathRunner(
+                host=connection["host"], port=connection["port"], username=connection["username"],
+                known_hosts_file=connection["known_hosts_file"], askpass_program=str(askpass_path),
+                connection_config_path=str(connection["connection_config_path"]),
+            )
+        else:
+            raise SystemExit("root preflight requires the credential-safe SFTP canonical transport")
         preflight = RootOnlySftpPreflight(
             protocol, timeout_seconds=source_manifest_config.get("timeout_seconds", 30.0),
             max_output_bytes=source_manifest_config.get("root_preflight_max_output_bytes", 64 * 1024),
