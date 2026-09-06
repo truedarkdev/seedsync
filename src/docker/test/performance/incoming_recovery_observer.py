@@ -25,6 +25,37 @@ class ObserverCaptureError(ObserverSchemaError):
     """The observer could not persist a required capture boundary."""
 
 
+@dataclass
+class GuardedQueueRunner:
+    """Run one preflighted Queue POST with a bounded passive observer.
+
+    The caller owns transport construction, including its 35-second timeout;
+    this small coordinator makes the one-shot gate and observer ordering
+    testable without retaining credentials or response bodies.
+    """
+
+    gate: "QueueGate"
+    get: Callable[[str], object]
+    send: Callable[[str], object]
+    start_passive: Callable[[], Callable[[], None]]
+    environment: Mapping[str, str]
+    client_timeout_seconds: int = 35
+
+    def run(self) -> object:
+        if self.environment.get("INCOMING_RECOVERY_ALLOW_QUEUE") != "1":
+            raise ObserverSchemaError("Queue gate environment is not enabled")
+        if self.client_timeout_seconds < 35:
+            raise ObserverSchemaError("Queue client timeout must cover the handler budget")
+        self.gate.preflight(self.get)
+        stop_passive = self.start_passive()
+        if not callable(stop_passive):
+            raise ObserverCaptureError("passive observer did not provide a stop boundary")
+        try:
+            return self.gate.queue(self.send)
+        finally:
+            stop_passive()
+
+
 _SCAN_AUTHORITY_OUTCOMES = frozenset({"adopt", "publish", "reject", "no_op"})
 _SCAN_AUTHORITY_REASONS = frozenset({
     "no_scan_event", "pair_delta_adopted", "source_buckets_adopted",

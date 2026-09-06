@@ -512,3 +512,45 @@ def test_custom_exception_and_response_names_are_not_persisted(tmp_path):
     assert "BearerPrivateException" not in serialized
     assert "PrivateResponse409" not in serialized
     assert "secret" not in serialized
+
+
+def test_guarded_queue_runner_orders_passive_observer_before_exactly_one_post():
+    events = []
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming")
+
+    def get(path):
+        events.append("get")
+        return responses()[path]
+
+    def start_passive():
+        events.append("passive-start")
+        return lambda: events.append("passive-stop")
+
+    def send(_path):
+        events.append("post")
+        return 200
+
+    runner = observer.GuardedQueueRunner(gate, get, send, start_passive,
+        {"INCOMING_RECOVERY_ALLOW_QUEUE": "1"})
+    assert runner.run() == 200
+    assert events.index("passive-start") < events.index("post") < events.index("passive-stop")
+    with pytest.raises(observer.ObserverSchemaError, match="already attempted"):
+        runner.run()
+    assert events.count("post") == 1
+
+
+def test_guarded_queue_runner_fails_before_observer_or_post_without_gate():
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming")
+    runner = observer.GuardedQueueRunner(gate, lambda path: responses()[path],
+        lambda _path: pytest.fail("POST must not run"), lambda: pytest.fail("observer must not start"), {}, 35)
+    with pytest.raises(observer.ObserverSchemaError, match="environment"):
+        runner.run()
+
+
+def test_guarded_queue_runner_rejects_a_timeout_shorter_than_the_handler_budget():
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming")
+    runner = observer.GuardedQueueRunner(gate, lambda path: responses()[path],
+        lambda _path: pytest.fail("POST must not run"), lambda: pytest.fail("observer must not start"),
+        {"INCOMING_RECOVERY_ALLOW_QUEUE": "1"}, 30)
+    with pytest.raises(observer.ObserverSchemaError, match="timeout"):
+        runner.run()
