@@ -26,6 +26,20 @@ class ObserverCaptureError(ObserverSchemaError):
     """The observer could not persist a required capture boundary."""
 
 
+@dataclass(frozen=True)
+class QueueTransportResponse:
+    """Status-bearing Queue transport result; its body is private input only."""
+
+    status: int
+    body: bytes = b""
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not int or not 100 <= self.status <= 599:
+            raise ObserverSchemaError("Queue transport status is invalid")
+        if not isinstance(self.body, bytes):
+            raise ObserverSchemaError("Queue transport body must be bytes")
+
+
 @dataclass
 class GuardedQueueRunner:
     """Run one preflighted Queue POST with a bounded passive observer.
@@ -1246,9 +1260,16 @@ class QueueGate:
                 "failure": self.last_queue_evidence,
             }, "queue_failure")
             raise
-        status = getattr(response, "status", getattr(response, "code", 200))
+        if isinstance(response, tuple):
+            raise ObserverSchemaError("Queue transport tuple is incompatible; return QueueTransportResponse")
+        status = getattr(response, "status", getattr(response, "code", None))
+        if type(status) is not int or not 100 <= status <= 599:
+            raise ObserverSchemaError("Queue transport did not return a status-bearing response")
+        body = getattr(response, "body", b"")
+        if not isinstance(body, bytes):
+            raise ObserverSchemaError("Queue transport response body must be bytes")
         self.last_queue_evidence = {
-            **queue_response_evidence(status, b""),
+            **queue_response_evidence(status, body),
             "scan_lifecycle": self.scan_lifecycle,
         }
         status_failure = type(status) is int and status >= 400

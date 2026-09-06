@@ -218,7 +218,7 @@ def test_repeated_preflight_does_not_reset_one_post_attempt():
     sent = []
     get = lambda path: responses()[path]
     gate.preflight(get)
-    gate.queue(lambda path: sent.append(path) or object())
+    gate.queue(lambda path: sent.append(path) or observer.QueueTransportResponse(200))
     gate.preflight(get)
     with pytest.raises(observer.ObserverSchemaError, match="already attempted"):
         gate.queue(lambda path: sent.append(path) or object())
@@ -528,11 +528,11 @@ def test_guarded_queue_runner_orders_passive_observer_before_exactly_one_post():
 
     def send(_path):
         events.append("post")
-        return 200
+        return observer.QueueTransportResponse(200)
 
     runner = observer.GuardedQueueRunner(gate, get, send, start_passive,
         {"INCOMING_RECOVERY_ALLOW_QUEUE": "1"})
-    assert runner.run() == 200
+    assert runner.run().status == 200
     assert events.index("passive-start") < events.index("post") < events.index("passive-stop")
     with pytest.raises(observer.ObserverSchemaError, match="already attempted"):
         runner.run()
@@ -565,8 +565,24 @@ def test_passive_queue_caller_samples_before_and_during_one_post(tmp_path):
     def send(_path):
         assert events.count("get") >= 6  # QueueGate preflight plus first passive GET.
         events.append("post")
-        return 200
+        return observer.QueueTransportResponse(200)
     caller = observer.PassiveQueueCaller(gate, get, send, ("/server/status",),
         tmp_path / "passive.jsonl", {"INCOMING_RECOVERY_ALLOW_QUEUE": "1"})
-    assert caller.run() == 200
+    assert caller.run().status == 200
     assert events.count("post") == 1
+
+
+def test_queue_transport_non_200_is_persisted_and_tuple_is_rejected(tmp_path):
+    artifact = tmp_path / "queue.jsonl"
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", artifact_path=artifact)
+    gate.preflight(lambda path: responses()[path])
+    result = gate.queue(lambda _path: observer.QueueTransportResponse(409, b'{"message":"Queue is not ready"}'))
+    assert result.status == 409
+    assert gate.last_queue_evidence["status_code"] == 409
+    assert gate.last_queue_evidence["body_reason"] == "unrecognized_409_response"
+    assert 'message' not in artifact.read_text(encoding="utf-8")
+    other = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming")
+    other.preflight(lambda path: responses()[path])
+    with pytest.raises(observer.ObserverSchemaError, match="tuple"):
+        other.queue(lambda _path: (409, 2.0, {}))
+    assert other.queue_attempted is True
