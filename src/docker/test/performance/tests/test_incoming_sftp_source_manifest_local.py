@@ -126,9 +126,10 @@ def _local_sftp_fixture(*, chroot: bool = False):
         )
         lftp_wrapper.chmod(0o700)
         ssh_diagnostic = workspace / "ssh.stderr"
+        ssh_arguments = workspace / "ssh.arguments"
         ssh_wrapper = wrapper_dir / "ssh"
         ssh_wrapper.write_text(
-            "#!/bin/sh\nexec " + shlex.quote(ssh_binary) + " -i " + shlex.quote(str(client_key))
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >" + shlex.quote(str(ssh_arguments)) + "\nexec " + shlex.quote(ssh_binary) + " -i " + shlex.quote(str(client_key))
             + " \"$@\" 2>" + shlex.quote(str(ssh_diagnostic)) + "\n",
             encoding="utf-8",
         )
@@ -241,6 +242,7 @@ def _local_sftp_fixture(*, chroot: bool = False):
                 "path_prefix": str(wrapper_dir),
                 "lftp_diagnostic": str(lftp_diagnostic),
                 "ssh_diagnostic": str(ssh_diagnostic),
+                "ssh_arguments": str(ssh_arguments),
                 "expected_bytes": expected_bytes,
             }
         finally:
@@ -410,6 +412,8 @@ def test_real_lftp_root_preflight_is_strict_and_resolves_landing_forms(tmp_path,
         # why the production preflight must use SFTP realpath instead.
         assert any(dummy_password.encode("utf-8") in output for output in captured)
         assert runner.main(str(config_path), source_root_preflight=True) == 0
+        ssh_arguments = Path(fixture["ssh_arguments"]).read_text(encoding="utf-8")
+        assert "BatchMode=no" in ssh_arguments
         artifact = json.loads(output_path.read_text(encoding="utf-8"))
         assert artifact["schema"] == "incoming-recovery-source-root-preflight.v1"
         assert artifact["reason"] == "ok"

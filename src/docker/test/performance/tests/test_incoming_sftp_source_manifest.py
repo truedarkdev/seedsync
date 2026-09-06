@@ -501,7 +501,7 @@ def test_sftp_canonical_root_uses_pwd_without_url_or_listing(monkeypatch):
     )
     assert protocol.canonicalize("safe root", timeout_seconds=5, max_output_bytes=4096) == "/canonical/root"
     argv, script, environment = calls[0]
-    assert argv[:8] == ["sftp", "-q", "-b", "-", "-S", "ssh", "-P", "2222"]
+    assert argv[:10] == ["sftp", "-q", "-o", "BatchMode=no", "-b", "-", "-S", "ssh", "-P", "2222"]
     assert "cd \"safe root\"" in script and "pwd" in script
     assert "find" not in script and "realpath" not in script and "put" not in script and "rm " not in script
     assert environment["SSH_ASKPASS"] == "safe-askpass"

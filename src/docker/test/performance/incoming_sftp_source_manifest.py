@@ -745,7 +745,10 @@ class ReadOnlySftpRealpathRunner:
         })
         remote_host = "[" + self.host + "]" if ":" in self.host and not self.host.startswith("[") else self.host
         argv = [
-            self.executable, "-q", "-b", "-", "-S", self.ssh_program, "-P", str(self.port),
+            # sftp -b otherwise enables BatchMode=yes, preventing SSH_ASKPASS
+            # from supplying the protected password.  OpenSSH uses the first
+            # command-line value for this option, so the override precedes -b.
+            self.executable, "-q", "-o", "BatchMode=no", "-b", "-", "-S", self.ssh_program, "-P", str(self.port),
             "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + self.known_hosts_file,
             "-o", "NumberOfPasswordPrompts=1", self.username + "@" + remote_host,
         ]
