@@ -35,8 +35,11 @@ from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE_LOCK_HOLD,
     DURATION_MODEL_UPDATE_LOCK_WAIT,
     DURATION_MODEL_UPDATE_FINALIZATION_COMMAND_IDENTITY_REFRESH,
+    DURATION_MODEL_UPDATE_FINALIZATION_COMPLETION_GATE_PHYSICAL_PROOF,
     DURATION_MODEL_UPDATE_FINALIZATION_FULL_ADOPTION,
     DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF,
+    DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_APPLICATION,
+    DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_CONSTRUCTION,
     DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
     DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD,
     DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT,
@@ -88,6 +91,9 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
             DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD,
             DURATION_MODEL_UPDATE_FINALIZATION_PAIR_CANDIDATE_COMPOSITION,
             DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF,
+            DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_CONSTRUCTION,
+            DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_APPLICATION,
+            DURATION_MODEL_UPDATE_FINALIZATION_COMPLETION_GATE_PHYSICAL_PROOF,
             DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
             DURATION_MODEL_UPDATE_FINALIZATION_OVERLAY_CLEAR,
             DURATION_MODEL_UPDATE_FINALIZATION_OVERLAY_REBASE,
@@ -415,6 +421,33 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
         self.assertEqual(92.5, attribution["controller_process"]["coverage_percent"])
         self.assertEqual(100.0, attribution["model_update"]["coverage_percent"])
         self.assertEqual(0.02, attribution["controller_job"]["unattributed_cpu_seconds"])
+
+    def test_build_finalization_attribution_does_not_double_count_nested_lifecycle_spans(self):
+        clock = [0.0]
+        collector = PerformanceDiagnosticsCollector(lambda: True, monotonic_fn=lambda: clock[0])
+        collector.observe_duration(DURATION_MODEL_UPDATE_BUILD_FINALIZATION, 1.0, 1.0)
+        collector.observe_duration(DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF, 0.25, 0.25)
+        for metric in (
+            DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_CONSTRUCTION,
+            DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_APPLICATION,
+            DURATION_MODEL_UPDATE_FINALIZATION_COMPLETION_GATE_PHYSICAL_PROOF,
+        ):
+            collector.observe_duration(metric, 0.1, 0.1)
+
+        clock[0] = 2.0
+        collector.record_sample({}, close_window_at=clock[0])
+        stage_window = collector.snapshot()["samples"][-1]["stage_window"]
+        attribution = stage_window["attribution"]["model_update_build_finalization"]
+
+        self.assertEqual(0.25, attribution["named_cpu_seconds"])
+        self.assertEqual(0.75, attribution["unattributed_cpu_seconds"])
+        self.assertEqual(25.0, attribution["coverage_percent"])
+        for metric in (
+            DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_CONSTRUCTION,
+            DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_APPLICATION,
+            DURATION_MODEL_UPDATE_FINALIZATION_COMPLETION_GATE_PHYSICAL_PROOF,
+        ):
+            self.assertEqual(1, stage_window["metrics"][metric]["count"])
 
     def test_model_builder_setter_durations_are_fixed_registered_metrics(self):
         collector = PerformanceDiagnosticsCollector(lambda: True)

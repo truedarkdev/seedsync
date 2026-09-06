@@ -50,8 +50,11 @@ from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE_LOCK_HOLD,
     DURATION_MODEL_UPDATE_LOCK_WAIT,
     DURATION_MODEL_UPDATE_FINALIZATION_COMMAND_IDENTITY_REFRESH,
+    DURATION_MODEL_UPDATE_FINALIZATION_COMPLETION_GATE_PHYSICAL_PROOF,
     DURATION_MODEL_UPDATE_FINALIZATION_FULL_ADOPTION,
     DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF,
+    DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_APPLICATION,
+    DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_CONSTRUCTION,
     DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
     DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD,
     DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT,
@@ -6948,6 +6951,12 @@ class ModelUpdater(_ControllerCoreAccess):
                     candidate_pair_id(file_id) == authoritative_pair_build.path_pair_id
 
             def pending_completion_move_authorized(file_id: str) -> bool:
+                with _ModelUpdateDurationSpan(
+                        diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_COMPLETION_GATE_PHYSICAL_PROOF,
+                ):
+                    return _pending_completion_move_authorized(file_id)
+
+            def _pending_completion_move_authorized(file_id: str) -> bool:
                 """Require current end-to-end authority before an automatic move.
 
                 The pending identity survives LFTP retirement specifically so a
@@ -7438,7 +7447,10 @@ class ModelUpdater(_ControllerCoreAccess):
                         recovery_file.is_stoppable = False
 
                 # Diff the new model with old model.
-                model_diff = ModelDiffUtil.diff_models(model, new_model)
+                with _ModelUpdateDurationSpan(
+                        diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_CONSTRUCTION,
+                ):
+                    model_diff = ModelDiffUtil.diff_models(model, new_model)
                 attempted_move_file_ids: set[str] = set()
                 pending_candidate_file_ids = pending_completion_file_ids()
                 diff_file_ids = {
@@ -7549,8 +7561,14 @@ class ModelUpdater(_ControllerCoreAccess):
                         restart_file.path_pair_name,
                     ))
 
+                def timed_model_diff_application():
+                    with _ModelUpdateDurationSpan(
+                            diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_APPLICATION,
+                    ):
+                        yield from model_diff
+
                 # Apply changes to the new model.
-                for diff in model_diff:
+                for diff in timed_model_diff_application():
                     old_file = getattr(diff, "old_file", None)
                     new_file = getattr(diff, "new_file", None)
 

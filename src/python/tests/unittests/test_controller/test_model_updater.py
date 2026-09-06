@@ -52,8 +52,11 @@ from common.performance_diagnostics import (
     COUNTER_CANDIDATE_PAIR_FALLBACK,
     COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED,
     DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
+    DURATION_MODEL_UPDATE_FINALIZATION_COMPLETION_GATE_PHYSICAL_PROOF,
     DURATION_MODEL_UPDATE_FINALIZATION_FULL_ADOPTION,
     DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF,
+    DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_APPLICATION,
+    DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_CONSTRUCTION,
     DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD,
     DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT,
     DURATION_MODEL_UPDATE_FINALIZATION_PAIR_ADOPTION,
@@ -4906,6 +4909,12 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(1, durations[DURATION_MODEL_UPDATE_FINALIZATION_PAIR_ADOPTION]["count"])
         self.assertNotIn(DURATION_MODEL_UPDATE_FINALIZATION_FULL_ADOPTION, durations)
         self.assertEqual(1, durations[DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF]["count"])
+        self.assertEqual(1, durations[
+            DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_CONSTRUCTION
+        ]["count"])
+        self.assertEqual(1, durations[
+            DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_APPLICATION
+        ]["count"])
 
     def test_targeted_progressive_final_clears_stale_inventory_when_roots_are_unchanged(self):
         """A selected pair completion publishes even when its roots match standing authority."""
@@ -10529,6 +10538,8 @@ class TestModelUpdater(unittest.TestCase):
 
     def test_v092_pending_completion_waits_for_authoritative_local_coverage(self):
         controller = self._make_v092_pending_completion_controller(complete=False)
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        controller._Controller__context.performance_diagnostics = diagnostics
 
         with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
             ModelUpdater(controller).update()
@@ -10537,6 +10548,12 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__move_from_staging.assert_not_called()
         self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
         self.assertNotIn(file_id, controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(
+            1,
+            diagnostics.snapshot()["durations"][
+                DURATION_MODEL_UPDATE_FINALIZATION_COMPLETION_GATE_PHYSICAL_PROOF
+            ]["count"],
+        )
 
     def test_v092_pending_completion_rejects_stale_builder_sidecar_checkpoint(self):
         """A retained candidate sidecar flag is not fresh physical release proof."""
