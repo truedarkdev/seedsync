@@ -277,3 +277,65 @@ def test_source_manifest_failure_writes_only_private_allowlisted_classification(
         "reason": "process_failed", "stage": "listing",
     }
     assert "fixture" not in str(payload)
+
+
+def test_root_preflight_mode_uses_external_config_and_never_constructs_queue_or_manifest(monkeypatch, tmp_path):
+    config_path = tmp_path / "runner.json"
+    connection_path = tmp_path / "connection.json"
+    known_hosts_path = tmp_path / "known_hosts"
+    artifact_path = tmp_path / "root-preflight.json"
+    known_hosts_path.write_text("seedbox.invalid ssh-ed25519 AAAA\n", encoding="utf-8")
+    connection_path.write_text(json.dumps({
+        "host": "seedbox.invalid", "port": 2222, "username": "remoteuser",
+        "password": "private-password", "remote_path": "fixture",
+    }), encoding="utf-8")
+    if sys.platform != "win32":
+        connection_path.chmod(0o600)
+    config_path.write_text(json.dumps({"source_manifest": {
+        "root": "Incoming", "connection_config_path": str(connection_path),
+        "known_hosts_file": str(known_hosts_path), "root_preflight_artifact_path": str(artifact_path),
+    }}), encoding="utf-8")
+    calls = []
+
+    class FakeProtocol:
+        def __init__(self, **kwargs):
+            calls.append(("protocol", kwargs))
+
+    class FakePreflight:
+        def __init__(self, protocol, **kwargs):
+            calls.append(("preflight", protocol, kwargs))
+        def capture_to(self, path, **kwargs):
+            calls.append(("capture", path, kwargs))
+
+    monkeypatch.setattr(runner, "ReadOnlySftpProtocolRunner", FakeProtocol)
+    monkeypatch.setattr(runner, "RootOnlySftpPreflight", FakePreflight)
+    monkeypatch.setattr(runner, "SourceManifestHarness", lambda *args, **kwargs: pytest.fail("manifest must not run"))
+    monkeypatch.setattr(runner, "QueueGate", lambda *args, **kwargs: pytest.fail("Queue must not be constructed"))
+    assert runner.main(str(config_path), source_root_preflight=True) == 0
+    assert calls[-1] == ("capture", str(artifact_path), {"relative_root": "fixture/Incoming", "trusted_absolute_root": None})
+
+
+def test_root_preflight_absolute_config_passes_only_trusted_absolute(monkeypatch, tmp_path):
+    config_path = tmp_path / "runner.json"
+    connection_path = tmp_path / "connection.json"
+    known_hosts_path = tmp_path / "known_hosts"
+    known_hosts_path.write_text("seedbox.invalid ssh-ed25519 AAAA\n", encoding="utf-8")
+    connection_path.write_text(json.dumps({
+        "host": "seedbox.invalid", "port": 2222, "username": "remoteuser",
+        "remote_path": "/home/remoteuser/files",
+    }), encoding="utf-8")
+    if sys.platform != "win32":
+        connection_path.chmod(0o600)
+    config_path.write_text(json.dumps({"source_manifest": {
+        "root": "nested/Incoming", "connection_config_path": str(connection_path),
+        "known_hosts_file": str(known_hosts_path), "root_preflight_artifact_path": str(tmp_path / "out.json"),
+    }}), encoding="utf-8")
+    captured = {}
+    monkeypatch.setattr(runner, "ReadOnlySftpProtocolRunner", lambda **_kwargs: object())
+    class FakePreflight:
+        def __init__(self, *_args, **_kwargs): pass
+        def capture_to(self, _path, **kwargs): captured.update(kwargs)
+    monkeypatch.setattr(runner, "RootOnlySftpPreflight", FakePreflight)
+    monkeypatch.setattr(runner, "QueueGate", lambda *args, **kwargs: pytest.fail("Queue must not be constructed"))
+    assert runner.main(str(config_path), source_root_preflight=True) == 0
+    assert captured == {"relative_root": None, "trusted_absolute_root": "/home/remoteuser/files/nested/Incoming"}

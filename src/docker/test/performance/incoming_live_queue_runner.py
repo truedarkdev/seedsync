@@ -40,6 +40,7 @@ SourceManifestEntry = _manifest.SourceManifestEntry
 SourceManifestSnapshot = _manifest.SourceManifestSnapshot
 SourceManifestStability = _manifest.SourceManifestStability
 ReadOnlySftpProtocolRunner = _manifest.ReadOnlySftpProtocolRunner
+RootOnlySftpPreflight = _manifest.RootOnlySftpPreflight
 redacted_manifest_error = _manifest.redacted_manifest_error
 compare_source_snapshots = _manifest.compare_source_snapshots
 
@@ -170,6 +171,14 @@ def _account_home_manifest_root(root: object, remote_path: object) -> str:
     return ("/" if base_absolute else "") + "/".join(resolved)
 
 
+def _source_root_preflight_candidates(root: object, remote_path: object) -> tuple[str | None, str | None]:
+    """Return only trusted configured root forms; PWD-derived forms stay in memory."""
+    resolved = _account_home_manifest_root(root, remote_path)
+    if resolved.startswith("/"):
+        return None, resolved
+    return resolved, None
+
+
 class HttpAdapter:
     """Keep secrets in the caller and return an explicit Queue status result."""
     def __init__(self, key_path: Path, opener=urllib.request.urlopen):
@@ -191,12 +200,38 @@ class HttpAdapter:
             return QueueTransportResponse(error.code, error.read())
 
 
-def main(config_path: str, dry_run: bool = False, source_manifest: bool = False) -> int:
+def main(
+    config_path: str, dry_run: bool = False, source_manifest: bool = False, source_root_preflight: bool = False,
+) -> int:
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     source_manifest_config = config.get("source_manifest")
     if source_manifest_config is not None and not isinstance(source_manifest_config, dict):
         raise SystemExit("source_manifest config must be an object")
     source_manifest_requested = source_manifest is True or "--source-manifest" in sys.argv[1:-1]
+    root_preflight_requested = source_root_preflight is True or "--source-root-preflight" in sys.argv[1:-1]
+    if source_manifest_requested and root_preflight_requested:
+        raise SystemExit("source manifest and root preflight modes are exclusive")
+    if root_preflight_requested:
+        if source_manifest_config is None:
+            raise SystemExit("source_manifest config is required")
+        root = source_manifest_config.get("configured_root", source_manifest_config.get("root"))
+        output_path = source_manifest_config.get("root_preflight_artifact_path")
+        if not isinstance(root, str) or not isinstance(output_path, str):
+            raise SystemExit("root preflight requires root and root_preflight_artifact_path")
+        connection = _source_manifest_connection(
+            config, source_manifest_config, base_dir=Path(config_path).resolve().parent,
+        )
+        relative_root, trusted_absolute_root = _source_root_preflight_candidates(root, connection["remote_path"])
+        protocol = ReadOnlySftpProtocolRunner(
+            host=connection["host"], port=connection["port"], username=connection["username"],
+            password=connection["password"], known_hosts_file=connection["known_hosts_file"],
+        )
+        preflight = RootOnlySftpPreflight(
+            protocol, timeout_seconds=source_manifest_config.get("timeout_seconds", 30.0),
+            max_output_bytes=source_manifest_config.get("root_preflight_max_output_bytes", 64 * 1024),
+        )
+        preflight.capture_to(output_path, relative_root=relative_root, trusted_absolute_root=trusted_absolute_root)
+        return 0
     if source_manifest_requested:
         if source_manifest_config is None:
             raise SystemExit("source_manifest config is required")
@@ -242,4 +277,8 @@ def main(config_path: str, dry_run: bool = False, source_manifest: bool = False)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[-1], "--dry-run" in sys.argv[1:-1]))
+    raise SystemExit(main(
+        sys.argv[-1], "--dry-run" in sys.argv[1:-1],
+        source_manifest="--source-manifest" in sys.argv[1:-1],
+        source_root_preflight="--source-root-preflight" in sys.argv[1:-1],
+    ))

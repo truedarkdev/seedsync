@@ -118,8 +118,9 @@ _FAILURE_REASONS = frozenset({
     "root_escape", "duplicate_entry", "cycle_detected", "symlink_entry",
     "special_entry", "special_name", "invalid_size", "invalid_metadata",
     "too_many_entries", "output_too_large", "unstable_snapshot", "artifact_failure",
+    "root_candidate_missing", "root_candidate_ambiguous", "pwd_malformed",
 })
-_FAILURE_STAGES = frozenset({"launch", "connection", "open", "root", "listing", "enumeration", "completion", "sentinel", "parse"})
+_FAILURE_STAGES = frozenset({"launch", "connection", "open", "pwd", "root", "root_preflight", "listing", "enumeration", "completion", "sentinel", "parse"})
 _ENTRY_KINDS = frozenset({"file", "directory"})
 _MAX_INTEGER = 2_147_483_647
 _MAX_BYTES = 2**63 - 1
@@ -137,6 +138,8 @@ _LFTP_LONG_RE = re.compile(
 )
 _LFTP_FIND_ROOT_RE = re.compile(r"^d[rwxstST-]{9}\s+-\s+-\s+\./$")
 _LFTP_PROGRESS_PREFIXES = ("cd ok, cwd=",)
+_ROOT_PREFLIGHT_SCHEMA = "incoming-recovery-source-root-preflight.v1"
+_ROOT_PREFLIGHT_MARKERS = ("source_root_preflight_open", "source_root_preflight_pwd", "source_root_preflight_candidate")
 
 
 def _fail(reason: str, stage: str | None = None) -> SourceManifestError:
@@ -335,6 +338,196 @@ def _redacted_artifact_error(exc: BaseException) -> Mapping[str, object]:
     return artifact
 
 
+@dataclass(frozen=True)
+class RootPreflightCandidate:
+    """One privacy-safe root candidate result.  Raw paths never leave memory."""
+
+    form: str
+    valid: bool
+    directory_digest: str | None = None
+
+    def as_artifact(self) -> Mapping[str, object]:
+        payload: dict[str, object] = {"form": self.form, "valid": self.valid}
+        if self.directory_digest is not None:
+            payload["directory_digest"] = self.directory_digest
+        return payload
+
+
+@dataclass(frozen=True)
+class RootPreflightResult:
+    """Sanitized root-only SFTP preflight result."""
+
+    landing_directory_digest: str | None
+    candidates: tuple[RootPreflightCandidate, ...]
+    ambiguity: str
+    stage: str
+    reason: str
+    selected_form: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.reason == "ok" and self.selected_form is not None
+
+    def as_artifact(self) -> Mapping[str, object]:
+        payload: dict[str, object] = {
+            "schema": _ROOT_PREFLIGHT_SCHEMA,
+            "stage": self.stage,
+            "reason": self.reason,
+            "ambiguity": self.ambiguity,
+            "candidates": [candidate.as_artifact() for candidate in self.candidates],
+        }
+        if self.landing_directory_digest is not None:
+            payload["landing_directory_digest"] = self.landing_directory_digest
+        if self.selected_form is not None:
+            payload["selected_form"] = self.selected_form
+        return payload
+
+
+class RootOnlySftpPreflight:
+    """Strict-host SFTP PWD/cd discriminator which never enumerates content."""
+
+    def __init__(self, protocol: "ReadOnlySftpProtocolRunner", *, timeout_seconds: float = 30.0, max_output_bytes: int = 64 * 1024):
+        if not isinstance(protocol, ReadOnlySftpProtocolRunner):
+            raise _fail("invalid_configuration")
+        if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 300:
+            raise _fail("invalid_configuration")
+        if type(max_output_bytes) is not int or not 0 < max_output_bytes <= 1024 * 1024:
+            raise _fail("invalid_configuration")
+        self.protocol = protocol
+        self.timeout_seconds = float(timeout_seconds)
+        self.max_output_bytes = max_output_bytes
+
+    @staticmethod
+    def _path_digest(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _absolute_path(value: str) -> str:
+        path = _root_path(value)
+        if not path.startswith("/") or path == "/":
+            raise _fail("invalid_configuration")
+        return path
+
+    @staticmethod
+    def _relative_path(value: str) -> str:
+        path = _root_path(value)
+        if path.startswith("/"):
+            raise _fail("invalid_configuration")
+        return path
+
+    @staticmethod
+    def _join_landing(landing: str, relative: str) -> str:
+        if landing == "/":
+            return "/" + relative
+        return landing.rstrip("/") + "/" + relative
+
+    def _result_from_failure(self, reason: str, stage: str) -> RootPreflightResult:
+        return RootPreflightResult(None, (), "missing", stage, reason)
+
+    def _extract_pwd(self, output: bytes, marker: str) -> str:
+        try:
+            lines = output.decode("utf-8").splitlines()
+        except UnicodeDecodeError:
+            raise _fail("pwd_malformed", "pwd")
+        if marker not in lines:
+            raise _fail("process_failed", "open")
+        values: list[str] = []
+        for line in lines[lines.index(marker) + 1:]:
+            if not line or line in _ROOT_PREFLIGHT_MARKERS or line.startswith(_LFTP_PROGRESS_PREFIXES):
+                continue
+            # LFTP 4.9 emits a URL, with a trailing slash for directories;
+            # accept only the URL token and normalize that slash in memory.
+            match = re.search(r"sftp://[^\s]+", line)
+            if match is None:
+                continue
+            try:
+                parsed = urlsplit(match.group(0))
+            except ValueError:
+                continue
+            if parsed.scheme != "sftp" or not parsed.hostname or parsed.password not in (None, ""):
+                continue
+            if parsed.query or parsed.fragment or _CONTROL_RE.search(parsed.path):
+                continue
+            path = parsed.path.rstrip("/") or "/"
+            try:
+                path = self._absolute_path(path) if path != "/" else "/"
+            except SourceManifestError:
+                continue
+            values.append(path)
+        if len(values) != 1:
+            raise _fail("pwd_malformed", "pwd")
+        return values[0]
+
+    def _run_pwd(self, candidate: str | None = None) -> tuple[str | None, SourceManifestError | None]:
+        try:
+            result = self.protocol.root_preflight_process(
+                candidate, timeout_seconds=self.timeout_seconds, max_output_bytes=self.max_output_bytes,
+            )
+        except SourceManifestError as exc:
+            return None, exc
+        if result.timed_out:
+            return None, _fail("process_timeout", "root" if candidate is not None else "pwd")
+        if result.truncated:
+            return None, _fail("output_truncated", "root" if candidate is not None else "pwd")
+        if result.returncode != 0:
+            return None, _fail("process_failed", result.failure_stage or ("root" if candidate is not None else "open"))
+        try:
+            return self._extract_pwd(result.stdout if isinstance(result.stdout, bytes) else b"", _ROOT_PREFLIGHT_MARKERS[-1] if candidate is not None else _ROOT_PREFLIGHT_MARKERS[1]), None
+        except SourceManifestError as exc:
+            return None, exc
+
+    def run(self, *, relative_root: str | None, trusted_absolute_root: str | None) -> RootPreflightResult:
+        if relative_root is not None:
+            relative_root = self._relative_path(relative_root)
+        if trusted_absolute_root is not None:
+            trusted_absolute_root = self._absolute_path(trusted_absolute_root)
+        if relative_root is None and trusted_absolute_root is None:
+            raise _fail("invalid_configuration")
+        landing, failure = self._run_pwd()
+        if failure is not None or landing is None:
+            return self._result_from_failure((failure.reason if failure else "protocol_failure"), (failure.stage if failure and failure.stage else "pwd"))
+        candidates: list[tuple[str, str]] = []
+        if relative_root is not None:
+            candidates.append(("account_relative", relative_root))
+            candidates.append(("landing_absolute", self._join_landing(landing, relative_root)))
+        if trusted_absolute_root is not None:
+            candidates.append(("trusted_absolute", trusted_absolute_root))
+            prefix = landing.rstrip("/") + "/"
+            if landing == "/":
+                derived = trusted_absolute_root.lstrip("/")
+            elif trusted_absolute_root.startswith(prefix):
+                derived = trusted_absolute_root[len(prefix):]
+            else:
+                derived = None
+            if derived:
+                candidates.append(("account_relative", self._relative_path(derived)))
+        # Retain each configured form label but avoid duplicate transport work.
+        probed: dict[str, tuple[bool, str | None]] = {}
+        outputs: list[RootPreflightCandidate] = []
+        for form, candidate in candidates:
+            if candidate not in probed:
+                resolved, candidate_failure = self._run_pwd(candidate)
+                probed[candidate] = (candidate_failure is None and resolved is not None, self._path_digest(resolved) if resolved is not None else None)
+            valid, digest = probed[candidate]
+            outputs.append(RootPreflightCandidate(form, valid, digest))
+        valid_outputs = [item for item in outputs if item.valid and item.directory_digest is not None]
+        digests = {item.directory_digest for item in valid_outputs}
+        if len(valid_outputs) == 1:
+            return RootPreflightResult(self._path_digest(landing), tuple(outputs), "unique", "root_preflight", "ok", valid_outputs[0].form)
+        if len(valid_outputs) > 1 and len(digests) == 1:
+            return RootPreflightResult(self._path_digest(landing), tuple(outputs), "equivalent", "root_preflight", "ok", "equivalent")
+        if len(valid_outputs) > 1:
+            return RootPreflightResult(self._path_digest(landing), tuple(outputs), "ambiguous", "root_preflight", "root_candidate_ambiguous")
+        return RootPreflightResult(self._path_digest(landing), tuple(outputs), "missing", "root_preflight", "root_candidate_missing")
+
+    def capture_to(self, output_path: str | os.PathLike[str], *, relative_root: str | None, trusted_absolute_root: str | None) -> RootPreflightResult:
+        result = self.run(relative_root=relative_root, trusted_absolute_root=trusted_absolute_root)
+        _write_private_atomic(result.as_artifact(), output_path)
+        if not result.succeeded:
+            raise _fail(result.reason, result.stage)
+        return result
+
+
 class ReadOnlySftpProtocolRunner:
     """Run a native LFTP SFTP listing using only read-only commands.
 
@@ -367,7 +560,7 @@ class ReadOnlySftpProtocolRunner:
                 raise _fail("invalid_configuration")
             if (
                 parsed.scheme != "sftp" or not parsed.hostname
-                or parsed.username is not None or parsed.password is not None
+                or parsed.username is not None or parsed.password not in (None, "")
                 or uri_port is not None or parsed.path or parsed.query or parsed.fragment
             ):
                 raise _fail("invalid_configuration")
@@ -402,6 +595,43 @@ class ReadOnlySftpProtocolRunner:
         self.password = password
         self.known_hosts_file = known_hosts_file
         self.remote = "sftp://" + host
+
+    def root_preflight_process(self, candidate: str | None, *, timeout_seconds: float, max_output_bytes: int) -> SftpProcessResult:
+        """Run strict-host PWD, optionally after one `cd`; never list content."""
+        if candidate is not None:
+            candidate = _root_path(candidate)
+        connection = "open"
+        if self.username is not None:
+            credentials = self.username + "," + (self.password or "")
+            connection += " -u " + json.dumps(credentials)
+        if self.port != 22:
+            connection += f" -p {self.port}"
+        connection += " " + json.dumps(self.remote)
+        connect_program = ""
+        if self.known_hosts_file is not None:
+            connect_program = (
+                "set sftp:connect-program "
+                + json.dumps("ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=" + shlex.quote(self.known_hosts_file))
+                + "\n"
+            )
+        marker = _ROOT_PREFLIGHT_MARKERS[-1] if candidate is not None else _ROOT_PREFLIGHT_MARKERS[1]
+        script = (
+            "set cmd:interactive false\nset cmd:fail-exit yes\nset net:max-retries 0\n"
+            + f"set net:timeout {int(max(1, timeout_seconds))}\n" + connect_program + connection + "\n"
+            + f"echo {_ROOT_PREFLIGHT_MARKERS[0]}\n"
+            + (f"cd {json.dumps(candidate)}\n" if candidate is not None else "")
+            + f"echo {marker}\npwd\nbye\n"
+        )
+        try:
+            completed = _run_bounded_process([self.executable, "--norc"], script.encode("utf-8"), timeout_seconds, max_output_bytes, environment=self.environment)
+        except (OSError, ValueError):
+            return SftpProcessResult(b"", returncode=-1, failure_stage="launch", failure_reason="process_failed")
+        if completed.timed_out or completed.truncated:
+            return completed
+        stdout = completed.stdout if isinstance(completed.stdout, bytes) else b""
+        if completed.returncode != 0:
+            return SftpProcessResult(b"", completed.returncode, failure_stage=("root" if candidate is not None else _failure_stage_from_root_preflight(stdout)), failure_reason="process_failed")
+        return completed
 
     def __call__(self, root: str, *, timeout_seconds: float, max_output_bytes: int) -> SftpProcessResult:
         # The root is quoted as an LFTP argument; it is never a shell command.
@@ -653,6 +883,14 @@ def _parse_lftp_listing(output: bytes, root: str) -> list[SourceManifestEntry]:
     if not root_header_seen and not find_root_seen:
         raise _fail("root_listing_missing")
     return entries
+
+
+def _failure_stage_from_root_preflight(output: bytes) -> str:
+    try:
+        lines = output.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return "launch"
+    return "pwd" if _ROOT_PREFLIGHT_MARKERS[0] in lines else "open"
 
 
 def _failure_stage_from_output(output: bytes) -> str:

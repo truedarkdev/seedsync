@@ -78,7 +78,7 @@ def _wait_for_port(port: int, process: subprocess.Popen[bytes], log_path: Path) 
 
 
 @contextmanager
-def _local_sftp_fixture():
+def _local_sftp_fixture(*, chroot: bool = False):
     """Yield a synthetic tree and strict-known-host connection details."""
 
     username = getpass.getuser()
@@ -87,7 +87,7 @@ def _local_sftp_fixture():
 
     with tempfile.TemporaryDirectory(prefix="seedsync-source-manifest-", dir=Path.home()) as raw_dir:
         workspace = Path(raw_dir)
-        remote_base = workspace.name + "/fixture"
+        remote_base = "fixture" if chroot else workspace.name + "/fixture"
         selected_root = "nested selected/Incoming"
         base_path = workspace / "fixture"
         source_root = base_path / selected_root
@@ -181,13 +181,29 @@ def _local_sftp_fixture():
 
         log_path = workspace / "sshd.log"
         log_handle = log_path.open("wb")
-        process = subprocess.Popen(
-            [sshd_binary, "-D", "-e", "-f", str(config)],
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        chroot_ownership_changed = False
+        if chroot:
+            # ChrootDirectory requires a root-owned boundary.  Leave the
+            # synthetic source tree user-owned and restore the temporary tree
+            # before TemporaryDirectory removes it.
+            with config.open("a", encoding="utf-8") as handle:
+                handle.write("ChrootDirectory " + str(workspace) + "\nForceCommand internal-sftp\n")
+            checked = subprocess.run(
+                ["sudo", "-n", "chown", "root:root", str(workspace)],
+                check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            if checked.returncode != 0:
+                pytest.skip("passwordless sudo chown is unavailable for local chroot integration")
+            chroot_ownership_changed = True
+            subprocess.run(["sudo", "-n", "chmod", "755", str(workspace)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = None
         try:
+            process = subprocess.Popen(
+                (["sudo", "-n"] if chroot else []) + [sshd_binary, "-D", "-e", "-f", str(config)],
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
             _wait_for_port(port, process, log_path)
             known_hosts = workspace / "known_hosts"
             scanned = subprocess.run(
@@ -215,7 +231,7 @@ def _local_sftp_fixture():
             yield {
                 "root": str(source_root),
                 "remote_base": remote_base,
-                "absolute_base": str(base_path),
+                "absolute_base": "/fixture" if chroot else str(base_path),
                 "selected_root": selected_root,
                 "host": "127.0.0.1",
                 "port": port,
@@ -228,7 +244,7 @@ def _local_sftp_fixture():
                 "expected_bytes": expected_bytes,
             }
         finally:
-            if process.poll() is None:
+            if process is not None and process.poll() is None:
                 process.terminate()
                 try:
                     process.wait(timeout=3)
@@ -236,6 +252,11 @@ def _local_sftp_fixture():
                     process.kill()
                     process.wait(timeout=3)
             log_handle.close()
+            if chroot_ownership_changed:
+                subprocess.run(
+                    ["sudo", "-n", "chown", "-R", f"{os.getuid()}:{os.getgid()}", str(workspace)],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
 
 
 @pytest.mark.parametrize("base_mode", ("relative", "absolute"))
@@ -341,3 +362,36 @@ def test_real_lftp_source_manifest_failure_phases_are_private(tmp_path, monkeypa
         assert payload["stage"] == expected_stage
         assert fixture["root"] not in str(payload)
         assert "blocked child" not in str(payload)
+
+
+@pytest.mark.parametrize("base_mode", ("relative", "absolute"))
+@pytest.mark.parametrize("chroot", (False, True))
+def test_real_lftp_root_preflight_is_strict_and_resolves_landing_forms(tmp_path, monkeypatch, base_mode, chroot):
+    required = ("lftp", "ssh", "ssh-keygen", "ssh-keyscan", "sshd")
+    missing = [name for name in required if not _command_available(name)]
+    if missing:
+        pytest.skip("missing local integration tools: " + ", ".join(missing))
+
+    with _local_sftp_fixture(chroot=chroot) as fixture:
+        monkeypatch.setenv("HOME", fixture["home"])
+        monkeypatch.setenv("PATH", fixture["path_prefix"] + os.pathsep + os.environ["PATH"])
+        connection_path = tmp_path / f"root-{base_mode}-{chroot}.json"
+        output_path = tmp_path / f"root-{base_mode}-{chroot}.artifact.json"
+        config_path = tmp_path / f"root-{base_mode}-{chroot}.config.json"
+        connection_path.write_text(json.dumps({
+            "host": fixture["host"], "port": fixture["port"], "username": fixture["username"],
+            "remote_path": fixture["remote_base"] if base_mode == "relative" else fixture["absolute_base"],
+        }), encoding="utf-8")
+        connection_path.chmod(0o600)
+        config_path.write_text(json.dumps({"source_manifest": {
+            "root": fixture["selected_root"], "connection_config_path": str(connection_path),
+            "known_hosts_file": fixture["known_hosts_file"], "root_preflight_artifact_path": str(output_path),
+        }}), encoding="utf-8")
+        assert runner.main(str(config_path), source_root_preflight=True) == 0
+        artifact = json.loads(output_path.read_text(encoding="utf-8"))
+        assert artifact["schema"] == "incoming-recovery-source-root-preflight.v1"
+        assert artifact["reason"] == "ok"
+        assert artifact["ambiguity"] in {"unique", "equivalent"}
+        assert fixture["root"] not in str(artifact)
+        assert "file-0000.bin" not in str(artifact)
+        assert "find" not in output_path.read_text(encoding="utf-8")

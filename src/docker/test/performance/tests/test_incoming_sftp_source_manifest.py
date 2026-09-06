@@ -369,3 +369,117 @@ def test_failure_replaces_a_prior_success_with_private_allowlisted_error(tmp_pat
     assert json.loads((tmp_path / "source.json.failure").read_text(encoding="utf-8")) == expected
     if os.name != "nt":
         assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
+def _root_preflight_output(marker, path):
+    return (marker + "\n" + "sftp://remote.example" + path + "\n").encode("utf-8")
+
+
+def test_root_only_preflight_uses_pwd_and_cd_without_listing_and_persists_only_digests(monkeypatch, tmp_path):
+    protocol = manifest.ReadOnlySftpProtocolRunner(
+        host="remote.example", port=2222, username="private-user", password="private-password",
+        known_hosts_file="private-known-hosts",
+    )
+    calls = []
+
+    def fake_process(candidate, **_kwargs):
+        calls.append(candidate)
+        if candidate is None:
+            return manifest.SftpProcessResult(_root_preflight_output("source_root_preflight_pwd", "/home/remoteuser"))
+        return manifest.SftpProcessResult(_root_preflight_output("source_root_preflight_candidate", "/home/remoteuser/files/Incoming"))
+
+    monkeypatch.setattr(protocol, "root_preflight_process", fake_process)
+    output_path = tmp_path / "root-preflight.json"
+    result = manifest.RootOnlySftpPreflight(protocol).capture_to(
+        output_path, relative_root="files/Incoming", trusted_absolute_root=None,
+    )
+    assert result.succeeded
+    assert result.ambiguity == "equivalent"
+    assert calls == [None, "files/Incoming", "/home/remoteuser/files/Incoming"]
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["schema"] == "incoming-recovery-source-root-preflight.v1"
+    assert payload["ambiguity"] == "equivalent"
+    assert "remote.example" not in str(payload)
+    assert "private" not in str(payload)
+    assert "/home/remoteuser" not in str(payload)
+    if os.name != "nt":
+        assert stat.S_IMODE(output_path.stat().st_mode) == 0o600
+
+
+def test_root_only_preflight_fails_closed_for_missing_or_ambiguous_candidates(monkeypatch, tmp_path):
+    protocol = manifest.ReadOnlySftpProtocolRunner(host="remote.example")
+    responses = {
+        None: manifest.SftpProcessResult(_root_preflight_output("source_root_preflight_pwd", "/home/user")),
+        "files/Incoming": manifest.SftpProcessResult(b"source_root_preflight_open\n", returncode=1),
+        "/home/user/files/Incoming": manifest.SftpProcessResult(b"source_root_preflight_open\n", returncode=1),
+    }
+    monkeypatch.setattr(protocol, "root_preflight_process", lambda candidate, **_kwargs: responses[candidate])
+    output_path = tmp_path / "missing.json"
+    with pytest.raises(manifest.SourceManifestError, match="root_candidate_missing"):
+        manifest.RootOnlySftpPreflight(protocol).capture_to(output_path, relative_root="files/Incoming", trusted_absolute_root=None)
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["ambiguity"] == "missing"
+    assert payload["reason"] == "root_candidate_missing"
+
+    def ambiguous(candidate, **_kwargs):
+        if candidate is None:
+            return manifest.SftpProcessResult(_root_preflight_output("source_root_preflight_pwd", "/home/user"))
+        suffix = "/a" if candidate == "files/Incoming" else "/b"
+        return manifest.SftpProcessResult(_root_preflight_output("source_root_preflight_candidate", suffix))
+
+    monkeypatch.setattr(protocol, "root_preflight_process", ambiguous)
+    with pytest.raises(manifest.SourceManifestError, match="root_candidate_ambiguous"):
+        manifest.RootOnlySftpPreflight(protocol).capture_to(tmp_path / "ambiguous.json", relative_root="files/Incoming", trusted_absolute_root=None)
+
+
+def test_root_only_process_script_is_strict_and_never_enumerates(monkeypatch):
+    calls = []
+
+    def fake_process(argv, input_bytes, timeout_seconds, max_output_bytes, *, environment):
+        calls.append((argv, input_bytes.decode("utf-8"), timeout_seconds, max_output_bytes))
+        return manifest.SftpProcessResult(_root_preflight_output("source_root_preflight_candidate", "/private/root"))
+
+    monkeypatch.setattr(manifest, "_run_bounded_process", fake_process)
+    protocol = manifest.ReadOnlySftpProtocolRunner(
+        host="remote.example", port=2222, username="user", password="secret", known_hosts_file="known_hosts",
+    )
+    result = protocol.root_preflight_process("safe root/Incoming", timeout_seconds=5, max_output_bytes=4096)
+    assert result.returncode == 0
+    script = calls[0][1]
+    assert "StrictHostKeyChecking=yes" in script
+    assert "UserKnownHostsFile=" in script
+    assert "cd \"safe root/Incoming\"" in script
+    assert "pwd" in script
+    assert "find" not in script and "cls" not in script and "put" not in script and "rm " not in script
+
+
+def test_root_only_preflight_models_chroot_landing_and_keeps_candidates_confined(monkeypatch):
+    protocol = manifest.ReadOnlySftpProtocolRunner(host="remote.example")
+    calls = []
+    def chroot_process(candidate, **_kwargs):
+        calls.append(candidate)
+        if candidate is None:
+            return manifest.SftpProcessResult(_root_preflight_output("source_root_preflight_pwd", "/"))
+        if candidate == "files/Incoming":
+            return manifest.SftpProcessResult(_root_preflight_output("source_root_preflight_candidate", "/files/Incoming"))
+        return manifest.SftpProcessResult(b"source_root_preflight_open\n", returncode=1)
+    monkeypatch.setattr(protocol, "root_preflight_process", chroot_process)
+    result = manifest.RootOnlySftpPreflight(protocol).run(
+        relative_root="files/Incoming", trusted_absolute_root="/outside/Incoming",
+    )
+    assert result.succeeded
+    assert result.selected_form == "account_relative"
+    assert calls == [None, "files/Incoming", "/files/Incoming", "/outside/Incoming", "outside/Incoming"]
+
+
+@pytest.mark.parametrize("output", [
+    b"source_root_preflight_pwd\nnot-a-url\n",
+    b"source_root_preflight_pwd\nsftp://one.example/root\nsftp://two.example/root\n",
+])
+def test_root_only_preflight_rejects_malformed_or_multiple_pwd_output(monkeypatch, output):
+    protocol = manifest.ReadOnlySftpProtocolRunner(host="remote.example")
+    monkeypatch.setattr(protocol, "root_preflight_process", lambda *_args, **_kwargs: manifest.SftpProcessResult(output))
+    result = manifest.RootOnlySftpPreflight(protocol).run(relative_root="fixture/Incoming", trusted_absolute_root=None)
+    assert result.reason == "pwd_malformed"
+    assert result.stage == "pwd"
+    assert result.candidates == ()
