@@ -255,6 +255,15 @@ def test_fixed_get_sampler_persists_before_each_next_get_without_overlap(tmp_pat
     assert phases == [("before", 0), ("after", 0), ("before", 1), ("after", 1)]
 
 
+def test_fixed_get_sampler_accepts_artifact_path_and_rejects_ambiguous_sink(tmp_path):
+    artifact_path = tmp_path / "samples.jsonl"
+    sampler = observer.FixedGetSampler(("/server/status",), artifact_path=artifact_path)
+    sampler.sample(lambda _path: {})
+    assert artifact_path.exists()
+    with pytest.raises(ValueError, match="artifact_sink or artifact_path"):
+        observer.FixedGetSampler(("/server/status",), artifact_sink=[], artifact_path=artifact_path)
+
+
 class PrivateResponse409:
     status = 409
 
@@ -299,6 +308,7 @@ def test_sampler_reports_post_get_capture_failure_and_stops_before_next_get():
     assert records == [{
         "schema": "incoming-recovery-observer-sample.v1", "event": "get",
         "phase": "after", "outcome": "capture_failure", "request_index": 0,
+        "endpoint_class": "unknown", "request_latency_ms": pytest.approx(records[0]["request_latency_ms"]),
         "response_kind": "mapping",
         "capture_failure": {
             "schema": "incoming-recovery-observer-capture-failure.v1",
@@ -326,6 +336,90 @@ def test_sampler_stops_after_get_exception_when_failure_capture_fails():
         "phase": "get_failure", "kind": "artifact_sink_failure",
     }
     assert "transport-private-detail" not in str(records)
+
+
+def test_sampler_records_latency_outside_capture_and_discriminator_respects_five_second_budget():
+    clock = iter((1_000_000_000, 5_999_000_000, 6_000_000_000, 11_000_000_000))
+    sampler = observer.FixedGetSampler(
+        ("/server/status", "/server/model/v1/summary"), clock=lambda: next(clock),
+    )
+    records = sampler.sample(lambda _path: {"private": "response"})
+    assert [record["request_latency_ms"] for record in records] == [4999.0, 5000.0]
+    assert [record["endpoint_class"] for record in records] == ["status", "model_summary"]
+    result = sampler.discriminate({
+        "schema": "seedsync.performance-diagnostics.v1",
+        "current": {"process_cpu_percent_one_core": 0.0},
+        "active_stages": {},
+    })
+    assert result["classification"] == "inconclusive"
+    assert result["reason"] == "slow_without_signal"
+    assert "private" not in str(result)
+
+
+@pytest.mark.parametrize(
+    ("diagnostics", "classification"),
+    [
+        ({"schema": "seedsync.performance-diagnostics.v1", "current": {"process_cpu_percent_one_core": 90.0}, "active_stages": {}}, "likely_gil_or_cpu"),
+        ({"schema": "seedsync.performance-diagnostics.v1", "current": {"process_cpu_percent_one_core": 1.0}, "active_stages": {
+            "model_update_lock_hold": {"count": 1, "max_wall_seconds": 5.0},
+        }}, "lock_wait_or_hold"),
+        ({"schema": "seedsync.performance-diagnostics.v1", "current": {"process_cpu_percent_one_core": 1.0}, "active_stages": {
+            "local_scan_filesystem_traversal": {"count": 1, "max_wall_seconds": 5.0},
+        }}, "scan_traversal_or_intake"),
+        ({"schema": "seedsync.performance-diagnostics.v1", "current": {"process_cpu_percent_one_core": 1.0}, "active_stages": {
+            "model_summary_serialization": {"count": 1, "max_wall_seconds": 5.0},
+        }}, "model_serialization_or_sse"),
+    ],
+)
+def test_discriminator_classifies_current_diagnostics_only(diagnostics, classification):
+    sampler = observer.FixedGetSampler(("/server/status",), clock=iter((0, 5_000_000_000)).__next__)
+    sampler.sample(lambda _path: {})
+    result = sampler.discriminate(diagnostics)
+    assert result["classification"] == classification
+
+
+def test_discriminator_fails_closed_for_auth_and_malformed_diagnostics():
+    sampler = observer.FixedGetSampler(("/server/status",), clock=iter((0, 1)).__next__)
+    sampler.sample(lambda _path: type("Response", (), {"status": 403})())
+    assert sampler.discriminate()["reason"] == "auth_error"
+    bad_records = [{"schema": "incoming-recovery-observer-sample.v1", "event": "get"}]
+    assert observer.discriminate_api_responsiveness(bad_records, {"schema": "wrong"})["classification"] == "inconclusive"
+
+
+def test_discriminator_rejects_duplicate_and_untyped_artifact_or_diagnostic_values():
+    record = {
+        "schema": "incoming-recovery-observer-sample.v1", "event": "get", "phase": "after",
+        "request_index": 0, "endpoint_class": "status", "outcome": "success", "request_latency_ms": 1,
+    }
+    malformed_cases = (
+        [record, dict(record)],
+        [{**record, "phase": []}],
+        [{**record, "outcome": "failure", "error": {"error_type": []}}],
+    )
+    for records in malformed_cases:
+        assert observer.discriminate_api_responsiveness(records)["classification"] == "inconclusive"
+    assert observer.discriminate_api_responsiveness([record], {"samples": None})["classification"] == "inconclusive"
+    assert observer.discriminate_api_responsiveness([record], {"samples": [None]})["classification"] == "inconclusive"
+    assert observer.discriminate_api_responsiveness([record], {"current": {}})["classification"] == "inconclusive"
+    failed = {**record, "outcome": "failure"}
+    captured = {**record, "outcome": "capture_failure"}
+    assert observer.discriminate_api_responsiveness([failed])["classification"] == "inconclusive"
+    assert observer.discriminate_api_responsiveness([captured])["classification"] == "inconclusive"
+
+
+def test_sampler_clears_stale_records_and_stops_on_http_status_when_requested():
+    sampler = observer.FixedGetSampler(("/server/status",), clock=iter((0, 1, 2, 3)).__next__)
+    sampler.sample(lambda _path: {})
+    sampler.artifact_sink = FailingSink()
+    with pytest.raises(observer.ObserverCaptureError):
+        sampler.sample(lambda _path: {})
+    assert sampler.discriminate()["classification"] == "inconclusive"
+
+    strict = observer.FixedGetSampler(("/server/status", "/server/model/v1/summary"), continue_on_error=False)
+    with pytest.raises(observer.ObserverSchemaError, match="HTTP error"):
+        strict.sample(lambda _path: type("Response", (), {"status": 403})())
+    assert len(strict.last_records) == 1
+    assert strict.last_records[0]["error"]["error_type"] == "auth_error"
 
 
 @pytest.mark.parametrize(

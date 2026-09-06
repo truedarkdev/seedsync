@@ -7,11 +7,13 @@ POST transport until the exact same gate instance has passed validation.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
+import time
 from typing import Any, Callable, Mapping, Sequence
 from urllib.error import HTTPError
-from urllib.parse import urlencode, quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 import json
 
 
@@ -42,10 +44,94 @@ _QUEUE_PREFLIGHT_REASONS = frozenset({
     "stopped", "file_missing", "stop_state_unknown", "path_pair_refresh",
 })
 
+# These are intentionally small, fixed vocabularies. The observer may receive
+# an arbitrary URL from a caller, but no URL or caller-provided route is ever
+# written to an artifact or returned by the discriminator.
+_ENDPOINT_CLASSES = frozenset({
+    "path_pairs", "config", "model_summary", "model_roots", "status",
+    "performance_diagnostics", "auth", "unknown",
+})
+_ARTIFACT_PHASES = frozenset({"before", "after"})
+_MAX_REQUEST_LATENCY_MS = 7 * 24 * 60 * 60 * 1000.0
+_SLOW_REQUEST_LATENCY_MS = 5000.0
+_HIGH_CPU_PERCENT = 75.0
+_LOW_CPU_PERCENT = 25.0
+_ACTIVE_STAGE_WALL_SECONDS = 0.5
+
+_SCAN_STAGES = frozenset({
+    "local_scan_filesystem_traversal", "local_scan_managed_extract",
+    "local_scan_staging_merge", "local_scan_aggregation",
+    "local_scan_progress_publication", "remote_scan_transport_read",
+    "remote_scan_stream_parsing", "remote_scan_aggregation",
+    "remote_scan_progress_publication", "model_update_scan_intake",
+})
+_SERIALIZATION_STAGES = frozenset({
+    "model_summary_serialization", "model_scoped_serialization",
+    "model_summary_sse_emission", "model_scoped_sse_emission",
+})
+_LOCK_STAGES = frozenset({
+    "model_update_lock_wait", "model_update_lock_hold",
+    "model_update_finalization_model_lock_wait", "model_update_finalization_model_lock_hold",
+})
+_KNOWN_DIAGNOSTIC_STAGES = frozenset({
+    *_SCAN_STAGES, *_SERIALIZATION_STAGES,
+    "model_update_lock_wait", "model_update_lock_hold",
+    "model_update_finalization_model_lock_wait", "model_update_finalization_model_lock_hold",
+    "model_update_state_preparation", "model_update_status_ingestion",
+    "model_update_builder_sync", "model_update_lifecycle_maintenance",
+    "model_update_build_finalization", "model_builder_set_local_files",
+    "model_builder_set_remote_files", "model_builder_set_active_files",
+    "model_builder_set_lftp_statuses", "model_builder_set_stopped_files",
+    "controller_process", "controller_job", "model_build",
+})
+
 def _mapping(payload: object, name: str) -> Mapping[str, Any]:
     if not isinstance(payload, Mapping):
         raise ObserverSchemaError(f"{name} must be an object")
     return payload
+
+
+def endpoint_class(path: object) -> str:
+    """Return a fixed public class for a probe route without retaining its URL."""
+    if not isinstance(path, str) or not path:
+        return "unknown"
+    try:
+        parsed = urlsplit(path)
+    except ValueError:
+        return "unknown"
+    route = parsed.path if parsed.path else path.split("?", 1)[0]
+    if route == "/server/path-pairs":
+        return "path_pairs"
+    if route == "/server/config/get":
+        return "config"
+    if route == "/server/model/v1/summary":
+        return "model_summary"
+    if route == "/server/status":
+        return "status"
+    if route == "/server/admin/performance-diagnostics/v1":
+        return "performance_diagnostics"
+    if route.startswith("/server/auth/"):
+        return "auth"
+    if route.startswith("/server/model/v1/pairs/") and route.endswith("/roots"):
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        if query == [("limit", "200")]:
+            return "model_roots"
+    return "unknown"
+
+
+def _status_code(value: object) -> int | None:
+    status = getattr(value, "status", getattr(value, "code", None))
+    return status if type(status) is int and 100 <= status <= 599 else None
+
+
+def _request_latency_ms(start_ns: object, end_ns: object) -> float | None:
+    """Convert monotonic clock boundaries to a bounded, safe millisecond value."""
+    if type(start_ns) is not int or type(end_ns) is not int or end_ns < start_ns:
+        return None
+    elapsed_ms = (end_ns - start_ns) / 1_000_000.0
+    if not math.isfinite(elapsed_ms) or elapsed_ms < 0 or elapsed_ms > _MAX_REQUEST_LATENCY_MS:
+        return None
+    return round(elapsed_ms, 3)
 
 
 def path_pairs(payload: object) -> Sequence[Mapping[str, Any]]:
@@ -145,6 +231,8 @@ def queue_response_evidence(status_code: object, body: object) -> Mapping[str, o
 def _safe_error_type(exc: BaseException) -> str:
     """Return a fixed public category; never expose a custom class name."""
     if isinstance(exc, HTTPError):
+        if exc.code in (401, 403):
+            return "auth_error"
         return "http_error"
     if isinstance(exc, TimeoutError):
         return "timeout"
@@ -176,6 +264,7 @@ _ARTIFACT_ALLOWED_KEYS = frozenset({
     "status_code", "body_reason", "request_index", "response_kind", "root_state",
     "root_found", "target_verified", "root_verified", "first_failure", "evidence",
     "error", "failure", "capture_failure", "queue_evidence", "scan_lifecycle", "sample_index",
+    "endpoint_class", "request_latency_ms", "classification", "reason", "request", "diagnostics",
 })
 _ARTIFACT_SAFE_REASONS = _QUEUE_PREFLIGHT_REASONS | frozenset({
     "queue_accepted", "success_response", "response_unavailable", "path_pair_relocation",
@@ -183,7 +272,9 @@ _ARTIFACT_SAFE_REASONS = _QUEUE_PREFLIGHT_REASONS | frozenset({
     "remote_content_unavailable", "directory_root_invalid", "unrecognized_409_response",
     "preflight_cancelled_unrecognized", "first_failure", "get_failed", "get_succeeded",
 })
-_ARTIFACT_ERROR_TYPES = frozenset({"http_error", "timeout", "transport_error", "observer_error"})
+_ARTIFACT_ERROR_TYPES = frozenset({
+    "auth_error", "http_error", "timeout", "transport_error", "observer_error",
+})
 _ARTIFACT_RESPONSE_KINDS = frozenset({"none", "mapping", "bytes", "text", "number", "object"})
 
 
@@ -242,6 +333,21 @@ def _sanitize_artifact(value: object) -> Mapping[str, object]:
             sanitized[key] = item if isinstance(item, str) and item in _ARTIFACT_ERROR_TYPES else "observer_error"
         elif key == "status_code":
             sanitized[key] = item if type(item) is int and 100 <= item <= 599 else None
+        elif key == "request_latency_ms":
+            sanitized[key] = (
+                round(float(item), 3)
+                if type(item) in (int, float) and math.isfinite(float(item))
+                and 0 <= float(item) <= _MAX_REQUEST_LATENCY_MS else None
+            )
+        elif key == "endpoint_class":
+            sanitized[key] = item if isinstance(item, str) and item in _ENDPOINT_CLASSES else "unknown"
+        elif key in {"classification", "reason"}:
+            allowed = _DISCRIMINATOR_LABELS if key == "classification" else _DISCRIMINATOR_REASONS
+            sanitized[key] = item if isinstance(item, str) and item in allowed else "inconclusive"
+        elif key == "request":
+            sanitized[key] = _sanitize_discriminator_request(item)
+        elif key == "diagnostics":
+            sanitized[key] = _sanitize_discriminator_diagnostics(item)
         elif key in {"request_index", "sample_index"}:
             sanitized[key] = item if type(item) is int and item >= 0 else None
         elif key in {"root_found", "target_verified", "root_verified", "first_failure", "success"}:
@@ -304,7 +410,12 @@ def _response_kind(response: object) -> str:
 
 
 class FixedGetSampler:
-    """Run a fixed GET list synchronously, persisting each boundary in order."""
+    """Run a fixed GET list synchronously, persisting each boundary in order.
+
+    Request timing starts after the ``before`` artifact is persisted and ends
+    immediately when the injected GET returns or raises. This keeps artifact
+    sink latency out of the request measurement.
+    """
 
     def __init__(
         self,
@@ -312,17 +423,25 @@ class FixedGetSampler:
         artifact_sink: object | None = None,
         *,
         continue_on_error: bool = True,
+        clock: Callable[[], int] | None = None,
+        artifact_path: str | os.PathLike[str] | None = None,
     ):
         if isinstance(paths, (str, bytes)) or not all(isinstance(path, str) and path for path in paths):
             raise ValueError("sampler paths must be non-empty strings")
+        if artifact_sink is not None and artifact_path is not None:
+            raise ValueError("provide artifact_sink or artifact_path, not both")
         self.paths = tuple(paths)
+        if artifact_path is not None:
+            artifact_sink = JsonArtifactSink(artifact_path)
         self.artifact_sink = (
             JsonArtifactSink(artifact_sink)
             if isinstance(artifact_sink, (str, os.PathLike)) else artifact_sink
         )
         self.continue_on_error = continue_on_error
+        self.clock = clock or time.monotonic_ns
         self.first_failure: Mapping[str, object] | None = None
         self.capture_failure: Mapping[str, object] | None = None
+        self.last_records: list[Mapping[str, object]] = []
 
     def _persist(self, artifact: Mapping[str, object], phase: str) -> bool:
         try:
@@ -337,20 +456,27 @@ class FixedGetSampler:
 
     def sample(self, get: Callable[[str], object]) -> list[Mapping[str, object]]:
         records: list[Mapping[str, object]] = []
+        self.last_records = records
         for index, path in enumerate(self.paths):
+            safe_endpoint = endpoint_class(path)
             # The next GET cannot begin until this record has been persisted.
             before_persisted = self._persist({
                 "schema": "incoming-recovery-observer-sample.v1", "event": "get",
                 "phase": "before", "request_index": index,
+                "endpoint_class": safe_endpoint,
             }, "get_before")
             if not before_persisted:
                 raise ObserverCaptureError("GET sampler artifact capture failed before request")
+            started_ns = self.clock()
             try:
                 response = get(path)
             except Exception as exc:
+                ended_ns = self.clock()
                 failure = {
                     "schema": "incoming-recovery-observer-sample.v1", "event": "get",
                     "phase": "after", "outcome": "failure", "request_index": index,
+                    "endpoint_class": safe_endpoint,
+                    "request_latency_ms": _request_latency_ms(started_ns, ended_ns),
                     "error": {**error_artifact(exc), "kind": "get_error"},
                 }
                 if self.first_failure is None:
@@ -361,15 +487,64 @@ class FixedGetSampler:
                     failure = {
                         **failure, "outcome": "capture_failure", "capture_failure": self.capture_failure,
                     }
-                records.append(_sanitize_artifact(failure))
+                public_failure = _sanitize_artifact(failure)
                 if not persisted:
+                    # Keep the historical return shape when the sink itself
+                    # fails; the richer timing remains in ``last_records``.
+                    public_failure = {
+                        key: value for key, value in public_failure.items()
+                        if key not in {"endpoint_class", "request_latency_ms"}
+                    }
+                records.append(public_failure)
+                if not persisted:
+                    self.last_records = records
                     return records
                 if not self.continue_on_error:
+                    self.last_records = records
                     raise
+                continue
+            ended_ns = self.clock()
+            status = _status_code(response)
+            if status is not None and status >= 400:
+                error_type = "auth_error" if status in (401, 403) else "http_error"
+                failure = {
+                    "schema": "incoming-recovery-observer-sample.v1", "event": "get",
+                    "phase": "after", "outcome": "failure", "request_index": index,
+                    "endpoint_class": safe_endpoint,
+                    "request_latency_ms": _request_latency_ms(started_ns, ended_ns),
+                    "error": {
+                        "schema": "incoming-recovery-observer-error.v1",
+                        "kind": "get_error", "error_type": error_type,
+                        "status_code": status,
+                    },
+                }
+                if self.first_failure is None:
+                    failure = {**failure, "first_failure": True}
+                    self.first_failure = failure
+                persisted = self._persist(failure, "get_failure")
+                if not persisted:
+                    failure = {
+                        **failure, "outcome": "capture_failure", "capture_failure": self.capture_failure,
+                    }
+                public_failure = _sanitize_artifact(failure)
+                if not persisted:
+                    public_failure = {
+                        key: value for key, value in public_failure.items()
+                        if key not in {"endpoint_class", "request_latency_ms"}
+                    }
+                records.append(public_failure)
+                if not persisted:
+                    self.last_records = records
+                    return records
+                if not self.continue_on_error:
+                    self.last_records = records
+                    raise ObserverSchemaError("GET returned an HTTP error")
                 continue
             success = {
                 "schema": "incoming-recovery-observer-sample.v1", "event": "get",
                 "phase": "after", "outcome": "success", "request_index": index,
+                "endpoint_class": safe_endpoint,
+                "request_latency_ms": _request_latency_ms(started_ns, ended_ns),
                 "response_kind": _response_kind(response),
             }
             persisted = self._persist(success, "get_success")
@@ -381,10 +556,462 @@ class FixedGetSampler:
                 }
             records.append(_sanitize_artifact(success))
             if not persisted:
+                self.last_records = records
                 return records
+        self.last_records = records
         return records
 
     collect = sample
+
+    def discriminate(self, diagnostics: object | None = None) -> Mapping[str, object]:
+        """Classify the most recent fixed probe using sanitized diagnostics."""
+        return discriminate_api_responsiveness(self.last_records, diagnostics)
+
+
+_DISCRIMINATOR_LABELS = frozenset({
+    "responsive", "likely_gil_or_cpu", "lock_wait_or_hold",
+    "scan_traversal_or_intake", "model_serialization_or_sse",
+    "observer_interference", "inconclusive",
+})
+_FAILURE_REASONS = frozenset({
+    "auth_error", "timeout", "http_error", "transport_error",
+    "observer_error", "mixed_request_failure", "malformed_request_evidence",
+    "malformed_diagnostics", "diagnostics_unavailable", "slow_without_signal",
+    "capture_failure",
+})
+_DISCRIMINATOR_REASONS = _FAILURE_REASONS | frozenset({
+    "request_latency_within_bound", "serialization_stage_or_counter",
+    "scan_stage_or_duration", "high_cpu_with_slow_request",
+    "long_active_stage_with_low_cpu",
+})
+_DIAGNOSTIC_SCHEMA = "seedsync.performance-diagnostics.v1"
+_DISCRIMINATOR_SCHEMA = "incoming-recovery-api-discriminator.v1"
+
+
+def _finite_nonnegative(value: object) -> float | None:
+    if type(value) not in (int, float):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _percentile(values: Sequence[float], rank: float = 0.95) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int(len(ordered) * rank + 0.999999) - 1))
+    return round(ordered[index], 3)
+
+
+def _empty_diagnostics(available: bool = False) -> dict[str, object]:
+    return {
+        "available": available,
+        "sample_count": 0,
+        "cpu_average_percent_one_core": None,
+        "cpu_peak_percent_one_core": None,
+        "active_stage": None,
+        "active_stage_wall_seconds": None,
+        "active_scanner_stage": None,
+        "active_scanner_stage_wall_seconds": None,
+        "duration_stages": [],
+        "duration_wall_seconds": {},
+        "duration_cpu_seconds": {},
+        "serialization_counter_total": 0,
+    }
+
+
+def _sanitize_discriminator_request(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, object] = {}
+    for key in (
+        "sample_count", "success_count", "failure_count", "auth_error_count",
+        "timeout_count",
+    ):
+        item = value.get(key)
+        result[key] = item if type(item) is int and item >= 0 else 0
+    for key in ("max_latency_ms", "p95_latency_ms"):
+        item = value.get(key)
+        result[key] = (
+            round(float(item), 3)
+            if item is not None and type(item) in (int, float)
+            and math.isfinite(float(item)) and 0 <= float(item) <= _MAX_REQUEST_LATENCY_MS
+            else None
+        )
+    reason = value.get("failure_reason")
+    result["failure_reason"] = reason if isinstance(reason, str) and reason in _FAILURE_REASONS else None
+    classes = value.get("endpoint_classes")
+    result["endpoint_classes"] = sorted({
+        item for item in classes if isinstance(item, str) and item in _ENDPOINT_CLASSES
+    }) if isinstance(classes, list) else []
+    return result
+
+
+def _sanitize_discriminator_diagnostics(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        return _empty_diagnostics()
+    result = _empty_diagnostics(bool(value.get("available")))
+    result["sample_count"] = value.get("sample_count") if type(value.get("sample_count")) is int \
+        and value.get("sample_count") >= 0 else 0
+    for key in ("cpu_average_percent_one_core", "cpu_peak_percent_one_core"):
+        item = value.get(key)
+        result[key] = round(float(item), 3) if type(item) in (int, float) \
+            and math.isfinite(float(item)) and float(item) >= 0 else None
+    for key in ("active_stage", "active_scanner_stage"):
+        result[key] = _safe_stage(value.get(key))
+        wall = value.get(f"{key}_wall_seconds")
+        result[f"{key}_wall_seconds"] = round(float(wall), 6) if type(wall) in (int, float) \
+            and math.isfinite(float(wall)) and float(wall) >= 0 else None
+    stages = value.get("duration_stages")
+    result["duration_stages"] = sorted({
+        item for item in stages if isinstance(item, str) and item in _KNOWN_DIAGNOSTIC_STAGES
+    }) if isinstance(stages, list) else []
+    for source_key, target_key in (("duration_wall_seconds", "duration_wall_seconds"),
+                                   ("duration_cpu_seconds", "duration_cpu_seconds")):
+        source = value.get(source_key)
+        result[target_key] = {
+            metric: round(float(item), 6)
+            for metric, item in source.items()
+            if isinstance(metric, str) and metric in _KNOWN_DIAGNOSTIC_STAGES
+            and type(item) in (int, float) and math.isfinite(float(item)) and float(item) >= 0
+        } if isinstance(source, Mapping) else {}
+    counter = value.get("serialization_counter_total")
+    result["serialization_counter_total"] = counter if type(counter) is int and counter >= 0 else 0
+    return result
+
+
+def _safe_stage(value: object) -> str | None:
+    return value if isinstance(value, str) and value in _KNOWN_DIAGNOSTIC_STAGES else None
+
+
+def _diagnostic_stage_value(value: object, field: str) -> tuple[str | None, float | None, bool]:
+    if not isinstance(value, Mapping):
+        return None, None, False
+    name = value.get("name")
+    if name is not None and not isinstance(name, str):
+        return None, None, False
+    wall = value.get(field)
+    if wall is None:
+        return _safe_stage(name), None, True
+    number = _finite_nonnegative(wall)
+    return _safe_stage(name), number, number is not None
+
+
+def _sanitize_diagnostics(diagnostics: object | None) -> tuple[dict[str, object], bool, str | None]:
+    """Reduce the known diagnostics snapshot to a fixed, public evidence shape."""
+    if diagnostics is None:
+        return _empty_diagnostics(False), True, "diagnostics_unavailable"
+    if not isinstance(diagnostics, Mapping):
+        return _empty_diagnostics(), False, "malformed_diagnostics"
+    if diagnostics.get("schema") != _DIAGNOSTIC_SCHEMA:
+        return _empty_diagnostics(), False, "malformed_diagnostics"
+
+    result = _empty_diagnostics(True)
+    cpu_values: list[float] = []
+    samples = diagnostics.get("samples", [])
+    if not isinstance(samples, list) or not all(isinstance(sample, Mapping) for sample in samples):
+        return _empty_diagnostics(), False, "malformed_diagnostics"
+    current = diagnostics.get("current", {})
+    if current is not None and not isinstance(current, Mapping):
+        return _empty_diagnostics(), False, "malformed_diagnostics"
+    # ``current`` is the only CPU evidence used for classification. Retained
+    # samples are historical and cannot establish causality for this probe.
+    cpu_source = current if isinstance(current, Mapping) else {}
+    for field in ("process_cpu_percent_one_core", "cgroup_cpu_percent_one_core"):
+        if field not in cpu_source:
+            continue
+        value = cpu_source[field]
+        if value is None:
+            continue
+        number = _finite_nonnegative(value)
+        if number is None:
+            return _empty_diagnostics(), False, "malformed_diagnostics"
+        cpu_values.append(number)
+    if cpu_values:
+        result["sample_count"] = len(samples)
+        result["cpu_average_percent_one_core"] = round(sum(cpu_values) / len(cpu_values), 3)
+        result["cpu_peak_percent_one_core"] = round(max(cpu_values), 3)
+
+    for key, output_key, field in (
+        ("active_stage", "active_stage", "wall_seconds"),
+        ("active_scanner_stage", "active_scanner_stage", "wall_seconds"),
+    ):
+        if key not in diagnostics:
+            continue
+        name, wall, valid = _diagnostic_stage_value(diagnostics[key], field)
+        if not valid:
+            return _empty_diagnostics(), False, "malformed_diagnostics"
+        result[output_key] = name
+        result[f"{output_key}_wall_seconds"] = wall
+
+    duration_wall: dict[str, float] = {}
+    duration_cpu: dict[str, float] = {}
+
+    def add_duration(metric: object, values: object, *, active: bool = False) -> bool:
+        if not isinstance(metric, str) or metric not in _KNOWN_DIAGNOSTIC_STAGES:
+            return True
+        if not isinstance(values, Mapping):
+            return False
+        wall_key = "max_wall_seconds" if active else "total_wall_seconds"
+        wall_value = values.get(wall_key)
+        cpu_value = values.get("total_cpu_seconds")
+        if wall_value is not None:
+            wall = _finite_nonnegative(wall_value)
+            if wall is None:
+                return False
+            duration_wall[metric] = max(duration_wall.get(metric, 0.0), wall)
+        if cpu_value is not None:
+            cpu = _finite_nonnegative(cpu_value)
+            if cpu is None:
+                return False
+            duration_cpu[metric] = max(duration_cpu.get(metric, 0.0), cpu)
+        return True
+
+    for field, active in (("durations", False), ("active_stages", True)):
+        values = diagnostics.get(field, {})
+        if values is not None and not isinstance(values, Mapping):
+            return _empty_diagnostics(), False, "malformed_diagnostics"
+        for metric, item in values.items() if isinstance(values, Mapping) else ():
+            if not add_duration(metric, item, active=active):
+                return _empty_diagnostics(), False, "malformed_diagnostics"
+
+    for sample in samples:
+        window = sample.get("stage_window")
+        if window is None:
+            continue
+        if not isinstance(window, Mapping):
+            return _empty_diagnostics(), False, "malformed_diagnostics"
+        metrics = window.get("metrics", {})
+        if metrics is not None and not isinstance(metrics, Mapping):
+            return _empty_diagnostics(), False, "malformed_diagnostics"
+        for metric, item in metrics.items() if isinstance(metrics, Mapping) else ():
+            if not add_duration(metric, item):
+                return _empty_diagnostics(), False, "malformed_diagnostics"
+
+    counters = diagnostics.get("counters", {})
+    if counters is not None and not isinstance(counters, Mapping):
+        return _empty_diagnostics(), False, "malformed_diagnostics"
+    serialization_total = 0
+    for metric in _SERIALIZATION_STAGES:
+        if not isinstance(counters, Mapping) or metric not in counters:
+            continue
+        value = counters[metric]
+        if type(value) is not int or value < 0:
+            return _empty_diagnostics(), False, "malformed_diagnostics"
+        serialization_total += value
+
+    result["duration_wall_seconds"] = {
+        metric: round(duration_wall[metric], 6) for metric in sorted(duration_wall)
+    }
+    result["duration_cpu_seconds"] = {
+        metric: round(duration_cpu[metric], 6) for metric in sorted(duration_cpu)
+    }
+    result["duration_stages"] = sorted(set(duration_wall) | set(duration_cpu))
+    result["serialization_counter_total"] = serialization_total
+    return result, True, None
+
+
+def _request_evidence(records: object) -> tuple[dict[str, object], bool, str | None]:
+    if isinstance(records, FixedGetSampler):
+        records = records.last_records
+    if isinstance(records, Mapping):
+        records = records.get("samples")
+    if not isinstance(records, list) or not records:
+        return {}, False, "malformed_request_evidence"
+
+    after: list[Mapping[str, object]] = []
+    phases: dict[int, set[str]] = {}
+    endpoints: dict[int, str] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            return {}, False, "malformed_request_evidence"
+        if record.get("schema") != "incoming-recovery-observer-sample.v1" \
+                or record.get("event") != "get":
+            return {}, False, "malformed_request_evidence"
+        index = record.get("request_index")
+        phase = record.get("phase")
+        endpoint = record.get("endpoint_class")
+        if type(index) is not int or index < 0 or not isinstance(phase, str) \
+                or phase not in _ARTIFACT_PHASES or not isinstance(endpoint, str) \
+                or endpoint not in _ENDPOINT_CLASSES:
+            return {}, False, "malformed_request_evidence"
+        index_phases = phases.setdefault(index, set())
+        if phase in index_phases or (index in endpoints and endpoints[index] != endpoint):
+            return {}, False, "malformed_request_evidence"
+        index_phases.add(phase)
+        endpoints[index] = endpoint
+        if phase != "after":
+            continue
+        outcome = record.get("outcome")
+        if not isinstance(outcome, str) or outcome not in {"success", "failure", "capture_failure"}:
+            return {}, False, "malformed_request_evidence"
+        latency = record.get("request_latency_ms")
+        if latency is None:
+            return {}, False, "malformed_request_evidence"
+        safe_latency = _finite_nonnegative(latency)
+        if safe_latency is None or safe_latency > _MAX_REQUEST_LATENCY_MS:
+            return {}, False, "malformed_request_evidence"
+        after.append(record)
+        if outcome == "success":
+            if "error" in record or "capture_failure" in record:
+                return {}, False, "malformed_request_evidence"
+        elif outcome == "failure":
+            error = record.get("error")
+            if not isinstance(error, Mapping) or error.get("schema") != "incoming-recovery-observer-error.v1":
+                return {}, False, "malformed_request_evidence"
+            error_type = error.get("error_type")
+            if not isinstance(error_type, str) or error_type not in _ARTIFACT_ERROR_TYPES:
+                return {}, False, "malformed_request_evidence"
+            status = error.get("status_code")
+            if status is not None and (type(status) is not int or not 100 <= status <= 599):
+                return {}, False, "malformed_request_evidence"
+            if "capture_failure" in record:
+                return {}, False, "malformed_request_evidence"
+        else:
+            capture_failure = record.get("capture_failure")
+            if not isinstance(capture_failure, Mapping) \
+                    or capture_failure.get("schema") != "incoming-recovery-observer-capture-failure.v1" \
+                    or capture_failure.get("kind") != "artifact_sink_failure" \
+                    or not isinstance(capture_failure.get("phase"), str):
+                return {}, False, "malformed_request_evidence"
+
+    if not after or sorted(phases) != list(range(len(phases))):
+        return {}, False, "malformed_request_evidence"
+    # ``FixedGetSampler.sample`` deliberately returns only post-request
+    # records, while its durable artifact contains both boundaries.  Accept
+    # either representation, but reject a mixed/partial artifact.
+    phase_shapes = set(tuple(sorted(value)) for value in phases.values())
+    if phase_shapes not in ({("after",)}, {("after", "before")}):
+        return {}, False, "malformed_request_evidence"
+
+    latencies = [round(float(record["request_latency_ms"]), 3) for record in after]
+    failures = [record for record in after if record.get("outcome") != "success"]
+    failure_types = []
+    for record in failures:
+        error = record.get("error")
+        if isinstance(error, Mapping) and isinstance(error.get("error_type"), str):
+            failure_types.append(error["error_type"])
+    unique_failures = set(failure_types)
+    if len(unique_failures) == 1:
+        failure_reason = next(iter(unique_failures))
+    elif unique_failures:
+        failure_reason = "mixed_request_failure"
+    else:
+        failure_reason = "capture_failure" if failures else None
+    return {
+        "sample_count": len(after),
+        "success_count": sum(record.get("outcome") == "success" for record in after),
+        "failure_count": len(failures),
+        "auth_error_count": failure_types.count("auth_error"),
+        "timeout_count": failure_types.count("timeout"),
+        "failure_reason": failure_reason,
+        "max_latency_ms": round(max(latencies), 3),
+        "p95_latency_ms": _percentile(latencies),
+        "endpoint_classes": sorted({record["endpoint_class"] for record in after}),
+    }, True, None
+
+
+def _inconclusive(reason: str, request: Mapping[str, object] | None = None,
+                  diagnostics: Mapping[str, object] | None = None) -> Mapping[str, object]:
+    safe_reason = reason if reason in _FAILURE_REASONS else "malformed_request_evidence"
+    return {
+        "schema": _DISCRIMINATOR_SCHEMA,
+        "classification": "inconclusive",
+        "reason": safe_reason,
+        "request": dict(request or {}),
+        "diagnostics": dict(diagnostics or _empty_diagnostics()),
+    }
+
+
+def discriminate_api_responsiveness(
+    records: object, diagnostics: object | None = None,
+) -> Mapping[str, object]:
+    """Classify a fixed authenticated GET probe against sanitized diagnostics.
+
+    This function is deliberately total: malformed or incomplete evidence
+    yields ``inconclusive`` and never causes an operational decision from
+    untrusted input. Auth failures and timeouts remain separate in ``reason``.
+    """
+    request, request_valid, request_reason = _request_evidence(records)
+    if not request_valid:
+        return _inconclusive(request_reason or "malformed_request_evidence")
+    safe_diagnostics, diagnostics_valid, diagnostics_reason = _sanitize_diagnostics(diagnostics)
+    if not diagnostics_valid:
+        return _inconclusive(diagnostics_reason or "malformed_diagnostics", request, safe_diagnostics)
+
+    failure_reason = request.get("failure_reason")
+    if failure_reason is not None:
+        return _inconclusive(str(failure_reason), request, safe_diagnostics)
+    if diagnostics_reason == "diagnostics_unavailable" and request["max_latency_ms"] >= _SLOW_REQUEST_LATENCY_MS:
+        return _inconclusive("diagnostics_unavailable", request, safe_diagnostics)
+
+    max_latency = float(request["max_latency_ms"])
+    slow = max_latency >= _SLOW_REQUEST_LATENCY_MS
+    if not slow:
+        return {
+            "schema": _DISCRIMINATOR_SCHEMA,
+            "classification": "responsive",
+            "reason": "request_latency_within_bound",
+            "request": dict(request),
+            "diagnostics": dict(safe_diagnostics),
+        }
+
+    # A failed artifact boundary is a direct signal that observer work altered
+    # the probe. It is evaluated before application-side diagnoses.
+    if request.get("failure_count", 0) and request.get("failure_reason") == "capture_failure":
+        classification = "observer_interference"
+        reason = "capture_failure"
+    else:
+        active_stage = safe_diagnostics.get("active_stage")
+        active_scanner_stage = safe_diagnostics.get("active_scanner_stage")
+        active_stages = set()
+        raw_active_stages = diagnostics.get("active_stages") if isinstance(diagnostics, Mapping) else None
+        if isinstance(raw_active_stages, Mapping):
+            for name, values in raw_active_stages.items():
+                if name not in _KNOWN_DIAGNOSTIC_STAGES or not isinstance(values, Mapping):
+                    continue
+                count = values.get("count")
+                wall = values.get("max_wall_seconds")
+                if type(count) is int and count > 0 and type(wall) in (int, float) \
+                        and math.isfinite(float(wall)) and float(wall) >= _ACTIVE_STAGE_WALL_SECONDS:
+                    active_stages.add(name)
+        scan_signal = active_scanner_stage in _SCAN_STAGES or bool(active_stages & _SCAN_STAGES)
+        serialization_signal = (
+            bool(active_stages & _SERIALIZATION_STAGES)
+            or active_stage in _SERIALIZATION_STAGES
+        )
+        cpu_peak = safe_diagnostics.get("cpu_peak_percent_one_core")
+        active_wall = safe_diagnostics.get("active_stage_wall_seconds")
+        lock_signal = (
+            isinstance(active_stage, str)
+            and active_stage not in _SCAN_STAGES
+            and active_stage not in _SERIALIZATION_STAGES
+            and type(active_wall) in (int, float)
+            and float(active_wall) >= _ACTIVE_STAGE_WALL_SECONDS
+            and (cpu_peak is None or float(cpu_peak) <= _LOW_CPU_PERCENT)
+        )
+        lock_signal = lock_signal or bool(active_stages & _LOCK_STAGES)
+        if serialization_signal:
+            classification, reason = "model_serialization_or_sse", "serialization_stage_or_counter"
+        elif scan_signal:
+            classification, reason = "scan_traversal_or_intake", "scan_stage_or_duration"
+        elif type(cpu_peak) in (int, float) and float(cpu_peak) >= _HIGH_CPU_PERCENT:
+            classification, reason = "likely_gil_or_cpu", "high_cpu_with_slow_request"
+        elif lock_signal:
+            classification, reason = "lock_wait_or_hold", "long_active_stage_with_low_cpu"
+        else:
+            classification, reason = "inconclusive", "slow_without_signal"
+
+    return {
+        "schema": _DISCRIMINATOR_SCHEMA,
+        "classification": classification,
+        "reason": reason,
+        "request": dict(request),
+        "diagnostics": dict(safe_diagnostics),
+    }
+
+
+classify_api_responsiveness = discriminate_api_responsiveness
 
 
 SequentialGetSampler = FixedGetSampler
