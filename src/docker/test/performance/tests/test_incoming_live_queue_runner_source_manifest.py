@@ -127,11 +127,13 @@ def test_source_manifest_reads_existing_lftp_settings_through_protected_referenc
     }
 
 
-def test_real_lftp_runner_requires_exact_terminal_sentinel(monkeypatch):
+def test_real_lftp_runner_adds_completion_only_after_the_process_finishes(monkeypatch):
     listing = (
-        "/fixture/incoming:\n"
-        "-rw-r--r-- 1 remoteuser remoteuser 3 2026-01-01 00:00 file.bin\n"
-        "source_manifest_complete\n"
+        "source_manifest_stage_started\n"
+        "source_manifest_stage_connected\n"
+        "source_manifest_stage_root\n"
+        "drwxr-xr-x                      - - ./\n"
+        "-rw-r--r-- 1 remoteuser remoteuser 3 2026-01-01 00:00 ./file.bin\n"
     ).encode("utf-8")
 
     calls = []
@@ -158,15 +160,58 @@ def test_real_lftp_runner_requires_exact_terminal_sentinel(monkeypatch):
     assert "-p 2222" in script
     assert "known_hosts" in script
     assert "set cmd:fail-exit yes" in script
+    assert argv == ["lftp", "--norc"]
+    assert "--quiet" not in script
+    assert "find -l ." in script
+    assert "source_manifest_complete" not in script
     assert all("private-password" not in str(argument) for argument in argv)
     assert all("sftp://" not in str(argument) for argument in argv)
     assert "put" not in script and "rm " not in script
 
     bare = runner.ReadOnlySftpProtocolRunner("sftp://seedbox.invalid")
     monkeypatch.setattr(runner._manifest, "_run_bounded_process", lambda *args, **kwargs: runner.SftpProcessResult(
-        listing.replace(b"source_manifest_complete\n", b""), returncode=0,
+        b"source_manifest_stage_started\n", returncode=1,
     ))
     incomplete = bare("/fixture/incoming", timeout_seconds=5, max_output_bytes=10_000)
-    assert incomplete.sentinel_seen is False
-    with pytest.raises(runner._manifest.SourceManifestError, match="sentinel_missing"):
+    assert incomplete.failure_stage == "connection"
+    assert incomplete.failure_reason == "process_failed"
+    with pytest.raises(runner._manifest.SourceManifestError, match="process_failed") as raised:
         runner.SourceManifestHarness("/fixture/incoming", lambda _root: incomplete).snapshot()
+    assert runner.redacted_manifest_error(raised.value)["stage"] == "connection"
+
+
+def test_source_manifest_failure_writes_only_private_allowlisted_classification(monkeypatch, tmp_path):
+    config_path = tmp_path / "runner.json"
+    output_path = tmp_path / "source.json"
+    connection_path = tmp_path / "connection.json"
+    known_hosts_path = tmp_path / "known_hosts"
+    connection_path.write_text(json.dumps({
+        "host": "seedbox.invalid", "port": 2222, "username": "remoteuser",
+    }), encoding="utf-8")
+    known_hosts_path.write_text("seedbox.invalid ssh-ed25519 AAAA\n", encoding="utf-8")
+    if sys.platform != "win32":
+        connection_path.chmod(0o600)
+    config_path.write_text(json.dumps({"source_manifest": {
+        "root": "/fixture/incoming", "connection_config_path": str(connection_path),
+        "known_hosts_file": str(known_hosts_path), "artifact_path": str(output_path),
+    }}), encoding="utf-8")
+
+    class FailingHarness:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def capture_stable_to(self, *_args, **_kwargs):
+            raise runner.SourceManifestError("process_failed", "listing")
+
+        def write_failure(self, exc, path):
+            runner._manifest._write_private_atomic(runner.redacted_manifest_error(exc), Path(path).with_name(Path(path).name + ".failure"))
+
+    monkeypatch.setattr(runner, "SourceManifestHarness", FailingHarness)
+    with pytest.raises(runner.SourceManifestError, match="process_failed"):
+        runner.main(str(config_path), source_manifest=True)
+    payload = json.loads((tmp_path / "source.json.failure").read_text(encoding="utf-8"))
+    assert payload == {
+        "schema": "incoming-recovery-source-manifest-error.v1",
+        "reason": "process_failed", "stage": "listing",
+    }
+    assert "fixture" not in str(payload)

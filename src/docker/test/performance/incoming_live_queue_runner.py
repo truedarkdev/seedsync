@@ -178,7 +178,11 @@ def main(config_path: str, dry_run: bool = False, source_manifest: bool = False)
             max_entries=source_manifest_config.get("max_entries", 100_000),
             max_output_bytes=source_manifest_config.get("max_output_bytes", 64 * 1024 * 1024),
         )
-        harness.capture_stable_to(output_path, delay_seconds=source_manifest_config.get("delay_seconds", 0.0))
+        try:
+            harness.capture_stable_to(output_path, delay_seconds=source_manifest_config.get("delay_seconds", 0.0))
+        except SourceManifestError as exc:
+            harness.write_failure(exc, output_path)
+            raise
         return 0
     adapter = HttpAdapter(Path(config["key_path"]))
     gate = QueueGate(config["pair_id"], config["pair_name"], config["root_id"],

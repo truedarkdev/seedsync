@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -174,6 +175,71 @@ def test_lftp_listing_requires_root_header_and_parses_colon_filename_before_head
         )
 
 
+def test_lftp_find_listing_requires_ordered_fixed_markers_and_discards_progress_path():
+    listing = (
+        b"source_manifest_stage_started\n"
+        b"source_manifest_stage_connected\n"
+        b"cd ok, cwd=/private/source/root\n"
+        b"source_manifest_stage_root\n"
+        b"drwxr-xr-x                      - - ./\n"
+        b"-rw-r--r-- user/group 4 2026-01-01 00:00 ./nested/file.bin\n"
+        b"source_manifest_complete\n"
+    )
+    records = manifest._parse_lftp_listing(listing, ROOT)
+    assert records[0].path == "nested/file.bin"
+
+    with pytest.raises(manifest.SourceManifestError, match="sentinel_malformed"):
+        manifest._parse_lftp_listing(listing.replace(
+            b"source_manifest_stage_connected\n", b"",
+        ), ROOT)
+
+
+def test_lftp_high_bit_timestamp_hash_is_normalized_before_protocol_encoding():
+    timestamp = "2026-09-06 11:34:00"
+    raw = int.from_bytes(hashlib.sha256(timestamp.encode("utf-8")).digest()[:8], "big")
+    assert raw > manifest._MAX_BYTES
+    records = manifest._parse_lftp_listing(
+        (
+            "source_manifest_stage_started\nsource_manifest_stage_connected\n"
+            "source_manifest_stage_root\ndrwxr-xr-x                      - - ./\n"
+            f"-rw-r--r-- user/group 1 {timestamp} ./file.bin\nsource_manifest_complete\n"
+        ).encode("utf-8"),
+        ROOT,
+    )
+    assert 0 <= records[0].mtime_ns <= manifest._MAX_BYTES
+    # The LFTP record is valid under the same JSON protocol range as normal entries.
+    assert manifest._entry_from_record({
+        "record": "entry", "path": "file.bin", "kind": "file", "size": 1,
+        "mtime_ns": records[0].mtime_ns, "mode": 0o644,
+    }, ROOT).mtime_ns == records[0].mtime_ns
+
+
+def test_lftp_failure_stage_is_allowlisted_and_persisted_without_output():
+    assert manifest._failure_stage_from_output(b"") == "launch"
+    assert manifest._failure_stage_from_output(b"source_manifest_stage_started\n") == "connection"
+    assert manifest._failure_stage_from_output(
+        b"source_manifest_stage_started\nsource_manifest_stage_connected\n",
+    ) == "root"
+    assert manifest._failure_stage_from_output(
+        b"source_manifest_stage_started\nsource_manifest_stage_connected\nsource_manifest_stage_root\n",
+    ) == "listing"
+
+    harness = manifest.SourceManifestHarness(
+        ROOT, lambda _root: manifest.SftpProcessResult(
+            b"sensitive stdout", returncode=1,
+            failure_stage="listing", failure_reason="process_failed",
+        ),
+    )
+    with pytest.raises(manifest.SourceManifestError) as raised:
+        harness.snapshot()
+    artifact = manifest.redacted_manifest_error(raised.value)
+    assert artifact == {
+        "schema": "incoming-recovery-source-manifest-error.v1",
+        "reason": "process_failed", "stage": "listing",
+    }
+    assert "sensitive" not in str(artifact)
+
+
 def test_remote_uri_is_host_only_and_credentials_are_separate():
     for remote in (
         "sftp://user@example.invalid", "sftp://example.invalid:22",
@@ -195,3 +261,30 @@ def test_bounded_process_stops_on_stdout_or_stderr_overflow():
     )
     assert result.truncated is True
     assert len(result.stdout) <= 1024
+
+
+def test_bounded_process_rejects_a_pipe_held_after_parent_exit():
+    result = manifest._run_bounded_process(
+        [
+            sys.executable, "-c",
+            "import subprocess,sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(2)']); print('parent-exit')",
+        ],
+        b"", 5, 1024,
+    )
+    assert result.truncated is True
+    assert result.stdout == b""
+
+
+def test_failure_replaces_a_prior_success_with_private_allowlisted_error(tmp_path):
+    output = tmp_path / "source.json"
+    manifest._write_private_atomic({"schema": "incoming-recovery-source-manifest.v1", "file_count": 1}, output)
+    harness = manifest.SourceManifestHarness(ROOT, lambda _root: protocol(nested_records(1)))
+    harness.write_failure(manifest.SourceManifestError("process_failed", "listing"), output)
+    expected = {
+        "schema": "incoming-recovery-source-manifest-error.v1",
+        "reason": "process_failed", "stage": "listing",
+    }
+    assert json.loads(output.read_text(encoding="utf-8")) == expected
+    assert json.loads((tmp_path / "source.json.failure").read_text(encoding="utf-8")) == expected
+    if os.name != "nt":
+        assert stat.S_IMODE(output.stat().st_mode) == 0o600

@@ -32,8 +32,9 @@ from urllib.parse import urlsplit
 class SourceManifestError(ValueError):
     """A source manifest cannot be trusted or safely persisted."""
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, stage: str | None = None):
         self.reason = reason if reason in _FAILURE_REASONS else "protocol_failure"
+        self.stage = stage if stage in _FAILURE_STAGES else None
         super().__init__(self.reason)
 
 
@@ -57,6 +58,8 @@ class SftpProcessResult:
     timed_out: bool = False
     truncated: bool = False
     sentinel_seen: bool | None = None
+    failure_stage: str | None = None
+    failure_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -116,20 +119,28 @@ _FAILURE_REASONS = frozenset({
     "special_entry", "special_name", "invalid_size", "invalid_metadata",
     "too_many_entries", "output_too_large", "unstable_snapshot", "artifact_failure",
 })
+_FAILURE_STAGES = frozenset({"launch", "connection", "root", "listing", "sentinel", "parse"})
 _ENTRY_KINDS = frozenset({"file", "directory"})
 _MAX_INTEGER = 2_147_483_647
 _MAX_BYTES = 2**63 - 1
 _SENTINEL = "source_manifest_complete"
+_STAGE_MARKERS = (
+    "source_manifest_stage_started",
+    "source_manifest_stage_connected",
+    "source_manifest_stage_root",
+)
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\ud800-\udfff]")
 _SAFE_MODE_RE = re.compile(r"^[bcdlps-][rwxstST-]{9}$")
 _LFTP_LONG_RE = re.compile(
-    r"^(?P<mode>[bcdlps-][rwxstST-]{9})\s+\S+\s+\S+\s+\S+\s+"
+    r"^(?P<mode>[bcdlps-][rwxstST-]{9})\s+(?:\S+\s+){1,3}"
     r"(?P<size>\d+)\s+(?P<mtime>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)\s+(?P<name>.*)$"
 )
+_LFTP_FIND_ROOT_RE = re.compile(r"^d[rwxstST-]{9}\s+-\s+-\s+\./$")
+_LFTP_PROGRESS_PREFIXES = ("cd ok, cwd=",)
 
 
-def _fail(reason: str) -> SourceManifestError:
-    return SourceManifestError(reason)
+def _fail(reason: str, stage: str | None = None) -> SourceManifestError:
+    return SourceManifestError(reason, stage)
 
 
 def _root_path(value: object) -> str:
@@ -223,7 +234,11 @@ def _entry_from_record(record: object, root: str) -> SourceManifestEntry:
     if kind == "file" and size < 0:
         raise _fail("invalid_size")
     if isinstance(mtime, str):
-        mtime_ns = int.from_bytes(hashlib.sha256(mtime.encode("utf-8")).digest()[:8], "big")
+        # LFTP's long listing exposes a stable timestamp string.  Normalize it
+        # to the same non-negative signed range accepted by the protocol.
+        mtime_ns = int.from_bytes(
+            hashlib.sha256(mtime.encode("utf-8")).digest()[:8], "big",
+        ) & _MAX_BYTES
     else:
         mtime_ns = mtime
     return SourceManifestEntry(relative, kind, size, mtime_ns, mode)
@@ -307,7 +322,12 @@ def _manifest_digest(entries: Sequence[SourceManifestEntry]) -> str:
 
 def _redacted_artifact_error(exc: BaseException) -> Mapping[str, object]:
     reason = exc.reason if isinstance(exc, SourceManifestError) else "protocol_failure"
-    return {"schema": "incoming-recovery-source-manifest-error.v1", "reason": reason}
+    artifact: dict[str, object] = {
+        "schema": "incoming-recovery-source-manifest-error.v1", "reason": reason,
+    }
+    if isinstance(exc, SourceManifestError) and exc.stage is not None:
+        artifact["stage"] = exc.stage
+    return artifact
 
 
 class ReadOnlySftpProtocolRunner:
@@ -404,25 +424,37 @@ class ReadOnlySftpProtocolRunner:
             "set net:max-retries 0\n"
             f"set net:timeout {int(max(1, timeout_seconds))}\n"
             + connect_program
+            + f"echo {_STAGE_MARKERS[0]}\n"
             + connection + "\n"
+            + f"echo {_STAGE_MARKERS[1]}\n"
             f"cd {root_json}\n"
-            "cls -lR --time-style=long-iso\n"
-            f"echo {_SENTINEL}\n"
+            f"echo {_STAGE_MARKERS[2]}\n"
+            "find -l .\n"
             "bye\n"
         )
         try:
             completed = _run_bounded_process(
-                [self.executable, "--norc", "--quiet"], script.encode("utf-8"),
+                [self.executable, "--norc"], script.encode("utf-8"),
                 timeout_seconds, max_output_bytes,
                 environment=self.environment,
             )
         except (OSError, ValueError):
             return SftpProcessResult(b"", returncode=-1)
-        if completed.timed_out or completed.truncated or completed.returncode != 0:
+        if completed.timed_out or completed.truncated:
             return completed
         stdout = completed.stdout if isinstance(completed.stdout, bytes) else b""
+        if completed.returncode != 0:
+            return SftpProcessResult(
+                b"", completed.returncode,
+                failure_stage=_failure_stage_from_output(stdout),
+                failure_reason="process_failed",
+            )
         try:
-            entries = _parse_lftp_listing(stdout, root)
+            # LFTP may stream a recursive `find` after it has accepted later
+            # stdin commands.  The bounded process boundary owns the terminal
+            # marker: it adds it only after LFTP exits and both output drains
+            # have joined, so it cannot split or interleave a listing record.
+            entries = _parse_lftp_listing(stdout.rstrip(b"\n") + b"\n" + _SENTINEL.encode("ascii") + b"\n", root)
             protocol = b"".join(_encode_entry(entry) + b"\n" for entry in entries)
             protocol += json.dumps({
                 "record": "end", "sentinel": _SENTINEL,
@@ -435,6 +467,8 @@ class ReadOnlySftpProtocolRunner:
                 b"", completed.returncode,
                 truncated=exc.reason in {"output_truncated", "record_malformed", "sentinel_malformed"},
                 sentinel_seen=False if exc.reason.startswith("sentinel_") else None,
+                failure_stage="parse",
+                failure_reason=exc.reason,
             )
 
 
@@ -504,9 +538,13 @@ def _run_bounded_process(
     finally:
         stdout_thread.join(timeout=1)
         stderr_thread.join(timeout=1)
+    # A descendant can retain a pipe after the LFTP parent exits.  Do not
+    # synthesize completion from a partially drained stream in that case.
+    if stdout_thread.is_alive() or stderr_thread.is_alive():
+        return SftpProcessResult(b"", returncode, truncated=True)
     if overflow.is_set():
-        return SftpProcessResult(bytes(stdout_chunks), returncode, truncated=True)
-    return SftpProcessResult(bytes(stdout_chunks), returncode, timed_out=timed_out)
+        return SftpProcessResult(b"".join(stdout_chunks), returncode, truncated=True)
+    return SftpProcessResult(b"".join(stdout_chunks), returncode, timed_out=timed_out)
 
 
 def _parse_lftp_listing(output: bytes, root: str) -> list[SourceManifestEntry]:
@@ -518,19 +556,52 @@ def _parse_lftp_listing(output: bytes, root: str) -> list[SourceManifestEntry]:
     current = root
     sentinel_seen = False
     root_header_seen = False
+    find_root_seen = False
+    stage_index = 0
+    stage_markers_seen = False
     nonempty_lines = [line for line in text.splitlines() if line.strip()]
     for line_index, raw_line in enumerate(nonempty_lines):
         if raw_line == _SENTINEL:
-            if sentinel_seen or line_index != len(nonempty_lines) - 1:
+            if (
+                sentinel_seen or line_index != len(nonempty_lines) - 1
+                or stage_markers_seen and stage_index != len(_STAGE_MARKERS)
+            ):
                 raise _fail("sentinel_malformed")
             sentinel_seen = True
             continue
+        if raw_line in _STAGE_MARKERS:
+            if stage_index >= len(_STAGE_MARKERS) or raw_line != _STAGE_MARKERS[stage_index]:
+                raise _fail("sentinel_malformed")
+            stage_index += 1
+            stage_markers_seen = True
+            continue
         if not raw_line.strip() or raw_line.startswith("total "):
+            continue
+        # LFTP acknowledges a successful `cd` on stdout, including the remote
+        # absolute path.  It is transport progress, never a manifest record;
+        # discard it before parsing so it cannot enter persisted artifacts.
+        if raw_line.startswith(_LFTP_PROGRESS_PREFIXES):
+            continue
+        if not root_header_seen and _LFTP_FIND_ROOT_RE.match(raw_line):
+            find_root_seen = True
             continue
         match = _LFTP_LONG_RE.match(raw_line)
         if match:
-            if not root_header_seen:
-                raise _fail("root_listing_missing")
+            raw_name = match.group("name")
+            if root_header_seen:
+                path = current + "/" + _safe_name(raw_name)
+            else:
+                # `find -l .` is the supported recursive LFTP form.  Its
+                # long records are rooted explicitly at `./`, so retain that
+                # boundary instead of accepting an unqualified listing.
+                if not raw_name.startswith("./"):
+                    raise _fail("root_listing_missing")
+                relative = raw_name[2:]
+                if relative in ("", "."):
+                    find_root_seen = True
+                    continue
+                path = root + "/" + relative
+                find_root_seen = True
             mode = match.group("mode")
             if not _SAFE_MODE_RE.match(mode):
                 raise _fail("special_entry")
@@ -539,8 +610,6 @@ def _parse_lftp_listing(output: bytes, root: str) -> list[SourceManifestEntry]:
                 raise _fail("symlink_entry")
             if marker not in "-d":
                 raise _fail("special_entry")
-            name = _safe_name(match.group("name"))
-            path = current + "/" + name
             kind = "directory" if marker == "d" else "file"
             size = int(match.group("size"))
             if size > _MAX_BYTES:
@@ -558,7 +627,10 @@ def _parse_lftp_listing(output: bytes, root: str) -> list[SourceManifestEntry]:
                 mode_value |= bits << (6 - offset * 3)
             entries.append(SourceManifestEntry(
                 _relative_entry_path(path, root), kind, 0 if kind == "directory" else size,
-                int.from_bytes(hashlib.sha256(metadata.encode("utf-8")).digest()[:8], "big"), mode_value,
+                int.from_bytes(
+                    hashlib.sha256(metadata.encode("utf-8")).digest()[:8], "big",
+                ) & _MAX_BYTES,
+                mode_value,
             ))
             continue
         if raw_line.endswith(":") and not raw_line.startswith(" "):
@@ -585,9 +657,22 @@ def _parse_lftp_listing(output: bytes, root: str) -> list[SourceManifestEntry]:
         raise _fail("record_malformed")
     if not sentinel_seen:
         raise _fail("sentinel_missing")
-    if not root_header_seen:
+    if not root_header_seen and not find_root_seen:
         raise _fail("root_listing_missing")
     return entries
+
+
+def _failure_stage_from_output(output: bytes) -> str:
+    """Classify an LFTP failure using fixed markers, never retained process text."""
+    try:
+        lines = output.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return "launch"
+    marker_index = -1
+    for index, marker in enumerate(_STAGE_MARKERS):
+        if marker in lines:
+            marker_index = index
+    return ("launch", "connection", "root", "listing")[marker_index + 1]
 
 
 class SourceManifestHarness:
@@ -647,6 +732,8 @@ class SourceManifestHarness:
         except Exception:
             raise _fail("protocol_failure")
         if isinstance(result, SftpProcessResult):
+            if result.failure_reason is not None:
+                raise _fail(result.failure_reason, result.failure_stage)
             if result.timed_out:
                 raise _fail("process_timeout")
             if result.truncated:
@@ -658,6 +745,8 @@ class SourceManifestHarness:
             output = result.stdout
         elif isinstance(result, Mapping):
             output = result.get("stdout")
+            if result.get("failure_reason") is not None:
+                raise _fail(str(result.get("failure_reason")), result.get("failure_stage") if isinstance(result.get("failure_stage"), str) else None)
             if result.get("timed_out"):
                 raise _fail("process_timeout")
             if result.get("truncated"):
@@ -746,6 +835,17 @@ class SourceManifestHarness:
         if not isinstance(snapshot, SourceManifestSnapshot) or snapshot.schema != _SCHEMA:
             raise _fail("artifact_failure")
         _write_private_atomic(snapshot.as_artifact(), output_path)
+
+    def write_failure(self, exc: SourceManifestError, output_path: str | os.PathLike[str]) -> None:
+        """Persist only the allowlisted failure classification beside a manifest."""
+        destination = Path(output_path)
+        payload = _redacted_artifact_error(exc)
+        # Replace any prior success at the canonical path first: consumers
+        # cannot mistake an earlier manifest for current evidence after a
+        # failed two-snapshot attempt.  Keep a sibling failure record for
+        # operators that collect only explicit failure artifacts.
+        _write_private_atomic(payload, destination)
+        _write_private_atomic(payload, destination.with_name(destination.name + ".failure"))
 
     def capture_stable_to(self, output_path: str | os.PathLike[str], *, delay_seconds: float = 0.0) -> SourceManifestSnapshot:
         snapshot = self.capture_stable(delay_seconds=delay_seconds)
