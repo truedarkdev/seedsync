@@ -3023,6 +3023,12 @@ class TestLftp(unittest.TestCase):
         self.assertIn("chmod 600 /home/seedsync/.ssh/config", contents)
         self.assertIn("mkdir /staging", contents)
         self.assertIn("chown seedsync:seedsync /staging", contents)
+        self.assertIn(
+            'FROM seedsync_run_python AS seedsync_run\n'
+            'ARG SEEDSYNC_DEBUG_AUTHORITY_TIMEOUT_SECS=""\n'
+            'ENV INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS="${SEEDSYNC_DEBUG_AUTHORITY_TIMEOUT_SECS}"',
+            contents,
+        )
         self.assertIn('VOLUME [ "/config", "/downloads" ]', contents)
         self.assertIn("RUN /scripts/entrypoint.sh --bootstrap-default-config", contents)
         self.assertIn("        tini \\", contents)

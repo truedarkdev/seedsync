@@ -112,6 +112,8 @@ RUN chmod -R a+rX /app/python
 
 # Full Seedsync docker image
 FROM seedsync_run_python AS seedsync_run
+ARG SEEDSYNC_DEBUG_AUTHORITY_TIMEOUT_SECS=""
+ENV INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS="${SEEDSYNC_DEBUG_AUTHORITY_TIMEOUT_SECS}"
 LABEL org.opencontainers.image.source="https://github.com/truedarkdev/seedsync"
 COPY --from=seedsync_build_angular /build/dist /app/html
 COPY src/docker/build/docker-image/entrypoint.sh /scripts/
