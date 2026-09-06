@@ -472,14 +472,18 @@ def test_root_only_preflight_models_chroot_landing_and_keeps_candidates_confined
     assert calls == [None, "files/Incoming", "/files/Incoming", "/outside/Incoming", "outside/Incoming"]
 
 
-@pytest.mark.parametrize("output", [
-    b"source_root_preflight_pwd\nnot-a-url\n",
-    b"source_root_preflight_pwd\nsftp://one.example/root\nsftp://two.example/root\n",
+@pytest.mark.parametrize(("output", "reason"), [
+    (b"source_root_preflight_pwd\nnot-a-url\n", "pwd_url_missing"),
+    (b"source_root_preflight_pwd\nsftp://one.example/root\nsftp://two.example/root\n", "pwd_url_multiple"),
+    (b"source_root_preflight_pwd\nsftp://[invalid/root\n", "pwd_url_invalid"),
+    (b"source_root_preflight_pwd\nsftp://user:secret@example/root\n", "pwd_url_unsafe"),
+    (b"source_root_preflight_pwd\nsftp://example/../root\n", "pwd_path_invalid"),
 ])
-def test_root_only_preflight_rejects_malformed_or_multiple_pwd_output(monkeypatch, output):
+def test_root_only_preflight_classifies_malformed_pwd_without_persisting_it(monkeypatch, output, reason):
     protocol = manifest.ReadOnlySftpProtocolRunner(host="remote.example")
     monkeypatch.setattr(protocol, "root_preflight_process", lambda *_args, **_kwargs: manifest.SftpProcessResult(output))
     result = manifest.RootOnlySftpPreflight(protocol).run(relative_root="fixture/Incoming", trusted_absolute_root=None)
-    assert result.reason == "pwd_malformed"
+    assert result.reason == reason
     assert result.stage == "pwd"
     assert result.candidates == ()
+    assert "secret" not in str(result.as_artifact())

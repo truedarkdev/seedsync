@@ -119,6 +119,7 @@ _FAILURE_REASONS = frozenset({
     "special_entry", "special_name", "invalid_size", "invalid_metadata",
     "too_many_entries", "output_too_large", "unstable_snapshot", "artifact_failure",
     "root_candidate_missing", "root_candidate_ambiguous", "pwd_malformed",
+    "pwd_url_missing", "pwd_url_multiple", "pwd_url_invalid", "pwd_url_unsafe", "pwd_path_invalid",
 })
 _FAILURE_STAGES = frozenset({"launch", "connection", "open", "pwd", "root", "root_preflight", "listing", "enumeration", "completion", "sentinel", "parse"})
 _ENTRY_KINDS = frozenset({"file", "directory"})
@@ -428,35 +429,32 @@ class RootOnlySftpPreflight:
         try:
             lines = output.decode("utf-8").splitlines()
         except UnicodeDecodeError:
-            raise _fail("pwd_malformed", "pwd")
+            raise _fail("pwd_url_invalid", "pwd")
         if marker not in lines:
             raise _fail("process_failed", "open")
-        values: list[str] = []
-        for line in lines[lines.index(marker) + 1:]:
-            if not line or line in _ROOT_PREFLIGHT_MARKERS or line.startswith(_LFTP_PROGRESS_PREFIXES):
-                continue
-            # LFTP 4.9 emits a URL, with a trailing slash for directories;
-            # accept only the URL token and normalize that slash in memory.
-            match = re.search(r"sftp://[^\s]+", line)
-            if match is None:
-                continue
-            try:
-                parsed = urlsplit(match.group(0))
-            except ValueError:
-                continue
-            if parsed.scheme != "sftp" or not parsed.hostname or parsed.password not in (None, ""):
-                continue
-            if parsed.query or parsed.fragment or _CONTROL_RE.search(parsed.path):
-                continue
-            path = parsed.path.rstrip("/") or "/"
-            try:
-                path = self._absolute_path(path) if path != "/" else "/"
-            except SourceManifestError:
-                continue
-            values.append(path)
-        if len(values) != 1:
-            raise _fail("pwd_malformed", "pwd")
-        return values[0]
+        tokens = [
+            match.group(0) for line in lines[lines.index(marker) + 1:]
+            if line and line not in _ROOT_PREFLIGHT_MARKERS and not line.startswith(_LFTP_PROGRESS_PREFIXES)
+            for match in re.finditer(r"sftp://[^\s]+", line)
+        ]
+        if not tokens:
+            raise _fail("pwd_url_missing", "pwd")
+        if len(tokens) != 1:
+            raise _fail("pwd_url_multiple", "pwd")
+        try:
+            parsed = urlsplit(tokens[0])
+            hostname = parsed.hostname
+        except ValueError:
+            raise _fail("pwd_url_invalid", "pwd")
+        if parsed.scheme != "sftp" or not hostname:
+            raise _fail("pwd_url_invalid", "pwd")
+        if parsed.password not in (None, "") or parsed.query or parsed.fragment or _CONTROL_RE.search(parsed.path):
+            raise _fail("pwd_url_unsafe", "pwd")
+        path = parsed.path.rstrip("/") or "/"
+        try:
+            return self._absolute_path(path) if path != "/" else "/"
+        except SourceManifestError:
+            raise _fail("pwd_path_invalid", "pwd")
 
     def _run_pwd(self, candidate: str | None = None) -> tuple[str | None, SourceManifestError | None]:
         try:
