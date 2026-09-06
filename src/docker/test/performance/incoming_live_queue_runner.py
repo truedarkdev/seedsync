@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import hashlib
 import os
 import configparser
 from pathlib import Path
+import secrets
+import stat
 import sys
 import urllib.request
 from urllib.error import HTTPError
@@ -45,6 +48,108 @@ RootOnlySftpPreflight = _manifest.RootOnlySftpPreflight
 ReadOnlySftpRealpathRunner = _manifest.ReadOnlySftpRealpathRunner
 redacted_manifest_error = _manifest.redacted_manifest_error
 compare_source_snapshots = _manifest.compare_source_snapshots
+
+
+def _private_protected_content_compare(
+    config_file: Path, config: dict[str, object], section: dict[str, object],
+) -> int:
+    """Compare exactly the retained inode-only protected entries to source.
+
+    Both retained manifests and the job artifact are owner-private.  Paths and
+    digest values stay in memory; the artifact contains only opaque IDs, sizes,
+    match booleans, and allowlisted statuses.
+    """
+    if config_file.stat().st_mode & 0o777 != 0o600 and os.name != "nt":
+        raise SystemExit("protected_content_compare requires private config")
+    fields = ("baseline_path", "provenance_path", "artifact_path", "expected_entries", "max_total_bytes")
+    if any(name not in section for name in fields):
+        raise SystemExit("protected_content_compare config is incomplete")
+    if not all(isinstance(section[name], str) and section[name] for name in fields[:3]):
+        raise SystemExit("protected_content_compare config is invalid")
+    if type(section["expected_entries"]) is not int or type(section["max_total_bytes"]) is not int:
+        raise SystemExit("protected_content_compare config is invalid")
+    try:
+        baseline = json.loads(Path(section["baseline_path"]).read_text(encoding="utf-8"))
+        provenance = json.loads(Path(section["provenance_path"]).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise SystemExit("protected_content_compare manifests are unavailable")
+    if not isinstance(baseline, dict) or not isinstance(provenance, dict):
+        raise SystemExit("protected_content_compare manifests are invalid")
+    baseline_entries, current_entries, local_root = baseline.get("entries"), provenance.get("entries"), provenance.get("root")
+    if not isinstance(baseline_entries, list) or not isinstance(current_entries, list) or not isinstance(local_root, str):
+        raise SystemExit("protected_content_compare manifests are invalid")
+    if not local_root.startswith("/mounts/") or ".." in local_root.split("/") or "//" in local_root:
+        raise SystemExit("protected_content_compare root is invalid")
+    try:
+        before = {item["path"]: item for item in baseline_entries if isinstance(item, dict)}
+        after = {item["path"]: item for item in current_entries if isinstance(item, dict)}
+    except (KeyError, TypeError):
+        raise SystemExit("protected_content_compare manifests are invalid")
+    selected: list[tuple[str, dict[str, object]]] = []
+    for path, old in before.items():
+        new = after.get(path)
+        if not isinstance(path, str) or not isinstance(old, dict) or not isinstance(new, dict):
+            raise SystemExit("protected_content_compare manifests are invalid")
+        if old.get("inode") != new.get("inode") and old.get("size") == new.get("size") and old.get("mtime_ns") == new.get("mtime_ns"):
+            if type(old.get("size")) is not int or old["size"] < 0:
+                raise SystemExit("protected_content_compare manifests are invalid")
+            try:
+                _manifest._relative_entry_path(path, "protected")
+            except SourceManifestError:
+                raise SystemExit("protected_content_compare manifests are invalid")
+            selected.append((path, old))
+    selected.sort(key=lambda item: item[0])
+    if len(selected) != section["expected_entries"] or sum(int(item[1]["size"]) for item in selected) != section["max_total_bytes"]:
+        raise SystemExit("protected_content_compare target set is invalid")
+    # Validate every local target before opening a source connection.
+    local_hashes: dict[str, str] = {}
+    for path, entry in selected:
+        target = Path(local_root, path)
+        try:
+            metadata = target.lstat()
+        except OSError:
+            _manifest._write_private_atomic({"schema": "incoming-recovery-protected-content.v1", "status": "local_missing"}, section["artifact_path"])
+            raise SystemExit("protected_content_compare local target is unavailable")
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != entry["size"]:
+            _manifest._write_private_atomic({"schema": "incoming-recovery-protected-content.v1", "status": "local_size_mismatch"}, section["artifact_path"])
+            raise SystemExit("protected_content_compare local target is unavailable")
+        digest = hashlib.sha256()
+        with target.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        local_hashes[path] = digest.hexdigest()
+    source_section = config.get("source_manifest")
+    if not isinstance(source_section, dict):
+        raise SystemExit("protected_content_compare source config is unavailable")
+    connection = _source_manifest_connection(config, source_section, base_dir=config_file.resolve().parent)
+    root = _trusted_manifest_root(
+        source_section.get("configured_root", source_section.get("root")), connection["remote_path"],
+        source_section.get("trusted_absolute_root"),
+    )
+    protocol = ReadOnlySftpProtocolRunner(
+        host=connection["host"], port=connection["port"], username=connection["username"],
+        password=connection["password"], known_hosts_file=connection["known_hosts_file"],
+    )
+    timeout_seconds = section.get("timeout_seconds", 900.0)
+    results = []
+    for path, entry in selected:
+        opaque_id = hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
+        status = "match"
+        try:
+            remote_hash = protocol.hash_file(root, path, int(entry["size"]), timeout_seconds=timeout_seconds)
+            if not secrets.compare_digest(local_hashes[path], remote_hash):
+                status = "hash_mismatch"
+        except SourceManifestError as exc:
+            status = exc.reason
+        results.append({"id": opaque_id, "size": entry["size"], "hash_match": status == "match", "status": status})
+        if status != "match":
+            break
+    payload = {"schema": "incoming-recovery-protected-content.v1", "entries": results,
+               "expected_entries": len(selected), "all_match": len(results) == len(selected) and all(item["hash_match"] for item in results)}
+    _manifest._write_private_atomic(payload, section["artifact_path"])
+    if not payload["all_match"]:
+        raise SystemExit("protected_content_compare failed")
+    return 0
 
 
 def _read_protected_source_config(config_path: Path) -> dict[str, object]:
@@ -253,6 +358,7 @@ class HttpAdapter:
 
 def main(
     config_path: str, dry_run: bool = False, source_manifest: bool = False, source_root_preflight: bool = False,
+    protected_content_compare: bool = False,
 ) -> int:
     config_file = Path(config_path)
     config = json.loads(config_file.read_text(encoding="utf-8"))
@@ -261,8 +367,14 @@ def main(
         raise SystemExit("source_manifest config must be an object")
     source_manifest_requested = source_manifest is True or "--source-manifest" in sys.argv[1:-1]
     root_preflight_requested = source_root_preflight is True or "--source-root-preflight" in sys.argv[1:-1]
-    if source_manifest_requested and root_preflight_requested:
-        raise SystemExit("source manifest and root preflight modes are exclusive")
+    content_compare_requested = protected_content_compare is True or "--protected-content-compare" in sys.argv[1:-1]
+    if sum((source_manifest_requested, root_preflight_requested, content_compare_requested)) > 1:
+        raise SystemExit("recovery diagnostic modes are exclusive")
+    if content_compare_requested:
+        section = config.get("protected_content_compare")
+        if not isinstance(section, dict):
+            raise SystemExit("protected_content_compare config is required")
+        return _private_protected_content_compare(config_file, config, section)
     if root_preflight_requested:
         if source_manifest_config is None:
             raise SystemExit("source_manifest config is required")
@@ -354,4 +466,5 @@ if __name__ == "__main__":
         sys.argv[-1], "--dry-run" in sys.argv[1:-1],
         source_manifest="--source-manifest" in sys.argv[1:-1],
         source_root_preflight="--source-root-preflight" in sys.argv[1:-1],
+        protected_content_compare="--protected-content-compare" in sys.argv[1:-1],
     ))

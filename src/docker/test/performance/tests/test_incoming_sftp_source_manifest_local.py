@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import getpass
+import hashlib
 import importlib.util
 import json
 import os
@@ -317,6 +318,26 @@ def test_real_lftp_source_manifest_is_local_strict_and_stable(tmp_path, monkeypa
         assert fixture["root"] not in output_path.read_text(encoding="utf-8")
         assert "file-0000.bin" not in output_path.read_text(encoding="utf-8")
         assert "source_manifest_complete" not in output_path.read_text(encoding="utf-8")
+
+
+def test_real_lftp_content_hash_streams_one_file_with_strict_host(tmp_path, monkeypatch):
+    required = ("lftp", "ssh", "ssh-keygen", "ssh-keyscan", "sshd")
+    missing = [name for name in required if not _command_available(name)]
+    if missing:
+        pytest.skip("missing local integration tools: " + ", ".join(missing))
+
+    with _local_sftp_fixture() as fixture:
+        monkeypatch.setenv("HOME", fixture["home"])
+        monkeypatch.setenv("PATH", fixture["path_prefix"] + os.pathsep + os.environ["PATH"])
+        target = Path(fixture["root"]) / "branch-00" / "leaf-00" / "file-0000.bin"
+        payload = target.read_bytes()
+        protocol = manifest.ReadOnlySftpProtocolRunner(
+            host=fixture["host"], port=fixture["port"], username=fixture["username"],
+            known_hosts_file=fixture["known_hosts_file"],
+        )
+        assert protocol.hash_file(
+            fixture["root"], "branch-00/leaf-00/file-0000.bin", len(payload), timeout_seconds=15,
+        ) == hashlib.sha256(payload).hexdigest()
 
 
 @pytest.mark.parametrize(("case", "expected_stage"), (

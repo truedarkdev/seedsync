@@ -124,8 +124,9 @@ _FAILURE_REASONS = frozenset({
     "too_many_entries", "output_too_large", "unstable_snapshot", "artifact_failure",
     "root_candidate_missing", "root_candidate_ambiguous", "pwd_malformed",
     "pwd_url_missing", "pwd_url_multiple", "pwd_url_invalid", "pwd_url_unsafe", "pwd_path_invalid",
+    "content_missing", "content_size_mismatch", "content_hash_mismatch",
 })
-_FAILURE_STAGES = frozenset({"launch", "connection", "open", "pwd", "root", "root_preflight", "listing", "enumeration", "completion", "sentinel", "parse"})
+_FAILURE_STAGES = frozenset({"launch", "connection", "open", "pwd", "root", "root_preflight", "listing", "enumeration", "completion", "sentinel", "parse", "content"})
 _ENTRY_KINDS = frozenset({"file", "directory"})
 _MAX_INTEGER = 2_147_483_647
 _MAX_BYTES = 2**63 - 1
@@ -756,6 +757,45 @@ class ReadOnlySftpProtocolRunner:
                 failure_reason=exc.reason,
             )
 
+    def hash_file(self, root: str, relative_path: str, expected_size: int, *, timeout_seconds: float) -> str:
+        """Hash one strictly contained remote file while discarding its bytes.
+
+        This is deliberately separate from manifest enumeration: it sends only
+        LFTP read commands, never retains payload chunks, and makes an exact
+        expected byte count a transport integrity boundary.
+        """
+        root = _root_path(root)
+        relative_path = _relative_entry_path(relative_path, root)
+        if type(expected_size) is not int or expected_size < 0 or expected_size > _MAX_BYTES:
+            raise _fail("invalid_size", "content")
+        if type(timeout_seconds) not in (int, float) or not 0 < timeout_seconds <= 900:
+            raise _fail("invalid_configuration", "content")
+        connection = "open"
+        if self.username is not None:
+            connection += " -u " + json.dumps(self.username + "," + (self.password or ""))
+        if self.port != 22:
+            connection += f" -p {self.port}"
+        connection += " " + json.dumps(self.remote)
+        connect_program = ""
+        if self.known_hosts_file is not None:
+            connect_program = (
+                "set sftp:connect-program "
+                + json.dumps(
+                    "ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile="
+                    + shlex.quote(self.known_hosts_file)
+                ) + "\n"
+            )
+        script = (
+            "set cmd:interactive false\nset cmd:fail-exit yes\nset net:max-retries 0\n"
+            + f"set net:timeout {int(max(1, timeout_seconds))}\n" + connect_program
+            + connection + "\n" + f"cd {json.dumps(root)}\n"
+            + f"cat {json.dumps(relative_path)}\nbye\n"
+        )
+        return _stream_lftp_sha256(
+            [self.executable, "--norc"], script.encode("utf-8"), expected_size,
+            float(timeout_seconds), environment=self.environment,
+        )
+
 
 class ReadOnlySftpRealpathRunner:
     """Strict-host SFTP canonicalization without LFTP URL rendering."""
@@ -905,6 +945,94 @@ def _run_bounded_process(
     if overflow.is_set():
         return SftpProcessResult(b"".join(stdout_chunks), returncode, truncated=True)
     return SftpProcessResult(b"".join(stdout_chunks), returncode, timed_out=timed_out)
+
+
+def _stream_lftp_sha256(
+    argv: Sequence[str], input_bytes: bytes, expected_size: int, timeout_seconds: float,
+    *, environment: Mapping[str, str] | None = None,
+) -> str:
+    """Drain one LFTP read stream into SHA-256 without retaining payload bytes."""
+    process_environment = dict(os.environ)
+    process_environment.update(environment or {})
+    try:
+        process = subprocess.Popen(
+            list(argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=process_environment, start_new_session=os.name != "nt",
+        )
+    except (OSError, ValueError):
+        raise _fail("process_failed", "launch")
+    digest = hashlib.sha256()
+    size = 0
+    overflow = threading.Event()
+    stdout_done = threading.Event()
+    stderr_done = threading.Event()
+
+    def drain_stdout() -> None:
+        nonlocal size
+        try:
+            while True:
+                chunk = process.stdout.read(65536)  # type: ignore[union-attr]
+                if not chunk:
+                    return
+                size += len(chunk)
+                if size > expected_size:
+                    overflow.set()
+                    return
+                digest.update(chunk)
+        finally:
+            stdout_done.set()
+
+    def drain_stderr() -> None:
+        try:
+            while process.stderr.read(65536):  # type: ignore[union-attr]
+                pass
+        finally:
+            stderr_done.set()
+
+    stdout_thread = threading.Thread(target=drain_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    def kill_process() -> None:
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                return
+            except (OSError, ProcessLookupError):
+                pass
+        process.kill()
+
+    timed_out = False
+    try:
+        if process.stdin is not None:
+            process.stdin.write(input_bytes)
+            process.stdin.close()
+        deadline = time.monotonic() + timeout_seconds
+        while process.poll() is None:
+            if overflow.is_set():
+                kill_process()
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                kill_process()
+                break
+            time.sleep(0.01)
+        returncode = process.wait()
+    except (BrokenPipeError, OSError):
+        kill_process()
+        process.wait()
+        raise _fail("process_failed", "content")
+    finally:
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+    if timed_out:
+        raise _fail("process_timeout", "content")
+    if overflow.is_set() or size != expected_size:
+        raise _fail("content_size_mismatch", "content")
+    if returncode != 0 or not stdout_done.is_set() or not stderr_done.is_set():
+        raise _fail("process_failed", "content")
+    return digest.hexdigest()
 
 
 def _parse_lftp_listing(output: bytes, root: str) -> list[SourceManifestEntry]:

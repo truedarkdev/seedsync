@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 from pathlib import Path
 import json
 import os
@@ -69,6 +70,54 @@ def test_source_manifest_mode_uses_external_config_and_does_not_construct_queue(
     monkeypatch.setattr(runner, "SourceManifestHarness", FakeHarness)
     monkeypatch.setattr(runner, "QueueGate", lambda *args, **kwargs: pytest.fail("Queue must not be constructed"))
     assert runner.main(str(config_path), source_manifest=True) == 0
+
+
+def test_protected_content_compare_mode_is_explicit_and_bypasses_queue(monkeypatch, tmp_path):
+    config_path = tmp_path / "runner.json"
+    config_path.write_text(json.dumps({"protected_content_compare": {"placeholder": True}}), encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(runner, "_private_protected_content_compare", lambda path, config, section: calls.append((path, config, section)) or 0)
+    monkeypatch.setattr(runner, "QueueGate", lambda *_args, **_kwargs: pytest.fail("Queue must not be constructed"))
+    assert runner.main(str(config_path), protected_content_compare=True) == 0
+    assert calls[0][0] == config_path
+    with pytest.raises(SystemExit, match="exclusive"):
+        runner.main(str(config_path), protected_content_compare=True, source_manifest=True)
+
+
+def test_protected_content_compare_hashes_exact_inode_only_set_and_persists_opaque_results(monkeypatch, tmp_path):
+    local = tmp_path / "local"
+    entries = []
+    hashes = {}
+    for index in range(11):
+        relative = f"group-{index}/leaf.bin"
+        target = local / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = f"payload-{index}".encode()
+        target.write_bytes(payload)
+        hashes[relative] = hashlib.sha256(payload).hexdigest()
+        entries.append({"path": relative, "inode": index, "size": len(payload), "mtime_ns": 1})
+    current = [{**entry, "inode": entry["inode"] + 100} for entry in entries]
+    baseline_path, provenance_path, artifact_path = (tmp_path / "baseline.json", tmp_path / "provenance.json", tmp_path / "artifact.json")
+    baseline_path.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+    provenance_path.write_text(json.dumps({"entries": current, "root": "/mounts/protected"}), encoding="utf-8")
+    config_path, connection_path, known_hosts = tmp_path / "runner.json", tmp_path / "connection.json", tmp_path / "known_hosts"
+    known_hosts.write_text("test ssh-ed25519 AAAA\n", encoding="utf-8")
+    connection_path.write_text(json.dumps({"host":"test","port":22,"username":"user","password":"secret","remote_path":"base"}), encoding="utf-8")
+    config = {"source_manifest":{"root":"Incoming","trusted_absolute_root":"/base/Incoming","connection_config_path":str(connection_path),"known_hosts_file":str(known_hosts)},"protected_content_compare":{"baseline_path":str(baseline_path),"provenance_path":str(provenance_path),"artifact_path":str(artifact_path),"expected_entries":11,"max_total_bytes":sum(e["size"] for e in entries)}}
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    real_path = runner.Path
+    monkeypatch.setattr(runner, "Path", lambda *parts: local / parts[1] if len(parts) == 2 and parts[0] == "/mounts/protected" else real_path(*parts))
+    class FakeProtocol:
+        def __init__(self, **_kwargs): pass
+        def hash_file(self, root, path, size, *, timeout_seconds):
+            assert root == "/base/Incoming" and size > 0 and timeout_seconds == 900.0
+            return hashes[path]
+    monkeypatch.setattr(runner, "ReadOnlySftpProtocolRunner", FakeProtocol)
+    assert runner._private_protected_content_compare(config_path, config, config["protected_content_compare"]) == 0
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert artifact["all_match"] and len(artifact["entries"]) == 11
+    rendered = artifact_path.read_text(encoding="utf-8")
+    assert "group-0" not in rendered and hashes["group-0/leaf.bin"] not in rendered
 
 
 def test_source_manifest_main_resolves_trusted_absolute_base_once(monkeypatch, tmp_path):

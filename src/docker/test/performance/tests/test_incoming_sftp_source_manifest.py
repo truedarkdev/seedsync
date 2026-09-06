@@ -1,5 +1,6 @@
 import importlib.util
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -320,6 +321,45 @@ def test_protocol_rejects_inconsistent_legacy_timestamp_provenance():
             "record": "entry", "path": "file.bin", "kind": "file", "size": 1,
             "mtime_ns": 7, "legacy_mtime_ns": 8, "mode": 0o644,
         }, ROOT)
+
+
+def test_remote_content_hash_streams_without_retaining_payload_or_side_effect_commands(monkeypatch):
+    class RecordingInput(io.BytesIO):
+        def close(self):
+            pass
+
+    class Process:
+        def __init__(self):
+            self.stdin, self.stdout, self.stderr = RecordingInput(), io.BytesIO(b"abc"), io.BytesIO()
+            self.pid = 1
+        def poll(self): return 0
+        def wait(self): return 0
+        def kill(self): pass
+
+    created = []
+    monkeypatch.setattr(manifest.subprocess, "Popen", lambda *args, **kwargs: created.append(Process()) or created[-1])
+    runner = manifest.ReadOnlySftpProtocolRunner(
+        host="remote.example", port=2222, username="user", password="secret", known_hosts_file="known-hosts",
+    )
+    assert runner.hash_file(ROOT, "nested/file.bin", 3, timeout_seconds=5) == hashlib.sha256(b"abc").hexdigest()
+    script = created[0].stdin.getvalue().decode("utf-8")
+    assert "cat \"nested/file.bin\"" in script
+    assert "StrictHostKeyChecking=yes" in script
+    assert not any(command in script for command in ("put ", "rm ", "mkdir ", "find "))
+    assert b"abc" not in created[0].stdin.getvalue()
+
+
+def test_remote_content_hash_fails_closed_on_wrong_stream_size(monkeypatch):
+    class Process:
+        stdin, stdout, stderr, pid = io.BytesIO(), io.BytesIO(b"abcd"), io.BytesIO(), 1
+        def poll(self): return 0
+        def wait(self): return 0
+        def kill(self): pass
+
+    monkeypatch.setattr(manifest.subprocess, "Popen", lambda *args, **kwargs: Process())
+    runner = manifest.ReadOnlySftpProtocolRunner(host="remote.example")
+    with pytest.raises(manifest.SourceManifestError, match="content_size_mismatch"):
+        runner.hash_file(ROOT, "file.bin", 3, timeout_seconds=5)
 
 
 def test_lftp_failure_stage_is_allowlisted_and_persisted_without_output():
