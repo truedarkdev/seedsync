@@ -409,24 +409,50 @@ def test_sftp_failure_classifier_uses_unknown_fallback_without_returning_stderr(
     assert manifest.classify_sftp_failure(b"\xff\xfe") == "unknown"
 
 
+@pytest.mark.parametrize(("stderr", "transport_stage"), [
+    (b"Unable to negotiate a common algorithm private.example", "negotiation"),
+    (b"Permission denied for private-user", "authentication"),
+    (b"subsystem request failed on channel 0", "subsystem"),
+    (b"Connection closed by remote host private.example", "immediate_remote_close"),
+    (b"opaque private-user private.example /private/source secret-token", "unknown"),
+])
+def test_sftp_transport_classifier_returns_fixed_stage_vocabulary(
+    stderr, transport_stage,
+):
+    assert manifest.classify_sftp_transport_failure(stderr) == transport_stage
+    assert manifest.classify_sftp_transport_failure(stderr.decode("utf-8")) == transport_stage
+
+
 def test_streaming_failure_classifier_keeps_timeout_over_later_conflicting_chunks():
     classifier = manifest._SftpFailureClassifier()
     classifier.feed(b"Host key verification failed")
     classifier.feed(b"x" * 512)
+    classifier.feed(b"Connection closed by remote host")
     classifier.feed(b"Connection timed ")
     classifier.feed(b"out during banner exchange")
     classifier.feed(b"x" * 512)
     classifier.feed(b"Permission denied for private-user")
     assert classifier.result() == "timeout"
+    assert classifier.transport_result() == "timeout"
+
+
+def test_streaming_failure_classifier_ignores_debug_progress_before_remote_close():
+    classifier = manifest._SftpFailureClassifier()
+    classifier.feed(b"debug1: next authentication method: publickey\n")
+    classifier.feed(b"debug1: sending subsystem: sftp\n")
+    classifier.feed(b"Connection closed by remote host private.example /private/source")
+    assert classifier.transport_result() == "immediate_remote_close"
+    assert not hasattr(classifier, "stderr")
 
 
 def test_bounded_process_classifies_stderr_without_retaining_it():
     result = manifest._run_bounded_process(
-        [sys.executable, "-c", "import sys; sys.stderr.write('Host key verification failed for private.example'); sys.exit(1)"],
+        [sys.executable, "-c", "import sys; sys.stderr.write('Connection closed by remote host private.example /private/source'); sys.exit(1)"],
         b"", 5, 1024,
     )
     assert result.returncode != 0
-    assert result.failure_class == "host_key"
+    assert result.failure_class == "connect"
+    assert result.transport_stage == "immediate_remote_close"
     assert not hasattr(result, "stderr")
 
 
@@ -446,6 +472,42 @@ def test_failure_class_is_added_to_redacted_persistence_payload_without_raw_outp
         "reason": "process_failed", "stage": "listing", "failure_class": "dns",
     }
     assert "private.example" not in str(manifest.redacted_manifest_error(raised.value))
+
+
+def test_transport_stage_is_added_to_root_preflight_artifact_without_raw_output():
+    class OpenSshFailure:
+        def canonicalize(self, *_args, **_kwargs):
+            raise manifest.SourceManifestError(
+                "process_failed", "root", "connect",
+                "immediate_remote_close",
+            )
+
+    result = manifest.RootOnlySftpPreflight(OpenSshFailure()).run(
+        relative_root="Incoming", trusted_absolute_root=None,
+    )
+    artifact = result.as_artifact()
+    assert artifact == {
+        "schema": "incoming-recovery-source-root-preflight.v1",
+        "reason": "process_failed", "stage": "root", "ambiguity": "missing",
+        "candidates": [], "failure_class": "connect",
+        "transport_stage": "immediate_remote_close",
+    }
+    assert "private.example" not in str(artifact)
+
+    generic = manifest.redacted_manifest_error(manifest.SourceManifestError(
+        "process_failed", "root", "connect", "immediate_remote_close",
+    ))
+    assert "transport_stage" not in generic
+
+
+def test_root_preflight_artifact_closes_invalid_transport_stage_to_unknown():
+    artifact = manifest.RootPreflightResult(
+        None, (), "missing", "root", "process_failed",
+        failure_class=["raw-secret"], transport_stage=["raw-stage"],
+    ).as_artifact()
+    assert artifact["failure_class"] == "unknown"
+    assert artifact["transport_stage"] == "unknown"
+    assert "raw-secret" not in json.dumps(artifact)
 
 
 @pytest.mark.parametrize("result", [
@@ -571,6 +633,7 @@ def test_root_only_preflight_fails_closed_for_missing_or_ambiguous_candidates(mo
     assert payload["ambiguity"] == "missing"
     assert payload["reason"] == "root_candidate_missing"
     assert payload["failure_class"] == "timeout"
+    assert payload["transport_stage"] == "timeout"
 
     def ambiguous(candidate, **_kwargs):
         if candidate is None:
@@ -581,6 +644,29 @@ def test_root_only_preflight_fails_closed_for_missing_or_ambiguous_candidates(mo
     monkeypatch.setattr(protocol, "root_preflight_process", ambiguous)
     with pytest.raises(manifest.SourceManifestError, match="root_candidate_ambiguous"):
         manifest.RootOnlySftpPreflight(protocol).capture_to(tmp_path / "ambiguous.json", relative_root="files/Incoming", trusted_absolute_root=None)
+
+
+def test_root_only_preflight_aggregates_later_terminal_transport_stage(monkeypatch):
+    protocol = manifest.ReadOnlySftpProtocolRunner(host="remote.example")
+    responses = {
+        None: manifest.SftpProcessResult(_root_preflight_output("source_root_preflight_pwd", "/home/user")),
+        "files/Incoming": manifest.SftpProcessResult(
+            b"source_root_preflight_open\n", returncode=1,
+            failure_stage="root", failure_reason="process_failed",
+            failure_class="auth_config", transport_stage="authentication",
+        ),
+        "/home/user/files/Incoming": manifest.SftpProcessResult(
+            b"source_root_preflight_open\n", returncode=1,
+            failure_stage="root", failure_reason="process_failed",
+            failure_class="connect", transport_stage="immediate_remote_close",
+        ),
+    }
+    monkeypatch.setattr(protocol, "root_preflight_process", lambda candidate, **_kwargs: responses[candidate])
+    result = manifest.RootOnlySftpPreflight(protocol).run(
+        relative_root="files/Incoming", trusted_absolute_root=None,
+    )
+    assert result.reason == "root_candidate_missing"
+    assert result.transport_stage == "immediate_remote_close"
 
 
 @pytest.mark.parametrize("failure_class", ["raw-secret", ["raw-secret"], {"failure_class": "raw-secret"}])
@@ -612,6 +698,31 @@ def test_root_only_process_script_is_strict_and_never_enumerates(monkeypatch):
     assert "cd \"safe root/Incoming\"" in script
     assert "pwd" in script
     assert "find" not in script and "cls" not in script and "put" not in script and "rm " not in script
+
+
+def test_realpath_root_preflight_preserves_bounded_transport_stage_into_artifact(monkeypatch, tmp_path):
+    def failed_process(*_args, **_kwargs):
+        return manifest.SftpProcessResult(
+            b"source_root_preflight_open\n", returncode=1,
+            failure_class="connect", transport_stage="immediate_remote_close",
+        )
+
+    monkeypatch.setattr(manifest, "_run_bounded_process", failed_process)
+    protocol = manifest.ReadOnlySftpRealpathRunner(
+        host="remote.example", port=2222, username="user",
+        known_hosts_file="known_hosts", askpass_program="safe-askpass",
+        connection_config_path="protected-settings",
+    )
+
+    output_path = tmp_path / "root-preflight-failure.json"
+    with pytest.raises(manifest.SourceManifestError, match="process_failed"):
+        manifest.RootOnlySftpPreflight(protocol).capture_to(
+            output_path, relative_root="Incoming", trusted_absolute_root=None,
+        )
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["failure_class"] == "connect"
+    assert payload["transport_stage"] == "immediate_remote_close"
+    assert "remote.example" not in json.dumps(payload)
 
 
 def test_root_only_preflight_models_chroot_landing_and_keeps_candidates_confined(monkeypatch):

@@ -32,10 +32,19 @@ from urllib.parse import urlsplit
 class SourceManifestError(ValueError):
     """A source manifest cannot be trusted or safely persisted."""
 
-    def __init__(self, reason: str, stage: str | None = None, failure_class: str | None = None):
+    def __init__(
+        self,
+        reason: str,
+        stage: str | None = None,
+        failure_class: str | None = None,
+        transport_stage: str | None = None,
+    ):
         self.reason = reason if reason in _FAILURE_REASONS else "protocol_failure"
         self.stage = stage if stage in _FAILURE_STAGES else None
         self.failure_class = failure_class if failure_class in _FAILURE_CLASSES else None
+        self.transport_stage = _sanitize_transport_stage(
+            transport_stage, default_unknown=transport_stage is not None,
+        )
         super().__init__(self.reason)
 
 
@@ -63,6 +72,7 @@ class SftpProcessResult:
     failure_stage: str | None = None
     failure_reason: str | None = None
     failure_class: str | None = None
+    transport_stage: str | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +143,62 @@ _FAILURE_CLASSES = frozenset({
     "auth_config", "dns", "connect", "host_key", "protocol", "timeout",
     "remote_path", "stat", "unknown",
 })
+_TRANSPORT_STAGES = frozenset({
+    "invocation", "dns", "timeout", "connect", "negotiation", "host_key",
+    "authentication", "subsystem", "immediate_remote_close", "unknown",
+})
+_TRANSPORT_STAGE_PRIORITY = {
+    "unknown": 0,
+    "invocation": 1,
+    "dns": 2,
+    "connect": 3,
+    "negotiation": 4,
+    "host_key": 5,
+    "authentication": 6,
+    "subsystem": 7,
+    "immediate_remote_close": 8,
+    "timeout": 9,
+}
+_TRANSPORT_FAILURE_PATTERNS = (
+    ("invocation", (
+        "usage:", "unknown option", "illegal option", "bad configuration option",
+        "unsupported option", "command-line",
+    )),
+    ("dns", (
+        "could not resolve hostname", "could not resolve host", "name or service not known",
+        "temporary failure in name resolution", "nodename nor servname", "unknown host",
+        "getaddrinfo",
+    )),
+    ("timeout", ("timed out", "timeout", "deadline exceeded")),
+    ("negotiation", (
+        "kex_exchange_identification", "ssh_exchange_identification",
+        "no matching host key type", "no matching cipher", "no matching key exchange",
+        "no matching key exchange method", "unable to negotiate",
+    )),
+    ("host_key", (
+        "host key verification failed", "remote host identification has changed",
+        "offending .* key", "known_hosts", "known hosts", "man-in-the-middle",
+    )),
+    ("authentication", (
+        "permission denied", "authentication failed", "authentication error",
+        "no supported authentication methods available", "too many authentication failures",
+        "askpass", "cannot read passphrase",
+        "could not open a connection to your authentication agent",
+    )),
+    ("subsystem", (
+        "subsystem request failed", "could not request subsystem",
+        "subsystem 'sftp' not found", 'subsystem "sftp" not found',
+    )),
+    ("immediate_remote_close", (
+        "connection closed by ", "closed by remote host", "connection reset by peer",
+        "connection reset by remote", "remote side unexpectedly closed", "lost connection",
+        "broken pipe",
+    )),
+    ("connect", (
+        "connection refused", "connection reset", "no route to host",
+        "network is unreachable", "failed to connect", "connect to ",
+    )),
+)
 _FAILURE_CLASS_PATTERNS = (
     ("timeout", ("timed out", "timeout", "deadline exceeded")),
     ("host_key", (
@@ -191,8 +257,23 @@ _ROOT_PREFLIGHT_SCHEMA = "incoming-recovery-source-root-preflight.v1"
 _ROOT_PREFLIGHT_MARKERS = ("source_root_preflight_open", "source_root_preflight_pwd", "source_root_preflight_candidate")
 
 
-def _fail(reason: str, stage: str | None = None, failure_class: str | None = None) -> SourceManifestError:
-    return SourceManifestError(reason, stage, failure_class)
+def _sanitize_transport_stage(
+    transport_stage: object, *, default_unknown: bool = False,
+) -> str | None:
+    if isinstance(transport_stage, str) and transport_stage in _TRANSPORT_STAGES:
+        return transport_stage
+    if default_unknown and transport_stage is not None:
+        return "unknown"
+    return None
+
+
+def _fail(
+    reason: str,
+    stage: str | None = None,
+    failure_class: str | None = None,
+    transport_stage: str | None = None,
+) -> SourceManifestError:
+    return SourceManifestError(reason, stage, failure_class, transport_stage)
 
 
 def classify_sftp_failure(stderr: bytes | str) -> str:
@@ -211,6 +292,27 @@ def classify_sftp_failure(stderr: bytes | str) -> str:
             elif pattern in text:
                 return failure_class
     return "unknown"
+
+
+def classify_sftp_transport_failure(stderr: bytes | str) -> str:
+    """Return a fixed, privacy-safe OpenSSH transport stage."""
+    if isinstance(stderr, bytes):
+        text = stderr.decode("utf-8", errors="ignore").casefold()
+    elif isinstance(stderr, str):
+        text = stderr.casefold()
+    else:
+        return "unknown"
+    matched_stage = "unknown"
+    for stage, patterns in _TRANSPORT_FAILURE_PATTERNS:
+        for pattern in patterns:
+            if pattern == "offending .* key":
+                if re.search(pattern, text):
+                    if _TRANSPORT_STAGE_PRIORITY[stage] > _TRANSPORT_STAGE_PRIORITY[matched_stage]:
+                        matched_stage = stage
+            elif pattern in text:
+                if _TRANSPORT_STAGE_PRIORITY[stage] > _TRANSPORT_STAGE_PRIORITY[matched_stage]:
+                    matched_stage = stage
+    return matched_stage
 
 
 def _root_path(value: object) -> str:
@@ -471,6 +573,7 @@ class RootPreflightResult:
     reason: str
     selected_form: str | None = None
     failure_class: str | None = None
+    transport_stage: str | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -496,6 +599,10 @@ class RootPreflightResult:
                 self.failure_class
                 if isinstance(self.failure_class, str) and self.failure_class in _FAILURE_CLASSES
                 else "unknown"
+            )
+        if self.transport_stage is not None:
+            payload["transport_stage"] = _sanitize_transport_stage(
+                self.transport_stage, default_unknown=True,
             )
         return payload
 
@@ -538,8 +645,17 @@ class RootOnlySftpPreflight:
             return "/" + relative
         return landing.rstrip("/") + "/" + relative
 
-    def _result_from_failure(self, reason: str, stage: str, failure_class: str | None = None) -> RootPreflightResult:
-        return RootPreflightResult(None, (), "missing", stage, reason, failure_class=failure_class)
+    def _result_from_failure(
+        self,
+        reason: str,
+        stage: str,
+        failure_class: str | None = None,
+        transport_stage: str | None = None,
+    ) -> RootPreflightResult:
+        return RootPreflightResult(
+            None, (), "missing", stage, reason, failure_class=failure_class,
+            transport_stage=transport_stage,
+        )
 
     def _extract_pwd(self, output: bytes, marker: str) -> str:
         try:
@@ -590,13 +706,19 @@ class RootOnlySftpPreflight:
         except SourceManifestError as exc:
             return None, exc
         if result.timed_out:
-            return None, _fail("process_timeout", "root" if candidate is not None else "pwd", "timeout")
+            return None, _fail(
+                "process_timeout", "root" if candidate is not None else "pwd", "timeout",
+                "timeout",
+            )
         if result.truncated:
-            return None, _fail("output_truncated", "root" if candidate is not None else "pwd", result.failure_class)
+            return None, _fail(
+                "output_truncated", "root" if candidate is not None else "pwd", result.failure_class,
+                result.transport_stage,
+            )
         if result.returncode != 0:
             return None, _fail(
                 "process_failed", result.failure_stage or ("root" if candidate is not None else "open"),
-                result.failure_class,
+                result.failure_class, result.transport_stage,
             )
         try:
             return self._extract_pwd(result.stdout if isinstance(result.stdout, bytes) else b"", _ROOT_PREFLIGHT_MARKERS[-1] if candidate is not None else _ROOT_PREFLIGHT_MARKERS[1]), None
@@ -616,6 +738,7 @@ class RootOnlySftpPreflight:
                 (failure.reason if failure else "protocol_failure"),
                 (failure.stage if failure and failure.stage else "pwd"),
                 failure.failure_class if failure else None,
+                failure.transport_stage if failure else None,
             )
         candidates: list[tuple[str, str]] = []
         if relative_root is not None:
@@ -633,21 +756,30 @@ class RootOnlySftpPreflight:
             if derived:
                 candidates.append(("account_relative", self._relative_path(derived)))
         # Retain each configured form label but avoid duplicate transport work.
-        probed: dict[str, tuple[bool, str | None, str | None]] = {}
+        probed: dict[str, tuple[bool, str | None, str | None, str | None]] = {}
         outputs: list[RootPreflightCandidate] = []
         failure_classes: list[str] = []
+        transport_diagnostics: list[str] = []
         for form, candidate in candidates:
             if candidate not in probed:
                 resolved, candidate_failure = self._run_pwd(candidate)
                 candidate_class = candidate_failure.failure_class if candidate_failure is not None else None
+                candidate_transport = (
+                    candidate_failure.transport_stage
+                    if candidate_failure is not None and candidate_failure.transport_stage is not None
+                    else None
+                )
                 probed[candidate] = (
                     candidate_failure is None and resolved is not None,
                     self._path_digest(resolved) if resolved is not None else None,
                     candidate_class,
+                    candidate_transport,
                 )
                 if candidate_class is not None:
                     failure_classes.append(candidate_class)
-            valid, digest, _ = probed[candidate]
+                if candidate_transport is not None:
+                    transport_diagnostics.append(candidate_transport)
+            valid, digest, _, _ = probed[candidate]
             outputs.append(RootPreflightCandidate(form, valid, digest))
         valid_outputs = [item for item in outputs if item.valid and item.directory_digest is not None]
         digests = {item.directory_digest for item in valid_outputs}
@@ -661,16 +793,25 @@ class RootOnlySftpPreflight:
             "timeout" if "timeout" in failure_classes
             else next((item for item in failure_classes if item != "unknown"), failure_classes[0] if failure_classes else None)
         )
+        transport_stage = max(
+            transport_diagnostics,
+            key=lambda item: _TRANSPORT_STAGE_PRIORITY.get(item, 0),
+            default=None,
+        )
         return RootPreflightResult(
             self._path_digest(landing), tuple(outputs), "missing", "root_preflight", "root_candidate_missing",
             failure_class=failure_class,
+            transport_stage=transport_stage,
         )
 
     def capture_to(self, output_path: str | os.PathLike[str], *, relative_root: str | None, trusted_absolute_root: str | None) -> RootPreflightResult:
         result = self.run(relative_root=relative_root, trusted_absolute_root=trusted_absolute_root)
         _write_private_atomic(result.as_artifact(), output_path)
         if not result.succeeded:
-            raise _fail(result.reason, result.stage, result.failure_class)
+            raise _fail(
+                result.reason, result.stage, result.failure_class,
+                result.transport_stage,
+            )
         return result
 
 
@@ -940,13 +1081,19 @@ class ReadOnlySftpRealpathRunner:
             command = "pwd\n" if candidate == "." else "cd " + json.dumps(candidate) + "\npwd\n"
             result = _run_bounded_process(argv, (command + "bye\n").encode("utf-8"), timeout_seconds, max_output_bytes, environment=environment)
         except (OSError, ValueError):
-            raise _fail("process_failed", "launch", "unknown")
+            raise _fail("process_failed", "launch", "unknown", "unknown")
         if result.timed_out:
-            raise _fail("process_timeout", "root", "timeout")
+            raise _fail("process_timeout", "root", "timeout", "timeout")
         if result.truncated:
-            raise _fail("output_truncated", "root", result.failure_class)
+            raise _fail(
+                "output_truncated", "root", result.failure_class,
+                result.transport_stage,
+            )
         if result.returncode != 0:
-            raise _fail("process_failed", "root", result.failure_class)
+            raise _fail(
+                "process_failed", "root", result.failure_class,
+                result.transport_stage,
+            )
         try:
             lines = result.stdout.decode("utf-8").splitlines() if isinstance(result.stdout, bytes) else []
         except UnicodeDecodeError:
@@ -982,6 +1129,7 @@ class _SftpFailureClassifier:
     def __init__(self) -> None:
         self._context = b""
         self._failure_class = "unknown"
+        self._transport_stage: str | None = None
 
     def feed(self, chunk: bytes) -> None:
         if not isinstance(chunk, bytes):
@@ -992,10 +1140,24 @@ class _SftpFailureClassifier:
             self._failure_class = "timeout"
         elif candidate != "unknown":
             self._failure_class = candidate
+        transport_stage = classify_sftp_transport_failure(context)
+        if transport_stage == "timeout" or self._transport_stage == "timeout":
+            self._transport_stage = "timeout"
+        elif (
+            transport_stage != "unknown"
+            and _TRANSPORT_STAGE_PRIORITY[transport_stage]
+            > _TRANSPORT_STAGE_PRIORITY.get(self._transport_stage or "unknown", 0)
+        ):
+            self._transport_stage = transport_stage
         self._context = context[-self._CONTEXT_BYTES:]
 
     def result(self) -> str:
         return self._failure_class
+
+    def transport_result(self) -> str:
+        if self._transport_stage is None:
+            return "unknown"
+        return self._transport_stage
 
 
 def _run_bounded_process(
@@ -1069,17 +1231,24 @@ def _run_bounded_process(
     # A descendant can retain a pipe after the LFTP parent exits.  Do not
     # synthesize completion from a partially drained stream in that case.
     failure_class = stderr_classifier.result()
+    transport_stage = stderr_classifier.transport_result()
     if timed_out:
         failure_class = "timeout"
+        transport_stage = "timeout"
     if stdout_thread.is_alive() or stderr_thread.is_alive():
-        return SftpProcessResult(b"", returncode, truncated=True, failure_class=failure_class)
+        return SftpProcessResult(
+            b"", returncode, truncated=True, failure_class=failure_class,
+            transport_stage=transport_stage,
+        )
     if overflow.is_set():
         return SftpProcessResult(
             b"".join(stdout_chunks), returncode, truncated=True, failure_class=failure_class,
+            transport_stage=transport_stage,
         )
     return SftpProcessResult(
         b"".join(stdout_chunks), returncode, timed_out=timed_out,
         failure_class=failure_class if (timed_out or returncode != 0) else None,
+        transport_stage=transport_stage if (timed_out or returncode != 0) else None,
     )
 
 
