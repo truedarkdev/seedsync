@@ -13,19 +13,23 @@ from ssh import Sshcp
 class DeleteLocalProcess(AppOneShotProcess):
     def __init__(self, local_path: str, file_name: str,
                  artifact_paths: Sequence[str] = (), artifact_root: Optional[str] = None,
-                 delete_primary: bool = True):
+                 delete_primary: bool = True, allow_recursive: bool = False):
         super().__init__(name=self.__class__.__name__)
         self.__local_path = local_path
         self.__file_name: object = file_name
         self.__artifact_paths = tuple(artifact_paths)
         self.__artifact_root = artifact_root if artifact_root is not None else local_path
         self.__delete_primary = delete_primary
+        self.__allow_recursive = allow_recursive
 
     def run_once(self):
         file_name = self.__file_name
         if not isinstance(file_name, str) or file_name == "" or "\x00" in file_name:
             self.logger.error("Invalid local delete filename: {}".format(self.__file_name))
-            return
+            raise ValueError("Invalid local delete filename")
+        if type(self.__allow_recursive) is not bool:
+            self.logger.error("Invalid local delete target kind: {}".format(self.__allow_recursive))
+            raise ValueError("Invalid local delete target kind")
 
         file_path = os.path.join(self.__local_path, file_name)
         real_base = os.path.realpath(self.__local_path)
@@ -39,27 +43,30 @@ class DeleteLocalProcess(AppOneShotProcess):
             os.path.normcase(real_target) == os.path.normcase(real_base)
         ):
             self.logger.error("Path traversal blocked: {} escapes {}".format(real_target, real_base))
-            return
+            raise ValueError("Path traversal blocked")
 
         self.logger.debug("Deleting local file {}".format(file_name))
-        if self.__delete_primary and not os.path.exists(file_path):
-            self.logger.error("Failed to delete non-existing file: {}".format(file_path))
-            raise FileNotFoundError(file_path)
-        elif self.__delete_primary:
+        if self.__delete_primary:
+            if not os.path.exists(file_path):
+                self.logger.error("Failed to delete non-existing file: {}".format(file_path))
+                raise FileNotFoundError(file_path)
+            # The selected target kind is authoritative. A live type change
+            # must fail instead of selecting a different delete primitive.
+            if os.path.islink(file_path):
+                self.logger.error("Delete Local target changed to a symbolic link: {}".format(file_path))
+                raise OSError("Delete Local target is a symbolic link: {}".format(file_path))
+            if self.__allow_recursive:
+                if not os.path.isdir(file_path):
+                    self.logger.error("Delete Local target changed from directory: {}".format(file_path))
+                    raise OSError("Delete Local target is not a directory: {}".format(file_path))
+            elif not os.path.isfile(file_path):
+                self.logger.error("Delete Local target changed from regular file: {}".format(file_path))
+                raise OSError("Delete Local target is not a regular file: {}".format(file_path))
             try:
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
-                else:
+                if self.__allow_recursive:
                     shutil.rmtree(file_path)
-            except FileNotFoundError:
-                # Another actor may remove the target between the existence
-                # check and the actual delete. Treat only a vanished top-level
-                # target as success; a missing descendant while a directory
-                # remains is a partial-delete failure.
-                if os.path.lexists(file_path):
-                    self.logger.exception("Failed to delete local file {}".format(file_path))
-                    raise
-                self.logger.warning("File already gone: {}".format(file_path))
+                else:
+                    os.unlink(file_path)
             except OSError:
                 self.logger.exception("Failed to delete local file {}".format(file_path))
                 raise

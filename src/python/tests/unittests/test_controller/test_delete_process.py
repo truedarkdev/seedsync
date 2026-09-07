@@ -237,45 +237,141 @@ class TestDeleteRemoteProcess(unittest.TestCase):
 
 
 class TestDeleteLocalProcess(unittest.TestCase):
-    @patch("controller.delete.delete_process.os.path.lexists", return_value=False)
-    @patch("controller.delete.delete_process.os.remove", side_effect=FileNotFoundError)
+    @patch("controller.delete.delete_process.os.unlink", side_effect=FileNotFoundError)
     @patch("controller.delete.delete_process.os.path.isfile", return_value=True)
     @patch("controller.delete.delete_process.os.path.exists", return_value=True)
-    def test_run_once_tolerates_target_disappearing_during_delete(self, _, __, remove, lexists):
+    def test_run_once_propagates_target_disappearing_during_delete(self, exists, isfile, unlink):
         process = DeleteLocalProcess(local_path="/local", file_name="gone")
         process.logger = MagicMock()
 
-        process.run_once()
+        with self.assertRaises(FileNotFoundError):
+            process.run_once()
 
-        remove.assert_called_once_with(os.path.join("/local", "gone"))
-        lexists.assert_called_once_with(os.path.join("/local", "gone"))
-        process.logger.warning.assert_called_once()
+        unlink.assert_called_once_with(os.path.join("/local", "gone"))
+        process.logger.exception.assert_called_once()
 
-    @patch("controller.delete.delete_process.os.path.lexists", return_value=True)
     @patch("controller.delete.delete_process.shutil.rmtree", side_effect=FileNotFoundError("child vanished"))
-    @patch("controller.delete.delete_process.os.path.isfile", return_value=False)
+    @patch("controller.delete.delete_process.os.path.isdir", return_value=True)
     @patch("controller.delete.delete_process.os.path.exists", return_value=True)
-    def test_run_once_propagates_descendant_race_when_directory_remains(self, _, __, rmtree, lexists):
-        process = DeleteLocalProcess(local_path="/local", file_name="directory")
+    def test_run_once_propagates_descendant_race_when_directory_remains(self, exists, isdir, rmtree):
+        process = DeleteLocalProcess(local_path="/local", file_name="directory", allow_recursive=True)
         process.logger = MagicMock()
 
         with self.assertRaises(FileNotFoundError):
             process.run_once()
 
         rmtree.assert_called_once_with(os.path.join("/local", "directory"))
-        lexists.assert_called_once_with(os.path.join("/local", "directory"))
         process.logger.exception.assert_called_once()
 
     @patch("controller.delete.delete_process.shutil.rmtree")
-    @patch("controller.delete.delete_process.os.path.isfile", return_value=False)
+    @patch("controller.delete.delete_process.os.path.isdir", return_value=True)
     @patch("controller.delete.delete_process.os.path.exists", return_value=True)
-    def test_run_once_deletes_directory_target(self, _, __, rmtree):
-        process = DeleteLocalProcess(local_path="/local", file_name="dir")
+    def test_run_once_deletes_directory_target(self, exists, isdir, rmtree):
+        process = DeleteLocalProcess(local_path="/local", file_name="dir", allow_recursive=True)
         process.logger = MagicMock()
 
         process.run_once()
 
         rmtree.assert_called_once_with(os.path.join("/local", "dir"))
+
+    @patch("controller.delete.delete_process.shutil.rmtree")
+    @patch("controller.delete.delete_process.os.path.isfile", return_value=False)
+    @patch("controller.delete.delete_process.os.path.exists", return_value=True)
+    def test_run_once_rejects_directory_substitution_without_recursive_fallback(self, exists, isfile, rmtree):
+        process = DeleteLocalProcess(local_path="/local", file_name="changed")
+        process.logger = MagicMock()
+
+        with self.assertRaises(OSError):
+            process.run_once()
+
+        rmtree.assert_not_called()
+
+    def test_run_once_preserves_substituted_directory_contents(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "changed")
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write("regular target")
+            process = DeleteLocalProcess(local_path=temp_dir, file_name="changed")
+            process.logger = MagicMock()
+
+            os.unlink(target)
+            os.mkdir(target)
+            sentinel = os.path.join(target, "sentinel.bin")
+            with open(sentinel, "w", encoding="utf-8") as handle:
+                handle.write("must survive")
+
+            with self.assertRaises(OSError):
+                process.run_once()
+
+            self.assertTrue(os.path.isdir(target))
+            self.assertTrue(os.path.isfile(sentinel))
+            with open(sentinel, encoding="utf-8") as handle:
+                self.assertEqual("must survive", handle.read())
+
+    def test_run_once_rejects_regular_file_symlink_substitution(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "target")
+            substitute = os.path.join(temp_dir, "changed")
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write("must survive")
+            try:
+                os.symlink(target, substitute)
+            except (NotImplementedError, OSError):
+                self.skipTest("symbolic links are unavailable")
+
+            process = DeleteLocalProcess(local_path=temp_dir, file_name="changed")
+            process.logger = MagicMock()
+
+            with self.assertRaises(OSError):
+                process.run_once()
+
+            self.assertTrue(os.path.islink(substitute))
+            self.assertTrue(os.path.isfile(target))
+            with open(target, encoding="utf-8") as handle:
+                self.assertEqual("must survive", handle.read())
+
+    @patch("controller.delete.delete_process.shutil.rmtree")
+    @patch("controller.delete.delete_process.os.unlink")
+    @patch("controller.delete.delete_process.os.path.isfile", return_value=True)
+    @patch("controller.delete.delete_process.os.path.islink", return_value=True)
+    @patch("controller.delete.delete_process.os.path.exists", return_value=True)
+    def test_run_once_rejects_symlink_before_any_delete_primitive(
+            self, exists, islink, isfile, unlink, rmtree):
+        process = DeleteLocalProcess(local_path="/local", file_name="changed")
+        process.logger = MagicMock()
+
+        with self.assertRaises(OSError):
+            process.run_once()
+
+        unlink.assert_not_called()
+        rmtree.assert_not_called()
+
+    @patch("controller.delete.delete_process.shutil.rmtree")
+    @patch("controller.delete.delete_process.os.unlink", side_effect=PermissionError("denied"))
+    @patch("controller.delete.delete_process.os.path.isfile", return_value=True)
+    @patch("controller.delete.delete_process.os.path.exists", return_value=True)
+    def test_run_once_propagates_unlink_failure_without_recursive_fallback(
+            self, exists, isfile, unlink, rmtree):
+        process = DeleteLocalProcess(local_path="/local", file_name="protected")
+        process.logger = MagicMock()
+
+        with self.assertRaises(PermissionError):
+            process.run_once()
+
+        unlink.assert_called_once_with(os.path.join("/local", "protected"))
+        rmtree.assert_not_called()
+
+    @patch("controller.delete.delete_process.shutil.rmtree")
+    @patch("controller.delete.delete_process.os.path.isdir", return_value=False)
+    @patch("controller.delete.delete_process.os.path.exists", return_value=True)
+    def test_run_once_rejects_file_substitution_for_recursive_target(self, exists, isdir, rmtree):
+        process = DeleteLocalProcess(local_path="/local", file_name="changed", allow_recursive=True)
+        process.logger = MagicMock()
+
+        with self.assertRaises(OSError):
+            process.run_once()
+
+        rmtree.assert_not_called()
 
     @patch("controller.delete.delete_process.os.path.exists", return_value=False)
     def test_run_once_raises_for_missing_target(self, exists):
@@ -298,7 +394,8 @@ class TestDeleteLocalProcess(unittest.TestCase):
             process = DeleteLocalProcess(local_path=local_root, file_name="../escape.txt")
             process.logger = MagicMock()
 
-            process.run_once()
+            with self.assertRaises(ValueError):
+                process.run_once()
 
             self.assertTrue(os.path.isfile(outside_file))
             self.assertTrue(os.path.isdir(local_root))
@@ -308,6 +405,7 @@ class TestDeleteLocalProcess(unittest.TestCase):
             process = DeleteLocalProcess(local_path=temp_dir, file_name=".")
             process.logger = MagicMock()
 
-            process.run_once()
+            with self.assertRaises(ValueError):
+                process.run_once()
 
             self.assertTrue(os.path.isdir(temp_dir))

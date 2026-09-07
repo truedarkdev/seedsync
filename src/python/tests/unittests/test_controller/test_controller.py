@@ -6226,7 +6226,8 @@ class TestController(unittest.TestCase):
 
         delete_local_process.assert_called_once_with(
             local_path="/local/movies",
-            file_name="stale"
+            file_name="stale",
+            allow_recursive=False,
         )
         delete_local_process.return_value.start.assert_called_once_with()
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
@@ -6284,7 +6285,9 @@ class TestController(unittest.TestCase):
 
             self.controller._Controller__update_model()
 
-        delete_local_process.assert_called_once_with(local_path="/local/b", file_name="stale")
+        delete_local_process.assert_called_once_with(
+            local_path="/local/b", file_name="stale", allow_recursive=False
+        )
         delete_local_process.return_value.start.assert_called_once_with()
         self.assertEqual(set(), self.controller._Controller__pending_auto_purge_file_ids)
 
@@ -8354,7 +8357,8 @@ class TestController(unittest.TestCase):
 
         delete_local_process.assert_called_once_with(
             local_path="/local/movies/incomplete",
-            file_name="dup"
+            file_name="dup",
+            allow_recursive=False,
         )
 
     @patch("controller.controller.os.path.exists")
@@ -8382,7 +8386,8 @@ class TestController(unittest.TestCase):
 
         delete_local_process.assert_called_once_with(
             local_path="/local/movies/incomplete",
-            file_name="dup.lftp"
+            file_name="dup.lftp",
+            allow_recursive=False,
         )
 
     @patch("controller.controller.os.path.exists")
@@ -8410,7 +8415,8 @@ class TestController(unittest.TestCase):
 
         delete_local_process.assert_called_once_with(
             local_path="/local/movies",
-            file_name="dup"
+            file_name="dup",
+            allow_recursive=False,
         )
 
     def test_process_commands_delete_local_staged_directory_skips_file_artifact_planner(self):
@@ -8454,6 +8460,7 @@ class TestController(unittest.TestCase):
             delete_local_process.assert_called_once_with(
                 local_path=staging_root,
                 file_name="sample-directory",
+                allow_recursive=True,
             )
             process.start.assert_called_once_with()
             callback.on_success.assert_called_once_with()
@@ -8512,6 +8519,7 @@ class TestController(unittest.TestCase):
             delete_local_process.assert_called_once_with(
                 local_path=final_root,
                 file_name="normal.bin",
+                allow_recursive=False,
             )
             process.start.assert_called_once_with()
             normal_callback.on_success.assert_called_once_with()
@@ -8618,6 +8626,7 @@ class TestController(unittest.TestCase):
                 file_name="sample.bin",
                 artifact_paths=("artifact",),
                 artifact_root=staging_root,
+                allow_recursive=False,
             )
             process.start.assert_called_once_with()
 

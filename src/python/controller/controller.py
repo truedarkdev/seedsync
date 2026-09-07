@@ -8328,6 +8328,9 @@ class Controller:
         process_kwargs: dict[str, object] = {
             "local_path": delete_local_path,
             "file_name": delete_local_name,
+            # Preserve the model/plan target kind across the process boundary;
+            # DeleteLocalProcess rejects any later filesystem type change.
+            "allow_recursive": file.is_dir,
         }
         if artifact_paths:
             process_kwargs["artifact_paths"] = artifact_paths
