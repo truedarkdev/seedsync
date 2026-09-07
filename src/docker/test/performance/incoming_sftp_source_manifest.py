@@ -32,9 +32,10 @@ from urllib.parse import urlsplit
 class SourceManifestError(ValueError):
     """A source manifest cannot be trusted or safely persisted."""
 
-    def __init__(self, reason: str, stage: str | None = None):
+    def __init__(self, reason: str, stage: str | None = None, failure_class: str | None = None):
         self.reason = reason if reason in _FAILURE_REASONS else "protocol_failure"
         self.stage = stage if stage in _FAILURE_STAGES else None
+        self.failure_class = failure_class if failure_class in _FAILURE_CLASSES else None
         super().__init__(self.reason)
 
 
@@ -61,6 +62,7 @@ class SftpProcessResult:
     sentinel_seen: bool | None = None
     failure_stage: str | None = None
     failure_reason: str | None = None
+    failure_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +129,47 @@ _FAILURE_REASONS = frozenset({
     "content_missing", "content_size_mismatch", "content_hash_mismatch",
 })
 _FAILURE_STAGES = frozenset({"launch", "connection", "open", "pwd", "root", "root_preflight", "listing", "enumeration", "completion", "sentinel", "parse", "content"})
+_FAILURE_CLASSES = frozenset({
+    "auth_config", "dns", "connect", "host_key", "protocol", "timeout",
+    "remote_path", "stat", "unknown",
+})
+_FAILURE_CLASS_PATTERNS = (
+    ("timeout", ("timed out", "timeout", "deadline exceeded")),
+    ("host_key", (
+        "host key verification failed", "remote host identification has changed",
+        "offending .* key", "known_hosts", "known hosts", "man-in-the-middle",
+        "no matching host key type found",
+    )),
+    ("dns", (
+        "could not resolve hostname", "could not resolve host", "name or service not known",
+        "temporary failure in name resolution", "nodename nor servname", "unknown host",
+        "getaddrinfo",
+    )),
+    ("auth_config", (
+        "permission denied", "authentication failed", "authentication error",
+        "authenticat", "invalid user", "unknown option", "usage:",
+        "bad configuration", "configuration error", "identity file",
+    )),
+    ("connect", (
+        "connection refused", "connection reset", "connection closed",
+        "no route to host", "network is unreachable", "failed to connect",
+        "connect to ",
+    )),
+    ("host_key", ("host key",)),
+    ("stat", (
+        "couldn't stat", "could not stat", "cannot stat", "failed to stat",
+        "unable to stat", "lstat",
+    )),
+    ("remote_path", (
+        "no such file or directory", "no such file", "not a directory",
+        "couldn't canonicalize", "could not canonicalize", "cannot canonicalize",
+        "remote path", "cd failed", "access failed",
+    )),
+    ("protocol", (
+        "protocol error", "subsystem request failed", "invalid packet", "bad packet",
+        "kex_exchange_identification", "ssh_exchange_identification", "channel ",
+    )),
+)
 _ENTRY_KINDS = frozenset({"file", "directory"})
 _MAX_INTEGER = 2_147_483_647
 _MAX_BYTES = 2**63 - 1
@@ -148,8 +191,26 @@ _ROOT_PREFLIGHT_SCHEMA = "incoming-recovery-source-root-preflight.v1"
 _ROOT_PREFLIGHT_MARKERS = ("source_root_preflight_open", "source_root_preflight_pwd", "source_root_preflight_candidate")
 
 
-def _fail(reason: str, stage: str | None = None) -> SourceManifestError:
-    return SourceManifestError(reason, stage)
+def _fail(reason: str, stage: str | None = None, failure_class: str | None = None) -> SourceManifestError:
+    return SourceManifestError(reason, stage, failure_class)
+
+
+def classify_sftp_failure(stderr: bytes | str) -> str:
+    """Return a fixed, privacy-safe class for bounded SFTP process diagnostics."""
+    if isinstance(stderr, bytes):
+        text = stderr.decode("utf-8", errors="ignore").casefold()
+    elif isinstance(stderr, str):
+        text = stderr.casefold()
+    else:
+        return "unknown"
+    for failure_class, patterns in _FAILURE_CLASS_PATTERNS:
+        for pattern in patterns:
+            if pattern.endswith(".* key"):
+                if re.search(pattern, text):
+                    return failure_class
+            elif pattern in text:
+                return failure_class
+    return "unknown"
 
 
 def _root_path(value: object) -> str:
@@ -379,6 +440,8 @@ def _redacted_artifact_error(exc: BaseException) -> Mapping[str, object]:
     }
     if isinstance(exc, SourceManifestError) and exc.stage is not None:
         artifact["stage"] = exc.stage
+    if isinstance(exc, SourceManifestError) and exc.failure_class is not None:
+        artifact["failure_class"] = exc.failure_class
     return artifact
 
 
@@ -407,6 +470,7 @@ class RootPreflightResult:
     stage: str
     reason: str
     selected_form: str | None = None
+    failure_class: str | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -424,6 +488,15 @@ class RootPreflightResult:
             payload["landing_directory_digest"] = self.landing_directory_digest
         if self.selected_form is not None:
             payload["selected_form"] = self.selected_form
+        if self.failure_class is not None:
+            # Direct result construction is an input boundary too.  Keep the
+            # persisted vocabulary closed even when callers provide an
+            # unvalidated diagnostic value.
+            payload["failure_class"] = (
+                self.failure_class
+                if isinstance(self.failure_class, str) and self.failure_class in _FAILURE_CLASSES
+                else "unknown"
+            )
         return payload
 
 
@@ -465,8 +538,8 @@ class RootOnlySftpPreflight:
             return "/" + relative
         return landing.rstrip("/") + "/" + relative
 
-    def _result_from_failure(self, reason: str, stage: str) -> RootPreflightResult:
-        return RootPreflightResult(None, (), "missing", stage, reason)
+    def _result_from_failure(self, reason: str, stage: str, failure_class: str | None = None) -> RootPreflightResult:
+        return RootPreflightResult(None, (), "missing", stage, reason, failure_class=failure_class)
 
     def _extract_pwd(self, output: bytes, marker: str) -> str:
         try:
@@ -517,11 +590,14 @@ class RootOnlySftpPreflight:
         except SourceManifestError as exc:
             return None, exc
         if result.timed_out:
-            return None, _fail("process_timeout", "root" if candidate is not None else "pwd")
+            return None, _fail("process_timeout", "root" if candidate is not None else "pwd", "timeout")
         if result.truncated:
-            return None, _fail("output_truncated", "root" if candidate is not None else "pwd")
+            return None, _fail("output_truncated", "root" if candidate is not None else "pwd", result.failure_class)
         if result.returncode != 0:
-            return None, _fail("process_failed", result.failure_stage or ("root" if candidate is not None else "open"))
+            return None, _fail(
+                "process_failed", result.failure_stage or ("root" if candidate is not None else "open"),
+                result.failure_class,
+            )
         try:
             return self._extract_pwd(result.stdout if isinstance(result.stdout, bytes) else b"", _ROOT_PREFLIGHT_MARKERS[-1] if candidate is not None else _ROOT_PREFLIGHT_MARKERS[1]), None
         except SourceManifestError as exc:
@@ -536,7 +612,11 @@ class RootOnlySftpPreflight:
             raise _fail("invalid_configuration")
         landing, failure = self._run_pwd()
         if failure is not None or landing is None:
-            return self._result_from_failure((failure.reason if failure else "protocol_failure"), (failure.stage if failure and failure.stage else "pwd"))
+            return self._result_from_failure(
+                (failure.reason if failure else "protocol_failure"),
+                (failure.stage if failure and failure.stage else "pwd"),
+                failure.failure_class if failure else None,
+            )
         candidates: list[tuple[str, str]] = []
         if relative_root is not None:
             candidates.append(("account_relative", relative_root))
@@ -553,13 +633,21 @@ class RootOnlySftpPreflight:
             if derived:
                 candidates.append(("account_relative", self._relative_path(derived)))
         # Retain each configured form label but avoid duplicate transport work.
-        probed: dict[str, tuple[bool, str | None]] = {}
+        probed: dict[str, tuple[bool, str | None, str | None]] = {}
         outputs: list[RootPreflightCandidate] = []
+        failure_classes: list[str] = []
         for form, candidate in candidates:
             if candidate not in probed:
                 resolved, candidate_failure = self._run_pwd(candidate)
-                probed[candidate] = (candidate_failure is None and resolved is not None, self._path_digest(resolved) if resolved is not None else None)
-            valid, digest = probed[candidate]
+                candidate_class = candidate_failure.failure_class if candidate_failure is not None else None
+                probed[candidate] = (
+                    candidate_failure is None and resolved is not None,
+                    self._path_digest(resolved) if resolved is not None else None,
+                    candidate_class,
+                )
+                if candidate_class is not None:
+                    failure_classes.append(candidate_class)
+            valid, digest, _ = probed[candidate]
             outputs.append(RootPreflightCandidate(form, valid, digest))
         valid_outputs = [item for item in outputs if item.valid and item.directory_digest is not None]
         digests = {item.directory_digest for item in valid_outputs}
@@ -569,13 +657,20 @@ class RootOnlySftpPreflight:
             return RootPreflightResult(self._path_digest(landing), tuple(outputs), "equivalent", "root_preflight", "ok", "equivalent")
         if len(valid_outputs) > 1:
             return RootPreflightResult(self._path_digest(landing), tuple(outputs), "ambiguous", "root_preflight", "root_candidate_ambiguous")
-        return RootPreflightResult(self._path_digest(landing), tuple(outputs), "missing", "root_preflight", "root_candidate_missing")
+        failure_class = (
+            "timeout" if "timeout" in failure_classes
+            else next((item for item in failure_classes if item != "unknown"), failure_classes[0] if failure_classes else None)
+        )
+        return RootPreflightResult(
+            self._path_digest(landing), tuple(outputs), "missing", "root_preflight", "root_candidate_missing",
+            failure_class=failure_class,
+        )
 
     def capture_to(self, output_path: str | os.PathLike[str], *, relative_root: str | None, trusted_absolute_root: str | None) -> RootPreflightResult:
         result = self.run(relative_root=relative_root, trusted_absolute_root=trusted_absolute_root)
         _write_private_atomic(result.as_artifact(), output_path)
         if not result.succeeded:
-            raise _fail(result.reason, result.stage)
+            raise _fail(result.reason, result.stage, result.failure_class)
         return result
 
 
@@ -676,12 +771,19 @@ class ReadOnlySftpProtocolRunner:
         try:
             completed = _run_bounded_process([self.executable, "--norc"], script.encode("utf-8"), timeout_seconds, max_output_bytes, environment=self.environment)
         except (OSError, ValueError):
-            return SftpProcessResult(b"", returncode=-1, failure_stage="launch", failure_reason="process_failed")
+            return SftpProcessResult(
+                b"", returncode=-1, failure_stage="launch", failure_reason="process_failed",
+                failure_class="unknown",
+            )
         if completed.timed_out or completed.truncated:
             return completed
         stdout = completed.stdout if isinstance(completed.stdout, bytes) else b""
         if completed.returncode != 0:
-            return SftpProcessResult(b"", completed.returncode, failure_stage=("root" if candidate is not None else _failure_stage_from_root_preflight(stdout)), failure_reason="process_failed")
+            return SftpProcessResult(
+                b"", completed.returncode,
+                failure_stage=("root" if candidate is not None else _failure_stage_from_root_preflight(stdout)),
+                failure_reason="process_failed", failure_class=completed.failure_class,
+            )
         return completed
 
     def __call__(self, root: str, *, timeout_seconds: float, max_output_bytes: int) -> SftpProcessResult:
@@ -725,7 +827,7 @@ class ReadOnlySftpProtocolRunner:
                 environment=self.environment,
             )
         except (OSError, ValueError):
-            return SftpProcessResult(b"", returncode=-1)
+            return SftpProcessResult(b"", returncode=-1, failure_class="unknown")
         if completed.timed_out or completed.truncated:
             return completed
         stdout = completed.stdout if isinstance(completed.stdout, bytes) else b""
@@ -733,7 +835,7 @@ class ReadOnlySftpProtocolRunner:
             return SftpProcessResult(
                 b"", completed.returncode,
                 failure_stage=_failure_stage_from_output(stdout),
-                failure_reason="process_failed",
+                failure_reason="process_failed", failure_class=completed.failure_class,
             )
         try:
             # LFTP may stream a recursive `find` after it has accepted later
@@ -838,13 +940,13 @@ class ReadOnlySftpRealpathRunner:
             command = "pwd\n" if candidate == "." else "cd " + json.dumps(candidate) + "\npwd\n"
             result = _run_bounded_process(argv, (command + "bye\n").encode("utf-8"), timeout_seconds, max_output_bytes, environment=environment)
         except (OSError, ValueError):
-            raise _fail("process_failed", "launch")
+            raise _fail("process_failed", "launch", "unknown")
         if result.timed_out:
-            raise _fail("process_timeout", "root")
+            raise _fail("process_timeout", "root", "timeout")
         if result.truncated:
-            raise _fail("output_truncated", "root")
+            raise _fail("output_truncated", "root", result.failure_class)
         if result.returncode != 0:
-            raise _fail("process_failed", "root")
+            raise _fail("process_failed", "root", result.failure_class)
         try:
             lines = result.stdout.decode("utf-8").splitlines() if isinstance(result.stdout, bytes) else []
         except UnicodeDecodeError:
@@ -872,6 +974,30 @@ class ReadOnlySftpRealpathRunner:
         return paths[0]
 
 
+class _SftpFailureClassifier:
+    """Classify stderr incrementally without retaining the process output."""
+
+    _CONTEXT_BYTES = 256
+
+    def __init__(self) -> None:
+        self._context = b""
+        self._failure_class = "unknown"
+
+    def feed(self, chunk: bytes) -> None:
+        if not isinstance(chunk, bytes):
+            return
+        context = self._context + chunk
+        candidate = classify_sftp_failure(context)
+        if candidate == "timeout" or self._failure_class == "timeout":
+            self._failure_class = "timeout"
+        elif candidate != "unknown":
+            self._failure_class = candidate
+        self._context = context[-self._CONTEXT_BYTES:]
+
+    def result(self) -> str:
+        return self._failure_class
+
+
 def _run_bounded_process(
     argv: Sequence[str], input_bytes: bytes, timeout_seconds: float, max_output_bytes: int,
     *, environment: Mapping[str, str] | None = None,
@@ -887,6 +1013,7 @@ def _run_bounded_process(
     stdout_size = 0
     stderr_size = 0
     overflow = threading.Event()
+    stderr_classifier = _SftpFailureClassifier()
 
     def drain(stream: object, retain: bool) -> None:
         nonlocal stdout_size, stderr_size
@@ -902,6 +1029,7 @@ def _run_bounded_process(
                 stdout_chunks.append(chunk)
             else:
                 stderr_size += len(chunk)
+                stderr_classifier.feed(chunk)
                 if stderr_size > max_output_bytes:
                     overflow.set()
                     return
@@ -940,11 +1068,19 @@ def _run_bounded_process(
         stderr_thread.join(timeout=1)
     # A descendant can retain a pipe after the LFTP parent exits.  Do not
     # synthesize completion from a partially drained stream in that case.
+    failure_class = stderr_classifier.result()
+    if timed_out:
+        failure_class = "timeout"
     if stdout_thread.is_alive() or stderr_thread.is_alive():
-        return SftpProcessResult(b"", returncode, truncated=True)
+        return SftpProcessResult(b"", returncode, truncated=True, failure_class=failure_class)
     if overflow.is_set():
-        return SftpProcessResult(b"".join(stdout_chunks), returncode, truncated=True)
-    return SftpProcessResult(b"".join(stdout_chunks), returncode, timed_out=timed_out)
+        return SftpProcessResult(
+            b"".join(stdout_chunks), returncode, truncated=True, failure_class=failure_class,
+        )
+    return SftpProcessResult(
+        b"".join(stdout_chunks), returncode, timed_out=timed_out,
+        failure_class=failure_class if (timed_out or returncode != 0) else None,
+    )
 
 
 def _stream_lftp_sha256(
@@ -1222,29 +1358,50 @@ class SourceManifestHarness:
         except Exception:
             raise _fail("protocol_failure")
         if isinstance(result, SftpProcessResult):
-            if result.failure_reason is not None:
-                raise _fail(result.failure_reason, result.failure_stage)
             if result.timed_out:
-                raise _fail("process_timeout")
+                if result.failure_reason is not None:
+                    raise _fail(result.failure_reason, result.failure_stage, "timeout")
+                raise _fail("process_timeout", failure_class="timeout")
+            if result.failure_reason is not None:
+                raise _fail(result.failure_reason, result.failure_stage, result.failure_class)
             if result.truncated:
-                raise _fail("output_truncated")
+                raise _fail("output_truncated", failure_class=result.failure_class)
             if result.sentinel_seen is False:
-                raise _fail("sentinel_missing")
+                raise _fail("sentinel_missing", failure_class=result.failure_class)
             if result.returncode != 0:
-                raise _fail("process_failed")
+                raise _fail("process_failed", failure_class=result.failure_class)
             output = result.stdout
         elif isinstance(result, Mapping):
             output = result.get("stdout")
-            if result.get("failure_reason") is not None:
-                raise _fail(str(result.get("failure_reason")), result.get("failure_stage") if isinstance(result.get("failure_stage"), str) else None)
             if result.get("timed_out"):
-                raise _fail("process_timeout")
+                if result.get("failure_reason") is not None:
+                    raise _fail(
+                        str(result.get("failure_reason")),
+                        result.get("failure_stage") if isinstance(result.get("failure_stage"), str) else None,
+                        "timeout",
+                    )
+                raise _fail("process_timeout", failure_class="timeout")
+            if result.get("failure_reason") is not None:
+                raise _fail(
+                    str(result.get("failure_reason")),
+                    result.get("failure_stage") if isinstance(result.get("failure_stage"), str) else None,
+                    result.get("failure_class") if isinstance(result.get("failure_class"), str) else None,
+                )
             if result.get("truncated"):
-                raise _fail("output_truncated")
+                raise _fail(
+                    "output_truncated",
+                    failure_class=result.get("failure_class") if isinstance(result.get("failure_class"), str) else None,
+                )
             if result.get("sentinel_seen") is False:
-                raise _fail("sentinel_missing")
+                raise _fail(
+                    "sentinel_missing",
+                    failure_class=result.get("failure_class") if isinstance(result.get("failure_class"), str) else None,
+                )
             if type(result.get("returncode", 0)) is not int or result.get("returncode", 0) != 0:
-                raise _fail("process_failed")
+                raise _fail(
+                    "process_failed",
+                    failure_class=result.get("failure_class") if isinstance(result.get("failure_class"), str) else None,
+                )
         elif isinstance(result, (bytes, str)):
             output = result
         elif isinstance(result, Iterable):

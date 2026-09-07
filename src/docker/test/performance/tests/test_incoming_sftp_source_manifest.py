@@ -388,6 +388,85 @@ def test_lftp_failure_stage_is_allowlisted_and_persisted_without_output():
     assert "sensitive" not in str(artifact)
 
 
+@pytest.mark.parametrize(("stderr", "failure_class"), [
+    (b"Permission denied (publickey,password) for private-user", "auth_config"),
+    (b"ssh: Could not resolve hostname private.example: Name or service not known", "dns"),
+    (b"ssh: connect to host private.example port 22: Connection refused", "connect"),
+    (b"Host key verification failed for private.example", "host_key"),
+    (b"subsystem request failed on channel 0", "protocol"),
+    (b"Connection timed out during banner exchange", "timeout"),
+    (b"Couldn't canonicalize remote path /private/source: No such file or directory", "remote_path"),
+    (b"Couldn't stat remote file /private/source/file.bin: No such file or directory", "stat"),
+])
+def test_sftp_failure_classifier_returns_only_fixed_vocabulary(stderr, failure_class):
+    assert manifest.classify_sftp_failure(stderr) == failure_class
+    assert manifest.classify_sftp_failure(stderr.decode("utf-8")) == failure_class
+
+
+def test_sftp_failure_classifier_uses_unknown_fallback_without_returning_stderr():
+    stderr = b"unrecognized diagnostic private-user private.example /private/source secret-token"
+    assert manifest.classify_sftp_failure(stderr) == "unknown"
+    assert manifest.classify_sftp_failure(b"\xff\xfe") == "unknown"
+
+
+def test_streaming_failure_classifier_keeps_timeout_over_later_conflicting_chunks():
+    classifier = manifest._SftpFailureClassifier()
+    classifier.feed(b"Host key verification failed")
+    classifier.feed(b"x" * 512)
+    classifier.feed(b"Connection timed ")
+    classifier.feed(b"out during banner exchange")
+    classifier.feed(b"x" * 512)
+    classifier.feed(b"Permission denied for private-user")
+    assert classifier.result() == "timeout"
+
+
+def test_bounded_process_classifies_stderr_without_retaining_it():
+    result = manifest._run_bounded_process(
+        [sys.executable, "-c", "import sys; sys.stderr.write('Host key verification failed for private.example'); sys.exit(1)"],
+        b"", 5, 1024,
+    )
+    assert result.returncode != 0
+    assert result.failure_class == "host_key"
+    assert not hasattr(result, "stderr")
+
+
+def test_failure_class_is_added_to_redacted_persistence_payload_without_raw_output():
+    harness = manifest.SourceManifestHarness(
+        ROOT, lambda _root: manifest.SftpProcessResult(
+            b"sensitive stdout", returncode=1,
+            failure_stage="listing", failure_reason="process_failed",
+            failure_class="dns",
+        ),
+    )
+    with pytest.raises(manifest.SourceManifestError) as raised:
+        harness.snapshot()
+    assert raised.value.failure_class == "dns"
+    assert manifest.redacted_manifest_error(raised.value) == {
+        "schema": "incoming-recovery-source-manifest-error.v1",
+        "reason": "process_failed", "stage": "listing", "failure_class": "dns",
+    }
+    assert "private.example" not in str(manifest.redacted_manifest_error(raised.value))
+
+
+@pytest.mark.parametrize("result", [
+    manifest.SftpProcessResult(
+        b"sensitive stdout", returncode=1, timed_out=True,
+        failure_stage="listing", failure_reason="process_failed", failure_class="dns",
+    ),
+    {
+        "stdout": b"sensitive stdout", "returncode": 1, "timed_out": True,
+        "failure_stage": "listing", "failure_reason": "process_failed", "failure_class": "dns",
+    },
+])
+def test_injected_timeout_forces_timeout_failure_class_for_result_and_mapping(result):
+    harness = manifest.SourceManifestHarness(ROOT, lambda _root: result)
+    with pytest.raises(manifest.SourceManifestError) as raised:
+        harness.snapshot()
+    assert raised.value.reason == "process_failed"
+    assert raised.value.stage == "listing"
+    assert raised.value.failure_class == "timeout"
+
+
 def test_remote_uri_is_host_only_and_credentials_are_separate():
     for remote in (
         "sftp://user@example.invalid", "sftp://example.invalid:22",
@@ -477,8 +556,12 @@ def test_root_only_preflight_fails_closed_for_missing_or_ambiguous_candidates(mo
     protocol = manifest.ReadOnlySftpProtocolRunner(host="remote.example")
     responses = {
         None: manifest.SftpProcessResult(_root_preflight_output("source_root_preflight_pwd", "/home/user")),
-        "files/Incoming": manifest.SftpProcessResult(b"source_root_preflight_open\n", returncode=1),
-        "/home/user/files/Incoming": manifest.SftpProcessResult(b"source_root_preflight_open\n", returncode=1),
+        "files/Incoming": manifest.SftpProcessResult(
+            b"source_root_preflight_open\n", returncode=1, timed_out=True, failure_class="dns",
+        ),
+        "/home/user/files/Incoming": manifest.SftpProcessResult(
+            b"source_root_preflight_open\n", returncode=1, failure_class="remote_path",
+        ),
     }
     monkeypatch.setattr(protocol, "root_preflight_process", lambda candidate, **_kwargs: responses[candidate])
     output_path = tmp_path / "missing.json"
@@ -487,6 +570,7 @@ def test_root_only_preflight_fails_closed_for_missing_or_ambiguous_candidates(mo
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["ambiguity"] == "missing"
     assert payload["reason"] == "root_candidate_missing"
+    assert payload["failure_class"] == "timeout"
 
     def ambiguous(candidate, **_kwargs):
         if candidate is None:
@@ -497,6 +581,16 @@ def test_root_only_preflight_fails_closed_for_missing_or_ambiguous_candidates(mo
     monkeypatch.setattr(protocol, "root_preflight_process", ambiguous)
     with pytest.raises(manifest.SourceManifestError, match="root_candidate_ambiguous"):
         manifest.RootOnlySftpPreflight(protocol).capture_to(tmp_path / "ambiguous.json", relative_root="files/Incoming", trusted_absolute_root=None)
+
+
+@pytest.mark.parametrize("failure_class", ["raw-secret", ["raw-secret"], {"failure_class": "raw-secret"}])
+def test_root_preflight_artifact_closes_invalid_direct_failure_class(failure_class):
+    result = manifest.RootPreflightResult(
+        None, (), "missing", "root_preflight", "root_candidate_missing", failure_class=failure_class,
+    )
+    artifact = result.as_artifact()
+    assert artifact["failure_class"] == "unknown"
+    assert "raw-secret" not in json.dumps(artifact)
 
 
 def test_root_only_process_script_is_strict_and_never_enumerates(monkeypatch):
