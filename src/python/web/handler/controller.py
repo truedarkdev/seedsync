@@ -1,5 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import json
 import os
 from threading import BoundedSemaphore, Event
 from typing import Optional, TypeGuard
@@ -140,6 +141,12 @@ class ControllerHandler(IHandler):
             "/server/command/retry_move/<file_name>",
             self.__handle_action_retry_move,
             required_scope="write"
+        )
+        web_app.add_post_handler(
+            "/server/command/remote_full_scan",
+            self.__handle_action_remote_full_scan,
+            required_scope="admin",
+            always_auth=True,
         )
         web_app.add_delete_handler(
             "/server/command/delete_local/<file_name>",
@@ -323,6 +330,19 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Move retry completed")
         return HTTPResponse(body=callback.error, status=callback.error_code)
+
+    def __handle_action_remote_full_scan(self) -> HTTPResponse:
+        result = self.__controller.request_remote_full_scan()
+        # A 202 confirms only that this one request reached force_scan(None);
+        # the existing scanner owner reports completion asynchronously.
+        status = 202 if result["accepted"] is True and result["reason"] == "enqueued" else (
+            403 if result["reason"] == "debug_gate_off" else 500
+        )
+        return HTTPResponse(
+            body=json.dumps(result, separators=(",", ":"), allow_nan=False),
+            status=status,
+            headers={"Content-Type": "application/json"},
+        )
 
     def __handle_action_extract(self, file_name: str) -> HTTPResponse:
         """

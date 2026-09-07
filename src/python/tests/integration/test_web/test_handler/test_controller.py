@@ -4,6 +4,8 @@ from threading import Event, Thread
 from unittest.mock import MagicMock, patch
 from urllib.parse import quote
 
+from webtest import TestApp
+
 from tests.integration.test_web.test_web_app import BaseTestWebApp
 from controller import Controller
 from web.handler.controller import ControllerHandler
@@ -41,6 +43,101 @@ class TestControllerHandler(BaseTestWebApp):
             self.assertEqual(ControllerHandler._ACTION_TIMEOUT, ControllerHandler._queue_action_timeout())
         with patch.dict("os.environ", {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"}):
             self.assertEqual(605.0, ControllerHandler._queue_action_timeout())
+
+    def test_remote_full_scan_requires_admin_authentication(self):
+        self.controller.request_remote_full_scan = MagicMock(return_value={
+            "schema": "remote_full_scan.v1",
+            "accepted": True,
+            "rejected": False,
+            "operation": "remote_full_scan",
+            "generation": 4,
+            "reason": "enqueued",
+        })
+
+        self.context.config.general.disable_browser_auth = True
+        unauthenticated = self.build_browser_test_app()
+        response = unauthenticated.post(
+            "/server/command/remote_full_scan", expect_errors=True,
+        )
+        self.assertEqual(401, response.status_int)
+        self.controller.request_remote_full_scan.assert_not_called()
+
+        write_secret = self.auth_store.create_api_key("integration-write", ["write"])["secret"]
+        write_app = TestApp(
+            self.web_app,
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(write_secret)},
+        )
+        response = write_app.post(
+            "/server/command/remote_full_scan", expect_errors=True,
+        )
+        self.assertEqual(403, response.status_int)
+        self.controller.request_remote_full_scan.assert_not_called()
+
+    def test_remote_full_scan_returns_fixed_authenticated_envelope(self):
+        expected = {
+            "schema": "remote_full_scan.v1",
+            "accepted": True,
+            "rejected": False,
+            "operation": "remote_full_scan",
+            "generation": 4,
+            "reason": "enqueued",
+        }
+        self.controller.request_remote_full_scan = MagicMock(return_value=expected)
+
+        response = self.test_app.post("/server/command/remote_full_scan")
+
+        self.assertEqual(202, response.status_int)
+        self.assertEqual("application/json", response.content_type)
+        self.assertEqual(expected, response.json)
+        self.controller.request_remote_full_scan.assert_called_once_with()
+
+    def test_remote_full_scan_returns_truthful_fixed_failure_envelope(self):
+        expected = {
+            "schema": "remote_full_scan.v1",
+            "accepted": False,
+            "rejected": True,
+            "operation": "remote_full_scan",
+            "generation": 9,
+            "reason": "dispatch_failed",
+        }
+        self.controller.request_remote_full_scan = MagicMock(return_value=expected)
+
+        response = self.test_app.post(
+            "/server/command/remote_full_scan", expect_errors=True,
+        )
+
+        self.assertEqual(500, response.status_int)
+        self.assertEqual("application/json", response.content_type)
+        self.assertEqual(set(expected), set(response.json))
+        self.assertEqual(expected, response.json)
+        self.assertNotIn("private", response.text)
+        self.controller.request_remote_full_scan.assert_called_once_with()
+
+    def test_remote_full_scan_gate_off_returns_fixed_rejection_envelope(self):
+        expected = {
+            "schema": "remote_full_scan.v1",
+            "accepted": False,
+            "rejected": True,
+            "operation": "remote_full_scan",
+            "generation": None,
+            "reason": "debug_gate_off",
+        }
+        self.controller.request_remote_full_scan = MagicMock(return_value=expected)
+
+        with patch.dict("os.environ", {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "599"}):
+            response = self.test_app.post(
+                "/server/command/remote_full_scan", expect_errors=True,
+            )
+
+        self.assertEqual(403, response.status_int)
+        self.assertEqual("application/json", response.content_type)
+        self.assertEqual(
+            {"schema", "accepted", "rejected", "operation", "generation", "reason"},
+            set(response.json),
+        )
+        self.assertEqual(expected, response.json)
+        self.assertNotIn("private", response.text)
+        self.controller.request_remote_full_scan.assert_called_once_with()
 
     @staticmethod
     def __model_file(name: str, file_id: str, path_pair_id: str = None):

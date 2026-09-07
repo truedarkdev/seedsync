@@ -578,12 +578,35 @@ class Controller:
     # generation/failure policy and is intentionally not covered here.
     _DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS = Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
     _EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV = "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS"
+    _REMOTE_FULL_SCAN_OPERATION = "remote_full_scan"
+    _REMOTE_FULL_SCAN_SCHEMA = "remote_full_scan.v1"
+    _REMOTE_FULL_SCAN_MAX_GENERATION = 2_147_483_647
+
+    @classmethod
+    def _incoming_recovery_debug_enabled(cls) -> bool:
+        """Return true only for the exact maintainer-authorized debug image gate."""
+        return os.environ.get(cls._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV) == "600"
 
     @classmethod
     def _initial_rescan_timeout_seconds(cls) -> float:
         """Use the maintainer-authorized 600s diagnostic window only when exact."""
-        return 600.0 if os.environ.get(cls._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV) == "600" \
+        return 600.0 if cls._incoming_recovery_debug_enabled() \
             else cls._DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS
+
+    @classmethod
+    def _remote_full_scan_result(
+            cls, accepted: bool, generation: object, reason: str,
+    ) -> dict[str, object]:
+        bounded_generation = generation if type(generation) is int and \
+            0 <= generation <= cls._REMOTE_FULL_SCAN_MAX_GENERATION else None
+        return {
+            "schema": cls._REMOTE_FULL_SCAN_SCHEMA,
+            "accepted": accepted,
+            "rejected": not accepted,
+            "operation": cls._REMOTE_FULL_SCAN_OPERATION,
+            "generation": bounded_generation,
+            "reason": reason,
+        }
 
     __context: Context
     __persist: ControllerPersist
@@ -4499,6 +4522,31 @@ class Controller:
         """
         with self.__model_lock:
             self.__model.remove_listener(listener)
+
+    def request_remote_full_scan(self) -> dict[str, object]:
+        """Enqueue one gated full scan; acceptance does not assert scan completion."""
+        if not self._incoming_recovery_debug_enabled():
+            return self._remote_full_scan_result(False, None, "debug_gate_off")
+
+        remote_scan_process = getattr(self, "_Controller__remote_scan_process", None)
+        force_scan = getattr(remote_scan_process, "force_scan", None)
+        if not callable(force_scan):
+            return self._remote_full_scan_result(False, None, "remote_scanner_unavailable")
+
+        try:
+            force_scan(None)
+        except Exception:
+            try:
+                generation = getattr(remote_scan_process, "generation", None)
+            except Exception:
+                generation = None
+            return self._remote_full_scan_result(False, generation, "dispatch_failed")
+
+        try:
+            generation = getattr(remote_scan_process, "generation", None)
+        except Exception:
+            generation = None
+        return self._remote_full_scan_result(True, generation, "enqueued")
 
     def prioritize_path_pair_scan(self, path_pair_id: str) -> None:
         """Move the browser-selected pair ahead of an in-flight full scan."""
