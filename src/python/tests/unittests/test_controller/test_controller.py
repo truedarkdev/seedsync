@@ -11975,9 +11975,11 @@ class TestController(unittest.TestCase):
         with patch.dict(os.environ, {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"}):
             self.assertEqual(600.0, Controller._initial_rescan_timeout_seconds())
 
-    def test_remote_full_scan_gate_off_rejects_without_scanner_call(self):
+    def test_full_scan_gate_off_rejects_without_scanner_call(self):
         remote_process = self.controller._Controller__remote_scan_process
         remote_process.force_scan = MagicMock()
+        local_process = self.controller._Controller__local_scan_process
+        local_process.force_scan = MagicMock()
 
         for gate_value in (None, "", "599", "600.0", "0600", "600 ", "1"):
             with self.subTest(gate_value=gate_value):
@@ -11985,63 +11987,139 @@ class TestController(unittest.TestCase):
                     "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": gate_value,
                 }
                 with patch.dict(os.environ, environment, clear=True):
-                    result = self.controller.request_remote_full_scan()
+                    result = self.controller.request_full_scan()
 
                 self.assertEqual(
                     {
-                        "schema": "remote_full_scan.v1",
+                        "schema": "full_scan.v1",
                         "accepted": False,
                         "rejected": True,
-                        "operation": "remote_full_scan",
-                        "generation": None,
+                        "operation": "full_scan",
+                        "local_generation": None,
+                        "remote_generation": None,
+                        "dispatch": "none",
                         "reason": "debug_gate_off",
                     },
                     result,
                 )
         remote_process.force_scan.assert_not_called()
+        local_process.force_scan.assert_not_called()
 
-    def test_remote_full_scan_uses_existing_remote_owner_once_without_lifecycle_side_effects(self):
+    def test_full_scan_dispatches_local_then_remote_once_without_lifecycle_side_effects(self):
         active_process = self.controller._Controller__active_scan_process
         local_process = self.controller._Controller__local_scan_process
         remote_process = self.controller._Controller__remote_scan_process
+        local_process.generation = 16
         remote_process.generation = 17
-        remote_process.force_scan = MagicMock()
+        dispatch_order = []
+        local_process.force_scan = MagicMock(side_effect=lambda target: dispatch_order.append("local"))
+        remote_process.force_scan = MagicMock(side_effect=lambda target: dispatch_order.append("remote"))
 
         with patch.dict(
                 os.environ,
                 {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
         ):
-            result = self.controller.request_remote_full_scan()
+            result = self.controller.request_full_scan()
 
         self.assertTrue(result["accepted"])
         self.assertFalse(result["rejected"])
-        self.assertEqual("remote_full_scan", result["operation"])
-        self.assertEqual(17, result["generation"])
+        self.assertEqual("full_scan", result["operation"])
+        self.assertEqual(16, result["local_generation"])
+        self.assertEqual(17, result["remote_generation"])
+        self.assertEqual("both", result["dispatch"])
         self.assertEqual("enqueued", result["reason"])
+        self.assertEqual(["local", "remote"], dispatch_order)
+        local_process.force_scan.assert_called_once_with(None)
         remote_process.force_scan.assert_called_once_with(None)
         active_process.force_scan.assert_not_called()
-        local_process.force_scan.assert_not_called()
         self.controller._Controller__persist.assert_not_called()
         self.assertEqual([], list(self.controller._Controller__command_queue.queue))
 
-    def test_remote_full_scan_reports_dispatch_failure_without_raw_error(self):
+    def test_full_scan_reports_partial_dispatch_without_raw_error(self):
+        local_process = self.controller._Controller__local_scan_process
         remote_process = self.controller._Controller__remote_scan_process
+        local_process.generation = 18
         remote_process.generation = 19
+        local_process.force_scan = MagicMock()
         remote_process.force_scan = MagicMock(side_effect=RuntimeError("private/path"))
 
         with patch.dict(
                 os.environ,
                 {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
         ):
-            result = self.controller.request_remote_full_scan()
+            result = self.controller.request_full_scan()
 
+        self.assertEqual("partial_dispatch", result["reason"])
+        self.assertFalse(result["accepted"])
+        self.assertTrue(result["rejected"])
+        self.assertEqual(18, result["local_generation"])
+        self.assertEqual(19, result["remote_generation"])
+        self.assertEqual("local", result["dispatch"])
+        self.assertNotIn("private/path", str(result))
+        local_process.force_scan.assert_called_once_with(None)
+        remote_process.force_scan.assert_called_once_with(None)
+        self.controller._Controller__persist.assert_not_called()
+
+    def test_full_scan_reports_remote_only_partial_when_local_dispatch_fails(self):
+        local_process = self.controller._Controller__local_scan_process
+        remote_process = self.controller._Controller__remote_scan_process
+        local_process.generation = 20
+        remote_process.generation = 21
+        local_process.force_scan = MagicMock(side_effect=RuntimeError("local/private"))
+        remote_process.force_scan = MagicMock()
+
+        with patch.dict(
+                os.environ,
+                {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
+        ):
+            result = self.controller.request_full_scan()
+
+        self.assertEqual("partial_dispatch", result["reason"])
+        self.assertFalse(result["accepted"])
+        self.assertTrue(result["rejected"])
+        self.assertEqual(20, result["local_generation"])
+        self.assertEqual(21, result["remote_generation"])
+        self.assertEqual("remote", result["dispatch"])
+        self.assertNotIn("local/private", str(result))
+        local_process.force_scan.assert_called_once_with(None)
+        remote_process.force_scan.assert_called_once_with(None)
+        self.controller._Controller__persist.assert_not_called()
+
+    def test_full_scan_reports_no_dispatch_when_both_scanners_fail_without_raw_error(self):
+        local_process = self.controller._Controller__local_scan_process
+        remote_process = self.controller._Controller__remote_scan_process
+        local_process.force_scan = MagicMock(side_effect=RuntimeError("local/private"))
+        remote_process.force_scan = MagicMock(side_effect=RuntimeError("remote/private"))
+
+        with patch.dict(
+                os.environ,
+                {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
+        ):
+            result = self.controller.request_full_scan()
+
+        self.assertEqual("none", result["dispatch"])
         self.assertEqual("dispatch_failed", result["reason"])
         self.assertFalse(result["accepted"])
         self.assertTrue(result["rejected"])
-        self.assertEqual(19, result["generation"])
-        self.assertNotIn("private/path", str(result))
+        self.assertNotIn("private", str(result))
+        local_process.force_scan.assert_called_once_with(None)
         remote_process.force_scan.assert_called_once_with(None)
-        self.controller._Controller__persist.assert_not_called()
+
+    def test_full_scan_checks_both_force_scan_callables_before_dispatch(self):
+        local_process = self.controller._Controller__local_scan_process
+        remote_process = self.controller._Controller__remote_scan_process
+        local_process.force_scan = MagicMock()
+        del remote_process.force_scan
+
+        with patch.dict(
+                os.environ,
+                {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
+        ):
+            result = self.controller.request_full_scan()
+
+        self.assertEqual("none", result["dispatch"])
+        self.assertEqual("scanner_unavailable", result["reason"])
+        local_process.force_scan.assert_not_called()
 
     def test_experimental_progress_buckets_are_monotonic_deduplicated_and_identity_free(self):
         trace = BreadcrumbTraceCollector(

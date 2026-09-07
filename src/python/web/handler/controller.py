@@ -143,8 +143,8 @@ class ControllerHandler(IHandler):
             required_scope="write"
         )
         web_app.add_post_handler(
-            "/server/command/remote_full_scan",
-            self.__handle_action_remote_full_scan,
+            "/server/command/full_scan",
+            self.__handle_action_full_scan,
             required_scope="admin",
             always_auth=True,
         )
@@ -331,12 +331,14 @@ class ControllerHandler(IHandler):
             return HTTPResponse(body="Move retry completed")
         return HTTPResponse(body=callback.error, status=callback.error_code)
 
-    def __handle_action_remote_full_scan(self) -> HTTPResponse:
-        result = self.__controller.request_remote_full_scan()
-        # A 202 confirms only that this one request reached force_scan(None);
-        # the existing scanner owner reports completion asynchronously.
-        status = 202 if result["accepted"] is True and result["reason"] == "enqueued" else (
-            403 if result["reason"] == "debug_gate_off" else 500
+    def __handle_action_full_scan(self) -> HTTPResponse:
+        result = self.__controller.request_full_scan()
+        # A 202 confirms only that both existing scanners accepted the request;
+        # their owners report scan completion asynchronously.
+        reason = result.get("reason")
+        status = 202 if result.get("accepted") is True and \
+            result.get("dispatch") == "both" and reason == "enqueued" else (
+            403 if reason == "debug_gate_off" else 500
         )
         return HTTPResponse(
             body=json.dumps(result, separators=(",", ":"), allow_nan=False),

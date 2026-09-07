@@ -7,6 +7,7 @@ import tempfile
 from copy import copy
 from concurrent.futures import Future
 from datetime import datetime, timedelta
+from queue import Queue
 from threading import RLock
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -921,6 +922,171 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(1, snapshot["durations"][DURATION_MODEL_UPDATE_LOCK_HOLD]["count"])
         self.assertNotIn("path-pair-a", str(snapshot))
         self.assertNotIn("sample-remote-root", str(snapshot))
+
+    def test_full_scan_control_reconciles_both_sides_without_queue_or_data_effects(self):
+        local_process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+        remote_process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+        self.addCleanup(local_process.close_queues)
+        self.addCleanup(remote_process.close_queues)
+        local_session = local_process.session_token
+        remote_session = remote_process.session_token
+
+        def scan_result(name, generation, session_token, *, full):
+            root = SystemFile(name, 1)
+            return ScannerResult(
+                datetime.now(), [root],
+                scanned_path_pair_ids={None}, completed_path_pair_ids={None},
+                generation=generation, is_progress=True, is_scan_final=True,
+                session_token=session_token, is_full_snapshot=full,
+                full_snapshot_path_pair_ids={None} if full else set(),
+            )
+
+        initial_remote = scan_result("remote-root", 1, remote_session, full=False)
+        initial_local = scan_result("local-root", 1, local_session, full=False)
+        builder = ModelBuilder()
+        builder.set_remote_files(initial_remote.files)
+        builder.set_local_files(initial_local.files)
+        controller, builder = self._make_progressive_update_controller(
+            initial_remote, initial_local, model_builder=builder, model=builder.build_model(),
+        )
+        controller._Controller__local_scan_process = local_process
+        controller._Controller__remote_scan_process = remote_process
+        controller.request_full_scan = Controller.request_full_scan.__get__(controller, Controller)
+        controller._incoming_recovery_debug_enabled = Controller._incoming_recovery_debug_enabled
+        controller._full_scan_result = Controller._full_scan_result
+        controller._full_scan_generation = Controller._full_scan_generation
+        controller._Controller__command_queue = Queue()
+
+        def publish(process, result):
+            process._ScannerProcess__publish_result(result)
+
+        updater = ModelUpdater(controller)
+        local_initial = scan_result("local-root", 1, local_session, full=False)
+        remote_initial = scan_result("remote-root", 1, remote_session, full=False)
+        publish(local_process, local_initial)
+        publish(remote_process, remote_initial)
+        updater.update()
+        initial_authority = controller._Controller__scan_authority_snapshot
+        self.assertFalse(initial_authority["final"])
+        self.assertFalse(initial_authority["full"], initial_authority)
+
+        # Stale generation and session rows are consumed by the real
+        # ScannerProcess queue but rejected by the accumulator fence.
+        publish(remote_process, scan_result("stale-root", 0, remote_session, full=True))
+        publish(remote_process, scan_result("stale-session-root", 99, "stale-remote-session", full=True))
+        updater.update()
+        self.assertEqual(remote_session, controller._Controller__progressive_remote_scan_state.session_token)
+        self.assertEqual({(None, "remote-root")}, set(
+            controller._Controller__progressive_remote_scan_state.snapshot()
+        ))
+
+        persisted_before = set(controller._Controller__persist.downloaded_file_names)
+        with patch.dict(os.environ, {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"}):
+            result = controller.request_full_scan()
+        self.assertEqual("both", result["dispatch"])
+        self.assertEqual("enqueued", result["reason"])
+        self.assertTrue(controller._Controller__command_queue.empty())
+        self.assertEqual(persisted_before, controller._Controller__persist.downloaded_file_names)
+
+        publish(local_process, scan_result("local-root", 2, local_session, full=True))
+        updater.update()
+        local_first_authority = controller._Controller__scan_authority_snapshot
+        self.assertFalse(local_first_authority["full"], local_first_authority)
+
+        publish(remote_process, scan_result("remote-root", 2, remote_session, full=True))
+        updater.update()
+        final_authority = controller._Controller__scan_authority_snapshot
+        self.assertTrue(final_authority["final"])
+        self.assertTrue(final_authority["full"], final_authority)
+        self.assertEqual(2, final_authority["local_scan_generation"])
+        self.assertEqual(2, final_authority["remote_scan_generation"])
+
+        # A newer non-full local generation revokes standing full authority.
+        publish(local_process, scan_result("local-delta", 3, local_session, full=False))
+        updater.update()
+        revoked_authority = controller._Controller__scan_authority_snapshot
+        self.assertFalse(revoked_authority["full"], revoked_authority)
+
+        # Exercise the opposite arrival order: remote full alone is still
+        # incomplete until the local side restores its current generation.
+        publish(remote_process, scan_result("remote-root", 3, remote_session, full=True))
+        updater.update()
+        remote_first_authority = controller._Controller__scan_authority_snapshot
+        self.assertFalse(remote_first_authority["full"], remote_first_authority)
+
+        publish(local_process, scan_result("local-root", 3, local_session, full=True))
+        updater.update()
+        final_authority = controller._Controller__scan_authority_snapshot
+        self.assertTrue(final_authority["final"])
+        self.assertTrue(final_authority["full"], final_authority)
+        self.assertEqual(3, final_authority["local_scan_generation"])
+        self.assertEqual(3, final_authority["remote_scan_generation"])
+        self.assertEqual(local_session, controller._Controller__progressive_local_scan_state.session_token)
+        self.assertEqual(remote_session, controller._Controller__progressive_remote_scan_state.session_token)
+        self.assertEqual(persisted_before, controller._Controller__persist.downloaded_file_names)
+
+        authority_fields = (
+            "local_scan_generation", "remote_scan_generation", "final", "full",
+            "scanned_pair_count", "completed_pair_count", "unknown_pair_count",
+            "joint_final", "joint_authoritative_after", "joint_authoritative",
+            "publication_required", "outcome", "reason", "comparison_proven_count",
+            "delta_count", "staged_bucket_count", "adopted_bucket_count",
+            "local_noop_count", "unknown_overlay_after_count",
+            "raw_local_reconciliation_after_count", "effective_local_reconciliation_after_count",
+            "pair_delta_allowed", "pair_delta_fallback",
+        )
+
+        def authority_state(snapshot):
+            return {field: snapshot.get(field) for field in authority_fields}
+
+        standing_full_state = authority_state(final_authority)
+
+        # Once joint full authority is established, a later stale row from the
+        # same scanner session must not become a current partial publication.
+        publish(remote_process, scan_result("stale-after-full", 2, remote_session, full=True))
+        updater.update()
+        same_session_stale_state = authority_state(controller._Controller__scan_authority_snapshot)
+
+        # A row from a replaced scanner session is independently rejected and
+        # must preserve the same standing authority.
+        publish(remote_process, scan_result("mismatched-after-full", 99, "stale-remote-session", full=True))
+        updater.update()
+        mismatched_session_state = authority_state(controller._Controller__scan_authority_snapshot)
+
+        self.assertEqual(
+            {
+                "standing_full": standing_full_state,
+                "same_session_stale": standing_full_state,
+                "mismatched_session": standing_full_state,
+            },
+            {
+                "standing_full": standing_full_state,
+                "same_session_stale": same_session_stale_state,
+                "mismatched_session": mismatched_session_state,
+            },
+        )
+
+    def test_nonfull_completion_marker_does_not_complete_or_mark_pair_full(self):
+        accumulator = _ProgressiveScanAccumulator()
+        initial = ScannerResult(
+            datetime.now(), [SystemFile("root", 1)], scanned_path_pair_ids={"pair"},
+            completed_path_pair_ids={"pair"}, generation=1, is_progress=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+        )
+        self.assertTrue(accumulator.apply([initial]).is_full_snapshot)
+
+        nonfull = ScannerResult(
+            datetime.now(), [SystemFile("changed", 2)], scanned_path_pair_ids={"pair"},
+            completed_path_pair_ids={"pair"}, generation=2, is_progress=True,
+            is_scan_final=True,
+        )
+        result = accumulator.apply([nonfull])
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result.is_scan_final)
+        self.assertFalse(result.is_full_snapshot)
+        self.assertNotIn("pair", accumulator.completed_pairs())
+        self.assertIn("pair", accumulator.incomplete_pairs())
 
     def test_scan_authority_breadcrumb_is_aggregate_queryable_and_sanitized(self):
         remote = ScannerResult(
@@ -2709,8 +2875,7 @@ class TestModelUpdater(unittest.TestCase):
             ),
         ])
 
-        self.assertFalse(result.failed)
-        self.assertEqual(set(), result.scanned_path_pair_ids)
+        self.assertIsNone(result)
         self.assertEqual({("pair", "root")}, set(accumulator.snapshot()))
 
     def test_progressive_full_snapshot_touches_only_actual_pair_changes(self):
@@ -3074,8 +3239,8 @@ class TestModelUpdater(unittest.TestCase):
             ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
                           is_progress=True, root_names=set(), completed_path_pair_ids={"pair"}),
         ])
-        self.assertIsNotNone(stale)
-        self.assertEqual(2, stale.files[0].size)
+        self.assertIsNone(stale)
+        self.assertEqual({("pair", "a")}, set(accumulator.snapshot()))
 
     def test_progressive_accumulator_rejects_stale_full_snapshot(self):
         accumulator = _ProgressiveScanAccumulator()

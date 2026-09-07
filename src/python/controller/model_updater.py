@@ -1854,6 +1854,7 @@ class _ProgressiveScanAccumulator:
         malformed: list[str] = []
         managed: list[str] = []
         failed = False
+        full_snapshot_completed: set[Optional[str]] = set()
         drain_recoverable_path_pair_ids: set[Optional[str]] = set()
         drain_terminal_path_pair_ids: set[Optional[str]] = set()
         error_message: Optional[str] = None
@@ -1898,6 +1899,7 @@ class _ProgressiveScanAccumulator:
                     continue
                 if generation > previous_generation:
                     self.__active_generation[pair_id] = generation
+                    full_snapshot_completed.discard(pair_id)
                     self.__incomplete_pairs.add(pair_id)
                     self.__completed_pairs.discard(pair_id)
                     completed.discard(pair_id)
@@ -2035,6 +2037,7 @@ class _ProgressiveScanAccumulator:
                     if previous_file != file:
                         self.__last_touched_keys.add((pair_id, file.name))
                 if full_snapshot:
+                    full_snapshot_completed.add(pair_id)
                     self.__manifests.setdefault(generation, {})[pair_id] = set(working)
                 # A progressive completion marker can arrive after earlier
                 # root batches were evicted from the bounded queue.  Do not
@@ -2085,7 +2088,7 @@ class _ProgressiveScanAccumulator:
             if event_stale_rejected and root_shape_trace is not None:
                 root_shape_trace["stale_rejected_event_count"] += 1
 
-        if not had_progress_event and not touched and not failed and not completed:
+        if not touched and not failed and not completed:
             if root_shape_trace is not None:
                 root_shape_trace["committed_root_count"] = sum(
                     len(files) for files in self.__committed_by_pair.values()
@@ -2119,6 +2122,10 @@ class _ProgressiveScanAccumulator:
             if self.__active_generation.get(path_pair_id) == generation
             and path_pair_id in published_incomplete
         }.difference(self.__recoverable_incomplete_pairs)
+        aggregate_full_snapshot_path_pair_ids = completed.intersection(full_snapshot_completed)
+        aggregate_is_full_snapshot = bool(completed) and \
+            not published_incomplete and not failed and \
+            aggregate_full_snapshot_path_pair_ids == completed
         if root_shape_trace is not None:
             root_shape_trace["committed_root_count"] = sum(
                 len(files) for files in self.__committed_by_pair.values()
@@ -2155,6 +2162,10 @@ class _ProgressiveScanAccumulator:
             completed_path_pair_ids=completed,
             unknown_path_pair_ids=published_incomplete,
             is_scan_final=bool(completed) and not published_incomplete and not failed,
+            is_full_snapshot=aggregate_is_full_snapshot,
+            full_snapshot_path_pair_ids=(
+                aggregate_full_snapshot_path_pair_ids if aggregate_is_full_snapshot else set()
+            ),
             is_targeted_scan=any(
                 bool(getattr(event, "is_targeted_scan", False)) for event in accepted
             ),
@@ -8412,8 +8423,18 @@ class ModelUpdater(_ControllerCoreAccess):
             scan_authority_trace_enabled = _controller_breadcrumb_effectively_enabled(
                 controller, "scan.authority", "info",
             )
-            def scan_full(result: Optional[ScannerResult]) -> bool:
-                return result is not None and bool(getattr(result, "is_full_snapshot", False))
+            def scan_full(side: str, result: Optional[ScannerResult]) -> bool:
+                # A current result owns its full marker.  When one side is
+                # absent from this tick, retain only that side's settled
+                # accumulator authority until its generation/session/failure
+                # state clears completion.
+                if result is not None:
+                    return bool(getattr(result, "is_full_snapshot", False))
+                accumulator = getattr(
+                    controller, "_Controller__progressive_{}_scan_state".format(side), None,
+                )
+                return isinstance(accumulator, _ProgressiveScanAccumulator) and \
+                    bool(accumulator.completed_pairs()) and not accumulator.incomplete_pairs()
 
             local_scanned_pair_count = scan_pair_count(latest_local_scan, "scanned_path_pair_ids") \
                 if latest_local_scan is not None else 0
@@ -8427,8 +8448,8 @@ class ModelUpdater(_ControllerCoreAccess):
                 if latest_local_scan is not None else 0
             remote_unknown_pair_count = scan_pair_count(latest_remote_scan, "unknown_path_pair_ids") \
                 if latest_remote_scan is not None else 0
-            local_full = scan_full(latest_local_scan)
-            remote_full = scan_full(latest_remote_scan)
+            local_full = scan_full("local", latest_local_scan)
+            remote_full = scan_full("remote", latest_remote_scan)
             local_final = scan_final_relevant("local", latest_local_scan)
             remote_final = scan_final_relevant("remote", latest_remote_scan)
             joint_authoritative_before = joint_authoritative_before_event

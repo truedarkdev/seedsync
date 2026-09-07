@@ -578,9 +578,9 @@ class Controller:
     # generation/failure policy and is intentionally not covered here.
     _DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS = Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
     _EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV = "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS"
-    _REMOTE_FULL_SCAN_OPERATION = "remote_full_scan"
-    _REMOTE_FULL_SCAN_SCHEMA = "remote_full_scan.v1"
-    _REMOTE_FULL_SCAN_MAX_GENERATION = 2_147_483_647
+    _FULL_SCAN_OPERATION = "full_scan"
+    _FULL_SCAN_SCHEMA = "full_scan.v1"
+    _FULL_SCAN_MAX_GENERATION = 2_147_483_647
 
     @classmethod
     def _incoming_recovery_debug_enabled(cls) -> bool:
@@ -594,19 +594,37 @@ class Controller:
             else cls._DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS
 
     @classmethod
-    def _remote_full_scan_result(
-            cls, accepted: bool, generation: object, reason: str,
+    def _full_scan_result(
+            cls,
+            accepted: bool,
+            local_generation: object,
+            remote_generation: object,
+            dispatch: str,
+            reason: str,
     ) -> dict[str, object]:
-        bounded_generation = generation if type(generation) is int and \
-            0 <= generation <= cls._REMOTE_FULL_SCAN_MAX_GENERATION else None
+        def bounded_generation(generation: object) -> int | None:
+            return generation if type(generation) is int and \
+                0 <= generation <= cls._FULL_SCAN_MAX_GENERATION else None
+
         return {
-            "schema": cls._REMOTE_FULL_SCAN_SCHEMA,
+            "schema": cls._FULL_SCAN_SCHEMA,
             "accepted": accepted,
             "rejected": not accepted,
-            "operation": cls._REMOTE_FULL_SCAN_OPERATION,
-            "generation": bounded_generation,
+            "operation": cls._FULL_SCAN_OPERATION,
+            "local_generation": bounded_generation(local_generation),
+            "remote_generation": bounded_generation(remote_generation),
+            "dispatch": dispatch,
             "reason": reason,
         }
+
+    @classmethod
+    def _full_scan_generation(cls, scan_process: object) -> int | None:
+        try:
+            generation = getattr(scan_process, "generation", None)
+        except Exception:
+            return None
+        return generation if type(generation) is int and \
+            0 <= generation <= cls._FULL_SCAN_MAX_GENERATION else None
 
     __context: Context
     __persist: ControllerPersist
@@ -4523,30 +4541,55 @@ class Controller:
         with self.__model_lock:
             self.__model.remove_listener(listener)
 
-    def request_remote_full_scan(self) -> dict[str, object]:
-        """Enqueue one gated full scan; acceptance does not assert scan completion."""
+    def request_full_scan(self) -> dict[str, object]:
+        """Enqueue one gated local/remote full scan without asserting completion.
+
+        The local scanner is dispatched before the remote scanner in a fixed
+        order.  Both callables are checked before either one is invoked so a
+        missing scanner cannot produce a one-sided request accidentally.
+        """
         if not self._incoming_recovery_debug_enabled():
-            return self._remote_full_scan_result(False, None, "debug_gate_off")
+            return self._full_scan_result(False, None, None, "none", "debug_gate_off")
 
+        local_scan_process = getattr(self, "_Controller__local_scan_process", None)
         remote_scan_process = getattr(self, "_Controller__remote_scan_process", None)
-        force_scan = getattr(remote_scan_process, "force_scan", None)
-        if not callable(force_scan):
-            return self._remote_full_scan_result(False, None, "remote_scanner_unavailable")
+        try:
+            local_force_scan = getattr(local_scan_process, "force_scan", None)
+            remote_force_scan = getattr(remote_scan_process, "force_scan", None)
+        except Exception:
+            return self._full_scan_result(False, None, None, "none", "scanner_unavailable")
+        if not callable(local_force_scan) or not callable(remote_force_scan):
+            return self._full_scan_result(False, None, None, "none", "scanner_unavailable")
+
+        local_dispatched = False
+        remote_dispatched = False
+        try:
+            local_force_scan(None)
+            local_dispatched = True
+        except Exception:
+            pass
 
         try:
-            force_scan(None)
+            remote_force_scan(None)
+            remote_dispatched = True
         except Exception:
-            try:
-                generation = getattr(remote_scan_process, "generation", None)
-            except Exception:
-                generation = None
-            return self._remote_full_scan_result(False, generation, "dispatch_failed")
+            pass
 
-        try:
-            generation = getattr(remote_scan_process, "generation", None)
-        except Exception:
-            generation = None
-        return self._remote_full_scan_result(True, generation, "enqueued")
+        dispatch = (
+            "both" if local_dispatched and remote_dispatched else
+            "local" if local_dispatched else
+            "remote" if remote_dispatched else
+            "none"
+        )
+        return self._full_scan_result(
+            local_dispatched and remote_dispatched,
+            self._full_scan_generation(local_scan_process),
+            self._full_scan_generation(remote_scan_process),
+            dispatch,
+            "enqueued" if dispatch == "both" else (
+                "partial_dispatch" if dispatch != "none" else "dispatch_failed"
+            ),
+        )
 
     def prioritize_path_pair_scan(self, path_pair_id: str) -> None:
         """Move the browser-selected pair ahead of an in-flight full scan."""

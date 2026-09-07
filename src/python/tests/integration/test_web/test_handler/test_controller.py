@@ -44,23 +44,25 @@ class TestControllerHandler(BaseTestWebApp):
         with patch.dict("os.environ", {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"}):
             self.assertEqual(605.0, ControllerHandler._queue_action_timeout())
 
-    def test_remote_full_scan_requires_admin_authentication(self):
-        self.controller.request_remote_full_scan = MagicMock(return_value={
-            "schema": "remote_full_scan.v1",
+    def test_full_scan_requires_admin_authentication(self):
+        self.controller.request_full_scan = MagicMock(return_value={
+            "schema": "full_scan.v1",
             "accepted": True,
             "rejected": False,
-            "operation": "remote_full_scan",
-            "generation": 4,
+            "operation": "full_scan",
+            "local_generation": 4,
+            "remote_generation": 5,
+            "dispatch": "both",
             "reason": "enqueued",
         })
 
         self.context.config.general.disable_browser_auth = True
         unauthenticated = self.build_browser_test_app()
         response = unauthenticated.post(
-            "/server/command/remote_full_scan", expect_errors=True,
+            "/server/command/full_scan", expect_errors=True,
         )
         self.assertEqual(401, response.status_int)
-        self.controller.request_remote_full_scan.assert_not_called()
+        self.controller.request_full_scan.assert_not_called()
 
         write_secret = self.auth_store.create_api_key("integration-write", ["write"])["secret"]
         write_app = TestApp(
@@ -68,42 +70,72 @@ class TestControllerHandler(BaseTestWebApp):
             extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(write_secret)},
         )
         response = write_app.post(
-            "/server/command/remote_full_scan", expect_errors=True,
+            "/server/command/full_scan", expect_errors=True,
         )
         self.assertEqual(403, response.status_int)
-        self.controller.request_remote_full_scan.assert_not_called()
+        self.controller.request_full_scan.assert_not_called()
 
-    def test_remote_full_scan_returns_fixed_authenticated_envelope(self):
+    def test_full_scan_returns_fixed_authenticated_envelope(self):
         expected = {
-            "schema": "remote_full_scan.v1",
+            "schema": "full_scan.v1",
             "accepted": True,
             "rejected": False,
-            "operation": "remote_full_scan",
-            "generation": 4,
+            "operation": "full_scan",
+            "local_generation": 4,
+            "remote_generation": 5,
+            "dispatch": "both",
             "reason": "enqueued",
         }
-        self.controller.request_remote_full_scan = MagicMock(return_value=expected)
+        self.controller.request_full_scan = MagicMock(return_value=expected)
 
-        response = self.test_app.post("/server/command/remote_full_scan")
+        response = self.test_app.post("/server/command/full_scan")
 
         self.assertEqual(202, response.status_int)
         self.assertEqual("application/json", response.content_type)
         self.assertEqual(expected, response.json)
-        self.controller.request_remote_full_scan.assert_called_once_with()
+        self.controller.request_full_scan.assert_called_once_with()
 
-    def test_remote_full_scan_returns_truthful_fixed_failure_envelope(self):
+    def test_full_scan_rejects_inconsistent_success_envelopes(self):
+        base = {
+            "schema": "full_scan.v1",
+            "accepted": True,
+            "rejected": False,
+            "operation": "full_scan",
+            "local_generation": 4,
+            "remote_generation": 5,
+            "dispatch": "both",
+            "reason": "enqueued",
+        }
+        for field, value in (
+                ("accepted", False),
+                ("dispatch", "local"),
+                ("reason", "partial_dispatch"),
+        ):
+            with self.subTest(field=field):
+                envelope = dict(base)
+                envelope[field] = value
+                self.controller.request_full_scan = MagicMock(return_value=envelope)
+                response = self.test_app.post(
+                    "/server/command/full_scan", expect_errors=True,
+                )
+                self.assertEqual(500, response.status_int)
+                self.assertEqual(envelope, response.json)
+
+    def test_full_scan_returns_truthful_fixed_failure_envelope(self):
         expected = {
-            "schema": "remote_full_scan.v1",
+            "schema": "full_scan.v1",
             "accepted": False,
             "rejected": True,
-            "operation": "remote_full_scan",
-            "generation": 9,
-            "reason": "dispatch_failed",
+            "operation": "full_scan",
+            "local_generation": 9,
+            "remote_generation": 10,
+            "dispatch": "local",
+            "reason": "partial_dispatch",
         }
-        self.controller.request_remote_full_scan = MagicMock(return_value=expected)
+        self.controller.request_full_scan = MagicMock(return_value=expected)
 
         response = self.test_app.post(
-            "/server/command/remote_full_scan", expect_errors=True,
+            "/server/command/full_scan", expect_errors=True,
         )
 
         self.assertEqual(500, response.status_int)
@@ -111,33 +143,38 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(set(expected), set(response.json))
         self.assertEqual(expected, response.json)
         self.assertNotIn("private", response.text)
-        self.controller.request_remote_full_scan.assert_called_once_with()
+        self.controller.request_full_scan.assert_called_once_with()
 
-    def test_remote_full_scan_gate_off_returns_fixed_rejection_envelope(self):
+    def test_full_scan_gate_off_returns_fixed_rejection_envelope(self):
         expected = {
-            "schema": "remote_full_scan.v1",
+            "schema": "full_scan.v1",
             "accepted": False,
             "rejected": True,
-            "operation": "remote_full_scan",
-            "generation": None,
+            "operation": "full_scan",
+            "local_generation": None,
+            "remote_generation": None,
+            "dispatch": "none",
             "reason": "debug_gate_off",
         }
-        self.controller.request_remote_full_scan = MagicMock(return_value=expected)
+        self.controller.request_full_scan = MagicMock(return_value=expected)
 
         with patch.dict("os.environ", {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "599"}):
             response = self.test_app.post(
-                "/server/command/remote_full_scan", expect_errors=True,
+                "/server/command/full_scan", expect_errors=True,
             )
 
         self.assertEqual(403, response.status_int)
         self.assertEqual("application/json", response.content_type)
         self.assertEqual(
-            {"schema", "accepted", "rejected", "operation", "generation", "reason"},
+            {
+                "schema", "accepted", "rejected", "operation",
+                "local_generation", "remote_generation", "dispatch", "reason",
+            },
             set(response.json),
         )
         self.assertEqual(expected, response.json)
         self.assertNotIn("private", response.text)
-        self.controller.request_remote_full_scan.assert_called_once_with()
+        self.controller.request_full_scan.assert_called_once_with()
 
     @staticmethod
     def __model_file(name: str, file_id: str, path_pair_id: str = None):
