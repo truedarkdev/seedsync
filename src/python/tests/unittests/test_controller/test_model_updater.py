@@ -7474,6 +7474,57 @@ class TestModelUpdater(unittest.TestCase):
         )
         self.assertEqual(8, len(self._membership_trace_events(trace)))
 
+    def test_lftp_membership_keeps_poll_flow_for_unrelated_pending_queue_chunks(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=None,
+            policy={"default": "off", "rules": {"transfer.lftp.membership": "info"}},
+        )
+        controller = self._membership_trace_controller(trace)
+        pending_file_id = "private-pending.mkv"
+        controller._Controller__pending_queue_dispatches = {
+            pending_file_id: PendingQueueDispatch(0.0, pending_file_id, None, False, 7),
+        }
+        controller._Controller__fractional_queue_flow_id = (
+            lambda file_id, sequence: "fractional-queue:0123456789abcdef"
+        )
+        statuses = [
+            SimpleNamespace(
+                file_id=pending_file_id,
+                job_correlation="lftp-job:0000000000000001",
+                state=LftpJobStatus.State.RUNNING,
+            ),
+        ] + [
+            SimpleNamespace(
+                file_id="private-unrelated-{:02d}".format(index),
+                job_correlation="lftp-job:{:016x}".format(index + 2),
+                state=LftpJobStatus.State.RUNNING,
+            )
+            for index in range(32)
+        ]
+
+        with patch.dict(
+                os.environ,
+                {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
+        ):
+            _record_lftp_status_membership_transition(
+                controller, [statuses[0]], statuses, statuses,
+                previous_malformed_ids=set(), current_malformed_ids=set(),
+                source="fresh_healthy", fresh=True, healthy=True,
+                poll_correlation="lftp-poll:fedcba9876543210",
+            )
+
+        events = self._membership_trace_events(trace)
+        self.assertEqual(2, len(events))
+        self.assertEqual([0, 1], [event["details"]["chunk_index"] for event in events])
+        self.assertTrue(all(
+            event["flow_id"] == "lftp-poll:fedcba9876543210"
+            for event in events
+        ))
+        self.assertTrue(all("queue_flow_ids" not in event["details"] for event in events))
+        self.assertNotIn("private-pending.mkv", str(events))
+        self.assertNotIn("private-unrelated", str(events))
+
     def test_lftp_membership_trace_invalid_identity_is_opaque_and_inactive(self):
         trace = BreadcrumbTraceCollector(
             lambda: True, policy={"default": "off", "rules": {"transfer.lftp.membership": "info"}},

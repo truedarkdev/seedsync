@@ -47,6 +47,7 @@ from common.exclude_patterns import ExactPathExclusion
 from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation
 from common.path_pair import PathPair
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
+from lftp.lftp import _record_lftp_sidecar_breadcrumb
 from model import ActiveProgressOverlay, IModelListener, Model, ModelDiff, ModelError, ModelFile
 from system import SystemFile
 from transfer import RcloneTransferError
@@ -6847,6 +6848,54 @@ class TestController(unittest.TestCase):
 
         self.assertEqual([], trace.snapshot()["entries"])
 
+    def test_queue_http_wait_flow_reuses_pending_opaque_flow_only_under_exact_debug_gate(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={
+                "default": "off",
+                "rules": {"queue.readiness": "info", "lftp.sidecar": "info"},
+            },
+            max_entries=8,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        file_id = ModelFile.build_file_id("private-wait.bin", None)
+        self.controller._Controller__pending_queue_dispatches = {
+            file_id: PendingQueueDispatch(0.0, "private-wait.bin", None, False, 7),
+        }
+        command = Controller.Command(Controller.Command.Action.QUEUE, file_id)
+        command.add_callback(MagicMock())
+        expected_flow = "fractional-queue:{}".format(
+            opaque_trace_correlation("queue:{}:7".format(file_id)),
+        )
+
+        with patch.dict(
+                os.environ,
+                {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "599"},
+        ):
+            self.controller._Controller__record_queue_callback_trace(command, 0, "success")
+            self.controller.record_queue_http_wait_trace(file_id, False, None)
+        with patch.dict(
+                os.environ,
+                {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
+        ):
+            self.controller._Controller__record_queue_callback_trace(command, 0, "success")
+            self.controller.record_queue_http_wait_trace(file_id, True, True)
+            _record_lftp_sidecar_breadcrumb(
+                trace, "missing", "private-sidecar.bin", flow_id=expected_flow,
+            )
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(5, len(entries))
+        self.assertIsNone(entries[0]["flow_id"])
+        self.assertIsNone(entries[1]["flow_id"])
+        self.assertEqual(expected_flow, entries[2]["flow_id"])
+        self.assertEqual(expected_flow, entries[3]["flow_id"])
+        self.assertEqual(entries[2]["flow_id"], entries[3]["flow_id"])
+        sidecar = next(entry for entry in entries if entry["category"] == "lftp.sidecar")
+        self.assertEqual(expected_flow, sidecar["flow_id"])
+        self.assertNotIn("private-wait.bin", repr(entries))
+        self.assertNotIn("private-sidecar.bin", repr(entries))
+
     def test_async_queue_rejection_stays_rejected_during_idle_reconciliation(self):
         file = ModelFile("async-rejected", False)
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
@@ -7201,6 +7250,38 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp_executor.shutdown(wait=True)
 
         self.assertTrue(self.controller._Controller__lftp.queue.call_args.kwargs["allow_resume"])
+
+    def test_queue_passes_opaque_flow_to_sidecar_without_command_trace(self):
+        file = ModelFile("private-sidecar.bin", False)
+        file.remote_size = 100
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {
+                "queue.readiness": "info", "lftp.sidecar": "info",
+            }},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.backend_name = "lftp"
+
+        with patch.dict(
+                os.environ,
+                {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
+        ):
+            self.controller.queue_command(
+                Controller.Command(Controller.Command.Action.QUEUE, file.file_id),
+            )
+            self.controller._Controller__process_commands()
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+        expected_flow = "fractional-queue:{}".format(
+            opaque_trace_correlation("queue:{}:1".format(file.file_id)),
+        )
+        queue_kwargs = self.controller._Controller__lftp.queue.call_args.kwargs
+        self.assertEqual(expected_flow, queue_kwargs["trace_flow_id"])
+        self.assertFalse(self.controller._Controller__lftp_command_trace_is_enabled())
+        self.assertNotIn("private-sidecar.bin", repr(queue_kwargs))
 
     def test_queue_disables_resume_for_same_size_mtime_drift(self):
         file = ModelFile("resume.bin", False)

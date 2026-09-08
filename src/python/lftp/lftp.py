@@ -97,6 +97,7 @@ def _record_lftp_sidecar_breadcrumb(
         target_presence: str = "unknown",
         sidecar_presence: str = "unknown",
         sidecar_size: str = "unknown",
+        flow_id: object = None,
 ) -> None:
     """Record one bounded queue-sidecar decision without runtime identities."""
     if classification not in LFTP_SIDECAR_TRACE_CLASSIFICATIONS:
@@ -138,6 +139,11 @@ def _record_lftp_sidecar_breadcrumb(
             level=level,
             corr_id=opaque_trace_correlation(
                 "lftp.sidecar|{}".format(target_identity),
+            ),
+            flow_id=(
+                _safe_lftp_queue_trace_flow(flow_id)
+                if os.environ.get("INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS") == "600"
+                else None
             ),
             _coalesce_key=coalesce_key,
             trace_scope="flow",
@@ -1841,7 +1847,7 @@ class Lftp:
     @classmethod
     def __file_resume_artifacts(
             cls, local_dir: str, name: str, expected_size: Optional[int] = None,
-            breadcrumb_trace: object = None,
+            breadcrumb_trace: object = None, flow_id: object = None,
     ) -> tuple[bool, bool]:
         """Return (one target exists, it has a valid matching pget map).
 
@@ -1869,6 +1875,7 @@ class Lftp:
                 target_presence=target_presence,
                 sidecar_presence=sidecar_presence,
                 sidecar_size=sidecar_size,
+                flow_id=flow_id,
             )
 
         targets: list[tuple[str, Optional[str]]] = []
@@ -2151,6 +2158,7 @@ class Lftp:
             has_existing_target, has_valid_pget_map = self.__file_resume_artifacts(
                 local_dir, name, expected_size if allow_resume else None,
                 getattr(self, "_Lftp__breadcrumb_trace", None),
+                trace_flow_id,
             )
         legacy_get_resume = False
         if allow_legacy_get_resume:

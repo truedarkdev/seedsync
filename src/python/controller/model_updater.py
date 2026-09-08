@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -509,6 +510,45 @@ def _controller_breadcrumb_effectively_enabled(
     )
 
 
+def _queue_flow_ids_for_files(
+        controller: object, file_ids: Iterable[object],
+) -> list[str]:
+    """Resolve at most a small set of opaque Queue flows for publication evidence."""
+    if os.environ.get("INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS") != "600":
+        return []
+    pending = getattr(controller, "_Controller__pending_queue_dispatches", None)
+    flow_factory = getattr(controller, "_Controller__fractional_queue_flow_id", None)
+    if not isinstance(pending, dict) or not callable(flow_factory):
+        return []
+    result: list[str] = []
+    for file_id in sorted(
+            {value for value in file_ids if isinstance(value, str)},
+            key=opaque_trace_correlation,
+    ):
+        dispatch = pending.get(file_id)
+        sequence = getattr(dispatch, "operation_sequence", None)
+        if dispatch is None or type(sequence) is not int:
+            continue
+        try:
+            flow_id = flow_factory(file_id, sequence)
+        except Exception:
+            flow_id = None
+        if (
+                isinstance(flow_id, str) and
+                flow_id.startswith("fractional-queue:") and
+                len(flow_id) == len("fractional-queue:") + 16 and
+                all(
+                    character in "0123456789abcdef"
+                    for character in flow_id[len("fractional-queue:"):]
+                ) and
+                flow_id not in result
+        ):
+            result.append(flow_id)
+        if len(result) >= 16:
+            break
+    return result
+
+
 def _record_pending_queue_overlay_publications(
         controller: object,
         authoritative_statuses: Sequence[object],
@@ -925,6 +965,7 @@ def _record_lftp_status_membership_transition(
 
         prior, raw, filtered = (view(statuses, malformed) for statuses, malformed in ((previous_statuses, previous_malformed_ids), (raw_statuses, current_malformed_ids), (filtered_statuses, current_malformed_ids)))
         tokens: list[str] = []
+        transition_file_ids: set[object] = set()
         def mask(classes: tuple[str, ...]) -> str:
             return "".join(code for code, name in (("d", "duplicate"), ("m", "malformed"), ("i", "invalid")) if name in classes) or ("a" if classes == ("absent",) else "v")
         for file_id in sorted(set(prior) | set(raw) | set(filtered), key=opaque_trace_correlation):
@@ -935,6 +976,7 @@ def _record_lftp_status_membership_transition(
             bs, cs = sorted(cast(set[str], before[2])) if before else [], sorted(cast(set[str], current[2])) if current else []
             ba, ca, rm, fm = bool(before and before[1]), bool(post and post[1]), current is not None, post is not None
             if (bool(before) != rm or ba != ca or bc != cc or bj != cj or bs != cs or bool(before and not before[5]) != fm):
+                transition_file_ids.add(file_id)
                 if before is None and current is not None: transition = "added"
                 elif before is not None and current is None: transition = "removed"
                 elif "invalid" in bc or "invalid" in cc: transition = "invalid"
@@ -952,9 +994,16 @@ def _record_lftp_status_membership_transition(
         tokens.sort()
         if tokens:
             safe_poll = _safe_lftp_status_poll_correlation(poll_correlation)
+            queue_flow_ids = _queue_flow_ids_for_files(
+                controller, transition_file_ids,
+            )
             chunk_count = (len(tokens) + 15) // 16
             for chunk_index in range(chunk_count):
                 details: dict[str, object] = {"schema": "lftp_status_membership.v2", "phase": "status_membership", "chunk_index": chunk_index, "chunk_count": chunk_count, "transition_count": len(tokens), "transition_set_digest": opaque_trace_correlation("|".join(tokens)), "source": source, "fresh": bool(fresh), "healthy": bool(healthy), "idle_authoritative": bool(getattr(controller, "_Controller__lftp_idle_status_authoritative", False)), "raw_status_count": min(len(raw_statuses), _LFTP_STATUS_TRACE_COUNT_LIMIT), "raw_status_count_overflow": len(raw_statuses) > _LFTP_STATUS_TRACE_COUNT_LIMIT, "filtered_status_count": min(len(filtered_statuses), _LFTP_STATUS_TRACE_COUNT_LIMIT), "filtered_status_count_overflow": len(filtered_statuses) > _LFTP_STATUS_TRACE_COUNT_LIMIT, "poll_correlation": safe_poll, "transitions": tokens[chunk_index * 16:(chunk_index + 1) * 16]}
+                if queue_flow_ids and os.environ.get(
+                        "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS",
+                ) == "600":
+                    details["queue_flow_ids"] = queue_flow_ids
                 recorder(stage="lftp_status_membership", message="lftp_status_membership_transition", details=details, event_type="state_transition", category=_LFTP_STATUS_MEMBERSHIP_TRACE_CATEGORY, level=level, corr_id="lftp:" + opaque_trace_correlation(_LFTP_STATUS_TRACE_CORRELATION), flow_id=safe_poll, trace_scope="flow")
     except Exception:
         pass
@@ -8332,15 +8381,27 @@ class ModelUpdater(_ControllerCoreAccess):
             try:
                 model_version = getattr(controller._Controller__model, "version", None)
                 if isinstance(model_version, int):
+                    publication_flow_ids = _queue_flow_ids_for_files(
+                        controller,
+                        lifecycle_publication_subject_ids or (
+                            [direct_target_file_id]
+                            if isinstance(direct_target_file_id, str) else []
+                        ),
+                    )
                     correlation = "model_version:{}".format(model_version)
+                    details = {
+                        "model_version": model_version,
+                        "model_root_count": getattr(controller._Controller__model, "file_count", 0),
+                        "model_tree_file_count": getattr(controller._Controller__model, "tree_file_count", 0),
+                    }
+                    if publication_flow_ids and os.environ.get(
+                            "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS",
+                    ) == "600":
+                        details["queue_flow_ids"] = publication_flow_ids
                     controller._Controller__record_breadcrumb(
                         stage="model_update",
                         message="model_build_completed",
-                        details={
-                            "model_version": model_version,
-                            "model_root_count": getattr(controller._Controller__model, "file_count", 0),
-                            "model_tree_file_count": getattr(controller._Controller__model, "tree_file_count", 0),
-                        },
+                        details=details,
                         event_type="state_transition",
                         category="model.update",
                         level="info",

@@ -201,6 +201,17 @@ def _fractional_queue_flow_id(
     return result if isinstance(result, str) else None
 
 
+def _incoming_recovery_debug_enabled(controller: object) -> bool:
+    """Read the exact debug gate without requiring a full Controller core."""
+    checker = getattr(controller, "_incoming_recovery_debug_enabled", None)
+    if not callable(checker):
+        return False
+    try:
+        return checker() is True
+    except Exception:
+        return False
+
+
 def _final_move_errno_class(error: Optional[BaseException]) -> str:
     """Normalize publication failures without retaining platform text."""
     if error is None:
@@ -1474,6 +1485,7 @@ class Controller:
             *,
             error: object = None,
             exception_family: Optional[str] = None,
+            flow_id: Optional[str] = None,
     ) -> None:
         """Record executor lifecycle without carrying transfer identities."""
         safe_correlation = _lftp_executor_correlation(correlation)
@@ -1508,6 +1520,7 @@ class Controller:
                 category=_LFTP_EXECUTOR_TRACE_CATEGORY,
                 level=level,
                 corr_id=safe_correlation,
+                flow_id=flow_id,
                 trace_scope="flow",
             )
         except Exception:
@@ -1536,12 +1549,14 @@ class Controller:
         if executor is None:
             return False
 
+        queue_flow_id = _fractional_queue_flow_id(
+            self, file_id, operation_sequence,
+        ) if action == "queue" and isinstance(file_id, str) else None
+        queue_correlation_flow_id = queue_flow_id \
+            if _incoming_recovery_debug_enabled(self) else None
+
         submitted_operation = operation
         if action == "queue":
-            queue_flow_id = _fractional_queue_flow_id(
-                self, file_id, operation_sequence,
-            ) if isinstance(file_id, str) else None
-
             def queue_operation() -> _LftpQueueResult:
                 if isinstance(file_id, str):
                     _record_fractional_queue_trace(
@@ -1575,21 +1590,25 @@ class Controller:
             if executor_trace_enabled:
                 self.__record_lftp_executor_observation(
                     executor_correlation, action, "enqueue_attempt", "attempted",
+                    flow_id=queue_correlation_flow_id,
                 )
 
                 def observed_operation() -> object:
                     self.__record_lftp_executor_observation(
                         executor_correlation, action, "worker_enter", "running",
+                        flow_id=queue_correlation_flow_id,
                     )
                     try:
                         result = submitted_operation()
                     except BaseException as exc:
                         self.__record_lftp_executor_observation(
                             executor_correlation, action, "worker_exception", "exception", error=exc,
+                            flow_id=queue_correlation_flow_id,
                         )
                         raise
                     self.__record_lftp_executor_observation(
                         executor_correlation, action, "worker_return", "returned",
+                        flow_id=queue_correlation_flow_id,
                     )
                     return result
 
@@ -1601,11 +1620,13 @@ class Controller:
             if executor_trace_enabled:
                 self.__record_lftp_executor_observation(
                     executor_correlation, action, "enqueue_failed", "failed", error=exc,
+                    flow_id=queue_correlation_flow_id,
                 )
             return False
         if executor_trace_enabled:
             self.__record_lftp_executor_observation(
                 executor_correlation, action, "enqueue_returned", "enqueued",
+                flow_id=queue_correlation_flow_id,
             )
 
         def on_lftp_future_done(done_future: Future[object]) -> None:
@@ -1629,6 +1650,7 @@ class Controller:
                     harvest_outcome,
                     error=harvest_error,
                     exception_family="cancelled" if harvest_outcome == "cancelled" else None,
+                    flow_id=queue_correlation_flow_id,
                 )
             self.wake_process()
 
@@ -1821,6 +1843,14 @@ class Controller:
                 executor_harvest_outcome,
                 error=harvest_error,
                 exception_family=None,
+                flow_id=(
+                    _fractional_queue_flow_id(
+                        self, operation.file_id, operation.operation_sequence,
+                    )
+                    if _incoming_recovery_debug_enabled(self) and
+                    operation.action == "queue" and isinstance(operation.file_id, str)
+                    else None
+                ),
             )
             operation_file_id = getattr(operation, "file_id", None)
             if operation.action in ("queue", "stop") and operation_file_id is not None:
@@ -5413,6 +5443,7 @@ class Controller:
     def __record_queue_readiness_trace(
             self, file_id: str, event: str,
             details: dict[str, object] | Callable[[], dict[str, object]],
+            flow_id: Optional[str] = None,
     ) -> None:
         """Emit identity-free Queue admission/readiness evidence.
 
@@ -5437,6 +5468,7 @@ class Controller:
                 category="queue.readiness",
                 level="info",
                 corr_id="fractional-mtime:{}".format(opaque_trace_correlation(file_id)),
+                flow_id=flow_id,
                 trace_scope="flow",
             )
         except Exception:
@@ -5457,7 +5489,7 @@ class Controller:
             "callback_index": callback_index,
             "callback_count": len(command.callbacks),
             "error_code": error_code if type(error_code) is int else 0,
-        })
+        }, flow_id=self.__queue_flow_id_for_pending_file(command.filename))
 
     def record_queue_http_wait_trace(
             self, file_id: str, completed: bool, callback_success: object,
@@ -5471,7 +5503,20 @@ class Controller:
             "schema": "queue_readiness.v1",
             "phase": "wait_return",
             "outcome": outcome,
-        })
+        }, flow_id=self.__queue_flow_id_for_pending_file(file_id))
+
+    def __queue_flow_id_for_pending_file(self, file_id: object) -> Optional[str]:
+        """Reuse the existing pending dispatch identity when it is available."""
+        if not _incoming_recovery_debug_enabled(self):
+            return None
+        if not isinstance(file_id, str):
+            return None
+        pending = getattr(self, "_Controller__pending_queue_dispatches", None)
+        dispatch = pending.get(file_id) if isinstance(pending, dict) else None
+        operation_sequence = getattr(dispatch, "operation_sequence", None)
+        if dispatch is None or type(operation_sequence) is not int:
+            return None
+        return self.__fractional_queue_flow_id(file_id, operation_sequence)
 
     def __fractional_queue_trace_is_enabled(self) -> bool:
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
@@ -5493,12 +5538,41 @@ class Controller:
             _breadcrumb_effectively_enabled(breadcrumb_trace, "transfer.lftp.command", "warning")
         )
 
+    def __queue_correlation_trace_is_enabled(self) -> bool:
+        """Check new Queue correlation consumers without enabling command tracing."""
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        return any(
+            _breadcrumb_effectively_enabled(breadcrumb_trace, category, level)
+            for category, level in (
+                ("queue.readiness", "info"),
+                ("lftp.sidecar", "info"),
+                ("lftp.sidecar", "warning"),
+                ("transfer.lftp.executor", "info"),
+                ("transfer.lftp.executor", "warning"),
+                ("transfer.lftp.membership", "info"),
+                ("transfer.lftp.membership", "warning"),
+                ("model.update", "info"),
+            )
+        )
+
+    def __lftp_queue_flow_trace_is_enabled(self) -> bool:
+        """Forward Queue flow metadata only to an enabled LFTP consumer."""
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        return self.__lftp_command_trace_is_enabled() or any(
+            _breadcrumb_effectively_enabled(breadcrumb_trace, "lftp.sidecar", level)
+            for level in ("info", "warning")
+        )
+
     def __fractional_queue_flow_id(self, file_id: str, operation_sequence: object) -> Optional[str]:
         if type(operation_sequence) is not int or operation_sequence < 1:
             return None
-        if not (
-                self.__fractional_queue_trace_is_enabled() or
-                self.__lftp_command_trace_is_enabled()
+        legacy_trace_enabled = (
+            self.__fractional_queue_trace_is_enabled() or
+            self.__lftp_command_trace_is_enabled()
+        )
+        if not legacy_trace_enabled and not (
+                _incoming_recovery_debug_enabled(self) and
+                self.__queue_correlation_trace_is_enabled()
         ):
             return None
         return "fractional-queue:{}".format(
@@ -10214,7 +10288,7 @@ class Controller:
                             if allow_legacy_get_resume:
                                 queue_kwargs["allow_legacy_get_resume"] = True
                         if self.__uses_async_lftp_owner() and queue_trace_flow_id is not None and \
-                                self.__lftp_command_trace_is_enabled():
+                                self.__lftp_queue_flow_trace_is_enabled():
                             queue_kwargs["trace_flow_id"] = queue_trace_flow_id
                         lifecycle_before_queue = self.__download_start_lifecycle_snapshot(file.file_id)
                         dispatch = PendingQueueDispatch(

@@ -858,6 +858,47 @@ class TestLftp(unittest.TestCase):
         self.assertNotIn("private-name.bin", repr(trace.record.call_args))
         self.assertNotEqual("private-name.bin", trace.record.call_args.kwargs["corr_id"])
 
+    def test_queue_sidecar_flow_is_opaque_and_exact_debug_gated(self):
+        lftp = self._build_test_lftp()
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"lftp.sidecar": "info"}},
+            max_entries=8,
+        )
+        lftp.set_breadcrumb_trace(trace)
+        flow_id = "fractional-queue:0123456789abcdef"
+        with tempfile.TemporaryDirectory() as local_dir, patch.dict(
+                os.environ, {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
+        ):
+            lftp.queue(
+                "private-name.bin", False,
+                local_base_dir_path=local_dir, trace_flow_id=flow_id,
+            )
+
+        events = trace.snapshot()["entries"]
+        self.assertEqual(1, len(events))
+        self.assertEqual(flow_id, events[0]["flow_id"])
+        self.assertNotIn("private-name.bin", repr(events))
+        self.assertEqual(1, lftp._Lftp__run_command.call_count)
+
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"lftp.sidecar": "info"}},
+            max_entries=8,
+        )
+        lftp.set_breadcrumb_trace(trace)
+        with tempfile.TemporaryDirectory() as local_dir, patch.dict(
+                os.environ, {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "599"},
+        ):
+            lftp.queue(
+                "private-name.bin", False,
+                local_base_dir_path=local_dir, trace_flow_id=flow_id,
+            )
+
+        self.assertIsNone(trace.snapshot()["entries"][0]["flow_id"])
+        self.assertNotIn("private-name.bin", repr(trace.snapshot()["entries"]))
+        self.assertEqual(2, lftp._Lftp__run_command.call_count)
+
     def test_queue_sidecar_breadcrumb_classifies_rejection_and_valid_artifact(self):
         lftp = self._build_test_lftp()
         trace = MagicMock()
