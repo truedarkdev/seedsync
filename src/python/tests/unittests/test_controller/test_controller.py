@@ -199,9 +199,9 @@ class TestController(unittest.TestCase):
         recorder("root_default", {"root_state": "default", "coverage": "incomplete"})
 
         payloads = [json.loads(call.args[1]) for call in logger.info.call_args_list]
-        self.assertEqual(8, len(payloads))
+        self.assertEqual(4, len(payloads))
         self.assertEqual("root_default", payloads[-1]["event"])
-        self.assertEqual(5, payloads[-1]["dropped"])
+        self.assertEqual(8, payloads[-1]["dropped"])
         self.assertEqual("incomplete", payloads[-1]["coverage"])
         self.assertEqual("function", type(registry.recorder("bad-flow")).__name__)
 
@@ -210,15 +210,113 @@ class TestController(unittest.TestCase):
         registry = _IncomingRecoveryDiagnosticRegistry(logger)
         recorders = [registry.recorder("fractional-queue:{:016x}".format(index)) for index in range(4)]
         for recorder in recorders:
-            for _ in range(7):
-                recorder("executor_start", {})
+            recorder("queue_admitted", {})
+            recorder("executor_start", {})
+            recorder("executor_return", {})
+            recorder("lftp_child", {"classification": "command_error", "phase": "prompt"})
+            recorder("lftp_child", {"classification": "timeout", "phase": "prompt"})
+            recorder("lftp_child", {"classification": "timeout", "phase": "connecting"})
+            recorder("lftp_child", {"classification": "terminal_backlog", "phase": "error_recovery"})
+            recorder("executor_error", {"classification": "command_error"})
+            recorder("lftp_child", {"classification": "eof", "reaped": "not_alive"})
+            recorder("lftp_child", {"classification": "exit", "reaped": "exit"})
+            recorder("controller_force_close", {"phase": "teardown"})
+
+        states = registry._IncomingRecoveryDiagnosticRegistry__flows
+        self.assertEqual(28, registry._IncomingRecoveryDiagnosticRegistry__process_records)
+        self.assertTrue(all(state["records"] == 7 for state in states.values()))
+        self.assertTrue(all(state["records"] <= registry._MAX_RECORDS for state in states.values()))
+        self.assertLessEqual(registry._IncomingRecoveryDiagnosticRegistry__process_records, registry._MAX_PROCESS_RECORDS)
+        self.assertEqual(4, len(states))
+        self.assertTrue(all(registry.existing_recorder(flow_id) is not None for flow_id in states))
+
         for recorder in recorders:
             recorder("root_default", {"root_state": "default", "coverage": "incomplete"})
 
         payloads = [json.loads(call.args[1]) for call in logger.info.call_args_list]
         self.assertEqual(32, len(payloads))
         self.assertEqual(4, sum(payload["event"] == "root_default" for payload in payloads))
+        self.assertEqual({"prompt", "connecting"}, {
+            payload["phase"] for payload in payloads if payload["event"] == "lftp_child"
+            and payload["classification"] in {"command_error", "timeout"}
+        })
+        roots = [payload for payload in payloads if payload["event"] == "root_default"]
+        self.assertTrue(all(payload["dropped"] == 3 for payload in roots))
+        self.assertTrue(all(payload["coalesced"] == 1 for payload in roots))
+        self.assertEqual(32, registry._IncomingRecoveryDiagnosticRegistry__process_records)
         self.assertEqual({}, registry._IncomingRecoveryDiagnosticRegistry__flows)
+
+    def test_incoming_recovery_registry_rejects_fifth_flow_without_eviction(self):
+        logger = MagicMock()
+        registry = _IncomingRecoveryDiagnosticRegistry(logger)
+        flow_ids = ["fractional-queue:{:016x}".format(index) for index in range(4)]
+        recorders = [registry.recorder(flow_id) for flow_id in flow_ids]
+        for recorder in recorders:
+            recorder("queue_admitted", {})
+            recorder("executor_start", {})
+            recorder("executor_return", {})
+            recorder("lftp_child", {"classification": "command_error", "phase": "prompt"})
+            recorder("lftp_child", {"classification": "timeout", "phase": "connecting"})
+
+        rejected = registry.recorder("fractional-queue:0000000000000004")
+        rejected("queue_admitted", {})
+        payloads = [json.loads(call.args[1]) for call in logger.info.call_args_list]
+        self.assertEqual("process_budget", payloads[-1]["reason"])
+        self.assertTrue(all(registry.existing_recorder(flow_id) is not None for flow_id in flow_ids))
+        self.assertEqual(20, registry._IncomingRecoveryDiagnosticRegistry__process_records)
+
+        for recorder in recorders:
+            recorder("lftp_child", {"classification": "eof", "reaped": "not_alive"})
+            recorder("controller_force_close", {"phase": "teardown"})
+            recorder("root_default", {"root_state": "default", "coverage": "incomplete"})
+
+        payloads = [json.loads(call.args[1]) for call in logger.info.call_args_list]
+        self.assertEqual(4, sum(payload["event"] == "root_default" for payload in payloads))
+        self.assertEqual(32, registry._IncomingRecoveryDiagnosticRegistry__process_records)
+        self.assertLessEqual(registry._IncomingRecoveryDiagnosticRegistry__process_records, registry._MAX_PROCESS_RECORDS)
+        self.assertEqual({}, registry._IncomingRecoveryDiagnosticRegistry__flows)
+
+        logger = MagicMock()
+        registry = _IncomingRecoveryDiagnosticRegistry(logger)
+        flow_ids = ["fractional-queue:{:016x}".format(index) for index in range(4)]
+        recorders = [registry.recorder(flow_id) for flow_id in flow_ids]
+        for recorder in recorders:
+            recorder("lftp_child", {"classification": "eof", "reaped": "not_alive"})
+            recorder("controller_force_close", {"phase": "teardown"})
+
+        rejected = registry.recorder("fractional-queue:0000000000000004")
+        rejected("queue_admitted", {})
+        payloads = [json.loads(call.args[1]) for call in logger.info.call_args_list]
+        self.assertEqual("process_budget", payloads[-1]["reason"])
+        self.assertTrue(all(registry.existing_recorder(flow_id) is not None for flow_id in flow_ids))
+        self.assertEqual(8, registry._IncomingRecoveryDiagnosticRegistry__process_records)
+
+        for recorder in recorders:
+            recorder("root_default", {"root_state": "default", "coverage": "incomplete"})
+
+        payloads = [json.loads(call.args[1]) for call in logger.info.call_args_list]
+        self.assertEqual(4, sum(payload["event"] == "root_default" for payload in payloads))
+        self.assertEqual(12, registry._IncomingRecoveryDiagnosticRegistry__process_records)
+        self.assertEqual({}, registry._IncomingRecoveryDiagnosticRegistry__flows)
+
+    def test_incoming_recovery_registry_drops_unknown_child_phases(self):
+        logger = MagicMock()
+        registry = _IncomingRecoveryDiagnosticRegistry(logger)
+        recorder = registry.recorder("fractional-queue:0123456789abcdef")
+
+        recorder("lftp_child", {"classification": "timeout", "phase": "unknown"})
+        recorder("lftp_child", {"classification": "timeout", "phase": "not-a-phase"})
+        recorder("lftp_child", {"classification": "command_error", "phase": "prompt"})
+        recorder("lftp_child", {"classification": "timeout", "phase": "connecting"})
+        recorder("lftp_child", {"classification": "terminal_backlog", "phase": "error_recovery"})
+        self.assertIsNotNone(registry.existing_recorder("fractional-queue:0123456789abcdef"))
+        recorder("root_default", {"root_state": "default", "coverage": "incomplete"})
+
+        payloads = [json.loads(call.args[1]) for call in logger.info.call_args_list]
+        child_payloads = [payload for payload in payloads if payload["event"] == "lftp_child"]
+        self.assertEqual(["prompt", "connecting"], [payload["phase"] for payload in child_payloads])
+        self.assertEqual(3, payloads[-1]["dropped"])
+        self.assertEqual(0, payloads[-1]["coalesced"])
 
     def test_incoming_recovery_registry_emits_one_capacity_drop(self):
         logger = MagicMock()
@@ -228,12 +326,12 @@ class TestController(unittest.TestCase):
 
         payloads = [json.loads(call.args[1]) for call in logger.info.call_args_list]
         self.assertEqual(["dropped"], [payload["event"] for payload in payloads])
-        self.assertEqual("flow_evicted", payloads[0]["reason"])
+        self.assertEqual("process_budget", payloads[0]["reason"])
         fifth = registry.recorder("fractional-queue:0000000000000005")
         fifth("queue_admitted", {})
-        self.assertEqual("queue_admitted", json.loads(logger.info.call_args.args[1])["event"])
+        self.assertEqual("dropped", json.loads(logger.info.call_args.args[1])["event"])
 
-    def test_incoming_recovery_executor_admission_failures_are_terminal_and_bounded(self):
+    def test_incoming_recovery_executor_admission_failures_are_bounded_until_root_default(self):
         executor = MagicMock()
         executor.submit.side_effect = RuntimeError("closed")
         with patch.object(self.controller, "_Controller__ensure_lftp_executor", return_value=executor), \
@@ -244,6 +342,8 @@ class TestController(unittest.TestCase):
         payloads = [json.loads(call.args[1]) for call in self.controller.logger.info.call_args_list]
         self.assertEqual(["queue_admitted", "executor_error"],
                          [payload["event"] for payload in payloads])
+        registry = self.controller._Controller__incoming_recovery_diagnostic_registry
+        registry.active_recorder()("root_default", {"root_state": "default", "coverage": "incomplete"})
         self.assertEqual({}, self.controller._Controller__incoming_recovery_diagnostic_registry._IncomingRecoveryDiagnosticRegistry__flows)
 
     def test_incoming_recovery_queue_diagnostics_ignore_breadcrumb_policy_at_exact_gate(self):
@@ -349,7 +449,7 @@ class TestController(unittest.TestCase):
         self.assertEqual("absent", payloads[-1]["membership"])
         self.assertEqual("incomplete", payloads[-1]["coverage"])
 
-    def test_incoming_recovery_root_default_does_not_resurrect_terminal_or_evicted_flow(self):
+    def test_incoming_recovery_root_default_does_not_resurrect_terminal_or_rejected_flow(self):
         root = ModelFile("private-root", True)
         root.state = ModelFile.State.DOWNLOADING
         root.complete_local_coverage = False
@@ -362,7 +462,7 @@ class TestController(unittest.TestCase):
         with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "600"}):
             self.controller._Controller__lftp_operation_sequences = {root.file_id: 1}
             self.controller._Controller__incoming_recovery_flow_recorder(root.file_id, 1)(
-                "executor_error", {},
+                "root_default", {"root_state": "default", "coverage": "incomplete"},
             )
             roots = self.controller._Controller__incoming_recovery_downloading_roots()
             root.state = ModelFile.State.DEFAULT
@@ -381,7 +481,8 @@ class TestController(unittest.TestCase):
             root.state = ModelFile.State.DEFAULT
             self.controller.logger.info.reset_mock()
             self.controller._Controller__record_incoming_recovery_root_defaults(roots)
-        self.assertEqual([], self.controller.logger.info.call_args_list)
+        payloads = [json.loads(call.args[1]) for call in self.controller.logger.info.call_args_list]
+        self.assertEqual(["root_default"], [payload["event"] for payload in payloads])
 
     def test_incoming_recovery_post_update_flow_disposition(self):
         for state, coverage, expected_events in (
@@ -408,6 +509,88 @@ class TestController(unittest.TestCase):
                     status_recorder("lftp_child", {"classification": "exit"})
                 payloads = [json.loads(call.args[1]) for call in self.controller.logger.info.call_args_list]
                 self.assertEqual(expected_events, [payload["event"] for payload in payloads])
+
+    def test_incoming_recovery_root_default_requires_fresh_status_snapshot(self):
+        root = ModelFile("private-root", True)
+        root.state = ModelFile.State.DOWNLOADING
+        root.complete_local_coverage = False
+        self.controller._Controller__model = MagicMock()
+        self.controller._Controller__model.get_file.return_value = root
+        self.controller._Controller__model_lock = threading.RLock()
+        self.controller._Controller__lftp_operation_sequences = {root.file_id: 1}
+        self.controller._Controller__last_lftp_statuses = []
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+
+        with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "600"}):
+            self.assertIsNotNone(self.controller._Controller__incoming_recovery_flow_recorder(root.file_id, 1))
+            roots = self.controller._Controller__incoming_recovery_downloading_roots()
+            root.state = ModelFile.State.DEFAULT
+            self.controller._Controller__record_incoming_recovery_root_defaults(
+                roots, status_snapshot_fresh=False,
+            )
+        cached_payload = json.loads(self.controller.logger.info.call_args.args[1])
+        self.assertEqual("unknown", cached_payload["status_parse"])
+
+        self.controller.logger.info.reset_mock()
+        root.state = ModelFile.State.DOWNLOADING
+        self.controller._Controller__lftp_operation_sequences[root.file_id] = 2
+        with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "600"}):
+            self.assertIsNotNone(self.controller._Controller__incoming_recovery_flow_recorder(root.file_id, 2))
+            roots = self.controller._Controller__incoming_recovery_downloading_roots()
+            root.state = ModelFile.State.DEFAULT
+            self.controller._Controller__record_incoming_recovery_root_defaults(
+                roots, status_snapshot_fresh=True,
+            )
+        fresh_payload = json.loads(self.controller.logger.info.call_args.args[1])
+        self.assertEqual("accepted_empty", fresh_payload["status_parse"])
+
+    def test_incoming_recovery_status_submitted_before_queue_keeps_old_recorder(self):
+        started = threading.Event()
+        release = threading.Event()
+        status_kwargs_seen = []
+        backend = Lftp.__new__(Lftp)
+        backend._Lftp__last_status_poll_healthy = True
+        backend._Lftp__last_status_poll_failure_reason = None
+
+        def blocking_status(**kwargs):
+            status_kwargs_seen.append(kwargs)
+            started.set()
+            self.assertTrue(release.wait(1))
+            recorder = kwargs.get("diagnostic_recorder")
+            if recorder is not None:
+                recorder("lftp_child", {"classification": "eof", "phase": "prompt"})
+            return []
+
+        backend.status = blocking_status
+        self.controller._Controller__lftp = backend
+        self.controller._Controller__lftp_executor = None
+        self.controller._Controller__lftp_operations = []
+        self.controller._Controller__lftp_status_future = None
+        self.controller._Controller__lftp_status_future_correlation = None
+        self.controller._Controller__lftp_status_future_publication_epoch = None
+        self.controller._Controller__progress_publication_epoch = 0
+
+        with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "600"}):
+            try:
+                self.assertIsNone(self.controller._get_lftp_status_snapshot())
+                self.assertTrue(started.wait(1))
+                status_future = self.controller._Controller__lftp_status_future
+                self.assertIsNotNone(status_future)
+                self.assertTrue(self.controller._Controller__submit_lftp_operation(
+                    "queue", lambda: True, "private", 1,
+                ))
+                release.set()
+                self.assertEqual(([], True), status_future.result(timeout=1))
+            finally:
+                release.set()
+                executor = self.controller._Controller__lftp_executor
+                if executor is not None:
+                    executor.shutdown(wait=True)
+                    self.controller._Controller__lftp_executor = None
+
+        payloads = [json.loads(call.args[1]) for call in self.controller.logger.info.call_args_list]
+        self.assertNotIn("diagnostic_recorder", status_kwargs_seen[0], repr(status_kwargs_seen))
+        self.assertNotIn("lftp_child", [payload["event"] for payload in payloads], repr(payloads))
 
     def test_incoming_recovery_flow_recorder_is_exact_gate_and_logger_fault_safe(self):
         for value in (None, "599"):
@@ -1011,10 +1194,13 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp_executor_closing = False
         self.controller._Controller__started = True
 
-        self.controller.exit()
+        with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "600"}):
+            self.assertIsNotNone(self.controller._Controller__incoming_recovery_flow_recorder("private", 1))
+            self.controller.exit()
 
         executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
         self.assertIsNone(self.controller._Controller__lftp_executor)
+        self.assertEqual(["controller_exit"], [payload["event"] for payload in self._incoming_recovery_events()])
 
     def test_lftp_executor_forced_close_releases_blocked_exit(self):
         self.controller._Controller__started = True
@@ -1027,17 +1213,81 @@ class TestController(unittest.TestCase):
             started.set()
             release.wait(5)
 
+        teardown_order = []
+
+        def record_info(*args):
+            if args and args[0] == "incoming_recovery_queue_lifecycle %s":
+                teardown_order.append(json.loads(args[1])["event"])
+
+        def force_close():
+            teardown_order.append("force_close")
+            release.set()
+
         self.controller._Controller__lftp.exit.side_effect = blocked_exit
-        self.controller._Controller__lftp.force_close.side_effect = release.set
+        self.controller._Controller__lftp.force_close.side_effect = force_close
+        self.controller.logger.info.side_effect = record_info
         self.controller._Controller__ensure_lftp_executor()
 
         started_at = time.monotonic()
-        self.controller.exit()
+        with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "600"}):
+            self.assertIsNotNone(self.controller._Controller__incoming_recovery_flow_recorder("private", 1))
+            self.controller.exit()
 
         self.assertLess(time.monotonic() - started_at, 3.5)
         self.assertTrue(started.is_set())
         self.controller._Controller__lftp.force_close.assert_called_once_with()
         self.assertIsNone(self.controller._Controller__lftp_executor)
+        self.assertEqual(["controller_force_close", "force_close"], teardown_order)
+
+    def test_lftp_executor_graceful_exit_records_one_teardown_fact(self):
+        self.controller._Controller__started = True
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self._set_exit_worker_processes_not_alive()
+        future = Future()
+        future.set_result(None)
+        executor = MagicMock()
+        executor.submit.return_value = future
+        self.controller._Controller__lftp_executor = executor
+
+        with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "600"}):
+            self.assertIsNotNone(self.controller._Controller__incoming_recovery_flow_recorder("private", 1))
+            self.controller.exit()
+
+        payloads = self._incoming_recovery_events()
+        self.assertEqual(["controller_exit"], [payload["event"] for payload in payloads])
+
+    def test_lftp_executor_failed_exit_records_one_controller_exit_fact(self):
+        self.controller._Controller__started = True
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self._set_exit_worker_processes_not_alive()
+        future = Future()
+        future.set_exception(RuntimeError("lftp exit failed"))
+        executor = MagicMock()
+        executor.submit.return_value = future
+        self.controller._Controller__lftp_executor = executor
+
+        with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "600"}):
+            self.assertIsNotNone(self.controller._Controller__incoming_recovery_flow_recorder("private", 1))
+            self.controller.exit()
+
+        self.assertEqual(["controller_exit"], [payload["event"] for payload in self._incoming_recovery_events()])
+
+    def test_lftp_executor_timeout_without_force_close_records_one_controller_exit_fact(self):
+        self.controller._Controller__started = True
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self._set_exit_worker_processes_not_alive()
+        future = MagicMock()
+        future.result.side_effect = [TimeoutError(), TimeoutError()]
+        executor = MagicMock()
+        executor.submit.return_value = future
+        self.controller._Controller__lftp_executor = executor
+        self.controller._Controller__lftp.force_close = None
+
+        with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "600"}):
+            self.assertIsNotNone(self.controller._Controller__incoming_recovery_flow_recorder("private", 1))
+            self.controller.exit()
+
+        self.assertEqual(["controller_exit"], [payload["event"] for payload in self._incoming_recovery_events()])
 
     def test_lftp_executor_trace_is_explicit_opt_in_without_disabled_timing(self):
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
@@ -1783,6 +2033,13 @@ class TestController(unittest.TestCase):
             self.controller._Controller__validate_process,
         ):
             process.is_alive.return_value = False
+
+    def _incoming_recovery_events(self):
+        return [
+            json.loads(call.args[1]) for call in self.controller.logger.info.call_args_list
+            if len(call.args) > 1 and isinstance(call.args[1], str) and
+            call.args[0] == "incoming_recovery_queue_lifecycle %s"
+        ]
 
     def _assert_exit_teardown(self, *, still_alive_processes=None, active_scanner_closed=True):
         join_timeout = Controller._Controller__JOIN_TIMEOUT_IN_SECS

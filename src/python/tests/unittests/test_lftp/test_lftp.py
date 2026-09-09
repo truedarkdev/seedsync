@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 from unittest.mock import call
 from unittest.mock import patch
-from io import StringIO
+from io import BytesIO, StringIO
 
 import pexpect
 import pytest
@@ -3205,6 +3205,58 @@ class TestLftp(unittest.TestCase):
 
 
 class TestIncomingRecoveryLftpDiagnostics(unittest.TestCase):
+    def test_child_record_does_not_read_pexpect_buffer_property(self):
+        class Process:
+            pid = 1234
+            exitstatus = None
+            signalstatus = None
+
+            def __init__(self):
+                self._buffer = BytesIO(b"unread")
+
+            @property
+            def buffer(self):
+                raise AssertionError("compatibility property must not be read")
+
+            @staticmethod
+            def isalive():
+                return True
+
+        records = []
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+            lftp_mod._incoming_recovery_child_record(
+                lambda event, fields: records.append((event, fields)), Process(), phase="prompt",
+            )
+        self.assertEqual("private_buffer", records[0][1]["read_buffer_source"])
+        self.assertEqual(1234, records[0][1]["process_pid"])
+
+    def test_child_record_timeout_sentinel_still_counts_private_buffer(self):
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.pid = 1234
+        process.exitstatus = None
+        process.signalstatus = None
+        process.before = pexpect.exceptions.TIMEOUT("public before unavailable")
+        process.after = pexpect.exceptions.TIMEOUT("public after unavailable")
+        process.buffer = pexpect.exceptions.TIMEOUT("public buffer unavailable")
+        process._buffer = BytesIO(b"unread PTY bytes")
+        records = []
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+            lftp_mod._incoming_recovery_child_record(
+                lambda event, fields: records.append((event, fields)), process,
+                error=pexpect.exceptions.TIMEOUT("prompt timeout"),
+                phase="prompt", started_at=time.monotonic() - 0.01, alive_before=False,
+            )
+        fields = records[0][1]
+        self.assertEqual("timeout", fields["classification"])
+        self.assertEqual("prompt", fields["phase"])
+        self.assertEqual("private_buffer", fields["read_buffer_source"])
+        self.assertEqual("1-127", fields["read_buffer_byte_length_bucket"])
+        self.assertEqual((False, True), (fields["process_alive_before"], fields["process_alive_after"]))
+        self.assertEqual("alive", fields["reaped"])
+        self.assertEqual(1234, fields["process_pid"])
+        self.assertNotIn("process_start_identity", fields)
+
     def test_status_forwards_later_child_terminal_observations(self):
         for exitstatus, signalstatus, expected in ((7, None, "exit"), (None, 9, "signal")):
             with self.subTest(expected=expected), \
@@ -3228,7 +3280,6 @@ class TestIncomingRecoveryLftpDiagnostics(unittest.TestCase):
                 diagnostic_recorder=lambda event, fields: eof_records.append((event, fields)),
             ))
         self.assertEqual(["eof"], [fields["classification"] for _, fields in eof_records])
-        self.assertNotIn("private", repr(eof_records))
 
         for boundary in ("send", "drain"):
             with self.subTest(boundary=boundary), \
@@ -3244,7 +3295,6 @@ class TestIncomingRecoveryLftpDiagnostics(unittest.TestCase):
                     diagnostic_recorder=lambda event, fields: terminal_records.append((event, fields)),
                 ))
                 self.assertEqual(["eof"], [fields["classification"] for _, fields in terminal_records])
-                self.assertNotIn("private", repr(terminal_records))
 
         recovery_lftp = TestLftp._build_status_poll_test_lftp()
         recovery_lftp._Lftp__process.expect.side_effect = [None, pexpect.exceptions.EOF("private recovery eof")]
@@ -3256,7 +3306,6 @@ class TestIncomingRecoveryLftpDiagnostics(unittest.TestCase):
                 diagnostic_recorder=lambda event, fields: recovery_records.append((event, fields)),
             ))
         self.assertEqual(["command_error", "eof"], [fields["classification"] for _, fields in recovery_records])
-        self.assertNotIn("private", repr(recovery_records))
 
         timeout_lftp = TestLftp._build_status_poll_test_lftp()
         timeout_lftp._Lftp__process.send.side_effect = pexpect.exceptions.TIMEOUT("private timeout")

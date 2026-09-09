@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import hashlib
+import io
 import json
 import logging
 import re
@@ -69,6 +70,62 @@ redact_credentials = redact_sensitive_text
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 _INCOMING_RECOVERY_DIAGNOSTIC_ENV = "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS"
+_INCOMING_RECOVERY_PHASES = frozenset({
+    "precheck", "drain", "send", "prompt", "connecting", "error_recovery", "teardown", "unknown",
+})
+
+
+def _incoming_recovery_buffer_length(value: object) -> int | None:
+    if isinstance(value, bytes):
+        return len(value)
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, io.BytesIO):
+        try:
+            view = value.getbuffer()
+            try:
+                return view.nbytes
+            finally:
+                view.release()
+        except Exception:
+            return None
+    return None
+
+
+def _incoming_recovery_duration_bucket(started_at: object, ended_at: object) -> str:
+    try:
+        elapsed_ms = max(0, int((float(ended_at) - float(started_at)) * 1000))
+    except (TypeError, ValueError, OverflowError):
+        return "unknown"
+    if elapsed_ms <= 4:
+        return "0-4"
+    if elapsed_ms <= 19:
+        return "5-19"
+    if elapsed_ms <= 99:
+        return "20-99"
+    if elapsed_ms <= 499:
+        return "100-499"
+    if elapsed_ms <= 1999:
+        return "500-1999"
+    return "2000+"
+
+
+def _incoming_recovery_buffer_observation(process: object) -> tuple[str, str]:
+    """Measure one unread PTY buffer source without combining matched frames."""
+    try:
+        attributes = vars(process)
+    except Exception:
+        return "unavailable", "unknown"
+    # pexpect's public ``buffer`` compatibility property calls ``getvalue()``.
+    # Read only raw instance attributes so this exact-600 diagnostic cannot
+    # materialize a large retained PTY frame.
+    public_length = _incoming_recovery_buffer_length(attributes.get("buffer"))
+    if public_length is not None:
+        return "public_buffer", _lftp_trace_bytes_bucket(public_length)
+    private_length = _incoming_recovery_buffer_length(attributes.get("_buffer"))
+    if private_length is not None:
+        return "private_buffer", _lftp_trace_bytes_bucket(private_length)
+    return "unavailable", "unknown"
 
 
 def _incoming_recovery_diagnostic_enabled() -> bool:
@@ -77,13 +134,15 @@ def _incoming_recovery_diagnostic_enabled() -> bool:
 
 def _incoming_recovery_child_record(
         recorder: object, process: object, error: object = None, classification: str = "unknown",
+        *, phase: str = "unknown", started_at: object = None,
+        alive_before: object = None,
 ) -> None:
     if not _incoming_recovery_diagnostic_enabled() or not callable(recorder):
         return
     try:
-        alive = process.isalive() if process is not None else None
+        alive_after = process.isalive() if process is not None else None
     except Exception:
-        alive = None
+        alive_after = None
     try:
         exitstatus = getattr(process, "exitstatus", None)
     except Exception:
@@ -102,11 +161,35 @@ def _incoming_recovery_child_record(
         classification = "signal"
     elif isinstance(exitstatus, int) and classification == "unknown":
         classification = "exit"
+    safe_phase = phase if phase in _INCOMING_RECOVERY_PHASES else "unknown"
+    buffer_source, read_buffer_byte_length_bucket = _incoming_recovery_buffer_observation(process)
+    reaped = (
+        "signal" if isinstance(signalstatus, int) else
+        "exit" if isinstance(exitstatus, int) else
+        "alive" if alive_after is True else
+        "not_alive" if alive_after is False else "unknown"
+    )
+    process_pid = "unavailable"
+    try:
+        pid = getattr(process, "pid", None)
+        if type(pid) is int and pid > 0:
+            process_pid = pid
+    except Exception:
+        pass
+    ended_at = time.monotonic()
     try:
         recorder("lftp_child", {
-            "process_alive": alive if type(alive) is bool else None,
+            "phase": safe_phase,
+            "duration_bucket": _incoming_recovery_duration_bucket(started_at, ended_at),
+            "process_pid": process_pid,
+            "process_alive_before": alive_before if type(alive_before) is bool else None,
+            "process_alive_after": alive_after if type(alive_after) is bool else None,
+            "process_alive": alive_after if type(alive_after) is bool else None,
+            "reaped": reaped,
             "exitstatus": exitstatus, "signalstatus": signalstatus,
             "classification": classification,
+            "read_buffer_source": buffer_source,
+            "read_buffer_byte_length_bucket": read_buffer_byte_length_bucket,
         })
     except Exception:
         pass
@@ -977,8 +1060,12 @@ class Lftp:
         """
         @wraps(method)
         def wrapper(inst: "Lftp", *args: _P.args, **kwargs: _P.kwargs) -> _R:
-            if not inst.__process.isalive():
-                _incoming_recovery_child_record(kwargs.get("diagnostic_recorder"), inst.__process)
+            alive_before = inst.__process.isalive()
+            if not alive_before:
+                _incoming_recovery_child_record(
+                    kwargs.get("diagnostic_recorder"), inst.__process,
+                    phase="precheck", alive_before=alive_before,
+                )
                 raise LftpError("lftp process is not running")
             return method(inst, *args, **kwargs)
         return wrapper
@@ -1182,9 +1269,20 @@ class Lftp:
         safe_status_poll_correlation = _safe_lftp_status_poll_correlation(trace_status_poll_correlation)
         pty_trace = getattr(self, "_Lftp__breadcrumb_trace", None)
         pty_flow_id = _safe_lftp_pty_correlation(trace_pty_correlation)
-        def record_diagnostic_child(error: object = None, classification: str = "unknown") -> None:
+        diagnostic_started_at = time.monotonic() if _incoming_recovery_diagnostic_enabled() and \
+            callable(diagnostic_recorder) else None
+        try:
+            diagnostic_alive_before = self.__process.isalive() if diagnostic_started_at is not None else None
+        except Exception:
+            diagnostic_alive_before = None
+
+        def record_diagnostic_child(
+                error: object = None, classification: str = "unknown", phase: str = "unknown",
+        ) -> None:
             _incoming_recovery_child_record(
                 diagnostic_recorder, self.__process, error, classification,
+                phase=phase, started_at=diagnostic_started_at,
+                alive_before=diagnostic_alive_before,
             )
 
         pty_debug_enabled = pty_flow_id is not None and _lftp_pty_trace_enabled(pty_trace, "debug")
@@ -1254,8 +1352,7 @@ class Lftp:
             if status_poll:
                 terminal_failure = self.__drain_status_poll_terminal()
                 if terminal_failure is not None:
-                    if terminal_failure in {"eof", "command_error"}:
-                        record_diagnostic_child(classification=terminal_failure)
+                    record_diagnostic_child(classification=terminal_failure, phase="drain")
                     self.__last_command_timed_out = True
                     self.__last_status_poll_failure_reason = terminal_failure
                     record_status_trace(
@@ -1291,7 +1388,7 @@ class Lftp:
                 })
             except pexpect.exceptions.TIMEOUT as exc:
                 if status_poll:
-                    record_diagnostic_child(exc)
+                    record_diagnostic_child(exc, phase="send")
                 record_pty_trace("write", "send_error", exc)
                 record_command_trace("prompt_timeout")
                 record_status_trace("prompt_timeout", failure_reason="timeout", exception=exc, boundary="send")
@@ -1303,7 +1400,7 @@ class Lftp:
                 raise
             except pexpect.exceptions.EOF as exc:
                 if status_poll:
-                    record_diagnostic_child(exc)
+                    record_diagnostic_child(exc, phase="send")
                 record_pty_trace("write", "send_error", exc)
                 record_command_trace("process_eof")
                 record_status_trace("process_eof", failure_reason="eof", exception=exc, boundary="send")
@@ -1334,7 +1431,7 @@ class Lftp:
                                     break
                                 time.sleep(0.01)
                             except pexpect.exceptions.EOF as exc:
-                                record_diagnostic_child(exc)
+                                record_diagnostic_child(exc, phase="prompt")
                                 self.__last_command_timed_out = True
                                 self.__last_status_poll_failure_reason = "eof"
                                 record_status_trace("process_eof", failure_reason="eof", exception=exc)
@@ -1343,14 +1440,14 @@ class Lftp:
                                     self.__normalize_output(self.__decode_spawn_output(self.__process.before))
                                 ))
                     except pexpect.exceptions.ExceptionPexpect as exc:
-                        record_diagnostic_child(exc, "command_error")
+                        record_diagnostic_child(exc, "command_error", "prompt")
                         self.__last_command_timed_out = True
                         self.__last_status_poll_failure_reason = "command_error"
                         record_status_trace("command_error", failure_reason="command_error", exception=exc)
                         self.logger.warning("Ignoring status poll failure: {}".format(exc))
                         return ""
                     except OSError as exc:
-                        record_diagnostic_child(exc, "command_error")
+                        record_diagnostic_child(exc, "command_error", "prompt")
                         self.__last_command_timed_out = True
                         self.__last_status_poll_failure_reason = "command_error"
                         record_status_trace("command_error", failure_reason="command_error", exception=exc)
@@ -1400,7 +1497,7 @@ class Lftp:
                 if prompt_reached:
                     record_status_trace("prompt_ready", out)
                 else:
-                    record_diagnostic_child(classification="timeout")
+                    record_diagnostic_child(classification="timeout", phase="prompt")
                     record_status_trace("prompt_timeout", out, failure_reason="timeout")
 
             if status_poll and "Connecting..." in out:
@@ -1412,9 +1509,10 @@ class Lftp:
                     self.__process.expect(self.__expect_pattern, timeout=connecting_grace_timeout)
                     record_status_trace("prompt_ready")
                 except pexpect.exceptions.TIMEOUT:
+                    record_diagnostic_child(classification="timeout", phase="connecting")
                     pass
                 except pexpect.exceptions.EOF as exc:
-                    record_diagnostic_child(exc)
+                    record_diagnostic_child(exc, phase="connecting")
                     self.__last_command_timed_out = True
                     self.__last_status_poll_failure_reason = "eof"
                     record_status_trace("process_eof", failure_reason="eof", exception=exc)
@@ -1431,20 +1529,22 @@ class Lftp:
                 record_command_trace("backend_error", out)
                 record_status_trace("backend_error", out, failure_reason="command_error")
                 if status_poll:
-                    record_diagnostic_child(classification="command_error")
+                    record_diagnostic_child(classification="command_error", phase="error_recovery")
                 # we need to consume the actual output so that
                 # it doesn't get passed onto next command
                 error_out = out
                 try:
                     self.__process.expect(self.__expect_pattern, timeout=timeout_seconds)
                 except pexpect.exceptions.TIMEOUT:
+                    if status_poll:
+                        record_diagnostic_child(classification="timeout", phase="error_recovery")
                     out = self.__normalize_output(self.__decode_spawn_output(self.__process.before))
                     if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "recovering from error"):
                         self.logger.warning("Lftp timeout exception")
                     pass
                 except pexpect.exceptions.EOF as exc:
                     if status_poll:
-                        record_diagnostic_child(exc)
+                        record_diagnostic_child(exc, phase="error_recovery")
                         self.__last_status_poll_failure_reason = "eof"
                     self.logger.error("Lftp process died unexpectedly (EOF) during error recovery")
                     raise LftpError("Lftp process terminated during error recovery")

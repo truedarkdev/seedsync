@@ -403,18 +403,27 @@ class _IncomingRecoveryDiagnosticRegistry:
     _MAX_FLOWS = 4
     _MAX_RECORDS = 8
     _MAX_PROCESS_RECORDS = _MAX_FLOWS * _MAX_RECORDS
+    _MAX_SPECIAL_RECORDS = 3
+    _MAX_LINEAGE_RECORDS = 3
+    _MAX_CHILD_PHASES = 2
     _EVENTS = frozenset({
         "queue_admitted", "executor_start", "executor_return", "executor_error",
-        "lftp_child", "root_default",
-    })
-    _TERMINAL_EVENTS = frozenset({
-        "executor_error", "root_default",
+        "lftp_child", "root_default", "controller_exit", "controller_force_close",
     })
     _FAILURE_CLASSIFICATIONS = frozenset({
         "none", "eof", "exit", "signal", "timeout", "command_error",
         "parser_error", "terminal_backlog", "unhealthy_snapshot", "unknown",
     })
-
+    _PHASES = frozenset({
+        "precheck", "drain", "send", "prompt", "connecting", "error_recovery", "teardown", "unknown",
+    })
+    _CHILD_PHASES = frozenset(_PHASES - {"unknown"})
+    _DURATION_BUCKETS = frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+", "unknown"})
+    _REAPED = frozenset({"alive", "not_alive", "exit", "signal", "unknown"})
+    _BUFFER_SOURCES = frozenset({"public_buffer", "private_buffer", "unavailable"})
+    _READ_BUFFER_BUCKETS = frozenset({
+        "0", "1-127", "128-511", "512-2047", "2048-8191", "8192-32767", "32768+", "unknown",
+    })
     def __init__(self, logger: object):
         self.__logger = logger
         self.__lock = Lock()
@@ -431,18 +440,26 @@ class _IncomingRecoveryDiagnosticRegistry:
         accepted = True
         with self.__lock:
             if flow_id not in self.__flows:
+                # Reserve three global-budget records for every active flow's
+                # child terminal, teardown, and root outcome. New flows fail
+                # diagnostic-closed once that finite budget is exhausted.
+                reserved_special = self.__reserved_special_records()
                 if len(self.__flows) >= self._MAX_FLOWS:
-                    self.__flows.pop(next(iter(self.__flows)), None)
-                    drop_reason = "flow_evicted"
-                # Reserve one global-budget record for every active flow's
-                # terminal outcome.  New flows fail diagnostic-closed once
-                # earlier flows have exhausted that finite budget.
-                if self.__process_records >= self._MAX_PROCESS_RECORDS - len(self.__flows):
                     accepted = False
-                    drop_reason = drop_reason or "process_budget"
+                    drop_reason = "process_budget"
                 else:
+                    can_admit = self.__process_records < self._MAX_PROCESS_RECORDS - (
+                        reserved_special + self._MAX_SPECIAL_RECORDS
+                    )
+                    if not can_admit:
+                        accepted = False
+                        drop_reason = "process_budget"
+                if accepted:
                     self.__flows[flow_id] = {
-                        "records": 0, "dropped": 0,
+                        "records": 0, "ordinary_records": 0, "lineage_records": 0,
+                        "child_phases": set(), "dropped": 0, "coalesced": 0,
+                        "child_terminal_recorded": False, "teardown_recorded": False,
+                        "root_recorded": False,
                         "file_id": file_id if isinstance(file_id, str) else None,
                         "operation_sequence": operation_sequence if type(operation_sequence) is int else None,
                     }
@@ -458,7 +475,17 @@ class _IncomingRecoveryDiagnosticRegistry:
         return (lambda event, fields: self.record(flow_id, event, fields)) if present else None
 
     def active_recorder(self) -> Callable[[str, dict[str, object]], None]:
-        return self.record_active
+        # Capture the current flow set at operation admission.  A status poll
+        # may run later on the shared executor, after Queue creates a flow;
+        # that older poll must not publish child facts into the new flow.
+        with self.__lock:
+            flow_ids = tuple(self.__flows)
+
+        def record_admitted(event: str, fields: dict[str, object]) -> None:
+            for flow_id in flow_ids:
+                self.record(flow_id, event, fields)
+
+        return record_admitted
 
     def active_flow_candidates(self) -> tuple[tuple[str, int], ...]:
         with self.__lock:
@@ -488,27 +515,105 @@ class _IncomingRecoveryDiagnosticRegistry:
             state = self.__flows.get(flow_id)
             if state is None:
                 return
-            terminal = event in self._TERMINAL_EVENTS
-            per_flow_available = terminal or state["records"] < self._MAX_RECORDS - 1
-            # Normal observations leave one slot per active flow.  A terminal
-            # record consumes its reserved slot and therefore cannot vanish
-            # merely because the process budget is otherwise exhausted.
-            process_available = self.__process_records < (
-                self._MAX_PROCESS_RECORDS if terminal else
-                self._MAX_PROCESS_RECORDS - len(self.__flows)
+            child_terminal = self.__is_decisive_child_terminal(event, fields)
+            teardown = event in {"controller_exit", "controller_force_close"}
+            root = event == "root_default"
+            if child_terminal and state["child_terminal_recorded"]:
+                state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
+                return
+            if teardown and state["teardown_recorded"]:
+                state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
+                return
+            if root and state["root_recorded"]:
+                state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
+                return
+
+            child_observation = event == "lftp_child" and not child_terminal
+            child_phase = self.__child_phase(fields) if child_observation else None
+            if child_observation:
+                if child_phase is None:
+                    state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
+                    return
+                if child_phase in state["child_phases"]:
+                    state["coalesced"] = min(self._MAX_RECORDS, state["coalesced"] + 1)
+                    return
+                if len(state["child_phases"]) >= self._MAX_CHILD_PHASES:
+                    state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
+                    return
+
+            special = child_terminal or teardown or root
+            ordinary_available = state["ordinary_records"] < (
+                self._MAX_LINEAGE_RECORDS + self._MAX_CHILD_PHASES
             )
-            if per_flow_available and process_available:
+            lineage = event in {
+                "queue_admitted", "executor_start", "executor_return", "executor_error",
+            }
+            if not special and lineage and state["lineage_records"] >= self._MAX_LINEAGE_RECORDS:
+                state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
+                return
+            if not special and not lineage and not child_observation:
+                state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
+                return
+
+            process_available = self.__process_records < (
+                self._MAX_PROCESS_RECORDS if special else
+                self._MAX_PROCESS_RECORDS - self.__reserved_special_records()
+            )
+            if (special or ordinary_available) and state["records"] < self._MAX_RECORDS and process_available:
                 state["records"] += 1
                 self.__process_records += 1
+                if not special:
+                    state["ordinary_records"] += 1
+                    if lineage:
+                        state["lineage_records"] += 1
+                    elif child_observation:
+                        state["child_phases"].add(child_phase)
+                if child_terminal:
+                    state["child_terminal_recorded"] = True
+                if teardown:
+                    state["teardown_recorded"] = True
+                if root:
+                    state["root_recorded"] = True
                 payload = self.__payload(flow_id, event, fields)
             else:
                 state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
-            if terminal:
+            if root:
                 if payload is not None:
                     payload["dropped"] = state["dropped"]
+                    payload["coalesced"] = state["coalesced"]
                 self.__flows.pop(flow_id, None)
         if payload is not None:
             self.__emit(payload)
+
+    def __reserved_special_records(self) -> int:
+        return sum(
+            self.__state_reserved_special_records(state)
+            for state in self.__flows.values()
+        )
+
+    @staticmethod
+    def __state_reserved_special_records(state: dict[str, object]) -> int:
+        return (
+            (0 if state["child_terminal_recorded"] else 1) +
+            (0 if state["teardown_recorded"] else 1) +
+            (0 if state["root_recorded"] else 1)
+        )
+
+    @staticmethod
+    def __is_decisive_child_terminal(event: str, fields: dict[str, object]) -> bool:
+        if event != "lftp_child":
+            return False
+        return (
+            fields.get("classification") in {"eof", "exit", "signal"} or
+            fields.get("reaped") in {"not_alive", "exit", "signal"} or
+            fields.get("process_alive_after") is False or
+            fields.get("process_alive") is False
+        )
+
+    @classmethod
+    def __child_phase(cls, fields: dict[str, object]) -> Optional[str]:
+        phase = fields.get("phase")
+        return phase if phase in cls._CHILD_PHASES else None
 
     def __emit_drop(self, reason: str) -> None:
         payload = None
@@ -524,17 +629,34 @@ class _IncomingRecoveryDiagnosticRegistry:
             self.__emit(payload)
 
     def __payload(self, flow_id: str, event: str, fields: dict[str, object]) -> dict[str, object]:
+        process_pid = fields.get("process_pid")
+        safe_process_pid = type(process_pid) is int and process_pid > 0
         return {
             "schema": "incoming_recovery.queue_lifecycle.v1",
             "event": event, "flow_id": flow_id,
+            "phase": fields.get("phase") if fields.get("phase") in self._PHASES else "unknown",
+            "duration_bucket": fields.get("duration_bucket")
+            if fields.get("duration_bucket") in self._DURATION_BUCKETS else "unknown",
+            "process_pid": process_pid if safe_process_pid else "unavailable",
+            "process_alive_before": fields.get("process_alive_before")
+            if type(fields.get("process_alive_before")) is bool else None,
+            "process_alive_after": fields.get("process_alive_after")
+            if type(fields.get("process_alive_after")) is bool else None,
             "process_alive": fields.get("process_alive") if type(fields.get("process_alive")) is bool else None,
+            "reaped": fields.get("reaped") if fields.get("reaped") in self._REAPED else "unknown",
             "exitstatus": fields.get("exitstatus") if type(fields.get("exitstatus")) is int and -1 <= fields["exitstatus"] <= 255 else None,
             "signalstatus": fields.get("signalstatus") if type(fields.get("signalstatus")) is int and -1 <= fields["signalstatus"] <= 255 else None,
             "classification": fields.get("classification") if fields.get("classification") in self._FAILURE_CLASSIFICATIONS else "unknown",
+            "read_buffer_source": fields.get("read_buffer_source")
+            if fields.get("read_buffer_source") in self._BUFFER_SOURCES else "unavailable",
+            "read_buffer_byte_length_bucket": fields.get("read_buffer_byte_length_bucket")
+            if fields.get("read_buffer_byte_length_bucket") in self._READ_BUFFER_BUCKETS else "unknown",
             "status_health": fields.get("status_health") if fields.get("status_health") in {"healthy", "unhealthy", "unknown"} else "unknown",
             "membership": fields.get("membership") if fields.get("membership") in {"present", "absent", "unknown"} else "unknown",
             "root_state": fields.get("root_state") if fields.get("root_state") in {"default", "unknown"} else "unknown",
             "coverage": fields.get("coverage") if fields.get("coverage") in {"incomplete", "complete", "unknown"} else "unknown",
+            "status_parse": fields.get("status_parse")
+            if fields.get("status_parse") in {"accepted_empty", "unknown"} else "unknown",
         }
 
     def __emit(self, payload: dict[str, object]) -> None:
@@ -2285,11 +2407,11 @@ class Controller:
                 self, "_Controller__lftp_status_poll_command_trace_enabled", None,
             )
             command_trace_enabled = bool(trace_enabled()) if callable(trace_enabled) else False
+            status_recorder = self.__incoming_recovery_status_recorder()
             def poll() -> tuple[list[LftpJobStatus], bool]:
                 if callable(record_lineage):
                     record_lineage(correlation, "status_start")
                 try:
-                    status_recorder = self.__incoming_recovery_status_recorder()
                     if isinstance(self.__lftp, Lftp):
                         status_kwargs: dict[str, object] = {}
                         if isinstance(correlation, str) and command_trace_enabled:
@@ -3894,8 +4016,16 @@ class Controller:
                         self.logger.exception("Ignoring lftp reconfigure failure")
             stage_timer.switch(DURATION_MODEL_UPDATE)
             diagnostic_roots = self.__incoming_recovery_downloading_roots()
+            status_snapshot_before = self.__last_lftp_statuses
             self.__updater.update()
-            self.__record_incoming_recovery_root_defaults(diagnostic_roots)
+            # ModelUpdater replaces the controller's status list only when it
+            # consumed a fresh poll; cached ticks retain the same list. Carry
+            # that existing snapshot identity across this local boundary
+            # without adding lifecycle state to Controller.
+            status_snapshot_fresh = self.__last_lftp_statuses is not status_snapshot_before
+            self.__record_incoming_recovery_root_defaults(
+                diagnostic_roots, status_snapshot_fresh=status_snapshot_fresh,
+            )
             stage_timer.switch(DURATION_CONTROLLER_AUXILIARY_REAP)
             self.__reap_idle_auxiliary_workers()
             stage_timer.switch(DURATION_CONTROLLER_DIAGNOSTICS)
@@ -3989,6 +4119,20 @@ class Controller:
             self.__retire_lftp_status_future_locked()
         self.__shutdown_collision_compare_worker()
         if self.__started or getattr(self, "_Controller__startup_failed", False):
+            teardown_recorded = False
+
+            def record_incoming_recovery_teardown(event: str) -> None:
+                nonlocal teardown_recorded
+                if teardown_recorded:
+                    return
+                teardown_recorded = True
+                try:
+                    recorder = self.__incoming_recovery_status_recorder()
+                    if recorder is not None:
+                        recorder(event, {"phase": "teardown"})
+                except Exception:
+                    pass
+
             try:
                 self.__lftp_executor_closing = True
                 executor = getattr(self, "_Controller__lftp_executor", None)
@@ -4003,6 +4147,7 @@ class Controller:
                             # the pool between the state check and submit.
                             # There is no safe direct PTY fallback here.
                             self.logger.warning("Lftp executor was already closed during teardown")
+                            record_incoming_recovery_teardown("controller_exit")
                         else:
                             try:
                                 future.result(timeout=self.__JOIN_TIMEOUT_IN_SECS)
@@ -4013,24 +4158,32 @@ class Controller:
                                 )
                                 force_close = getattr(self.__lftp, "force_close", None)
                                 if callable(force_close):
+                                    record_incoming_recovery_teardown("controller_force_close")
                                     self.__best_effort_teardown(
                                         "lftp forced close",
                                         force_close,
                                     )
+                                else:
+                                    record_incoming_recovery_teardown("controller_exit")
                                 try:
                                     future.result(timeout=0.5)
                                 except TimeoutError:
                                     self.logger.warning(
                                         "Lftp executor remained blocked after forced close"
                                     )
+                            else:
+                                record_incoming_recovery_teardown("controller_exit")
                     finally:
                         executor.shutdown(wait=False, cancel_futures=True)
                         self.__lftp_executor = None
                 else:
+                    record_incoming_recovery_teardown("controller_exit")
                     self.__lftp.exit()
             except LftpError as exc:
+                record_incoming_recovery_teardown("controller_exit")
                 self.logger.warning("Ignoring lftp teardown failure: {}".format(exc))
             except Exception:
+                record_incoming_recovery_teardown("controller_exit")
                 self.logger.exception("Ignoring lftp teardown failure; continuing shutdown")
             finally:
                 self.__cleanup_active_command_processes_for_exit()
@@ -9955,7 +10108,9 @@ class Controller:
             return []
         return snapshot
 
-    def __record_incoming_recovery_root_defaults(self, roots: list[tuple[str, int]]) -> None:
+    def __record_incoming_recovery_root_defaults(
+            self, roots: list[tuple[str, int]], *, status_snapshot_fresh: bool = False,
+    ) -> None:
         if not roots:
             return
         observations: list[tuple[str, int, dict[str, object]]] = []
@@ -9979,6 +10134,8 @@ class Controller:
                     observations.append((file_id, sequence, {
                         "status_health": status_health,
                         "membership": membership,
+                        "status_parse": "accepted_empty" if status_snapshot_fresh is True and
+                        status_health == "healthy" and membership == "absent" else "unknown",
                         "classification": "none" if failure is None else failure \
                             if failure in _IncomingRecoveryDiagnosticRegistry._FAILURE_CLASSIFICATIONS else "unknown",
                         "root_state": "default",
