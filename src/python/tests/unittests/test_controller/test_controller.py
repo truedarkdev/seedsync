@@ -375,6 +375,151 @@ class TestController(unittest.TestCase):
         registry.active_recorder()("root_default", {"root_state": "default", "coverage": "incomplete"})
         self.assertEqual({}, self.controller._Controller__incoming_recovery_diagnostic_registry._IncomingRecoveryDiagnosticRegistry__flows)
 
+    def test_exact_gate_queue_capacity_refuses_before_pending_dispatch_or_executor(self):
+        registry = _IncomingRecoveryDiagnosticRegistry(self.controller.logger)
+        self.controller._Controller__incoming_recovery_diagnostic_registry = registry
+        for index in range(4):
+            recorder = registry.reserve_recorder(
+                "fractional-queue:{:016x}".format(index), "retained-{}".format(index), 1,
+            )
+            self.assertIsNotNone(recorder)
+            recorder("queue_admitted", {})
+            recorder("executor_start", {})
+            recorder("executor_error", {"classification": "command_error"})
+
+        file = ModelFile("capacity-refusal.bin", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.backend_name = "lftp"
+        executor = MagicMock()
+        self.controller._Controller__lftp_executor = executor
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        with patch.dict(
+                os.environ,
+                {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
+        ):
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+
+        callback.on_failure.assert_called_once_with("Queue diagnostics capacity exhausted", 503)
+        executor.submit.assert_not_called()
+        self.controller._Controller__lftp.queue.assert_not_called()
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+        payloads = [
+            json.loads(log_call.args[1]) for log_call in self.controller.logger.info.call_args_list
+            if len(log_call.args) > 1
+        ]
+        self.assertEqual("dropped", payloads[-1]["event"])
+        self.assertEqual("process_budget", payloads[-1]["reason"])
+        self.assertTrue(all("capacity-refusal.bin" not in repr(payload) for payload in payloads))
+
+    def test_exact_gate_queue_capacity_retires_ready_deferred_intent(self):
+        registry = _IncomingRecoveryDiagnosticRegistry(self.controller.logger)
+        self.controller._Controller__incoming_recovery_diagnostic_registry = registry
+        for index in range(4):
+            recorder = registry.reserve_recorder(
+                "fractional-queue:{:016x}".format(index), "retained-{}".format(index), 1,
+            )
+            self.assertIsNotNone(recorder)
+            recorder("queue_admitted", {})
+            recorder("executor_start", {})
+            recorder("executor_error", {"classification": "command_error"})
+
+        file = ModelFile("deferred-capacity-refusal.bin", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.backend_name = "lftp"
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        callback = MagicMock()
+        command.add_callback(callback)
+        intent = DeferredQueueIntent(command, file.file_id, None)
+        intent.phase = "rescan"
+        intent.rescan_requested = True
+        self.controller._Controller__deferred_queue_intents = {file.file_id: intent}
+
+        with patch.dict(
+                os.environ,
+                {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
+        ), patch.object(
+                self.controller,
+                "_Controller__queue_collision_preflight",
+                return_value=("clear", "ready", intent),
+        ):
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+            self.controller._Controller__process_commands()
+
+        callback.on_failure.assert_called_once_with("Queue diagnostics capacity exhausted", 503)
+        self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+        self.controller._Controller__lftp.queue.assert_not_called()
+
+    def test_exact_gate_rclone_queue_preserves_backend_signature(self):
+        backend = MagicMock()
+        backend.backend_name = "rclone"
+        self.controller._Controller__lftp = backend
+        registry = _IncomingRecoveryDiagnosticRegistry(self.controller.logger)
+        self.controller._Controller__incoming_recovery_diagnostic_registry = registry
+        for index in range(4):
+            recorder = registry.reserve_recorder(
+                "fractional-queue:{:016x}".format(index), "retained-{}".format(index), 1,
+            )
+            self.assertIsNotNone(recorder)
+            recorder("queue_admitted", {})
+            recorder("executor_error", {"classification": "command_error"})
+        file = ModelFile("rclone-capacity.bin", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+
+        with patch.dict(
+                os.environ,
+                {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
+        ):
+            self.controller.queue_command(
+                Controller.Command(Controller.Command.Action.QUEUE, file.file_id),
+            )
+            self.controller._Controller__process_commands()
+
+        backend.queue.assert_called_once()
+        self.assertNotIn("diagnostic_recorder", backend.queue.call_args.kwargs)
+
+    def test_exact_gate_rclone_startup_recovery_preserves_backend_signature(self):
+        backend = MagicMock()
+        backend.backend_name = "rclone"
+        self.controller._Controller__lftp = backend
+        registry = _IncomingRecoveryDiagnosticRegistry(self.controller.logger)
+        self.controller._Controller__incoming_recovery_diagnostic_registry = registry
+        for index in range(4):
+            recorder = registry.reserve_recorder(
+                "fractional-queue:{:016x}".format(index), "retained-{}".format(index), 1,
+            )
+            self.assertIsNotNone(recorder)
+            recorder("queue_admitted", {})
+            recorder("executor_error", {"classification": "command_error"})
+        self.controller._Controller__persist.downloaded_file_names = set()
+        remote_file = SimpleNamespace(
+            name="rclone-recovery.bin",
+            path_pair_id=None,
+            is_dir=False,
+            size=10,
+            mtime_ns=1_000_000_000,
+        )
+
+        with tempfile.TemporaryDirectory() as staging_path:
+            Path(staging_path, "rclone-recovery.bin.lftp").touch()
+            self.controller._Controller__staging_path = staging_path
+            with patch.dict(
+                    os.environ,
+                    {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
+            ):
+                self.controller._Controller__recover_interrupted_downloads([remote_file])
+
+        backend.queue.assert_called_once()
+        self.assertNotIn("diagnostic_recorder", backend.queue.call_args.kwargs)
+
     def test_incoming_recovery_queue_diagnostics_ignore_breadcrumb_policy_at_exact_gate(self):
         executor = MagicMock()
         submitted = []
@@ -16262,6 +16407,42 @@ class TestController(unittest.TestCase):
         )
         self.assertIsNotNone(exclude_patterns.call_args.args[2])
         self.assertEqual({}, self.controller._Controller__download_start_state)
+
+    def test_recovery_capacity_rejection_warning_is_identity_free(self):
+        registry = _IncomingRecoveryDiagnosticRegistry(self.controller.logger)
+        self.controller._Controller__incoming_recovery_diagnostic_registry = registry
+        for index in range(4):
+            recorder = registry.reserve_recorder(
+                "fractional-queue:{:016x}".format(index), "retained-{}".format(index), 1,
+            )
+            self.assertIsNotNone(recorder)
+            recorder("queue_admitted", {})
+            recorder("executor_error", {"classification": "command_error"})
+
+        self.controller._Controller__lftp.backend_name = "lftp"
+        with tempfile.TemporaryDirectory() as staging_path:
+            Path(staging_path, "private-recovery-target.lftp").touch()
+            self.controller._Controller__staging_path = staging_path
+            remote_file = SimpleNamespace(
+                name="private-recovery-target",
+                path_pair_id=None,
+                is_dir=False,
+                size=10,
+                mtime_ns=1_000_000_000,
+            )
+            with patch.dict(
+                    os.environ,
+                    {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
+            ):
+                self.controller._Controller__recover_interrupted_downloads([remote_file])
+
+        warning_text = " ".join(
+            str(log_call.args[0]) for log_call in self.controller.logger.warning.call_args_list
+        )
+        self.assertIn("diagnostic capture capacity is exhausted", warning_text)
+        self.assertNotIn("private-recovery-target", warning_text)
+        self.assertNotIn(staging_path, warning_text)
+        self.controller._Controller__lftp.queue.assert_not_called()
 
     def test_recover_interrupted_downloads_uses_async_owner_for_real_lftp(self):
         self.controller._Controller__persist.downloaded_file_names = set()

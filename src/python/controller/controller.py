@@ -431,6 +431,7 @@ class _IncomingRecoveryDiagnosticRegistry:
     _PRE_SEND_DRAIN_SHAPES = frozenset({"empty", "marked", "unknown"})
     _POST_SEND_PROMPTS = frozenset({"reached", "not_reached", "unknown"})
     _COMMAND_KINDS = frozenset({"queue", "status", "unknown"})
+    _COMMAND_OUTCOMES = frozenset({"success", "prompt_timeout", "eof", "error", "unknown"})
     def __init__(self, logger: object):
         self.__logger = logger
         self.__lock = Lock()
@@ -441,8 +442,16 @@ class _IncomingRecoveryDiagnosticRegistry:
     def recorder(
             self, flow_id: object, file_id: object = None, operation_sequence: object = None,
     ) -> Callable[[str, dict[str, object]], None]:
+        return self.reserve_recorder(flow_id, file_id, operation_sequence) or (
+            lambda _event, _fields: None
+        )
+
+    def reserve_recorder(
+            self, flow_id: object, file_id: object = None, operation_sequence: object = None,
+    ) -> Optional[Callable[[str, dict[str, object]], None]]:
+        """Atomically reserve a new flow, returning None when capacity rejects it."""
         if not isinstance(flow_id, str) or not flow_id.startswith("fractional-queue:"):
-            return lambda _event, _fields: None
+            return None
         drop_reason = None
         accepted = True
         with self.__lock:
@@ -474,7 +483,7 @@ class _IncomingRecoveryDiagnosticRegistry:
         if drop_reason is not None:
             self.__emit_drop(drop_reason)
         if not accepted:
-            return lambda _event, _fields: None
+            return None
         return lambda event, fields: self.record(flow_id, event, fields)
 
     def existing_recorder(self, flow_id: object) -> Optional[Callable[[str, dict[str, object]], None]]:
@@ -674,6 +683,8 @@ class _IncomingRecoveryDiagnosticRegistry:
             "classification": fields.get("classification") if fields.get("classification") in self._FAILURE_CLASSIFICATIONS else "unknown",
             "command_kind": fields.get("command_kind")
             if fields.get("command_kind") in self._COMMAND_KINDS else "unknown",
+            "command_outcome": fields.get("command_outcome")
+            if fields.get("command_outcome") in self._COMMAND_OUTCOMES else "unknown",
             "read_buffer_source": fields.get("read_buffer_source")
             if fields.get("read_buffer_source") in self._BUFFER_SOURCES else "unavailable",
             "read_buffer_byte_length_bucket": fields.get("read_buffer_byte_length_bucket")
@@ -1863,9 +1874,17 @@ class Controller:
             operation_sequence: int = 0,
             pending_dispatch: Optional[PendingQueueDispatch] = None,
             download_start_lifecycle_before: Optional[DownloadStartLifecycleEntry] = None,
+            diagnostic_recorder: Optional[Callable[[str, dict[str, object]], None]] = None,
+            diagnostic_admission_attempted: bool = False,
     ) -> bool:
-        diagnostic_recorder = self.__incoming_recovery_flow_recorder(file_id, operation_sequence) \
-            if action == "queue" else None
+        diagnostic_required = action == "queue" and _incoming_recovery_debug_enabled(self) and \
+            isinstance(file_id, str) and type(operation_sequence) is int and operation_sequence >= 1
+        if action == "queue" and diagnostic_recorder is None and not diagnostic_admission_attempted:
+            diagnostic_recorder = self.__incoming_recovery_flow_recorder(
+                file_id, operation_sequence, require_admission=diagnostic_required,
+            )
+        if diagnostic_required and diagnostic_recorder is None:
+            return False
         executor = self.__ensure_lftp_executor()
         if executor is None:
             if diagnostic_recorder is not None:
@@ -2023,6 +2042,7 @@ class Controller:
 
     def __incoming_recovery_flow_recorder(
             self, file_id: object, operation_sequence: object, create: bool = True,
+            require_admission: bool = False,
     ) -> Optional[Callable[[str, dict[str, object]], None]]:
         if not _incoming_recovery_debug_enabled(self) or not isinstance(file_id, str) or \
                 type(operation_sequence) is not int or operation_sequence < 1:
@@ -2043,7 +2063,11 @@ class Controller:
         if registry is None:
             return None
         try:
-            return registry.recorder(flow_id, file_id, operation_sequence) if create else registry.existing_recorder(flow_id)
+            if create:
+                if require_admission:
+                    return registry.reserve_recorder(flow_id, file_id, operation_sequence)
+                return registry.recorder(flow_id, file_id, operation_sequence)
+            return registry.existing_recorder(flow_id)
         except Exception:
             return None
 
@@ -9147,6 +9171,26 @@ class Controller:
                             queue_kwargs["expected_size"] = source_identity[0]
                         if allow_legacy_get_resume:
                             queue_kwargs["allow_legacy_get_resume"] = True
+                    queue_diagnostic_enabled = self.__uses_async_lftp_owner() and \
+                        _incoming_recovery_debug_enabled(self)
+                    queue_diagnostic_recorder = self.__incoming_recovery_flow_recorder(
+                        file_id, operation_sequence, require_admission=True,
+                    ) if queue_diagnostic_enabled else None
+                    if queue_diagnostic_enabled and queue_diagnostic_recorder is None:
+                        self.logger.warning(
+                            "Interrupted download recovery rejected: "
+                            "diagnostic capture capacity is exhausted",
+                        )
+                        _record_fractional_queue_trace(self, file_id, "startup_recovery_queue_dispatch", lambda: {
+                            "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
+                            "dispatch_mode": "async_future",
+                            "outcome": "diagnostic_capacity",
+                            "future_outcome": "diagnostic_capacity",
+                            "status_acknowledgement": "not_applicable",
+                            "result": "rejected",
+                            "reason": "diagnostic_capacity",
+                        }, flow_id=_fractional_queue_flow_id(self, file_id, operation_sequence))
+                        continue
                     def queue_lftp(
                             file_name: str = file_name,
                             is_dir: bool = is_dir,
@@ -9155,16 +9199,22 @@ class Controller:
                             local_base_dir_path: Optional[str] = staging_path,
                             staging_entry: str = entry,
                             queue_kwargs: dict[str, object] = queue_kwargs,
+                            diagnostic_recorder: Optional[Callable[[str, dict[str, object]], None]] =
+                                queue_diagnostic_recorder,
                     ) -> object:
                         if self.__safe_recovery_staging_entry(
                                 local_base_dir_path, staging_entry, is_dir) is None:
                             raise LftpError("Interrupted recovery staging artifact is unsafe")
+                        diagnostic_kwargs = {
+                            "diagnostic_recorder": diagnostic_recorder,
+                        } if diagnostic_recorder is not None else {}
                         return self.__lftp.queue(
                             file_name,
                             is_dir,
                             remote_base_dir_path=remote_base_dir_path,
                             local_base_dir_path=local_base_dir_path,
-                            **queue_kwargs
+                            **queue_kwargs,
+                            **diagnostic_kwargs,
                         )
                     if self.__uses_async_lftp_owner():
                         self.__queue_dispatch_pending()[file_id] = PendingQueueDispatch(
@@ -9172,7 +9222,9 @@ class Controller:
                             source_identity if not allow_resume else None,
                         )
                         if not self.__submit_lftp_operation(
-                                "queue", queue_lftp, file_id, operation_sequence):
+                                "queue", queue_lftp, file_id, operation_sequence,
+                                diagnostic_recorder=queue_diagnostic_recorder,
+                                diagnostic_admission_attempted=queue_diagnostic_enabled):
                             pending = self.__queue_dispatch_pending()
                             dispatch = pending.get(file_id)
                             if dispatch is not None and dispatch.operation_sequence == operation_sequence:
@@ -10808,6 +10860,31 @@ class Controller:
                         if self.__uses_async_lftp_owner() and queue_trace_flow_id is not None and \
                                 self.__lftp_queue_flow_trace_is_enabled():
                             queue_kwargs["trace_flow_id"] = queue_trace_flow_id
+                        queue_diagnostic_enabled = self.__uses_async_lftp_owner() and \
+                            _incoming_recovery_debug_enabled(self)
+                        queue_diagnostic_recorder = self.__incoming_recovery_flow_recorder(
+                            file.file_id, operation_sequence, require_admission=True,
+                        ) if queue_diagnostic_enabled else None
+                        if queue_diagnostic_enabled and queue_diagnostic_recorder is None:
+                            self.__record_queue_readiness_trace(file.file_id, "queue_dispatch_boundary", {
+                                "schema": "queue_readiness.v1",
+                                "phase": "dispatch_boundary",
+                                "origin": (
+                                    "auto_queue"
+                                    if getattr(command, "origin", "manual") == "auto_queue"
+                                    else "manual"
+                                ),
+                                "dispatch_attempted": False,
+                                "dispatch_mode": "async" if self.__uses_async_lftp_owner() else "sync",
+                                "operation_sequence_present": type(operation_sequence) is int,
+                                "result": "rejected",
+                                "reason": "diagnostic_capacity",
+                            })
+                            self.__retire_deferred_queue_intent(
+                                file.file_id, "diagnostic_capacity", 503,
+                            )
+                            _notify_failure(command, "Queue diagnostics capacity exhausted", 503, file)
+                            continue
                         lifecycle_before_queue = self.__download_start_lifecycle_snapshot(file.file_id)
                         dispatch = PendingQueueDispatch(
                             time.monotonic(), file.full_path, file.path_pair_id, file.is_dir, operation_sequence,
@@ -10840,18 +10917,26 @@ class Controller:
                                 remote_base_dir_path: Optional[str] = path_pair.remote_path if path_pair else None,
                                 local_base_dir_path: Optional[str] = local_base_dir_path,
                                 queue_kwargs: dict[str, object] = queue_kwargs,
+                                diagnostic_recorder: Optional[Callable[[str, dict[str, object]], None]] =
+                                    queue_diagnostic_recorder,
                         ) -> object:
+                            diagnostic_kwargs = {
+                                "diagnostic_recorder": diagnostic_recorder,
+                            } if diagnostic_recorder is not None else {}
                             return self.__lftp.queue(
                                 file_name,
                                 is_dir,
                                 remote_base_dir_path=remote_base_dir_path,
                                 local_base_dir_path=local_base_dir_path,
-                                **queue_kwargs
+                                **queue_kwargs,
+                                **diagnostic_kwargs,
                             )
                         if self.__uses_async_lftp_owner():
                             if not self.__submit_lftp_operation(
                                     "queue", queue_lftp, file.file_id, operation_sequence,
-                                    download_start_lifecycle_before=lifecycle_before_queue):
+                                    download_start_lifecycle_before=lifecycle_before_queue,
+                                    diagnostic_recorder=queue_diagnostic_recorder,
+                                    diagnostic_admission_attempted=queue_diagnostic_enabled):
                                 pending_queue_dispatches.pop(file.file_id, None)
                                 self.__retire_deferred_queue_intent(file.file_id, "backend_shutting_down")
                                 _record_fractional_queue_trace(self, file.file_id, "queue_dispatch", lambda: {

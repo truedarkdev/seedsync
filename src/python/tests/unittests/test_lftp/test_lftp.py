@@ -3439,6 +3439,70 @@ class TestIncomingRecoveryLftpDiagnostics(unittest.TestCase):
         self.assertEqual("0", fields["status_count_bucket"])
         self.assertNotIn("output", fields)
 
+    def test_queue_recorder_captures_one_command_outcome_before_same_flow_status(self):
+        lftp = TestLftp._build_status_poll_test_lftp()
+        records = []
+        recorder = lambda event, fields: records.append((event, fields))
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+            lftp.queue("private.bin", False, diagnostic_recorder=recorder)
+            self.assertEqual([], lftp.status(diagnostic_recorder=recorder))
+
+        queue_records = [fields for event, fields in records if fields.get("command_kind") == "queue"]
+        status_records = [fields for event, fields in records if fields.get("command_kind") == "status"]
+        self.assertEqual(1, len(queue_records))
+        self.assertEqual("success", queue_records[0]["command_outcome"])
+        self.assertEqual("prompt", queue_records[0]["phase"])
+        self.assertEqual(1, len(status_records))
+        self.assertEqual("status", status_records[0]["command_kind"])
+        self.assertEqual("healthy", status_records[0]["status_health"])
+
+    def test_queue_recorder_captures_one_prompt_timeout_outcome(self):
+        lftp = TestLftp._build_status_poll_test_lftp()
+        lftp._Lftp__process.expect.side_effect = pexpect.exceptions.TIMEOUT("prompt timeout")
+        records = []
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+            lftp.queue(
+                "private.bin", False,
+                diagnostic_recorder=lambda event, fields: records.append((event, fields)),
+            )
+
+        queue_records = [fields for event, fields in records if fields.get("command_kind") == "queue"]
+        self.assertEqual(1, len(queue_records))
+        self.assertEqual("prompt_timeout", queue_records[0]["command_outcome"])
+        self.assertEqual("timeout", queue_records[0]["classification"])
+
+    def test_queue_recorder_captures_fixed_eof_and_backend_error_outcomes(self):
+        cases = (
+            ("eof", pexpect.exceptions.EOF("terminal eof"), "eof"),
+            ("error", None, "command_error"),
+        )
+        for expected_outcome, expect_side_effect, expected_classification in cases:
+            with self.subTest(expected_outcome=expected_outcome):
+                lftp = TestLftp._build_status_poll_test_lftp()
+                if expect_side_effect is not None:
+                    lftp._Lftp__process.expect.side_effect = expect_side_effect
+                else:
+                    lftp._Lftp__process.before = "Login failed: private backend"
+                records = []
+                with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+                    if expected_outcome == "eof":
+                        with self.assertRaises(LftpError):
+                            lftp.queue(
+                                "private.bin", False,
+                                diagnostic_recorder=lambda event, fields: records.append((event, fields)),
+                            )
+                    else:
+                        lftp.queue(
+                            "private.bin", False,
+                            diagnostic_recorder=lambda event, fields: records.append((event, fields)),
+                        )
+                queue_records = [
+                    fields for event, fields in records if fields.get("command_kind") == "queue"
+                ]
+                self.assertEqual(1, len(queue_records))
+                self.assertEqual(expected_outcome, queue_records[0]["command_outcome"])
+                self.assertEqual(expected_classification, queue_records[0]["classification"])
+
     def test_status_completion_collapses_large_status_count_to_registry_bucket(self):
         status_lftp = TestLftp._build_status_poll_test_lftp()
         status_lftp._Lftp__last_status_poll_healthy = True
