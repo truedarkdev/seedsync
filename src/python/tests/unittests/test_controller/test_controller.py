@@ -318,6 +318,35 @@ class TestController(unittest.TestCase):
         self.assertEqual(3, payloads[-1]["dropped"])
         self.assertEqual(0, payloads[-1]["coalesced"])
 
+    def test_incoming_recovery_registry_keeps_first_status_poll_with_queue_flow(self):
+        logger = MagicMock()
+        registry = _IncomingRecoveryDiagnosticRegistry(logger)
+        recorder = registry.recorder("fractional-queue:0123456789abcdef")
+        recorder("queue_admitted", {})
+        recorder("executor_start", {})
+        recorder("executor_return", {})
+        recorder("lftp_child", {"classification": "timeout", "phase": "prompt", "command_kind": "status"})
+        recorder("lftp_child", {"classification": "timeout", "phase": "connecting", "command_kind": "status"})
+        recorder("lftp_child", {
+            "classification": "none", "phase": "status", "command_kind": "status",
+            "status_health": "healthy", "status_count_bucket": "0",
+            "process_alive": False,
+            "pre_send_drain_shape": "empty", "post_send_prompt": "reached",
+        })
+        recorder("lftp_child", {"classification": "eof", "reaped": "not_alive"})
+        recorder("root_default", {"root_state": "default", "coverage": "incomplete"})
+        payloads = [json.loads(call.args[1]) for call in logger.info.call_args_list]
+        status = [payload for payload in payloads if payload["event"] == "lftp_child" and payload["phase"] == "status"]
+        self.assertEqual(1, len(status))
+        self.assertEqual("status", status[0]["command_kind"])
+        self.assertEqual("0", status[0]["status_count_bucket"])
+        self.assertEqual("empty", status[0]["pre_send_drain_shape"])
+        self.assertEqual(["prompt", "status", "unknown"], [
+            payload["phase"] for payload in payloads if payload["event"] == "lftp_child"
+        ])
+        self.assertEqual("eof", [payload for payload in payloads if payload["event"] == "lftp_child"][-1]["classification"])
+        self.assertEqual("root_default", payloads[-1]["event"])
+
     def test_incoming_recovery_registry_emits_one_capacity_drop(self):
         logger = MagicMock()
         registry = _IncomingRecoveryDiagnosticRegistry(logger)

@@ -3423,6 +3423,34 @@ class TestIncomingRecoveryLftpDiagnostics(unittest.TestCase):
         self.assertEqual(1234, fields["process_pid"])
         self.assertNotIn("process_start_identity", fields)
 
+    def test_status_binds_one_successful_empty_poll_to_existing_recorder(self):
+        status_lftp = TestLftp._build_status_poll_test_lftp()
+        records = []
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+            self.assertEqual([], status_lftp.status(
+                diagnostic_recorder=lambda event, fields: records.append((event, fields)),
+            ))
+        self.assertEqual(["lftp_child"], [event for event, _ in records])
+        fields = records[0][1]
+        self.assertEqual("status", fields["phase"])
+        self.assertEqual("status", fields["command_kind"])
+        self.assertEqual("none", fields["classification"])
+        self.assertEqual("healthy", fields["status_health"])
+        self.assertEqual("0", fields["status_count_bucket"])
+        self.assertNotIn("output", fields)
+
+    def test_status_completion_collapses_large_status_count_to_registry_bucket(self):
+        status_lftp = TestLftp._build_status_poll_test_lftp()
+        status_lftp._Lftp__last_status_poll_healthy = True
+        status_lftp._Lftp__last_status_poll_failure_reason = None
+        status_lftp._Lftp__last_incoming_recovery_status_observation = {}
+        records = []
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+            status_lftp._Lftp__record_incoming_recovery_status_completion(
+                lambda event, fields: records.append((event, fields)), [object()] * 17,
+            )
+        self.assertEqual("17+", records[0][1]["status_count_bucket"])
+
     def test_status_forwards_later_child_terminal_observations(self):
         for exitstatus, signalstatus, expected in ((7, None, "exit"), (None, 9, "signal")):
             with self.subTest(expected=expected), \
@@ -3437,6 +3465,7 @@ class TestIncomingRecoveryLftpDiagnostics(unittest.TestCase):
                 ))
                 self.assertEqual(["lftp_child"], [event for event, _ in status_records])
                 self.assertEqual(expected, status_records[0][1]["classification"])
+                self.assertEqual("status", status_records[0][1]["command_kind"])
 
         eof_lftp = TestLftp._build_status_poll_test_lftp()
         eof_lftp._Lftp__process.expect.side_effect = pexpect.exceptions.EOF("private status eof")

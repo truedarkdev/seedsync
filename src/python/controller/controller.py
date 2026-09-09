@@ -415,7 +415,7 @@ class _IncomingRecoveryDiagnosticRegistry:
         "parser_error", "terminal_backlog", "unhealthy_snapshot", "unknown",
     })
     _PHASES = frozenset({
-        "precheck", "drain", "send", "prompt", "connecting", "error_recovery", "teardown", "unknown",
+        "precheck", "drain", "send", "prompt", "connecting", "error_recovery", "status", "teardown", "unknown",
     })
     _CHILD_PHASES = frozenset(_PHASES - {"unknown"})
     _DURATION_BUCKETS = frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+", "unknown"})
@@ -430,6 +430,7 @@ class _IncomingRecoveryDiagnosticRegistry:
     _STATUS_RECOVERIES = frozenset({"none", "connection_grace", "unknown"})
     _PRE_SEND_DRAIN_SHAPES = frozenset({"empty", "marked", "unknown"})
     _POST_SEND_PROMPTS = frozenset({"reached", "not_reached", "unknown"})
+    _COMMAND_KINDS = frozenset({"queue", "status", "unknown"})
     def __init__(self, logger: object):
         self.__logger = logger
         self.__lock = Lock()
@@ -464,6 +465,7 @@ class _IncomingRecoveryDiagnosticRegistry:
                     self.__flows[flow_id] = {
                         "records": 0, "ordinary_records": 0, "lineage_records": 0,
                         "child_phases": set(), "dropped": 0, "coalesced": 0,
+                        "status_completion_recorded": False,
                         "child_terminal_recorded": False, "teardown_recorded": False,
                         "root_recorded": False,
                         "file_id": file_id if isinstance(file_id, str) else None,
@@ -536,14 +538,24 @@ class _IncomingRecoveryDiagnosticRegistry:
 
             child_observation = event == "lftp_child" and not child_terminal
             child_phase = self.__child_phase(fields) if child_observation else None
+            status_completion = child_observation and fields.get("command_kind") == "status" and \
+                fields.get("classification") == "none" and fields.get("status_health") == "healthy"
             if child_observation:
                 if child_phase is None:
                     state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
                     return
+                if status_completion and state["status_completion_recorded"]:
+                    state["coalesced"] = min(self._MAX_RECORDS, state["coalesced"] + 1)
+                    return
                 if child_phase in state["child_phases"]:
                     state["coalesced"] = min(self._MAX_RECORDS, state["coalesced"] + 1)
                     return
-                if len(state["child_phases"]) >= self._MAX_CHILD_PHASES:
+                # Preserve one existing child-failure slot and one later healthy
+                # status completion so prompt noise cannot exhaust the sole
+                # post-Queue membership discriminator.
+                if (fields.get("command_kind") == "status" and not status_completion and
+                        len(state["child_phases"]) >= 1) or \
+                        len(state["child_phases"]) >= self._MAX_CHILD_PHASES:
                     state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
                     return
 
@@ -574,6 +586,8 @@ class _IncomingRecoveryDiagnosticRegistry:
                         state["lineage_records"] += 1
                     elif child_observation:
                         state["child_phases"].add(child_phase)
+                        if status_completion:
+                            state["status_completion_recorded"] = True
                 if child_terminal:
                     state["child_terminal_recorded"] = True
                 if teardown:
@@ -608,6 +622,11 @@ class _IncomingRecoveryDiagnosticRegistry:
     @staticmethod
     def __is_decisive_child_terminal(event: str, fields: dict[str, object]) -> bool:
         if event != "lftp_child":
+            return False
+        if fields.get("command_kind") == "status" and fields.get("classification") == "none" and \
+                fields.get("status_health") == "healthy":
+            # A completed status parse may sample a just-exited child; retain
+            # that fact without consuming the later EOF/exit/signal reservation.
             return False
         return (
             fields.get("classification") in {"eof", "exit", "signal"} or
@@ -653,11 +672,15 @@ class _IncomingRecoveryDiagnosticRegistry:
             "exitstatus": fields.get("exitstatus") if type(fields.get("exitstatus")) is int and -1 <= fields["exitstatus"] <= 255 else None,
             "signalstatus": fields.get("signalstatus") if type(fields.get("signalstatus")) is int and -1 <= fields["signalstatus"] <= 255 else None,
             "classification": fields.get("classification") if fields.get("classification") in self._FAILURE_CLASSIFICATIONS else "unknown",
+            "command_kind": fields.get("command_kind")
+            if fields.get("command_kind") in self._COMMAND_KINDS else "unknown",
             "read_buffer_source": fields.get("read_buffer_source")
             if fields.get("read_buffer_source") in self._BUFFER_SOURCES else "unavailable",
             "read_buffer_byte_length_bucket": fields.get("read_buffer_byte_length_bucket")
             if fields.get("read_buffer_byte_length_bucket") in self._READ_BUFFER_BUCKETS else "unknown",
             "status_health": fields.get("status_health") if fields.get("status_health") in {"healthy", "unhealthy", "unknown"} else "unknown",
+            "status_count_bucket": fields.get("status_count_bucket")
+            if fields.get("status_count_bucket") in {"0", "1", "2-4", "5-16", "17+", "unknown"} else "unknown",
             "membership": fields.get("membership") if fields.get("membership") in {"present", "absent", "unknown"} else "unknown",
             "root_state": fields.get("root_state") if fields.get("root_state") in {"default", "unknown"} else "unknown",
             "coverage": fields.get("coverage") if fields.get("coverage") in {"incomplete", "complete", "unknown"} else "unknown",

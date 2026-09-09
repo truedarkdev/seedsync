@@ -160,7 +160,7 @@ def _incoming_recovery_diagnostic_enabled() -> bool:
 def _incoming_recovery_child_record(
         recorder: object, process: object, error: object = None, classification: str = "unknown",
         *, phase: str = "unknown", started_at: object = None,
-        alive_before: object = None,
+        alive_before: object = None, command_kind: object = "unknown",
 ) -> None:
     if not _incoming_recovery_diagnostic_enabled() or not callable(recorder):
         return
@@ -213,6 +213,7 @@ def _incoming_recovery_child_record(
             "reaped": reaped,
             "exitstatus": exitstatus, "signalstatus": signalstatus,
             "classification": classification,
+            "command_kind": command_kind if command_kind in {"queue", "status", "unknown"} else "unknown",
             "read_buffer_source": buffer_source,
             "read_buffer_byte_length_bucket": read_buffer_byte_length_bucket,
         })
@@ -1091,6 +1092,7 @@ class Lftp:
                 _incoming_recovery_child_record(
                     kwargs.get("diagnostic_recorder"), inst.__process,
                     phase="precheck", alive_before=alive_before,
+                    command_kind="status" if kwargs.get("status_poll") is True else "queue",
                 )
                 raise LftpError("lftp process is not running")
             return method(inst, *args, **kwargs)
@@ -1350,6 +1352,7 @@ class Lftp:
                 diagnostic_recorder, self.__process, error, classification,
                 phase=phase, started_at=diagnostic_started_at,
                 alive_before=diagnostic_alive_before,
+                command_kind="status" if status_poll else "queue",
             )
 
         pty_debug_enabled = pty_flow_id is not None and _lftp_pty_trace_enabled(pty_trace, "debug")
@@ -1889,6 +1892,32 @@ class Lftp:
             "read_buffer_byte_length_bucket": buffer_bucket,
         }
 
+    def __record_incoming_recovery_status_completion(
+            self, diagnostic_recorder: object, statuses: object,
+    ) -> None:
+        """Bind one completed post-Queue status poll to the existing active flow."""
+        if not _incoming_recovery_diagnostic_enabled() or not callable(diagnostic_recorder) or \
+                not isinstance(statuses, list) or self.__last_status_poll_healthy is not True or \
+                self.__last_status_poll_failure_reason is not None:
+            return
+        try:
+            observation = self.incoming_recovery_last_status_observation
+            healthy = self.__last_status_poll_healthy
+            status_count = len(statuses)
+            status_count_bucket = (
+                "0" if status_count == 0 else "1" if status_count == 1 else
+                "2-4" if status_count <= 4 else "5-16" if status_count <= 16 else "17+"
+            )
+            diagnostic_recorder("lftp_child", {
+                "phase": "status", "command_kind": "status",
+                "classification": "none", "status_health": "healthy" if healthy is True else "unknown",
+                "status_count_bucket": status_count_bucket,
+                **observation,
+            })
+        except Exception:
+            # The existing diagnostic callback is never part of status ownership.
+            return
+
     @property
     def sftp_connect_program(self) -> str:
         return self.__get(Lftp.__SET_SFTP_CONNECT_PROGRAM)
@@ -2071,6 +2100,7 @@ class Lftp:
             out, statuses, preceded_timeout=preceded_timeout,
             used_connection_grace=used_connection_grace,
         )
+        self.__record_incoming_recovery_status_completion(diagnostic_recorder, statuses)
         record_status_result(
             "health", status_count=(len(statuses) if statuses is not None else None),
             healthy=self.__last_status_poll_healthy,
