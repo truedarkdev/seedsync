@@ -73,6 +73,10 @@ _INCOMING_RECOVERY_DIAGNOSTIC_ENV = "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TI
 _INCOMING_RECOVERY_PHASES = frozenset({
     "precheck", "drain", "send", "prompt", "connecting", "error_recovery", "teardown", "unknown",
 })
+_INCOMING_RECOVERY_STATUS_RESULT_SHAPES = frozenset({
+    "empty_or_prompt", "queue_done", "job_present", "ambiguous", "parse_error", "unknown",
+})
+_INCOMING_RECOVERY_STATUS_RECOVERIES = frozenset({"none", "connection_grace", "unknown"})
 
 
 def _incoming_recovery_buffer_length(value: object) -> int | None:
@@ -126,6 +130,27 @@ def _incoming_recovery_buffer_observation(process: object) -> tuple[str, str]:
     if private_length is not None:
         return "private_buffer", _lftp_trace_bytes_bucket(private_length)
     return "unavailable", "unknown"
+
+
+def _incoming_recovery_status_result_shape(output: object, statuses: object) -> str:
+    """Classify a parsed status result without retaining its private frame."""
+    if statuses is None:
+        return "parse_error"
+    if isinstance(statuses, list) and statuses:
+        return "job_present"
+    if not isinstance(output, str):
+        return "ambiguous"
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        # ``before`` excludes a matched prompt, so this cannot distinguish a
+        # genuinely idle queue from a prompt-only response.
+        return "empty_or_prompt"
+    if any(re.match(r"^\[\d+\]\s+(?:mirror|pget|get|put)\b", line) or
+           re.search(r"\b\d+/\d+\s+\(\d+%\)", line) for line in lines):
+        return "job_present"
+    if any(re.match(r"^\[\d+\]\s+Done\s+\(queue\s+\(", line) for line in lines):
+        return "queue_done"
+    return "ambiguous"
 
 
 def _incoming_recovery_diagnostic_enabled() -> bool:
@@ -874,6 +899,7 @@ class Lftp:
         # Per-poll diagnostic classification only; it is not transfer
         # authority, a cache, or a persisted lifecycle marker.
         self.__last_status_poll_failure_reason: Optional[str] = None
+        self.__last_incoming_recovery_status_observation: dict[str, object] | None = None
         self.__status_poll_needs_connection_grace = False
         self.__breadcrumb_trace: object = None
 
@@ -1171,9 +1197,15 @@ class Lftp:
         evidence_tail = ""
         saw_backend_error = False
         saw_host_key_prompt = False
+        saw_queue_done = False
+        saw_job_or_progress = False
+        saw_prompt_or_echo = False
+        drained_byte_count = 0
+        diagnostic_enabled = _incoming_recovery_diagnostic_enabled()
 
         def observe(value: object) -> None:
-            nonlocal evidence_tail, saw_backend_error, saw_host_key_prompt
+            nonlocal evidence_tail, saw_backend_error, saw_host_key_prompt, saw_queue_done, \
+                saw_job_or_progress, saw_prompt_or_echo, drained_byte_count
             if not isinstance(value, (str, bytes)):
                 return
             text = self.__decode_spawn_output(value)
@@ -1185,6 +1217,41 @@ class Lftp:
             # Keep only enough private in-memory context to recognize an
             # existing error across a chunk boundary.  Never log this output.
             evidence_tail = combined[-1024:]
+            if not diagnostic_enabled:
+                return
+            try:
+                drained_byte_count += len(text.encode("utf-8", "surrogateescape"))
+            except UnicodeEncodeError:
+                drained_byte_count = -1
+            lines = [line.strip() for line in combined.splitlines() if line.strip()]
+            saw_queue_done = saw_queue_done or any(
+                re.match(r"^\[\d+\]\s+Done\s+\(queue\s+\(", line) for line in lines
+            )
+            saw_job_or_progress = saw_job_or_progress or any(
+                re.match(r"^\[\d+\]\s+(?:mirror|pget|get|put)\b", line) or
+                re.search(r"\b\d+/\d+\s+\(\d+%\)", line) for line in lines
+            )
+            saw_prompt_or_echo = saw_prompt_or_echo or "jobs -v" in combined or bool(
+                re.search(self.__expect_pattern, combined)
+            )
+
+        def finish(failure: Optional[str]) -> Optional[str]:
+            if diagnostic_enabled:
+                observation = getattr(self, "_Lftp__last_incoming_recovery_status_observation", None)
+                observation = dict(observation) if isinstance(observation, dict) else {}
+                previous_bytes = observation.get("_pre_send_drain_bytes", 0)
+                total_bytes = previous_bytes + drained_byte_count \
+                    if type(previous_bytes) is int and previous_bytes >= 0 and drained_byte_count >= 0 else -1
+                observation.update({
+                    "_pre_send_drain_bytes": total_bytes,
+                    "_pre_send_drain_queue_done": bool(observation.get("_pre_send_drain_queue_done")) or saw_queue_done,
+                    "_pre_send_drain_job_or_progress": bool(observation.get("_pre_send_drain_job_or_progress")) or saw_job_or_progress,
+                    "_pre_send_drain_prompt_or_echo": bool(observation.get("_pre_send_drain_prompt_or_echo")) or saw_prompt_or_echo,
+                    "_pre_send_drain_error": bool(observation.get("_pre_send_drain_error")) or
+                    saw_backend_error or saw_host_key_prompt,
+                })
+                self.__last_incoming_recovery_status_observation = observation
+            return failure
 
         def terminal_error() -> Optional[str]:
             if saw_host_key_prompt:
@@ -1224,9 +1291,9 @@ class Lftp:
             replace_retained(process.buffer_type().getvalue())
         process.after = None
         if terminal_error() is not None:
-            return "command_error"
+            return finish("command_error")
         if remaining <= 0:
-            return "terminal_backlog"
+            return finish("terminal_backlog")
 
         while remaining > 0:
             try:
@@ -1234,17 +1301,17 @@ class Lftp:
                     size=min(STATUS_POLL_TERMINAL_DRAIN_READ_BYTES, remaining), timeout=0,
                 )
             except pexpect.exceptions.TIMEOUT:
-                return terminal_error()
+                return finish(terminal_error())
             except pexpect.exceptions.EOF:
-                return "eof"
+                return finish("eof")
             if not isinstance(chunk, (str, bytes)) or not chunk:
-                return terminal_error()
+                return finish(terminal_error())
             observe(chunk)
             remaining -= len(chunk)
             error = terminal_error()
             if error is not None:
-                return error
-        return "terminal_backlog"
+                return finish(error)
+        return finish("terminal_backlog")
 
     @with_check_process
     def __run_command(self,
@@ -1415,6 +1482,7 @@ class Lftp:
                 raise
             timeout_seconds = self.__timeout if timeout_seconds is None else timeout_seconds
             prompt_reached = False
+            final_prompt_reached = False
             recovered_output_preserved = False
             try:
                 if status_poll:
@@ -1425,6 +1493,7 @@ class Lftp:
                             try:
                                 self.__process.expect(self.__expect_pattern, timeout=0)
                                 prompt_reached = True
+                                final_prompt_reached = True
                                 break
                             except pexpect.exceptions.TIMEOUT:
                                 if time.monotonic() >= status_poll_deadline:
@@ -1507,6 +1576,7 @@ class Lftp:
                 try:
                     connecting_grace_timeout = max(status_poll_timeout_seconds or 0, 5.0)
                     self.__process.expect(self.__expect_pattern, timeout=connecting_grace_timeout)
+                    final_prompt_reached = True
                     record_status_trace("prompt_ready")
                 except pexpect.exceptions.TIMEOUT:
                     record_diagnostic_child(classification="timeout", phase="connecting")
@@ -1523,6 +1593,11 @@ class Lftp:
 
             if status_poll and not prompt_reached and not recovered_output_preserved and not self.__detect_errors_from_output(out):
                 out = ""
+            if status_poll and _incoming_recovery_diagnostic_enabled():
+                observation = getattr(self, "_Lftp__last_incoming_recovery_status_observation", None)
+                observation = dict(observation) if isinstance(observation, dict) else {}
+                observation["_post_send_prompt"] = "reached" if final_prompt_reached else "not_reached"
+                self.__last_incoming_recovery_status_observation = observation
 
             # let's try and detect some errors
             if self.__detect_errors_from_output(out):
@@ -1757,6 +1832,64 @@ class Lftp:
         return reason if reason in LFTP_STATUS_POLL_FAILURE_REASONS else None
 
     @property
+    def incoming_recovery_last_status_observation(self) -> dict[str, object]:
+        """Return bounded last-poll metadata for the exact-600 root record only."""
+        observation = getattr(self, "_Lftp__last_incoming_recovery_status_observation", None)
+        if not isinstance(observation, dict):
+            return {}
+        fields = {
+            "status_result_shape", "status_recovery", "status_preceded_timeout",
+            "pre_send_drain_shape", "pre_send_drain_byte_length_bucket",
+            "pre_send_drain_queue_done", "pre_send_drain_job_or_progress",
+            "pre_send_drain_prompt_or_echo", "pre_send_drain_error", "post_send_prompt",
+            "process_pid", "process_alive", "read_buffer_source", "read_buffer_byte_length_bucket",
+        }
+        return {field: observation[field] for field in fields if field in observation}
+
+    def __record_incoming_recovery_status_observation(
+            self, output: object, statuses: object, *, preceded_timeout: object,
+            used_connection_grace: object,
+    ) -> None:
+        if not _incoming_recovery_diagnostic_enabled():
+            return
+        try:
+            process = self.__process
+            alive = process.isalive()
+            pid = getattr(process, "pid", None)
+        except Exception:
+            process = None
+            alive = None
+            pid = None
+        buffer_source, buffer_bucket = _incoming_recovery_buffer_observation(process)
+        result_shape = _incoming_recovery_status_result_shape(output, statuses)
+        recovery = "connection_grace" if used_connection_grace is True else \
+            "none" if used_connection_grace is False else "unknown"
+        prior = getattr(self, "_Lftp__last_incoming_recovery_status_observation", None)
+        prior = prior if isinstance(prior, dict) else {}
+        drain_bytes = prior.get("_pre_send_drain_bytes", -1)
+        drain_marked = any(prior.get(field) is True for field in (
+            "_pre_send_drain_queue_done", "_pre_send_drain_job_or_progress",
+            "_pre_send_drain_prompt_or_echo", "_pre_send_drain_error",
+        ))
+        self.__last_incoming_recovery_status_observation = {
+            "status_result_shape": result_shape if result_shape in _INCOMING_RECOVERY_STATUS_RESULT_SHAPES else "unknown",
+            "status_recovery": recovery if recovery in _INCOMING_RECOVERY_STATUS_RECOVERIES else "unknown",
+            "status_preceded_timeout": preceded_timeout if type(preceded_timeout) is bool else None,
+            "pre_send_drain_shape": "empty" if drain_bytes == 0 else "marked" if drain_marked else "unknown",
+            "pre_send_drain_byte_length_bucket": _lftp_trace_bytes_bucket(drain_bytes),
+            "pre_send_drain_queue_done": prior.get("_pre_send_drain_queue_done") is True,
+            "pre_send_drain_job_or_progress": prior.get("_pre_send_drain_job_or_progress") is True,
+            "pre_send_drain_prompt_or_echo": prior.get("_pre_send_drain_prompt_or_echo") is True,
+            "pre_send_drain_error": prior.get("_pre_send_drain_error") is True,
+            "post_send_prompt": prior.get("_post_send_prompt")
+            if prior.get("_post_send_prompt") in {"reached", "not_reached"} else "unknown",
+            "process_pid": pid if type(pid) is int and pid > 0 else "unavailable",
+            "process_alive": alive if type(alive) is bool else None,
+            "read_buffer_source": buffer_source,
+            "read_buffer_byte_length_bucket": buffer_bucket,
+        }
+
+    @property
     def sftp_connect_program(self) -> str:
         return self.__get(Lftp.__SET_SFTP_CONNECT_PROGRAM)
 
@@ -1772,6 +1905,9 @@ class Lftp:
         :return:
         """
         self.__last_status_poll_failure_reason = None
+        # A prior exact-600 poll must never be associated with this poll, or
+        # survive after the gate is disabled.
+        self.__last_incoming_recovery_status_observation = None
         safe_trace_poll_correlation = _safe_lftp_status_poll_correlation(trace_poll_correlation)
 
         def record_status_result(phase: str, output: object = None, status_count: object = None,
@@ -1857,6 +1993,8 @@ class Lftp:
             )
             raise
         timed_out = self.__last_command_timed_out
+        preceded_timeout = timed_out is True
+        used_connection_grace = False
         statuses: Optional[List[LftpJobStatus]] = None
         try:
             try:
@@ -1887,6 +2025,7 @@ class Lftp:
             self.__annotate_status_path_pairs(statuses)
         if not statuses and getattr(self, "_Lftp__status_poll_needs_connection_grace", False) and not self.__pending_error:
             self.__status_poll_needs_connection_grace = False
+            used_connection_grace = True
             connection_grace_timeout = max(STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS, 5.0)
             run_command: Any = self.__run_command
             out = run_command(
@@ -1928,6 +2067,10 @@ class Lftp:
                 self.__annotate_status_path_pairs(statuses)
         if not self.__last_status_poll_healthy and self.__last_status_poll_failure_reason is None:
             self.__last_status_poll_failure_reason = "unhealthy_snapshot"
+        self.__record_incoming_recovery_status_observation(
+            out, statuses, preceded_timeout=preceded_timeout,
+            used_connection_grace=used_connection_grace,
+        )
         record_status_result(
             "health", status_count=(len(statuses) if statuses is not None else None),
             healthy=self.__last_status_poll_healthy,

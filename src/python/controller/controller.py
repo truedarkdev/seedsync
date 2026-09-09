@@ -424,6 +424,12 @@ class _IncomingRecoveryDiagnosticRegistry:
     _READ_BUFFER_BUCKETS = frozenset({
         "0", "1-127", "128-511", "512-2047", "2048-8191", "8192-32767", "32768+", "unknown",
     })
+    _STATUS_RESULT_SHAPES = frozenset({
+        "empty_or_prompt", "queue_done", "job_present", "ambiguous", "parse_error", "unknown",
+    })
+    _STATUS_RECOVERIES = frozenset({"none", "connection_grace", "unknown"})
+    _PRE_SEND_DRAIN_SHAPES = frozenset({"empty", "marked", "unknown"})
+    _POST_SEND_PROMPTS = frozenset({"reached", "not_reached", "unknown"})
     def __init__(self, logger: object):
         self.__logger = logger
         self.__lock = Lock()
@@ -657,6 +663,26 @@ class _IncomingRecoveryDiagnosticRegistry:
             "coverage": fields.get("coverage") if fields.get("coverage") in {"incomplete", "complete", "unknown"} else "unknown",
             "status_parse": fields.get("status_parse")
             if fields.get("status_parse") in {"accepted_empty", "unknown"} else "unknown",
+            "status_result_shape": fields.get("status_result_shape")
+            if fields.get("status_result_shape") in self._STATUS_RESULT_SHAPES else "unknown",
+            "status_recovery": fields.get("status_recovery")
+            if fields.get("status_recovery") in self._STATUS_RECOVERIES else "unknown",
+            "status_preceded_timeout": fields.get("status_preceded_timeout")
+            if type(fields.get("status_preceded_timeout")) is bool else None,
+            "pre_send_drain_shape": fields.get("pre_send_drain_shape")
+            if fields.get("pre_send_drain_shape") in self._PRE_SEND_DRAIN_SHAPES else "unknown",
+            "pre_send_drain_byte_length_bucket": fields.get("pre_send_drain_byte_length_bucket")
+            if fields.get("pre_send_drain_byte_length_bucket") in self._READ_BUFFER_BUCKETS else "unknown",
+            "pre_send_drain_queue_done": fields.get("pre_send_drain_queue_done")
+            if type(fields.get("pre_send_drain_queue_done")) is bool else None,
+            "pre_send_drain_job_or_progress": fields.get("pre_send_drain_job_or_progress")
+            if type(fields.get("pre_send_drain_job_or_progress")) is bool else None,
+            "pre_send_drain_prompt_or_echo": fields.get("pre_send_drain_prompt_or_echo")
+            if type(fields.get("pre_send_drain_prompt_or_echo")) is bool else None,
+            "pre_send_drain_error": fields.get("pre_send_drain_error")
+            if type(fields.get("pre_send_drain_error")) is bool else None,
+            "post_send_prompt": fields.get("post_send_prompt")
+            if fields.get("post_send_prompt") in self._POST_SEND_PROMPTS else "unknown",
         }
 
     def __emit(self, payload: dict[str, object]) -> None:
@@ -10120,6 +10146,15 @@ class Controller:
                 statuses = list(self.__last_lftp_statuses or [])
                 health = getattr(self.__lftp, "last_status_poll_healthy", None)
                 failure = getattr(self.__lftp, "last_status_poll_failure_reason", None)
+                status_observation: dict[str, object] = {}
+                if status_snapshot_fresh is True:
+                    observation_getter = getattr(self.__lftp, "incoming_recovery_last_status_observation", None)
+                    try:
+                        status_observation = observation_getter() if callable(observation_getter) else observation_getter
+                    except Exception:
+                        status_observation = {}
+                    if not isinstance(status_observation, dict):
+                        status_observation = {}
                 for file_id, sequence in roots:
                     file = self.__model.get_file(file_id)
                     state_name = getattr(getattr(file, "state", None), "name", None)
@@ -10136,6 +10171,28 @@ class Controller:
                         "membership": membership,
                         "status_parse": "accepted_empty" if status_snapshot_fresh is True and
                         status_health == "healthy" and membership == "absent" else "unknown",
+                        "status_result_shape": status_observation.get("status_result_shape"),
+                        "status_recovery": status_observation.get("status_recovery"),
+                        "status_preceded_timeout": status_observation.get("status_preceded_timeout"),
+                        "pre_send_drain_shape": status_observation.get("pre_send_drain_shape"),
+                        "pre_send_drain_byte_length_bucket": status_observation.get(
+                            "pre_send_drain_byte_length_bucket"
+                        ),
+                        "pre_send_drain_queue_done": status_observation.get("pre_send_drain_queue_done"),
+                        "pre_send_drain_job_or_progress": status_observation.get(
+                            "pre_send_drain_job_or_progress"
+                        ),
+                        "pre_send_drain_prompt_or_echo": status_observation.get(
+                            "pre_send_drain_prompt_or_echo"
+                        ),
+                        "pre_send_drain_error": status_observation.get("pre_send_drain_error"),
+                        "post_send_prompt": status_observation.get("post_send_prompt"),
+                        "process_pid": status_observation.get("process_pid"),
+                        "process_alive": status_observation.get("process_alive"),
+                        "read_buffer_source": status_observation.get("read_buffer_source"),
+                        "read_buffer_byte_length_bucket": status_observation.get(
+                            "read_buffer_byte_length_bucket"
+                        ),
                         "classification": "none" if failure is None else failure \
                             if failure in _IncomingRecoveryDiagnosticRegistry._FAILURE_CLASSIFICATIONS else "unknown",
                         "root_state": "default",

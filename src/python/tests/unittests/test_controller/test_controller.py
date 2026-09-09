@@ -390,6 +390,22 @@ class TestController(unittest.TestCase):
         lftp = Lftp.__new__(Lftp)
         lftp._Lftp__last_status_poll_healthy = True
         lftp._Lftp__last_status_poll_failure_reason = None
+        lftp._Lftp__last_incoming_recovery_status_observation = {
+            "status_result_shape": "empty_or_prompt",
+            "status_recovery": "connection_grace",
+            "status_preceded_timeout": True,
+            "pre_send_drain_shape": "marked",
+            "pre_send_drain_byte_length_bucket": "128-511",
+            "pre_send_drain_queue_done": True,
+            "pre_send_drain_job_or_progress": False,
+            "pre_send_drain_prompt_or_echo": True,
+            "pre_send_drain_error": False,
+            "post_send_prompt": "reached",
+            "process_pid": 41,
+            "process_alive": True,
+            "read_buffer_source": "private_buffer",
+            "read_buffer_byte_length_bucket": "32768+",
+        }
         process = MagicMock()
         process.isalive.return_value = False
         process.exitstatus = None
@@ -410,9 +426,11 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp_status_future_publication_epoch = None
         self.controller._Controller__progress_publication_epoch = 0
         self.controller._Controller__started = True
-        self.controller._Controller__updater.update.side_effect = lambda: setattr(
-            root, "state", ModelFile.State.DEFAULT,
-        )
+        def publish_fresh_empty_status():
+            root.state = ModelFile.State.DEFAULT
+            self.controller._Controller__last_lftp_statuses = []
+
+        self.controller._Controller__updater.update.side_effect = publish_fresh_empty_status
         self.controller.logger.info.side_effect = lambda *_args: self.assertFalse(model_lock._is_owned())
 
         with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "600"}):
@@ -448,6 +466,15 @@ class TestController(unittest.TestCase):
         self.assertEqual("eof", payloads[3]["classification"])
         self.assertEqual("absent", payloads[-1]["membership"])
         self.assertEqual("incomplete", payloads[-1]["coverage"])
+        self.assertEqual("empty_or_prompt", payloads[-1]["status_result_shape"])
+        self.assertEqual("connection_grace", payloads[-1]["status_recovery"])
+        self.assertTrue(payloads[-1]["status_preceded_timeout"])
+        self.assertEqual("marked", payloads[-1]["pre_send_drain_shape"])
+        self.assertTrue(payloads[-1]["pre_send_drain_queue_done"])
+        self.assertEqual("reached", payloads[-1]["post_send_prompt"])
+        self.assertTrue(payloads[-1]["process_alive"])
+        self.assertEqual("private_buffer", payloads[-1]["read_buffer_source"])
+        self.assertNotIn("private-root", repr(payloads[-1]))
 
     def test_incoming_recovery_root_default_does_not_resurrect_terminal_or_rejected_flow(self):
         root = ModelFile("private-root", True)
@@ -520,6 +547,12 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp_operation_sequences = {root.file_id: 1}
         self.controller._Controller__last_lftp_statuses = []
         self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__lftp.incoming_recovery_last_status_observation = lambda: {
+            "status_result_shape": "job_present",
+            "status_recovery": "connection_grace",
+            "status_preceded_timeout": True,
+            "process_pid": 41,
+        }
 
         with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "600"}):
             self.assertIsNotNone(self.controller._Controller__incoming_recovery_flow_recorder(root.file_id, 1))
@@ -530,10 +563,25 @@ class TestController(unittest.TestCase):
             )
         cached_payload = json.loads(self.controller.logger.info.call_args.args[1])
         self.assertEqual("unknown", cached_payload["status_parse"])
+        self.assertEqual("unknown", cached_payload["status_result_shape"])
+        self.assertEqual("unknown", cached_payload["status_recovery"])
+        self.assertIsNone(cached_payload["status_preceded_timeout"])
+        self.assertEqual("unavailable", cached_payload["process_pid"])
+        self.assertIsNone(cached_payload["process_alive"])
+        self.assertEqual("unavailable", cached_payload["read_buffer_source"])
+        self.assertEqual("unknown", cached_payload["read_buffer_byte_length_bucket"])
+        self.assertEqual("unknown", cached_payload["pre_send_drain_shape"])
+        self.assertIsNone(cached_payload["pre_send_drain_queue_done"])
+        self.assertEqual("unknown", cached_payload["post_send_prompt"])
 
         self.controller.logger.info.reset_mock()
         root.state = ModelFile.State.DOWNLOADING
         self.controller._Controller__lftp_operation_sequences[root.file_id] = 2
+        self.controller._Controller__lftp.incoming_recovery_last_status_observation = lambda: {
+            "status_result_shape": "queue_done",
+            "status_recovery": "none",
+            "status_preceded_timeout": False,
+        }
         with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "600"}):
             self.assertIsNotNone(self.controller._Controller__incoming_recovery_flow_recorder(root.file_id, 2))
             roots = self.controller._Controller__incoming_recovery_downloading_roots()
@@ -543,6 +591,9 @@ class TestController(unittest.TestCase):
             )
         fresh_payload = json.loads(self.controller.logger.info.call_args.args[1])
         self.assertEqual("accepted_empty", fresh_payload["status_parse"])
+        self.assertEqual("queue_done", fresh_payload["status_result_shape"])
+        self.assertEqual("none", fresh_payload["status_recovery"])
+        self.assertFalse(fresh_payload["status_preceded_timeout"])
 
     def test_incoming_recovery_status_submitted_before_queue_keeps_old_recorder(self):
         started = threading.Event()

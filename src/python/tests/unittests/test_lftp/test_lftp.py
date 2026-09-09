@@ -3205,6 +3205,172 @@ class TestLftp(unittest.TestCase):
 
 
 class TestIncomingRecoveryLftpDiagnostics(unittest.TestCase):
+    def test_status_observation_keeps_multiline_terminal_drain_shape(self):
+        lftp = TestLftp._build_status_poll_test_lftp()
+        process = lftp._Lftp__process
+        process._buffer.write(
+            "jobs -v\n[0] queue (sftp://private@host)\nsftp://private@host/root\n"
+            "[0] Done (queue (sftp://private@host))\n"
+        )
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+            self.assertEqual([], lftp.status())
+
+        observation = lftp.incoming_recovery_last_status_observation
+        self.assertEqual("marked", observation["pre_send_drain_shape"])
+        self.assertTrue(observation["pre_send_drain_queue_done"])
+        self.assertTrue(observation["pre_send_drain_prompt_or_echo"])
+        self.assertFalse(observation["pre_send_drain_job_or_progress"])
+        self.assertEqual("empty_or_prompt", observation["status_result_shape"])
+        self.assertEqual("reached", observation["post_send_prompt"])
+        self.assertNotIn("private", repr(observation))
+
+    def test_status_observation_classifies_post_send_frames(self):
+        cases = (
+            ("", "empty_or_prompt"),
+            (
+                "jobs -v\n[0] queue (sftp://private@host)\nsftp://private@host/root\n"
+                "[0] Done (queue (sftp://private@host))\n", "queue_done",
+            ),
+            ("jobs -v\nprivate unexpected frame\n", "ambiguous"),
+        )
+        for output, expected in cases:
+            with self.subTest(expected=expected):
+                lftp = TestLftp._build_status_poll_test_lftp()
+                process = lftp._Lftp__process
+
+                def prompt(*_args, **_kwargs):
+                    process.before = output
+                    return 0
+
+                process.expect.side_effect = prompt
+                with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+                    self.assertEqual([], lftp.status())
+                observation = lftp.incoming_recovery_last_status_observation
+                self.assertEqual(expected, observation["status_result_shape"])
+                self.assertEqual("empty", observation["pre_send_drain_shape"])
+                self.assertEqual("reached", observation["post_send_prompt"])
+                self.assertNotIn("private", repr(observation))
+
+    def test_status_observation_accumulates_real_grace_drain_and_prompt(self):
+        lftp = TestLftp._build_status_poll_test_lftp()
+        process = lftp._Lftp__process
+        process._buffer.write("[0] Done (queue (sftp://private@host))\n")
+        process.before = "Connecting..."
+        process.expect.side_effect = [
+            pexpect.exceptions.TIMEOUT("initial prompt"), 0, 0,
+        ]
+        with patch.object(lftp_mod.time, "monotonic", side_effect=[0, 2, 3]):
+            with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+                self.assertEqual([], lftp.status())
+
+        observation = lftp.incoming_recovery_last_status_observation
+        self.assertEqual("connection_grace", observation["status_recovery"])
+        self.assertTrue(observation["pre_send_drain_queue_done"])
+        self.assertEqual("reached", observation["post_send_prompt"])
+        self.assertEqual(3, process.expect.call_count)
+        self.assertGreaterEqual(process.expect.call_args_list[1].kwargs["timeout"], 5)
+        self.assertNotIn("private", repr(observation))
+
+    def test_status_drain_does_not_classify_when_gate_is_off(self):
+        lftp = TestLftp._build_status_poll_test_lftp()
+        process = lftp._Lftp__process
+        process._buffer.write("private discarded terminal frame")
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "599"}), \
+                patch.object(lftp_mod.re, "search", side_effect=AssertionError("gate-off marker scan")):
+            self.assertEqual([], lftp.status())
+        self.assertEqual({}, lftp.incoming_recovery_last_status_observation)
+
+    def test_status_drain_keeps_existing_error_detection_when_gate_is_off(self):
+        lftp = TestLftp._build_status_poll_test_lftp()
+        process = lftp._Lftp__process
+        process._buffer.write("Login failed: private")
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "599"}):
+            self.assertEqual([], lftp.status())
+        process.send.assert_not_called()
+        self.assertEqual("command_error", lftp.last_status_poll_failure_reason)
+        self.assertEqual("Lftp status terminal reported a backend error", lftp._Lftp__pending_error)
+        self.assertEqual({}, lftp.incoming_recovery_last_status_observation)
+
+    def test_status_drain_keeps_existing_host_key_detection_when_gate_is_off(self):
+        lftp = TestLftp._build_status_poll_test_lftp()
+        process = lftp._Lftp__process
+        process.read_nonblocking.side_effect = [
+            "The authenticity of ", "host private cannot be established",
+        ]
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "599"}):
+            self.assertEqual([], lftp.status())
+        process.send.assert_not_called()
+        self.assertEqual("command_error", lftp.last_status_poll_failure_reason)
+        self.assertEqual("Lftp status terminal reported a backend error", lftp._Lftp__pending_error)
+        self.assertEqual({}, lftp.incoming_recovery_last_status_observation)
+
+    def test_status_observation_binds_prior_timeout_to_empty_grace_result(self):
+        lftp = TestLftp._build_test_lftp()
+        lftp._Lftp__job_status_parser = MagicMock()
+        lftp._Lftp__job_status_parser.parse.return_value = []
+        lftp._Lftp__status_poll_needs_connection_grace = True
+
+        def command(*_args, **_kwargs):
+            if lftp._Lftp__run_command.call_count == 1:
+                lftp._Lftp__last_command_timed_out = True
+                return "Connecting..."
+            lftp._Lftp__last_command_timed_out = False
+            return ""
+
+        lftp._Lftp__run_command.side_effect = command
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+            self.assertEqual([], lftp.status())
+
+        observation = lftp.incoming_recovery_last_status_observation
+        self.assertEqual("empty_or_prompt", observation["status_result_shape"])
+        self.assertEqual("connection_grace", observation["status_recovery"])
+        self.assertTrue(observation["status_preceded_timeout"])
+        self.assertTrue(lftp.last_status_poll_healthy)
+
+    def test_status_result_shapes_are_fixed_and_content_free(self):
+        cases = (
+            ("", [], "empty_or_prompt"),
+            ("[7] Done (queue (sftp://private))", [], "queue_done"),
+            ("[7] Done (queue (sftp://private))\n[8] mirror -c -- 1/2 (50%)", [], "job_present"),
+            ("private transfer progress", [], "ambiguous"),
+            ("private transfer progress", [object()], "job_present"),
+            ("private parser frame", None, "parse_error"),
+        )
+        for output, statuses, expected in cases:
+            with self.subTest(expected=expected):
+                result = lftp_mod._incoming_recovery_status_result_shape(output, statuses)
+                self.assertEqual(expected, result)
+                self.assertNotIn("private", result)
+
+    def test_status_observation_preserves_parser_failure_through_grace(self):
+        lftp = TestLftp._build_test_lftp()
+        lftp._Lftp__job_status_parser = MagicMock()
+        lftp._Lftp__job_status_parser.parse.side_effect = [
+            LftpJobStatusParserError("private parser detail"), [],
+        ]
+        lftp._Lftp__consecutive_status_errors = 0
+        lftp._Lftp__status_poll_needs_connection_grace = True
+        lftp._Lftp__run_command.side_effect = ["private frame", ""]
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+            self.assertEqual([], lftp.status())
+
+        observation = lftp.incoming_recovery_last_status_observation
+        self.assertEqual("empty_or_prompt", observation["status_result_shape"])
+        self.assertEqual("connection_grace", observation["status_recovery"])
+        self.assertEqual("parser_error", lftp.last_status_poll_failure_reason)
+
+    def test_status_observation_is_absent_when_exact_gate_is_off(self):
+        lftp = TestLftp._build_test_lftp()
+        lftp._Lftp__job_status_parser = MagicMock()
+        lftp._Lftp__job_status_parser.parse.return_value = []
+        lftp._Lftp__last_incoming_recovery_status_observation = {
+            "status_result_shape": "empty_or_prompt",
+        }
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "599"}):
+            self.assertEqual([], lftp.status())
+        self.assertEqual({}, lftp.incoming_recovery_last_status_observation)
+        self.assertTrue(lftp.last_status_poll_healthy)
+
     def test_child_record_does_not_read_pexpect_buffer_property(self):
         class Process:
             pid = 1234
