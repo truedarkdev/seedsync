@@ -3203,6 +3203,97 @@ class TestLftp(unittest.TestCase):
         self.assertIn("remote_python_path = python3", compose_contents)
 
 
+
+class TestIncomingRecoveryLftpDiagnostics(unittest.TestCase):
+    def test_status_forwards_later_child_terminal_observations(self):
+        for exitstatus, signalstatus, expected in ((7, None, "exit"), (None, 9, "signal")):
+            with self.subTest(expected=expected), \
+                    patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+                status_lftp = TestLftp._build_status_poll_test_lftp()
+                status_lftp._Lftp__process.isalive.return_value = False
+                status_lftp._Lftp__process.exitstatus = exitstatus
+                status_lftp._Lftp__process.signalstatus = signalstatus
+                status_records = []
+                self.assertEqual([], status_lftp.status(
+                    diagnostic_recorder=lambda event, fields: status_records.append((event, fields)),
+                ))
+                self.assertEqual(["lftp_child"], [event for event, _ in status_records])
+                self.assertEqual(expected, status_records[0][1]["classification"])
+
+        eof_lftp = TestLftp._build_status_poll_test_lftp()
+        eof_lftp._Lftp__process.expect.side_effect = pexpect.exceptions.EOF("private status eof")
+        eof_records = []
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+            self.assertEqual([], eof_lftp.status(
+                diagnostic_recorder=lambda event, fields: eof_records.append((event, fields)),
+            ))
+        self.assertEqual(["eof"], [fields["classification"] for _, fields in eof_records])
+        self.assertNotIn("private", repr(eof_records))
+
+        for boundary in ("send", "drain"):
+            with self.subTest(boundary=boundary), \
+                    patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+                terminal_lftp = TestLftp._build_status_poll_test_lftp()
+                terminal_process = terminal_lftp._Lftp__process
+                if boundary == "send":
+                    terminal_process.send.side_effect = pexpect.exceptions.EOF("private send eof")
+                else:
+                    terminal_process.read_nonblocking.side_effect = pexpect.exceptions.EOF("private drain eof")
+                terminal_records = []
+                self.assertEqual([], terminal_lftp.status(
+                    diagnostic_recorder=lambda event, fields: terminal_records.append((event, fields)),
+                ))
+                self.assertEqual(["eof"], [fields["classification"] for _, fields in terminal_records])
+                self.assertNotIn("private", repr(terminal_records))
+
+        recovery_lftp = TestLftp._build_status_poll_test_lftp()
+        recovery_lftp._Lftp__process.expect.side_effect = [None, pexpect.exceptions.EOF("private recovery eof")]
+        recovery_records = []
+        with patch.object(Lftp, "_Lftp__normalize_output", return_value="backend"), \
+                patch.object(Lftp, "_Lftp__detect_errors_from_output", side_effect=lambda value: value == "backend"), \
+                patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+            self.assertEqual([], recovery_lftp.status(
+                diagnostic_recorder=lambda event, fields: recovery_records.append((event, fields)),
+            ))
+        self.assertEqual(["command_error", "eof"], [fields["classification"] for _, fields in recovery_records])
+        self.assertNotIn("private", repr(recovery_records))
+
+        timeout_lftp = TestLftp._build_status_poll_test_lftp()
+        timeout_lftp._Lftp__process.send.side_effect = pexpect.exceptions.TIMEOUT("private timeout")
+        timeout_records = []
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+            self.assertEqual([], timeout_lftp.status(
+                diagnostic_recorder=lambda event, fields: timeout_records.append((event, fields)),
+            ))
+        self.assertEqual(["timeout"], [fields["classification"] for _, fields in timeout_records])
+
+        for error in (pexpect.exceptions.ExceptionPexpect("private command"), OSError("private command")):
+            with self.subTest(status_error=type(error).__name__):
+                command_lftp = TestLftp._build_status_poll_test_lftp()
+                command_lftp._Lftp__process.expect.side_effect = error
+                command_records = []
+                with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+                    self.assertEqual([], command_lftp.status(
+                        diagnostic_recorder=lambda event, fields: command_records.append((event, fields)),
+                    ))
+                self.assertEqual(["command_error"], [fields["classification"] for _, fields in command_records])
+
+        terminal_lftp = TestLftp._build_status_poll_test_lftp()
+        terminal_lftp._Lftp__process._buffer.write("Login failed: private backend")
+        terminal_records = []
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
+            self.assertEqual([], terminal_lftp.status(
+                diagnostic_recorder=lambda event, fields: terminal_records.append((event, fields)),
+            ))
+        self.assertEqual(["command_error"], [fields["classification"] for _, fields in terminal_records])
+
+        suppressed_lftp = TestLftp._build_status_poll_test_lftp()
+        suppressed_lftp._Lftp__process.send.side_effect = pexpect.exceptions.TIMEOUT("private timeout")
+        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "599"}):
+            self.assertEqual([], suppressed_lftp.status(
+                diagnostic_recorder=lambda *_args: self.fail("disabled diagnostic emitted"),
+            ))
+
 class TestLftpPromptClassification(unittest.TestCase):
     @patch("lftp.lftp.pexpect.spawn", create=True)
     def test_init_raises_lftp_error_on_ssh_host_key_prompt_timeout(self, spawn):
