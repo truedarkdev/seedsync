@@ -633,12 +633,9 @@ class ModelApiHandler(IHandler):
             trace = self.__breadcrumb_trace
             if trace is not None:
                 try:
-                    explicitly_configured = getattr(trace, "is_explicitly_configured", None)
                     effectively_enabled = getattr(trace, "is_effectively_enabled", None)
                     recorder = getattr(trace, "record", None)
-                    if callable(explicitly_configured) and callable(effectively_enabled) and \
-                            callable(recorder) and \
-                            explicitly_configured(self._SUMMARY_LOCK_TRACE_CATEGORY) is True and \
+                    if callable(effectively_enabled) and callable(recorder) and \
                             effectively_enabled(
                                 self._SUMMARY_LOCK_TRACE_CATEGORY,
                                 self._SUMMARY_LOCK_TRACE_LEVEL,

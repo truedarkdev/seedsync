@@ -139,6 +139,42 @@ class TestModelApi(unittest.TestCase):
         self.assertEqual(503, response.status_code)
         self.assertEqual([], trace.snapshot(category="model_api")["entries"])
 
+    def test_summary_lock_timeout_uses_default_info_policy_without_category_rule(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=trace)
+        with patch.object(self.controller, "_Controller__model_lock") as model_lock:
+            model_lock.acquire.return_value = False
+            response = handler._ModelApiHandler__handle_summary()
+
+        self.assertEqual(503, response.status_code)
+        entries = trace.snapshot(category="model_api")["entries"]
+        self.assertEqual(1, len(entries))
+        self.assertEqual("model_lock_timeout", entries[0]["message"])
+        self.assertEqual("warning", entries[0]["level"])
+        self.assertEqual(250, entries[0]["details"]["wait_ms"])
+        model_lock.acquire.assert_called_once_with(timeout=0.25)
+
+    def test_summary_lock_timeout_honors_explicit_verbosity_and_category_overrides(self):
+        cases = (
+            ({"default": "warning"}, True),
+            ({"default": "error"}, False),
+            ({"default": "info", "rules": {"model_api": "off"}}, False),
+            ({"default": "off", "rules": {"model_api": "warning"}}, True),
+        )
+        for policy, expected_record in cases:
+            with self.subTest(policy=policy):
+                trace = BreadcrumbTraceCollector(lambda: True, max_entries=8, policy=policy)
+                handler = ModelApiHandler(self.controller, breadcrumb_trace=trace)
+                with patch.object(self.controller, "_Controller__model_lock") as model_lock:
+                    model_lock.acquire.return_value = False
+                    response = handler._ModelApiHandler__handle_summary()
+
+                self.assertEqual(503, response.status_code)
+                entries = trace.snapshot(category="model_api")["entries"]
+                self.assertEqual(expected_record, len(entries) == 1)
+                if expected_record:
+                    self.assertEqual("model_lock_timeout", entries[0]["message"])
+
     def test_summary_success_does_not_record_lock_timeout_breadcrumb(self):
         trace = BreadcrumbTraceCollector(
             lambda: True,
@@ -183,10 +219,6 @@ class TestModelApi(unittest.TestCase):
 
     def test_summary_lock_timeout_logger_failure_does_not_change_response(self):
         class FailingBreadcrumbTrace:
-            @staticmethod
-            def is_explicitly_configured(_category):
-                return True
-
             @staticmethod
             def is_effectively_enabled(_category, _level):
                 return True
