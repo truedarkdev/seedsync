@@ -94,6 +94,115 @@ class TestModelApi(unittest.TestCase):
 
         self.assertEqual([True], acquired)
 
+    def test_summary_lock_timeout_records_one_fixed_breadcrumb(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"model_api": "warning"}},
+        )
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=trace)
+        self.controller.get_model_summary = MagicMock()
+        with patch.object(self.controller, "_Controller__model_lock") as model_lock:
+            model_lock.acquire.return_value = False
+            response = handler._ModelApiHandler__handle_summary()
+
+        self.assertEqual(503, response.status_code)
+        self.assertEqual({"error": "model_summary_busy"}, json.loads(response.body))
+        entries = trace.snapshot(category="model_api")["entries"]
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertEqual("model_api", entry["source"])
+        self.assertEqual("model_api", entry["category"])
+        self.assertEqual("warning", entry["level"])
+        self.assertEqual("model_lock_timeout", entry["message"])
+        self.assertEqual("model_summary", entry["stage"])
+        self.assertEqual("diagnostic", entry["event_type"])
+        self.assertEqual("aggregate", entry["trace_scope"])
+        self.assertEqual({
+            "operation": "summary_request",
+            "outcome": "lock_acquire_timeout",
+            "timestamp_basis": "breadcrumb_recorded_at",
+            "wait_ms": 250,
+        }, entry["details"])
+        self.assertNotIn("/", str(entry))
+        self.assertNotIn("secret", str(entry))
+        self.controller.get_model_summary.assert_not_called()
+        model_lock.release.assert_not_called()
+
+    def test_summary_lock_timeout_is_off_without_an_explicit_policy_rule(self):
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "off"})
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=trace)
+        with patch.object(self.controller, "_Controller__model_lock") as model_lock:
+            model_lock.acquire.return_value = False
+            response = handler._ModelApiHandler__handle_summary()
+
+        self.assertEqual(503, response.status_code)
+        self.assertEqual([], trace.snapshot(category="model_api")["entries"])
+
+    def test_summary_success_does_not_record_lock_timeout_breadcrumb(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"model_api": "warning"}},
+        )
+        self.controller.get_model_summary = MagicMock(return_value={"model_version": 1})
+        response = ModelApiHandler(self.controller, breadcrumb_trace=trace)._ModelApiHandler__handle_summary()
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual([], trace.snapshot(category="model_api")["entries"])
+        self.controller.get_model_summary.assert_called_once_with()
+
+    def test_summary_lock_timeout_honors_disabled_policy(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"model_api": "off"}},
+        )
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=trace)
+        with patch.object(self.controller, "_Controller__model_lock") as model_lock:
+            model_lock.acquire.return_value = False
+            response = handler._ModelApiHandler__handle_summary()
+
+        self.assertEqual(503, response.status_code)
+        self.assertEqual([], trace.snapshot(category="model_api")["entries"])
+
+    def test_summary_lock_timeout_breadcrumb_respects_existing_capacity_bound(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=1,
+            policy={"default": "off", "rules": {"model_api": "warning"}},
+        )
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=trace)
+        with patch.object(self.controller, "_Controller__model_lock") as model_lock:
+            model_lock.acquire.return_value = False
+            for _ in range(3):
+                response = handler._ModelApiHandler__handle_summary()
+                self.assertEqual(503, response.status_code)
+
+        entries = trace.snapshot(category="model_api")["entries"]
+        self.assertLessEqual(len(entries), 1)
+        self.assertEqual("model_lock_timeout", entries[0]["message"])
+
+    def test_summary_lock_timeout_logger_failure_does_not_change_response(self):
+        class FailingBreadcrumbTrace:
+            @staticmethod
+            def is_explicitly_configured(_category):
+                return True
+
+            @staticmethod
+            def is_effectively_enabled(_category, _level):
+                return True
+
+            @staticmethod
+            def record(*_args, **_kwargs):
+                raise RuntimeError("private logger failure")
+
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=FailingBreadcrumbTrace())
+        with patch.object(self.controller, "_Controller__model_lock") as model_lock:
+            model_lock.acquire.return_value = False
+            response = handler._ModelApiHandler__handle_summary()
+
+        self.assertEqual(503, response.status_code)
+        self.assertEqual({"error": "model_summary_busy"}, json.loads(response.body))
+
     def test_scoped_stream_breadcrumb_is_opt_in_and_identity_free(self):
         page = {"records": [{"private": "record"}] * 9, "model_version": 4, "next_cursor": "private"}
         disabled = BreadcrumbTraceCollector(lambda: True, policy={"default": "off"})

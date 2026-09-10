@@ -225,6 +225,10 @@ class ModelApiHandler(IHandler):
     _MAX_CURSOR_LENGTH = 4096
     _KEEPALIVE_INTERVAL_SECONDS = 5.0
     _SUMMARY_MIN_INTERVAL_SECONDS = 0.5
+    _SUMMARY_LOCK_TRACE_CATEGORY = "model_api"
+    _SUMMARY_LOCK_TRACE_LEVEL = "warning"
+    _SUMMARY_LOCK_TRACE_MESSAGE = "model_lock_timeout"
+    _SUMMARY_LOCK_TIMEOUT_SECONDS = 0.25
 
     def __init__(
         self,
@@ -625,7 +629,38 @@ class ModelApiHandler(IHandler):
         # enough to exceed clients' admission budget.  Fail explicitly rather
         # than letting the web worker retain an ambiguous, timed-out request.
         model_lock = getattr(self.__controller, "_Controller__model_lock", None)
-        if model_lock is not None and not model_lock.acquire(timeout=0.25):
+        if model_lock is not None and not model_lock.acquire(timeout=self._SUMMARY_LOCK_TIMEOUT_SECONDS):
+            trace = self.__breadcrumb_trace
+            if trace is not None:
+                try:
+                    explicitly_configured = getattr(trace, "is_explicitly_configured", None)
+                    effectively_enabled = getattr(trace, "is_effectively_enabled", None)
+                    recorder = getattr(trace, "record", None)
+                    if callable(explicitly_configured) and callable(effectively_enabled) and \
+                            callable(recorder) and \
+                            explicitly_configured(self._SUMMARY_LOCK_TRACE_CATEGORY) is True and \
+                            effectively_enabled(
+                                self._SUMMARY_LOCK_TRACE_CATEGORY,
+                                self._SUMMARY_LOCK_TRACE_LEVEL,
+                            ) is True:
+                        recorder(
+                            self._SUMMARY_LOCK_TRACE_CATEGORY,
+                            self._SUMMARY_LOCK_TRACE_MESSAGE,
+                            {
+                                "operation": "summary_request",
+                                "outcome": "lock_acquire_timeout",
+                                "timestamp_basis": "breadcrumb_recorded_at",
+                                "wait_ms": int(self._SUMMARY_LOCK_TIMEOUT_SECONDS * 1000),
+                            },
+                            stage="model_summary",
+                            event_type="diagnostic",
+                            category=self._SUMMARY_LOCK_TRACE_CATEGORY,
+                            level=self._SUMMARY_LOCK_TRACE_LEVEL,
+                            trace_scope="aggregate",
+                        )
+                except Exception:
+                    # Diagnostics must never change the 503 response or lock path.
+                    pass
             return self.__json_response({"error": "model_summary_busy"}, status=503, summary=True)
         try:
             summary = self.__controller.get_model_summary()
