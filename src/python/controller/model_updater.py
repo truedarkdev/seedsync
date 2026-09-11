@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -513,9 +512,7 @@ def _controller_breadcrumb_effectively_enabled(
 def _queue_flow_ids_for_files(
         controller: object, file_ids: Iterable[object],
 ) -> list[str]:
-    """Resolve at most a small set of opaque Queue flows for publication evidence."""
-    if os.environ.get("INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS") != "600":
-        return []
+    """Resolve opaque Queue flows from currently pending Queue dispatches."""
     pending = getattr(controller, "_Controller__pending_queue_dispatches", None)
     flow_factory = getattr(controller, "_Controller__fractional_queue_flow_id", None)
     if not isinstance(pending, dict) or not callable(flow_factory):
@@ -994,17 +991,13 @@ def _record_lftp_status_membership_transition(
         tokens.sort()
         if tokens:
             safe_poll = _safe_lftp_status_poll_correlation(poll_correlation)
-            queue_flow_ids = _queue_flow_ids_for_files(
-                controller, transition_file_ids,
-            )
+            queue_flow_ids = _queue_flow_ids_for_files(controller, transition_file_ids)
+            queue_flow_id = queue_flow_ids[0] \
+                if len(transition_file_ids) == 1 and len(queue_flow_ids) == 1 else None
             chunk_count = (len(tokens) + 15) // 16
             for chunk_index in range(chunk_count):
                 details: dict[str, object] = {"schema": "lftp_status_membership.v2", "phase": "status_membership", "chunk_index": chunk_index, "chunk_count": chunk_count, "transition_count": len(tokens), "transition_set_digest": opaque_trace_correlation("|".join(tokens)), "source": source, "fresh": bool(fresh), "healthy": bool(healthy), "idle_authoritative": bool(getattr(controller, "_Controller__lftp_idle_status_authoritative", False)), "raw_status_count": min(len(raw_statuses), _LFTP_STATUS_TRACE_COUNT_LIMIT), "raw_status_count_overflow": len(raw_statuses) > _LFTP_STATUS_TRACE_COUNT_LIMIT, "filtered_status_count": min(len(filtered_statuses), _LFTP_STATUS_TRACE_COUNT_LIMIT), "filtered_status_count_overflow": len(filtered_statuses) > _LFTP_STATUS_TRACE_COUNT_LIMIT, "poll_correlation": safe_poll, "transitions": tokens[chunk_index * 16:(chunk_index + 1) * 16]}
-                if queue_flow_ids and os.environ.get(
-                        "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS",
-                ) == "600":
-                    details["queue_flow_ids"] = queue_flow_ids
-                recorder(stage="lftp_status_membership", message="lftp_status_membership_transition", details=details, event_type="state_transition", category=_LFTP_STATUS_MEMBERSHIP_TRACE_CATEGORY, level=level, corr_id="lftp:" + opaque_trace_correlation(_LFTP_STATUS_TRACE_CORRELATION), flow_id=safe_poll, trace_scope="flow")
+                recorder(stage="lftp_status_membership", message="lftp_status_membership_transition", details=details, event_type="state_transition", category=_LFTP_STATUS_MEMBERSHIP_TRACE_CATEGORY, level=level, corr_id="lftp:" + opaque_trace_correlation(_LFTP_STATUS_TRACE_CORRELATION), flow_id=queue_flow_id or safe_poll, trace_scope="flow")
     except Exception:
         pass
 
@@ -8394,10 +8387,6 @@ class ModelUpdater(_ControllerCoreAccess):
                         "model_root_count": getattr(controller._Controller__model, "file_count", 0),
                         "model_tree_file_count": getattr(controller._Controller__model, "tree_file_count", 0),
                     }
-                    if publication_flow_ids and os.environ.get(
-                            "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS",
-                    ) == "600":
-                        details["queue_flow_ids"] = publication_flow_ids
                     controller._Controller__record_breadcrumb(
                         stage="model_update",
                         message="model_build_completed",
@@ -8406,8 +8395,8 @@ class ModelUpdater(_ControllerCoreAccess):
                         category="model.update",
                         level="info",
                         corr_id=correlation,
-                        flow_id=correlation,
-                        trace_scope="aggregate",
+                        flow_id=publication_flow_ids[0] if publication_flow_ids else correlation,
+                        trace_scope="flow" if publication_flow_ids else "aggregate",
                     )
             except Exception:
                 pass

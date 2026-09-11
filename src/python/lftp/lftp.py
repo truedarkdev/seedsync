@@ -69,7 +69,6 @@ LFTP_STATUS_POLL_TRACE_FAILURE_PHASES = frozenset({
 redact_credentials = redact_sensitive_text
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
-_INCOMING_RECOVERY_DIAGNOSTIC_ENV = "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS"
 _INCOMING_RECOVERY_PHASES = frozenset({
     "precheck", "drain", "send", "prompt", "connecting", "error_recovery", "teardown", "unknown",
 })
@@ -124,7 +123,7 @@ def _incoming_recovery_buffer_observation(process: object) -> tuple[str, str]:
     except Exception:
         return "unavailable", "unknown"
     # pexpect's public ``buffer`` compatibility property calls ``getvalue()``.
-    # Read only raw instance attributes so this exact-600 diagnostic cannot
+    # Read only raw instance attributes so this diagnostic cannot
     # materialize a large retained PTY frame.
     public_length = _incoming_recovery_buffer_length(attributes.get("buffer"))
     if public_length is not None:
@@ -156,17 +155,13 @@ def _incoming_recovery_status_result_shape(output: object, statuses: object) -> 
     return "ambiguous"
 
 
-def _incoming_recovery_diagnostic_enabled() -> bool:
-    return os.environ.get(_INCOMING_RECOVERY_DIAGNOSTIC_ENV) == "600"
-
-
 def _incoming_recovery_child_record(
         recorder: object, process: object, error: object = None, classification: str = "unknown",
         *, phase: str = "unknown", started_at: object = None,
         alive_before: object = None, command_kind: object = "unknown",
         command_outcome: object = "unknown",
 ) -> None:
-    if not _incoming_recovery_diagnostic_enabled() or not callable(recorder):
+    if not callable(recorder):
         return
     try:
         alive_after = process.isalive() if process is not None else None
@@ -297,11 +292,7 @@ def _record_lftp_sidecar_breadcrumb(
             corr_id=opaque_trace_correlation(
                 "lftp.sidecar|{}".format(target_identity),
             ),
-            flow_id=(
-                _safe_lftp_queue_trace_flow(flow_id)
-                if os.environ.get("INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS") == "600"
-                else None
-            ),
+            flow_id=_safe_lftp_queue_trace_flow(flow_id),
             _coalesce_key=coalesce_key,
             trace_scope="flow",
         )
@@ -1191,7 +1182,7 @@ class Lftp:
             self.logger.error("Lftp process died unexpectedly (EOF) before {}".format(context))
             raise LftpError("Lftp process terminated before {}: {}".format(context, out))
 
-    def __drain_status_poll_terminal(self) -> Optional[str]:
+    def __drain_status_poll_terminal(self, diagnostic_enabled: bool = False) -> Optional[str]:
         """Discard stale PTY output before one authoritative status command.
 
         The single LFTP executor is the only reader.  A background mirror can
@@ -1210,8 +1201,6 @@ class Lftp:
         saw_job_or_progress = False
         saw_prompt_or_echo = False
         drained_byte_count = 0
-        diagnostic_enabled = _incoming_recovery_diagnostic_enabled()
-
         def observe(value: object) -> None:
             nonlocal evidence_tail, saw_backend_error, saw_host_key_prompt, saw_queue_done, \
                 saw_job_or_progress, saw_prompt_or_echo, drained_byte_count
@@ -1345,8 +1334,7 @@ class Lftp:
         safe_status_poll_correlation = _safe_lftp_status_poll_correlation(trace_status_poll_correlation)
         pty_trace = getattr(self, "_Lftp__breadcrumb_trace", None)
         pty_flow_id = _safe_lftp_pty_correlation(trace_pty_correlation)
-        diagnostic_started_at = time.monotonic() if _incoming_recovery_diagnostic_enabled() and \
-            callable(diagnostic_recorder) else None
+        diagnostic_started_at = time.monotonic() if callable(diagnostic_recorder) else None
         diagnostic_recorded = False
         try:
             diagnostic_alive_before = self.__process.isalive() if diagnostic_started_at is not None else None
@@ -1435,7 +1423,9 @@ class Lftp:
                 self.__ensure_prompt_ready("running command")
                 pty_readiness = "ready"
             if status_poll:
-                terminal_failure = self.__drain_status_poll_terminal()
+                terminal_failure = self.__drain_status_poll_terminal(
+                    callable(diagnostic_recorder),
+                )
                 if terminal_failure is not None:
                     record_diagnostic_child(classification=terminal_failure, phase="drain")
                     self.__last_command_timed_out = True
@@ -1637,7 +1627,7 @@ class Lftp:
 
             if status_poll and not prompt_reached and not recovered_output_preserved and not self.__detect_errors_from_output(out):
                 out = ""
-            if status_poll and _incoming_recovery_diagnostic_enabled():
+            if status_poll and callable(diagnostic_recorder):
                 observation = getattr(self, "_Lftp__last_incoming_recovery_status_observation", None)
                 observation = dict(observation) if isinstance(observation, dict) else {}
                 observation["_post_send_prompt"] = "reached" if final_prompt_reached else "not_reached"
@@ -1889,7 +1879,7 @@ class Lftp:
 
     @property
     def last_command_timed_out(self) -> bool:
-        """Expose the most recent command's prompt outcome for opt-in diagnostics only."""
+        """Expose the most recent command's prompt outcome for diagnostics."""
         return self.__last_command_timed_out
 
     @property
@@ -1900,7 +1890,7 @@ class Lftp:
 
     @property
     def incoming_recovery_last_status_observation(self) -> dict[str, object]:
-        """Return bounded last-poll metadata for the exact-600 root record only."""
+        """Return bounded last-poll metadata for Queue lifecycle diagnostics."""
         observation = getattr(self, "_Lftp__last_incoming_recovery_status_observation", None)
         if not isinstance(observation, dict):
             return {}
@@ -1915,9 +1905,9 @@ class Lftp:
 
     def __record_incoming_recovery_status_observation(
             self, output: object, statuses: object, *, preceded_timeout: object,
-            used_connection_grace: object,
+            used_connection_grace: object, enabled: bool = False,
     ) -> None:
-        if not _incoming_recovery_diagnostic_enabled():
+        if enabled is not True:
             return
         try:
             process = self.__process
@@ -1960,8 +1950,8 @@ class Lftp:
             self, diagnostic_recorder: object, statuses: object,
     ) -> None:
         """Bind one completed post-Queue status poll to the existing active flow."""
-        if not _incoming_recovery_diagnostic_enabled() or not callable(diagnostic_recorder) or \
-                not isinstance(statuses, list) or self.__last_status_poll_healthy is not True or \
+        if not callable(diagnostic_recorder) or not isinstance(statuses, list) or \
+                self.__last_status_poll_healthy is not True or \
                 self.__last_status_poll_failure_reason is not None:
             return
         try:
@@ -1998,7 +1988,7 @@ class Lftp:
         :return:
         """
         self.__last_status_poll_failure_reason = None
-        # A prior exact-600 poll must never be associated with this poll, or
+        # A prior poll must never be associated with this poll, or
         # survive after the gate is disabled.
         self.__last_incoming_recovery_status_observation = None
         safe_trace_poll_correlation = _safe_lftp_status_poll_correlation(trace_poll_correlation)
@@ -2046,7 +2036,7 @@ class Lftp:
             }
             if safe_trace_poll_correlation is not None:
                 status_command_kwargs["trace_status_poll_correlation"] = safe_trace_poll_correlation
-            if _incoming_recovery_diagnostic_enabled() and callable(diagnostic_recorder):
+            if callable(diagnostic_recorder):
                 status_command_kwargs["diagnostic_recorder"] = diagnostic_recorder
             out = self.__run_command("jobs -v", **status_command_kwargs)  # type: ignore[arg-type]
         except pexpect.exceptions.TIMEOUT as exc:
@@ -2129,7 +2119,7 @@ class Lftp:
                 **({"trace_status_poll_correlation": safe_trace_poll_correlation}
                    if safe_trace_poll_correlation is not None else {}),
                 **({"diagnostic_recorder": diagnostic_recorder}
-                   if _incoming_recovery_diagnostic_enabled() and callable(diagnostic_recorder) else {})
+                   if callable(diagnostic_recorder) else {})
             )
             try:
                 try:
@@ -2163,6 +2153,7 @@ class Lftp:
         self.__record_incoming_recovery_status_observation(
             out, statuses, preceded_timeout=preceded_timeout,
             used_connection_grace=used_connection_grace,
+            enabled=callable(diagnostic_recorder),
         )
         self.__record_incoming_recovery_status_completion(diagnostic_recorder, statuses)
         record_status_result(
@@ -2655,7 +2646,7 @@ class Lftp:
             })
             if command_metrics is not None:
                 trace_kwargs["trace_command_metrics"] = command_metrics
-        if _incoming_recovery_diagnostic_enabled() and callable(diagnostic_recorder):
+        if callable(diagnostic_recorder):
             trace_kwargs["diagnostic_recorder"] = diagnostic_recorder
         trace = getattr(self, "_Lftp__breadcrumb_trace", None)
         if _lftp_pty_trace_enabled(trace, "debug") or _lftp_pty_trace_enabled(trace, "warning"):

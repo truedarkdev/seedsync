@@ -72,6 +72,10 @@ from .controller_persist import ControllerPersist
 from .delete import DeleteLocalProcess, DeleteRemoteProcess
 from system import SystemFile
 
+
+_QUEUE_LIFECYCLE_TRACE_CATEGORY = "queue.lifecycle"
+_QUEUE_LIFECYCLE_TRACE_SCHEMA = "queue.lifecycle.v1"
+
 ActiveScannerRuntime = ActiveScanner | MultiPathActiveScanner
 LocalScannerRuntime = LocalScanner | MultiPathLocalScanner
 RemoteScannerRuntime = RemoteScanner | MultiPathRemoteScanner
@@ -398,335 +402,6 @@ class DownloadStartLifecycleEntry:
     transitioned_at: datetime
 
 
-class _IncomingRecoveryDiagnosticRegistry:
-    """Exact-600, bounded, transient logger for one Queue ownership chain."""
-    _MAX_FLOWS = 4
-    _MAX_RECORDS = 8
-    _MAX_PROCESS_RECORDS = _MAX_FLOWS * _MAX_RECORDS
-    _MAX_SPECIAL_RECORDS = 3
-    _MAX_LINEAGE_RECORDS = 3
-    _MAX_CHILD_PHASES = 2
-    _EVENTS = frozenset({
-        "queue_admitted", "executor_start", "executor_return", "executor_error",
-        "lftp_child", "root_default", "controller_exit", "controller_force_close",
-    })
-    _FAILURE_CLASSIFICATIONS = frozenset({
-        "none", "eof", "exit", "signal", "timeout", "command_error",
-        "parser_error", "terminal_backlog", "unhealthy_snapshot", "unknown",
-    })
-    _PHASES = frozenset({
-        "precheck", "drain", "send", "prompt", "connecting", "error_recovery", "status", "teardown", "unknown",
-    })
-    _CHILD_PHASES = frozenset(_PHASES - {"unknown"})
-    _DURATION_BUCKETS = frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+", "unknown"})
-    _REAPED = frozenset({"alive", "not_alive", "exit", "signal", "unknown"})
-    _BUFFER_SOURCES = frozenset({"public_buffer", "private_buffer", "unavailable"})
-    _READ_BUFFER_BUCKETS = frozenset({
-        "0", "1-127", "128-511", "512-2047", "2048-8191", "8192-32767", "32768+", "unknown",
-    })
-    _STATUS_RESULT_SHAPES = frozenset({
-        "empty_or_prompt", "queue_done", "job_present", "ambiguous", "parse_error", "unknown",
-    })
-    _STATUS_RECOVERIES = frozenset({"none", "connection_grace", "unknown"})
-    _PRE_SEND_DRAIN_SHAPES = frozenset({"empty", "marked", "unknown"})
-    _POST_SEND_PROMPTS = frozenset({"reached", "not_reached", "unknown"})
-    _COMMAND_KINDS = frozenset({"queue", "status", "unknown"})
-    _COMMAND_OUTCOMES = frozenset({"success", "prompt_timeout", "eof", "error", "unknown"})
-    def __init__(self, logger: object):
-        self.__logger = logger
-        self.__lock = Lock()
-        self.__flows: dict[str, dict[str, object]] = {}
-        self.__process_records = 0
-        self.__capacity_drop_emitted = False
-
-    def recorder(
-            self, flow_id: object, file_id: object = None, operation_sequence: object = None,
-    ) -> Callable[[str, dict[str, object]], None]:
-        return self.reserve_recorder(flow_id, file_id, operation_sequence) or (
-            lambda _event, _fields: None
-        )
-
-    def reserve_recorder(
-            self, flow_id: object, file_id: object = None, operation_sequence: object = None,
-    ) -> Optional[Callable[[str, dict[str, object]], None]]:
-        """Atomically reserve a new flow, returning None when capacity rejects it."""
-        if not isinstance(flow_id, str) or not flow_id.startswith("fractional-queue:"):
-            return None
-        drop_reason = None
-        accepted = True
-        with self.__lock:
-            if flow_id not in self.__flows:
-                # Reserve three global-budget records for every active flow's
-                # child terminal, teardown, and root outcome. New flows fail
-                # diagnostic-closed once that finite budget is exhausted.
-                reserved_special = self.__reserved_special_records()
-                if len(self.__flows) >= self._MAX_FLOWS:
-                    accepted = False
-                    drop_reason = "process_budget"
-                else:
-                    can_admit = self.__process_records < self._MAX_PROCESS_RECORDS - (
-                        reserved_special + self._MAX_SPECIAL_RECORDS
-                    )
-                    if not can_admit:
-                        accepted = False
-                        drop_reason = "process_budget"
-                if accepted:
-                    self.__flows[flow_id] = {
-                        "records": 0, "ordinary_records": 0, "lineage_records": 0,
-                        "child_phases": set(), "dropped": 0, "coalesced": 0,
-                        "status_completion_recorded": False,
-                        "child_terminal_recorded": False, "teardown_recorded": False,
-                        "root_recorded": False,
-                        "file_id": file_id if isinstance(file_id, str) else None,
-                        "operation_sequence": operation_sequence if type(operation_sequence) is int else None,
-                    }
-        if drop_reason is not None:
-            self.__emit_drop(drop_reason)
-        if not accepted:
-            return None
-        return lambda event, fields: self.record(flow_id, event, fields)
-
-    def existing_recorder(self, flow_id: object) -> Optional[Callable[[str, dict[str, object]], None]]:
-        with self.__lock:
-            present = isinstance(flow_id, str) and flow_id in self.__flows
-        return (lambda event, fields: self.record(flow_id, event, fields)) if present else None
-
-    def active_recorder(self) -> Callable[[str, dict[str, object]], None]:
-        # Capture the current flow set at operation admission.  A status poll
-        # may run later on the shared executor, after Queue creates a flow;
-        # that older poll must not publish child facts into the new flow.
-        with self.__lock:
-            flow_ids = tuple(self.__flows)
-
-        def record_admitted(event: str, fields: dict[str, object]) -> None:
-            for flow_id in flow_ids:
-                self.record(flow_id, event, fields)
-
-        return record_admitted
-
-    def active_flow_candidates(self) -> tuple[tuple[str, int], ...]:
-        with self.__lock:
-            return tuple(
-                (state["file_id"], state["operation_sequence"])
-                for state in self.__flows.values()
-                if isinstance(state.get("file_id"), str) and type(state.get("operation_sequence")) is int
-            )
-
-    def discard_active_flow(self, file_id: object, operation_sequence: object) -> None:
-        with self.__lock:
-            for flow_id, state in tuple(self.__flows.items()):
-                if state.get("file_id") == file_id and state.get("operation_sequence") == operation_sequence:
-                    self.__flows.pop(flow_id, None)
-
-    def record_active(self, event: str, fields: dict[str, object]) -> None:
-        with self.__lock:
-            flow_ids = tuple(self.__flows)
-        for flow_id in flow_ids:
-            self.record(flow_id, event, fields)
-
-    def record(self, flow_id: str, event: str, fields: dict[str, object]) -> None:
-        if event not in self._EVENTS:
-            return
-        payload: Optional[dict[str, object]] = None
-        with self.__lock:
-            state = self.__flows.get(flow_id)
-            if state is None:
-                return
-            child_terminal = self.__is_decisive_child_terminal(event, fields)
-            teardown = event in {"controller_exit", "controller_force_close"}
-            root = event == "root_default"
-            if child_terminal and state["child_terminal_recorded"]:
-                state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
-                return
-            if teardown and state["teardown_recorded"]:
-                state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
-                return
-            if root and state["root_recorded"]:
-                state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
-                return
-
-            child_observation = event == "lftp_child" and not child_terminal
-            child_phase = self.__child_phase(fields) if child_observation else None
-            status_completion = child_observation and fields.get("command_kind") == "status" and \
-                fields.get("classification") == "none" and fields.get("status_health") == "healthy"
-            if child_observation:
-                if child_phase is None:
-                    state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
-                    return
-                if status_completion and state["status_completion_recorded"]:
-                    state["coalesced"] = min(self._MAX_RECORDS, state["coalesced"] + 1)
-                    return
-                if child_phase in state["child_phases"]:
-                    state["coalesced"] = min(self._MAX_RECORDS, state["coalesced"] + 1)
-                    return
-                # Preserve one existing child-failure slot and one later healthy
-                # status completion so prompt noise cannot exhaust the sole
-                # post-Queue membership discriminator.
-                if (fields.get("command_kind") == "status" and not status_completion and
-                        len(state["child_phases"]) >= 1) or \
-                        len(state["child_phases"]) >= self._MAX_CHILD_PHASES:
-                    state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
-                    return
-
-            special = child_terminal or teardown or root
-            ordinary_available = state["ordinary_records"] < (
-                self._MAX_LINEAGE_RECORDS + self._MAX_CHILD_PHASES
-            )
-            lineage = event in {
-                "queue_admitted", "executor_start", "executor_return", "executor_error",
-            }
-            if not special and lineage and state["lineage_records"] >= self._MAX_LINEAGE_RECORDS:
-                state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
-                return
-            if not special and not lineage and not child_observation:
-                state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
-                return
-
-            process_available = self.__process_records < (
-                self._MAX_PROCESS_RECORDS if special else
-                self._MAX_PROCESS_RECORDS - self.__reserved_special_records()
-            )
-            if (special or ordinary_available) and state["records"] < self._MAX_RECORDS and process_available:
-                state["records"] += 1
-                self.__process_records += 1
-                if not special:
-                    state["ordinary_records"] += 1
-                    if lineage:
-                        state["lineage_records"] += 1
-                    elif child_observation:
-                        state["child_phases"].add(child_phase)
-                        if status_completion:
-                            state["status_completion_recorded"] = True
-                if child_terminal:
-                    state["child_terminal_recorded"] = True
-                if teardown:
-                    state["teardown_recorded"] = True
-                if root:
-                    state["root_recorded"] = True
-                payload = self.__payload(flow_id, event, fields)
-            else:
-                state["dropped"] = min(self._MAX_RECORDS, state["dropped"] + 1)
-            if root:
-                if payload is not None:
-                    payload["dropped"] = state["dropped"]
-                    payload["coalesced"] = state["coalesced"]
-                self.__flows.pop(flow_id, None)
-        if payload is not None:
-            self.__emit(payload)
-
-    def __reserved_special_records(self) -> int:
-        return sum(
-            self.__state_reserved_special_records(state)
-            for state in self.__flows.values()
-        )
-
-    @staticmethod
-    def __state_reserved_special_records(state: dict[str, object]) -> int:
-        return (
-            (0 if state["child_terminal_recorded"] else 1) +
-            (0 if state["teardown_recorded"] else 1) +
-            (0 if state["root_recorded"] else 1)
-        )
-
-    @staticmethod
-    def __is_decisive_child_terminal(event: str, fields: dict[str, object]) -> bool:
-        if event != "lftp_child":
-            return False
-        if fields.get("command_kind") == "status" and fields.get("classification") == "none" and \
-                fields.get("status_health") == "healthy":
-            # A completed status parse may sample a just-exited child; retain
-            # that fact without consuming the later EOF/exit/signal reservation.
-            return False
-        return (
-            fields.get("classification") in {"eof", "exit", "signal"} or
-            fields.get("reaped") in {"not_alive", "exit", "signal"} or
-            fields.get("process_alive_after") is False or
-            fields.get("process_alive") is False
-        )
-
-    @classmethod
-    def __child_phase(cls, fields: dict[str, object]) -> Optional[str]:
-        phase = fields.get("phase")
-        return phase if phase in cls._CHILD_PHASES else None
-
-    def __emit_drop(self, reason: str) -> None:
-        payload = None
-        with self.__lock:
-            if not self.__capacity_drop_emitted:
-                self.__capacity_drop_emitted = True
-                payload = {
-                    "schema": "incoming_recovery.queue_lifecycle.v1",
-                    "event": "dropped",
-                    "reason": reason,
-                }
-        if payload is not None:
-            self.__emit(payload)
-
-    def __payload(self, flow_id: str, event: str, fields: dict[str, object]) -> dict[str, object]:
-        process_pid = fields.get("process_pid")
-        safe_process_pid = type(process_pid) is int and process_pid > 0
-        return {
-            "schema": "incoming_recovery.queue_lifecycle.v1",
-            "event": event, "flow_id": flow_id,
-            "phase": fields.get("phase") if fields.get("phase") in self._PHASES else "unknown",
-            "duration_bucket": fields.get("duration_bucket")
-            if fields.get("duration_bucket") in self._DURATION_BUCKETS else "unknown",
-            "process_pid": process_pid if safe_process_pid else "unavailable",
-            "process_alive_before": fields.get("process_alive_before")
-            if type(fields.get("process_alive_before")) is bool else None,
-            "process_alive_after": fields.get("process_alive_after")
-            if type(fields.get("process_alive_after")) is bool else None,
-            "process_alive": fields.get("process_alive") if type(fields.get("process_alive")) is bool else None,
-            "reaped": fields.get("reaped") if fields.get("reaped") in self._REAPED else "unknown",
-            "exitstatus": fields.get("exitstatus") if type(fields.get("exitstatus")) is int and -1 <= fields["exitstatus"] <= 255 else None,
-            "signalstatus": fields.get("signalstatus") if type(fields.get("signalstatus")) is int and -1 <= fields["signalstatus"] <= 255 else None,
-            "classification": fields.get("classification") if fields.get("classification") in self._FAILURE_CLASSIFICATIONS else "unknown",
-            "command_kind": fields.get("command_kind")
-            if fields.get("command_kind") in self._COMMAND_KINDS else "unknown",
-            "command_outcome": fields.get("command_outcome")
-            if fields.get("command_outcome") in self._COMMAND_OUTCOMES else "unknown",
-            "read_buffer_source": fields.get("read_buffer_source")
-            if fields.get("read_buffer_source") in self._BUFFER_SOURCES else "unavailable",
-            "read_buffer_byte_length_bucket": fields.get("read_buffer_byte_length_bucket")
-            if fields.get("read_buffer_byte_length_bucket") in self._READ_BUFFER_BUCKETS else "unknown",
-            "status_health": fields.get("status_health") if fields.get("status_health") in {"healthy", "unhealthy", "unknown"} else "unknown",
-            "status_count_bucket": fields.get("status_count_bucket")
-            if fields.get("status_count_bucket") in {"0", "1", "2-4", "5-16", "17+", "unknown"} else "unknown",
-            "membership": fields.get("membership") if fields.get("membership") in {"present", "absent", "unknown"} else "unknown",
-            "root_state": fields.get("root_state") if fields.get("root_state") in {"default", "unknown"} else "unknown",
-            "coverage": fields.get("coverage") if fields.get("coverage") in {"incomplete", "complete", "unknown"} else "unknown",
-            "status_parse": fields.get("status_parse")
-            if fields.get("status_parse") in {"accepted_empty", "unknown"} else "unknown",
-            "status_result_shape": fields.get("status_result_shape")
-            if fields.get("status_result_shape") in self._STATUS_RESULT_SHAPES else "unknown",
-            "status_recovery": fields.get("status_recovery")
-            if fields.get("status_recovery") in self._STATUS_RECOVERIES else "unknown",
-            "status_preceded_timeout": fields.get("status_preceded_timeout")
-            if type(fields.get("status_preceded_timeout")) is bool else None,
-            "pre_send_drain_shape": fields.get("pre_send_drain_shape")
-            if fields.get("pre_send_drain_shape") in self._PRE_SEND_DRAIN_SHAPES else "unknown",
-            "pre_send_drain_byte_length_bucket": fields.get("pre_send_drain_byte_length_bucket")
-            if fields.get("pre_send_drain_byte_length_bucket") in self._READ_BUFFER_BUCKETS else "unknown",
-            "pre_send_drain_queue_done": fields.get("pre_send_drain_queue_done")
-            if type(fields.get("pre_send_drain_queue_done")) is bool else None,
-            "pre_send_drain_job_or_progress": fields.get("pre_send_drain_job_or_progress")
-            if type(fields.get("pre_send_drain_job_or_progress")) is bool else None,
-            "pre_send_drain_prompt_or_echo": fields.get("pre_send_drain_prompt_or_echo")
-            if type(fields.get("pre_send_drain_prompt_or_echo")) is bool else None,
-            "pre_send_drain_error": fields.get("pre_send_drain_error")
-            if type(fields.get("pre_send_drain_error")) is bool else None,
-            "post_send_prompt": fields.get("post_send_prompt")
-            if fields.get("post_send_prompt") in self._POST_SEND_PROMPTS else "unknown",
-        }
-
-    def __emit(self, payload: dict[str, object]) -> None:
-        try:
-            logger = getattr(self.__logger, "info", None)
-            if callable(logger):
-                logger("incoming_recovery_queue_lifecycle %s", json.dumps(payload, sort_keys=True, separators=(",", ":")))
-        except Exception:
-            pass
-
 @dataclass
 class PendingQueueDispatch:
     accepted_at_monotonic: float
@@ -735,6 +410,7 @@ class PendingQueueDispatch:
     is_dir: bool = False
     operation_sequence: int = 0
     resume_source_identity: Optional[tuple[int, int]] = None
+    status_lifecycle_recorded: bool = field(default=False, compare=False)
 
 
 @dataclass
@@ -816,17 +492,20 @@ _LFTP_EXECUTOR_PHASES = frozenset({
 
 
 def _lftp_executor_trace_enabled(trace: object, level: Optional[str] = None) -> bool:
-    """Require an explicit executor rule before allocating observations."""
-    explicit = getattr(trace, "is_explicitly_configured", None)
-    if not callable(explicit):
-        return False
+    """Use existing explicit policy controls for detailed executor records.
+
+    The detailed executor stream remains controlled by its existing category
+    and level policy. Queue lifecycle info/warning observations are emitted by
+    the ordinary flow recorder and do not require this detailed stream.
+    """
     try:
-        if explicit(_LFTP_EXECUTOR_TRACE_CATEGORY) is not True:
+        explicitly_configured = getattr(trace, "is_explicitly_configured", None)
+        if not callable(explicitly_configured) or explicitly_configured(
+                _LFTP_EXECUTOR_TRACE_CATEGORY
+        ) is not True:
             return False
         if level is not None:
             return _breadcrumb_effectively_enabled(trace, _LFTP_EXECUTOR_TRACE_CATEGORY, level)
-        # A warning-only policy may need a local token before a later failure;
-        # success observations remain filtered by their own info level.
         return any(
             _breadcrumb_effectively_enabled(trace, _LFTP_EXECUTOR_TRACE_CATEGORY, candidate)
             for candidate in ("debug", "info", "warning")
@@ -1445,7 +1124,6 @@ class Controller:
         self.__command_queue = Queue()
         self.__command_flow_sequence = 0
         self.__command_flow_lock = Lock()
-        self.__incoming_recovery_diagnostic_registry: Optional[_IncomingRecoveryDiagnosticRegistry] = None
         self.__pending_queue_dispatches: Dict[str, PendingQueueDispatch] = {}
         # Runtime-only Queue intents waiting for collision comparison or a
         # generation-fenced scoped rescan.  The map is bounded by file id and
@@ -1821,8 +1499,9 @@ class Controller:
         safe_correlation = _lftp_executor_correlation(correlation)
         if safe_correlation is None or phase not in _LFTP_EXECUTOR_PHASES:
             return
-        level = "warning" if phase in {"enqueue_failed", "worker_exception"} else "info"
-        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        level = "warning" if phase in {"enqueue_failed", "worker_exception"} else "debug"
+        context = getattr(self, "_Controller__context", None)
+        breadcrumb_trace = getattr(context, "breadcrumb_trace", None)
         if not _lftp_executor_trace_enabled(breadcrumb_trace, level):
             return
         try:
@@ -1877,14 +1556,10 @@ class Controller:
             diagnostic_recorder: Optional[Callable[[str, dict[str, object]], None]] = None,
             diagnostic_admission_attempted: bool = False,
     ) -> bool:
-        diagnostic_required = action == "queue" and _incoming_recovery_debug_enabled(self) and \
-            isinstance(file_id, str) and type(operation_sequence) is int and operation_sequence >= 1
         if action == "queue" and diagnostic_recorder is None and not diagnostic_admission_attempted:
             diagnostic_recorder = self.__incoming_recovery_flow_recorder(
-                file_id, operation_sequence, require_admission=diagnostic_required,
+                file_id, operation_sequence,
             )
-        if diagnostic_required and diagnostic_recorder is None:
-            return False
         executor = self.__ensure_lftp_executor()
         if executor is None:
             if diagnostic_recorder is not None:
@@ -1894,8 +1569,7 @@ class Controller:
         queue_flow_id = _fractional_queue_flow_id(
             self, file_id, operation_sequence,
         ) if action == "queue" and isinstance(file_id, str) else None
-        queue_correlation_flow_id = queue_flow_id \
-            if _incoming_recovery_debug_enabled(self) else None
+        queue_correlation_flow_id = queue_flow_id
         if diagnostic_recorder is not None:
             diagnostic_recorder("queue_admitted", {})
 
@@ -1931,7 +1605,8 @@ class Controller:
             submitted_operation = queue_operation
 
         # The default path submits the original callable unchanged.
-        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        context = getattr(self, "_Controller__context", None)
+        breadcrumb_trace = getattr(context, "breadcrumb_trace", None)
         executor_trace_enabled = _lftp_executor_trace_enabled(breadcrumb_trace)
         executor_correlation: Optional[str] = None
         submit_callable = submitted_operation
@@ -2044,8 +1719,8 @@ class Controller:
             self, file_id: object, operation_sequence: object, create: bool = True,
             require_admission: bool = False,
     ) -> Optional[Callable[[str, dict[str, object]], None]]:
-        if not _incoming_recovery_debug_enabled(self) or not isinstance(file_id, str) or \
-                type(operation_sequence) is not int or operation_sequence < 1:
+        del create, require_admission
+        if not isinstance(file_id, str) or type(operation_sequence) is not int or operation_sequence < 1:
             return None
         try:
             flow_id = "fractional-queue:{}".format(
@@ -2053,32 +1728,114 @@ class Controller:
             )
         except Exception:
             return None
-        registry = getattr(self, "_Controller__incoming_recovery_diagnostic_registry", None)
-        if registry is None and create:
-            try:
-                registry = _IncomingRecoveryDiagnosticRegistry(self.logger)
-                self.__incoming_recovery_diagnostic_registry = registry
-            except Exception:
-                return None
-        if registry is None:
-            return None
-        try:
-            if create:
-                if require_admission:
-                    return registry.reserve_recorder(flow_id, file_id, operation_sequence)
-                return registry.recorder(flow_id, file_id, operation_sequence)
-            return registry.existing_recorder(flow_id)
-        except Exception:
+        context = getattr(self, "_Controller__context", None)
+        breadcrumb_trace = getattr(context, "breadcrumb_trace", None)
+        if not any(
+                _breadcrumb_effectively_enabled(
+                    breadcrumb_trace, _QUEUE_LIFECYCLE_TRACE_CATEGORY, level,
+                )
+                for level in ("debug", "info", "warning")
+        ):
             return None
 
+        def record(event: str, fields: dict[str, object]) -> None:
+            if not isinstance(event, str) or not isinstance(fields, dict):
+                return
+            failure = event in {"executor_error", "controller_force_close"}
+            classification = fields.get("classification")
+            command_outcome = fields.get("command_outcome")
+            if classification in {
+                    "eof", "exit", "signal", "timeout", "command_error", "parser_error",
+                    "terminal_backlog", "unhealthy_snapshot",
+            } or command_outcome in {"prompt_timeout", "eof", "error"}:
+                failure = True
+            # Retirement is the normal successful end of a Queue lifecycle.
+            # Keep it informational unless the handoff carries an actual
+            # backend/transport failure classification.
+            if event == "queue_retired" and classification in {
+                    "eof", "exit", "signal", "timeout", "command_error",
+                    "parser_error", "terminal_backlog", "unhealthy_snapshot",
+            }:
+                failure = True
+            detail_event = event in {"executor_start", "executor_return"}
+            if event == "lftp_child" and fields.get("phase") != "status":
+                detail_event = True
+            level = "warning" if failure else "debug" if detail_event else "info"
+            if not _breadcrumb_effectively_enabled(
+                    breadcrumb_trace, _QUEUE_LIFECYCLE_TRACE_CATEGORY, level,
+            ):
+                return
+            try:
+                details = dict(fields)
+                details.setdefault("schema", _QUEUE_LIFECYCLE_TRACE_SCHEMA)
+                details.setdefault("event", event)
+                recorder = getattr(breadcrumb_trace, "record", None)
+                if not callable(recorder):
+                    return
+                recorder(
+                    "controller",
+                    "queue_lifecycle_{}".format(event),
+                    details,
+                    stage="queue_lifecycle",
+                    event_type="failure" if failure else "state_transition",
+                    category=_QUEUE_LIFECYCLE_TRACE_CATEGORY,
+                    level=level,
+                    corr_id=flow_id,
+                    flow_id=flow_id,
+                    trace_scope="flow",
+                )
+            except Exception:
+                # Breadcrumb evidence is strictly best effort and must not
+                # affect Queue, LFTP, model, or teardown ownership.
+                try:
+                    self.logger.debug("Ignoring Queue lifecycle breadcrumb failure", exc_info=True)
+                except Exception:
+                    pass
+
+        return record
+
     def __incoming_recovery_status_recorder(self) -> Optional[Callable[[str, dict[str, object]], None]]:
-        if not _incoming_recovery_debug_enabled(self):
+        pending = getattr(self, "_Controller__pending_queue_dispatches", None)
+        if not isinstance(pending, dict):
             return None
-        registry = getattr(self, "_Controller__incoming_recovery_diagnostic_registry", None)
-        try:
-            return registry.active_recorder() if registry is not None else None
-        except Exception:
+        candidates: list[
+            tuple[float, str, PendingQueueDispatch, Callable[[str, dict[str, object]], None]]
+        ] = []
+        for file_id, dispatch in tuple(pending.items()):
+            if not isinstance(dispatch, PendingQueueDispatch) or \
+                    bool(getattr(dispatch, "status_lifecycle_recorded", False)):
+                continue
+            sequence = getattr(dispatch, "operation_sequence", None)
+            recorder = self.__incoming_recovery_flow_recorder(
+                file_id, sequence, create=False,
+            )
+            if recorder is not None:
+                accepted_at = getattr(dispatch, "accepted_at_monotonic", None)
+                sort_time = float(accepted_at) if type(accepted_at) in (int, float) else float("inf")
+                candidates.append((
+                    sort_time, opaque_trace_correlation(str(file_id)), dispatch, recorder,
+                ))
+        if not candidates:
             return None
+        # A status response is global and has no file identity.  Assign this
+        # poll to the oldest accepted Queue dispatch; the next poll can bind
+        # the next pending flow.  Fan-out would falsely attribute one status
+        # lifecycle to every queued file.
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        dispatch = candidates[0][2]
+        recorder = candidates[0][3]
+        status_lifecycle_recorded = False
+
+        def record(event: str, fields: dict[str, object]) -> None:
+            nonlocal status_lifecycle_recorded
+            if event == "lftp_child" and fields.get("phase") == "status":
+                if status_lifecycle_recorded:
+                    return
+                status_lifecycle_recorded = True
+                dispatch.status_lifecycle_recorded = True
+            recorder(event, fields)
+
+        return record
 
     def __next_lftp_operation_sequence(self, file_id: str) -> int:
         sequences = getattr(self, "_Controller__lftp_operation_sequences", None)
@@ -2244,8 +2001,7 @@ class Controller:
                     _fractional_queue_flow_id(
                         self, operation.file_id, operation.operation_sequence,
                     )
-                    if _incoming_recovery_debug_enabled(self) and
-                    operation.action == "queue" and isinstance(operation.file_id, str)
+                    if operation.action == "queue" and isinstance(getattr(operation, "file_id", None), str)
                     else None
                 ),
             )
@@ -5950,8 +5706,6 @@ class Controller:
 
     def __queue_flow_id_for_pending_file(self, file_id: object) -> Optional[str]:
         """Reuse the existing pending dispatch identity when it is available."""
-        if not _incoming_recovery_debug_enabled(self):
-            return None
         if not isinstance(file_id, str):
             return None
         pending = getattr(self, "_Controller__pending_queue_dispatches", None)
@@ -5982,11 +5736,14 @@ class Controller:
         )
 
     def __queue_correlation_trace_is_enabled(self) -> bool:
-        """Check new Queue correlation consumers without enabling command tracing."""
+        """Check ordinary Queue-flow consumers before deriving a flow token."""
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
         return any(
             _breadcrumb_effectively_enabled(breadcrumb_trace, category, level)
             for category, level in (
+                (_QUEUE_LIFECYCLE_TRACE_CATEGORY, "info"),
+                (_QUEUE_LIFECYCLE_TRACE_CATEGORY, "warning"),
+                (_QUEUE_LIFECYCLE_TRACE_CATEGORY, "debug"),
                 ("queue.readiness", "info"),
                 ("lftp.sidecar", "info"),
                 ("lftp.sidecar", "warning"),
@@ -6013,10 +5770,7 @@ class Controller:
             self.__fractional_queue_trace_is_enabled() or
             self.__lftp_command_trace_is_enabled()
         )
-        if not legacy_trace_enabled and not (
-                _incoming_recovery_debug_enabled(self) and
-                self.__queue_correlation_trace_is_enabled()
-        ):
+        if not legacy_trace_enabled and not self.__queue_correlation_trace_is_enabled():
             return None
         return "fractional-queue:{}".format(
             opaque_trace_correlation("queue:{}:{}".format(file_id, operation_sequence))
@@ -9159,9 +8913,7 @@ class Controller:
                     )
                     queue_kwargs: dict[str, object] = {}
                     exclude_patterns = self.__transfer_exclude_patterns(
-                        file_id,
-                        is_dir,
-                        _fractional_queue_flow_id(self, file_id, operation_sequence),
+                        file_id, is_dir, None,
                     )
                     if exclude_patterns:
                         queue_kwargs["exclude_patterns"] = exclude_patterns
@@ -9171,26 +8923,11 @@ class Controller:
                             queue_kwargs["expected_size"] = source_identity[0]
                         if allow_legacy_get_resume:
                             queue_kwargs["allow_legacy_get_resume"] = True
-                    queue_diagnostic_enabled = self.__uses_async_lftp_owner() and \
-                        _incoming_recovery_debug_enabled(self)
-                    queue_diagnostic_recorder = self.__incoming_recovery_flow_recorder(
-                        file_id, operation_sequence, require_admission=True,
-                    ) if queue_diagnostic_enabled else None
-                    if queue_diagnostic_enabled and queue_diagnostic_recorder is None:
-                        self.logger.warning(
-                            "Interrupted download recovery rejected: "
-                            "diagnostic capture capacity is exhausted",
-                        )
-                        _record_fractional_queue_trace(self, file_id, "startup_recovery_queue_dispatch", lambda: {
-                            "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
-                            "dispatch_mode": "async_future",
-                            "outcome": "diagnostic_capacity",
-                            "future_outcome": "diagnostic_capacity",
-                            "status_acknowledgement": "not_applicable",
-                            "result": "rejected",
-                            "reason": "diagnostic_capacity",
-                        }, flow_id=_fractional_queue_flow_id(self, file_id, operation_sequence))
-                        continue
+                    # Startup recovery is outside the exact normal Queue
+                    # breadcrumb path.  Preserve its transfer behavior while
+                    # preventing the generic executor fallback from attaching
+                    # diagnostic state to this lifecycle.
+                    queue_diagnostic_recorder = None
                     def queue_lftp(
                             file_name: str = file_name,
                             is_dir: bool = is_dir,
@@ -9224,7 +8961,7 @@ class Controller:
                         if not self.__submit_lftp_operation(
                                 "queue", queue_lftp, file_id, operation_sequence,
                                 diagnostic_recorder=queue_diagnostic_recorder,
-                                diagnostic_admission_attempted=queue_diagnostic_enabled):
+                                diagnostic_admission_attempted=True):
                             pending = self.__queue_dispatch_pending()
                             dispatch = pending.get(file_id)
                             if dispatch is not None and dispatch.operation_sequence == operation_sequence:
@@ -9243,7 +8980,7 @@ class Controller:
                                 "status_acknowledgement": "not_applicable",
                                 "result": "rejected",
                                 "reason": "backend_shutting_down",
-                            }, flow_id=_fractional_queue_flow_id(self, file_id, operation_sequence))
+                            })
                             continue
                         _record_fractional_queue_trace(self, file_id, "startup_recovery_queue_dispatch", lambda: {
                             "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
@@ -9251,7 +8988,7 @@ class Controller:
                             "future_outcome": "pending",
                             "status_acknowledgement": "pending",
                             "result": "submitted",
-                        }, flow_id=_fractional_queue_flow_id(self, file_id, operation_sequence))
+                        })
                     else:
                         if queue_lftp() is False:
                             _record_fractional_queue_trace(self, file_id, "startup_recovery_queue_dispatch", lambda: {
@@ -9260,7 +8997,7 @@ class Controller:
                                 "future_outcome": "backend_rejection",
                                 "status_acknowledgement": "not_applicable",
                                 "result": "rejected",
-                            }, flow_id=_fractional_queue_flow_id(self, file_id, operation_sequence))
+                            })
                             continue
                         _record_fractional_queue_trace(self, file_id, "startup_recovery_queue_dispatch", lambda: {
                             "schema": "fractional_mtime_redownload.startup_recovery_queue_dispatch.v2",
@@ -9268,7 +9005,7 @@ class Controller:
                             "future_outcome": "not_applicable",
                             "status_acknowledgement": "pending",
                             "result": "submitted",
-                        }, flow_id=_fractional_queue_flow_id(self, file_id, operation_sequence))
+                        })
                     self.logger.info("Recovered interrupted download '%s' from '%s'", file_name, staging_path)
                 except (LftpError, RcloneTransferError) as error:
                     _record_fractional_queue_trace(self, file_id, "startup_recovery_queue_dispatch", lambda: {
@@ -9278,7 +9015,7 @@ class Controller:
                         "status_acknowledgement": "not_applicable",
                         "result": "rejected",
                         "reason": "backend_error",
-                    }, flow_id=_fractional_queue_flow_id(self, file_id, operation_sequence))
+                    })
                     self.logger.warning(
                         "Failed to recover interrupted download '%s' from '%s': %s",
                         file_name,
@@ -10192,18 +9929,19 @@ class Controller:
         updater.update()
 
     def __incoming_recovery_downloading_roots(self) -> list[tuple[str, int]]:
-        if not _incoming_recovery_debug_enabled(self):
-            return []
         snapshot: list[tuple[str, int]] = []
         try:
-            registry = getattr(self, "_Controller__incoming_recovery_diagnostic_registry", None)
-            candidates = registry.active_flow_candidates() if registry is not None else ()
+            pending = getattr(self, "_Controller__pending_queue_dispatches", None)
+            candidates = tuple(
+                (file_id, getattr(dispatch, "operation_sequence", None))
+                for file_id, dispatch in pending.items()
+            ) if isinstance(pending, dict) else ()
             with self.__model_lock:
                 for file_id, sequence in candidates:
                     file = self.__model.get_file(file_id)
                     if getattr(file, "file_id", None) != file_id:
                         continue
-                    if getattr(getattr(file, "state", None), "name", None) == "DOWNLOADING" and type(sequence) is int:
+                    if type(sequence) is int:
                         snapshot.append((file_id, sequence))
         except Exception:
             return []
@@ -10217,6 +9955,8 @@ class Controller:
         observations: list[tuple[str, int, dict[str, object]]] = []
         retirements: list[tuple[str, int]] = []
         try:
+            pending = getattr(self, "_Controller__pending_queue_dispatches", None)
+            pending_ids = set(pending) if isinstance(pending, dict) else set()
             with self.__model_lock:
                 statuses = list(self.__last_lftp_statuses or [])
                 health = getattr(self.__lftp, "last_status_poll_healthy", None)
@@ -10231,6 +9971,11 @@ class Controller:
                     if not isinstance(status_observation, dict):
                         status_observation = {}
                 for file_id, sequence in roots:
+                    # A retained Queue dispatch still owns this lifecycle;
+                    # do not describe it as retired merely because the model
+                    # rendered a queued/default row for the current tick.
+                    if file_id in pending_ids:
+                        continue
                     file = self.__model.get_file(file_id)
                     state_name = getattr(getattr(file, "state", None), "name", None)
                     if state_name == "DOWNLOADING":
@@ -10268,8 +10013,11 @@ class Controller:
                         "read_buffer_byte_length_bucket": status_observation.get(
                             "read_buffer_byte_length_bucket"
                         ),
-                        "classification": "none" if failure is None else failure \
-                            if failure in _IncomingRecoveryDiagnosticRegistry._FAILURE_CLASSIFICATIONS else "unknown",
+                        "classification": "none" if failure is None else failure
+                        if failure in {
+                            "eof", "exit", "signal", "timeout", "command_error",
+                            "parser_error", "terminal_backlog", "unhealthy_snapshot",
+                        } else "unknown",
                         "root_state": "default",
                         "coverage": "incomplete",
                     }))
@@ -10282,11 +10030,17 @@ class Controller:
                     recorder("root_default", fields)
             except Exception:
                 pass
-        registry = getattr(self, "_Controller__incoming_recovery_diagnostic_registry", None)
         for file_id, sequence in retirements:
             try:
-                if registry is not None:
-                    registry.discard_active_flow(file_id, sequence)
+                recorder = self.__incoming_recovery_flow_recorder(
+                    file_id, sequence, create=False,
+                )
+                if recorder is not None:
+                    recorder("queue_retired", {
+                        "phase": "retirement",
+                        "root_state": "unknown",
+                        "coverage": "unknown",
+                    })
             except Exception:
                 pass
 
@@ -10860,31 +10614,10 @@ class Controller:
                         if self.__uses_async_lftp_owner() and queue_trace_flow_id is not None and \
                                 self.__lftp_queue_flow_trace_is_enabled():
                             queue_kwargs["trace_flow_id"] = queue_trace_flow_id
-                        queue_diagnostic_enabled = self.__uses_async_lftp_owner() and \
-                            _incoming_recovery_debug_enabled(self)
+                        queue_diagnostic_enabled = self.__uses_async_lftp_owner()
                         queue_diagnostic_recorder = self.__incoming_recovery_flow_recorder(
                             file.file_id, operation_sequence, require_admission=True,
                         ) if queue_diagnostic_enabled else None
-                        if queue_diagnostic_enabled and queue_diagnostic_recorder is None:
-                            self.__record_queue_readiness_trace(file.file_id, "queue_dispatch_boundary", {
-                                "schema": "queue_readiness.v1",
-                                "phase": "dispatch_boundary",
-                                "origin": (
-                                    "auto_queue"
-                                    if getattr(command, "origin", "manual") == "auto_queue"
-                                    else "manual"
-                                ),
-                                "dispatch_attempted": False,
-                                "dispatch_mode": "async" if self.__uses_async_lftp_owner() else "sync",
-                                "operation_sequence_present": type(operation_sequence) is int,
-                                "result": "rejected",
-                                "reason": "diagnostic_capacity",
-                            })
-                            self.__retire_deferred_queue_intent(
-                                file.file_id, "diagnostic_capacity", 503,
-                            )
-                            _notify_failure(command, "Queue diagnostics capacity exhausted", 503, file)
-                            continue
                         lifecycle_before_queue = self.__download_start_lifecycle_snapshot(file.file_id)
                         dispatch = PendingQueueDispatch(
                             time.monotonic(), file.full_path, file.path_pair_id, file.is_dir, operation_sequence,

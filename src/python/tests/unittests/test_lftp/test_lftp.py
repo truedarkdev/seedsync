@@ -858,7 +858,7 @@ class TestLftp(unittest.TestCase):
         self.assertNotIn("private-name.bin", repr(trace.record.call_args))
         self.assertNotEqual("private-name.bin", trace.record.call_args.kwargs["corr_id"])
 
-    def test_queue_sidecar_flow_is_opaque_and_exact_debug_gated(self):
+    def test_queue_sidecar_flow_is_opaque_and_ordinary_policy_gated(self):
         lftp = self._build_test_lftp()
         trace = BreadcrumbTraceCollector(
             lambda: True,
@@ -867,9 +867,7 @@ class TestLftp(unittest.TestCase):
         )
         lftp.set_breadcrumb_trace(trace)
         flow_id = "fractional-queue:0123456789abcdef"
-        with tempfile.TemporaryDirectory() as local_dir, patch.dict(
-                os.environ, {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"},
-        ):
+        with tempfile.TemporaryDirectory() as local_dir:
             lftp.queue(
                 "private-name.bin", False,
                 local_base_dir_path=local_dir, trace_flow_id=flow_id,
@@ -881,21 +879,13 @@ class TestLftp(unittest.TestCase):
         self.assertNotIn("private-name.bin", repr(events))
         self.assertEqual(1, lftp._Lftp__run_command.call_count)
 
-        trace = BreadcrumbTraceCollector(
-            lambda: True,
-            policy={"default": "off", "rules": {"lftp.sidecar": "info"}},
-            max_entries=8,
-        )
-        lftp.set_breadcrumb_trace(trace)
-        with tempfile.TemporaryDirectory() as local_dir, patch.dict(
-                os.environ, {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "599"},
-        ):
+        with tempfile.TemporaryDirectory() as local_dir:
             lftp.queue(
                 "private-name.bin", False,
                 local_base_dir_path=local_dir, trace_flow_id=flow_id,
             )
 
-        self.assertIsNone(trace.snapshot()["entries"][0]["flow_id"])
+        self.assertEqual(flow_id, trace.snapshot()["entries"][0]["flow_id"])
         self.assertNotIn("private-name.bin", repr(trace.snapshot()["entries"]))
         self.assertEqual(2, lftp._Lftp__run_command.call_count)
 
@@ -3204,298 +3194,58 @@ class TestLftp(unittest.TestCase):
 
 
 
-class TestIncomingRecoveryLftpDiagnostics(unittest.TestCase):
-    def test_status_observation_keeps_multiline_terminal_drain_shape(self):
-        lftp = TestLftp._build_status_poll_test_lftp()
-        process = lftp._Lftp__process
-        process._buffer.write(
-            "jobs -v\n[0] queue (sftp://private@host)\nsftp://private@host/root\n"
-            "[0] Done (queue (sftp://private@host))\n"
-        )
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-            self.assertEqual([], lftp.status())
-
-        observation = lftp.incoming_recovery_last_status_observation
-        self.assertEqual("marked", observation["pre_send_drain_shape"])
-        self.assertTrue(observation["pre_send_drain_queue_done"])
-        self.assertTrue(observation["pre_send_drain_prompt_or_echo"])
-        self.assertFalse(observation["pre_send_drain_job_or_progress"])
-        self.assertEqual("empty_or_prompt", observation["status_result_shape"])
-        self.assertEqual("reached", observation["post_send_prompt"])
-        self.assertNotIn("private", repr(observation))
-
-    def test_status_observation_classifies_post_send_frames(self):
-        cases = (
-            ("", "empty_or_prompt"),
-            (
-                "jobs -v\n[0] queue (sftp://private@host)\nsftp://private@host/root\n"
-                "[0] Done (queue (sftp://private@host))\n", "queue_done",
-            ),
-            ("jobs -v\nprivate unexpected frame\n", "ambiguous"),
-        )
-        for output, expected in cases:
-            with self.subTest(expected=expected):
-                lftp = TestLftp._build_status_poll_test_lftp()
-                process = lftp._Lftp__process
-
-                def prompt(*_args, **_kwargs):
-                    process.before = output
-                    return 0
-
-                process.expect.side_effect = prompt
-                with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-                    self.assertEqual([], lftp.status())
-                observation = lftp.incoming_recovery_last_status_observation
-                self.assertEqual(expected, observation["status_result_shape"])
-                self.assertEqual("empty", observation["pre_send_drain_shape"])
-                self.assertEqual("reached", observation["post_send_prompt"])
-                self.assertNotIn("private", repr(observation))
-
-    def test_status_observation_accumulates_real_grace_drain_and_prompt(self):
-        lftp = TestLftp._build_status_poll_test_lftp()
-        process = lftp._Lftp__process
-        process._buffer.write("[0] Done (queue (sftp://private@host))\n")
-        process.before = "Connecting..."
-        process.expect.side_effect = [
-            pexpect.exceptions.TIMEOUT("initial prompt"), 0, 0,
-        ]
-        with patch.object(lftp_mod.time, "monotonic", side_effect=[0, 2, 3]):
-            with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-                self.assertEqual([], lftp.status())
-
-        observation = lftp.incoming_recovery_last_status_observation
-        self.assertEqual("connection_grace", observation["status_recovery"])
-        self.assertTrue(observation["pre_send_drain_queue_done"])
-        self.assertEqual("reached", observation["post_send_prompt"])
-        self.assertEqual(3, process.expect.call_count)
-        self.assertGreaterEqual(process.expect.call_args_list[1].kwargs["timeout"], 5)
-        self.assertNotIn("private", repr(observation))
-
-    def test_status_drain_does_not_classify_when_gate_is_off(self):
-        lftp = TestLftp._build_status_poll_test_lftp()
-        process = lftp._Lftp__process
-        process._buffer.write("private discarded terminal frame")
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "599"}), \
-                patch.object(lftp_mod.re, "search", side_effect=AssertionError("gate-off marker scan")):
-            self.assertEqual([], lftp.status())
-        self.assertEqual({}, lftp.incoming_recovery_last_status_observation)
-
-    def test_status_drain_keeps_existing_error_detection_when_gate_is_off(self):
-        lftp = TestLftp._build_status_poll_test_lftp()
-        process = lftp._Lftp__process
-        process._buffer.write("Login failed: private")
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "599"}):
-            self.assertEqual([], lftp.status())
-        process.send.assert_not_called()
-        self.assertEqual("command_error", lftp.last_status_poll_failure_reason)
-        self.assertEqual("Lftp status terminal reported a backend error", lftp._Lftp__pending_error)
-        self.assertEqual({}, lftp.incoming_recovery_last_status_observation)
-
-    def test_status_drain_keeps_existing_host_key_detection_when_gate_is_off(self):
-        lftp = TestLftp._build_status_poll_test_lftp()
-        process = lftp._Lftp__process
-        process.read_nonblocking.side_effect = [
-            "The authenticity of ", "host private cannot be established",
-        ]
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "599"}):
-            self.assertEqual([], lftp.status())
-        process.send.assert_not_called()
-        self.assertEqual("command_error", lftp.last_status_poll_failure_reason)
-        self.assertEqual("Lftp status terminal reported a backend error", lftp._Lftp__pending_error)
-        self.assertEqual({}, lftp.incoming_recovery_last_status_observation)
-
-    def test_status_observation_binds_prior_timeout_to_empty_grace_result(self):
-        lftp = TestLftp._build_test_lftp()
-        lftp._Lftp__job_status_parser = MagicMock()
-        lftp._Lftp__job_status_parser.parse.return_value = []
-        lftp._Lftp__status_poll_needs_connection_grace = True
-
-        def command(*_args, **_kwargs):
-            if lftp._Lftp__run_command.call_count == 1:
-                lftp._Lftp__last_command_timed_out = True
-                return "Connecting..."
-            lftp._Lftp__last_command_timed_out = False
-            return ""
-
-        lftp._Lftp__run_command.side_effect = command
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-            self.assertEqual([], lftp.status())
-
-        observation = lftp.incoming_recovery_last_status_observation
-        self.assertEqual("empty_or_prompt", observation["status_result_shape"])
-        self.assertEqual("connection_grace", observation["status_recovery"])
-        self.assertTrue(observation["status_preceded_timeout"])
-        self.assertTrue(lftp.last_status_poll_healthy)
-
-    def test_status_result_shapes_are_fixed_and_content_free(self):
-        cases = (
-            ("", [], "empty_or_prompt"),
-            ("[7] Done (queue (sftp://private))", [], "queue_done"),
-            ("[7] Done (queue (sftp://private))\n[8] mirror -c -- 1/2 (50%)", [], "job_present"),
-            ("private transfer progress", [], "ambiguous"),
-            ("private transfer progress", [object()], "job_present"),
-            ("private parser frame", None, "parse_error"),
-        )
-        for output, statuses, expected in cases:
-            with self.subTest(expected=expected):
-                result = lftp_mod._incoming_recovery_status_result_shape(output, statuses)
-                self.assertEqual(expected, result)
-                self.assertNotIn("private", result)
-
-    def test_status_observation_preserves_parser_failure_through_grace(self):
-        lftp = TestLftp._build_test_lftp()
-        lftp._Lftp__job_status_parser = MagicMock()
-        lftp._Lftp__job_status_parser.parse.side_effect = [
-            LftpJobStatusParserError("private parser detail"), [],
-        ]
-        lftp._Lftp__consecutive_status_errors = 0
-        lftp._Lftp__status_poll_needs_connection_grace = True
-        lftp._Lftp__run_command.side_effect = ["private frame", ""]
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-            self.assertEqual([], lftp.status())
-
-        observation = lftp.incoming_recovery_last_status_observation
-        self.assertEqual("empty_or_prompt", observation["status_result_shape"])
-        self.assertEqual("connection_grace", observation["status_recovery"])
-        self.assertEqual("parser_error", lftp.last_status_poll_failure_reason)
-
-    def test_status_observation_is_absent_when_exact_gate_is_off(self):
-        lftp = TestLftp._build_test_lftp()
-        lftp._Lftp__job_status_parser = MagicMock()
-        lftp._Lftp__job_status_parser.parse.return_value = []
-        lftp._Lftp__last_incoming_recovery_status_observation = {
-            "status_result_shape": "empty_or_prompt",
-        }
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "599"}):
-            self.assertEqual([], lftp.status())
-        self.assertEqual({}, lftp.incoming_recovery_last_status_observation)
-        self.assertTrue(lftp.last_status_poll_healthy)
-
-    def test_child_record_does_not_read_pexpect_buffer_property(self):
-        class Process:
-            pid = 1234
-            exitstatus = None
-            signalstatus = None
-
-            def __init__(self):
-                self._buffer = BytesIO(b"unread")
-
-            @property
-            def buffer(self):
-                raise AssertionError("compatibility property must not be read")
-
-            @staticmethod
-            def isalive():
-                return True
-
-        records = []
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-            lftp_mod._incoming_recovery_child_record(
-                lambda event, fields: records.append((event, fields)), Process(), phase="prompt",
-            )
-        self.assertEqual("private_buffer", records[0][1]["read_buffer_source"])
-        self.assertEqual(1234, records[0][1]["process_pid"])
-
-    def test_child_record_timeout_sentinel_still_counts_private_buffer(self):
-        process = MagicMock()
-        process.isalive.return_value = True
-        process.pid = 1234
-        process.exitstatus = None
-        process.signalstatus = None
-        process.before = pexpect.exceptions.TIMEOUT("public before unavailable")
-        process.after = pexpect.exceptions.TIMEOUT("public after unavailable")
-        process.buffer = pexpect.exceptions.TIMEOUT("public buffer unavailable")
-        process._buffer = BytesIO(b"unread PTY bytes")
-        records = []
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-            lftp_mod._incoming_recovery_child_record(
-                lambda event, fields: records.append((event, fields)), process,
-                error=pexpect.exceptions.TIMEOUT("prompt timeout"),
-                phase="prompt", started_at=time.monotonic() - 0.01, alive_before=False,
-            )
-        fields = records[0][1]
-        self.assertEqual("timeout", fields["classification"])
-        self.assertEqual("prompt", fields["phase"])
-        self.assertEqual("private_buffer", fields["read_buffer_source"])
-        self.assertEqual("1-127", fields["read_buffer_byte_length_bucket"])
-        self.assertEqual((False, True), (fields["process_alive_before"], fields["process_alive_after"]))
-        self.assertEqual("alive", fields["reaped"])
-        self.assertEqual(1234, fields["process_pid"])
-        self.assertNotIn("process_start_identity", fields)
-
-    def test_status_binds_one_successful_empty_poll_to_existing_recorder(self):
-        status_lftp = TestLftp._build_status_poll_test_lftp()
-        records = []
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-            self.assertEqual([], status_lftp.status(
-                diagnostic_recorder=lambda event, fields: records.append((event, fields)),
-            ))
-        self.assertEqual(["lftp_child"], [event for event, _ in records])
-        fields = records[0][1]
-        self.assertEqual("status", fields["phase"])
-        self.assertEqual("status", fields["command_kind"])
-        self.assertEqual("none", fields["classification"])
-        self.assertEqual("healthy", fields["status_health"])
-        self.assertEqual("0", fields["status_count_bucket"])
-        self.assertNotIn("output", fields)
-
-    def test_queue_recorder_captures_one_command_outcome_before_same_flow_status(self):
+class TestQueueLifecycleLftpBreadcrumbs(unittest.TestCase):
+    def test_queue_success_and_status_health_share_callback_path(self):
         lftp = TestLftp._build_status_poll_test_lftp()
         records = []
         recorder = lambda event, fields: records.append((event, fields))
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-            lftp.queue("private.bin", False, diagnostic_recorder=recorder)
-            self.assertEqual([], lftp.status(diagnostic_recorder=recorder))
+
+        lftp.queue("private.bin", False, diagnostic_recorder=recorder)
+        self.assertEqual([], lftp.status(diagnostic_recorder=recorder))
 
         queue_records = [fields for event, fields in records if fields.get("command_kind") == "queue"]
         status_records = [fields for event, fields in records if fields.get("command_kind") == "status"]
         self.assertEqual(1, len(queue_records))
         self.assertEqual("success", queue_records[0]["command_outcome"])
-        self.assertEqual("prompt", queue_records[0]["phase"])
         self.assertEqual(1, len(status_records))
-        self.assertEqual("status", status_records[0]["command_kind"])
         self.assertEqual("healthy", status_records[0]["status_health"])
 
-    def test_queue_recorder_captures_one_prompt_timeout_outcome(self):
+    def test_queue_prompt_timeout_is_forwarded_without_exact_gate(self):
         lftp = TestLftp._build_status_poll_test_lftp()
         lftp._Lftp__process.expect.side_effect = pexpect.exceptions.TIMEOUT("prompt timeout")
         records = []
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-            lftp.queue(
-                "private.bin", False,
-                diagnostic_recorder=lambda event, fields: records.append((event, fields)),
-            )
+
+        lftp.queue("private.bin", False, diagnostic_recorder=lambda event, fields: records.append((event, fields)))
 
         queue_records = [fields for event, fields in records if fields.get("command_kind") == "queue"]
         self.assertEqual(1, len(queue_records))
         self.assertEqual("prompt_timeout", queue_records[0]["command_outcome"])
         self.assertEqual("timeout", queue_records[0]["classification"])
 
-    def test_queue_recorder_captures_fixed_eof_and_backend_error_outcomes(self):
+    def test_queue_eof_and_backend_error_are_forwarded(self):
         cases = (
-            ("eof", pexpect.exceptions.EOF("terminal eof"), "eof"),
-            ("error", None, "command_error"),
+            (pexpect.exceptions.EOF("terminal eof"), None, "eof", "eof"),
+            (None, "Login failed: backend", "error", "command_error"),
         )
-        for expected_outcome, expect_side_effect, expected_classification in cases:
+        for expect_side_effect, before, expected_outcome, expected_classification in cases:
             with self.subTest(expected_outcome=expected_outcome):
                 lftp = TestLftp._build_status_poll_test_lftp()
                 if expect_side_effect is not None:
                     lftp._Lftp__process.expect.side_effect = expect_side_effect
                 else:
-                    lftp._Lftp__process.before = "Login failed: private backend"
+                    lftp._Lftp__process.before = before
                 records = []
-                with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-                    if expected_outcome == "eof":
-                        with self.assertRaises(LftpError):
-                            lftp.queue(
-                                "private.bin", False,
-                                diagnostic_recorder=lambda event, fields: records.append((event, fields)),
-                            )
-                    else:
+                if expected_outcome == "eof":
+                    with self.assertRaises(LftpError):
                         lftp.queue(
                             "private.bin", False,
                             diagnostic_recorder=lambda event, fields: records.append((event, fields)),
                         )
+                else:
+                    lftp.queue(
+                        "private.bin", False,
+                        diagnostic_recorder=lambda event, fields: records.append((event, fields)),
+                    )
                 queue_records = [
                     fields for event, fields in records if fields.get("command_kind") == "queue"
                 ]
@@ -3503,104 +3253,11 @@ class TestIncomingRecoveryLftpDiagnostics(unittest.TestCase):
                 self.assertEqual(expected_outcome, queue_records[0]["command_outcome"])
                 self.assertEqual(expected_classification, queue_records[0]["classification"])
 
-    def test_status_completion_collapses_large_status_count_to_registry_bucket(self):
-        status_lftp = TestLftp._build_status_poll_test_lftp()
-        status_lftp._Lftp__last_status_poll_healthy = True
-        status_lftp._Lftp__last_status_poll_failure_reason = None
-        status_lftp._Lftp__last_incoming_recovery_status_observation = {}
-        records = []
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-            status_lftp._Lftp__record_incoming_recovery_status_completion(
-                lambda event, fields: records.append((event, fields)), [object()] * 17,
-            )
-        self.assertEqual("17+", records[0][1]["status_count_bucket"])
+    def test_status_without_callback_does_not_collect_observation(self):
+        lftp = TestLftp._build_status_poll_test_lftp()
+        self.assertEqual([], lftp.status())
+        self.assertEqual({}, lftp.incoming_recovery_last_status_observation)
 
-    def test_status_forwards_later_child_terminal_observations(self):
-        for exitstatus, signalstatus, expected in ((7, None, "exit"), (None, 9, "signal")):
-            with self.subTest(expected=expected), \
-                    patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-                status_lftp = TestLftp._build_status_poll_test_lftp()
-                status_lftp._Lftp__process.isalive.return_value = False
-                status_lftp._Lftp__process.exitstatus = exitstatus
-                status_lftp._Lftp__process.signalstatus = signalstatus
-                status_records = []
-                self.assertEqual([], status_lftp.status(
-                    diagnostic_recorder=lambda event, fields: status_records.append((event, fields)),
-                ))
-                self.assertEqual(["lftp_child"], [event for event, _ in status_records])
-                self.assertEqual(expected, status_records[0][1]["classification"])
-                self.assertEqual("status", status_records[0][1]["command_kind"])
-
-        eof_lftp = TestLftp._build_status_poll_test_lftp()
-        eof_lftp._Lftp__process.expect.side_effect = pexpect.exceptions.EOF("private status eof")
-        eof_records = []
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-            self.assertEqual([], eof_lftp.status(
-                diagnostic_recorder=lambda event, fields: eof_records.append((event, fields)),
-            ))
-        self.assertEqual(["eof"], [fields["classification"] for _, fields in eof_records])
-
-        for boundary in ("send", "drain"):
-            with self.subTest(boundary=boundary), \
-                    patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-                terminal_lftp = TestLftp._build_status_poll_test_lftp()
-                terminal_process = terminal_lftp._Lftp__process
-                if boundary == "send":
-                    terminal_process.send.side_effect = pexpect.exceptions.EOF("private send eof")
-                else:
-                    terminal_process.read_nonblocking.side_effect = pexpect.exceptions.EOF("private drain eof")
-                terminal_records = []
-                self.assertEqual([], terminal_lftp.status(
-                    diagnostic_recorder=lambda event, fields: terminal_records.append((event, fields)),
-                ))
-                self.assertEqual(["eof"], [fields["classification"] for _, fields in terminal_records])
-
-        recovery_lftp = TestLftp._build_status_poll_test_lftp()
-        recovery_lftp._Lftp__process.expect.side_effect = [None, pexpect.exceptions.EOF("private recovery eof")]
-        recovery_records = []
-        with patch.object(Lftp, "_Lftp__normalize_output", return_value="backend"), \
-                patch.object(Lftp, "_Lftp__detect_errors_from_output", side_effect=lambda value: value == "backend"), \
-                patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-            self.assertEqual([], recovery_lftp.status(
-                diagnostic_recorder=lambda event, fields: recovery_records.append((event, fields)),
-            ))
-        self.assertEqual(["command_error", "eof"], [fields["classification"] for _, fields in recovery_records])
-
-        timeout_lftp = TestLftp._build_status_poll_test_lftp()
-        timeout_lftp._Lftp__process.send.side_effect = pexpect.exceptions.TIMEOUT("private timeout")
-        timeout_records = []
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-            self.assertEqual([], timeout_lftp.status(
-                diagnostic_recorder=lambda event, fields: timeout_records.append((event, fields)),
-            ))
-        self.assertEqual(["timeout"], [fields["classification"] for _, fields in timeout_records])
-
-        for error in (pexpect.exceptions.ExceptionPexpect("private command"), OSError("private command")):
-            with self.subTest(status_error=type(error).__name__):
-                command_lftp = TestLftp._build_status_poll_test_lftp()
-                command_lftp._Lftp__process.expect.side_effect = error
-                command_records = []
-                with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-                    self.assertEqual([], command_lftp.status(
-                        diagnostic_recorder=lambda event, fields: command_records.append((event, fields)),
-                    ))
-                self.assertEqual(["command_error"], [fields["classification"] for _, fields in command_records])
-
-        terminal_lftp = TestLftp._build_status_poll_test_lftp()
-        terminal_lftp._Lftp__process._buffer.write("Login failed: private backend")
-        terminal_records = []
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "600"}):
-            self.assertEqual([], terminal_lftp.status(
-                diagnostic_recorder=lambda event, fields: terminal_records.append((event, fields)),
-            ))
-        self.assertEqual(["command_error"], [fields["classification"] for _, fields in terminal_records])
-
-        suppressed_lftp = TestLftp._build_status_poll_test_lftp()
-        suppressed_lftp._Lftp__process.send.side_effect = pexpect.exceptions.TIMEOUT("private timeout")
-        with patch.dict(os.environ, {lftp_mod._INCOMING_RECOVERY_DIAGNOSTIC_ENV: "599"}):
-            self.assertEqual([], suppressed_lftp.status(
-                diagnostic_recorder=lambda *_args: self.fail("disabled diagnostic emitted"),
-            ))
 
 class TestLftpPromptClassification(unittest.TestCase):
     @patch("lftp.lftp.pexpect.spawn", create=True)
