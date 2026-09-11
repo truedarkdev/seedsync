@@ -60,6 +60,7 @@ _EXCLUDED_TOP_LEVEL_NAMES = frozenset({
     ".migration-recovery-intent.json",
     ".seedsync.runtime.lock",
     "migration-state.json",
+    ".migration-root-rebind.json",
     RESTORE_JOURNAL_NAME,
 })
 _COORDINATOR_TEMP_TARGETS = frozenset({
@@ -425,9 +426,22 @@ def _validate_root(root: Path) -> tuple[int, ...]:
     absolute = Path(os.path.abspath(root))
     if absolute.parent == absolute:
         raise BackupRestoreError("Refusing a filesystem root as the SeedSync configuration root")
+    if os.name != "posix":
+        # Windows uses the same volume/file-index identity as the coordinator's
+        # no-follow handle anchor. Keep manifest provenance comparable across
+        # backup validation and the coordinator transaction boundary.
+        from .coordinator import _capture_root_identity
+
+        return _capture_root_identity(absolute)
     info = absolute.lstat()
     if stat.S_ISLNK(info.st_mode) or _is_reparse(info) or not stat.S_ISDIR(info.st_mode):
         raise BackupRestoreError("SeedSync configuration root must be a real directory")
+    return (info.st_dev, info.st_ino)
+
+
+def _legacy_root_identity(root: Path) -> tuple[int, int]:
+    """Return the two-field Windows identity used by older manifests."""
+    info = Path(os.path.abspath(root)).lstat()
     return (info.st_dev, info.st_ino)
 
 
@@ -1500,10 +1514,11 @@ def validate_backup(
     *,
     _expected_backup_id: str | None = None,
     _allow_staging: bool = False,
+    _allow_root_identity_mismatch: bool = False,
 ) -> dict[str, object]:
     """Treat a retained manifest and its data tree as untrusted input."""
     config_root = canonical_config_root(config_root)
-    _validate_root(config_root)
+    current_root_identity = _validate_root(config_root)
     backup_root = config_root / BACKUP_ROOT_NAME
     try:
         backup_dir.absolute().relative_to(backup_root.absolute())
@@ -1583,7 +1598,10 @@ def validate_backup(
         or not all(type(value) is int and cast(int, value) >= 0 for value in root_identity)
     ):
         raise BackupRestoreError("Migration backup root identity is invalid")
-    if root_identity != list(_validate_root(config_root)):
+    current_identity_matches = root_identity == list(current_root_identity)
+    if os.name != "posix" and root_identity == list(_legacy_root_identity(config_root)):
+        current_identity_matches = True
+    if not current_identity_matches and not _allow_root_identity_mismatch:
         raise BackupRestoreError("Migration backup belongs to a different configuration root")
     entries_value = manifest.get("entries")
     if not isinstance(entries_value, list) or len(entries_value) > MAX_ENTRIES:

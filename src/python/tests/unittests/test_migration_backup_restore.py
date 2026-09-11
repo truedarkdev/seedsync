@@ -1829,6 +1829,26 @@ except RuntimeExclusionError:
         restore.assert_called_once_with("backup-id")
         preflight.assert_not_called()
 
+    def test_cli_root_rebind_requires_both_explicit_confirmations(self) -> None:
+        argv = ["seedsync.py", "-c", str(self.root), "--rebind-migration-backup", "backup-id"]
+        with patch.object(sys, "argv", argv):
+            with self.assertRaises(SystemExit) as context:
+                Seedsync()
+        self.assertIn("both --confirm-root-rebind and --confirm-stopped", str(context.exception))
+
+        result = {"files": 2, "directories": 1, "entries": 3, "total_size": 7}
+        argv += ["--confirm-root-rebind", "--confirm-stopped"]
+        with patch.object(sys, "argv", argv), patch.object(
+            MigrationCoordinator, "rebind_offline", return_value=result,
+        ) as rebind, patch.object(MigrationCoordinator, "preflight") as preflight:
+            application = Seedsync()
+            with self.assertRaises(ServiceExit):
+                application.run()
+        rebind.assert_called_once_with(
+            "backup-id", other_instances_stopped=True, confirm_root_rebind=True,
+        )
+        preflight.assert_not_called()
+
     def test_outside_backup_and_existing_lock_are_refused(self) -> None:
         (self.root / "a").write_text("old", encoding="utf-8")
         backup = self._create_backup()

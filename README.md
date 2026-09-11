@@ -64,6 +64,14 @@ seedsync -c <config-root> --restore-migration-backup <backup-id-or-absolute-path
 
 Both confirmations are mandatory. `--confirm-stopped` is the operator's required attestation that every SeedSync process using the configuration root—including legacy v0.8.6 processes that the new lease cannot observe—has been stopped. The backup must be one directly retained beneath that configuration root's `migration-backups` directory. Restore verifies the complete manifest, owner, private permissions, and content before changing destination files, removes post-backup configuration entries under that exact root, retains the backup itself, and exits without constructing the web or controller runtime. Backups are intentionally restorable only by the same supported runtime principal that created them; copying them between users or relaxing their permissions is unsupported and refused. The SeedSync OS account is part of this trust boundary: owner-private files and the cross-process lease separate SeedSync from other accounts and participating current SeedSync processes, but they cannot protect against malicious software already running as the same OS account. The command remains the break-glass path when normal authenticated startup is unavailable; browser recovery is limited to the sole receipt-bound backup from the completed migration.
 
+If the configuration directory itself was intentionally replaced and its completed migration receipt and retained backup were copied into that exact new root, use the separate stopped-instance root-rebind ceremony:
+
+```text
+seedsync -c <config-root> --rebind-migration-backup <exact-backup-id-or-path> --confirm-root-rebind --confirm-stopped
+```
+
+This offline-only command accepts only the backup named by the structurally valid claimed receipt beneath `migration-backups`. It independently validates that receipt, claimed-auth binding, complete backup manifest, and every backup file, then records the old and new root identities, immutable receipt/manifest hashes, and validated inventory in an owner-private attestation. It does not replace or delete any current configuration entry: the copied current configuration remains byte-for-byte unchanged, and the original receipt, manifest, and backup data are never edited. Downloads, staging, mounts, and unrelated appdata are outside the attestation. No browser route, retry, normal-startup fallback, or automatic root rebind is available. The completed audit is single-use: a later independent replacement of the configuration root is explicitly refused and requires a separately designed recovery audit.
+
 ## How it works
 
 Install SeedSync on a local machine.

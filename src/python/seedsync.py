@@ -122,6 +122,29 @@ class Seedsync:
         # Parse the args
         args = self._parse_args(sys.argv[1:])
 
+        if args.rebind_migration_backup is not None:
+            if not args.confirm_stopped or not args.confirm_root_rebind:
+                raise SystemExit(
+                    "Offline root rebind requires both --confirm-root-rebind and --confirm-stopped"
+                )
+            coordinator = MigrationCoordinator(args.config_dir)
+            try:
+                result = coordinator.rebind_offline(
+                    args.rebind_migration_backup,
+                    other_instances_stopped=args.confirm_stopped,
+                    confirm_root_rebind=args.confirm_root_rebind,
+                )
+            except (BackupRestoreError, OSError, ValueError) as exc:
+                raise SystemExit("Offline migration root rebind refused: {}".format(exc)) from exc
+            sys.stdout.write(
+                "Rebound migration backup {} ({} files, {} directories, {} bytes).\n".format(
+                    args.rebind_migration_backup,
+                    result["files"], result["directories"], result["total_size"],
+                )
+            )
+            self.restore_exit_requested = True
+            return
+
         if args.restore_migration_backup is not None:
             if not args.confirm_restore or not args.confirm_stopped:
                 raise SystemExit(
@@ -595,6 +618,10 @@ class Seedsync:
             value == "--restore-migration-backup" or value.startswith("--restore-migration-backup=")
             for value in args
         )
+        rebind_requested = any(
+            value == "--rebind-migration-backup" or value.startswith("--rebind-migration-backup=")
+            for value in args
+        )
         parser.add_argument("-c", "--config_dir", required=True, help="Path to config directory")
         parser.add_argument("--logdir", help="Directory for log files")
         parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logs")
@@ -610,7 +637,7 @@ class Seedsync:
         # noinspection PyProtectedMember
         default_html_path = os.path.join(meipass, "html") if is_frozen and meipass is not None else None
         parser.add_argument("--html",
-                            required=not is_frozen and not restore_requested,
+                            required=not is_frozen and not restore_requested and not rebind_requested,
                             default=default_html_path,
                             help="Path to directory containing html resources")
 
@@ -620,7 +647,7 @@ class Seedsync:
         # noinspection PyProtectedMember
         default_scanfs_path = os.path.join(meipass, "scanfs") if is_frozen and meipass is not None else None
         parser.add_argument("--scanfs",
-                            required=not is_frozen and not restore_requested,
+                            required=not is_frozen and not restore_requested and not rebind_requested,
                             default=default_scanfs_path,
                             help="Path to scanfs executable")
         parser.add_argument("--web-bind-host",
@@ -633,6 +660,11 @@ class Seedsync:
             help="Offline-only: restore one retained migration backup and exit",
         )
         parser.add_argument(
+            "--rebind-migration-backup",
+            metavar="BACKUP_ID_OR_PATH",
+            help="Offline-only: rebind a replaced configuration root to one claimed migration backup and exit",
+        )
+        parser.add_argument(
             "--confirm-restore", action="store_true",
             help="Confirm removal of post-backup files under the exact config root",
         )
@@ -640,10 +672,22 @@ class Seedsync:
             "--confirm-stopped", action="store_true",
             help="Confirm that all SeedSync processes using this config root are stopped",
         )
+        parser.add_argument(
+            "--confirm-root-rebind", action="store_true",
+            help="Confirm that the configuration root was intentionally replaced",
+        )
 
         parsed = parser.parse_args(args)
-        if parsed.restore_migration_backup is None and (parsed.confirm_restore or parsed.confirm_stopped):
+        if parsed.restore_migration_backup is not None and parsed.rebind_migration_backup is not None:
+            parser.error("--restore-migration-backup and --rebind-migration-backup are mutually exclusive")
+        if parsed.rebind_migration_backup is None and parsed.confirm_root_rebind:
+            parser.error("--confirm-root-rebind requires --rebind-migration-backup")
+        if parsed.restore_migration_backup is None and parsed.rebind_migration_backup is None and (
+            parsed.confirm_restore or parsed.confirm_stopped
+        ):
             parser.error("restore confirmation flags require --restore-migration-backup")
+        if parsed.rebind_migration_backup is not None and parsed.confirm_restore:
+            parser.error("--confirm-restore cannot be used with --rebind-migration-backup")
         return parsed
 
     @staticmethod

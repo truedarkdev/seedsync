@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import configparser
 import errno
 import hashlib
@@ -27,6 +28,7 @@ from .backup_restore import (
     MANIFEST_NAME,
     RESTORE_JOURNAL_NAME,
     _fsync_directory,
+    _legacy_root_identity,
     audit_reserved_publications,
     create_retained_backup,
     resolve_backup,
@@ -40,6 +42,7 @@ CURRENT_SCHEMA_ID = "seedsync-current-v1"
 METADATA_FILE = "migration-state.json"
 LOCK_FILE = ".migration.lock"
 RECOVERY_INTENT_FILE = ".migration-recovery-intent.json"
+ROOT_REBIND_ATTESTATION_FILE = ".migration-root-rebind.json"
 BACKUP_ROOT = "migration-backups"
 LEGACY_DOCKER_LOCAL_PATHS = frozenset(("downloads", "downloads/"))
 DOCKER_LOCAL_PATH = "/downloads"
@@ -177,13 +180,18 @@ def _handle_identity(descriptor_or_handle: int, *, windows_handle: bool = False)
 
 
 def _capture_root_identity(root: Path) -> tuple[int, ...]:
+    absolute = Path(os.path.abspath(root))
+    if absolute.parent == absolute:
+        raise ValueError("Refusing a filesystem root as the SeedSync configuration root")
+    info = absolute.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or (
+        os.name != "posix" and bool(getattr(info, "st_file_attributes", 0) & 0x400)
+    ):
+        raise ValueError("Migration configuration root must be a real directory")
     if os.name == "posix":
-        info = root.lstat()
-        if root.is_symlink() or not stat.S_ISDIR(info.st_mode):
-            raise ValueError("Migration configuration root must be a real directory")
         if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
             raise PermissionError("Migration configuration root must be owned by the effective user and not group/other writable")
-        descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(absolute, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
         try:
             return _handle_identity(descriptor)
         finally:
@@ -192,7 +200,7 @@ def _capture_root_identity(root: Path) -> tuple[int, ...]:
     from ctypes import wintypes
 
     kernel32, _, _ = _windows_api()
-    handle = kernel32.CreateFileW(str(Path(os.path.abspath(root))), 0x80, 0x7, None, 3, 0x02200000, None)
+    handle = kernel32.CreateFileW(str(absolute), 0x80, 0x7, None, 3, 0x02200000, None)
     if handle == ctypes.c_void_p(-1).value:
         raise OSError(ctypes.get_last_error(), "Unable to anchor migration configuration root")
     try:
@@ -1058,11 +1066,25 @@ def _read_bytes(
     *,
     owner_only: bool = False,
 ) -> bytes:
-    descriptor = _open_anchored(path, root, os.O_RDONLY, owner_control=owner_only)
+    initial = path.lstat()
+    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISREG(initial.st_mode):
+        raise ValueError("Migration input must be a regular file")
+    if owner_only and os.name == "posix" and (
+        initial.st_uid != os.geteuid() or stat.S_IMODE(initial.st_mode) & 0o077
+    ):
+        raise PermissionError("Migration input is not owner-private")
+    descriptor = _open_anchored(
+        path,
+        root,
+        os.O_RDONLY | getattr(os, "O_NONBLOCK", 0),
+        owner_control=owner_only,
+    )
     try:
         info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
+        if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != (initial.st_dev, initial.st_ino):
             raise ValueError("Migration input must be a regular file")
+        if owner_only and info.st_nlink != 1:
+            raise ValueError("Migration input must not be hard-linked")
         if info.st_size > max_bytes:
             raise ValueError("Migration input exceeds the size limit")
         if owner_only:
@@ -1093,7 +1115,13 @@ def _write_private_backup(path: Path, payload: bytes, root: Path) -> None:
         raise ValueError("Completed migration backup failed validation")
 
 
-def _atomic_write(path: Path, content: str, root: Path) -> None:
+def _atomic_write(
+    path: Path,
+    content: str,
+    root: Path,
+    *,
+    before_replace: Callable[[], None] | None = None,
+) -> None:
     encoded = content.encode("utf-8")
     if len(encoded) > _MAX_RELEVANT_FILE_BYTES:
         raise ValueError("Migration output exceeds the size limit")
@@ -1122,6 +1150,8 @@ def _atomic_write(path: Path, content: str, root: Path) -> None:
                     raise OSError("Unable to write migration output")
                 view = view[written:]
             os.fsync(descriptor)
+            if before_replace is not None:
+                before_replace()
             if os.name == "posix":
                 os.replace(temp_name, target_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
                 os.fsync(directory_fd)
@@ -1228,8 +1258,18 @@ def _looks_current(config_dir: Path) -> bool:
         return False
 
 
-def _validate_manifest(backup_dir: Path, config_dir: Path, spec: MigrationSpec) -> dict[str, object]:
-    manifest = validate_backup(backup_dir, config_dir)
+def _validate_manifest(
+    backup_dir: Path,
+    config_dir: Path,
+    spec: MigrationSpec,
+    *,
+    allow_root_identity_mismatch: bool = False,
+) -> dict[str, object]:
+    manifest = validate_backup(
+        backup_dir,
+        config_dir,
+        _allow_root_identity_mismatch=allow_root_identity_mismatch,
+    )
     if (
         manifest.get("migration_id") != spec.migration_id
         or manifest.get("source_schema") != spec.source_schema
@@ -1385,6 +1425,7 @@ class MigrationCoordinator:
         self.metadata_path = self.config_dir / METADATA_FILE
         self.lock_path = self.config_dir / LOCK_FILE
         self.recovery_intent_path = self.config_dir / RECOVERY_INTENT_FILE
+        self.root_rebind_attestation_path = self.config_dir / ROOT_REBIND_ATTESTATION_FILE
         self.registry = tuple(sorted(registry or default_migration_registry(), key=lambda item: item.order))
         self._root_identity: tuple[int, ...] | None = None
         ids = [spec.migration_id for spec in self.registry]
@@ -1609,12 +1650,28 @@ class MigrationCoordinator:
             if decision.state in (MigrationState.REQUIRED, MigrationState.FAILED):
                 return decision
             if decision.state == MigrationState.COMPLETE:
+                # Root-rebind retains the copied current configuration and
+                # original completion receipt. Its exact attestation is the
+                # only narrow exception to the ordinary backup-root identity
+                # gate; the receipt remains the normal lineage authority.
+                rebound = self._completed_root_rebind_for_preflight()
+                if rebound is not None:
+                    rebound_metadata, rebound_manifest, rebound_binding = rebound
+                    return self._validate_completed_lineage(
+                        rebound_metadata,
+                        allow_root_identity_mismatch=True,
+                        validated_manifest=rebound_manifest,
+                        validated_binding=rebound_binding,
+                    )
                 return self._validate_completed_lineage(metadata)
             return self._failure_decision(None, "Migration lineage metadata is invalid", False)
 
         relevant = [
             path for path in self.config_dir.iterdir()
-            if path.name not in (LOCK_FILE, METADATA_FILE, RECOVERY_INTENT_FILE, ".seedsync.runtime.lock")
+            if path.name not in (
+                LOCK_FILE, METADATA_FILE, RECOVERY_INTENT_FILE,
+                ROOT_REBIND_ATTESTATION_FILE, ".seedsync.runtime.lock",
+            )
         ]
         if not relevant:
             return MigrationDecision(MigrationState.NOT_REQUIRED)
@@ -1818,6 +1875,396 @@ class MigrationCoordinator:
                         os.close(descriptor)
                     self._remove_owned_lock(lock_bytes)
 
+    @staticmethod
+    def _rebind_identity(value: object, field: str) -> tuple[int, ...]:
+        if (
+            not isinstance(value, list)
+            or not value
+            or len(value) > 4
+            or not all(type(item) is int and cast(int, item) >= 0 for item in value)
+        ):
+            raise BackupRestoreError("Migration root-rebind {} is invalid".format(field))
+        return tuple(cast(list[int], value))
+
+    def _resolve_rebind_backup(self, backup_reference: str) -> tuple[Path, dict[str, object]]:
+        """Resolve an exact in-root backup while allowing its recorded old root."""
+        if not isinstance(backup_reference, str) or not backup_reference or backup_reference.strip() != backup_reference:
+            raise BackupRestoreError("A single unambiguous migration backup id or path is required")
+        backup_root = self.config_dir / BACKUP_ROOT
+        if not backup_root.exists():
+            raise BackupRestoreError("Migration backup root does not exist")
+        supplied = Path(backup_reference)
+        if supplied.is_absolute():
+            candidate = supplied
+        elif supplied.parts and supplied.parts[0] == BACKUP_ROOT:
+            if len(supplied.parts) != 2:
+                raise BackupRestoreError("Migration backup reference must name one published backup")
+            candidate = self.config_dir / supplied
+        else:
+            if len(supplied.parts) != 1:
+                raise BackupRestoreError("Migration backup reference must name one published backup")
+            candidate = backup_root / supplied
+        absolute = Path(os.path.abspath(candidate))
+        if absolute.parent != Path(os.path.abspath(backup_root)) or absolute.name.startswith("."):
+            raise BackupRestoreError("Migration backup reference must name one published backup")
+        try:
+            manifest = validate_backup(
+                absolute,
+                self.config_dir,
+                _allow_root_identity_mismatch=True,
+            )
+        except BackupRestoreError:
+            raise
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise BackupRestoreError("The selected migration backup could not be validated") from exc
+        return absolute, manifest
+
+    @staticmethod
+    def _rebind_inventory_digest(manifest: Mapping[str, object]) -> str:
+        payload = json.dumps({
+            "entries": manifest.get("entries"),
+            "aggregate": manifest.get("aggregate"),
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _validate_rebind_receipt(
+        self,
+        metadata: Mapping[str, object],
+        backup_dir: Path,
+        manifest: Mapping[str, object],
+        current_identity: tuple[int, ...],
+        *,
+        require_claimed_auth: bool = True,
+        binding: Mapping[str, str] | None = None,
+    ) -> tuple[MigrationSpec, dict[str, str]]:
+        expected_specs = self._expected_completed_specs()
+        spec_id = metadata.get("migration_id")
+        spec = self._spec(spec_id if isinstance(spec_id, str) else None)
+        try:
+            applied = self._applied(metadata)
+        except ValueError:
+            applied = []
+        valid = (
+            spec is not None
+            and bool(expected_specs)
+            and len(applied) == len(expected_specs)
+            and applied == [item.migration_id for item in expected_specs]
+            and metadata.get("metadata_version") == 2
+            and metadata.get("receipt_version") == 1
+            and metadata.get("state") == MigrationState.COMPLETE.value
+            and metadata.get("migration_id") == spec.migration_id
+            and metadata.get("source_schema") == spec.source_schema
+            and metadata.get("target_schema") == spec.target_schema
+            and metadata.get("current_schema") == spec.target_schema
+            and type(metadata.get("attempt")) is int
+            and cast(int, metadata.get("attempt")) >= 1
+            and _valid_receipt_timestamp(metadata.get("completed_at"))
+            and _valid_receipt_timestamp(metadata.get("updated_at"))
+            and metadata.get("error") is None
+            and metadata.get("retryable") is False
+            and metadata.get("normal_startup_released", True) is True
+            and metadata.get("backup") == "{}/{}".format(BACKUP_ROOT, backup_dir.name)
+            and manifest.get("migration_id") == spec.migration_id
+            and manifest.get("source_schema") == spec.source_schema
+            and manifest.get("target_schema") == spec.target_schema
+        )
+        if not valid or spec is None:
+            raise BackupRestoreError("Root rebind requires a structurally valid COMPLETE receipt")
+        old_identity = self._rebind_identity(manifest.get("root_identity"), "old identity")
+        if old_identity == current_identity or (
+            os.name != "posix" and old_identity == _legacy_root_identity(self.config_dir)
+        ):
+            raise BackupRestoreError("Root rebind requires an old and current root identity mismatch")
+        receipt = dict(binding) if binding is not None else self._completed_auth_binding(metadata, backup_dir)
+        if require_claimed_auth:
+            if spec.validate_completed_claimed is None:
+                raise BackupRestoreError("Root rebind requires a claimed completed migration receipt")
+            try:
+                spec.validate_completed_claimed(self.config_dir, receipt)
+            except Exception as exc:
+                raise BackupRestoreError("Root rebind requires a claimed completed migration receipt") from exc
+        return spec, receipt
+
+    def _create_root_rebind_attestation(
+        self,
+        backup_reference: str,
+        current_identity: tuple[int, ...],
+    ) -> dict[str, object]:
+        backup_dir, manifest = self._resolve_rebind_backup(backup_reference)
+        receipt_bytes = _read_bytes(
+            self.metadata_path, self.config_dir, _MAX_JSON_BYTES, owner_only=True,
+        )
+        try:
+            metadata_value = json.loads(receipt_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            raise BackupRestoreError("Root rebind receipt is invalid") from exc
+        if not isinstance(metadata_value, dict):
+            raise BackupRestoreError("Root rebind receipt is invalid")
+        metadata = cast(dict[str, object], metadata_value)
+        manifest_bytes = _read_bytes(
+            backup_dir / MANIFEST_NAME, self.config_dir, _MAX_JSON_BYTES, owner_only=True,
+        )
+        refreshed_manifest = validate_backup(
+            backup_dir,
+            self.config_dir,
+            _allow_root_identity_mismatch=True,
+        )
+        if refreshed_manifest != manifest:
+            raise BackupRestoreError("Root rebind backup changed during attestation")
+        manifest = refreshed_manifest
+        binding = self._completed_auth_binding(
+            metadata,
+            backup_dir,
+            receipt_bytes=receipt_bytes,
+            manifest_bytes=manifest_bytes,
+        )
+        spec, receipt = self._validate_rebind_receipt(
+            metadata,
+            backup_dir,
+            manifest,
+            current_identity,
+            binding=binding,
+        )
+        old_identity = self._rebind_identity(manifest.get("root_identity"), "old identity")
+        entries = manifest.get("entries")
+        aggregate = manifest.get("aggregate")
+        if not isinstance(entries, list) or not isinstance(aggregate, dict):
+            raise BackupRestoreError("Root rebind manifest inventory is invalid")
+        attestation = {
+            "attestation_version": 1,
+            "phase": "attested",
+            "migration_id": spec.migration_id,
+            "backup": "{}/{}".format(BACKUP_ROOT, backup_dir.name),
+            "old_root_identity": list(old_identity),
+            "new_root_identity": list(current_identity),
+            "receipt_sha256": receipt["receipt_sha256"],
+            "original_receipt": base64.b64encode(receipt_bytes).decode("ascii"),
+            "backup_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "inventory_sha256": self._rebind_inventory_digest(manifest),
+            "aggregate": aggregate,
+            "created_at": _utc_now(),
+        }
+        _atomic_write(
+            self.root_rebind_attestation_path,
+            json.dumps(attestation, indent=2, sort_keys=True) + "\n",
+            self.config_dir,
+        )
+        return attestation
+
+    def _completed_root_rebind_for_preflight(
+        self,
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, str]] | None:
+        """Return one validated receipt/manifest snapshot for completed lineage."""
+        try:
+            attestation = _read_json_object(
+                self.root_rebind_attestation_path,
+                self.config_dir,
+                owner_only=True,
+            )
+            if attestation.get("phase") != "complete":
+                return None
+            return cast(
+                tuple[dict[str, object], dict[str, object], dict[str, str]],
+                self._consume_root_rebind_attestation_locked(
+                    validate_only=True, _return_snapshot=True,
+                ),
+            )
+        except (BackupRestoreError, OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def _consume_root_rebind_attestation_locked(
+        self,
+        *,
+        expected_backup_reference: str | None = None,
+        validate_only: bool = False,
+        _return_snapshot: bool = False,
+    ) -> dict[str, int] | tuple[dict[str, object], dict[str, object], dict[str, str]]:
+        attestation_bytes = _read_bytes(
+            self.root_rebind_attestation_path,
+            self.config_dir,
+            _MAX_JSON_BYTES,
+            owner_only=True,
+        )
+        try:
+            attestation_value = json.loads(attestation_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            raise BackupRestoreError("Root rebind attestation is invalid") from exc
+        if not isinstance(attestation_value, dict):
+            raise BackupRestoreError("Root rebind attestation is invalid")
+        attestation = cast(dict[str, object], attestation_value)
+        required = {
+            "attestation_version", "phase", "migration_id", "backup",
+            "old_root_identity", "new_root_identity", "receipt_sha256",
+            "original_receipt", "backup_manifest_sha256", "inventory_sha256", "aggregate",
+            "created_at",
+        }
+        if set(attestation) != required or attestation.get("attestation_version") != 1:
+            raise BackupRestoreError("Root rebind attestation is invalid")
+        if attestation.get("phase") not in {"attested", "complete"}:
+            raise BackupRestoreError("Root rebind attestation is invalid")
+        if not _valid_receipt_timestamp(attestation.get("created_at")):
+            raise BackupRestoreError("Root rebind attestation timestamp is invalid")
+        original_receipt = attestation.get("original_receipt")
+        if not isinstance(original_receipt, str):
+            raise BackupRestoreError("Root rebind attestation receipt is invalid")
+        try:
+            original_receipt_bytes = base64.b64decode(original_receipt.encode("ascii"), validate=True)
+            if len(original_receipt_bytes) > _MAX_JSON_BYTES or not isinstance(json.loads(original_receipt_bytes), dict):
+                raise ValueError
+        except (ValueError, UnicodeEncodeError, json.JSONDecodeError) as exc:
+            raise BackupRestoreError("Root rebind attestation receipt is invalid") from exc
+        if hashlib.sha256(original_receipt_bytes).hexdigest() != attestation.get("receipt_sha256"):
+            raise BackupRestoreError("Root rebind attestation receipt changed")
+        current_identity = _capture_root_identity(self.config_dir)
+        old_identity = self._rebind_identity(attestation.get("old_root_identity"), "old identity")
+        new_identity = self._rebind_identity(attestation.get("new_root_identity"), "new identity")
+        if old_identity == new_identity or (
+            os.name != "posix" and old_identity == _legacy_root_identity(self.config_dir)
+        ):
+            raise BackupRestoreError("Root rebind attestation root identity is stale")
+        if new_identity != current_identity:
+            if attestation.get("phase") == "complete":
+                raise BackupRestoreError(
+                    "Root rebind refuses a later independent configuration-root replacement"
+                )
+            raise BackupRestoreError("Root rebind attestation root identity is stale")
+        backup_reference = attestation.get("backup")
+        if (
+            not isinstance(backup_reference, str)
+            or Path(backup_reference).parts != (BACKUP_ROOT, Path(backup_reference).name)
+        ):
+            raise BackupRestoreError("Root rebind attestation backup is invalid")
+        if expected_backup_reference is not None:
+            selected, _ = self._resolve_rebind_backup(expected_backup_reference)
+            if selected.name != Path(backup_reference).name:
+                raise BackupRestoreError("Root rebind attestation does not match the selected backup")
+        backup_dir, manifest = self._resolve_rebind_backup(backup_reference)
+        if manifest.get("root_identity") != list(old_identity):
+            raise BackupRestoreError("Root rebind attestation old root identity does not match its backup")
+        spec = self._spec(attestation.get("migration_id"))
+        if (
+            spec is None
+            or manifest.get("migration_id") != spec.migration_id
+            or manifest.get("source_schema") != spec.source_schema
+            or manifest.get("target_schema") != spec.target_schema
+        ):
+            raise BackupRestoreError("Root rebind attestation migration identity is invalid")
+        if self._rebind_inventory_digest(manifest) != attestation.get("inventory_sha256"):
+            raise BackupRestoreError("Root rebind attestation inventory digest is invalid")
+        if manifest.get("aggregate") != attestation.get("aggregate"):
+            raise BackupRestoreError("Root rebind attestation inventory is invalid")
+        manifest_bytes = _read_bytes(
+            backup_dir / MANIFEST_NAME, self.config_dir, _MAX_JSON_BYTES, owner_only=True,
+        )
+        if hashlib.sha256(manifest_bytes).hexdigest() != attestation.get("backup_manifest_sha256"):
+            raise BackupRestoreError("Root rebind attestation backup manifest changed")
+
+        try:
+            receipt_bytes = _read_bytes(
+                self.metadata_path, self.config_dir, _MAX_JSON_BYTES, owner_only=True,
+            )
+            metadata_value = json.loads(receipt_bytes.decode("utf-8"))
+        except FileNotFoundError as exc:
+            raise BackupRestoreError("Root rebind receipt is missing") from exc
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            raise BackupRestoreError("Root rebind receipt is invalid") from exc
+        if not isinstance(metadata_value, dict):
+            raise BackupRestoreError("Root rebind receipt is invalid")
+        metadata = cast(dict[str, object], metadata_value)
+        binding = self._completed_auth_binding(
+            metadata,
+            backup_dir,
+            receipt_bytes=receipt_bytes,
+            manifest_bytes=manifest_bytes,
+        )
+        _, receipt = self._validate_rebind_receipt(
+            metadata,
+            backup_dir,
+            manifest,
+            current_identity,
+            require_claimed_auth=True,
+            binding=binding,
+        )
+        if receipt["receipt_sha256"] != attestation.get("receipt_sha256"):
+            raise BackupRestoreError("Root rebind attestation receipt changed")
+        if attestation.get("phase") == "complete":
+            if _return_snapshot:
+                return metadata, manifest, receipt
+            return cast(dict[str, int], manifest["aggregate"])
+        if validate_only:
+            if _return_snapshot:
+                return metadata, manifest, receipt
+            raise BackupRestoreError("Root rebind attestation is incomplete")
+        if attestation.get("phase") != "attested":
+            raise BackupRestoreError("Root rebind attestation no longer matches a recoverable ceremony")
+
+        initial_snapshot = (metadata, manifest, receipt)
+        attestation["phase"] = "complete"
+        _atomic_write(
+            self.root_rebind_attestation_path,
+            json.dumps(attestation, indent=2, sort_keys=True) + "\n",
+            self.config_dir,
+            before_replace=lambda: self._revalidate_root_rebind_before_complete(
+                initial_snapshot, attestation_bytes,
+            ),
+        )
+        return cast(dict[str, int], manifest["aggregate"])
+
+    def _revalidate_root_rebind_before_complete(
+        self,
+        initial_snapshot: tuple[dict[str, object], dict[str, object], dict[str, str]],
+        attestation_bytes: bytes,
+    ) -> None:
+        """Recheck all attested inputs while the completion write is still staged."""
+        current_snapshot = cast(
+            tuple[dict[str, object], dict[str, object], dict[str, str]],
+            self._consume_root_rebind_attestation_locked(
+                validate_only=True, _return_snapshot=True,
+            ),
+        )
+        if current_snapshot != initial_snapshot:
+            raise BackupRestoreError("Root rebind inputs changed before completion")
+        current_attestation_bytes = _read_bytes(
+            self.root_rebind_attestation_path,
+            self.config_dir,
+            _MAX_JSON_BYTES,
+            owner_only=True,
+        )
+        if current_attestation_bytes != attestation_bytes:
+            raise BackupRestoreError("Root rebind attestation changed before completion")
+
+    def rebind_offline(
+        self,
+        backup_reference: str,
+        *,
+        other_instances_stopped: bool,
+        confirm_root_rebind: bool,
+    ) -> dict[str, int]:
+        """Explicitly rebind one replaced root to its claimed migration backup."""
+        if other_instances_stopped is not True:
+            raise ValueError("Confirm that no other SeedSync instance uses this configuration")
+        if confirm_root_rebind is not True:
+            raise ValueError("Confirm that the configuration root was intentionally replaced")
+        identity = _capture_root_identity(self.config_dir)
+        if self._root_identity is None:
+            self._root_identity = identity
+        elif identity != self._root_identity:
+            raise ValueError("Migration configuration root identity changed")
+        with _root_transaction(self.config_dir, self._root_identity):
+            try:
+                exclusion = RuntimeExclusion(self.config_dir, "migration-root-rebind")
+            except RuntimeExclusionError as exc:
+                raise BackupRestoreError("Offline root rebind refused because SeedSync is active") from exc
+            with exclusion, self._process_lock:
+                if self.root_rebind_attestation_path.exists() or self.root_rebind_attestation_path.is_symlink():
+                    return self._consume_root_rebind_attestation_locked(
+                        expected_backup_reference=backup_reference,
+                    )
+                self._create_root_rebind_attestation(backup_reference, identity)
+                return self._consume_root_rebind_attestation_locked(
+                    expected_backup_reference=backup_reference,
+                )
+
     def require_normal_startup(self) -> MigrationDecision:
         decision = self.preflight()
         if not decision.allows_normal_startup:
@@ -2002,7 +2449,14 @@ class MigrationCoordinator:
                 return ()
         return tuple(lineage)
 
-    def _validate_completed_lineage(self, metadata: Mapping[str, object]) -> MigrationDecision:
+    def _validate_completed_lineage(
+        self,
+        metadata: Mapping[str, object],
+        *,
+        allow_root_identity_mismatch: bool = False,
+        validated_manifest: Mapping[str, object] | None = None,
+        validated_binding: Mapping[str, str] | None = None,
+    ) -> MigrationDecision:
         expected_specs = self._expected_completed_specs()
         try:
             applied = self._applied(metadata)
@@ -2047,8 +2501,27 @@ class MigrationCoordinator:
             return self._failure_decision(None, "Completed migration lineage is invalid", False)
         try:
             backup_dir = self.config_dir / cast(str, expected_backup)
-            _validate_manifest(backup_dir, self.config_dir, last_spec)
-            binding = self._completed_auth_binding(metadata, backup_dir)
+            if validated_manifest is None:
+                manifest = _validate_manifest(
+                    backup_dir,
+                    self.config_dir,
+                    last_spec,
+                    allow_root_identity_mismatch=allow_root_identity_mismatch,
+                )
+            else:
+                manifest = validated_manifest
+                if (
+                    manifest.get("backup_id") != backup_dir.name
+                    or manifest.get("migration_id") != last_spec.migration_id
+                    or manifest.get("source_schema") != last_spec.source_schema
+                    or manifest.get("target_schema") != last_spec.target_schema
+                ):
+                    raise ValueError("Completed migration backup snapshot is invalid")
+            binding = (
+                dict(validated_binding)
+                if validated_binding is not None
+                else self._completed_auth_binding(metadata, backup_dir)
+            )
             from web.auth_store import (
                 completed_migration_claim_marker_exists,
                 recover_completed_migration_claim_journal,
@@ -2069,7 +2542,10 @@ class MigrationCoordinator:
             return self._failure_decision(
                 last_spec.migration_id,
                 "Completed migration validation failed: {}".format(type(exc).__name__),
-                True,
+                not (
+                    isinstance(exc, BackupRestoreError)
+                    and str(exc) == "Migration backup belongs to a different configuration root"
+                ),
             )
         if len(applied) < len(expected_specs):
             next_spec = expected_specs[len(applied)]
@@ -2084,7 +2560,14 @@ class MigrationCoordinator:
             normal_startup_released=metadata.get("normal_startup_released", True),
         )
 
-    def _completed_auth_binding(self, metadata: Mapping[str, object], backup_dir: Path) -> dict[str, str]:
+    def _completed_auth_binding(
+        self,
+        metadata: Mapping[str, object],
+        backup_dir: Path,
+        *,
+        receipt_bytes: bytes | None = None,
+        manifest_bytes: bytes | None = None,
+    ) -> dict[str, str]:
         migration_id = metadata.get("migration_id")
         backup = metadata.get("backup")
         if not isinstance(migration_id, str) or not isinstance(backup, str):
@@ -2092,8 +2575,13 @@ class MigrationCoordinator:
         # The receipt and already-validated manifest are read-only binding
         # inputs. Do not tighten their descriptors here: the same validation
         # must work from the contained read-only product verifier.
-        receipt = _read_bytes(self.metadata_path, self.config_dir, _MAX_JSON_BYTES)
-        manifest = _read_bytes(backup_dir / MANIFEST_NAME, self.config_dir, _MAX_JSON_BYTES)
+        if (receipt_bytes is None) != (manifest_bytes is None):
+            raise ValueError("Completed migration binding snapshots must be paired")
+        receipt = receipt_bytes
+        manifest = manifest_bytes
+        if receipt is None or manifest is None:
+            receipt = _read_bytes(self.metadata_path, self.config_dir, _MAX_JSON_BYTES)
+            manifest = _read_bytes(backup_dir / MANIFEST_NAME, self.config_dir, _MAX_JSON_BYTES)
         return {
             "migration_id": migration_id,
             "backup": backup,

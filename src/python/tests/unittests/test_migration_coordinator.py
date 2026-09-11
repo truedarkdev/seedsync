@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -1737,6 +1738,227 @@ class TestMigrationCoordinator(unittest.TestCase):
                 self.assertFalse(seedsync.migration_decision.allows_normal_startup)
                 self.assertEqual(before, self._tree_bytes(root))
 
+    @unittest.skipUnless(os.name == "posix", "Root replacement exercise requires POSIX identity semantics")
+    def _claimed_replaced_root(self) -> tuple[Path, str, bytes]:
+        suffix = len(tuple(self.root.glob("source-root-*")))
+        source = self.root / "source-root-{}".format(suffix)
+        MigrationFixture(source).write()
+        coordinator, _ = self._complete_migrated_browser_claim(source)
+        receipt_bytes = (source / "migration-state.json").read_bytes()
+        receipt = json.loads(receipt_bytes)
+        backup = source / receipt["backup"]
+        manifest_bytes = (backup / "manifest.json").read_bytes()
+        replacement = self.root / "replacement-root-{}".format(suffix)
+        shutil.copytree(source, replacement, symlinks=True)
+        (replacement / ".seedsync.runtime.lock").unlink(missing_ok=True)
+        return replacement, backup.name, manifest_bytes
+
+    @unittest.skipUnless(os.name == "nt", "Windows root identity normalization regression")
+    def test_windows_root_rebind_rejects_same_root_identity(self) -> None:
+        coordinator, _ = self._complete_migrated_browser_claim(self.root)
+        receipt = json.loads((self.root / "migration-state.json").read_text(encoding="utf-8"))
+        backup_id = Path(receipt["backup"]).name
+        with self.assertRaisesRegex(BackupRestoreError, "old and current root identity mismatch"):
+            coordinator.rebind_offline(
+                backup_id,
+                other_instances_stopped=True,
+                confirm_root_rebind=True,
+            )
+        self.assertFalse((self.root / ".migration-root-rebind.json").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows legacy manifest compatibility regression")
+    def test_windows_legacy_two_part_manifest_identity_remains_valid(self) -> None:
+        self._complete_migrated_browser_claim(self.root)
+        receipt = json.loads((self.root / "migration-state.json").read_text(encoding="utf-8"))
+        backup = self.root / receipt["backup"]
+        manifest_path = backup / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        root_info = self.root.lstat()
+        legacy_identity = [root_info.st_dev, root_info.st_ino]
+        manifest["root_identity"] = legacy_identity
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        from migration.backup_restore import validate_backup
+
+        self.assertEqual(legacy_identity, validate_backup(backup, self.root)["root_identity"])
+        manifest["root_identity"] = [root_info.st_dev, root_info.st_ino + 1]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaises(BackupRestoreError):
+            validate_backup(backup, self.root)
+
+    @unittest.skipUnless(os.name == "posix", "Root replacement exercise requires POSIX identity semantics")
+    def test_root_rebind_requires_exact_claimed_backup_and_preserves_audit(self) -> None:
+        replacement, backup_id, manifest_before = self._claimed_replaced_root()
+        coordinator = MigrationCoordinator(replacement)
+        receipt_before = (replacement / "migration-state.json").read_bytes()
+        receipt_stat_before = (replacement / "migration-state.json").lstat()
+        receipt = json.loads((replacement / "migration-state.json").read_text(encoding="utf-8"))
+        backup = replacement / receipt["backup"]
+        backup_data_before = self._tree_bytes(backup / "data")
+        before = {
+            name: value for name, value in self._tree_bytes(replacement).items()
+            if name not in {".migration-root-rebind.json", ".seedsync.runtime.lock"}
+        }
+        decision = MigrationCoordinator(replacement).preflight()
+        self.assertEqual(MigrationState.FAILED, decision.state)
+        self.assertFalse(decision.retryable)
+
+        with self.assertRaises(ValueError):
+            coordinator.rebind_offline(
+                backup_id,
+                other_instances_stopped=True,
+                confirm_root_rebind=False,
+            )
+        self.assertEqual(manifest_before, (backup / "manifest.json").read_bytes())
+        self.assertEqual(receipt, json.loads((replacement / "migration-state.json").read_text(encoding="utf-8")))
+
+        outside = replacement.parent / "outside-backup"
+        with self.assertRaises(BackupRestoreError):
+            coordinator.rebind_offline(
+                str(outside),
+                other_instances_stopped=True,
+                confirm_root_rebind=True,
+            )
+
+        result = coordinator.rebind_offline(
+            backup_id,
+            other_instances_stopped=True,
+            confirm_root_rebind=True,
+        )
+        self.assertEqual(len(backup_data_before), result["files"])
+        self.assertEqual(manifest_before, (backup / "manifest.json").read_bytes())
+        self.assertEqual(backup_data_before, self._tree_bytes(backup / "data"))
+        audit = json.loads((replacement / ".migration-root-rebind.json").read_text(encoding="utf-8"))
+        self.assertEqual("complete", audit["phase"])
+        self.assertNotEqual(audit["old_root_identity"], audit["new_root_identity"])
+        self.assertEqual(receipt_before, base64.b64decode(audit["original_receipt"], validate=True))
+        self.assertEqual(hashlib.sha256(receipt_before).hexdigest(), audit["receipt_sha256"])
+        self.assertNotIn("inventory", audit)
+        after = {
+            name: value for name, value in self._tree_bytes(replacement).items()
+            if name not in {".migration-root-rebind.json", ".seedsync.runtime.lock"}
+        }
+        self.assertEqual(before, after)
+        decision = MigrationCoordinator(replacement).preflight()
+        self.assertEqual(MigrationState.COMPLETE, decision.state)
+        self.assertTrue(decision.allows_normal_startup)
+        self.assertEqual(result, coordinator.rebind_offline(
+            backup_id,
+            other_instances_stopped=True,
+            confirm_root_rebind=True,
+        ))
+        retained_receipt = replacement / "migration-state.json"
+        self.assertTrue(retained_receipt.exists())
+        self.assertTrue(stat.S_ISREG(retained_receipt.lstat().st_mode))
+        self.assertEqual(receipt_before, retained_receipt.read_bytes())
+        self.assertEqual(stat.S_IMODE(receipt_stat_before.st_mode), stat.S_IMODE(retained_receipt.lstat().st_mode))
+        self.assertEqual(receipt_stat_before.st_uid, retained_receipt.lstat().st_uid)
+
+    @unittest.skipUnless(os.name == "posix", "Root replacement exercise requires POSIX identity semantics")
+    def test_root_rebind_tamper_fails_closed_without_configuration_mutation(self) -> None:
+        for target_name in ("manifest.json", "migration-state.json", "api-keys.json"):
+            with self.subTest(target=target_name):
+                replacement, backup_id, _ = self._claimed_replaced_root()
+                coordinator = MigrationCoordinator(replacement)
+                coordinator.rebind_offline(
+                    backup_id,
+                    other_instances_stopped=True,
+                    confirm_root_rebind=True,
+                )
+                target = replacement / target_name
+                if target_name == "manifest.json":
+                    target = replacement / "migration-backups" / backup_id / target_name
+                target.write_bytes(target.read_bytes() + (b"!" if target_name == "api-keys.json" else b" "))
+                before_preflight = self._tree_bytes(replacement)
+                decision = MigrationCoordinator(replacement).preflight()
+                self.assertEqual(MigrationState.FAILED, decision.state)
+                self.assertFalse(decision.retryable)
+                self.assertEqual(before_preflight, self._tree_bytes(replacement))
+
+        replacement, _, _ = self._claimed_replaced_root()
+        later_root = replacement.parent / "later-replacement-root"
+        shutil.copytree(replacement, later_root, symlinks=True)
+        (later_root / ".seedsync.runtime.lock").unlink(missing_ok=True)
+        before = self._tree_bytes(later_root)
+        decision = MigrationCoordinator(later_root).preflight()
+        self.assertEqual(MigrationState.FAILED, decision.state)
+        self.assertFalse(decision.retryable)
+        self.assertEqual(before, self._tree_bytes(later_root))
+
+    @unittest.skipUnless(os.name == "posix", "Root-rebind final snapshot exercise requires POSIX identity semantics")
+    def test_root_rebind_final_revalidation_rejects_mutation_before_completion(self) -> None:
+        for target_name in (
+            "manifest.json", "migration-state.json", "backup-data", ".migration-root-rebind.json",
+        ):
+            with self.subTest(target=target_name):
+                replacement, backup_id, _ = self._claimed_replaced_root()
+                coordinator = MigrationCoordinator(replacement)
+                if target_name == "manifest.json":
+                    target = replacement / "migration-backups" / backup_id / target_name
+                elif target_name == "migration-state.json":
+                    target = replacement / target_name
+                elif target_name == ".migration-root-rebind.json":
+                    target = replacement / target_name
+                else:
+                    target = next((replacement / "migration-backups" / backup_id / "data").iterdir())
+                original_revalidate = coordinator._revalidate_root_rebind_before_complete
+
+                def mutate_then_revalidate(initial, attestation_bytes):
+                    target.write_bytes(target.read_bytes() + b"!")
+                    return original_revalidate(initial, attestation_bytes)
+
+                with patch.object(
+                    coordinator,
+                    "_revalidate_root_rebind_before_complete",
+                    side_effect=mutate_then_revalidate,
+                ):
+                    with self.assertRaises(BackupRestoreError):
+                        coordinator.rebind_offline(
+                            backup_id,
+                            other_instances_stopped=True,
+                            confirm_root_rebind=True,
+                        )
+                attestation_path = replacement / ".migration-root-rebind.json"
+                if target_name == ".migration-root-rebind.json":
+                    with self.assertRaises(json.JSONDecodeError):
+                        json.loads(attestation_path.read_text(encoding="utf-8"))
+                else:
+                    attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+                    self.assertEqual("attested", attestation["phase"])
+
+    @unittest.skipUnless(os.name == "posix", "Control-file type and owner contract requires POSIX semantics")
+    def test_root_rebind_rejects_unsafe_receipt_and_attestation_controls(self) -> None:
+        mutations = {
+            "symlink": lambda path, external: (path.unlink(), path.symlink_to(external)),
+            "directory": lambda path, external: (path.unlink(), path.mkdir()),
+            "fifo": lambda path, external: (path.unlink(), os.mkfifo(path)),
+            "unsafe-mode": lambda path, external: os.chmod(path, 0o644),
+        }
+        for target in ("migration-state.json", ".migration-root-rebind.json"):
+            for name, mutate in mutations.items():
+                with self.subTest(target=target, mutation=name):
+                    replacement, backup_id, _ = self._claimed_replaced_root()
+                    coordinator = MigrationCoordinator(replacement)
+                    current_identity = migration_coordinator._capture_root_identity(replacement)
+                    if target == ".migration-root-rebind.json":
+                        coordinator._create_root_rebind_attestation(backup_id, current_identity)
+                    path = replacement / target
+                    external = replacement.parent / "foreign-{}-{}".format(target.replace(".", ""), name)
+                    external.write_bytes(b"not a control file")
+                    mutate(path, external)
+                    with self.assertRaises((BackupRestoreError, PermissionError, ValueError, OSError)):
+                        coordinator.rebind_offline(
+                            backup_id,
+                            other_instances_stopped=True,
+                            confirm_root_rebind=True,
+                        )
+
+        replacement, _, _ = self._claimed_replaced_root()
+        path = replacement / "migration-state.json"
+        current_uid = path.lstat().st_uid
+        with patch.object(migration_coordinator.os, "geteuid", return_value=current_uid + 1):
+            with self.assertRaises(PermissionError):
+                migration_coordinator._read_bytes(path, replacement, owner_only=True)
 
 if __name__ == "__main__":
     unittest.main()
