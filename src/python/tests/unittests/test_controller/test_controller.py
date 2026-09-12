@@ -221,6 +221,224 @@ class TestController(unittest.TestCase):
         self.assertEqual(1, len({entry["corr_id"] for entry in entries}))
         self.assertEqual("healthy", entries[3]["details"]["status_health"])
 
+    def test_queue_lifecycle_projects_fixed_redacted_details(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "info"},
+            max_entries=8,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        recorder = self.controller._Controller__incoming_recovery_flow_recorder("sample", 1)
+        self.assertIsNotNone(recorder)
+        recorder("lftp_child", {
+            "phase": "status",
+            "classification": "command_error",
+            "command_outcome": "error",
+            "status_health": "healthy",
+            "process_pid": 12345,
+            "path": "/private/sentinel.bin",
+            "raw_output": "private-output",
+            "exception_text": "private-exception",
+        })
+
+        entry = trace.snapshot()["entries"][0]
+        details = entry["details"]
+        self.assertEqual({
+            "schema", "event", "source", "phase", "outcome", "error_class", "boundary",
+            "status_health", "command_outcome",
+        }, set(details))
+        self.assertEqual("lftp", details["source"])
+        self.assertEqual("command_error", details["error_class"])
+        self.assertNotIn("12345", repr(entry))
+        self.assertNotIn("private", repr(entry))
+        logged_details = self.controller.logger.warning.call_args.args[1]
+        self.assertEqual(set(details) | {"flow_id"}, set(logged_details))
+        self.assertEqual("lftp", logged_details["source"])
+        self.assertEqual("command_error", logged_details["error_class"])
+        self.assertEqual(entry["flow_id"], logged_details["flow_id"])
+        self.assertNotIn("12345", repr(logged_details))
+        self.assertNotIn("private", repr(logged_details))
+
+    def test_queue_lifecycle_ordinary_logs_join_by_opaque_flow(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "info"},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        first = self.controller._Controller__incoming_recovery_flow_recorder("first", 1)
+        second = self.controller._Controller__incoming_recovery_flow_recorder("second", 1)
+        first("queue_admitted", {})
+        first("executor_return", {})
+        second("queue_admitted", {})
+
+        logs = [
+            call.args[1] for call in self.controller.logger.info.call_args_list
+            if call.args and call.args[0] == "Queue lifecycle %s"
+        ]
+        self.assertEqual(3, len(logs))
+        self.assertEqual(logs[0]["flow_id"], logs[1]["flow_id"])
+        self.assertNotEqual(logs[0]["flow_id"], logs[2]["flow_id"])
+        for details in logs:
+            self.assertRegex(details["flow_id"], r"^fractional-queue:[0-9a-f]{16}$")
+            self.assertNotIn("first", repr(details))
+            self.assertNotIn("second", repr(details))
+
+    def test_queue_lifecycle_success_command_has_explicit_success_outcome(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "debug"},
+            max_entries=8,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        recorder = self.controller._Controller__incoming_recovery_flow_recorder("sample", 1)
+        recorder("lftp_child", {
+            "phase": "send",
+            "classification": "none",
+            "command_outcome": "success",
+            "command_kind": "queue",
+        })
+
+        details = trace.snapshot()["entries"][0]["details"]
+        self.assertEqual("success", details["outcome"])
+        self.assertEqual("none", details["error_class"])
+
+    def test_queue_lifecycle_exact_membership_uses_pending_file_flow(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "info"},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        file = ModelFile("sample", False)
+        self.controller._Controller__pending_queue_dispatches = {
+            file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
+        }
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file.name, "/remote/sample",
+        )
+
+        self.controller._reconcile_pending_queue_dispatches_from_fresh_status(
+            [status], diagnostic_statuses=[status],
+        )
+
+        membership = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["details"].get("event") == "status_membership"
+        )
+        self.assertEqual(
+            self.controller._Controller__fractional_queue_flow_id(file.file_id, 1),
+            membership["flow_id"],
+        )
+        self.assertEqual("healthy", membership["details"]["status_health"])
+        self.assertEqual("present", membership["details"]["membership"])
+        self.assertEqual("1", membership["details"]["status_count_bucket"])
+
+    def test_queue_lifecycle_filtered_status_is_unknown_not_absent(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "info"},
+            max_entries=8,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        file = ModelFile("filtered", False)
+        self.controller._Controller__pending_queue_dispatches = {
+            file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
+        }
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file.name, "/remote/filtered",
+        )
+
+        self.controller._reconcile_pending_queue_dispatches_from_fresh_status(
+            [], diagnostic_statuses=[status], filtered_status_file_ids={file.file_id},
+        )
+
+        membership = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["details"].get("event") == "status_membership"
+        )
+        self.assertEqual("unknown", membership["details"]["membership"])
+        self.assertEqual("filtered", membership["details"]["membership_reason"])
+        self.assertNotEqual("absent", membership["details"]["outcome"])
+
+    def test_queue_lifecycle_ordinary_status_log_is_once_per_pending_flow(self):
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"}, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        file = ModelFile("repeat", False)
+        self.controller._Controller__pending_queue_dispatches = {
+            file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
+        }
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.QUEUED, file.name, "/remote/repeat",
+        )
+
+        for _ in range(3):
+            self.controller._reconcile_pending_queue_dispatches_from_fresh_status(
+                [status], diagnostic_statuses=[status],
+            )
+
+        status_logs = [
+            call for call in self.controller.logger.info.call_args_list
+            if call.args and call.args[0] == "Queue lifecycle %s"
+            and call.args[1].get("event") == "status_membership"
+        ]
+        self.assertEqual(1, len(status_logs))
+        self.assertEqual("status_membership", status_logs[0].args[1]["boundary"])
+
+    def test_queue_lifecycle_ordinary_log_failure_does_not_change_reconciliation(self):
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"}, max_entries=8)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller.logger.info.side_effect = RuntimeError("log sink unavailable")
+        file = ModelFile("logger-failure", False)
+        self.controller._Controller__pending_queue_dispatches = {
+            file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
+        }
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.QUEUED, file.name, "/remote/logger-failure",
+        )
+
+        self.controller._reconcile_pending_queue_dispatches_from_fresh_status(
+            [status], diagnostic_statuses=[status],
+        )
+
+        self.assertIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+        self.assertEqual(
+            "status_membership",
+            trace.snapshot()["entries"][0]["details"]["event"],
+        )
+
+    def test_lftp_child_breadcrumb_excludes_process_identity_and_exit_values(self):
+        recorded = []
+        process = SimpleNamespace(
+            pid=12345,
+            exitstatus=0,
+            signalstatus=None,
+            isalive=lambda: False,
+        )
+        _incoming_recovery_child_record(
+            lambda event, details: recorded.append((event, details)),
+            process, phase="send", started_at=time.monotonic() - 0.001,
+            command_kind="queue", command_outcome="success",
+            classification="private-exception-text",
+        )
+        self.assertEqual(1, len(recorded))
+        details = recorded[0][1]
+        self.assertNotIn("process_pid", details)
+        self.assertNotIn("exitstatus", details)
+        self.assertNotIn("signalstatus", details)
+        self.assertEqual("unknown", details["classification"])
+
+    def test_lftp_child_preserves_none_classification_without_payload(self):
+        recorded = []
+        process = SimpleNamespace(isalive=lambda: True, exitstatus=None, signalstatus=None)
+        _incoming_recovery_child_record(
+            lambda event, details: recorded.append((event, details)),
+            process, phase="prompt", started_at=time.monotonic() - 0.001,
+            command_kind="queue", command_outcome="success", classification="none",
+        )
+        self.assertEqual(1, len(recorded))
+        self.assertEqual("none", recorded[0][1]["classification"])
+
     def test_queue_lifecycle_default_policy_keeps_rare_transitions_only(self):
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
         self.controller._Controller__context.breadcrumb_trace = trace
@@ -305,7 +523,7 @@ class TestController(unittest.TestCase):
         )
         self.assertTrue(all(entry["details"]["event"] in {"queue_admitted", "executor_error"} for entry in entries))
 
-    def test_queue_lifecycle_status_binds_oldest_flow_once_without_fanout(self):
+    def test_queue_lifecycle_status_does_not_attribute_oldest_pending_flow(self):
         trace = BreadcrumbTraceCollector(
             lambda: True,
             policy={"default": "debug"},
@@ -319,34 +537,14 @@ class TestController(unittest.TestCase):
             second: PendingQueueDispatch(2.0, "second", None, False, 1),
         }
 
-        recorder = self.controller._Controller__incoming_recovery_status_recorder()
-        self.assertIsNotNone(recorder)
-        status = {"phase": "status", "status_health": "healthy", "membership": "present"}
-        recorder("lftp_child", status)
-        recorder("lftp_child", status)
-        recorder("lftp_child", {"phase": "status", "status_health": "healthy"})
-
-        entries = [
-            entry for entry in trace.snapshot()["entries"]
-            if entry.get("category") == "queue.lifecycle"
-            and entry.get("details", {}).get("event") == "lftp_child"
-            and entry.get("details", {}).get("phase") == "status"
-        ]
-        self.assertEqual(1, len(entries))
-        self.assertEqual(
-            self.controller._Controller__fractional_queue_flow_id(first, 1),
-            entries[0]["flow_id"],
-        )
-
-        # A later poll binds the next unobserved flow rather than repeating or
-        # fanning out the first while it remains pending.
-        next_recorder = self.controller._Controller__incoming_recovery_status_recorder()
-        self.assertIsNotNone(next_recorder)
-        next_recorder("lftp_child", status)
+        self.assertFalse(callable(getattr(
+            self.controller, "_Controller__incoming_recovery_status_recorder", None,
+        )))
+        self.controller._reconcile_pending_queue_dispatches_from_fresh_status([])
         status_entries = [
             entry for entry in trace.snapshot()["entries"]
             if entry.get("category") == "queue.lifecycle"
-            and entry.get("details", {}).get("event") == "lftp_child"
+            and entry.get("details", {}).get("event") == "status_membership"
             and entry.get("details", {}).get("phase") == "status"
         ]
         self.assertEqual(
@@ -354,9 +552,6 @@ class TestController(unittest.TestCase):
              self.controller._Controller__fractional_queue_flow_id(second, 1)},
             {entry["flow_id"] for entry in status_entries},
         )
-        self.controller._Controller__pending_queue_dispatches.pop(first)
-        self.controller._Controller__pending_queue_dispatches.pop(second)
-        self.assertIsNone(self.controller._Controller__incoming_recovery_status_recorder())
 
     def test_queue_lifecycle_successful_retirement_is_info_and_failure_is_warning(self):
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
@@ -7204,7 +7399,7 @@ class TestController(unittest.TestCase):
         time.sleep(0.05)
         entries = trace.snapshot()["entries"]
         self.assertEqual(
-            {"queue_future_outcome", "queue_status_ack"},
+            {"queue_future_outcome", "queue_status_ack", "queue_lifecycle_status_membership"},
             {entry["message"] for entry in entries},
         )
         self.assertEqual(1, len({entry["flow_id"] for entry in entries}))
@@ -15921,10 +16116,9 @@ class TestController(unittest.TestCase):
             },
             {entry["message"] for entry in selected},
         )
-        self.assertEqual(
-            [],
-            [entry for entry in entries if entry.get("category") == "queue.lifecycle"],
-        )
+        lifecycle_entries = [entry for entry in entries if entry.get("category") == "queue.lifecycle"]
+        self.assertTrue(lifecycle_entries)
+        self.assertEqual(1, len({entry["flow_id"] for entry in lifecycle_entries}))
 
     def test_recovery_async_queue_abandons_pre_queue_idle_status_for_post_queue_poll(self):
         class TrackingFuture(Future):

@@ -22,6 +22,11 @@ from common.managed_extract import (
 from system import SystemScanner, SystemFile, SystemScannerError
 
 
+_SCAN_MISSING_ROOT_TRACE_CATEGORY = "scanner_process"
+_SCAN_MISSING_ROOT_TRACE_SCHEMA = "scan.missing_root.v1"
+_SCAN_MISSING_ROOT_ROLES = frozenset({"final", "staging"})
+
+
 class LocalScanner(IScanner):
     """
     Scanner implementation to scan the local filesystem
@@ -55,12 +60,53 @@ class LocalScanner(IScanner):
         self.__path_pair_name = path_pair_name
         self.__progress_callback: Optional[ScanProgressCallback] = None
         self.__performance_diagnostics = performance_diagnostics
+        self.__breadcrumb_trace: object = None
 
     def set_breadcrumb_trace(self, breadcrumb_trace: object) -> None:
         """Forward the worker-local emitter to all owned system scanners."""
+        self.__breadcrumb_trace = breadcrumb_trace
         self.__scanner.set_breadcrumb_trace(breadcrumb_trace)
         if self.__staging_scanner is not None:
             self.__staging_scanner.set_breadcrumb_trace(breadcrumb_trace)
+
+    def __record_missing_root(self, role: str) -> None:
+        """Record a role-only manifest race without root or Queue identity."""
+        if role not in _SCAN_MISSING_ROOT_ROLES:
+            return
+        trace = self.__breadcrumb_trace
+        if trace is None:
+            return
+        gate = getattr(trace, "is_effectively_enabled", None)
+        try:
+            if callable(gate) and not bool(gate(_SCAN_MISSING_ROOT_TRACE_CATEGORY, "warning")):
+                return
+            details = {
+                "schema": _SCAN_MISSING_ROOT_TRACE_SCHEMA,
+                "source": "local_scanner",
+                "phase": "root_scan",
+                "outcome": "missing",
+                "error_class": "root_missing",
+                "boundary": role,
+                "root_role": role,
+            }
+            recorder = getattr(trace, "record", None)
+            if callable(recorder):
+                recorder(
+                    "local_scanner",
+                    "scan_missing_root",
+                    details,
+                    stage="scan",
+                    event_type="failure",
+                    category=_SCAN_MISSING_ROOT_TRACE_CATEGORY,
+                    level="warning",
+                    corr_id="local_scanner",
+                    trace_scope="aggregate",
+                )
+            self.logger.warning("Local scanner missing root %s", details)
+        except Exception:
+            # Missing-root evidence is best effort and never changes scan
+            # failure handling or publication authority.
+            return
 
     @property
     def path_pair_id(self) -> Optional[str]:
@@ -232,6 +278,7 @@ class LocalScanner(IScanner):
                         # disappearance as authoritative absence.  Keep this
                         # check before managed-extract pruning, where None is
                         # a legitimate result for a successfully scanned root.
+                        self.__record_missing_root("final")
                         raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
                     if result is not None and self.__managed_extract_folders_enabled:
                         managed_extract_started = self.__begin_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT)
@@ -250,6 +297,7 @@ class LocalScanner(IScanner):
                         # Staging roots share the same manifest authority as
                         # Final roots.  A vanished root must not be published
                         # as a complete authoritative absence.
+                        self.__record_missing_root("staging")
                         raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
                     if staging_result is not None:
                         if self.__managed_extract_folders_enabled and self.__staging_path is not None:

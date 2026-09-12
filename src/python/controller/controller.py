@@ -75,6 +75,145 @@ from system import SystemFile
 
 _QUEUE_LIFECYCLE_TRACE_CATEGORY = "queue.lifecycle"
 _QUEUE_LIFECYCLE_TRACE_SCHEMA = "queue.lifecycle.v1"
+_QUEUE_LIFECYCLE_EVENTS = frozenset({
+    "queue_admitted", "executor_start", "executor_return", "executor_error",
+    "lftp_child", "status_membership", "root_default", "queue_retired",
+    "controller_force_close",
+})
+_QUEUE_LIFECYCLE_PHASES = frozenset({
+    "admission", "executor", "lftp", "status", "publication", "retirement",
+    "teardown", "precheck", "drain", "send", "prompt", "connecting",
+    "error_recovery", "unknown",
+})
+_QUEUE_LIFECYCLE_OUTCOMES = frozenset({
+    "accepted", "entered", "returned", "success", "observed", "present", "absent",
+    "ambiguous", "published", "retired", "error", "unknown",
+})
+_QUEUE_LIFECYCLE_ERROR_CLASSES = frozenset({
+    "none", "eof", "exit", "signal", "timeout", "command_error",
+    "parser_error", "terminal_backlog", "unhealthy_snapshot", "unknown",
+})
+_QUEUE_LIFECYCLE_COMMAND_KINDS = frozenset({"queue", "status", "unknown"})
+_QUEUE_LIFECYCLE_COMMAND_OUTCOMES = frozenset({
+    "success", "prompt_timeout", "eof", "error", "unknown",
+})
+_QUEUE_LIFECYCLE_ENUM_FIELDS = {
+    "status_health": frozenset({"healthy", "unhealthy", "unknown"}),
+    "membership": frozenset({"present", "absent", "ambiguous", "unknown"}),
+    "status_parse": frozenset({"accepted_empty", "unknown"}),
+    "status_result_shape": frozenset({
+        "empty_or_prompt", "queue_done", "job_present", "ambiguous", "parse_error", "unknown",
+    }),
+    "status_recovery": frozenset({"none", "connection_grace", "unknown"}),
+    "status_state": frozenset({"queued", "running", "none", "unknown"}),
+    "membership_reason": frozenset({"filtered", "none", "unknown"}),
+    "root_state": frozenset({"default", "unknown"}),
+    "coverage": frozenset({"incomplete", "unknown"}),
+    "publication_outcome": frozenset({"default_incomplete", "unknown"}),
+    "read_buffer_source": frozenset({"public_buffer", "private_buffer", "unavailable"}),
+    "duration_bucket": frozenset({"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+", "unknown"}),
+    "read_buffer_byte_length_bucket": frozenset({
+        "0", "1-64", "65-1024", "1025-16384", "16385-65536", "65537+", "unknown",
+    }),
+    "status_count_bucket": frozenset({"0", "1", "2+", "unknown"}),
+    "command_kind": _QUEUE_LIFECYCLE_COMMAND_KINDS,
+    "command_outcome": _QUEUE_LIFECYCLE_COMMAND_OUTCOMES,
+    "reaped": frozenset({"signal", "exit", "alive", "not_alive", "unknown"}),
+}
+_QUEUE_LIFECYCLE_BOOL_FIELDS = frozenset({
+    "fresh", "healthy", "process_alive_before", "process_alive_after", "process_alive",
+    "pre_send_drain_queue_done", "pre_send_drain_job_or_progress", "pre_send_drain_prompt_or_echo",
+})
+_QUEUE_LIFECYCLE_BOUNDARIES = {
+    "queue_admitted": "queue_admission",
+    "executor_start": "executor",
+    "executor_return": "executor",
+    "executor_error": "executor",
+    "lftp_child": "lftp_command",
+    "status_membership": "status_membership",
+    "root_default": "root_publication",
+    "queue_retired": "queue_retirement",
+    "controller_force_close": "teardown",
+}
+
+
+def _queue_lifecycle_project(event: object, fields: object) -> Optional[dict[str, object]]:
+    """Project Queue lifecycle evidence before it reaches the breadcrumb sink."""
+    if not isinstance(event, str) or event not in _QUEUE_LIFECYCLE_EVENTS:
+        return None
+    source_fields = fields if isinstance(fields, dict) else {}
+    phase = {
+        "queue_admitted": "admission",
+        "executor_start": "executor",
+        "executor_return": "executor",
+        "executor_error": "executor",
+        "lftp_child": source_fields.get("phase"),
+        "status_membership": "status",
+        "root_default": "publication",
+        "queue_retired": "retirement",
+        "controller_force_close": "teardown",
+    }.get(event)
+    if type(phase) is not str or phase not in _QUEUE_LIFECYCLE_PHASES:
+        phase = "unknown"
+    command_outcome = source_fields.get("command_outcome")
+    safe_command_outcome = command_outcome if (
+        type(command_outcome) is str and command_outcome in _QUEUE_LIFECYCLE_COMMAND_OUTCOMES
+    ) else "unknown"
+    classification = source_fields.get("classification")
+    if classification is None:
+        error_class = "none"
+    elif type(classification) is str and classification in _QUEUE_LIFECYCLE_ERROR_CLASSES:
+        error_class = classification
+    else:
+        error_class = "unknown"
+    if error_class == "none" and safe_command_outcome in {"prompt_timeout", "eof", "error"}:
+        error_class = {
+            "prompt_timeout": "timeout", "eof": "eof", "error": "command_error",
+        }[safe_command_outcome]
+    if error_class not in _QUEUE_LIFECYCLE_ERROR_CLASSES:
+        error_class = "unknown"
+    outcome = {
+        "queue_admitted": "accepted",
+        "executor_start": "entered",
+        "executor_return": "returned",
+        "executor_error": "error",
+        "lftp_child": (
+            safe_command_outcome if type(command_outcome) is str else "observed"
+        ),
+        "status_membership": (
+            source_fields.get("membership")
+            if type(source_fields.get("membership")) is str and
+            source_fields.get("membership") in _QUEUE_LIFECYCLE_ENUM_FIELDS["membership"]
+            else "unknown"
+        ),
+        "root_default": "published",
+        "queue_retired": "retired",
+        "controller_force_close": "error",
+    }.get(event)
+    if outcome not in _QUEUE_LIFECYCLE_OUTCOMES:
+        outcome = "unknown"
+    if event == "lftp_child" and outcome in {"prompt_timeout", "eof", "error"}:
+        outcome = "error"
+    if event == "status_membership" and outcome not in {"present", "absent", "ambiguous"}:
+        outcome = "unknown"
+    projected: dict[str, object] = {
+        "schema": _QUEUE_LIFECYCLE_TRACE_SCHEMA,
+        "event": event,
+        "source": "lftp" if event == "lftp_child" else "controller",
+        "phase": phase,
+        "outcome": outcome,
+        "error_class": error_class,
+        "boundary": _QUEUE_LIFECYCLE_BOUNDARIES[event],
+    }
+    for key, allowed in _QUEUE_LIFECYCLE_ENUM_FIELDS.items():
+        value = source_fields.get(key)
+        if isinstance(value, str) and value in allowed:
+            projected[key] = value
+    for key in _QUEUE_LIFECYCLE_BOOL_FIELDS:
+        value = source_fields.get(key)
+        if type(value) is bool:
+            projected[key] = value
+    return projected
 
 ActiveScannerRuntime = ActiveScanner | MultiPathActiveScanner
 LocalScannerRuntime = LocalScanner | MultiPathLocalScanner
@@ -410,6 +549,8 @@ class PendingQueueDispatch:
     is_dir: bool = False
     operation_sequence: int = 0
     resume_source_identity: Optional[tuple[int, int]] = None
+    # Diagnostic-only marker for the one historical status membership log in
+    # this dispatch lifecycle. It never participates in Queue decisions.
     status_lifecycle_recorded: bool = field(default=False, compare=False)
 
 
@@ -1741,99 +1882,85 @@ class Controller:
         def record(event: str, fields: dict[str, object]) -> None:
             if not isinstance(event, str) or not isinstance(fields, dict):
                 return
-            failure = event in {"executor_error", "controller_force_close"}
-            classification = fields.get("classification")
-            command_outcome = fields.get("command_outcome")
-            if classification in {
-                    "eof", "exit", "signal", "timeout", "command_error", "parser_error",
-                    "terminal_backlog", "unhealthy_snapshot",
-            } or command_outcome in {"prompt_timeout", "eof", "error"}:
-                failure = True
-            # Retirement is the normal successful end of a Queue lifecycle.
-            # Keep it informational unless the handoff carries an actual
-            # backend/transport failure classification.
-            if event == "queue_retired" and classification in {
-                    "eof", "exit", "signal", "timeout", "command_error",
-                    "parser_error", "terminal_backlog", "unhealthy_snapshot",
-            }:
-                failure = True
             detail_event = event in {"executor_start", "executor_return"}
             if event == "lftp_child" and fields.get("phase") != "status":
                 detail_event = True
-            level = "warning" if failure else "debug" if detail_event else "info"
-            if not _breadcrumb_effectively_enabled(
-                    breadcrumb_trace, _QUEUE_LIFECYCLE_TRACE_CATEGORY, level,
-            ):
+            initial_failure = event in {"executor_error", "controller_force_close"}
+            initial_level = "warning" if initial_failure else "debug" if detail_event else "info"
+            breadcrumb_enabled = _breadcrumb_effectively_enabled(
+                    breadcrumb_trace, _QUEUE_LIFECYCLE_TRACE_CATEGORY, initial_level,
+            )
+            ordinary_log_enabled = _breadcrumb_effectively_enabled(
+                breadcrumb_trace,
+                _QUEUE_LIFECYCLE_TRACE_CATEGORY,
+                "warning" if initial_failure else "info",
+            )
+            if not breadcrumb_enabled and not ordinary_log_enabled:
                 return
             try:
-                details = dict(fields)
-                details.setdefault("schema", _QUEUE_LIFECYCLE_TRACE_SCHEMA)
-                details.setdefault("event", event)
-                recorder = getattr(breadcrumb_trace, "record", None)
-                if not callable(recorder):
+                details = _queue_lifecycle_project(event, fields)
+                if details is None:
                     return
-                recorder(
-                    "controller",
-                    "queue_lifecycle_{}".format(event),
-                    details,
-                    stage="queue_lifecycle",
-                    event_type="failure" if failure else "state_transition",
-                    category=_QUEUE_LIFECYCLE_TRACE_CATEGORY,
-                    level=level,
-                    corr_id=flow_id,
-                    flow_id=flow_id,
-                    trace_scope="flow",
+                failure = initial_failure or details["error_class"] not in {"none", "unknown"}
+                if event == "lftp_child" and details["outcome"] == "error":
+                    failure = True
+                # Retirement is the normal successful end of a Queue lifecycle.
+                # Keep it informational unless the handoff carries an actual
+                # backend/transport failure classification.
+                level = "warning" if failure else "debug" if detail_event else "info"
+                recorder = getattr(breadcrumb_trace, "record", None)
+                if breadcrumb_enabled and _breadcrumb_effectively_enabled(
+                        breadcrumb_trace, _QUEUE_LIFECYCLE_TRACE_CATEGORY, level,
+                ) and callable(recorder):
+                    recorder(
+                        "controller",
+                        "queue_lifecycle_{}".format(event),
+                        details,
+                        stage="queue_lifecycle",
+                        event_type="failure" if failure else "state_transition",
+                        category=_QUEUE_LIFECYCLE_TRACE_CATEGORY,
+                        level=level,
+                        corr_id=flow_id,
+                        flow_id=flow_id,
+                        trace_scope="flow",
+                    )
+                # BreadcrumbTrace is intentionally bounded and in-memory. Keep
+                # the same fixed projection in ordinary logs so historical log
+                # collection can retain the sparse info/warning boundaries.
+                ordinary_log_allowed = ordinary_log_enabled and _breadcrumb_effectively_enabled(
+                    breadcrumb_trace,
+                    _QUEUE_LIFECYCLE_TRACE_CATEGORY,
+                    "warning" if failure else "info",
                 )
+                if ordinary_log_allowed and event == "status_membership":
+                    # One historical status boundary is sufficient for a
+                    # pending Queue lifecycle. Reuse the dispatch's existing
+                    # diagnostic marker; no new registry or rate cache is
+                    # introduced, and this marker never affects Queue state.
+                    pending = getattr(self, "_Controller__pending_queue_dispatches", None)
+                    dispatch = pending.get(file_id) if isinstance(pending, dict) else None
+                    if isinstance(dispatch, PendingQueueDispatch):
+                        ordinary_log_allowed = not dispatch.status_lifecycle_recorded
+                        if ordinary_log_allowed:
+                            dispatch.status_lifecycle_recorded = True
+                if ordinary_log_allowed:
+                    logger = getattr(self, "logger", None)
+                    log_method = getattr(logger, "warning" if level == "warning" else "info", None)
+                    if callable(log_method):
+                        # Ordinary history retains only ``details``. Copy the
+                        # already-opaque Queue flow correlation into that
+                        # projection so restart-retrieved logs remain
+                        # joinable without exposing the source file identity.
+                        ordinary_details = dict(details)
+                        ordinary_details["flow_id"] = flow_id
+                        log_method("Queue lifecycle %s", ordinary_details)
             except Exception:
                 # Breadcrumb evidence is strictly best effort and must not
                 # affect Queue, LFTP, model, or teardown ownership.
                 try:
-                    self.logger.debug("Ignoring Queue lifecycle breadcrumb failure", exc_info=True)
+                    self.logger.debug("Ignoring Queue lifecycle breadcrumb failure")
                 except Exception:
                     pass
-
-        return record
-
-    def __incoming_recovery_status_recorder(self) -> Optional[Callable[[str, dict[str, object]], None]]:
-        pending = getattr(self, "_Controller__pending_queue_dispatches", None)
-        if not isinstance(pending, dict):
-            return None
-        candidates: list[
-            tuple[float, str, PendingQueueDispatch, Callable[[str, dict[str, object]], None]]
-        ] = []
-        for file_id, dispatch in tuple(pending.items()):
-            if not isinstance(dispatch, PendingQueueDispatch) or \
-                    bool(getattr(dispatch, "status_lifecycle_recorded", False)):
-                continue
-            sequence = getattr(dispatch, "operation_sequence", None)
-            recorder = self.__incoming_recovery_flow_recorder(
-                file_id, sequence, create=False,
-            )
-            if recorder is not None:
-                accepted_at = getattr(dispatch, "accepted_at_monotonic", None)
-                sort_time = float(accepted_at) if type(accepted_at) in (int, float) else float("inf")
-                candidates.append((
-                    sort_time, opaque_trace_correlation(str(file_id)), dispatch, recorder,
-                ))
-        if not candidates:
-            return None
-        # A status response is global and has no file identity.  Assign this
-        # poll to the oldest accepted Queue dispatch; the next poll can bind
-        # the next pending flow.  Fan-out would falsely attribute one status
-        # lifecycle to every queued file.
-        candidates.sort(key=lambda item: (item[0], item[1]))
-        dispatch = candidates[0][2]
-        recorder = candidates[0][3]
-        status_lifecycle_recorded = False
-
-        def record(event: str, fields: dict[str, object]) -> None:
-            nonlocal status_lifecycle_recorded
-            if event == "lftp_child" and fields.get("phase") == "status":
-                if status_lifecycle_recorded:
-                    return
-                status_lifecycle_recorded = True
-                dispatch.status_lifecycle_recorded = True
-            recorder(event, fields)
 
         return record
 
@@ -2202,13 +2329,10 @@ class Controller:
             try:
                 if callable(record_lineage):
                     record_lineage(correlation, "status_start")
-                status_recorder = self.__incoming_recovery_status_recorder()
                 if isinstance(self.__lftp, Lftp):
                     status_kwargs: dict[str, object] = {}
                     if isinstance(correlation, str) and self.__lftp_status_poll_command_trace_enabled():
                         status_kwargs["trace_poll_correlation"] = correlation
-                    if status_recorder is not None:
-                        status_kwargs["diagnostic_recorder"] = status_recorder
                     statuses = self.__lftp.status(**status_kwargs)
                 else:
                     statuses = self.__lftp.status()
@@ -2236,7 +2360,6 @@ class Controller:
                 self, "_Controller__lftp_status_poll_command_trace_enabled", None,
             )
             command_trace_enabled = bool(trace_enabled()) if callable(trace_enabled) else False
-            status_recorder = self.__incoming_recovery_status_recorder()
             def poll() -> tuple[list[LftpJobStatus], bool]:
                 if callable(record_lineage):
                     record_lineage(correlation, "status_start")
@@ -2245,8 +2368,6 @@ class Controller:
                         status_kwargs: dict[str, object] = {}
                         if isinstance(correlation, str) and command_trace_enabled:
                             status_kwargs["trace_poll_correlation"] = correlation
-                        if status_recorder is not None:
-                            status_kwargs["diagnostic_recorder"] = status_recorder
                         statuses = self.__lftp.status(**status_kwargs)
                     else:
                         statuses = self.__lftp.status()
@@ -3951,16 +4072,11 @@ class Controller:
             teardown_recorded = False
 
             def record_incoming_recovery_teardown(event: str) -> None:
+                del event
                 nonlocal teardown_recorded
                 if teardown_recorded:
                     return
                 teardown_recorded = True
-                try:
-                    recorder = self.__incoming_recovery_status_recorder()
-                    if recorder is not None:
-                        recorder(event, {"phase": "teardown"})
-                except Exception:
-                    pass
 
             try:
                 self.__lftp_executor_closing = True
@@ -9063,6 +9179,8 @@ class Controller:
     def _reconcile_pending_queue_dispatches_from_fresh_status(
             self, statuses: Sequence[LftpJobStatus] | Set[str],
             idle_completion_proven_file_ids: Optional[Set[str]] = None,
+            diagnostic_statuses: Optional[Sequence[LftpJobStatus]] = None,
+            filtered_status_file_ids: Optional[Set[str]] = None,
     ) -> set[tuple[str, Optional[str], Optional[str]]]:
         """Retire acknowledged Queue intent when a fresh idle poll sees no job.
 
@@ -9073,18 +9191,90 @@ class Controller:
         pending-completion owner.  This is intentionally not a download-start
         confirmation: only a RUNNING status may commit resume provenance or
         start-lifecycle effects.
+
+        ``diagnostic_statuses`` is the raw fresh snapshot retained by
+        ModelUpdater before malformed rows are filtered for model behavior.
+        Membership is unknown when that raw evidence is unavailable or when a
+        matching row was filtered; the operational ``statuses`` argument keeps
+        its existing post-filter semantics.
         """
         record_fractional_queue_trace = _record_fractional_queue_trace
         fractional_queue_flow_id = _fractional_queue_flow_id
         pending = self.__queue_dispatch_pending()
+        status_counts: dict[str, int] = {}
+        membership_is_exact = diagnostic_statuses is not None
+        membership_statuses = diagnostic_statuses if diagnostic_statuses is not None else statuses
+        membership_statuses_by_file_id = {
+            status.file_id: status for status in membership_statuses
+            if isinstance(status, LftpJobStatus)
+        }
         statuses_by_file_id = {
             status.file_id: status for status in statuses if isinstance(status, LftpJobStatus)
         }
+        for status in membership_statuses:
+            if isinstance(status, LftpJobStatus) and isinstance(status.file_id, str):
+                status_counts[status.file_id] = status_counts.get(status.file_id, 0) + 1
         active_file_ids = set(statuses_by_file_id) if statuses_by_file_id else {
             file_id for file_id in statuses if isinstance(file_id, str)
         }
         retired_without_running: set[tuple[str, Optional[str], Optional[str]]] = set()
         for file_id in list(pending):
+            # This is the only Queue lifecycle status-membership attribution.
+            # The caller invokes this method only after a fresh healthy poll,
+            # and the file-specific pending dispatch supplies the exact flow.
+            # Do not infer identity from a global status poll or oldest pending
+            # dispatch.
+            try:
+                dispatch = pending[file_id]
+                membership_recorder = self.__incoming_recovery_flow_recorder(
+                    file_id, dispatch.operation_sequence, create=False,
+                )
+                if membership_recorder is not None:
+                    status_count = status_counts.get(file_id, 1 if file_id in active_file_ids else 0)
+                    filtered = isinstance(filtered_status_file_ids, set) and file_id in filtered_status_file_ids
+                    if not membership_is_exact:
+                        # A caller that has no raw snapshot cannot establish
+                        # exact membership; the supplied status list may have
+                        # already been filtered.
+                        membership = "unknown"
+                        status_state = "unknown"
+                        membership_reason = "unknown"
+                    elif filtered:
+                        membership = "unknown"
+                        status_state = "unknown"
+                        membership_reason = "filtered"
+                    elif status_count == 0:
+                        membership = "absent"
+                        status_state = "none"
+                        membership_reason = "none"
+                    elif status_count == 1:
+                        status = membership_statuses_by_file_id.get(file_id)
+                        status_state = (
+                            "queued" if status is not None and status.state == LftpJobStatus.State.QUEUED
+                            else "running" if status is not None and status.state == LftpJobStatus.State.RUNNING
+                            else "unknown"
+                        )
+                        membership = "present" if status_state != "unknown" else "unknown"
+                        membership_reason = "none" if membership == "present" else "unknown"
+                    else:
+                        membership = "ambiguous"
+                        status_state = "unknown"
+                        membership_reason = "unknown"
+                    membership_recorder("status_membership", {
+                        "phase": "status",
+                        "status_health": "healthy",
+                        "membership": membership,
+                        "membership_reason": membership_reason,
+                        "status_state": status_state,
+                        "status_count_bucket": (
+                            "unknown" if not membership_is_exact else
+                            "0" if status_count == 0 else "1" if status_count == 1 else "2+"
+                        ),
+                        "fresh": True,
+                        "healthy": True,
+                    })
+            except Exception:
+                pass
             status = statuses_by_file_id.get(file_id)
             if file_id in active_file_ids:
                 dispatch = pending[file_id]
@@ -9950,6 +10140,7 @@ class Controller:
     def __record_incoming_recovery_root_defaults(
             self, roots: list[tuple[str, int]], *, status_snapshot_fresh: bool = False,
     ) -> None:
+        del status_snapshot_fresh
         if not roots:
             return
         observations: list[tuple[str, int, dict[str, object]]] = []
@@ -9958,18 +10149,6 @@ class Controller:
             pending = getattr(self, "_Controller__pending_queue_dispatches", None)
             pending_ids = set(pending) if isinstance(pending, dict) else set()
             with self.__model_lock:
-                statuses = list(self.__last_lftp_statuses or [])
-                health = getattr(self.__lftp, "last_status_poll_healthy", None)
-                failure = getattr(self.__lftp, "last_status_poll_failure_reason", None)
-                status_observation: dict[str, object] = {}
-                if status_snapshot_fresh is True:
-                    observation_getter = getattr(self.__lftp, "incoming_recovery_last_status_observation", None)
-                    try:
-                        status_observation = observation_getter() if callable(observation_getter) else observation_getter
-                    except Exception:
-                        status_observation = {}
-                    if not isinstance(status_observation, dict):
-                        status_observation = {}
                 for file_id, sequence in roots:
                     # A retained Queue dispatch still owns this lifecycle;
                     # do not describe it as retired merely because the model
@@ -9983,43 +10162,10 @@ class Controller:
                     if state_name != "DEFAULT" or getattr(file, "complete_local_coverage", None) is not False:
                         retirements.append((file_id, sequence))
                         continue
-                    status_health = "healthy" if health is True else "unhealthy" if health is False else "unknown"
-                    membership = ("present" if any(getattr(status, "file_id", None) == file_id for status in statuses) else "absent") \
-                        if status_health == "healthy" else "unknown"
                     observations.append((file_id, sequence, {
-                        "status_health": status_health,
-                        "membership": membership,
-                        "status_parse": "accepted_empty" if status_snapshot_fresh is True and
-                        status_health == "healthy" and membership == "absent" else "unknown",
-                        "status_result_shape": status_observation.get("status_result_shape"),
-                        "status_recovery": status_observation.get("status_recovery"),
-                        "status_preceded_timeout": status_observation.get("status_preceded_timeout"),
-                        "pre_send_drain_shape": status_observation.get("pre_send_drain_shape"),
-                        "pre_send_drain_byte_length_bucket": status_observation.get(
-                            "pre_send_drain_byte_length_bucket"
-                        ),
-                        "pre_send_drain_queue_done": status_observation.get("pre_send_drain_queue_done"),
-                        "pre_send_drain_job_or_progress": status_observation.get(
-                            "pre_send_drain_job_or_progress"
-                        ),
-                        "pre_send_drain_prompt_or_echo": status_observation.get(
-                            "pre_send_drain_prompt_or_echo"
-                        ),
-                        "pre_send_drain_error": status_observation.get("pre_send_drain_error"),
-                        "post_send_prompt": status_observation.get("post_send_prompt"),
-                        "process_pid": status_observation.get("process_pid"),
-                        "process_alive": status_observation.get("process_alive"),
-                        "read_buffer_source": status_observation.get("read_buffer_source"),
-                        "read_buffer_byte_length_bucket": status_observation.get(
-                            "read_buffer_byte_length_bucket"
-                        ),
-                        "classification": "none" if failure is None else failure
-                        if failure in {
-                            "eof", "exit", "signal", "timeout", "command_error",
-                            "parser_error", "terminal_backlog", "unhealthy_snapshot",
-                        } else "unknown",
                         "root_state": "default",
                         "coverage": "incomplete",
+                        "publication_outcome": "default_incomplete",
                     }))
         except Exception:
             return

@@ -79,6 +79,10 @@ _INCOMING_RECOVERY_STATUS_RECOVERIES = frozenset({"none", "connection_grace", "u
 _INCOMING_RECOVERY_COMMAND_OUTCOMES = frozenset({
     "success", "prompt_timeout", "eof", "error", "unknown",
 })
+_INCOMING_RECOVERY_ERROR_CLASSES = frozenset({
+    "none", "eof", "exit", "signal", "timeout", "command_error", "parser_error",
+    "terminal_backlog", "unhealthy_snapshot", "unknown",
+})
 
 
 def _incoming_recovery_buffer_length(value: object) -> int | None:
@@ -183,9 +187,12 @@ def _incoming_recovery_child_record(
         classification = "command_error"
     if isinstance(signalstatus, int):
         classification = "signal"
-    elif isinstance(exitstatus, int) and classification == "unknown":
+    elif isinstance(exitstatus, int) and type(classification) is str and classification == "unknown":
         classification = "exit"
-    safe_phase = phase if phase in _INCOMING_RECOVERY_PHASES else "unknown"
+    safe_phase = phase if type(phase) is str and phase in _INCOMING_RECOVERY_PHASES else "unknown"
+    safe_classification = classification if (
+        type(classification) is str and classification in _INCOMING_RECOVERY_ERROR_CLASSES
+    ) else "unknown"
     buffer_source, read_buffer_byte_length_bucket = _incoming_recovery_buffer_observation(process)
     reaped = (
         "signal" if isinstance(signalstatus, int) else
@@ -193,28 +200,22 @@ def _incoming_recovery_child_record(
         "alive" if alive_after is True else
         "not_alive" if alive_after is False else "unknown"
     )
-    process_pid = "unavailable"
-    try:
-        pid = getattr(process, "pid", None)
-        if type(pid) is int and pid > 0:
-            process_pid = pid
-    except Exception:
-        pass
     ended_at = time.monotonic()
     try:
         recorder("lftp_child", {
             "phase": safe_phase,
             "duration_bucket": _incoming_recovery_duration_bucket(started_at, ended_at),
-            "process_pid": process_pid,
             "process_alive_before": alive_before if type(alive_before) is bool else None,
             "process_alive_after": alive_after if type(alive_after) is bool else None,
             "process_alive": alive_after if type(alive_after) is bool else None,
             "reaped": reaped,
-            "exitstatus": exitstatus, "signalstatus": signalstatus,
-            "classification": classification,
-            "command_kind": command_kind if command_kind in {"queue", "status", "unknown"} else "unknown",
+            "classification": safe_classification,
+            "command_kind": command_kind
+            if type(command_kind) is str and command_kind in {"queue", "status", "unknown"}
+            else "unknown",
             "command_outcome": command_outcome
-            if command_outcome in _INCOMING_RECOVERY_COMMAND_OUTCOMES else "unknown",
+            if type(command_outcome) is str and command_outcome in _INCOMING_RECOVERY_COMMAND_OUTCOMES
+            else "unknown",
             "read_buffer_source": buffer_source,
             "read_buffer_byte_length_bucket": read_buffer_byte_length_bucket,
         })
@@ -1899,7 +1900,7 @@ class Lftp:
             "pre_send_drain_shape", "pre_send_drain_byte_length_bucket",
             "pre_send_drain_queue_done", "pre_send_drain_job_or_progress",
             "pre_send_drain_prompt_or_echo", "pre_send_drain_error", "post_send_prompt",
-            "process_pid", "process_alive", "read_buffer_source", "read_buffer_byte_length_bucket",
+            "process_alive", "read_buffer_source", "read_buffer_byte_length_bucket",
         }
         return {field: observation[field] for field in fields if field in observation}
 
@@ -1912,11 +1913,9 @@ class Lftp:
         try:
             process = self.__process
             alive = process.isalive()
-            pid = getattr(process, "pid", None)
         except Exception:
             process = None
             alive = None
-            pid = None
         buffer_source, buffer_bucket = _incoming_recovery_buffer_observation(process)
         result_shape = _incoming_recovery_status_result_shape(output, statuses)
         recovery = "connection_grace" if used_connection_grace is True else \
@@ -1940,7 +1939,6 @@ class Lftp:
             "pre_send_drain_error": prior.get("_pre_send_drain_error") is True,
             "post_send_prompt": prior.get("_post_send_prompt")
             if prior.get("_post_send_prompt") in {"reached", "not_reached"} else "unknown",
-            "process_pid": pid if type(pid) is int and pid > 0 else "unavailable",
             "process_alive": alive if type(alive) is bool else None,
             "read_buffer_source": buffer_source,
             "read_buffer_byte_length_bucket": buffer_bucket,

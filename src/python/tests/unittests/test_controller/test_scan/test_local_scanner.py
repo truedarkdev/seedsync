@@ -67,6 +67,9 @@ class TestLocalScanner(unittest.TestCase):
             handle.write("content")
 
         scanner = LocalScanner(self.temp_dir, use_temp_file=False, path_pair_id="pair")
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner.set_breadcrumb_trace(trace)
         events = []
 
         def publish(files, _pair_id, _pair_name, root_names, complete):
@@ -86,6 +89,10 @@ class TestLocalScanner(unittest.TestCase):
         self.assertTrue(error.exception.recoverable)
         self.assertEqual({"target"}, events[0][1])
         self.assertFalse(any(event[2] for event in events))
+        missing = next(call for call in trace.record.call_args_list if call.args[1] == "scan_missing_root")
+        self.assertEqual("final", missing.args[2]["root_role"])
+        self.assertEqual("final", missing.args[2]["boundary"])
+        self.assertNotIn("target", repr(missing))
 
     def test_progressive_scan_fails_when_manifest_staging_root_disappears_before_scan(self):
         staging_dir = os.path.join(self.temp_dir, "staging")
@@ -102,6 +109,9 @@ class TestLocalScanner(unittest.TestCase):
             staging_path=staging_dir,
             path_pair_id="pair",
         )
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner.set_breadcrumb_trace(trace)
         events = []
 
         def publish(files, _pair_id, _pair_name, root_names, complete):
@@ -121,6 +131,10 @@ class TestLocalScanner(unittest.TestCase):
         self.assertTrue(error.exception.recoverable)
         self.assertEqual({"partial"}, events[0][1])
         self.assertFalse(any(event[2] for event in events))
+        missing = next(call for call in trace.record.call_args_list if call.args[1] == "scan_missing_root")
+        self.assertEqual("staging", missing.args[2]["root_role"])
+        self.assertEqual("staging", missing.args[2]["boundary"])
+        self.assertNotIn("partial", repr(missing))
 
     @unittest.skipUnless(os.name == "posix", "Dangling symlink semantics require POSIX")
     def test_progressive_scan_fails_closed_for_manifest_dangling_symlink(self):

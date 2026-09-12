@@ -962,7 +962,6 @@ def _record_lftp_status_membership_transition(
 
         prior, raw, filtered = (view(statuses, malformed) for statuses, malformed in ((previous_statuses, previous_malformed_ids), (raw_statuses, current_malformed_ids), (filtered_statuses, current_malformed_ids)))
         tokens: list[str] = []
-        transition_file_ids: set[object] = set()
         def mask(classes: tuple[str, ...]) -> str:
             return "".join(code for code, name in (("d", "duplicate"), ("m", "malformed"), ("i", "invalid")) if name in classes) or ("a" if classes == ("absent",) else "v")
         for file_id in sorted(set(prior) | set(raw) | set(filtered), key=opaque_trace_correlation):
@@ -973,7 +972,6 @@ def _record_lftp_status_membership_transition(
             bs, cs = sorted(cast(set[str], before[2])) if before else [], sorted(cast(set[str], current[2])) if current else []
             ba, ca, rm, fm = bool(before and before[1]), bool(post and post[1]), current is not None, post is not None
             if (bool(before) != rm or ba != ca or bc != cc or bj != cj or bs != cs or bool(before and not before[5]) != fm):
-                transition_file_ids.add(file_id)
                 if before is None and current is not None: transition = "added"
                 elif before is not None and current is None: transition = "removed"
                 elif "invalid" in bc or "invalid" in cc: transition = "invalid"
@@ -991,13 +989,14 @@ def _record_lftp_status_membership_transition(
         tokens.sort()
         if tokens:
             safe_poll = _safe_lftp_status_poll_correlation(poll_correlation)
-            queue_flow_ids = _queue_flow_ids_for_files(controller, transition_file_ids)
-            queue_flow_id = queue_flow_ids[0] \
-                if len(transition_file_ids) == 1 and len(queue_flow_ids) == 1 else None
             chunk_count = (len(tokens) + 15) // 16
             for chunk_index in range(chunk_count):
                 details: dict[str, object] = {"schema": "lftp_status_membership.v2", "phase": "status_membership", "chunk_index": chunk_index, "chunk_count": chunk_count, "transition_count": len(tokens), "transition_set_digest": opaque_trace_correlation("|".join(tokens)), "source": source, "fresh": bool(fresh), "healthy": bool(healthy), "idle_authoritative": bool(getattr(controller, "_Controller__lftp_idle_status_authoritative", False)), "raw_status_count": min(len(raw_statuses), _LFTP_STATUS_TRACE_COUNT_LIMIT), "raw_status_count_overflow": len(raw_statuses) > _LFTP_STATUS_TRACE_COUNT_LIMIT, "filtered_status_count": min(len(filtered_statuses), _LFTP_STATUS_TRACE_COUNT_LIMIT), "filtered_status_count_overflow": len(filtered_statuses) > _LFTP_STATUS_TRACE_COUNT_LIMIT, "poll_correlation": safe_poll, "transitions": tokens[chunk_index * 16:(chunk_index + 1) * 16]}
-                recorder(stage="lftp_status_membership", message="lftp_status_membership_transition", details=details, event_type="state_transition", category=_LFTP_STATUS_MEMBERSHIP_TRACE_CATEGORY, level=level, corr_id="lftp:" + opaque_trace_correlation(_LFTP_STATUS_TRACE_CORRELATION), flow_id=queue_flow_id or safe_poll, trace_scope="flow")
+                # This aggregate transition view is not file-exact. Queue
+                # identity is attached only by Controller's fresh healthy
+                # reconciliation, where the pending dispatch and membership
+                # row are joined directly.
+                recorder(stage="lftp_status_membership", message="lftp_status_membership_transition", details=details, event_type="state_transition", category=_LFTP_STATUS_MEMBERSHIP_TRACE_CATEGORY, level=level, corr_id="lftp:" + opaque_trace_correlation(_LFTP_STATUS_TRACE_CORRELATION), flow_id=safe_poll, trace_scope="flow")
     except Exception:
         pass
 
@@ -3157,6 +3156,8 @@ class _ControllerCoreAccess:
     def _reconcile_pending_queue_dispatches_from_fresh_status(
             self, statuses: list[LftpJobStatus],
             idle_completion_proven_file_ids: Optional[set[str]] = None,
+            diagnostic_statuses: Optional[list[LftpJobStatus]] = None,
+            filtered_status_file_ids: Optional[set[str]] = None,
     ) -> set[tuple[str, Optional[str], Optional[str]]]: ...
     def _confirm_fresh_healthy_download_starts(self, statuses: list[LftpJobStatus]) -> None: ...
     def _complete_download_start_lifecycle(self, file_id: str) -> None: ...
@@ -5368,6 +5369,10 @@ class ModelUpdater(_ControllerCoreAccess):
                                     continue
                 reconciled_dispatches = reconcile_pending_queues(
                     lftp_statuses, idle_completion_proven_file_ids,
+                    diagnostic_statuses=raw_lftp_statuses,
+                    filtered_status_file_ids=getattr(
+                        controller, "_Controller__malformed_status_only_file_ids", set(),
+                    ),
                 )
                 if isinstance(reconciled_dispatches, set):
                     retired_queue_dispatches = {
