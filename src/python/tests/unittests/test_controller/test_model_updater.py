@@ -38,6 +38,7 @@ from controller.model_updater import (
     _remote_reconciliation_established,
     _pop_scan_updates,
     _sync_remote_scan_root_fingerprint_hints,
+    _ModelFinalizationBreadcrumbSpan,
     _ModelUpdateDurationSpan,
     _ModelUpdateStageTimer,
     _ModelUpdateTimedModelLock,
@@ -82,6 +83,335 @@ from system.scanner import SystemScanner
 
 
 class TestModelUpdater(unittest.TestCase):
+    @staticmethod
+    def _model_finalization_trace_controller(trace):
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__lftp_status_poll_correlation="lftp-poll:0123456789abcdef",
+            logger=MagicMock(),
+        )
+
+        def record_breadcrumb(**kwargs):
+            trace.record(
+                "controller",
+                kwargs["message"],
+                kwargs["details"],
+                stage=kwargs["stage"],
+                event_type=kwargs["event_type"],
+                category=kwargs["category"],
+                level=kwargs["level"],
+                corr_id=kwargs["corr_id"],
+                flow_id=kwargs.get("flow_id"),
+                trace_scope=kwargs.get("trace_scope", "flow"),
+            )
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        return controller
+
+    def test_model_finalization_entry_survives_nonreturning_stage(self):
+        trace = BreadcrumbTraceCollector(lambda: True)
+        controller = self._model_finalization_trace_controller(trace)
+        span = _ModelFinalizationBreadcrumbSpan(controller, "model_build")
+
+        span.__enter__()
+
+        events = trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=4,
+        )["events"]
+        self.assertEqual(["entry"], [event["details"]["phase"] for event in events])
+        self.assertEqual("model_build", events[0]["details"]["stage"])
+        self.assertEqual("lftp-poll:0123456789abcdef", events[0]["corr_id"])
+
+    def test_model_finalization_breadcrumb_pairs_and_records_failure_without_details(self):
+        trace = BreadcrumbTraceCollector(lambda: True)
+        controller = self._model_finalization_trace_controller(trace)
+
+        with self.assertRaisesRegex(RuntimeError, "expected"):
+            with _ModelFinalizationBreadcrumbSpan(
+                    controller, "diff_application", "private-raw-correlation",
+            ):
+                raise RuntimeError("expected")
+
+        events = trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=4,
+        )["events"]
+        self.assertEqual(["entry", "error"], [event["details"]["phase"] for event in events])
+        self.assertEqual("failed", events[-1]["details"]["outcome"])
+        self.assertIsInstance(events[-1]["details"]["wall_ms"], int)
+        self.assertIsInstance(events[-1]["details"]["thread_cpu_ms"], int)
+        self.assertEqual("thread_time_ns", events[-1]["details"]["cpu_clock"])
+        self.assertEqual("lftp-poll:0123456789abcdef", events[0]["corr_id"])
+        self.assertNotIn("private-raw-correlation", str(events))
+        self.assertNotIn("expected", str(events))
+
+    def test_model_finalization_cpu_clock_is_thread_scoped_or_explicitly_unavailable(self):
+        trace = BreadcrumbTraceCollector(lambda: True)
+        controller = self._model_finalization_trace_controller(trace)
+        with patch(
+                "controller.model_updater.time.thread_time_ns",
+                side_effect=[1_000_000_000, 1_007_000_000],
+        ), patch(
+                "controller.model_updater.time.process_time_ns",
+                side_effect=AssertionError("process-wide clock must not be used"),
+        ):
+            with _ModelFinalizationBreadcrumbSpan(controller, "model_build"):
+                pass
+        events = trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=4,
+        )["events"]
+        self.assertEqual("model_finalization.v2", events[-1]["details"]["schema"])
+        self.assertEqual("thread_time_ns", events[0]["details"]["cpu_clock"])
+        self.assertEqual(7, events[-1]["details"]["thread_cpu_ms"])
+
+        trace = BreadcrumbTraceCollector(lambda: True)
+        controller = self._model_finalization_trace_controller(trace)
+        with patch("controller.model_updater.time.thread_time_ns", None), patch(
+                "controller.model_updater.time.process_time_ns",
+                side_effect=AssertionError("process-wide clock must not be used"),
+        ):
+            with _ModelFinalizationBreadcrumbSpan(controller, "model_build"):
+                pass
+        events = trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=4,
+        )["events"]
+        self.assertEqual("unavailable", events[0]["details"]["cpu_clock"])
+        self.assertIsNone(events[-1]["details"]["thread_cpu_ms"])
+
+    def test_model_finalization_info_default_and_collector_eviction_are_preserved(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+        controller = self._model_finalization_trace_controller(trace)
+
+        for stage in ("diff_construction", "diff_application"):
+            with _ModelFinalizationBreadcrumbSpan(controller, stage):
+                pass
+
+        events = trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=8,
+        )["events"]
+        self.assertEqual(2, len(events))
+        self.assertEqual(
+            [("diff_application", "entry"), ("diff_application", "complete")],
+            [(event["details"]["stage"], event["details"]["phase"]) for event in events],
+        )
+        for event in events:
+            self.assertEqual("info", event["level"])
+            self.assertNotIn("private", str(event))
+
+    def test_model_finalization_breadcrumb_does_not_change_wrapped_result_or_publication(self):
+        trace = BreadcrumbTraceCollector(lambda: True)
+        controller = self._model_finalization_trace_controller(trace)
+        publication = []
+
+        def publish_if_selected(selected):
+            with _ModelFinalizationBreadcrumbSpan(controller, "full_adoption"):
+                if selected:
+                    publication.append("published")
+                return selected
+
+        self.assertTrue(publish_if_selected(True))
+        self.assertEqual(["published"], publication)
+        events = trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=4,
+        )["events"]
+        self.assertEqual(
+            ["entry", "complete"],
+            [event["details"]["phase"] for event in events],
+        )
+
+    def test_model_finalization_lock_breadcrumbs_include_bounded_wait_and_hold(self):
+        trace = BreadcrumbTraceCollector(lambda: True)
+        controller = self._model_finalization_trace_controller(trace)
+
+        for stage in ("model_lock_wait", "model_lock_hold"):
+            with _ModelFinalizationBreadcrumbSpan(controller, stage):
+                pass
+
+        events = trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=8,
+        )["events"]
+        terminal = {
+            event["details"]["stage"]: event["details"]
+            for event in events if event["details"]["phase"] == "complete"
+        }
+        self.assertIsInstance(terminal["model_lock_wait"]["lock_wait_ms"], int)
+        self.assertIsNone(terminal["model_lock_wait"]["lock_hold_ms"])
+        self.assertIsNone(terminal["model_lock_hold"]["lock_wait_ms"])
+        self.assertIsInstance(terminal["model_lock_hold"]["lock_hold_ms"], int)
+
+    def test_model_update_lock_breadcrumbs_pair_after_correlation_rotation(self):
+        trace = BreadcrumbTraceCollector(lambda: True)
+        controller = self._model_finalization_trace_controller(trace)
+        controller._Controller__model = SimpleNamespace(
+            set_version_publication_callback=MagicMock(),
+        )
+        controller._Controller__model_builder = SimpleNamespace(
+            begin_stop_resume_trace_cycle=MagicMock(),
+            finish_stop_resume_trace_cycle=MagicMock(),
+        )
+        controller._Controller__stop_resume_trace_cycle_id = 0
+        controller._Controller__work_state_lock = RLock()
+        updater = ModelUpdater(controller)
+
+        def update_once():
+            controller._Controller__lftp_status_poll_correlation = "lftp-poll:fedcba9876543210"
+            return True
+
+        updater._update_once = update_once
+        updater.update()
+
+        events = trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=16,
+        )["events"]
+        sequence = [
+            (event["details"]["stage"], event["details"]["phase"])
+            for event in events
+        ]
+        self.assertLess(
+            sequence.index(("update_lock_hold", "complete")),
+            sequence.index(("update_lock_release", "entry")),
+        )
+        grouped = {}
+        for event in events:
+            details = event["details"]
+            grouped.setdefault(details["stage"], []).append(event)
+        for stage in ("update_lock_wait", "update_lock_hold", "update_lock_release", "final_publication"):
+            self.assertEqual(["entry", "complete"], [
+                event["details"]["phase"] for event in grouped[stage]
+            ])
+            self.assertEqual(1, len({event["corr_id"] for event in grouped[stage]}))
+        self.assertEqual(
+            "lftp-poll:0123456789abcdef",
+            grouped["update_lock_hold"][0]["corr_id"],
+        )
+        self.assertEqual(
+            "lftp-poll:fedcba9876543210",
+            grouped["update_lock_release"][0]["corr_id"],
+        )
+
+    def test_timed_model_lock_release_survives_baseexception_breadcrumb_gate_or_recorder(self):
+        class BreadcrumbFailure(BaseException):
+            pass
+
+        class Lock:
+            def __init__(self):
+                self.events = []
+
+            def __enter__(self):
+                self.events.append("entered")
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self.events.append("exited")
+                return False
+
+        class RaisingGate:
+            def is_effectively_enabled(self, category, level):
+                raise BreadcrumbFailure("gate failure")
+
+        def raising_recorder(**kwargs):
+            raise BreadcrumbFailure("record failure")
+
+        for trace, recorder in (
+                (RaisingGate(), None),
+                (SimpleNamespace(is_effectively_enabled=lambda category, level: True),
+                 raising_recorder),
+        ):
+            lock = Lock()
+            controller = SimpleNamespace(
+                _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+                _Controller__record_breadcrumb=recorder,
+                logger=MagicMock(),
+            )
+            with _ModelUpdateTimedModelLock(lock, None, controller):
+                pass
+            self.assertEqual(["entered", "exited"], lock.events)
+
+    def test_model_update_work_lock_release_survives_baseexception_breadcrumb_gate(self):
+        class BreadcrumbFailure(BaseException):
+            pass
+
+        class RaisingFinalizationGate:
+            def is_effectively_enabled(self, category, level):
+                if category == "model.finalization":
+                    raise BreadcrumbFailure("gate failure")
+                return False
+
+        class Lock:
+            def __init__(self):
+                self.events = []
+
+            def acquire(self):
+                self.events.append("acquire")
+
+            def release(self):
+                self.events.append("release")
+
+        lock = Lock()
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(
+                breadcrumb_trace=RaisingFinalizationGate(),
+            ),
+            _Controller__model=SimpleNamespace(
+                set_version_publication_callback=MagicMock(),
+            ),
+            _Controller__model_builder=SimpleNamespace(
+                begin_stop_resume_trace_cycle=MagicMock(),
+                finish_stop_resume_trace_cycle=MagicMock(),
+            ),
+            _Controller__stop_resume_trace_cycle_id=0,
+            _Controller__work_state_lock=lock,
+            logger=MagicMock(),
+        )
+        updater = ModelUpdater(controller)
+        updater._update_once = lambda: True
+
+        updater.update()
+
+        self.assertEqual(["acquire", "release"], lock.events)
+
+    def test_model_update_work_lock_release_survives_baseexception_wait_finish_or_hold_begin(self):
+        class DiagnosticFailure(BaseException):
+            pass
+
+        class Diagnostics:
+            def __init__(self, failing_metric):
+                self.failing_metric = failing_metric
+
+            def begin_duration(self, metric):
+                if self.failing_metric == DURATION_MODEL_UPDATE_LOCK_HOLD and metric == self.failing_metric:
+                    raise DiagnosticFailure("begin failure")
+                return metric
+
+            def finish_duration(self, metric, token):
+                if self.failing_metric == DURATION_MODEL_UPDATE_LOCK_WAIT and metric == self.failing_metric:
+                    raise DiagnosticFailure("finish failure")
+
+        for failing_metric in (DURATION_MODEL_UPDATE_LOCK_WAIT, DURATION_MODEL_UPDATE_LOCK_HOLD):
+            lock = RLock()
+            controller = SimpleNamespace(
+                _Controller__context=SimpleNamespace(
+                    breadcrumb_trace=BreadcrumbTraceCollector(lambda: False),
+                    performance_diagnostics=Diagnostics(failing_metric),
+                ),
+                _Controller__model=SimpleNamespace(
+                    set_version_publication_callback=MagicMock(),
+                ),
+                _Controller__model_builder=SimpleNamespace(
+                    begin_stop_resume_trace_cycle=MagicMock(),
+                    finish_stop_resume_trace_cycle=MagicMock(),
+                ),
+                _Controller__stop_resume_trace_cycle_id=0,
+                _Controller__work_state_lock=lock,
+                logger=MagicMock(),
+            )
+            updater = ModelUpdater(controller)
+            updater._update_once = lambda: True
+
+            with self.assertRaises(DiagnosticFailure):
+                updater.update()
+            self.assertTrue(lock.acquire(blocking=False))
+            lock.release()
+
     def test_pending_queue_overlay_breadcrumb_links_synthetic_status_to_flow(self):
         trace = BreadcrumbTraceCollector(
             lambda: True,

@@ -1368,6 +1368,194 @@ class _ModelUpdateStageTimer:
             pass
 
 
+_MODEL_FINALIZATION_TRACE_CATEGORY = "model.finalization"
+_MODEL_FINALIZATION_TRACE_STAGE = "model_finalization"
+_MODEL_FINALIZATION_TRACE_SCHEMA = "model_finalization.v2"
+_MODEL_FINALIZATION_TRACE_STAGES = frozenset({
+    "update_lock_wait", "update_lock_hold", "update_lock_release",
+    "model_lock_wait", "model_lock_hold", "model_lock_release",
+    "model_build", "candidate_composition", "diff_construction",
+    "diff_application", "completion_gate", "marker_reconciliation",
+    "pair_adoption", "full_adoption", "final_publication",
+    "summary_publication",
+})
+_MODEL_FINALIZATION_TRACE_MAX_DURATION_MS = 86_400_000
+
+
+def _bounded_model_finalization_duration_ms(value: object) -> int:
+    """Return a finite duration for the fixed breadcrumb schema."""
+    if type(value) is not int:
+        return 0
+    return max(0, min(value, _MODEL_FINALIZATION_TRACE_MAX_DURATION_MS))
+
+
+class _ModelFinalizationBreadcrumbSpan:
+    """Record a bounded entry/terminal pair for one model stage.
+
+    The entry is emitted before the wrapped operation, so a non-returning
+    operation leaves the last retained stage visible.  Terminal records are
+    best-effort and contain only fixed enums, wall time, and thread CPU time
+    when ``thread_time_ns`` is available.  CPU time is explicitly marked
+    unavailable rather than falling back to a process-wide clock.  Breadcrumb
+    failures never affect the wrapped operation.
+    """
+
+    def __init__(
+        self, controller: object, stage: str,
+            correlation: Optional[str] = None,
+    ) -> None:
+        self.__controller = controller
+        self.__stage = stage if (
+            isinstance(stage, str) and stage in _MODEL_FINALIZATION_TRACE_STAGES
+        ) else "unknown"
+        self.__correlation = _safe_lftp_status_poll_correlation(correlation)
+        self.__effective_correlation: Optional[str] = None
+        self.__enabled = False
+        self.__started_wall_ns: Optional[int] = None
+        self.__started_cpu_ns: Optional[int] = None
+        self.__cpu_clock: Optional[Callable[[], int]] = None
+        self.__cpu_clock_name = "unavailable"
+
+    def __enter__(self) -> "_ModelFinalizationBreadcrumbSpan":
+        controller = self.__controller
+        try:
+            self.__enabled = _controller_breadcrumb_effectively_enabled(
+                controller, _MODEL_FINALIZATION_TRACE_CATEGORY, "info",
+            )
+        except BaseException:
+            self.__enabled = False
+        if not self.__enabled:
+            return self
+        try:
+            self.__started_wall_ns = time.monotonic_ns()
+        except BaseException:
+            self.__enabled = False
+            return self
+        try:
+            cpu_clock = getattr(time, "thread_time_ns", None)
+            if callable(cpu_clock):
+                started_cpu_ns = cpu_clock()
+                if type(started_cpu_ns) is int:
+                    self.__cpu_clock = cpu_clock
+                    self.__started_cpu_ns = started_cpu_ns
+                    self.__cpu_clock_name = "thread_time_ns"
+        except BaseException:
+            self.__cpu_clock = None
+            self.__started_cpu_ns = None
+        self.__effective_correlation = self.__resolve_correlation()
+        self.__record(
+            "entry", "started", 0,
+            0 if self.__cpu_clock is not None else None,
+            lock_wait_ms=None, lock_hold_ms=None,
+        )
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        if not self.__enabled:
+            return False
+        wall_ms, thread_cpu_ms = self.__elapsed_ms()
+        failed = exc_type is not None
+        lock_wait_ms = wall_ms if self.__stage.endswith("_lock_wait") else None
+        lock_hold_ms = wall_ms if self.__stage.endswith("_lock_hold") else None
+        self.__record(
+            "error" if failed else "complete",
+            "failed" if failed else "completed",
+            wall_ms,
+            thread_cpu_ms,
+            lock_wait_ms=lock_wait_ms,
+            lock_hold_ms=lock_hold_ms,
+        )
+        return False
+
+    def __elapsed_ms(self) -> tuple[int, Optional[int]]:
+        try:
+            started_wall_ns = self.__started_wall_ns
+            if type(started_wall_ns) is not int:
+                return 0, None
+            wall_ns = time.monotonic_ns() - started_wall_ns
+        except BaseException:
+            return 0, None
+        thread_cpu_ms: Optional[int] = None
+        cpu_clock = self.__cpu_clock
+        started_cpu_ns = self.__started_cpu_ns
+        if cpu_clock is not None and type(started_cpu_ns) is int:
+            try:
+                cpu_ns = cpu_clock() - started_cpu_ns
+                thread_cpu_ms = _bounded_model_finalization_duration_ms(
+                    max(0, cpu_ns // 1_000_000),
+                )
+            except BaseException:
+                self.__cpu_clock = None
+                self.__cpu_clock_name = "unavailable"
+        return (
+            _bounded_model_finalization_duration_ms(max(0, wall_ns // 1_000_000)),
+            thread_cpu_ms,
+        )
+
+    def __record(
+            self, phase: str, outcome: str, wall_ms: int, thread_cpu_ms: Optional[int],
+            *, lock_wait_ms: Optional[int], lock_hold_ms: Optional[int],
+    ) -> None:
+        controller = self.__controller
+        try:
+            recorder = getattr(controller, "_Controller__record_breadcrumb", None)
+        except BaseException:
+            return
+        if not callable(recorder):
+            return
+        correlation = self.__effective_correlation
+        if correlation is None:
+            # Directly invoking __record is not part of the public seam, but
+            # retain the fixed fallback if a future caller bypasses __enter__.
+            correlation = self.__correlation
+        if correlation is None:
+            correlation = "model-update:aggregate"
+        details = {
+            "schema": _MODEL_FINALIZATION_TRACE_SCHEMA,
+            "phase": phase,
+            "stage": self.__stage,
+            "outcome": outcome,
+            "wall_ms": wall_ms,
+            "thread_cpu_ms": thread_cpu_ms,
+            "cpu_clock": self.__cpu_clock_name,
+            "lock_wait_ms": lock_wait_ms,
+            "lock_hold_ms": lock_hold_ms,
+        }
+        try:
+            recorder(
+                stage=_MODEL_FINALIZATION_TRACE_STAGE,
+                message="model_finalization_{}".format(phase),
+                details=details,
+                event_type="failure" if phase == "error" else "state_transition",
+                category=_MODEL_FINALIZATION_TRACE_CATEGORY,
+                level="info",
+                corr_id=correlation,
+                flow_id=correlation,
+                trace_scope="aggregate",
+            )
+        except BaseException:
+            try:
+                logger = getattr(controller, "logger", None)
+            except BaseException:
+                logger = None
+            if logger is not None:
+                try:
+                    logger.debug("Ignoring model finalization breadcrumb failure", exc_info=True)
+                except BaseException:
+                    pass
+
+    def __resolve_correlation(self) -> str:
+        if self.__correlation is not None:
+            return self.__correlation
+        try:
+            correlation = _safe_lftp_status_poll_correlation(
+                getattr(self.__controller, "_Controller__lftp_status_poll_correlation", None),
+            )
+        except BaseException:
+            correlation = None
+        return correlation if correlation is not None else "model-update:aggregate"
+
+
 class _ModelUpdateDurationSpan:
     """Best-effort fixed-name span for nested finalization attribution."""
 
@@ -1401,9 +1589,21 @@ class _ModelUpdateDurationSpan:
 class _ModelUpdateTimedModelLock:
     """Preserve an existing lock context while timing wait and hold."""
 
-    def __init__(self, model_lock: object, diagnostics: object | None) -> None:
+    def __init__(
+            self, model_lock: object, diagnostics: object | None,
+            controller: object | None = None, correlation: Optional[str] = None,
+    ) -> None:
         self.__model_lock = model_lock
         self.__diagnostics = diagnostics
+        self.__wait_breadcrumb = _ModelFinalizationBreadcrumbSpan(
+            controller, "model_lock_wait", correlation,
+        ) if controller is not None else None
+        self.__hold_breadcrumb = _ModelFinalizationBreadcrumbSpan(
+            controller, "model_lock_hold", correlation,
+        ) if controller is not None else None
+        self.__release_breadcrumb = _ModelFinalizationBreadcrumbSpan(
+            controller, "model_lock_release", correlation,
+        ) if controller is not None else None
         self.__wait_span = _ModelUpdateDurationSpan(
             diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT,
         )
@@ -1412,20 +1612,30 @@ class _ModelUpdateTimedModelLock:
         )
 
     def __enter__(self) -> object:
+        if self.__wait_breadcrumb is not None:
+            self.__wait_breadcrumb.__enter__()
         self.__wait_span.__enter__()
         try:
             entered = self.__model_lock.__enter__()
         except BaseException as exc:
             self.__wait_span.__exit__(type(exc), exc, exc.__traceback__)
+            if self.__wait_breadcrumb is not None:
+                self.__wait_breadcrumb.__exit__(type(exc), exc, exc.__traceback__)
             raise
         try:
             self.__wait_span.__exit__(None, None, None)
+            if self.__wait_breadcrumb is not None:
+                self.__wait_breadcrumb.__exit__(None, None, None)
             self.__hold_span.__enter__()
+            if self.__hold_breadcrumb is not None:
+                self.__hold_breadcrumb.__enter__()
         except BaseException as exc:
             # The original raw ``with model_lock`` releases a lock it has
             # entered even when setup immediately after entry fails.  Keep
             # that guarantee for diagnostic control-flow failures too.
             self.__model_lock.__exit__(type(exc), exc, exc.__traceback__)
+            if self.__hold_breadcrumb is not None:
+                self.__hold_breadcrumb.__exit__(type(exc), exc, exc.__traceback__)
             raise
         return entered
 
@@ -1435,10 +1645,34 @@ class _ModelUpdateTimedModelLock:
         diagnostic_error: Optional[BaseException] = None
         try:
             self.__hold_span.__exit__(exc_type, exc_value, traceback)
+            if self.__hold_breadcrumb is not None:
+                self.__hold_breadcrumb.__exit__(exc_type, exc_value, traceback)
         except BaseException as error:
             diagnostic_error = error
         finally:
-            suppressed = bool(self.__model_lock.__exit__(exc_type, exc_value, traceback))
+            release_breadcrumb_started = False
+            if self.__release_breadcrumb is not None:
+                try:
+                    self.__release_breadcrumb.__enter__()
+                    release_breadcrumb_started = True
+                except BaseException:
+                    # Breadcrumb setup must never block the raw lock release.
+                    pass
+            try:
+                suppressed = bool(self.__model_lock.__exit__(exc_type, exc_value, traceback))
+            except BaseException as error:
+                if release_breadcrumb_started:
+                    try:
+                        self.__release_breadcrumb.__exit__(type(error), error, error.__traceback__)
+                    except BaseException:
+                        pass
+                raise
+            else:
+                if release_breadcrumb_started:
+                    try:
+                        self.__release_breadcrumb.__exit__(None, None, None)
+                    except BaseException:
+                        pass
         if diagnostic_error is not None:
             raise diagnostic_error
         return suppressed
@@ -4143,30 +4377,68 @@ class ModelUpdater(_ControllerCoreAccess):
                         if diagnostics is not None else None
                 except Exception:
                     pass
+                with _ModelFinalizationBreadcrumbSpan(
+                        controller, "update_lock_wait", lineage_cycle_correlation,
+                ):
+                    try:
+                        work_state_lock.acquire()
+                    except BaseException:
+                        if diagnostics is not None:
+                            try:
+                                diagnostics.finish_duration(DURATION_MODEL_UPDATE_LOCK_WAIT, lock_wait_started)
+                            except Exception:
+                                pass
+                        raise
                 try:
-                    work_state_lock.acquire()
-                finally:
                     if diagnostics is not None:
                         try:
                             diagnostics.finish_duration(DURATION_MODEL_UPDATE_LOCK_WAIT, lock_wait_started)
                         except Exception:
                             pass
-                lock_hold_started = None
-                try:
-                    lock_hold_started = diagnostics.begin_duration(DURATION_MODEL_UPDATE_LOCK_HOLD) \
-                        if diagnostics is not None else None
-                except Exception:
-                    pass
-                try:
-                    build_triggered = self._update_once()
-                    update_succeeded = True
-                finally:
-                    if diagnostics is not None:
+                    lock_hold_started = None
+                    try:
+                        lock_hold_started = diagnostics.begin_duration(DURATION_MODEL_UPDATE_LOCK_HOLD) \
+                            if diagnostics is not None else None
+                    except Exception:
+                        pass
+                    with _ModelFinalizationBreadcrumbSpan(
+                            controller, "update_lock_hold", lineage_cycle_correlation,
+                    ):
                         try:
-                            diagnostics.finish_duration(DURATION_MODEL_UPDATE_LOCK_HOLD, lock_hold_started)
-                        except Exception:
+                            build_triggered = self._update_once()
+                            update_succeeded = True
+                        finally:
+                            if diagnostics is not None:
+                                try:
+                                    diagnostics.finish_duration(DURATION_MODEL_UPDATE_LOCK_HOLD, lock_hold_started)
+                                except Exception:
+                                    pass
+                finally:
+                        release_breadcrumb = _ModelFinalizationBreadcrumbSpan(
+                            controller, "update_lock_release", lineage_cycle_correlation,
+                        )
+                        release_breadcrumb_started = False
+                        try:
+                            release_breadcrumb.__enter__()
+                            release_breadcrumb_started = True
+                        except BaseException:
+                            # Breadcrumb setup must never block the raw lock release.
                             pass
-                    work_state_lock.release()
+                        try:
+                            work_state_lock.release()
+                        except BaseException as error:
+                            if release_breadcrumb_started:
+                                try:
+                                    release_breadcrumb.__exit__(type(error), error, error.__traceback__)
+                                except BaseException:
+                                    pass
+                            raise
+                        else:
+                            if release_breadcrumb_started:
+                                try:
+                                    release_breadcrumb.__exit__(None, None, None)
+                                except BaseException:
+                                    pass
         finally:
             # Keep the no-rebuild case observable and finish only after all
             # model listeners have seen the applied diff.
@@ -4177,10 +4449,13 @@ class ModelUpdater(_ControllerCoreAccess):
             except Exception:
                 pass
             try:
-                model_builder.finish_stop_resume_trace_cycle(
-                    controller._Controller__model,
-                    build_triggered,
-                )
+                with _ModelFinalizationBreadcrumbSpan(
+                        controller, "final_publication", lineage_cycle_correlation,
+                ):
+                    model_builder.finish_stop_resume_trace_cycle(
+                        controller._Controller__model,
+                        build_triggered,
+                    )
             except Exception:
                 controller.logger.debug("Ignoring stop/resume trace finalization failure", exc_info=True)
             finally:
@@ -6151,6 +6426,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 try:
                     with _ModelUpdateTimedModelLock(
                             controller._Controller__model_lock, diagnostics,
+                            controller, lftp_status_poll_correlation,
                     ):
                         def root_exists(file_id: str) -> bool:
                             try:
@@ -6175,7 +6451,9 @@ class ModelUpdater(_ControllerCoreAccess):
                             for file_id in previous_root_ids:
                                 next_tree_count -= tree_file_count(model.get_file(file_id))
                             next_tree_count += sum(tree_file_count(file) for file in selected_roots)
-                            with _ModelUpdateDurationSpan(
+                            with _ModelFinalizationBreadcrumbSpan(
+                                    controller, "candidate_composition", lftp_status_poll_correlation,
+                            ), _ModelUpdateDurationSpan(
                                     diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_PAIR_CANDIDATE_COMPOSITION,
                             ):
                                 authoritative_pair_candidate = Model.compose_candidate(
@@ -6846,21 +7124,24 @@ class ModelUpdater(_ControllerCoreAccess):
             if candidate_lifecycle_triggered:
                 new_model = authoritative_pair_candidate
             else:
-                try:
-                    started_at = diagnostics.begin_duration(DURATION_MODEL_BUILD) if diagnostics is not None else None
-                except Exception:
-                    started_at = None
-                try:
-                    new_model = model_builder.build_model()
-                except Exception:
-                    retire_deferred_rejected_overlay()
-                    raise
-                finally:
-                    if diagnostics is not None:
-                        try:
-                            diagnostics.finish_duration(DURATION_MODEL_BUILD, started_at)
-                        except Exception:
-                            pass
+                with _ModelFinalizationBreadcrumbSpan(
+                        controller, "model_build", lftp_status_poll_correlation,
+                ):
+                    try:
+                        started_at = diagnostics.begin_duration(DURATION_MODEL_BUILD) if diagnostics is not None else None
+                    except Exception:
+                        started_at = None
+                    try:
+                        new_model = model_builder.build_model()
+                    except Exception:
+                        retire_deferred_rejected_overlay()
+                        raise
+                    finally:
+                        if diagnostics is not None:
+                            try:
+                                diagnostics.finish_duration(DURATION_MODEL_BUILD, started_at)
+                            except Exception:
+                                pass
             lifecycle_publication_build_kind = (
                 "authoritative_pair_candidate" if candidate_lifecycle_triggered else "full_build"
             )
@@ -7004,7 +7285,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     candidate_pair_id(file_id) == authoritative_pair_build.path_pair_id
 
             def pending_completion_move_authorized(file_id: str) -> bool:
-                with _ModelUpdateDurationSpan(
+                with _ModelFinalizationBreadcrumbSpan(
+                        controller, "completion_gate", lftp_status_poll_correlation,
+                ), _ModelUpdateDurationSpan(
                         diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_COMPLETION_GATE_PHYSICAL_PROOF,
                 ):
                     return _pending_completion_move_authorized(file_id)
@@ -7087,6 +7370,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     record_candidate_lifecycle_fallback,
             ), _ModelUpdateTimedModelLock(
                     controller._Controller__model_lock, diagnostics,
+                    controller, lftp_status_poll_correlation,
             ), _ModelUpdateDurationSpan(
                     diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF,
             ):
@@ -7500,7 +7784,9 @@ class ModelUpdater(_ControllerCoreAccess):
                         recovery_file.is_stoppable = False
 
                 # Diff the new model with old model.
-                with _ModelUpdateDurationSpan(
+                with _ModelFinalizationBreadcrumbSpan(
+                        controller, "diff_construction", lftp_status_poll_correlation,
+                ), _ModelUpdateDurationSpan(
                         diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_CONSTRUCTION,
                 ):
                     model_diff = ModelDiffUtil.diff_models(model, new_model)
@@ -7615,7 +7901,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     ))
 
                 def timed_model_diff_application():
-                    with _ModelUpdateDurationSpan(
+                    with _ModelFinalizationBreadcrumbSpan(
+                            controller, "diff_application", lftp_status_poll_correlation,
+                    ), _ModelUpdateDurationSpan(
                             diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_APPLICATION,
                     ):
                         yield from model_diff
@@ -7997,7 +8285,9 @@ class ModelUpdater(_ControllerCoreAccess):
                         lifecycle_active_model_ids = active_model_ids.union(
                             self._rendered_descendant_file_ids(new_model)
                         )
-                    with _ModelUpdateDurationSpan(
+                    with _ModelFinalizationBreadcrumbSpan(
+                            controller, "marker_reconciliation", lftp_status_poll_correlation,
+                    ), _ModelUpdateDurationSpan(
                             diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
                     ):
                         stale_move_failure_ids = {
@@ -8024,7 +8314,9 @@ class ModelUpdater(_ControllerCoreAccess):
                             file_id for file_id, failures in persist.move_failure_counts.items()
                             if failures >= controller._Controller__MAX_MOVE_FAILURES
                         })
-                    with _ModelUpdateDurationSpan(
+                    with _ModelFinalizationBreadcrumbSpan(
+                            controller, "marker_reconciliation", lftp_status_poll_correlation,
+                    ), _ModelUpdateDurationSpan(
                             diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
                     ):
                         remove_downloaded_file_names = self._safe_stale_marker_ids(
@@ -8060,7 +8352,9 @@ class ModelUpdater(_ControllerCoreAccess):
                         })
 
                     downloaded_timestamps = getattr(persist, "downloaded_timestamps", {})
-                    with _ModelUpdateDurationSpan(
+                    with _ModelFinalizationBreadcrumbSpan(
+                            controller, "marker_reconciliation", lftp_status_poll_correlation,
+                    ), _ModelUpdateDurationSpan(
                             diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
                     ):
                         stale_downloaded_timestamp_ids = self._safe_stale_marker_ids(
@@ -8079,7 +8373,9 @@ class ModelUpdater(_ControllerCoreAccess):
                             if self._normalize_scoped_persist_key(file_id, enabled_path_pair_ids) == file_id
                         })
 
-                    with _ModelUpdateDurationSpan(
+                    with _ModelFinalizationBreadcrumbSpan(
+                            controller, "marker_reconciliation", lftp_status_poll_correlation,
+                    ), _ModelUpdateDurationSpan(
                             diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
                     ):
                         stale_extracted_file_names = self._safe_stale_marker_ids(
@@ -8097,7 +8393,9 @@ class ModelUpdater(_ControllerCoreAccess):
                         persist.extracted_file_names.difference_update(stale_extracted_file_names)
                         model_builder.set_extracted_files(persist.extracted_file_names)
 
-                    with _ModelUpdateDurationSpan(
+                    with _ModelFinalizationBreadcrumbSpan(
+                            controller, "marker_reconciliation", lftp_status_poll_correlation,
+                    ), _ModelUpdateDurationSpan(
                             diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MARKER_RECONCILIATION,
                     ):
                         stale_final_move_succeeded_file_names = self._safe_stale_marker_ids(
@@ -8139,6 +8437,9 @@ class ModelUpdater(_ControllerCoreAccess):
                             record_candidate_lifecycle_fallback,
                     ), _ModelUpdateTimedModelLock(
                             controller._Controller__model_lock, diagnostics,
+                            controller, lftp_status_poll_correlation,
+                    ), _ModelFinalizationBreadcrumbSpan(
+                            controller, "pair_adoption", lftp_status_poll_correlation,
                     ), _ModelUpdateDurationSpan(
                             diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_PAIR_ADOPTION,
                     ):
@@ -8219,6 +8520,9 @@ class ModelUpdater(_ControllerCoreAccess):
             try:
                 with _ModelUpdateTimedModelLock(
                         controller._Controller__model_lock, diagnostics,
+                        controller, lftp_status_poll_correlation,
+                ), _ModelFinalizationBreadcrumbSpan(
+                        controller, "full_adoption", lftp_status_poll_correlation,
                 ), _ModelUpdateDurationSpan(
                         diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_FULL_ADOPTION,
                 ):
@@ -8842,7 +9146,10 @@ class ModelUpdater(_ControllerCoreAccess):
         ) and not summary_notified:
             summary_notifier = getattr(controller, "notify_model_summary_changed", None)
             if callable(summary_notifier):
-                summary_notifier()
+                with _ModelFinalizationBreadcrumbSpan(
+                        controller, "summary_publication", lftp_status_poll_correlation,
+                ):
+                    summary_notifier()
                 summary_notified = True
 
         # A mirror/directory job owns only its root lifecycle.  Its scanner
