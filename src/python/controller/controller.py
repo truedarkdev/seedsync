@@ -137,6 +137,10 @@ _QUEUE_LIFECYCLE_BOUNDARIES = {
 }
 
 
+_AUTHORITY_HANDOFF_TRACE_CATEGORY = "queue.authority"
+_AUTHORITY_HANDOFF_MAX_INTENTS = 16
+
+
 def _queue_lifecycle_project(event: object, fields: object) -> Optional[dict[str, object]]:
     """Project Queue lifecycle evidence before it reaches the breadcrumb sink."""
     if not isinstance(event, str) or event not in _QUEUE_LIFECYCLE_EVENTS:
@@ -238,6 +242,15 @@ def _breadcrumb_effectively_enabled(trace: object, category: str, level: str = "
             return False
     # Keep compatibility with the small record-only fakes used by callers.
     return True
+
+
+def _authority_handoff_trace_enabled(controller: object) -> bool:
+    context = getattr(controller, "_Controller__context", None)
+    return _breadcrumb_effectively_enabled(
+        getattr(context, "breadcrumb_trace", None),
+        _AUTHORITY_HANDOFF_TRACE_CATEGORY,
+        "info",
+    )
 
 
 _SCAN_AUTHORITY_DIAGNOSTIC_ONLY_KEYS = frozenset({
@@ -3221,6 +3234,22 @@ class Controller:
             if not isinstance(side_tokens, dict):
                 side_tokens = {}
                 tokens[side] = side_tokens
+
+            authority_trace_enabled = _authority_handoff_trace_enabled(self)
+            handoff_recorder = getattr(
+                self, "_record_authority_handoff_breadcrumb", None,
+            ) if authority_trace_enabled else None
+            selected_intents: list[DeferredQueueIntent] = []
+            if callable(handoff_recorder):
+                deferred_intents = getattr(self, "_Controller__deferred_queue_intents", None)
+                deferred_values = deferred_intents.values() if isinstance(deferred_intents, dict) else ()
+                for index, intent in enumerate(deferred_values):
+                    if index >= _AUTHORITY_HANDOFF_MAX_INTENTS:
+                        break
+                    if isinstance(intent, DeferredQueueIntent) and \
+                            type(intent.phase) is str and intent.phase in ("initial_rescan", "rescan") and \
+                            type(intent.file_id) is str:
+                        selected_intents.append(intent)
             for pair_id in covered_pair_ids:
                 if pair_id in unknown_pair_ids:
                     continue
@@ -3265,6 +3294,28 @@ class Controller:
                                 "side": side,
                                 "ready": False,
                             })
+
+            if callable(handoff_recorder):
+                side_index = 0 if side == "local" else 1
+                for intent in selected_intents:
+                    pair_id = intent.path_pair_id
+                    if pair_id not in covered_pair_ids or pair_id in unknown_pair_ids:
+                        continue
+                    token = side_tokens.get(pair_id)
+                    baselines = intent.rescan_generations
+                    baseline = baselines[side_index] if \
+                        isinstance(baselines, tuple) and len(baselines) == 2 else None
+                    if not isinstance(token, tuple) or len(token) != 2 or \
+                            not isinstance(baseline, tuple) or len(baseline) != 2 or \
+                            token[0] != baseline[0] or token[1] <= baseline[1]:
+                        continue
+                    handoff_recorder(
+                        intent.file_id,
+                        event="token_receipt",
+                        side=side,
+                        outcome="fresh",
+                        fresh=True,
+                    )
 
         record("local", local_result)
         record("remote", remote_result)
@@ -4580,6 +4631,34 @@ class Controller:
             self.__scan_authority_snapshot = published
             return dict(published)
 
+    def _record_authority_handoff_publication(
+            self, snapshot: object,
+            covered_path_pair_ids: object = None,
+    ) -> None:
+        """Link one final model publication to retained Queue authority intent."""
+        if not isinstance(snapshot, dict) or snapshot.get("final") is not True:
+            return
+        if not _authority_handoff_trace_enabled(self):
+            return
+        if not isinstance(covered_path_pair_ids, (set, frozenset)):
+            return
+        deferred_intents = getattr(self, "_Controller__deferred_queue_intents", None)
+        deferred_values = deferred_intents.values() if isinstance(deferred_intents, dict) else ()
+        for index, intent in enumerate(deferred_values):
+            if index >= _AUTHORITY_HANDOFF_MAX_INTENTS:
+                break
+            if not isinstance(intent, DeferredQueueIntent) or \
+                    type(intent.phase) is not str or intent.phase not in ("initial_rescan", "rescan") or \
+                    intent.path_pair_id not in covered_path_pair_ids:
+                continue
+            self._record_authority_handoff_breadcrumb(
+                intent.file_id,
+                event="publication",
+                side="both",
+                outcome="published",
+                covered=True,
+            )
+
     def get_model_summary(self, max_age_seconds: float = 0.0) -> dict[str, object]:
         """Return compact root-only counts; deliberately no file tree records."""
         with self.__model_lock:
@@ -5789,6 +5868,50 @@ class Controller:
         except Exception:
             # Diagnostics must never alter Queue admission or dispatch.
             self.logger.debug("Ignoring Queue readiness breadcrumb failure", exc_info=True)
+
+    def _record_authority_handoff_breadcrumb(
+            self,
+            file_id: object,
+            *,
+            event: str,
+            side: str = "none",
+            outcome: str = "unknown",
+            fresh: object = None,
+            covered: object = None,
+    ) -> None:
+        """Record one fixed, identity-free Queue authority boundary."""
+        if not isinstance(file_id, str):
+            return
+        context = getattr(self, "_Controller__context", None)
+        breadcrumb_trace = getattr(context, "breadcrumb_trace", None)
+        if not _breadcrumb_effectively_enabled(
+                breadcrumb_trace, _AUTHORITY_HANDOFF_TRACE_CATEGORY, "info",
+        ):
+            return
+        details = {
+            "event": event,
+            "side": side,
+            "outcome": outcome,
+            "fresh": fresh if type(fresh) is bool else None,
+            "covered": covered if type(covered) is bool else None,
+        }
+        try:
+            breadcrumb_trace.record(
+                "controller",
+                "queue_authority_handoff",
+                details,
+                stage="queue_authority_handoff",
+                event_type="state_transition",
+                category=_AUTHORITY_HANDOFF_TRACE_CATEGORY,
+                level="info",
+                corr_id="fractional-mtime:{}".format(opaque_trace_correlation(file_id)),
+                trace_scope="flow",
+            )
+        except Exception:
+            logger = getattr(self, "logger", None)
+            debug = getattr(logger, "debug", None)
+            if callable(debug):
+                debug("Ignoring Queue authority handoff breadcrumb failure", exc_info=True)
 
     def __record_queue_callback_trace(
             self, command: "Controller.Command", callback_index: int,
@@ -9683,6 +9806,12 @@ class Controller:
                 "reason": "authoritative_scoped_scan",
                 "ready": True,
             })
+            self._record_authority_handoff_breadcrumb(
+                intent.file_id,
+                event="readiness",
+                side="both",
+                outcome="ready",
+            )
         return ready
 
     def __record_initial_rescan_experiment_progress(
@@ -9739,6 +9868,12 @@ class Controller:
             # source/sidecar belonging to another Queue file.
             return None
         intents.pop(file_id, None)
+        self._record_authority_handoff_breadcrumb(
+            intent.file_id,
+            event="intent_terminal",
+            side="none",
+            outcome="terminal",
+        )
         self.__record_queue_readiness_trace(file_id, "queue_final_decision", {
             "schema": "queue_readiness.v1",
             "phase": "final_decision",
@@ -9801,6 +9936,7 @@ class Controller:
                 continue
             if file_id in queued_stops or intent.command.filename in queued_stops:
                 continue
+            ready_phase = None
             try:
                 if self.__is_explicitly_stopped(deferred_file.full_path, intent.path_pair_id) and \
                         not intent.stop_marker_at_defer:
@@ -9829,6 +9965,12 @@ class Controller:
                     intent.rescan_deadline_monotonic = None
                     if id(intent.command) not in queued_commands:
                         self.__command_queue.put(intent.command)
+                    self._record_authority_handoff_breadcrumb(
+                        intent.file_id,
+                        event="intent_reenqueued",
+                        side="both",
+                        outcome="reenqueued",
+                    )
                     continue
                 self.__record_initial_rescan_experiment_progress(intent, time.monotonic())
                 deadline = self.__ensure_initial_rescan_deadline(intent)
@@ -9881,6 +10023,7 @@ class Controller:
             elif intent.phase in ("rescan", "initial_rescan"):
                 if not self.__queue_scoped_rescan_ready(intent):
                     continue
+                ready_phase = intent.phase
                 if intent.phase == "initial_rescan":
                     # The initial scan fence only establishes a trustworthy
                     # model boundary. Consume it before normal collision
@@ -9892,6 +10035,13 @@ class Controller:
             if id(intent.command) in queued_commands:
                 continue
             self.__command_queue.put(intent.command)
+            if ready_phase is not None:
+                self._record_authority_handoff_breadcrumb(
+                    intent.file_id,
+                    event="intent_reenqueued",
+                    side="both",
+                    outcome="reenqueued",
+                )
 
     def __queue_preflight_intent_with_stop_state(
             self, file: ModelFile, command: "Controller.Command",

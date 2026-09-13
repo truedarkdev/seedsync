@@ -18070,3 +18070,230 @@ class TestController(unittest.TestCase):
             self.assertEqual(Controller.MoveFromStagingResult.CONFLICT, result)
             self.assertEqual(b"source", Path(src).read_bytes())
             self.assertEqual(b"racer", Path(dst).read_bytes())
+
+    def test_authority_handoff_tracks_fresh_sides_readiness_and_publication(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=32,
+            policy={"default": "off", "rules": {"queue.authority": "info"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
+        file_id = '[\"pair-private\", \"root-private\"]'
+        command = Controller.Command(Controller.Command.Action.QUEUE, file_id)
+        intent = DeferredQueueIntent(
+            command,
+            file_id,
+            "pair-private",
+            phase="initial_rescan",
+            rescan_requested=True,
+            rescan_generations=(
+                ("local-session", 1),
+                ("remote-session", 2),
+            ),
+        )
+        self.controller._Controller__deferred_queue_intents = {file_id: intent}
+
+        self.controller._record_path_pair_scan_tokens(
+            SimpleNamespace(
+                failed=False,
+                unknown_path_pair_ids=set(),
+                is_scan_final=True,
+                scanned_path_pair_ids={"pair-private"},
+                completed_path_pair_ids=set(),
+                session_token="local-session",
+                generation=2,
+            ),
+            None,
+        )
+        self.controller._record_path_pair_scan_tokens(
+            None,
+            SimpleNamespace(
+                failed=False,
+                unknown_path_pair_ids=set(),
+                is_scan_final=True,
+                scanned_path_pair_ids={"pair-private"},
+                completed_path_pair_ids=set(),
+                session_token="remote-session",
+                generation=3,
+            ),
+        )
+        self.controller.is_path_pair_reconciled = MagicMock(return_value=True)
+        self.assertTrue(self.controller._Controller__queue_scoped_rescan_ready(intent))
+        self.assertTrue(self.controller._Controller__queue_scoped_rescan_ready(intent))
+        self.controller._record_authority_handoff_publication({
+            "final": True,
+            "full": True,
+            "reason": "published",
+            "publication_id": 5,
+            "model_version": 6,
+        }, covered_path_pair_ids={"pair-private"})
+
+        events = trace.query_events(
+            category="queue.authority", stage="queue_authority_handoff", limit=32,
+        )["events"]
+        self.assertEqual(
+            [
+                "token_receipt", "token_receipt", "readiness", "publication",
+            ],
+            [event["details"]["event"] for event in events],
+        )
+        local_token = events[0]["details"]
+        self.assertEqual("local", local_token["side"])
+        self.assertTrue(local_token["fresh"])
+        self.assertRegex(events[0]["corr_id"], r"^fractional-mtime:[0-9a-f]{16}$")
+        remote_token = events[1]["details"]
+        self.assertEqual("remote", remote_token["side"])
+        self.assertTrue(remote_token["fresh"])
+        self.assertTrue(events[3]["details"]["covered"])
+        serialized = str(events)
+        self.assertNotIn("pair-private", serialized)
+        self.assertNotIn("root-private", serialized)
+
+    def test_authority_handoff_omits_stale_token_receipt(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"queue.authority": "info"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        file_id = '["pair-private", "root-private"]'
+        intent = DeferredQueueIntent(
+            Controller.Command(Controller.Command.Action.QUEUE, file_id),
+            file_id,
+            "pair-private",
+            phase="rescan",
+            rescan_requested=True,
+            rescan_generations=(
+                ("local-session", 4),
+                ("remote-session", 4),
+            ),
+        )
+        self.controller._Controller__deferred_queue_intents = {file_id: intent}
+        self.controller._record_path_pair_scan_tokens(
+            SimpleNamespace(
+                failed=False,
+                unknown_path_pair_ids=set(),
+                is_scan_final=True,
+                scanned_path_pair_ids={"pair-private"},
+                completed_path_pair_ids=set(),
+                session_token="local-session",
+                generation=4,
+            ),
+            None,
+        )
+        events = trace.query_events(
+            category="queue.authority", stage="queue_authority_handoff", limit=8,
+        )["events"]
+        self.assertEqual([], events)
+        self.assertEqual(
+            ("local-session", 4),
+            self.controller._Controller__scan_authority_tokens["local"]["pair-private"],
+        )
+
+    def test_authority_handoff_publication_requires_exact_pair_coverage(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"queue.authority": "info"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        intents = {}
+        for pair_id in ("pair-a", "pair-b"):
+            file_id = json.dumps([pair_id, "private-root"])
+            intents[file_id] = DeferredQueueIntent(
+                Controller.Command(Controller.Command.Action.QUEUE, file_id),
+                file_id,
+                pair_id,
+                phase="rescan",
+                rescan_requested=True,
+            )
+        self.controller._Controller__deferred_queue_intents = intents
+
+        self.controller._record_authority_handoff_publication(
+            {"final": True, "full": True, "reason": "published"},
+            covered_path_pair_ids={"pair-a"},
+        )
+        events = trace.query_events(
+            category="queue.authority", stage="queue_authority_handoff", limit=8,
+        )["events"]
+        self.assertEqual(1, len(events))
+        self.assertEqual("publication", events[0]["details"]["event"])
+        self.assertTrue(events[0]["details"]["covered"])
+
+    def test_authority_handoff_disabled_skips_deferred_intent_traversal(self):
+        class NoValuesDict(dict):
+            def values(self):
+                raise AssertionError("disabled authority trace traversed deferred intents")
+
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"queue.authority": "off"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__deferred_queue_intents = NoValuesDict()
+        self.controller._record_path_pair_reconciliation(set(), set())
+        with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "599"}):
+            self.controller._record_path_pair_scan_tokens(
+                SimpleNamespace(
+                    failed=False,
+                    unknown_path_pair_ids=set(),
+                    is_scan_final=True,
+                    scanned_path_pair_ids={"pair-a"},
+                    completed_path_pair_ids=set(),
+                    session_token="session",
+                    generation=2,
+                ),
+                None,
+            )
+        self.controller._record_authority_handoff_publication(
+            {"final": True}, covered_path_pair_ids={"pair-a"},
+        )
+        self.assertEqual([], trace.query_events(category="queue.authority")["events"])
+
+    def test_authority_handoff_selection_is_bounded_before_pair_preparation(self):
+        class CountingValuesDict(dict):
+            values_calls = 0
+
+            def values(self):
+                self.values_calls += 1
+                return super().values()
+
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=32,
+            policy={"default": "off", "rules": {"queue.authority": "info"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        intents = CountingValuesDict()
+        pair_ids = {"pair-{}".format(index) for index in range(32)}
+        for pair_id in pair_ids:
+            file_id = json.dumps([pair_id, "private-root"])
+            intents[file_id] = DeferredQueueIntent(
+                Controller.Command(Controller.Command.Action.QUEUE, file_id),
+                file_id,
+                pair_id,
+                phase="rescan",
+                rescan_requested=True,
+                rescan_generations=(("session", 1), ("remote", 1)),
+            )
+        self.controller._Controller__deferred_queue_intents = intents
+        with patch.dict(os.environ, {Controller._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV: "599"}):
+            self.controller._record_path_pair_scan_tokens(
+                SimpleNamespace(
+                    failed=False,
+                    unknown_path_pair_ids=set(),
+                    is_scan_final=True,
+                    scanned_path_pair_ids=pair_ids,
+                    completed_path_pair_ids=set(),
+                    session_token="session",
+                    generation=2,
+                ),
+                None,
+            )
+        events = trace.query_events(
+            category="queue.authority", stage="queue_authority_handoff", limit=32,
+        )["events"]
+        self.assertEqual(1, intents.values_calls)
+        self.assertEqual(16, len(events))

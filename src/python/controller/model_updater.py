@@ -9021,6 +9021,38 @@ class ModelUpdater(_ControllerCoreAccess):
                         })
                         controller._Controller__scan_authority_publication_id = publication_id
                         controller._Controller__scan_authority_snapshot = dict(standing_snapshot)
+            authority_publication_recorder = getattr(
+                controller, "_record_authority_handoff_publication", None,
+            )
+            if standing_snapshot.get("final") is True and \
+                    callable(authority_publication_recorder) and \
+                    _controller_breadcrumb_effectively_enabled(
+                        controller, "queue.authority", "info",
+                    ):
+                local_coverage = local_reconciled_ids
+                if not isinstance(local_coverage, (set, frozenset)):
+                    local_coverage = getattr(
+                        controller, "_Controller__reconciled_local_path_pair_ids", (),
+                    )
+                remote_coverage = remote_reconciled_ids
+                if not isinstance(remote_coverage, (set, frozenset)):
+                    remote_coverage = getattr(
+                        controller, "_Controller__reconciled_remote_path_pair_ids", (),
+                    )
+                try:
+                    covered_path_pair_ids = frozenset(local_coverage).intersection(remote_coverage)
+                except (TypeError, ValueError):
+                    covered_path_pair_ids = frozenset()
+                try:
+                    authority_publication_recorder(
+                        standing_snapshot,
+                        covered_path_pair_ids=covered_path_pair_ids,
+                    )
+                except Exception:
+                    controller.logger.debug(
+                        "Ignoring Queue authority publication breadcrumb failure",
+                        exc_info=True,
+                    )
             if scan_adoption_trace_enabled and (
                     global_full_build_triggered or authoritative_pair_delta_applied
                     or progressive_source_buckets_adopted

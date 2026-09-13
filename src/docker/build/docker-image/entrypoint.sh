@@ -15,6 +15,10 @@ DEFAULT_DISABLE_BROWSER_AUTH="${SEEDSYNC_DISABLE_BROWSER_AUTH-0}"
 DOWNLOADS_DIR=/downloads
 MOUNTS_DIR=/mounts
 USER_HOME="$APP_HOME_DIR"
+DURABLE_BREADCRUMB_LOGDIR_ENABLED=0
+if [ "${SEEDSYNC_ENABLE_DURABLE_BREADCRUMB_LOGDIR+x}" = x ]; then
+    DURABLE_BREADCRUMB_LOGDIR_ENABLED="$SEEDSYNC_ENABLE_DURABLE_BREADCRUMB_LOGDIR"
+fi
 
 validate_disable_browser_auth() {
     case "${DEFAULT_DISABLE_BROWSER_AUTH}" in
@@ -25,6 +29,47 @@ validate_disable_browser_auth() {
             exit 1
             ;;
     esac
+}
+
+validate_durable_breadcrumb_logdir() {
+    case "${DURABLE_BREADCRUMB_LOGDIR_ENABLED}" in
+        0|1)
+            ;;
+        *)
+            echo "ERROR: SEEDSYNC_ENABLE_DURABLE_BREADCRUMB_LOGDIR must be 0 or 1" >&2
+            exit 1
+            ;;
+    esac
+}
+
+prepare_runtime_command() {
+    RUNTIME_COMMAND=("$@")
+
+    # Durable breadcrumbs use the application-owned config log root only when
+    # explicitly enabled; the normal command and user command overrides stay
+    # unchanged by default.
+    if [ "${DURABLE_BREADCRUMB_LOGDIR_ENABLED}" != "1" ]; then
+        return 0
+    fi
+
+    if [ "${#RUNTIME_COMMAND[@]}" -ge 3 ] \
+        && [ "${RUNTIME_COMMAND[0]}" = "/bin/bash" ] \
+        && [ "${RUNTIME_COMMAND[1]}" = "-lc" ]; then
+        local command="${RUNTIME_COMMAND[2]}"
+        local web_bind_host_marker=" --web-bind-host "
+        case "$command" in
+            *"$web_bind_host_marker"*)
+                command="${command/"$web_bind_host_marker"/ --logdir \/config\/logs$web_bind_host_marker}"
+                ;;
+            *)
+                command="${command} --logdir /config/logs"
+                ;;
+        esac
+        RUNTIME_COMMAND[2]="$command"
+        return 0
+    fi
+
+    RUNTIME_COMMAND+=("--logdir" "/config/logs")
 }
 
 bootstrap_default_config() {
@@ -184,6 +229,7 @@ configure_legacy_nss_identity() {
 export CONFIG_DIR SETTINGS_FILE SCRIPT_PATH DEFAULT_LOCAL_PATH DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION DEFAULT_DISABLE_BROWSER_AUTH
 
 validate_disable_browser_auth
+validate_durable_breadcrumb_logdir
 
 if [ "${1:-}" = "--bootstrap-default-config" ]; then
     bootstrap_default_config
@@ -334,16 +380,18 @@ prepare_config_root() {
     local config_root="${1:-$CONFIG_DIR}"
     local test_delay_seconds="${2:-0}"
     local repair_test_delay_seconds="${3:-0}"
-    python3 - "$config_root" "$USER_ID" "$GROUP_ID" "$DEFAULT_ID" "$test_delay_seconds" "$repair_test_delay_seconds" "$LEGACY_NONROOT_MODE" <<'PY'
+    local prepare_durable_breadcrumb_logdir="${4:-$DURABLE_BREADCRUMB_LOGDIR_ENABLED}"
+    python3 - "$config_root" "$USER_ID" "$GROUP_ID" "$DEFAULT_ID" "$test_delay_seconds" "$repair_test_delay_seconds" "$LEGACY_NONROOT_MODE" "$prepare_durable_breadcrumb_logdir" <<'PY'
 import os
 import re
 import stat
 import sys
 import time
 
-root, user_id_text, group_id_text, default_id_text, test_delay_text, repair_test_delay_text, legacy_mode_text = sys.argv[1:]
+root, user_id_text, group_id_text, default_id_text, test_delay_text, repair_test_delay_text, legacy_mode_text, durable_logdir_text = sys.argv[1:]
 uid, gid, default_uid = int(user_id_text), int(group_id_text), int(default_id_text)
 legacy_mode = legacy_mode_text == "1"
+durable_logdir = durable_logdir_text == "1"
 try:
     test_delay_seconds = int(test_delay_text)
     repair_test_delay_seconds = int(repair_test_delay_text)
@@ -627,6 +675,43 @@ try:
     final_info = os.fstat(root_fd)
     if stat.S_IMODE(final_info.st_mode) != 0o700:
         fail("root mode did not restore to runtime-private access")
+    if durable_logdir:
+        try:
+            os.mkdir("logs", 0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        try:
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                directory_flags |= os.O_CLOEXEC
+            logdir_fd = os.open("logs", directory_flags, dir_fd=root_fd)
+        except OSError as exc:
+            fail("cannot open /config/logs without following links ({})".format(exc.__class__.__name__))
+        try:
+            logdir_info = os.fstat(logdir_fd)
+            if not stat.S_ISDIR(logdir_info.st_mode) or logdir_info.st_dev != final_info.st_dev:
+                fail("/config/logs is not a directory on the config filesystem")
+            if logdir_info.st_uid != uid or logdir_info.st_gid != gid:
+                try:
+                    os.fchown(logdir_fd, uid, gid)
+                except OSError as exc:
+                    fail("cannot assign the runtime owner to /config/logs ({})".format(exc.__class__.__name__))
+            try:
+                os.fchmod(logdir_fd, 0o700)
+            except OSError as exc:
+                fail("cannot restore runtime-private access to /config/logs ({})".format(exc.__class__.__name__))
+            logdir_info = os.fstat(logdir_fd)
+            path_info = os.stat("logs", dir_fd=root_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(logdir_info.st_mode)
+                or logdir_info.st_uid != uid
+                or logdir_info.st_gid != gid
+                or stat.S_IMODE(logdir_info.st_mode) != 0o700
+                or (logdir_info.st_dev, logdir_info.st_ino) != (path_info.st_dev, path_info.st_ino)
+            ):
+                fail("/config/logs owner, mode, or identity changed during preparation")
+        finally:
+            os.close(logdir_fd)
 finally:
     os.close(root_fd)
 mode_label = "legacy-nonroot" if legacy_mode else "strict"
@@ -691,7 +776,7 @@ if [ "${1:-}" = "--prepare-config-root" ]; then
         printf 'ERROR: SEEDSYNC_CONFIG_ROOT_REPAIR_TEST_DELAY_SECONDS must be an integer from 0 through 10 for --prepare-config-root\n' >&2
         exit 1
     fi
-    prepare_config_root "${2:-$CONFIG_DIR}" "$config_root_test_delay" "$config_root_repair_test_delay"
+    prepare_config_root "${2:-$CONFIG_DIR}" "$config_root_test_delay" "$config_root_repair_test_delay" 0
     exit 0
 fi
 
@@ -734,11 +819,12 @@ export TMPDIR="$RUNTIME_TMP_DIR"
 echo "Running as: $USER_NAME:$GROUP_NAME (UID=$USER_ID, GID=$GROUP_ID, HOME=$HOME, TMPDIR=$TMPDIR)" >&2
 
 export -f append_local_path_to_lftp_section bootstrap_default_config generate_default_config replace_browser_handover_recovery_version replace_disable_browser_auth replace_local_path
+prepare_runtime_command "$@"
 
 # Keep bootstrap and command/argument forwarding in the existing non-root
 # shell, but make tini the resulting PID 1 so it forwards signals and reaps
 # children spawned by the application.
 if [ "$LEGACY_NONROOT_MODE" = "1" ]; then
-    exec tini -g -- bash -lc 'set -euo pipefail; bootstrap_default_config; exec "$@"' bash "$@"
+    exec tini -g -- bash -lc 'set -euo pipefail; bootstrap_default_config; exec "$@"' bash "${RUNTIME_COMMAND[@]}"
 fi
-exec setpriv --reuid="$USER_ID" --regid="$GROUP_ID" --clear-groups -- tini -g -- bash -lc 'set -euo pipefail; bootstrap_default_config; exec "$@"' bash "$@"
+exec setpriv --reuid="$USER_ID" --regid="$GROUP_ID" --clear-groups -- tini -g -- bash -lc 'set -euo pipefail; bootstrap_default_config; exec "$@"' bash "${RUNTIME_COMMAND[@]}"

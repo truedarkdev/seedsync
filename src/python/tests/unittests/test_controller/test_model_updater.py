@@ -1549,6 +1549,7 @@ class TestModelUpdater(unittest.TestCase):
         controller._model_scope_id = Controller._model_scope_id
         controller.get_model_summary = Controller.get_model_summary.__get__(controller, Controller)
         controller._Controller__record_breadcrumb = MagicMock()
+        controller._record_authority_handoff_publication = MagicMock()
 
         ModelUpdater(controller).update()
 
@@ -1569,6 +1570,12 @@ class TestModelUpdater(unittest.TestCase):
             summary_snapshot["remote_scan_generation"], details["remote_scan_generation"],
         )
         self.assertEqual(11, summary["model_version"])
+        authority_handoff_call = controller._record_authority_handoff_publication.call_args
+        self.assertIsNotNone(authority_handoff_call)
+        self.assertEqual(
+            {"private-pair"},
+            authority_handoff_call.kwargs["covered_path_pair_ids"],
+        )
         for private_value in (
             "private-remote-root", "private-local-root", "private-pair",
             "private-remote-session", "private-local-session",
