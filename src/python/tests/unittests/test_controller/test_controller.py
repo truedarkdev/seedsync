@@ -197,6 +197,7 @@ class TestController(unittest.TestCase):
         recorder = self.controller._Controller__incoming_recovery_flow_recorder("sample", 1)
         self.assertIsNotNone(recorder)
         recorder("queue_admitted", {})
+        recorder("operation_scheduled", {})
         recorder("executor_start", {})
         recorder("executor_return", {})
         recorder("lftp_child", {
@@ -206,20 +207,21 @@ class TestController(unittest.TestCase):
             "pre_send_drain_shape": "empty",
         })
         recorder("root_default", {"root_state": "default", "coverage": "incomplete"})
-        recorder("queue_retired", {"phase": "retirement"})
+        recorder("queue_retired", {"phase": "retirement", "future_state": "finalized"})
 
         entries = [
             entry for entry in trace.snapshot()["entries"]
             if entry.get("category") == "queue.lifecycle"
         ]
         self.assertEqual(
-            ["queue_admitted", "executor_start", "executor_return", "lftp_child",
+            ["queue_admitted", "operation_scheduled", "executor_start", "executor_return", "lftp_child",
              "root_default", "queue_retired"],
             [entry["details"]["event"] for entry in entries],
         )
         self.assertEqual(1, len({entry["flow_id"] for entry in entries}))
         self.assertEqual(1, len({entry["corr_id"] for entry in entries}))
-        self.assertEqual("healthy", entries[3]["details"]["status_health"])
+        self.assertEqual("healthy", entries[4]["details"]["status_health"])
+        self.assertEqual("finalized", entries[-1]["details"]["future_state"])
 
     def test_queue_lifecycle_projects_fixed_redacted_details(self):
         trace = BreadcrumbTraceCollector(
@@ -7399,7 +7401,10 @@ class TestController(unittest.TestCase):
         time.sleep(0.05)
         entries = trace.snapshot()["entries"]
         self.assertEqual(
-            {"queue_future_outcome", "queue_status_ack", "queue_lifecycle_status_membership"},
+            {
+                "queue_future_outcome", "queue_status_ack",
+                "queue_lifecycle_status_membership", "queue_lifecycle_operation_retired",
+            },
             {entry["message"] for entry in entries},
         )
         self.assertEqual(1, len({entry["flow_id"] for entry in entries}))
@@ -7410,6 +7415,11 @@ class TestController(unittest.TestCase):
             entry for entry in entries if entry["message"] == "queue_status_ack"
         )
         self.assertEqual("fresh_idle_without_active_status", status_ack["details"]["retirement_reason"])
+        lifecycle_retirement = next(
+            entry for entry in entries
+            if entry["message"] == "queue_lifecycle_operation_retired"
+        )
+        self.assertEqual("finalized", lifecycle_retirement["details"]["future_state"])
 
     def test_queue_worker_start_future_outcome_and_retirement_share_opaque_flow(self):
         file = ModelFile("private-queue-target.mkv", False)
@@ -7532,6 +7542,41 @@ class TestController(unittest.TestCase):
         self.assertEqual("exception", outcome["details"]["outcome"])
         self.assertEqual("error", outcome["details"]["future_outcome"])
         self.assertNotIn("private-exception-target.mkv", str(outcome))
+        retirement = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("category") == "queue.lifecycle"
+        )
+        self.assertEqual("operation_retired", retirement["details"]["event"])
+        self.assertEqual("finalized", retirement["details"]["future_state"])
+        self.assertEqual("warning", retirement["level"])
+
+    def test_queue_lifecycle_failed_retirement_policy_matrix(self):
+        for policy, expected_level in (("off", None), ("info", "warning"), ("warning", "warning")):
+            with self.subTest(policy=policy):
+                trace = BreadcrumbTraceCollector(
+                    lambda: True, max_entries=16, policy={"default": policy},
+                )
+                self.controller._Controller__context.breadcrumb_trace = trace
+                recorder = self.controller._Controller__incoming_recovery_flow_recorder(
+                    "private-policy-target.mkv", 1,
+                )
+                if recorder is not None:
+                    recorder("operation_retired", {
+                        "phase": "retirement",
+                        "classification": "command_error",
+                        "command_outcome": "error",
+                        "future_state": "finalized",
+                    })
+
+                retirements = [
+                    entry for entry in trace.snapshot()["entries"]
+                    if entry.get("message") == "queue_lifecycle_operation_retired"
+                ]
+                if expected_level is None:
+                    self.assertEqual([], retirements)
+                else:
+                    self.assertEqual(1, len(retirements))
+                    self.assertEqual(expected_level, retirements[0]["level"])
 
     def test_pending_autoqueue_dispatch_with_other_active_status_stays_ambiguous(self):
         file = ModelFile("fallback-autoqueue", False)

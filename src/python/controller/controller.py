@@ -78,7 +78,7 @@ _QUEUE_LIFECYCLE_TRACE_SCHEMA = "queue.lifecycle.v1"
 _QUEUE_LIFECYCLE_EVENTS = frozenset({
     "queue_admitted", "executor_start", "executor_return", "executor_error",
     "lftp_child", "status_membership", "root_default", "queue_retired",
-    "controller_force_close",
+    "controller_force_close", "operation_scheduled", "operation_retired",
 })
 _QUEUE_LIFECYCLE_PHASES = frozenset({
     "admission", "executor", "lftp", "status", "publication", "retirement",
@@ -87,7 +87,7 @@ _QUEUE_LIFECYCLE_PHASES = frozenset({
 })
 _QUEUE_LIFECYCLE_OUTCOMES = frozenset({
     "accepted", "entered", "returned", "success", "observed", "present", "absent",
-    "ambiguous", "published", "retired", "error", "unknown",
+    "ambiguous", "published", "retired", "scheduled", "error", "unknown",
 })
 _QUEUE_LIFECYCLE_ERROR_CLASSES = frozenset({
     "none", "eof", "exit", "signal", "timeout", "command_error",
@@ -119,6 +119,9 @@ _QUEUE_LIFECYCLE_ENUM_FIELDS = {
     "command_kind": _QUEUE_LIFECYCLE_COMMAND_KINDS,
     "command_outcome": _QUEUE_LIFECYCLE_COMMAND_OUTCOMES,
     "reaped": frozenset({"signal", "exit", "alive", "not_alive", "unknown"}),
+    # Future state is the only terminal fact not already expressed by the
+    # existing Queue lifecycle event names.  It retains no Future object.
+    "future_state": frozenset({"finalized", "pending", "unknown"}),
 }
 _QUEUE_LIFECYCLE_BOOL_FIELDS = frozenset({
     "fresh", "healthy", "process_alive_before", "process_alive_after", "process_alive",
@@ -129,6 +132,8 @@ _QUEUE_LIFECYCLE_BOUNDARIES = {
     "executor_start": "executor",
     "executor_return": "executor",
     "executor_error": "executor",
+    "operation_scheduled": "executor",
+    "operation_retired": "retirement",
     "lftp_child": "lftp_command",
     "status_membership": "status_membership",
     "root_default": "root_publication",
@@ -151,6 +156,8 @@ def _queue_lifecycle_project(event: object, fields: object) -> Optional[dict[str
         "executor_start": "executor",
         "executor_return": "executor",
         "executor_error": "executor",
+        "operation_scheduled": "executor",
+        "operation_retired": "retirement",
         "lftp_child": source_fields.get("phase"),
         "status_membership": "status",
         "root_default": "publication",
@@ -181,6 +188,8 @@ def _queue_lifecycle_project(event: object, fields: object) -> Optional[dict[str
         "executor_start": "entered",
         "executor_return": "returned",
         "executor_error": "error",
+        "operation_scheduled": "scheduled",
+        "operation_retired": "retired",
         "lftp_child": (
             safe_command_outcome if type(command_outcome) is str else "observed"
         ),
@@ -1807,6 +1816,11 @@ class Controller:
             if diagnostic_recorder is not None:
                 diagnostic_recorder("executor_error", {"classification": "command_error"})
             return False
+        if diagnostic_recorder is not None:
+            # ``submit`` returning a Future is the existing executor admission
+            # boundary. Keep the state projection fixed and do not retain the
+            # Future or backend return value in the Queue flow.
+            diagnostic_recorder("operation_scheduled", {})
         if executor_trace_enabled:
             self.__record_lftp_executor_observation(
                 executor_correlation, action, "enqueue_returned", "enqueued",
@@ -1899,17 +1913,6 @@ class Controller:
             if event == "lftp_child" and fields.get("phase") != "status":
                 detail_event = True
             initial_failure = event in {"executor_error", "controller_force_close"}
-            initial_level = "warning" if initial_failure else "debug" if detail_event else "info"
-            breadcrumb_enabled = _breadcrumb_effectively_enabled(
-                    breadcrumb_trace, _QUEUE_LIFECYCLE_TRACE_CATEGORY, initial_level,
-            )
-            ordinary_log_enabled = _breadcrumb_effectively_enabled(
-                breadcrumb_trace,
-                _QUEUE_LIFECYCLE_TRACE_CATEGORY,
-                "warning" if initial_failure else "info",
-            )
-            if not breadcrumb_enabled and not ordinary_log_enabled:
-                return
             try:
                 details = _queue_lifecycle_project(event, fields)
                 if details is None:
@@ -1921,6 +1924,16 @@ class Controller:
                 # Keep it informational unless the handoff carries an actual
                 # backend/transport failure classification.
                 level = "warning" if failure else "debug" if detail_event else "info"
+                breadcrumb_enabled = _breadcrumb_effectively_enabled(
+                    breadcrumb_trace, _QUEUE_LIFECYCLE_TRACE_CATEGORY, level,
+                )
+                ordinary_log_enabled = _breadcrumb_effectively_enabled(
+                    breadcrumb_trace,
+                    _QUEUE_LIFECYCLE_TRACE_CATEGORY,
+                    "warning" if failure else "info",
+                )
+                if not breadcrumb_enabled and not ordinary_log_enabled:
+                    return
                 recorder = getattr(breadcrumb_trace, "record", None)
                 if breadcrumb_enabled and _breadcrumb_effectively_enabled(
                         breadcrumb_trace, _QUEUE_LIFECYCLE_TRACE_CATEGORY, level,
@@ -2103,6 +2116,7 @@ class Controller:
             failed_operation_sequences = set()
             self.__lftp_failed_operation_sequences = failed_operation_sequences
         remaining: list[_LftpOperation] = []
+        retired_queue_operations: list[tuple[_LftpOperation, bool, bool, str]] = []
         for operation in operations:
             if not operation.future.done():
                 remaining.append(operation)
@@ -2146,6 +2160,12 @@ class Controller:
                 ),
             )
             operation_file_id = getattr(operation, "file_id", None)
+            if operation.action == "queue" and isinstance(operation_file_id, str) and \
+                    type(getattr(operation, "operation_sequence", None)) is int and \
+                    operation.operation_sequence > 0:
+                retired_queue_operations.append((
+                    operation, command_prompt_timed_out, failed, future_outcome,
+                ))
             if operation.action in ("queue", "stop") and operation_file_id is not None:
                 marker_observed = operation_file_id in self.__persist.stopped_file_names
                 if operation.action == "stop":
@@ -2271,6 +2291,28 @@ class Controller:
             self.__lftp_status_poll_correlation = None
             self.__lftp_idle_status_authoritative = False
         self.__lftp_operations = remaining
+        # The assignment above is the registry retirement boundary. Emit the
+        # terminal Queue projection only after the completed operation is no
+        # longer retained, while keeping all payloads fixed and identity-free.
+        for operation, command_prompt_timed_out, failed, future_outcome in retired_queue_operations:
+            recorder = self.__incoming_recovery_flow_recorder(
+                operation.file_id, operation.operation_sequence, create=False,
+            )
+            if recorder is None:
+                continue
+            if command_prompt_timed_out:
+                classification = "timeout"
+                command_outcome = "prompt_timeout"
+            else:
+                failed_outcome = failed or future_outcome in {"rejected", "error"}
+                classification = "command_error" if failed_outcome else "none"
+                command_outcome = "error" if failed_outcome else "success"
+            recorder("operation_retired", {
+                "phase": "retirement",
+                "classification": classification,
+                "command_outcome": command_outcome,
+                "future_state": "finalized",
+            })
 
     def __lftp_status_lineage_enabled(self) -> bool:
         """Check diagnostic policy before creating a poll correlation."""
