@@ -66,6 +66,18 @@ LFTP_STATUS_POLL_TRACE_FAILURE_PHASES = frozenset({
     "prompt_timeout", "process_eof", "command_error", "backend_error", "parse_error",
     "terminal_backlog",
 })
+LFTP_STATUS_POLL_PROMPT_OUTCOMES = frozenset({
+    "not_attempted", "ready", "empty", "timeout", "eof", "error", "unknown",
+})
+LFTP_STATUS_POLL_ERROR_CLASSES = frozenset({
+    "none", "timeout", "eof", "command_error", "parser_error", "terminal_backlog",
+    "unhealthy_snapshot", "unknown",
+})
+LFTP_STATUS_POLL_DRAIN_CLASSES = frozenset({
+    "empty", "queue_done", "job_or_progress", "prompt_or_echo", "error", "eof",
+    "terminal_backlog", "mixed", "unknown",
+})
+_LFTP_TRACE_LINE_SCAN_MAX_BYTES = 64 * 1024
 redact_credentials = redact_sensitive_text
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -431,6 +443,185 @@ def _lftp_trace_bytes_bucket(value: object) -> str:
     return "32768+"
 
 
+def _lftp_trace_line_count(value: object) -> int:
+    """Count only enough lines to select the fixed diagnostic bucket.
+
+    Status frames never cross the diagnostic boundary as text.  Bytes and
+    string values can count newlines directly; a BytesIO view avoids calling
+    pexpect's public ``buffer`` property (which materializes its full history).
+    The scan stops as soon as the largest bucket is reached.
+    """
+    try:
+        if isinstance(value, bytes):
+            if len(value) > _LFTP_TRACE_LINE_SCAN_MAX_BYTES:
+                value = value[:_LFTP_TRACE_LINE_SCAN_MAX_BYTES]
+                bounded = True
+            else:
+                bounded = False
+            newline_count = 0
+            for byte in value:
+                if byte == 10:
+                    newline_count += 1
+                    if newline_count >= 257:
+                        return 257
+            if bounded:
+                return -1
+            return min(257, newline_count + (1 if value and value[-1] != 10 else 0))
+        if isinstance(value, str):
+            if len(value) > _LFTP_TRACE_LINE_SCAN_MAX_BYTES:
+                value = value[:_LFTP_TRACE_LINE_SCAN_MAX_BYTES]
+                bounded = True
+            else:
+                bounded = False
+            newline_count = 0
+            for character in value:
+                if character == "\n":
+                    newline_count += 1
+                    if newline_count >= 257:
+                        return 257
+            if bounded:
+                return -1
+            return min(257, newline_count + (1 if value and value[-1] != "\n" else 0))
+        if isinstance(value, io.BytesIO):
+            view = value.getbuffer()
+            try:
+                bounded = view.nbytes > _LFTP_TRACE_LINE_SCAN_MAX_BYTES
+                newline_count = 0
+                for byte in view[:_LFTP_TRACE_LINE_SCAN_MAX_BYTES]:
+                    if byte == 10:
+                        newline_count += 1
+                        if newline_count >= 257:
+                            return 257
+                if bounded:
+                    return -1
+                last_byte = view[-1] if view.nbytes else None
+                return min(257, newline_count + (1 if last_byte is not None and last_byte != 10 else 0))
+            finally:
+                view.release()
+        if isinstance(value, io.StringIO):
+            # StringIO is used by the unit-test pexpect doubles.  Production
+            # pexpect uses BytesIO; retain this fallback for text-mode fakes.
+            position = value.tell()
+            if position > _LFTP_TRACE_LINE_SCAN_MAX_BYTES:
+                return -1
+            return _lftp_trace_line_count(value.getvalue())
+    except (AttributeError, TypeError, ValueError):
+        return -1
+    return -1
+
+
+def _lftp_trace_value_metrics(value: object) -> tuple[int, int]:
+    """Return privacy-safe (byte count, line count), never the frame itself."""
+    # A long Unicode string is already known to exceed the largest byte
+    # bucket; avoid allocating an encoded copy merely to prove that fact.
+    if isinstance(value, str) and len(value) > 32767:
+        byte_count = 32768
+    else:
+        try:
+            byte_count = _lftp_boundary_byte_count(value)
+        except (UnicodeError, TypeError, ValueError):
+            byte_count = -1
+    if byte_count < 0 and isinstance(value, io.BytesIO):
+        measured = _incoming_recovery_buffer_length(value)
+        byte_count = measured if measured is not None else -1
+    elif byte_count < 0 and isinstance(value, io.StringIO):
+        try:
+            byte_count = len(value.getvalue().encode("utf-8", "surrogateescape"))
+        except (AttributeError, UnicodeEncodeError, ValueError):
+            byte_count = -1
+    return byte_count, _lftp_trace_line_count(value)
+
+
+def _lftp_status_boundary_values(process: object) -> tuple[object, object]:
+    """Read status ``before`` and retained history without public-buffer expansion."""
+    try:
+        before = getattr(process, "before", None)
+    except Exception:
+        before = None
+    try:
+        attributes = vars(process)
+    except Exception:
+        attributes = {}
+    # pexpect's public ``buffer`` property calls getvalue() and can copy an
+    # arbitrarily large retained frame.  The private buffer is the history
+    # reader already owned by this process and is safe for structural sampling.
+    retained = attributes.get("_buffer")
+    return before, retained
+
+
+def _lftp_status_prompt_outcome(
+        phase: object, output: object, prompt_outcome: object,
+) -> str:
+    if isinstance(prompt_outcome, str) and prompt_outcome in LFTP_STATUS_POLL_PROMPT_OUTCOMES:
+        return prompt_outcome
+    if phase == "prompt_ready":
+        return "ready"
+    if phase == "prompt_timeout":
+        return "timeout"
+    if phase == "process_eof":
+        return "eof"
+    if phase in {"command_error", "backend_error", "parse_error", "terminal_backlog"}:
+        return "error"
+    if phase in {"jobs_read", "parse_started", "parse_complete"}:
+        return "empty" if output in (None, "", b"") else "ready"
+    return "unknown"
+
+
+def _lftp_status_error_class(
+        phase: object, failure_reason: object, exception: object,
+        error_class: object,
+) -> str:
+    if isinstance(error_class, str) and error_class in LFTP_STATUS_POLL_ERROR_CLASSES:
+        return error_class
+    if isinstance(failure_reason, str) and failure_reason in LFTP_STATUS_POLL_ERROR_CLASSES:
+        return failure_reason
+    if phase == "parse_error":
+        return "parser_error"
+    if phase == "terminal_backlog":
+        return "terminal_backlog"
+    if phase == "process_eof":
+        return "eof"
+    if phase == "prompt_timeout":
+        return "timeout"
+    if phase in {"command_error", "backend_error"}:
+        return "command_error"
+    if exception is not None:
+        family = _lftp_diagnostic_exception_family(exception)
+        return {"parser": "parser_error", "eof": "eof", "timeout": "timeout"}.get(
+            family, "command_error",
+        )
+    return "none"
+
+
+def _lftp_status_drain_class(
+        drain_class: object, queue_done: object, job_or_progress: object,
+        prompt_or_echo: object, error: object, byte_count: object,
+) -> str:
+    if isinstance(drain_class, str) and drain_class in LFTP_STATUS_POLL_DRAIN_CLASSES:
+        return drain_class
+    if type(byte_count) is int and byte_count == 0:
+        return "empty"
+    classes = [
+        bool(queue_done), bool(job_or_progress), bool(prompt_or_echo), bool(error),
+    ]
+    if classes.count(True) > 1:
+        return "mixed"
+    if error:
+        return "error"
+    if queue_done:
+        return "queue_done"
+    if job_or_progress:
+        return "job_or_progress"
+    if prompt_or_echo:
+        return "prompt_or_echo"
+    return "unknown"
+
+
+def _lftp_detect_errors_from_output(output: str) -> bool:
+    """Use the class detector from module-level diagnostic helpers."""
+    return Lftp._Lftp__detect_errors_from_output(output)
+
+
 def _record_lftp_preparse_stderr(correlation: object, output: object, process_alive: object,
                                  trace: object) -> None:
     """Emit one bounded, host-retrievable parser-entry record when explicitly enabled.
@@ -640,7 +831,7 @@ def _record_lftp_command_breadcrumb(
             output_class = "empty"
         elif "Connecting..." in output_text:
             output_class = "connecting"
-        elif Lftp.__detect_errors_from_output(output_text):
+        elif _lftp_detect_errors_from_output(output_text):
             output_class = "backend_error"
         else:
             output_class = "other"
@@ -688,8 +879,18 @@ def _record_lftp_status_poll_breadcrumb(
         status_count: object = None, healthy: object = None,
         exception: object = None, boundary: object = None,
         boundary_state: object = None,
+        raw_before: object = None, retained: object = None,
+        normalized: object = None, prompt_outcome: object = None,
+        error_class: object = None, pre_send_drain_class: object = None,
+        pre_send_drain_bytes: object = None,
 ) -> None:
-    """Record bounded PTY status phases without command, output, or path data."""
+    """Record bounded PTY status phases without command, output, or path data.
+
+    ``raw_before``, ``retained`` and ``normalized`` are sampled only as
+    structural values.  The values themselves never enter the breadcrumb;
+    this is intentionally a pre-collapse discriminator for prompt versus
+    parser boundaries, not a second status-output transport.
+    """
     safe_correlation = _safe_lftp_status_poll_correlation(correlation)
     if safe_correlation is None or phase not in LFTP_STATUS_POLL_TRACE_PHASES:
         return
@@ -705,7 +906,7 @@ def _record_lftp_status_poll_breadcrumb(
             output_class = "empty"
         elif "Connecting..." in output_text:
             output_class = "connecting"
-        elif Lftp.__detect_errors_from_output(output_text):
+        elif _lftp_detect_errors_from_output(output_text):
             output_class = "backend_error"
         else:
             output_class = "other"
@@ -729,16 +930,48 @@ def _record_lftp_status_poll_breadcrumb(
             "schema": LFTP_STATUS_POLL_TRACE_SCHEMA,
             "phase": phase,
             "boundary": boundary,
-            "stage": boundary,
             "outcome": phase,
             "process_alive": process_alive is True,
             "output_class": output_class,
             "read_buffer_byte_length_bucket": _lftp_trace_bytes_bucket(
-                len(output_text.encode("utf-8", "surrogateescape")),
+                _lftp_trace_value_metrics(output_text)[0],
             ),
             "failure_reason": failure_reason,
             "status_count_bucket": _lftp_trace_count_bucket(status_count),
         }
+        raw_before_bytes, raw_before_lines = _lftp_trace_value_metrics(raw_before)
+        retained_bytes, retained_lines = _lftp_trace_value_metrics(retained)
+        normalized_value = output if normalized is None else normalized
+        normalized_bytes, normalized_lines = _lftp_trace_value_metrics(normalized_value)
+        details.update({
+            "raw_before_byte_length_bucket": _lftp_trace_bytes_bucket(raw_before_bytes),
+            "raw_before_line_count_bucket": _lftp_trace_count_bucket(raw_before_lines),
+            "retained_byte_length_bucket": _lftp_trace_bytes_bucket(retained_bytes),
+            "retained_line_count_bucket": _lftp_trace_count_bucket(retained_lines),
+            "normalized_byte_length_bucket": _lftp_trace_bytes_bucket(normalized_bytes),
+            "normalized_line_count_bucket": _lftp_trace_count_bucket(normalized_lines),
+            "prompt_outcome": _lftp_status_prompt_outcome(phase, output, prompt_outcome),
+            "error_class": _lftp_status_error_class(
+                phase, failure_reason, exception, error_class,
+            ),
+            "pre_send_drain_class": _lftp_status_drain_class(
+                pre_send_drain_class,
+                (boundary_state or {}).get("pre_send_drain_queue_done")
+                if isinstance(boundary_state, dict) else None,
+                (boundary_state or {}).get("pre_send_drain_job_or_progress")
+                if isinstance(boundary_state, dict) else None,
+                (boundary_state or {}).get("pre_send_drain_prompt_or_echo")
+                if isinstance(boundary_state, dict) else None,
+                (boundary_state or {}).get("pre_send_drain_error")
+                if isinstance(boundary_state, dict) else None,
+                pre_send_drain_bytes,
+            ),
+            # The collector stamps the wall-clock ``created_ns`` on the
+            # record; this explicit pair also helps callback/test recorders
+            # that do not provide the collector's outer timestamp.
+            "wall_time_ns": time.time_ns(),
+        })
+        details["monotonic_time_ns"] = time.monotonic_ns()
         if isinstance(boundary_state, dict):
             details.update({key: value for key, value in boundary_state.items()
                             if key in {"prior_prompt", "send_admitted", "prompt_reached", "retained_before"}})
@@ -1202,9 +1435,10 @@ class Lftp:
         saw_job_or_progress = False
         saw_prompt_or_echo = False
         drained_byte_count = 0
+        drained_line_count = 0
         def observe(value: object) -> None:
             nonlocal evidence_tail, saw_backend_error, saw_host_key_prompt, saw_queue_done, \
-                saw_job_or_progress, saw_prompt_or_echo, drained_byte_count
+                saw_job_or_progress, saw_prompt_or_echo, drained_byte_count, drained_line_count
             if not isinstance(value, (str, bytes)):
                 return
             text = self.__decode_spawn_output(value)
@@ -1222,6 +1456,12 @@ class Lftp:
                 drained_byte_count += len(text.encode("utf-8", "surrogateescape"))
             except UnicodeEncodeError:
                 drained_byte_count = -1
+            if drained_line_count >= 0:
+                current_lines = _lftp_trace_line_count(text)
+                if current_lines < 0:
+                    drained_line_count = -1
+                else:
+                    drained_line_count = min(257, drained_line_count + current_lines)
             lines = [line.strip() for line in combined.splitlines() if line.strip()]
             saw_queue_done = saw_queue_done or any(
                 re.match(r"^\[\d+\]\s+Done\s+\(queue\s+\(", line) for line in lines
@@ -1241,13 +1481,32 @@ class Lftp:
                 previous_bytes = observation.get("_pre_send_drain_bytes", 0)
                 total_bytes = previous_bytes + drained_byte_count \
                     if type(previous_bytes) is int and previous_bytes >= 0 and drained_byte_count >= 0 else -1
+                previous_lines = observation.get("_pre_send_drain_lines", 0)
+                total_lines = previous_lines + drained_line_count \
+                    if type(previous_lines) is int and previous_lines >= 0 and drained_line_count >= 0 else -1
+                queue_done = bool(observation.get("_pre_send_drain_queue_done")) or saw_queue_done
+                job_or_progress = bool(observation.get("_pre_send_drain_job_or_progress")) or saw_job_or_progress
+                prompt_or_echo = bool(observation.get("_pre_send_drain_prompt_or_echo")) or saw_prompt_or_echo
+                drain_error = bool(observation.get("_pre_send_drain_error")) or \
+                    saw_backend_error or saw_host_key_prompt
+                drain_class = _lftp_status_drain_class(
+                    None, queue_done, job_or_progress, prompt_or_echo,
+                    drain_error, total_bytes,
+                )
+                if failure == "eof":
+                    drain_class = "eof"
+                elif failure == "terminal_backlog":
+                    drain_class = "terminal_backlog"
+                elif failure == "command_error" and drain_class == "empty":
+                    drain_class = "error"
                 observation.update({
                     "_pre_send_drain_bytes": total_bytes,
-                    "_pre_send_drain_queue_done": bool(observation.get("_pre_send_drain_queue_done")) or saw_queue_done,
-                    "_pre_send_drain_job_or_progress": bool(observation.get("_pre_send_drain_job_or_progress")) or saw_job_or_progress,
-                    "_pre_send_drain_prompt_or_echo": bool(observation.get("_pre_send_drain_prompt_or_echo")) or saw_prompt_or_echo,
-                    "_pre_send_drain_error": bool(observation.get("_pre_send_drain_error")) or
-                    saw_backend_error or saw_host_key_prompt,
+                    "_pre_send_drain_lines": total_lines,
+                    "_pre_send_drain_queue_done": queue_done,
+                    "_pre_send_drain_job_or_progress": job_or_progress,
+                    "_pre_send_drain_prompt_or_echo": prompt_or_echo,
+                    "_pre_send_drain_error": drain_error,
+                    "_pre_send_drain_class": drain_class,
                 })
                 self.__last_incoming_recovery_status_observation = observation
             return failure
@@ -1335,6 +1594,22 @@ class Lftp:
         safe_status_poll_correlation = _safe_lftp_status_poll_correlation(trace_status_poll_correlation)
         pty_trace = getattr(self, "_Lftp__breadcrumb_trace", None)
         pty_flow_id = _safe_lftp_pty_correlation(trace_pty_correlation)
+        status_trace_enabled = safe_status_poll_correlation is not None and (
+            _breadcrumb_effectively_enabled(pty_trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug") or
+            _breadcrumb_effectively_enabled(pty_trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "warning")
+        )
+        status_boundary = {
+            "raw_before": None,
+            "retained": None,
+            "normalized": None,
+            "prompt_outcome": None,
+            "error_class": None,
+            "pre_send_drain_class": None,
+            "pre_send_drain_bytes": None,
+        }
+        if status_trace_enabled:
+            status_boundary["raw_before"], status_boundary["retained"] = \
+                _lftp_status_boundary_values(self.__process)
         diagnostic_started_at = time.monotonic() if callable(diagnostic_recorder) else None
         diagnostic_recorded = False
         try:
@@ -1392,7 +1667,8 @@ class Lftp:
         def record_status_trace(phase: str, output: object = None,
                                 failure_reason: object = None, status_count: object = None,
                                 exception: object = None, healthy: object = None,
-                                boundary: object = None, boundary_state: object = None) -> None:
+                                boundary: object = None, boundary_state: object = None,
+                                prompt_outcome: object = None, error_class: object = None) -> None:
             if safe_status_poll_correlation is None:
                 return
             trace = getattr(self, "_Lftp__breadcrumb_trace", None)
@@ -1409,6 +1685,15 @@ class Lftp:
                 process_alive=process_alive, output=output, failure_reason=failure_reason,
                 status_count=status_count, exception=exception, healthy=healthy,
                 boundary=boundary, boundary_state=boundary_state,
+                raw_before=status_boundary.get("raw_before"),
+                retained=status_boundary.get("retained"),
+                normalized=status_boundary.get("normalized"),
+                prompt_outcome=(status_boundary.get("prompt_outcome")
+                                if prompt_outcome is None else prompt_outcome),
+                error_class=(status_boundary.get("error_class")
+                             if error_class is None else error_class),
+                pre_send_drain_class=status_boundary.get("pre_send_drain_class"),
+                pre_send_drain_bytes=status_boundary.get("pre_send_drain_bytes"),
             )
         if status_poll:
             status_poll_timeout_seconds = STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS if timeout_seconds == 0 else timeout_seconds
@@ -1425,9 +1710,21 @@ class Lftp:
                 pty_readiness = "ready"
             if status_poll:
                 terminal_failure = self.__drain_status_poll_terminal(
-                    callable(diagnostic_recorder),
+                    callable(diagnostic_recorder) or status_trace_enabled,
                 )
+                if status_trace_enabled:
+                    status_boundary["pre_send_drain_class"] = (
+                        getattr(self, "_Lftp__last_incoming_recovery_status_observation", {}) or {}
+                    ).get("_pre_send_drain_class")
+                    status_boundary["pre_send_drain_bytes"] = (
+                        getattr(self, "_Lftp__last_incoming_recovery_status_observation", {}) or {}
+                    ).get("_pre_send_drain_bytes")
                 if terminal_failure is not None:
+                    if status_trace_enabled:
+                        status_boundary["pre_send_drain_class"] = (
+                            "terminal_backlog" if terminal_failure == "terminal_backlog" else
+                            "eof" if terminal_failure == "eof" else "error"
+                        )
                     record_diagnostic_child(classification=terminal_failure, phase="drain")
                     self.__last_command_timed_out = True
                     self.__last_status_poll_failure_reason = terminal_failure
@@ -1526,6 +1823,9 @@ class Lftp:
                                 record_diagnostic_child(exc, phase="prompt")
                                 self.__last_command_timed_out = True
                                 self.__last_status_poll_failure_reason = "eof"
+                                if status_trace_enabled:
+                                    status_boundary["prompt_outcome"] = "eof"
+                                    status_boundary["error_class"] = "eof"
                                 record_status_trace("process_eof", failure_reason="eof", exception=exc)
                                 self.logger.error("Lftp process died unexpectedly (EOF)")
                                 raise LftpError("Lftp process terminated: {}".format(
@@ -1535,6 +1835,9 @@ class Lftp:
                         record_diagnostic_child(exc, "command_error", "prompt")
                         self.__last_command_timed_out = True
                         self.__last_status_poll_failure_reason = "command_error"
+                        if status_trace_enabled:
+                            status_boundary["prompt_outcome"] = "error"
+                            status_boundary["error_class"] = "command_error"
                         record_status_trace("command_error", failure_reason="command_error", exception=exc)
                         self.logger.warning("Ignoring status poll failure: {}".format(exc))
                         return ""
@@ -1542,6 +1845,9 @@ class Lftp:
                         record_diagnostic_child(exc, "command_error", "prompt")
                         self.__last_command_timed_out = True
                         self.__last_status_poll_failure_reason = "command_error"
+                        if status_trace_enabled:
+                            status_boundary["prompt_outcome"] = "error"
+                            status_boundary["error_class"] = "command_error"
                         record_status_trace("command_error", failure_reason="command_error", exception=exc)
                         self.logger.warning("Ignoring status poll failure: {}".format(exc))
                         return ""
@@ -1581,7 +1887,12 @@ class Lftp:
                             self.__normalize_output(self.__decode_spawn_output(self.__process.before))
                         ))
             finally:
+                if status_poll and status_trace_enabled:
+                    status_boundary["raw_before"], status_boundary["retained"] = \
+                        _lftp_status_boundary_values(self.__process)
                 out = self.__normalize_output(self.__decode_spawn_output(self.__process.before))
+                if status_poll and status_trace_enabled:
+                    status_boundary["normalized"] = out
 
                 if log_command_output:
                     if status_poll:
@@ -1592,6 +1903,11 @@ class Lftp:
                     self.logger.debug("after: {}".format(after))
 
             if status_poll:
+                if status_trace_enabled:
+                    status_boundary["prompt_outcome"] = (
+                        "ready" if prompt_reached and out else
+                        "empty" if prompt_reached else "timeout"
+                    )
                 record_status_trace("jobs_read", out, boundary_state={
                     "prior_prompt": pty_readiness,
                     "send_admitted": True,
@@ -1612,6 +1928,10 @@ class Lftp:
                     connecting_grace_timeout = max(status_poll_timeout_seconds or 0, 5.0)
                     self.__process.expect(self.__expect_pattern, timeout=connecting_grace_timeout)
                     final_prompt_reached = True
+                    if status_trace_enabled:
+                        status_boundary["raw_before"], status_boundary["retained"] = \
+                            _lftp_status_boundary_values(self.__process)
+                        status_boundary["prompt_outcome"] = "ready"
                     record_status_trace("prompt_ready")
                 except pexpect.exceptions.TIMEOUT:
                     record_diagnostic_child(classification="timeout", phase="connecting")
@@ -1620,11 +1940,19 @@ class Lftp:
                     record_diagnostic_child(exc, phase="connecting")
                     self.__last_command_timed_out = True
                     self.__last_status_poll_failure_reason = "eof"
+                    if status_trace_enabled:
+                        status_boundary["prompt_outcome"] = "eof"
+                        status_boundary["error_class"] = "eof"
                     record_status_trace("process_eof", failure_reason="eof", exception=exc)
                     self.logger.error("Lftp process died unexpectedly (EOF) during status poll recovery")
                     raise LftpError("Lftp process terminated during status poll recovery")
                 finally:
                     out = self.__normalize_output(self.__decode_spawn_output(self.__process.before))
+                    if status_trace_enabled:
+                        status_boundary["raw_before"], status_boundary["retained"] = \
+                            _lftp_status_boundary_values(self.__process)
+                        status_boundary["normalized"] = out
+                        status_boundary["prompt_outcome"] = "ready" if out else "empty"
 
             if status_poll and not prompt_reached and not recovered_output_preserved and not self.__detect_errors_from_output(out):
                 out = ""
@@ -1636,6 +1964,9 @@ class Lftp:
 
             # let's try and detect some errors
             if self.__detect_errors_from_output(out):
+                if status_poll and status_trace_enabled:
+                    status_boundary["prompt_outcome"] = "error"
+                    status_boundary["error_class"] = "command_error"
                 record_command_trace("backend_error", out)
                 record_status_trace("backend_error", out, failure_reason="command_error")
                 record_diagnostic_child(
@@ -1898,9 +2229,14 @@ class Lftp:
         fields = {
             "status_result_shape", "status_recovery", "status_preceded_timeout",
             "pre_send_drain_shape", "pre_send_drain_byte_length_bucket",
+            "pre_send_drain_line_count_bucket", "pre_send_drain_class",
             "pre_send_drain_queue_done", "pre_send_drain_job_or_progress",
             "pre_send_drain_prompt_or_echo", "pre_send_drain_error", "post_send_prompt",
             "process_alive", "read_buffer_source", "read_buffer_byte_length_bucket",
+            "raw_before_byte_length_bucket", "raw_before_line_count_bucket",
+            "retained_byte_length_bucket", "retained_line_count_bucket",
+            "normalized_byte_length_bucket", "normalized_line_count_bucket",
+            "prompt_outcome", "error_class", "wall_time_ns", "monotonic_time_ns",
         }
         return {field: observation[field] for field in fields if field in observation}
 
@@ -1923,6 +2259,23 @@ class Lftp:
         prior = getattr(self, "_Lftp__last_incoming_recovery_status_observation", None)
         prior = prior if isinstance(prior, dict) else {}
         drain_bytes = prior.get("_pre_send_drain_bytes", -1)
+        drain_lines = prior.get("_pre_send_drain_lines", -1)
+        raw_before, retained = _lftp_status_boundary_values(process)
+        raw_before_bytes, raw_before_lines = _lftp_trace_value_metrics(raw_before)
+        retained_bytes, retained_lines = _lftp_trace_value_metrics(retained)
+        normalized_bytes, normalized_lines = _lftp_trace_value_metrics(output)
+        prompt_outcome = (
+            "timeout" if preceded_timeout is True else
+            "error" if statuses is None else
+            "empty" if prior.get("_post_send_prompt") == "reached" and output in (None, "", b"") else
+            "ready" if prior.get("_post_send_prompt") == "reached" else
+            "unknown"
+        )
+        failure_reason = self.__last_status_poll_failure_reason
+        error_class = _lftp_status_error_class(
+            "parse_error" if statuses is None else "health",
+            failure_reason, None, failure_reason,
+        )
         drain_marked = any(prior.get(field) is True for field in (
             "_pre_send_drain_queue_done", "_pre_send_drain_job_or_progress",
             "_pre_send_drain_prompt_or_echo", "_pre_send_drain_error",
@@ -1932,7 +2285,16 @@ class Lftp:
             "status_recovery": recovery if recovery in _INCOMING_RECOVERY_STATUS_RECOVERIES else "unknown",
             "status_preceded_timeout": preceded_timeout if type(preceded_timeout) is bool else None,
             "pre_send_drain_shape": "empty" if drain_bytes == 0 else "marked" if drain_marked else "unknown",
+            "pre_send_drain_class": _lftp_status_drain_class(
+                prior.get("_pre_send_drain_class"),
+                prior.get("_pre_send_drain_queue_done"),
+                prior.get("_pre_send_drain_job_or_progress"),
+                prior.get("_pre_send_drain_prompt_or_echo"),
+                prior.get("_pre_send_drain_error"),
+                drain_bytes,
+            ),
             "pre_send_drain_byte_length_bucket": _lftp_trace_bytes_bucket(drain_bytes),
+            "pre_send_drain_line_count_bucket": _lftp_trace_count_bucket(drain_lines),
             "pre_send_drain_queue_done": prior.get("_pre_send_drain_queue_done") is True,
             "pre_send_drain_job_or_progress": prior.get("_pre_send_drain_job_or_progress") is True,
             "pre_send_drain_prompt_or_echo": prior.get("_pre_send_drain_prompt_or_echo") is True,
@@ -1942,6 +2304,16 @@ class Lftp:
             "process_alive": alive if type(alive) is bool else None,
             "read_buffer_source": buffer_source,
             "read_buffer_byte_length_bucket": buffer_bucket,
+            "raw_before_byte_length_bucket": _lftp_trace_bytes_bucket(raw_before_bytes),
+            "raw_before_line_count_bucket": _lftp_trace_count_bucket(raw_before_lines),
+            "retained_byte_length_bucket": _lftp_trace_bytes_bucket(retained_bytes),
+            "retained_line_count_bucket": _lftp_trace_count_bucket(retained_lines),
+            "normalized_byte_length_bucket": _lftp_trace_bytes_bucket(normalized_bytes),
+            "normalized_line_count_bucket": _lftp_trace_count_bucket(normalized_lines),
+            "prompt_outcome": prompt_outcome,
+            "error_class": error_class,
+            "wall_time_ns": time.time_ns(),
+            "monotonic_time_ns": time.monotonic_ns(),
         }
 
     def __record_incoming_recovery_status_completion(
@@ -2005,25 +2377,46 @@ class Lftp:
                 process_alive = self.__process.isalive()
             except Exception:
                 process_alive = False
+            raw_before, retained = _lftp_status_boundary_values(self.__process)
+            observation = getattr(self, "_Lftp__last_incoming_recovery_status_observation", None)
+            observation = observation if isinstance(observation, dict) else {}
+            safe_failure_reason = (self.__last_status_poll_failure_reason
+                                   if failure_reason is None else failure_reason)
+            observed_prompt_outcome = (
+                "timeout" if self.__last_command_timed_out is True else
+                "error" if isinstance(exception, LftpJobStatusParserError) else None
+            )
             _record_lftp_status_poll_breadcrumb(
                 trace, safe_trace_poll_correlation, phase,
                 process_alive=process_alive, output=output,
-                failure_reason=(self.__last_status_poll_failure_reason
-                                if failure_reason is None else failure_reason),
+                failure_reason=safe_failure_reason,
                 status_count=status_count, exception=exception, healthy=healthy,
+                raw_before=raw_before, retained=retained, normalized=output,
+                prompt_outcome=observed_prompt_outcome,
+                error_class=safe_failure_reason,
+                pre_send_drain_class=observation.get("_pre_send_drain_class"),
+                pre_send_drain_bytes=observation.get("_pre_send_drain_bytes"),
+                boundary_state={
+                    "pre_send_drain_queue_done": observation.get("_pre_send_drain_queue_done") is True,
+                    "pre_send_drain_job_or_progress": observation.get("_pre_send_drain_job_or_progress") is True,
+                    "pre_send_drain_prompt_or_echo": observation.get("_pre_send_drain_prompt_or_echo") is True,
+                    "pre_send_drain_error": observation.get("_pre_send_drain_error") is True,
+                },
             )
 
         def capture_private_frame(output: object, process_alive: object) -> None:
             process = getattr(self, "_Lftp__process", None)
+            before, retained = _lftp_status_boundary_values(process)
+            retained_length = _incoming_recovery_buffer_length(retained)
             _lftp_private_status_frame_capture(
                 safe_trace_poll_correlation, output, process_alive,
                 getattr(self, "_Lftp__breadcrumb_trace", None),
                 {
                     "pexpect_version": str(getattr(pexpect, "__version__", "unknown")),
                     "command_timed_out": self.__last_command_timed_out is True,
-                    "before_byte_count": _lftp_boundary_byte_count(getattr(process, "before", None)),
+                    "before_byte_count": _lftp_boundary_byte_count(before),
                     "after_byte_count": _lftp_boundary_byte_count(getattr(process, "after", None)),
-                    "buffer_byte_count": _lftp_boundary_byte_count(getattr(process, "buffer", None)),
+                    "buffer_byte_count": retained_length if retained_length is not None else -1,
                 },
             )
         try:

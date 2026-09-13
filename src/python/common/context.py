@@ -4,6 +4,7 @@ import logging
 import json
 import copy
 import collections
+import os
 from typing import Any, Mapping, Optional
 
 # my libs
@@ -74,6 +75,13 @@ class Context:
             memory_budget_bytes=self.__breadcrumb_trace_memory_budget_bytes(),
             policy=self.__breadcrumb_trace_policy(),
             policy_persist=self.__persist_breadcrumb_trace_policy,
+            # Durable capture is the same temporary diagnostic opt-in as the
+            # existing breadcrumb trace gate. It remains off by default and
+            # has no independent arbitrary path setting.
+            durable_enabled=False,
+            durable_path=self.__breadcrumb_trace_durable_path(),
+            durable_enabled_getter=self.__breadcrumb_trace_enabled,
+            durable_path_getter=self.__breadcrumb_trace_durable_path,
         )
         self.performance_diagnostics = performance_diagnostics if performance_diagnostics is not None else \
             PerformanceDiagnosticsCollector(
@@ -127,6 +135,13 @@ class Context:
             # Config loading validates this field.  Keep Context construction
             # fail-safe for test doubles and legacy callers that bypass Config.
             return parse_breadcrumb_trace_policy(DEFAULT_BREADCRUMB_TRACE_POLICY)
+
+    def __breadcrumb_trace_durable_path(self) -> Optional[str]:
+        # ``logdir`` is already the application's owned logging root. Keep
+        # durable breadcrumbs in a fixed child directory; there is no
+        # caller-configurable durable path.
+        logdir = getattr(getattr(self, "args", None), "logdir", None)
+        return os.path.join(logdir, "breadcrumbs") if isinstance(logdir, str) and logdir else None
 
     def __persist_breadcrumb_trace_policy(self, policy: Mapping[str, object]) -> None:
         """Persist policy atomically through Config's existing owner/lock."""

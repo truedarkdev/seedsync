@@ -233,6 +233,7 @@ class Seedsync:
         ctx_args.debug = is_debug
         ctx_args.exit = args.exit
         ctx_args.web_bind_host = Seedsync._resolve_normal_web_bind_host(args.web_bind_host)
+        ctx_args.logdir = args.logdir
 
         # Logger setup
         # We separate the main log from the web-access log
@@ -322,9 +323,44 @@ class Seedsync:
         try:
             return self._run_with_exclusion()
         finally:
-            exclusion = getattr(self, "runtime_exclusion", None)
-            if exclusion is not None:
-                exclusion.release()
+            try:
+                # Keep the runtime exclusion until the recorder has reached
+                # terminal or truthful incomplete closure.  Releasing it
+                # first allows a replacement runtime to start while the old
+                # recorder still owns live queues/files.
+                recorder_retired = self._close_breadcrumb_trace()
+            finally:
+                # Breadcrumb capture is diagnostic-only. Its bounded close
+                # must never mask the service's shutdown or final persistence.
+                exclusion = getattr(self, "runtime_exclusion", None)
+                # An INCOMPLETE recorder with a live writer still owns its
+                # queues/files. Keep the runtime exclusion held rather than
+                # allowing a replacement runtime to create a second owner.
+                if exclusion is not None and recorder_retired:
+                    exclusion.release()
+
+    def _close_breadcrumb_trace(self) -> bool:
+        trace = getattr(getattr(self, "context", None), "breadcrumb_trace", None)
+        if trace is None:
+            return True
+        try:
+            result = trace.close()
+            if isinstance(result, dict):
+                return not bool(
+                    result.get("thread_alive")
+                    or result.get("ingress_drainer_alive")
+                    or result.get("ingress_queues_open")
+                    or not result.get("collector_retired", False)
+                )
+            return True
+        except Exception:
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                try:
+                    logger.exception("Breadcrumb diagnostic capture failed to close")
+                except Exception:
+                    pass
+            return False
 
     def _run_with_exclusion(self):
         if getattr(self, "restore_exit_requested", False):
