@@ -80,6 +80,9 @@ LFTP_STATUS_POLL_DRAIN_CLASSES = frozenset({
     "empty", "queue_done", "job_or_progress", "prompt_or_echo", "error", "eof",
     "terminal_backlog", "mixed", "unknown",
 })
+LFTP_STATUS_POLL_DRAIN_TERMINATIONS = frozenset({
+    "quiet_timeout", "empty_read", "terminal_backlog", "eof", "command_error", "unknown",
+})
 _LFTP_TRACE_LINE_SCAN_MAX_BYTES = 64 * 1024
 redact_credentials = redact_sensitive_text
 _P = ParamSpec("_P")
@@ -776,6 +779,9 @@ def _lftp_private_status_relation_capture(
         drain_lines = safe_observation.get("_pre_send_drain_lines")
         fresh_bytes = safe_observation.get("_pre_send_drain_fresh_bytes")
         fresh_lines = safe_observation.get("_pre_send_drain_fresh_lines")
+        drain_termination = safe_observation.get("_pre_send_drain_termination")
+        if drain_termination not in LFTP_STATUS_POLL_DRAIN_TERMINATIONS:
+            drain_termination = "unknown"
         fresh_present = (
             "present" if type(fresh_bytes) is int and fresh_bytes > 0 else
             "none" if type(fresh_bytes) is int and fresh_bytes == 0 else
@@ -799,6 +805,7 @@ def _lftp_private_status_relation_capture(
             "monotonic_elapsed_ns": elapsed_ns,
             "process_alive": process_alive is True,
             "drain_class": drain_class,
+            "drain_termination": drain_termination,
             "drain_byte_length_bucket": _lftp_trace_bytes_bucket(drain_bytes),
             "drain_line_count_bucket": _lftp_trace_count_bucket(drain_lines),
             "fresh_read_present": fresh_present,
@@ -809,6 +816,12 @@ def _lftp_private_status_relation_capture(
             ) is True,
             "fresh_read_job_or_progress": safe_observation.get(
                 "_pre_send_drain_fresh_job_or_progress"
+            ) is True,
+            "fresh_read_command_echo": safe_observation.get(
+                "_pre_send_drain_fresh_command_echo"
+            ) is True,
+            "fresh_read_prompt_match": safe_observation.get(
+                "_pre_send_drain_fresh_prompt_match"
             ) is True,
             "fresh_read_prompt_or_echo": safe_observation.get(
                 "_pre_send_drain_fresh_prompt_or_echo"
@@ -1600,6 +1613,8 @@ class Lftp:
         fresh_evidence_tail = ""
         fresh_saw_queue_done = False
         fresh_saw_job_or_progress = False
+        fresh_saw_command_echo = False
+        fresh_saw_prompt_match = False
         fresh_saw_prompt_or_echo = False
         fresh_saw_error = False
 
@@ -1607,7 +1622,8 @@ class Lftp:
             nonlocal evidence_tail, fresh_evidence_tail, saw_backend_error, saw_host_key_prompt, saw_queue_done, \
                 saw_job_or_progress, saw_prompt_or_echo, drained_byte_count, drained_line_count, \
                 retained_byte_count, retained_line_count, fresh_byte_count, fresh_line_count, \
-                fresh_saw_queue_done, fresh_saw_job_or_progress, fresh_saw_prompt_or_echo, fresh_saw_error
+                fresh_saw_queue_done, fresh_saw_job_or_progress, fresh_saw_command_echo, \
+                fresh_saw_prompt_match, fresh_saw_prompt_or_echo, fresh_saw_error
             if not isinstance(value, (str, bytes)):
                 return
             text = self.__decode_spawn_output(value)
@@ -1678,14 +1694,16 @@ class Lftp:
                     re.search(r"\b\d+/\d+\s+\(\d+%\)", line)
                     for line in [line.strip() for line in fresh_combined.splitlines() if line.strip()]
                 )
-                fresh_saw_prompt_or_echo = fresh_saw_prompt_or_echo or "jobs -v" in fresh_combined or bool(
-                    re.search(self.__expect_pattern, fresh_combined)
-                )
+                fresh_command_echo = "jobs -v" in fresh_combined
+                fresh_prompt_match = bool(re.search(self.__expect_pattern, fresh_combined))
+                fresh_saw_command_echo = fresh_saw_command_echo or fresh_command_echo
+                fresh_saw_prompt_match = fresh_saw_prompt_match or fresh_prompt_match
+                fresh_saw_prompt_or_echo = fresh_saw_prompt_or_echo or fresh_command_echo or fresh_prompt_match
                 fresh_saw_error = fresh_saw_error or self.__detect_errors_from_output(fresh_combined) or \
                     self.__detect_ssh_host_key_prompt(fresh_combined)
                 fresh_evidence_tail = fresh_combined[-1024:]
 
-        def finish(failure: Optional[str]) -> Optional[str]:
+        def finish(failure: Optional[str], termination: Optional[str] = None) -> Optional[str]:
             if diagnostic_enabled:
                 observation = getattr(self, "_Lftp__last_incoming_recovery_status_observation", None)
                 observation = dict(observation) if isinstance(observation, dict) else {}
@@ -1720,8 +1738,12 @@ class Lftp:
                     fresh_saw_queue_done
                 fresh_job_or_progress = bool(observation.get("_pre_send_drain_fresh_job_or_progress")) or \
                     fresh_saw_job_or_progress
+                fresh_command_echo = bool(observation.get("_pre_send_drain_fresh_command_echo")) or \
+                    fresh_saw_command_echo
+                fresh_prompt_match = bool(observation.get("_pre_send_drain_fresh_prompt_match")) or \
+                    fresh_saw_prompt_match
                 fresh_prompt_or_echo = bool(observation.get("_pre_send_drain_fresh_prompt_or_echo")) or \
-                    fresh_saw_prompt_or_echo
+                    fresh_saw_prompt_or_echo or fresh_command_echo or fresh_prompt_match
                 fresh_error = bool(observation.get("_pre_send_drain_fresh_error")) or fresh_saw_error
                 drain_class = _lftp_status_drain_class(
                     None, queue_done, job_or_progress, prompt_or_echo,
@@ -1733,6 +1755,10 @@ class Lftp:
                     drain_class = "terminal_backlog"
                 elif failure == "command_error" and drain_class == "empty":
                     drain_class = "error"
+                drain_termination = (
+                    termination if termination in LFTP_STATUS_POLL_DRAIN_TERMINATIONS else
+                    "unknown"
+                )
                 observation.update({
                     "_pre_send_drain_bytes": total_bytes,
                     "_pre_send_drain_lines": total_lines,
@@ -1746,9 +1772,12 @@ class Lftp:
                     "_pre_send_drain_error": drain_error,
                     "_pre_send_drain_fresh_queue_done": fresh_queue_done,
                     "_pre_send_drain_fresh_job_or_progress": fresh_job_or_progress,
+                    "_pre_send_drain_fresh_command_echo": fresh_command_echo,
+                    "_pre_send_drain_fresh_prompt_match": fresh_prompt_match,
                     "_pre_send_drain_fresh_prompt_or_echo": fresh_prompt_or_echo,
                     "_pre_send_drain_fresh_error": fresh_error,
                     "_pre_send_drain_class": drain_class,
+                    "_pre_send_drain_termination": drain_termination,
                 })
                 self.__last_incoming_recovery_status_observation = observation
             return failure
@@ -1791,9 +1820,9 @@ class Lftp:
             replace_retained(process.buffer_type().getvalue())
         process.after = None
         if terminal_error() is not None:
-            return finish("command_error")
+            return finish("command_error", "command_error")
         if remaining <= 0:
-            return finish("terminal_backlog")
+            return finish("terminal_backlog", "terminal_backlog")
 
         while remaining > 0:
             try:
@@ -1801,17 +1830,22 @@ class Lftp:
                     size=min(STATUS_POLL_TERMINAL_DRAIN_READ_BYTES, remaining), timeout=0,
                 )
             except pexpect.exceptions.TIMEOUT:
-                return finish(terminal_error())
+                # A nonblocking read timeout only means no byte arrived during
+                # this bounded drain; echo without a prompt is not proof of a
+                # prompt mismatch.
+                return finish(terminal_error(), "quiet_timeout")
             except pexpect.exceptions.EOF:
-                return finish("eof")
+                return finish("eof", "eof")
             if not isinstance(chunk, (str, bytes)) or not chunk:
-                return finish(terminal_error())
+                return finish(terminal_error(), "empty_read")
             observe(chunk, fresh=True)
             remaining -= len(chunk)
             error = terminal_error()
             if error is not None:
-                return finish(error)
-        return finish("terminal_backlog")
+                return finish(error, "command_error")
+        # Cap exhaustion proves only that this bounded drain ended at its
+        # safety limit; it is not proof of root backpressure.
+        return finish("terminal_backlog", "terminal_backlog")
 
     @with_check_process
     def __run_command(self,
@@ -2530,7 +2564,8 @@ class Lftp:
             "pre_send_drain_shape", "pre_send_drain_byte_length_bucket",
             "pre_send_drain_line_count_bucket", "pre_send_drain_class",
             "pre_send_drain_queue_done", "pre_send_drain_job_or_progress",
-            "pre_send_drain_prompt_or_echo", "pre_send_drain_error", "post_send_prompt",
+            "pre_send_drain_prompt_or_echo", "pre_send_drain_error",
+            "post_send_prompt",
             "process_alive", "read_buffer_source", "read_buffer_byte_length_bucket",
             "raw_before_byte_length_bucket", "raw_before_line_count_bucket",
             "retained_byte_length_bucket", "retained_line_count_bucket",

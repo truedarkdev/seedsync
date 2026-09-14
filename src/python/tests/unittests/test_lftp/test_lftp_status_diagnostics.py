@@ -346,6 +346,91 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         self.assertEqual("lftp-poll:fedcba9876543210", relation.call_args.args[1])
         self.assertIsNone(lftp._Lftp__status_timeout_predecessor_correlation)
 
+    def test_fresh_command_echo_is_separate_from_prompt_match(self):
+        lftp = self._build_lftp()
+        process = lftp._Lftp__process
+        process.before = "synthetic-timeout-frame"
+        process.expect.side_effect = pexpect.exceptions.TIMEOUT("timeout")
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+
+        with patch("lftp.lftp._lftp_private_status_frame_capture", return_value=True), \
+                patch("lftp.lftp.time.monotonic", side_effect=[0.0, 2.0]):
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        process.expect.side_effect = None
+        process.expect.return_value = None
+        process.before = ""
+        process._buffer = io.StringIO()
+        process._before = io.StringIO()
+        process.read_nonblocking.side_effect = [
+            "jobs -v\n", pexpect.exceptions.TIMEOUT("empty terminal"),
+        ]
+        with patch("lftp.lftp._lftp_private_status_relation_capture", return_value="captured") as relation:
+            self.assertEqual([], lftp.status("lftp-poll:fedcba9876543210"))
+
+        observation = relation.call_args.args[3]
+        self.assertEqual("quiet_timeout", observation["_pre_send_drain_termination"])
+        self.assertTrue(observation["_pre_send_drain_fresh_command_echo"])
+        self.assertFalse(observation["_pre_send_drain_fresh_prompt_match"])
+        self.assertTrue(observation["_pre_send_drain_fresh_prompt_or_echo"])
+
+    def test_empty_drain_read_has_distinct_termination(self):
+        lftp = self._build_lftp()
+        process = lftp._Lftp__process
+        process.before = "synthetic-timeout-frame"
+        process.expect.side_effect = pexpect.exceptions.TIMEOUT("timeout")
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+
+        with patch("lftp.lftp._lftp_private_status_frame_capture", return_value=True), \
+                patch("lftp.lftp.time.monotonic", side_effect=[0.0, 2.0]):
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        process.expect.side_effect = None
+        process.expect.return_value = None
+        process.before = ""
+        process._buffer = io.StringIO()
+        process._before = io.StringIO()
+        process.read_nonblocking.side_effect = ["", pexpect.exceptions.TIMEOUT("empty terminal")]
+        with patch("lftp.lftp._lftp_private_status_relation_capture", return_value="captured") as relation:
+            self.assertEqual([], lftp.status("lftp-poll:fedcba9876543210"))
+
+        observation = relation.call_args.args[3]
+        self.assertEqual("empty_read", observation["_pre_send_drain_termination"])
+        self.assertFalse(observation["_pre_send_drain_fresh_command_echo"])
+        self.assertFalse(observation["_pre_send_drain_fresh_prompt_match"])
+        self.assertFalse(observation["_pre_send_drain_fresh_prompt_or_echo"])
+
+    def test_fresh_prompt_match_is_separate_from_command_echo(self):
+        lftp = self._build_lftp()
+        process = lftp._Lftp__process
+        process.before = "synthetic-timeout-frame"
+        process.expect.side_effect = pexpect.exceptions.TIMEOUT("timeout")
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+
+        with patch("lftp.lftp._lftp_private_status_frame_capture", return_value=True), \
+                patch("lftp.lftp.time.monotonic", side_effect=[0.0, 2.0]):
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        process.expect.side_effect = None
+        process.expect.return_value = None
+        process.before = ""
+        process._buffer = io.StringIO()
+        process._before = io.StringIO()
+        process.read_nonblocking.side_effect = [
+            "prompt>", pexpect.exceptions.TIMEOUT("empty terminal"),
+        ]
+        with patch("lftp.lftp._lftp_private_status_relation_capture", return_value="captured") as relation:
+            self.assertEqual([], lftp.status("lftp-poll:fedcba9876543210"))
+
+        observation = relation.call_args.args[3]
+        self.assertEqual("quiet_timeout", observation["_pre_send_drain_termination"])
+        self.assertFalse(observation["_pre_send_drain_fresh_command_echo"])
+        self.assertTrue(observation["_pre_send_drain_fresh_prompt_match"])
+        self.assertTrue(observation["_pre_send_drain_fresh_prompt_or_echo"])
+
     def test_disabled_capture_path_does_not_create_predecessor_or_relation(self):
         lftp = self._build_lftp()
         lftp._Lftp__process.before = "synthetic-late-tail"
@@ -415,8 +500,12 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
                         1,
                         {
                             "_pre_send_drain_class": "mixed",
+                            "_pre_send_drain_termination": "quiet_timeout",
                             "_pre_send_drain_bytes": 17,
                             "_pre_send_drain_lines": 2,
+                            "_pre_send_drain_fresh_command_echo": True,
+                            "_pre_send_drain_fresh_prompt_match": False,
+                            "_pre_send_drain_fresh_prompt_or_echo": True,
                         },
                         True,
                         trace,
@@ -436,7 +525,11 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         self.assertEqual("lftp-poll:0123456789abcdef", manifest["predecessor_correlation"])
         self.assertEqual("lftp-poll:fedcba9876543210", manifest["current_correlation"])
         self.assertEqual("mixed", manifest["drain_class"])
+        self.assertEqual("quiet_timeout", manifest["drain_termination"])
         self.assertEqual("1-127", manifest["drain_byte_length_bucket"])
+        self.assertTrue(manifest["fresh_read_command_echo"])
+        self.assertFalse(manifest["fresh_read_prompt_match"])
+        self.assertTrue(manifest["fresh_read_prompt_or_echo"])
         self.assertEqual("available", manifest["capture_quota_state"])
         self.assertEqual(2, manifest["capture_quota_remaining_before"])
         self.assertEqual(1, manifest["capture_quota_remaining_after"])
