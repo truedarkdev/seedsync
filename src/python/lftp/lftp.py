@@ -83,6 +83,8 @@ LFTP_STATUS_POLL_DRAIN_CLASSES = frozenset({
 LFTP_STATUS_POLL_DRAIN_TERMINATIONS = frozenset({
     "quiet_timeout", "empty_read", "terminal_backlog", "eof", "command_error", "unknown",
 })
+LFTP_STATUS_POLL_BUFFER_PROGRESS = frozenset({"progress", "no_progress", "unknown"})
+_LFTP_STATUS_POLL_METRIC_MAX = 2_147_483_647
 _LFTP_TRACE_LINE_SCAN_MAX_BYTES = 64 * 1024
 redact_credentials = redact_sensitive_text
 _P = ParamSpec("_P")
@@ -555,6 +557,47 @@ def _lftp_status_boundary_values(process: object) -> tuple[object, object]:
     return before, retained
 
 
+def _lftp_status_structural_lengths(process: object) -> tuple[Optional[int], Optional[int]]:
+    """Read O(1) structural lengths for the status loop without payload access."""
+    try:
+        before = _incoming_recovery_buffer_length(getattr(process, "before", None))
+    except Exception:
+        before = None
+    try:
+        attributes = vars(process)
+        retained = attributes.get("_buffer")
+    except Exception:
+        retained = None
+    retained_length = _incoming_recovery_buffer_length(retained)
+    if retained_length is None and isinstance(retained, io.StringIO):
+        try:
+            position = retained.tell()
+            retained.seek(0, io.SEEK_END)
+            retained_length = retained.tell()
+            retained.seek(position)
+        except (AttributeError, OSError, TypeError, ValueError):
+            retained_length = None
+    return before, retained_length
+
+
+def _lftp_status_buffer_progress(
+        previous: object, current: object,
+) -> str:
+    """Classify structural before/buffer movement without reading content."""
+    if not isinstance(previous, tuple) or len(previous) != 2 or \
+            not isinstance(current, tuple) or len(current) != 2:
+        return "unknown"
+    if any(type(value) is not int or value < 0 for value in previous + current):
+        return "unknown"
+    if any(current_value < previous_value
+           for previous_value, current_value in zip(previous, current)):
+        return "unknown"
+    if any(current_value > previous_value
+           for previous_value, current_value in zip(previous, current)):
+        return "progress"
+    return "no_progress"
+
+
 def _lftp_status_prompt_outcome(
         phase: object, output: object, prompt_outcome: object,
 ) -> str:
@@ -1004,6 +1047,14 @@ def _record_lftp_status_poll_breadcrumb(
         normalized: object = None, prompt_outcome: object = None,
         error_class: object = None, pre_send_drain_class: object = None,
         pre_send_drain_bytes: object = None,
+        post_send_zero_timeout_expect_iterations: object = None,
+        post_send_productive_count: object = None,
+        post_send_no_progress_count: object = None,
+        post_send_unknown_count: object = None,
+        post_send_sleep_requested_ns: object = None,
+        post_send_sleep_actual_ns: object = None,
+        post_send_loop_elapsed_ns: object = None,
+        post_send_buffer_progress: object = None,
 ) -> None:
     """Record bounded PTY status phases without command, output, or path data.
 
@@ -1092,6 +1143,64 @@ def _record_lftp_status_poll_breadcrumb(
             # that do not provide the collector's outer timestamp.
             "wall_time_ns": time.time_ns(),
         })
+        if type(post_send_zero_timeout_expect_iterations) is int and \
+                post_send_zero_timeout_expect_iterations >= 0:
+            details["post_send_zero_timeout_expect_iterations"] = min(
+                _LFTP_STATUS_POLL_METRIC_MAX,
+                post_send_zero_timeout_expect_iterations,
+            )
+        if type(post_send_sleep_requested_ns) is int and post_send_sleep_requested_ns >= 0:
+            details["post_send_sleep_requested_ns"] = min(
+                _LFTP_STATUS_POLL_METRIC_MAX,
+                post_send_sleep_requested_ns,
+            )
+        if type(post_send_sleep_actual_ns) is int and post_send_sleep_actual_ns >= 0:
+            details["post_send_sleep_actual_ns"] = min(
+                _LFTP_STATUS_POLL_METRIC_MAX,
+                post_send_sleep_actual_ns,
+            )
+        for metric_name, metric_value in (
+                ("post_send_productive_count", post_send_productive_count),
+                ("post_send_no_progress_count", post_send_no_progress_count),
+                ("post_send_unknown_count", post_send_unknown_count),
+                ("post_send_loop_elapsed_ns", post_send_loop_elapsed_ns),
+        ):
+            if type(metric_value) is int and metric_value >= 0:
+                details[metric_name] = min(_LFTP_STATUS_POLL_METRIC_MAX, metric_value)
+        if post_send_buffer_progress is not None:
+            details["post_send_buffer_progress"] = (
+                post_send_buffer_progress
+                if post_send_buffer_progress in LFTP_STATUS_POLL_BUFFER_PROGRESS
+                else "unknown"
+            )
+        post_send_metric_details = {
+            key: details.pop(key)
+            for key in (
+                "post_send_zero_timeout_expect_iterations",
+                "post_send_productive_count",
+                "post_send_no_progress_count",
+                "post_send_unknown_count",
+                "post_send_sleep_requested_ns",
+                "post_send_sleep_actual_ns",
+                "post_send_loop_elapsed_ns",
+                "post_send_buffer_progress",
+            )
+            if key in details
+        }
+        if post_send_metric_details:
+            # Keep the complete loop discriminator and the existing terminal
+            # outcome fields within the collector's fixed mapping bound; this
+            # is schema ordering, not an unbounded detail expansion.
+            for key in (
+                "schema", "phase", "boundary", "outcome", "process_alive",
+                "output_class", "read_buffer_byte_length_bucket", "failure_reason",
+                "raw_before_byte_length_bucket", "retained_byte_length_bucket",
+                "normalized_byte_length_bucket", "prompt_outcome", "error_class",
+                "pre_send_drain_class", "wall_time_ns", "monotonic_time_ns",
+            ):
+                if key in details:
+                    post_send_metric_details[key] = details[key]
+            details = post_send_metric_details
         details["monotonic_time_ns"] = time.monotonic_ns()
         if isinstance(boundary_state, dict):
             details.update({key: value for key, value in boundary_state.items()
@@ -1876,6 +1985,8 @@ class Lftp:
             _breadcrumb_effectively_enabled(pty_trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug") or
             _breadcrumb_effectively_enabled(pty_trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "warning")
         )
+        status_metrics_enabled = safe_status_poll_correlation is not None and \
+            _breadcrumb_effectively_enabled(pty_trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug")
         status_boundary = {
             "raw_before": None,
             "retained": None,
@@ -1884,6 +1995,14 @@ class Lftp:
             "error_class": None,
             "pre_send_drain_class": None,
             "pre_send_drain_bytes": None,
+            "post_send_zero_timeout_expect_iterations": None,
+            "post_send_productive_count": None,
+            "post_send_no_progress_count": None,
+            "post_send_unknown_count": None,
+            "post_send_sleep_requested_ns": None,
+            "post_send_sleep_actual_ns": None,
+            "post_send_loop_elapsed_ns": None,
+            "post_send_buffer_progress": None,
         }
         if status_trace_enabled:
             status_boundary["raw_before"], status_boundary["retained"] = \
@@ -1972,6 +2091,16 @@ class Lftp:
                              if error_class is None else error_class),
                 pre_send_drain_class=status_boundary.get("pre_send_drain_class"),
                 pre_send_drain_bytes=status_boundary.get("pre_send_drain_bytes"),
+                post_send_zero_timeout_expect_iterations=status_boundary.get(
+                    "post_send_zero_timeout_expect_iterations"
+                ),
+                post_send_productive_count=status_boundary.get("post_send_productive_count"),
+                post_send_no_progress_count=status_boundary.get("post_send_no_progress_count"),
+                post_send_unknown_count=status_boundary.get("post_send_unknown_count"),
+                post_send_sleep_requested_ns=status_boundary.get("post_send_sleep_requested_ns"),
+                post_send_sleep_actual_ns=status_boundary.get("post_send_sleep_actual_ns"),
+                post_send_loop_elapsed_ns=status_boundary.get("post_send_loop_elapsed_ns"),
+                post_send_buffer_progress=status_boundary.get("post_send_buffer_progress"),
             )
         if status_poll:
             status_poll_timeout_seconds = STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS if timeout_seconds == 0 else timeout_seconds
@@ -2084,22 +2213,79 @@ class Lftp:
             prompt_reached = False
             final_prompt_reached = False
             recovered_output_preserved = False
+            post_send_zero_timeout_expect_iterations = 0 if status_metrics_enabled else None
+            post_send_productive_count = 0 if status_metrics_enabled else None
+            post_send_no_progress_count = 0 if status_metrics_enabled else None
+            post_send_unknown_count = 0 if status_metrics_enabled else None
+            post_send_sleep_requested_ns = 0 if status_metrics_enabled else None
+            post_send_sleep_actual_ns = 0 if status_metrics_enabled else None
+            post_send_loop_elapsed_ns = 0 if status_metrics_enabled else None
+
+            # The isolated fixture proves a possible throughput hazard only;
+            # it is not live attribution or a desired sleep policy.
             try:
                 if status_poll:
                     try:
                         status_poll_timeout_seconds = STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS if timeout_seconds == 0 else timeout_seconds
-                        status_poll_deadline = time.monotonic() + status_poll_timeout_seconds
+                        status_poll_loop_started = time.monotonic()
+                        status_poll_loop_last_monotonic = status_poll_loop_started
+                        status_poll_prompt_completed = False
+                        status_poll_deadline = status_poll_loop_started + status_poll_timeout_seconds
                         while True:
+                            structural_before = _lftp_status_structural_lengths(self.__process) \
+                                if status_metrics_enabled else None
+                            if status_metrics_enabled:
+                                post_send_zero_timeout_expect_iterations += 1
                             try:
                                 self.__process.expect(self.__expect_pattern, timeout=0)
+                                if status_metrics_enabled:
+                                    # A matching prompt may consume/reset the
+                                    # buffer; that transition is unknown, not
+                                    # evidence of zero progress.
+                                    post_send_unknown_count += 1
                                 prompt_reached = True
                                 final_prompt_reached = True
+                                status_poll_prompt_completed = True
                                 break
                             except pexpect.exceptions.TIMEOUT:
-                                if time.monotonic() >= status_poll_deadline:
+                                if status_metrics_enabled:
+                                    structural_after = _lftp_status_structural_lengths(self.__process)
+                                    iteration_progress = _lftp_status_buffer_progress(
+                                        structural_before, structural_after,
+                                    )
+                                    if iteration_progress == "progress":
+                                        post_send_productive_count += 1
+                                    elif iteration_progress == "no_progress":
+                                        post_send_no_progress_count += 1
+                                    else:
+                                        post_send_unknown_count += 1
+                                status_poll_now = time.monotonic()
+                                if status_metrics_enabled:
+                                    status_poll_loop_last_monotonic = status_poll_now
+                                if status_poll_now >= status_poll_deadline:
                                     break
-                                time.sleep(0.01)
+                                if status_metrics_enabled:
+                                    post_send_sleep_requested_ns += 10_000_000
+                                    sleep_started_ns = None
+                                    try:
+                                        sleep_started_ns = time.monotonic_ns()
+                                    except Exception:
+                                        pass
+                                    time.sleep(0.01)
+                                    if type(sleep_started_ns) is int:
+                                        try:
+                                            sleep_ended_ns = time.monotonic_ns()
+                                            if type(sleep_ended_ns) is int:
+                                                post_send_sleep_actual_ns += max(
+                                                    0, sleep_ended_ns - sleep_started_ns,
+                                                )
+                                        except Exception:
+                                            pass
+                                else:
+                                    time.sleep(0.01)
                             except pexpect.exceptions.EOF as exc:
+                                if status_metrics_enabled:
+                                    post_send_unknown_count += 1
                                 record_diagnostic_child(exc, phase="prompt")
                                 self.__last_command_timed_out = True
                                 self.__last_status_poll_failure_reason = "eof"
@@ -2112,6 +2298,8 @@ class Lftp:
                                     self.__normalize_output(self.__decode_spawn_output(self.__process.before))
                                 ))
                     except pexpect.exceptions.ExceptionPexpect as exc:
+                        if status_metrics_enabled:
+                            post_send_unknown_count += 1
                         record_diagnostic_child(exc, "command_error", "prompt")
                         self.__last_command_timed_out = True
                         self.__last_status_poll_failure_reason = "command_error"
@@ -2122,6 +2310,8 @@ class Lftp:
                         self.logger.warning("Ignoring status poll failure: {}".format(exc))
                         return ""
                     except OSError as exc:
+                        if status_metrics_enabled:
+                            post_send_unknown_count += 1
                         record_diagnostic_child(exc, "command_error", "prompt")
                         self.__last_command_timed_out = True
                         self.__last_status_poll_failure_reason = "command_error"
@@ -2131,6 +2321,30 @@ class Lftp:
                         record_status_trace("command_error", failure_reason="command_error", exception=exc)
                         self.logger.warning("Ignoring status poll failure: {}".format(exc))
                         return ""
+                    if status_metrics_enabled:
+                        if status_poll_prompt_completed:
+                            status_poll_loop_ended = time.monotonic()
+                        else:
+                            status_poll_loop_ended = status_poll_loop_last_monotonic
+                        post_send_loop_elapsed_ns = max(
+                            0,
+                            int((status_poll_loop_ended - status_poll_loop_started) * 1_000_000_000),
+                        )
+                        post_send_buffer_progress = (
+                            "unknown" if post_send_unknown_count else
+                            "progress" if post_send_productive_count else
+                            "no_progress" if post_send_no_progress_count else "unknown"
+                        )
+                        status_boundary.update({
+                            "post_send_zero_timeout_expect_iterations": post_send_zero_timeout_expect_iterations,
+                            "post_send_productive_count": post_send_productive_count,
+                            "post_send_no_progress_count": post_send_no_progress_count,
+                            "post_send_unknown_count": post_send_unknown_count,
+                            "post_send_sleep_requested_ns": post_send_sleep_requested_ns,
+                            "post_send_sleep_actual_ns": post_send_sleep_actual_ns,
+                            "post_send_loop_elapsed_ns": post_send_loop_elapsed_ns,
+                            "post_send_buffer_progress": post_send_buffer_progress,
+                        })
                     if not prompt_reached:
                         self.__last_command_timed_out = True
                         self.__last_status_poll_failure_reason = "timeout"
@@ -2254,6 +2468,30 @@ class Lftp:
                                     getattr(self.__process, "after", None),
                                 ),
                                 "buffer_byte_count": retained_length if retained_length is not None else -1,
+                                "post_send_zero_timeout_expect_iterations": status_boundary.get(
+                                    "post_send_zero_timeout_expect_iterations"
+                                ),
+                                "post_send_productive_count": status_boundary.get(
+                                    "post_send_productive_count"
+                                ),
+                                "post_send_no_progress_count": status_boundary.get(
+                                    "post_send_no_progress_count"
+                                ),
+                                "post_send_unknown_count": status_boundary.get(
+                                    "post_send_unknown_count"
+                                ),
+                                "post_send_sleep_requested_ns": status_boundary.get(
+                                    "post_send_sleep_requested_ns"
+                                ),
+                                "post_send_sleep_actual_ns": status_boundary.get(
+                                    "post_send_sleep_actual_ns"
+                                ),
+                                "post_send_loop_elapsed_ns": status_boundary.get(
+                                    "post_send_loop_elapsed_ns"
+                                ),
+                                "post_send_buffer_progress": status_boundary.get(
+                                    "post_send_buffer_progress"
+                                ),
                             },
                         )
                     except Exception:

@@ -125,6 +125,264 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         self.assertNotIn("raw/private", rendered)
         self.assertNotIn("retained/private", rendered)
 
+    def test_post_send_loop_metrics_report_productive_timeout(self):
+        lftp = self._build_lftp()
+        process = lftp._Lftp__process
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+
+        def first_timeout(*_args, **_kwargs):
+            process.before = b"x"
+            process._buffer = io.StringIO("y")
+            raise pexpect.exceptions.TIMEOUT("productive")
+
+        def second_timeout(*_args, **_kwargs):
+            process.before = b"xx"
+            process._buffer = io.StringIO("yy")
+            raise pexpect.exceptions.TIMEOUT("productive")
+
+        expect_calls = [0]
+
+        def expect_side_effect(*args, **kwargs):
+            callback = first_timeout if expect_calls[0] == 0 else second_timeout
+            expect_calls[0] += 1
+            return callback(*args, **kwargs)
+
+        process.expect.side_effect = expect_side_effect
+        with patch("lftp.lftp.time.monotonic", side_effect=[0.0, 0.1, 1.1]), \
+                patch("lftp.lftp.time.sleep"):
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        jobs_read = next(
+            event for event in trace.snapshot()["entries"]
+            if event["details"]["phase"] == "jobs_read"
+        )
+        details = jobs_read["details"]
+        self.assertEqual(2, details["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(2, details["post_send_productive_count"])
+        self.assertEqual(0, details["post_send_no_progress_count"])
+        self.assertEqual(0, details["post_send_unknown_count"])
+        self.assertEqual(10_000_000, details["post_send_sleep_requested_ns"])
+        self.assertGreaterEqual(details["post_send_sleep_actual_ns"], 0)
+        self.assertEqual(1_100_000_000, details["post_send_loop_elapsed_ns"])
+        self.assertEqual("progress", details["post_send_buffer_progress"])
+
+    def test_post_send_loop_metrics_distinguish_mixed_from_all_productive(self):
+        lftp = self._build_lftp()
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+        process = lftp._Lftp__process
+        expect_calls = [0]
+
+        def mixed_expect(*_args, **_kwargs):
+            if expect_calls[0] == 0:
+                process.before = b"x"
+                process._buffer = io.StringIO("y")
+            expect_calls[0] += 1
+            raise pexpect.exceptions.TIMEOUT("mixed")
+
+        process.expect.side_effect = mixed_expect
+        with patch("lftp.lftp.time.monotonic", side_effect=[0.0, 0.1, 0.2, 1.1]), \
+                patch("lftp.lftp.time.sleep"):
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        jobs_read = next(
+            event for event in trace.snapshot()["entries"]
+            if event["details"]["phase"] == "jobs_read"
+        )
+        details = jobs_read["details"]
+        self.assertEqual(3, details["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(1, details["post_send_productive_count"])
+        self.assertEqual(2, details["post_send_no_progress_count"])
+        self.assertEqual(0, details["post_send_unknown_count"])
+        self.assertEqual(1_100_000_000, details["post_send_loop_elapsed_ns"])
+        self.assertEqual("progress", details["post_send_buffer_progress"])
+
+    def test_post_send_loop_metrics_report_no_progress_timeout(self):
+        lftp = self._build_lftp()
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+        process = lftp._Lftp__process
+        process.before = b"same"
+        process._buffer = io.StringIO("same")
+        process.expect.side_effect = pexpect.exceptions.TIMEOUT("quiet")
+
+        with patch("lftp.lftp.time.monotonic", side_effect=[0.0, 0.1, 1.1]), \
+                patch("lftp.lftp.time.sleep"):
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        jobs_read = next(
+            event for event in trace.snapshot()["entries"]
+            if event["details"]["phase"] == "jobs_read"
+        )
+        details = jobs_read["details"]
+        self.assertEqual(2, details["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(0, details["post_send_productive_count"])
+        self.assertEqual(2, details["post_send_no_progress_count"])
+        self.assertEqual(0, details["post_send_unknown_count"])
+        self.assertEqual(10_000_000, details["post_send_sleep_requested_ns"])
+        self.assertEqual(1_100_000_000, details["post_send_loop_elapsed_ns"])
+        self.assertEqual("no_progress", details["post_send_buffer_progress"])
+
+    def test_post_send_prompt_completion_reset_is_unknown_progress(self):
+        lftp = self._build_lftp()
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+        process = lftp._Lftp__process
+
+        def timeout_then_progress(*_args, **_kwargs):
+            process.before = b"x"
+            process._buffer = io.StringIO("y")
+            raise pexpect.exceptions.TIMEOUT("waiting")
+
+        def prompt_match(*_args, **_kwargs):
+            process.before = b""
+            process._buffer = io.StringIO()
+            return None
+
+        expect_calls = [0]
+
+        def expect_side_effect(*args, **kwargs):
+            callback = timeout_then_progress if expect_calls[0] == 0 else prompt_match
+            expect_calls[0] += 1
+            return callback(*args, **kwargs)
+
+        process.expect.side_effect = expect_side_effect
+        with patch("lftp.lftp.time.monotonic", side_effect=[0.0, 0.1, 0.2]), \
+                patch("lftp.lftp.time.sleep"):
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        jobs_read = next(
+            event for event in trace.snapshot()["entries"]
+            if event["details"]["phase"] == "jobs_read"
+        )
+        details = jobs_read["details"]
+        self.assertEqual(2, details["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(1, details["post_send_productive_count"])
+        self.assertEqual(0, details["post_send_no_progress_count"])
+        self.assertEqual(1, details["post_send_unknown_count"])
+        self.assertEqual(200_000_000, details["post_send_loop_elapsed_ns"])
+        self.assertEqual("unknown", details["post_send_buffer_progress"])
+
+    def test_post_send_invalid_or_decreasing_structure_is_unknown(self):
+        lftp = self._build_lftp()
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+        process = lftp._Lftp__process
+        process.before = b"abc"
+        process._buffer = io.StringIO("xy")
+
+        def decreasing_timeout(*_args, **_kwargs):
+            process.before = b"a"
+            process._buffer = io.StringIO()
+            raise pexpect.exceptions.TIMEOUT("decrease")
+
+        process.expect.side_effect = decreasing_timeout
+        with patch("lftp.lftp.time.monotonic", side_effect=[0.0, 1.1]), \
+                patch("lftp.lftp.time.sleep"):
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        jobs_read = next(
+            event for event in trace.snapshot()["entries"]
+            if event["details"]["phase"] == "jobs_read"
+        )
+        details = jobs_read["details"]
+        self.assertEqual(1, details["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(0, details["post_send_productive_count"])
+        self.assertEqual(0, details["post_send_no_progress_count"])
+        self.assertEqual(1, details["post_send_unknown_count"])
+        self.assertEqual(1_100_000_000, details["post_send_loop_elapsed_ns"])
+        self.assertEqual("unknown", details["post_send_buffer_progress"])
+
+    def test_post_send_metrics_are_disabled_without_debug_status_trace(self):
+        lftp = self._build_lftp()
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=32,
+            policy={"default": "off"},
+        )
+        lftp.set_breadcrumb_trace(trace)
+        process = lftp._Lftp__process
+        process.expect.side_effect = pexpect.exceptions.TIMEOUT("quiet")
+
+        with patch("lftp.lftp._lftp_status_structural_lengths") as lengths, \
+                patch("lftp.lftp.time.monotonic_ns") as monotonic_ns, \
+                patch("lftp.lftp.time.monotonic", side_effect=[0.0, 1.1]), \
+                patch("lftp.lftp.time.sleep"):
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        lengths.assert_not_called()
+        monotonic_ns.assert_not_called()
+        self.assertEqual([], trace.snapshot()["entries"])
+
+    def test_post_send_metrics_serialize_to_trace_and_timeout_frame_manifest(self):
+        lftp = self._build_lftp()
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+        process = lftp._Lftp__process
+
+        def timeout_with_frame(*_args, **_kwargs):
+            process.before = b"raw timeout frame"
+            process._buffer = io.StringIO()
+            raise pexpect.exceptions.TIMEOUT("timeout")
+
+        process.expect.side_effect = timeout_with_frame
+        with tempfile.TemporaryDirectory() as capture_dir:
+            prior_remaining = lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING
+            lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 1
+            try:
+                with patch.dict(
+                        os.environ,
+                        {"SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": capture_dir},
+                ), patch("lftp.lftp.time.monotonic", side_effect=[0.0, 1.1]), \
+                        patch("lftp.lftp.time.sleep"):
+                    self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+                capture_dirs = [
+                    name for name in os.listdir(capture_dir)
+                    if name.startswith("lftp-status-")
+                ]
+                self.assertEqual(1, len(capture_dirs))
+                with open(
+                        os.path.join(capture_dir, capture_dirs[0], "manifest.json"),
+                        encoding="utf-8",
+                ) as handle:
+                    manifest = json.load(handle)
+            finally:
+                lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = prior_remaining
+
+        jobs_read = next(
+            event for event in trace.snapshot()["entries"]
+            if event["details"]["phase"] == "jobs_read"
+        )
+        details = jobs_read["details"]
+        self.assertEqual(1, details["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(1, details["post_send_productive_count"])
+        self.assertEqual(0, details["post_send_no_progress_count"])
+        self.assertEqual(0, details["post_send_unknown_count"])
+        self.assertEqual(0, details["post_send_sleep_requested_ns"])
+        self.assertEqual(1_100_000_000, details["post_send_loop_elapsed_ns"])
+        self.assertEqual("progress", details["post_send_buffer_progress"])
+        self.assertEqual(1, manifest["boundary"]["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(1, manifest["boundary"]["post_send_productive_count"])
+        self.assertEqual(0, manifest["boundary"]["post_send_no_progress_count"])
+        self.assertEqual(0, manifest["boundary"]["post_send_unknown_count"])
+        self.assertEqual(0, manifest["boundary"]["post_send_sleep_requested_ns"])
+        self.assertEqual(1_100_000_000, manifest["boundary"]["post_send_loop_elapsed_ns"])
+        self.assertEqual("progress", manifest["boundary"]["post_send_buffer_progress"])
+
+    def test_status_structural_lengths_use_bytesio_buffer_without_copy(self):
+        class NoCopyBytesIO(io.BytesIO):
+            def getvalue(self):
+                raise AssertionError("structural helper must not copy payload")
+
+        class Process:
+            before = b"before"
+
+            def __init__(self):
+                self._buffer = NoCopyBytesIO(b"retained")
+
+        self.assertEqual((6, 8), lftp_mod._lftp_status_structural_lengths(Process()))
+
     def test_invalid_poll_correlation_does_not_emit_status_diagnostics(self):
         trace = self._trace()
         lftp_mod._record_lftp_status_poll_breadcrumb(
