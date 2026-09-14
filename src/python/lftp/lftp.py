@@ -2232,8 +2232,7 @@ class Lftp:
                         status_poll_prompt_completed = False
                         status_poll_deadline = status_poll_loop_started + status_poll_timeout_seconds
                         while True:
-                            structural_before = _lftp_status_structural_lengths(self.__process) \
-                                if status_metrics_enabled else None
+                            structural_before = _lftp_status_structural_lengths(self.__process)
                             if status_metrics_enabled:
                                 post_send_zero_timeout_expect_iterations += 1
                             try:
@@ -2248,11 +2247,11 @@ class Lftp:
                                 status_poll_prompt_completed = True
                                 break
                             except pexpect.exceptions.TIMEOUT:
+                                structural_after = _lftp_status_structural_lengths(self.__process)
+                                iteration_progress = _lftp_status_buffer_progress(
+                                    structural_before, structural_after,
+                                )
                                 if status_metrics_enabled:
-                                    structural_after = _lftp_status_structural_lengths(self.__process)
-                                    iteration_progress = _lftp_status_buffer_progress(
-                                        structural_before, structural_after,
-                                    )
                                     if iteration_progress == "progress":
                                         post_send_productive_count += 1
                                     elif iteration_progress == "no_progress":
@@ -2264,25 +2263,29 @@ class Lftp:
                                     status_poll_loop_last_monotonic = status_poll_now
                                 if status_poll_now >= status_poll_deadline:
                                     break
-                                if status_metrics_enabled:
-                                    post_send_sleep_requested_ns += 10_000_000
-                                    sleep_started_ns = None
-                                    try:
-                                        sleep_started_ns = time.monotonic_ns()
-                                    except Exception:
-                                        pass
-                                    time.sleep(0.01)
-                                    if type(sleep_started_ns) is int:
+                                # Structural movement is not response completeness or
+                                # transfer/payload proof; quiet/unknown still yields to
+                                # bound CPU.
+                                if iteration_progress != "progress":
+                                    if status_metrics_enabled:
+                                        post_send_sleep_requested_ns += 10_000_000
+                                        sleep_started_ns = None
                                         try:
-                                            sleep_ended_ns = time.monotonic_ns()
-                                            if type(sleep_ended_ns) is int:
-                                                post_send_sleep_actual_ns += max(
-                                                    0, sleep_ended_ns - sleep_started_ns,
-                                                )
+                                            sleep_started_ns = time.monotonic_ns()
                                         except Exception:
                                             pass
-                                else:
-                                    time.sleep(0.01)
+                                        time.sleep(0.01)
+                                        if type(sleep_started_ns) is int:
+                                            try:
+                                                sleep_ended_ns = time.monotonic_ns()
+                                                if type(sleep_ended_ns) is int:
+                                                    post_send_sleep_actual_ns += max(
+                                                        0, sleep_ended_ns - sleep_started_ns,
+                                                    )
+                                            except Exception:
+                                                pass
+                                    else:
+                                        time.sleep(0.01)
                             except pexpect.exceptions.EOF as exc:
                                 if status_metrics_enabled:
                                     post_send_unknown_count += 1

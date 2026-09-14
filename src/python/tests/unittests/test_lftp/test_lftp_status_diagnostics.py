@@ -12,6 +12,49 @@ from common.breadcrumb_trace import BreadcrumbTraceCollector
 from lftp import Lftp, LftpJobStatusParser, LftpJobStatusParserError
 
 
+class _RealisticStatusPty:
+    """Small byte-oriented PTY seam for status-loop terminal outcomes."""
+
+    def __init__(self, mode, payload_size=0):
+        self.mode = mode
+        self.payload_size = payload_size
+        self.before = b""
+        self.after = b""
+        self.buffer_type = io.BytesIO
+        self._buffer = io.BytesIO()
+        self._before = io.BytesIO()
+        self.delaybeforesend = 0
+        self.delayafterread = 0
+        self.expect_calls = 0
+        self.send_calls = []
+        self.closed = False
+
+    def isalive(self):
+        return not self.closed
+
+    def send(self, command):
+        self.send_calls.append(command)
+
+    def read_nonblocking(self, size=-1, timeout=-1):
+        raise pexpect.exceptions.TIMEOUT("quiet terminal")
+
+    def expect(self, _pattern, timeout=None):
+        self.expect_calls += 1
+        if timeout != 0:
+            raise AssertionError("status fixture must use zero-timeout expect")
+        if self.mode == "eof":
+            self.closed = True
+            raise pexpect.exceptions.EOF("fixture eof")
+        if self.mode == "partial" and self.expect_calls == 1:
+            payload = b"x" * self.payload_size
+            self.before = payload
+            self._buffer = io.BytesIO(payload)
+        raise pexpect.exceptions.TIMEOUT("fixture timeout")
+
+    def close(self, force=False):
+        self.closed = True
+
+
 class TestLftpStatusDiagnostics(unittest.TestCase):
     @staticmethod
     def _build_lftp():
@@ -150,8 +193,10 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
 
         process.expect.side_effect = expect_side_effect
         with patch("lftp.lftp.time.monotonic", side_effect=[0.0, 0.1, 1.1]), \
-                patch("lftp.lftp.time.sleep"):
+                patch("lftp.lftp.time.sleep") as sleep:
             self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        sleep.assert_not_called()
 
         jobs_read = next(
             event for event in trace.snapshot()["entries"]
@@ -162,8 +207,8 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         self.assertEqual(2, details["post_send_productive_count"])
         self.assertEqual(0, details["post_send_no_progress_count"])
         self.assertEqual(0, details["post_send_unknown_count"])
-        self.assertEqual(10_000_000, details["post_send_sleep_requested_ns"])
-        self.assertGreaterEqual(details["post_send_sleep_actual_ns"], 0)
+        self.assertEqual(0, details["post_send_sleep_requested_ns"])
+        self.assertEqual(0, details["post_send_sleep_actual_ns"])
         self.assertEqual(1_100_000_000, details["post_send_loop_elapsed_ns"])
         self.assertEqual("progress", details["post_send_buffer_progress"])
 
@@ -208,8 +253,10 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         process.expect.side_effect = pexpect.exceptions.TIMEOUT("quiet")
 
         with patch("lftp.lftp.time.monotonic", side_effect=[0.0, 0.1, 1.1]), \
-                patch("lftp.lftp.time.sleep"):
+                patch("lftp.lftp.time.sleep") as sleep:
             self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        sleep.assert_called_once_with(0.01)
 
         jobs_read = next(
             event for event in trace.snapshot()["entries"]
@@ -278,18 +325,20 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
             raise pexpect.exceptions.TIMEOUT("decrease")
 
         process.expect.side_effect = decreasing_timeout
-        with patch("lftp.lftp.time.monotonic", side_effect=[0.0, 1.1]), \
-                patch("lftp.lftp.time.sleep"):
+        with patch("lftp.lftp.time.monotonic", side_effect=[0.0, 0.1, 1.1]), \
+                patch("lftp.lftp.time.sleep") as sleep:
             self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        sleep.assert_called_once_with(0.01)
 
         jobs_read = next(
             event for event in trace.snapshot()["entries"]
             if event["details"]["phase"] == "jobs_read"
         )
         details = jobs_read["details"]
-        self.assertEqual(1, details["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(2, details["post_send_zero_timeout_expect_iterations"])
         self.assertEqual(0, details["post_send_productive_count"])
-        self.assertEqual(0, details["post_send_no_progress_count"])
+        self.assertEqual(1, details["post_send_no_progress_count"])
         self.assertEqual(1, details["post_send_unknown_count"])
         self.assertEqual(1_100_000_000, details["post_send_loop_elapsed_ns"])
         self.assertEqual("unknown", details["post_send_buffer_progress"])
@@ -305,15 +354,53 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         process = lftp._Lftp__process
         process.expect.side_effect = pexpect.exceptions.TIMEOUT("quiet")
 
-        with patch("lftp.lftp._lftp_status_structural_lengths") as lengths, \
+        with patch(
+                "lftp.lftp._lftp_status_structural_lengths",
+                side_effect=[(0, 0), (1, 1), (1, 1), (2, 2)],
+        ) as lengths, \
                 patch("lftp.lftp.time.monotonic_ns") as monotonic_ns, \
-                patch("lftp.lftp.time.monotonic", side_effect=[0.0, 1.1]), \
-                patch("lftp.lftp.time.sleep"):
+                patch("lftp.lftp.time.monotonic", side_effect=[0.0, 0.1, 1.1]), \
+                patch("lftp.lftp.time.sleep") as sleep:
             self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
 
-        lengths.assert_not_called()
+        self.assertEqual(4, lengths.call_count)
         monotonic_ns.assert_not_called()
+        sleep.assert_not_called()
         self.assertEqual([], trace.snapshot()["entries"])
+
+    def test_status_realistic_pty_quiet_partial_and_eof_are_bounded_without_debug(self):
+        cases = (
+            ("quiet", 0, [0.0, 0.1, 1.1], 4, 1, "timeout"),
+            ("partial", 47_000, [0.0, 0.1, 0.2, 1.1], 6, 1, "timeout"),
+            ("eof", 47_000, [0.0], 1, 0, "eof"),
+        )
+        for mode, payload_size, clock, structural_checks, sleep_count, failure_reason in cases:
+            with self.subTest(mode=mode):
+                lftp = self._build_lftp()
+                trace = BreadcrumbTraceCollector(
+                    lambda: True,
+                    max_entries=32,
+                    policy={"default": "off"},
+                )
+                lftp.set_breadcrumb_trace(trace)
+                process = _RealisticStatusPty(mode, payload_size)
+                lftp._Lftp__process = process
+
+                with patch(
+                        "lftp.lftp._lftp_status_structural_lengths",
+                        wraps=lftp_mod._lftp_status_structural_lengths,
+                ) as structural, \
+                        patch("lftp.lftp.time.monotonic", side_effect=clock), \
+                        patch("lftp.lftp.time.sleep") as sleep:
+                    self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+                self.assertEqual(structural_checks, structural.call_count)
+                self.assertEqual(sleep_count, sleep.call_count)
+                self.assertEqual([], trace.snapshot()["entries"])
+                self.assertEqual(failure_reason, lftp.last_status_poll_failure_reason)
+                if mode == "partial":
+                    self.assertEqual(payload_size, len(process.before))
+                self.assertEqual(["jobs -v\n"], process.send_calls)
 
     def test_post_send_metrics_serialize_to_trace_and_timeout_frame_manifest(self):
         lftp = self._build_lftp()
