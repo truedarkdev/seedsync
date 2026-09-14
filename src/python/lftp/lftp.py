@@ -1959,6 +1959,28 @@ class Lftp:
                         status_boundary["prompt_outcome"] = "ready" if out else "empty"
 
             if status_poll and not prompt_reached and not recovered_output_preserved and not self.__detect_errors_from_output(out):
+                if out and _breadcrumb_effectively_enabled(
+                        pty_trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug",
+                ):
+                    try:
+                        process_alive = self.__process.isalive()
+                        before, retained = _lftp_status_boundary_values(self.__process)
+                        retained_length = _incoming_recovery_buffer_length(retained)
+                        _lftp_private_status_frame_capture(
+                            safe_status_poll_correlation, out, process_alive, pty_trace,
+                            {
+                                "pexpect_version": str(getattr(pexpect, "__version__", "unknown")),
+                                "command_timed_out": self.__last_command_timed_out is True,
+                                "before_byte_count": _lftp_boundary_byte_count(before),
+                                "after_byte_count": _lftp_boundary_byte_count(
+                                    getattr(self.__process, "after", None),
+                                ),
+                                "buffer_byte_count": retained_length if retained_length is not None else -1,
+                            },
+                        )
+                    except Exception:
+                        # Private capture is independent of status ownership.
+                        pass
                 out = ""
             if status_poll and callable(diagnostic_recorder):
                 observation = getattr(self, "_Lftp__last_incoming_recovery_status_observation", None)

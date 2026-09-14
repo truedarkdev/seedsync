@@ -209,6 +209,72 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         self.assertNotEqual("empty", prompt_timeout["details"]["prompt_outcome"])
         self.assertEqual("timeout", health["details"]["error_class"])
 
+    def test_timeout_status_frame_is_captured_before_nonempty_output_is_cleared(self):
+        lftp = self._build_lftp()
+        lftp._Lftp__process.before = "opaque-timeout-frame"
+        lftp._Lftp__process.expect.side_effect = pexpect.exceptions.TIMEOUT("timeout")
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+
+        with patch("lftp.lftp._lftp_private_status_frame_capture") as capture, \
+                patch("lftp.lftp.time.monotonic", side_effect=[0.0, 2.0]):
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        capture.assert_called_once()
+        self.assertEqual("lftp-poll:0123456789abcdef", capture.call_args.args[0])
+        self.assertEqual("opaque-timeout-frame", capture.call_args.args[1])
+        self.assertTrue(capture.call_args.args[2])
+        self.assertIs(capture.call_args.args[3], trace)
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("timeout", lftp.last_status_poll_failure_reason)
+
+    def test_timeout_status_frame_capture_failure_preserves_empty_unhealthy_result(self):
+        lftp = self._build_lftp()
+        lftp._Lftp__process.before = "opaque-timeout-frame"
+        lftp._Lftp__process.expect.side_effect = pexpect.exceptions.TIMEOUT("timeout")
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+
+        with patch(
+                "lftp.lftp._lftp_private_status_frame_capture",
+                side_effect=RuntimeError("capture failure"),
+        ), patch("lftp.lftp.time.monotonic", side_effect=[0.0, 2.0]):
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("timeout", lftp.last_status_poll_failure_reason)
+
+    def test_private_status_frame_is_not_captured_when_timeout_clear_branch_is_ineligible(self):
+        lftp = self._build_lftp()
+        lftp._Lftp__process.before = "opaque-prompt-result"
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+
+        with patch("lftp.lftp._lftp_private_status_frame_capture") as capture:
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        capture.assert_not_called()
+        self.assertTrue(lftp.last_status_poll_healthy)
+
+    def test_timeout_status_frame_is_default_off_without_debug_status_policy(self):
+        lftp = self._build_lftp()
+        lftp._Lftp__process.before = "opaque-timeout-frame"
+        lftp._Lftp__process.expect.side_effect = pexpect.exceptions.TIMEOUT("timeout")
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=32,
+            policy={"default": "info"},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        with patch("lftp.lftp._lftp_private_status_frame_capture") as capture, \
+                patch("lftp.lftp.time.monotonic", side_effect=[0.0, 2.0]):
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        capture.assert_not_called()
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual("timeout", lftp.last_status_poll_failure_reason)
+
     def test_command_timeout_before_parser_is_not_attempted(self):
         lftp = self._build_lftp()
         lftp._Lftp__run_command = MagicMock(
