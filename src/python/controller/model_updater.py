@@ -620,6 +620,8 @@ def _lftp_status_lineage_trace_enabled(controller: object) -> bool:
         _breadcrumb_effectively_enabled(trace, category, level)
         for category, level in (
             ("model.progress", "debug"),
+            ("transfer.lftp.status", "debug"),
+            ("transfer.lftp.status", "warning"),
             ("transfer.lftp", "debug"),
             ("transfer.lftp", "warning"),
             ("completion.gate", "info"),
@@ -683,6 +685,9 @@ _LFTP_STATUS_TRACE_SCHEMA = "lftp_status_authority.v1"
 _LFTP_STATUS_TRACE_CORRELATION = "lftp-status-aggregate"
 _LFTP_STATUS_TRACE_POLL_CORRELATION_PREFIX = "lftp-poll:"
 _LFTP_STATUS_TRACE_COUNT_LIMIT = 128
+_LFTP_STATUS_PARSE_OUTCOMES = frozenset({
+    "complete_success", "blank_empty", "partial_queue", "hard_error", "not_attempted",
+})
 _LFTP_STATUS_TRACE_WARNING_OUTCOMES = frozenset({
     "fresh_unhealthy", "unhealthy_empty", "cached_unhealthy",
     "cached_error", "error_empty", "cached_retry", "retry_empty",
@@ -720,6 +725,29 @@ def _lftp_status_trace_level(source: str, healthy: bool) -> str:
     if source in {"cached_inflight", "inflight_empty"}:
         return "debug"
     return "warning" if source in _LFTP_STATUS_TRACE_WARNING_OUTCOMES or not healthy else "debug"
+
+
+def _lftp_status_trace_category(controller: object, level: str) -> Optional[str]:
+    """Select the enabled legacy or status-specific model inlet category."""
+    if _controller_breadcrumb_effectively_enabled(controller, _LFTP_STATUS_TRACE_CATEGORY, level):
+        return _LFTP_STATUS_TRACE_CATEGORY
+    if _controller_breadcrumb_effectively_enabled(controller, "transfer.lftp.status", level):
+        return "transfer.lftp.status"
+    return None
+
+
+def _lftp_status_parser_outcome(controller: object, source: object) -> str:
+    """Read the current parser outcome without reusing cached poll state."""
+    if not isinstance(source, str) or source not in {
+            "fresh_healthy", "fresh_unhealthy", "error_empty", "unhealthy_empty",
+    }:
+        return "not_attempted"
+    backend = getattr(controller, "_Controller__lftp", None)
+    outcome = getattr(backend, "last_status_parse_outcome", None)
+    return (
+        outcome if isinstance(outcome, str) and outcome in _LFTP_STATUS_PARSE_OUTCOMES
+        else "not_attempted"
+    )
 
 
 def _record_lftp_status_sample_lineage(
@@ -796,9 +824,8 @@ def _record_lftp_status_breadcrumb(
         return
     _record_lftp_status_sample_lineage(controller, statuses, poll_correlation)
     level = _lftp_status_trace_level(source, healthy)
-    if not _controller_breadcrumb_effectively_enabled(
-            controller, _LFTP_STATUS_TRACE_CATEGORY, level,
-    ):
+    trace_category = _lftp_status_trace_category(controller, level)
+    if trace_category is None:
         return
     recorder = getattr(controller, "_Controller__record_breadcrumb", None)
     if not callable(recorder):
@@ -842,6 +869,7 @@ def _record_lftp_status_breadcrumb(
             "schema": _LFTP_STATUS_TRACE_SCHEMA,
             "phase": "status_inlet",
             "outcome": outcome,
+            "parser_outcome": _lftp_status_parser_outcome(controller, source),
             "source": source,
             "fresh": bool(fresh),
             "healthy": bool(healthy),
@@ -875,7 +903,7 @@ def _record_lftp_status_breadcrumb(
                     authority_context.update(candidate_context)
             details.update(authority_context)
         # Parser provenance is already retained on each status record. Read
-        # only a bounded sample after the transfer.lftp gate; never include
+        # only a bounded sample after the status breadcrumb gate; never include
         # names, paths, or raw counters in the diagnostic payload.
         record_samples: list[dict[str, object]] = []
         record_shape_counts = {"at": 0, "got": 0, "none": 0}
@@ -914,7 +942,7 @@ def _record_lftp_status_breadcrumb(
             message="lftp_status_poll",
             details=details,
             event_type="state_transition",
-            category=_LFTP_STATUS_TRACE_CATEGORY,
+            category=trace_category,
             level=level,
             corr_id=corr_id,
             flow_id=safe_poll_correlation,

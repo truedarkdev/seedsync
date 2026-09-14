@@ -32,6 +32,9 @@ class LftpJobStatusParser:
         "pget-chunk: Access failed: Wrong type",
         "mirror: Access failed: Wrong type",
     )
+    __PARSE_OUTCOMES = frozenset({
+        "complete_success", "blank_empty", "partial_queue", "hard_error", "not_attempted",
+    })
 
     # python doesn't support partial inline-modified flags, so we need
     # to capture all case-sensitive cases here
@@ -69,9 +72,22 @@ class LftpJobStatusParser:
 
     def __init__(self):
         self.logger = logging.getLogger("LftpJobStatusParser")
+        # This is parser-owned diagnostic state for the most recent snapshot.
+        # It carries only a fixed enum and never participates in parsing or
+        # status authority.
+        self.__last_parse_outcome = "not_attempted"
 
     def set_base_logger(self, base_logger: logging.Logger):
         self.logger = base_logger.getChild("LftpJobStatusParser")
+
+    @property
+    def last_parse_outcome(self) -> str:
+        """Return the fixed outcome of the most recent parse attempt."""
+        outcome = getattr(self, "_LftpJobStatusParser__last_parse_outcome", None)
+        return (
+            outcome if isinstance(outcome, str) and outcome in self.__PARSE_OUTCOMES
+            else "not_attempted"
+        )
 
     @staticmethod
     def _size_to_bytes(size: str) -> int:
@@ -299,6 +315,15 @@ class LftpJobStatusParser:
         return int(prefix.group("id")), flags, positionals[0][0], positionals[1][0], progress
 
     def parse(self, output: str) -> List[LftpJobStatus]:
+        self.__last_parse_outcome = "not_attempted"
+        try:
+            return self.__parse(output)
+        except Exception:
+            self.__last_parse_outcome = "hard_error"
+            raise
+
+    def __parse(self, output: str) -> List[LftpJobStatus]:
+        self.__last_parse_outcome = "not_attempted"
         statuses: list[LftpJobStatus] = []
         lines = [s.strip() for s in output.splitlines()]
         lines = list(filter(None, lines))  # remove blank lines
@@ -311,6 +336,7 @@ class LftpJobStatusParser:
             }
         ]
         if any(LftpJobStatusParser.__STATUS_COMMAND_ECHO_BRACKETED_LINE_REGEX.match(line) for line in lines):
+            self.__last_parse_outcome = "hard_error"
             raise LftpJobStatusParserError(
                 "Lftp status output contained a bracketed status command echo"
             )
@@ -320,6 +346,7 @@ class LftpJobStatusParser:
         jobs_marker_index = next((i for i, l in enumerate(lines) if l == "jobs -v"), None)
         preamble = lines if jobs_marker_index is None else lines[:jobs_marker_index]
         if any(re.match(LftpJobStatusParser.__QUEUE_COMMAND_ECHO_REGEX, line) for line in preamble):
+            self.__last_parse_outcome = "hard_error"
             raise LftpJobStatusParserError(
                 "Lftp status output contained a queue command echo before the snapshot"
             )
@@ -329,10 +356,12 @@ class LftpJobStatusParser:
         # command. That output is not a complete `jobs -v` snapshot, so it
         # must never be interpreted as an authoritative empty job list.
         if any(re.match(LftpJobStatusParser.__QUEUE_COMMAND_ECHO_REGEX, line) for line in lines):
+            self.__last_parse_outcome = "hard_error"
             raise LftpJobStatusParserError(
                 "Lftp status output contained a queue command echo instead of a complete snapshot"
             )
         if any(LftpJobStatusParser.__has_status_command_echo(line) for line in lines):
+            self.__last_parse_outcome = "hard_error"
             raise LftpJobStatusParserError(
                 "Lftp status command echo was interleaved with transfer progress"
             )
@@ -345,23 +374,30 @@ class LftpJobStatusParser:
         try:
             statuses += self.__parse_queue(lines)
         except _LftpKnownOptionsMirrorHeaderError as e:
+            self.__last_parse_outcome = "hard_error"
             self.logger.warning("LftpJobStateParser rejecting malformed known-option queue output: {}".format(str(e)))
             self.logger.debug("Bad status output:\n{}".format(redact_credentials(output)))
             raise LftpJobStatusParserError("Lftp status output had incomplete queue membership") from e
         except ValueError as e:
+            self.__last_parse_outcome = "partial_queue"
             self.logger.warning("LftpJobStateParser skipping bad queue output: {}".format(str(e)))
             self.logger.debug("Bad status output:\n{}".format(redact_credentials(output)))
             return statuses
         try:
             statuses += self.__parse_jobs(lines)
         except ValueError as e:
+            self.__last_parse_outcome = "hard_error"
             self.logger.warning("LftpJobStateParser skipping bad job output: {}".format(str(e)))
             self.logger.debug("Bad status output:\n{}".format(redact_credentials(output)))
             raise LftpJobStatusParserError("Lftp status output had incomplete job membership") from e
         if has_wrong_type_failure and statuses and not any(
             status.state == LftpJobStatus.State.RUNNING for status in statuses
         ):
+            # This recognized terminal failure deliberately clears the stale
+            # queue snapshot without raising; retain the failure classification.
+            self.__last_parse_outcome = "hard_error"
             return []
+        self.__last_parse_outcome = "complete_success" if statuses else "blank_empty"
         return statuses
 
     @staticmethod

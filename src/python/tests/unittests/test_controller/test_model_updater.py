@@ -29,6 +29,7 @@ from controller.model_updater import (
     _record_scan_adoption_breadcrumb,
     _record_lftp_status_breadcrumb,
     _record_lftp_status_membership_transition,
+    _lftp_status_lineage_trace_enabled,
     _record_pending_queue_overlay_publications,
     _ProgressiveScanAccumulator,
     _JointProgressiveReconciler,
@@ -8098,6 +8099,88 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(1, details["queue_dispatch_pending_count"])
         self.assertEqual(2, details["lftp_queue_operation_pending_count"])
         self.assertEqual(3, details["lftp_queue_operation_done_count"])
+
+    def test_status_only_policy_emits_model_inlet_with_parser_outcome(self):
+        for level, source, healthy, parser_outcome, expected_level in (
+                ("debug", "fresh_healthy", True, "complete_success", "debug"),
+                ("warning", "error_empty", False, "hard_error", "warning"),
+        ):
+            with self.subTest(level=level):
+                trace = BreadcrumbTraceCollector(
+                    lambda: True,
+                    max_entries=8,
+                    policy={"default": "off", "rules": {"transfer.lftp.status": level}},
+                )
+                controller = SimpleNamespace(
+                    _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+                    _Controller__record_breadcrumb=lambda **kwargs: trace.record(
+                        "model_updater", kwargs["message"], kwargs["details"],
+                        **{key: value for key, value in kwargs.items()
+                           if key not in {"message", "details"}},
+                    ),
+                    _Controller__lftp=SimpleNamespace(
+                        backend_name="lftp", last_status_parse_outcome=parser_outcome,
+                    ),
+                    _Controller__last_lftp_statuses=[],
+                    _Controller__lftp_status_cache_expires_at=None,
+                    _Controller__lftp_status_poll_retry_active=False,
+                    _Controller__lftp_idle_status_authoritative=False,
+                    logger=MagicMock(),
+                )
+                self.assertTrue(_lftp_status_lineage_trace_enabled(controller))
+
+                _record_lftp_status_breadcrumb(
+                    controller,
+                    [],
+                    source=source,
+                    fresh=source == "fresh_healthy",
+                    healthy=healthy,
+                    poll_correlation="lftp-poll:0123456789abcdef",
+                )
+
+                entries = trace.snapshot()["entries"]
+                self.assertEqual(1, len(entries))
+                self.assertEqual("transfer.lftp.status", entries[0]["category"])
+                self.assertEqual(expected_level, entries[0]["level"])
+                self.assertEqual(
+                    "lftp-poll:0123456789abcdef", entries[0]["flow_id"],
+                )
+                self.assertEqual(parser_outcome, entries[0]["details"]["parser_outcome"])
+
+    def test_cached_status_does_not_reuse_parser_outcome(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__record_breadcrumb=lambda **kwargs: trace.record(
+                "model_updater", kwargs["message"], kwargs["details"],
+                **{key: value for key, value in kwargs.items()
+                   if key not in {"message", "details"}},
+            ),
+            _Controller__lftp=SimpleNamespace(
+                backend_name="lftp", last_status_parse_outcome="complete_success",
+            ),
+            _Controller__last_lftp_statuses=[],
+            _Controller__lftp_status_cache_expires_at=None,
+            _Controller__lftp_status_poll_retry_active=False,
+            _Controller__lftp_idle_status_authoritative=True,
+            logger=MagicMock(),
+        )
+
+        _record_lftp_status_breadcrumb(
+            controller,
+            [],
+            source="cached_idle",
+            fresh=False,
+            healthy=True,
+        )
+
+        self.assertEqual(
+            "not_attempted", trace.snapshot()["entries"][0]["details"]["parser_outcome"],
+        )
 
     def test_lftp_status_breadcrumb_includes_bounded_record_provenance(self):
         trace = BreadcrumbTraceCollector(

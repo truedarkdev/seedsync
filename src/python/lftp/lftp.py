@@ -73,6 +73,9 @@ LFTP_STATUS_POLL_ERROR_CLASSES = frozenset({
     "none", "timeout", "eof", "command_error", "parser_error", "terminal_backlog",
     "unhealthy_snapshot", "unknown",
 })
+LFTP_STATUS_PARSE_OUTCOMES = frozenset({
+    "complete_success", "blank_empty", "partial_queue", "hard_error", "not_attempted",
+})
 LFTP_STATUS_POLL_DRAIN_CLASSES = frozenset({
     "empty", "queue_done", "job_or_progress", "prompt_or_echo", "error", "eof",
     "terminal_backlog", "mixed", "unknown",
@@ -1131,6 +1134,7 @@ class Lftp:
         # Per-poll diagnostic classification only; it is not transfer
         # authority, a cache, or a persisted lifecycle marker.
         self.__last_status_poll_failure_reason: Optional[str] = None
+        self.__last_status_parse_outcome = "not_attempted"
         self.__last_incoming_recovery_status_observation: dict[str, object] | None = None
         self.__status_poll_needs_connection_grace = False
         self.__breadcrumb_trace: object = None
@@ -2221,6 +2225,25 @@ class Lftp:
         return reason if reason in LFTP_STATUS_POLL_FAILURE_REASONS else None
 
     @property
+    def last_status_parse_outcome(self) -> str:
+        """Return the parser's fixed outcome for the current status poll."""
+        outcome = getattr(self, "_Lftp__last_status_parse_outcome", None)
+        return (
+            outcome if isinstance(outcome, str) and outcome in LFTP_STATUS_PARSE_OUTCOMES
+            else "not_attempted"
+        )
+
+    def __set_status_parse_outcome(self, statuses: object) -> None:
+        """Copy only the parser's fixed outcome into the LFTP owner."""
+        outcome = getattr(self.__job_status_parser, "last_parse_outcome", None)
+        if not isinstance(outcome, str) or outcome not in LFTP_STATUS_PARSE_OUTCOMES:
+            outcome = (
+                "complete_success" if isinstance(statuses, list) and statuses
+                else "blank_empty" if isinstance(statuses, list) else "not_attempted"
+            )
+        self.__last_status_parse_outcome = outcome
+
+    @property
     def incoming_recovery_last_status_observation(self) -> dict[str, object]:
         """Return bounded last-poll metadata for Queue lifecycle diagnostics."""
         observation = getattr(self, "_Lftp__last_incoming_recovery_status_observation", None)
@@ -2358,6 +2381,7 @@ class Lftp:
         :return:
         """
         self.__last_status_poll_failure_reason = None
+        self.__last_status_parse_outcome = "not_attempted"
         # A prior poll must never be associated with this poll, or
         # survive after the gate is disabled.
         self.__last_incoming_recovery_status_observation = None
@@ -2481,10 +2505,12 @@ class Lftp:
             )
             record_status_result("parse_started", out)
             statuses = self.__job_status_parser.parse(out)
+            self.__set_status_parse_outcome(statuses)
             self.__consecutive_status_errors = 0
             self.__last_status_poll_healthy = not timed_out
             record_status_result("parse_complete", out, len(statuses))
         except LftpJobStatusParserError as exc:
+            self.__set_status_parse_outcome(statuses)
             self.__consecutive_status_errors += 1
             self.__last_status_poll_failure_reason = "parser_error"
             self.__last_status_poll_healthy = False
@@ -2495,12 +2521,16 @@ class Lftp:
             else:
                 record_status_result("health", healthy=False, exception=exc)
                 raise
+        except Exception:
+            self.__last_status_parse_outcome = "hard_error"
+            raise
         if statuses is not None:
             self.__annotate_status_path_pairs(statuses)
         if not statuses and getattr(self, "_Lftp__status_poll_needs_connection_grace", False) and not self.__pending_error:
             self.__status_poll_needs_connection_grace = False
             used_connection_grace = True
             connection_grace_timeout = max(STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS, 5.0)
+            self.__last_status_parse_outcome = "not_attempted"
             run_command: Any = self.__run_command
             out = run_command(
                 "jobs -v",
@@ -2523,10 +2553,12 @@ class Lftp:
                 )
                 record_status_result("parse_started", out)
                 statuses = self.__job_status_parser.parse(out)
+                self.__set_status_parse_outcome(statuses)
                 self.__consecutive_status_errors = 0
                 self.__last_status_poll_healthy = not self.__last_command_timed_out
                 record_status_result("parse_complete", out, len(statuses))
             except LftpJobStatusParserError as exc:
+                self.__set_status_parse_outcome(statuses)
                 self.__consecutive_status_errors += 1
                 self.__last_status_poll_failure_reason = "parser_error"
                 self.__last_status_poll_healthy = False
@@ -2537,6 +2569,9 @@ class Lftp:
                 else:
                     record_status_result("health", healthy=False, exception=exc)
                     raise
+            except Exception:
+                self.__last_status_parse_outcome = "hard_error"
+                raise
             if statuses is not None:
                 self.__annotate_status_path_pairs(statuses)
         if not self.__last_status_poll_healthy and self.__last_status_poll_failure_reason is None:

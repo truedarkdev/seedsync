@@ -6,7 +6,7 @@ import pexpect
 
 import lftp.lftp as lftp_mod
 from common.breadcrumb_trace import BreadcrumbTraceCollector
-from lftp import Lftp, LftpJobStatusParserError
+from lftp import Lftp, LftpJobStatusParser, LftpJobStatusParserError
 
 
 class TestLftpStatusDiagnostics(unittest.TestCase):
@@ -48,6 +48,40 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
             max_entries=32,
             policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
         )
+
+    def test_parser_reports_only_fixed_snapshot_outcomes(self):
+        cases = (
+            (
+                "complete_success",
+                "jobs -v\n"
+                "[0] queue (sftp://someone:@localhost)\n"
+                "sftp://someone:@localhost/remote\n"
+                "Queue is running.\n"
+                "[1] mirror -c /remote/sample-directory /local/staging/ -- 10/20 (50%)\n",
+            ),
+            ("blank_empty", ""),
+            ("partial_queue", "jobs -v\n[0] queue (sftp://someone:@localhost)\n"),
+            ("hard_error", "jobs -v\n[2] jobs -v &\n"),
+            (
+                "hard_error",
+                "jobs -v\n"
+                "[0] queue (sftp://someone:@localhost)\n"
+                "sftp://someone:@localhost/home/someone\n"
+                "Queue is running.\n"
+                "Commands queued:\n"
+                " 1. mirror -c /tmp/test_lftp/remote/a /tmp/test_lftp/local/\n"
+                "mirror: Access failed: Wrong type\n",
+            ),
+        )
+        for expected, output in cases:
+            with self.subTest(expected=expected):
+                parser = LftpJobStatusParser()
+                try:
+                    parser.parse(output)
+                except LftpJobStatusParserError:
+                    pass
+                self.assertEqual(expected, parser.last_parse_outcome)
+                self.assertNotIn("someone", parser.last_parse_outcome)
 
     def test_status_boundary_emits_only_fixed_structural_fields(self):
         trace = self._trace()
@@ -175,6 +209,17 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         self.assertNotEqual("empty", prompt_timeout["details"]["prompt_outcome"])
         self.assertEqual("timeout", health["details"]["error_class"])
 
+    def test_command_timeout_before_parser_is_not_attempted(self):
+        lftp = self._build_lftp()
+        lftp._Lftp__run_command = MagicMock(
+            side_effect=pexpect.exceptions.TIMEOUT("timeout"),
+        )
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+
+        self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+        self.assertEqual("not_attempted", lftp.last_status_parse_outcome)
+
     def test_prompt_empty_is_not_prompt_timeout_or_parser_error(self):
         lftp = self._build_lftp()
         trace = self._trace()
@@ -194,6 +239,7 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
     def test_parser_error_has_distinct_error_class(self):
         lftp = self._build_lftp()
         lftp._Lftp__job_status_parser.parse.side_effect = LftpJobStatusParserError("private detail")
+        lftp._Lftp__job_status_parser.last_parse_outcome = "hard_error"
         trace = self._trace()
         lftp.set_breadcrumb_trace(trace)
 
@@ -205,6 +251,7 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         )
         self.assertEqual("error", parse_error["details"]["prompt_outcome"])
         self.assertEqual("parser_error", parse_error["details"]["error_class"])
+        self.assertEqual("hard_error", lftp.last_status_parse_outcome)
         self.assertNotIn("private detail", repr(trace.snapshot()))
 
 
