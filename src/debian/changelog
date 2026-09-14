@@ -1,3 +1,31 @@
+seedsync (0.9.5) stable; urgency=low
+
+  * Fixed Queue recovery after restart so incomplete LFTP temporary files are
+    kept out of Final when their resume status is missing or uncertain
+  * Added a guarded offline recovery step for re-establishing a migrated
+    configuration root without replacing current settings
+  * Fixed Queue recovery so SeedSync waits for enabled Path Pair Final-folder
+    information before it decides which existing files must be protected
+  * Made Downloading progress stay accurate through status refreshes, scans,
+    completion handoff, and Dashboard updates instead of dropping or moving
+    backwards while a transfer is still active
+  * Fixed Queue requests that could be delayed or lost while a relevant Path
+    Pair scan was still establishing its current state
+  * Fixed Delete Local for authorized staged directories and regular files,
+    while failing closed for unsafe or ambiguous targets
+  * Made Dashboard rows clearer when a live transfer temporarily cannot report
+    a usable size, speed, or ETA
+  * Fixed stopped transfers that could continue showing cached active status
+    after a status refresh
+  * Fixed LFTP status handling for retained terminal output and bracketed
+    command echoes, avoiding misleading or missing transfer status
+  * Extended optional Breadcrumb diagnostics so transfer status, scan adoption,
+    and Dashboard delivery can be correlated during troubleshooting
+  * Updated the Docker runtime base and reduced release images to runtime
+    sources only
+
+ -- Johan Rosén <johan.rosen.91@gmail.com>  Mon, 14 Sep 2026 00:00:00 +0200
+
 seedsync (0.9.4) stable; urgency=low
 
   * Fixed Queue requests during collision checks so SeedSync waits for the

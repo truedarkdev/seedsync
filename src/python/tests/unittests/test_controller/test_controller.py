@@ -31,7 +31,7 @@ from controller.controller import (
     _lftp_executor_exception_family, _lftp_executor_trace_enabled,
 )
 from controller.persist_keys import KEY_SEP, persist_key
-from common import AppError, Config, PathPairError, PathPairManager
+from common import AppError, Config, Constants, PathPairError, PathPairManager
 from common.performance_diagnostics import (
     DURATION_CONTROLLER_AUXILIARY_REAP,
     DURATION_CONTROLLER_CLEANUP_COMMANDS,
@@ -6836,7 +6836,34 @@ class TestController(unittest.TestCase):
             False,
             remote_base_dir_path=None,
             local_base_dir_path="/local/incomplete",
-            allow_resume=False,
+        )
+
+    def test_process_commands_queue_zero_byte_async_owner_disables_resume(self):
+        zero_file = ModelFile("zero-byte-async", False)
+        zero_file.remote_size = 0
+        self.controller._Controller__model.get_file.return_value = zero_file
+        self.controller._Controller__lftp.backend_name = "lftp"
+
+        self.controller.queue_command(
+            Controller.Command(Controller.Command.Action.QUEUE, zero_file.file_id),
+        )
+        self.controller._Controller__process_commands()
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+        queue_call = self.controller._Controller__lftp.queue.call_args
+        self.assertEqual(("zero-byte-async", False), queue_call.args)
+        self.assertEqual(
+            {
+                "remote_base_dir_path": None,
+                "local_base_dir_path": "/local/incomplete",
+                "allow_resume": False,
+            },
+            {
+                name: queue_call.kwargs[name]
+                for name in (
+                    "remote_base_dir_path", "local_base_dir_path", "allow_resume",
+                )
+            },
         )
 
     def test_process_commands_queue_is_idempotent_for_queued_file(self):
@@ -12141,6 +12168,99 @@ class TestController(unittest.TestCase):
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
 
+    def test_manual_directory_queue_initial_authority_succeeds_at_96_seconds(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+        clock = [0.0]
+
+        with patch("controller.controller.time.monotonic", side_effect=lambda: clock[0]):
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+            intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+            self.assertEqual(120.0, intent.rescan_deadline_monotonic)
+
+            clock[0] = 96.0
+            self.controller._Controller__scan_authority_tokens = {
+                "local": {"pair-a": ("local-test-session", 1)},
+                "remote": {"pair-a": ("remote-test-session", 1)},
+            }
+            self.controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+            self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+            self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            file.name,
+            True,
+            remote_base_dir_path="/remote",
+            local_base_dir_path="/local/incomplete",
+        )
+        callback.on_success.assert_called_once_with()
+        callback.on_failure.assert_not_called()
+
+    def test_manual_directory_queue_initial_authority_expires_at_120_once_without_late_dispatch(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+        clock = [0.0]
+
+        with patch("controller.controller.time.monotonic", side_effect=lambda: clock[0]):
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+            intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+            intent.rescan_deadline_grace_consumed = True
+            clock[0] = 120.0
+            self.controller._Controller__process_commands()
+
+            self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+            callback.on_failure.assert_called_once_with(
+                "Queue preflight cancelled: initial_scan_authority_deadline", 409,
+            )
+
+            # A late authoritative result cannot resurrect or dispatch the
+            # retired command.
+            self.controller._Controller__scan_authority_tokens = {
+                "local": {"pair-a": ("local-test-session", 1)},
+                "remote": {"pair-a": ("remote-test-session", 1)},
+            }
+            self.controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+            self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+            clock[0] = 121.0
+            self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_success.assert_not_called()
+        callback.on_failure.assert_called_once_with(
+            "Queue preflight cancelled: initial_scan_authority_deadline", 409,
+        )
+
+    def test_manual_directory_queue_stop_cancels_initial_authority_wait_once(self):
+        file = self._seed_manual_directory_scan_readiness_fixture()
+        queue_callback = MagicMock()
+        queue_command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        queue_command.add_callback(queue_callback)
+        stop_callback = MagicMock()
+        stop_command = Controller.Command(Controller.Command.Action.STOP, file.file_id)
+        stop_command.add_callback(stop_callback)
+        clock = [0.0]
+
+        with patch("controller.controller.time.monotonic", side_effect=lambda: clock[0]):
+            self.controller.queue_command(queue_command)
+            self.controller._Controller__process_commands()
+            clock[0] = 96.0
+            self.controller.queue_command(stop_command)
+            self.controller._Controller__process_commands()
+            clock[0] = 200.0
+            self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+        queue_callback.on_success.assert_not_called()
+        queue_callback.on_failure.assert_called_once()
+        stop_callback.on_success.assert_called_once_with()
+        stop_callback.on_failure.assert_not_called()
+
     def test_manual_directory_duplicate_queue_coalesces_to_one_initial_scan_and_dispatch(self):
         file = self._seed_manual_directory_scan_readiness_fixture()
         first_callback = MagicMock()
@@ -12417,47 +12537,27 @@ class TestController(unittest.TestCase):
             "Queue preflight cancelled: initial_local_scan_unknown", 409,
         )
 
-    def test_experimental_scan_token_trace_records_model_consumption_once_without_identity(self):
-        trace = BreadcrumbTraceCollector(
-            lambda: True,
-            policy={"default": "off", "rules": {"queue.readiness": "info"}},
-            max_entries=8,
+    def test_initial_rescan_timeout_is_dedicated_and_ignores_debug_gate(self):
+        self.assertEqual(5, Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS)
+        self.assertEqual(120, Constants.INITIAL_SCAN_AUTHORITY_TIMEOUT_IN_SECS)
+        self.assertEqual(5, Constants.QUEUE_HTTP_CALLBACK_MARGIN_IN_SECS)
+        self.assertEqual(125, Constants.QUEUE_HTTP_WAIT_TIMEOUT_IN_SECS)
+        self.assertEqual(
+            Constants.INITIAL_SCAN_AUTHORITY_TIMEOUT_IN_SECS +
+            Constants.QUEUE_HTTP_CALLBACK_MARGIN_IN_SECS,
+            Constants.QUEUE_HTTP_WAIT_TIMEOUT_IN_SECS,
         )
-        self.controller._Controller__context.breadcrumb_trace = trace
-        command = Controller.Command(Controller.Command.Action.QUEUE, "private-file")
-        self.controller._Controller__deferred_queue_intents = {
-            "private-file": DeferredQueueIntent(
-                command, "private-file", "private-pair", phase="initial_rescan",
-                rescan_requested=True,
-                rescan_generations=(("session", 2), ("session", 2)),
-            )
-        }
-        result = ScannerResult(
-            datetime.now(), [], scanned_path_pair_ids={"private-pair"},
-            completed_path_pair_ids={"private-pair"}, generation=3,
-            session_token="session", is_scan_final=False,
+        self.assertNotEqual(
+            Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS,
+            Constants.INITIAL_SCAN_AUTHORITY_TIMEOUT_IN_SECS,
         )
-        result._scan_authority_tokens_by_pair = {"private-pair": ("session", 3)}
-        with patch.dict(os.environ, {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"}):
-            self.controller._record_path_pair_scan_tokens(result, None)
-            self.controller._record_path_pair_scan_tokens(result, None)
-
-        entries = trace.query_events(category_prefix="queue.readiness")["events"]
-        self.assertEqual(1, len(entries))
-        self.assertEqual("queue_authority_experiment", entries[0]["message"])
-        self.assertEqual("model_consumed_token_recorded", entries[0]["details"]["phase"])
-        self.assertEqual("local", entries[0]["details"]["side"])
-        self.assertNotIn("private-file", str(entries))
-        self.assertNotIn("private-pair", str(entries))
-
-    def test_initial_rescan_timeout_uses_only_the_exact_experimental_gate(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
                 Controller._DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS,
                 Controller._initial_rescan_timeout_seconds(),
             )
         with patch.dict(os.environ, {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"}):
-            self.assertEqual(600.0, Controller._initial_rescan_timeout_seconds())
+            self.assertEqual(120.0, Controller._initial_rescan_timeout_seconds())
 
     def test_full_scan_gate_off_rejects_without_scanner_call(self):
         remote_process = self.controller._Controller__remote_scan_process
@@ -12604,43 +12704,6 @@ class TestController(unittest.TestCase):
         self.assertEqual("none", result["dispatch"])
         self.assertEqual("scanner_unavailable", result["reason"])
         local_process.force_scan.assert_not_called()
-
-    def test_experimental_progress_buckets_are_monotonic_deduplicated_and_identity_free(self):
-        trace = BreadcrumbTraceCollector(
-            lambda: True,
-            policy={"default": "off", "rules": {"queue.readiness": "info"}},
-            max_entries=8,
-        )
-        self.controller._Controller__context.breadcrumb_trace = trace
-        intent = DeferredQueueIntent(
-            Controller.Command(Controller.Command.Action.QUEUE, "private-file"),
-            "private-file", "private-pair", phase="initial_rescan", rescan_requested=True,
-            rescan_deadline_monotonic=600.0,
-        )
-        local, remote = MagicMock(), MagicMock()
-        local.priority_state.return_value = "queued"
-        remote.priority_state.return_value = "active"
-        self.controller._Controller__local_scan_process = local
-        self.controller._Controller__remote_scan_process = remote
-
-        with patch.dict(os.environ, {}, clear=True):
-            self.controller._Controller__record_initial_rescan_experiment_progress(intent, 0.0)
-        self.assertEqual([], trace.query_events(category_prefix="queue.readiness")["events"])
-
-        with patch.dict(os.environ, {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"}):
-            self.controller._Controller__record_initial_rescan_experiment_progress(intent, 0.0)
-            self.controller._Controller__record_initial_rescan_experiment_progress(intent, 10.0)
-            self.controller._Controller__record_initial_rescan_experiment_progress(intent, 10.0)
-            intent.rescan_deadline_grace_consumed = True
-            intent.rescan_deadline_monotonic = 10.1
-            self.controller._Controller__record_initial_rescan_experiment_progress(intent, 10.2)
-
-        entries = trace.query_events(category_prefix="queue.readiness")["events"]
-        self.assertEqual([0, 1], [entry["details"]["elapsed_bucket_10s"] for entry in entries])
-        self.assertTrue(all(entry["details"]["local_priority"] == "queued" for entry in entries))
-        self.assertTrue(all(entry["details"]["remote_priority"] == "active" for entry in entries))
-        self.assertNotIn("private-file", str(entries))
-        self.assertNotIn("private-pair", str(entries))
 
     def test_manual_directory_queue_initial_scan_missing_pair_token_retires_once(self):
         file = self._seed_manual_directory_scan_readiness_fixture()

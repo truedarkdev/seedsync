@@ -203,14 +203,20 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
             if event["details"]["phase"] == "jobs_read"
         )
         details = jobs_read["details"]
-        self.assertEqual(2, details["post_send_zero_timeout_expect_iterations"])
-        self.assertEqual(2, details["post_send_productive_count"])
-        self.assertEqual(0, details["post_send_no_progress_count"])
-        self.assertEqual(0, details["post_send_unknown_count"])
-        self.assertEqual(0, details["post_send_sleep_requested_ns"])
-        self.assertEqual(0, details["post_send_sleep_actual_ns"])
-        self.assertEqual(1_100_000_000, details["post_send_loop_elapsed_ns"])
-        self.assertEqual("progress", details["post_send_buffer_progress"])
+        metrics = details["post_send_metrics"]
+        self.assertLessEqual(len(details), 24)
+        self.assertEqual("not_required", details["prior_prompt"])
+        self.assertTrue(details["send_admitted"])
+        self.assertFalse(details["prompt_reached"])
+        self.assertEqual("unknown", details["retained_before"])
+        self.assertEqual(2, metrics["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(2, metrics["post_send_productive_count"])
+        self.assertEqual(0, metrics["post_send_no_progress_count"])
+        self.assertEqual(0, metrics["post_send_unknown_count"])
+        self.assertEqual(0, metrics["post_send_sleep_requested_ns"])
+        self.assertEqual(0, metrics["post_send_sleep_actual_ns"])
+        self.assertEqual(1_100_000_000, metrics["post_send_loop_elapsed_ns"])
+        self.assertEqual("progress", metrics["post_send_buffer_progress"])
 
     def test_post_send_loop_metrics_distinguish_mixed_from_all_productive(self):
         lftp = self._build_lftp()
@@ -236,12 +242,13 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
             if event["details"]["phase"] == "jobs_read"
         )
         details = jobs_read["details"]
-        self.assertEqual(3, details["post_send_zero_timeout_expect_iterations"])
-        self.assertEqual(1, details["post_send_productive_count"])
-        self.assertEqual(2, details["post_send_no_progress_count"])
-        self.assertEqual(0, details["post_send_unknown_count"])
-        self.assertEqual(1_100_000_000, details["post_send_loop_elapsed_ns"])
-        self.assertEqual("progress", details["post_send_buffer_progress"])
+        metrics = details["post_send_metrics"]
+        self.assertEqual(3, metrics["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(1, metrics["post_send_productive_count"])
+        self.assertEqual(2, metrics["post_send_no_progress_count"])
+        self.assertEqual(0, metrics["post_send_unknown_count"])
+        self.assertEqual(1_100_000_000, metrics["post_send_loop_elapsed_ns"])
+        self.assertEqual("progress", metrics["post_send_buffer_progress"])
 
     def test_post_send_loop_metrics_report_no_progress_timeout(self):
         lftp = self._build_lftp()
@@ -263,13 +270,14 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
             if event["details"]["phase"] == "jobs_read"
         )
         details = jobs_read["details"]
-        self.assertEqual(2, details["post_send_zero_timeout_expect_iterations"])
-        self.assertEqual(0, details["post_send_productive_count"])
-        self.assertEqual(2, details["post_send_no_progress_count"])
-        self.assertEqual(0, details["post_send_unknown_count"])
-        self.assertEqual(10_000_000, details["post_send_sleep_requested_ns"])
-        self.assertEqual(1_100_000_000, details["post_send_loop_elapsed_ns"])
-        self.assertEqual("no_progress", details["post_send_buffer_progress"])
+        metrics = details["post_send_metrics"]
+        self.assertEqual(2, metrics["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(0, metrics["post_send_productive_count"])
+        self.assertEqual(2, metrics["post_send_no_progress_count"])
+        self.assertEqual(0, metrics["post_send_unknown_count"])
+        self.assertEqual(10_000_000, metrics["post_send_sleep_requested_ns"])
+        self.assertEqual(1_100_000_000, metrics["post_send_loop_elapsed_ns"])
+        self.assertEqual("no_progress", metrics["post_send_buffer_progress"])
 
     def test_post_send_prompt_completion_reset_is_unknown_progress(self):
         lftp = self._build_lftp()
@@ -304,12 +312,13 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
             if event["details"]["phase"] == "jobs_read"
         )
         details = jobs_read["details"]
-        self.assertEqual(2, details["post_send_zero_timeout_expect_iterations"])
-        self.assertEqual(1, details["post_send_productive_count"])
-        self.assertEqual(0, details["post_send_no_progress_count"])
-        self.assertEqual(1, details["post_send_unknown_count"])
-        self.assertEqual(200_000_000, details["post_send_loop_elapsed_ns"])
-        self.assertEqual("unknown", details["post_send_buffer_progress"])
+        metrics = details["post_send_metrics"]
+        self.assertEqual(2, metrics["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(1, metrics["post_send_productive_count"])
+        self.assertEqual(0, metrics["post_send_no_progress_count"])
+        self.assertEqual(1, metrics["post_send_unknown_count"])
+        self.assertEqual(200_000_000, metrics["post_send_loop_elapsed_ns"])
+        self.assertEqual("unknown", metrics["post_send_buffer_progress"])
 
     def test_post_send_invalid_or_decreasing_structure_is_unknown(self):
         lftp = self._build_lftp()
@@ -336,12 +345,13 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
             if event["details"]["phase"] == "jobs_read"
         )
         details = jobs_read["details"]
-        self.assertEqual(2, details["post_send_zero_timeout_expect_iterations"])
-        self.assertEqual(0, details["post_send_productive_count"])
-        self.assertEqual(1, details["post_send_no_progress_count"])
-        self.assertEqual(1, details["post_send_unknown_count"])
-        self.assertEqual(1_100_000_000, details["post_send_loop_elapsed_ns"])
-        self.assertEqual("unknown", details["post_send_buffer_progress"])
+        metrics = details["post_send_metrics"]
+        self.assertEqual(2, metrics["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(0, metrics["post_send_productive_count"])
+        self.assertEqual(1, metrics["post_send_no_progress_count"])
+        self.assertEqual(1, metrics["post_send_unknown_count"])
+        self.assertEqual(1_100_000_000, metrics["post_send_loop_elapsed_ns"])
+        self.assertEqual("unknown", metrics["post_send_buffer_progress"])
 
     def test_post_send_metrics_are_disabled_without_debug_status_trace(self):
         lftp = self._build_lftp()
@@ -442,13 +452,14 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
             if event["details"]["phase"] == "jobs_read"
         )
         details = jobs_read["details"]
-        self.assertEqual(1, details["post_send_zero_timeout_expect_iterations"])
-        self.assertEqual(1, details["post_send_productive_count"])
-        self.assertEqual(0, details["post_send_no_progress_count"])
-        self.assertEqual(0, details["post_send_unknown_count"])
-        self.assertEqual(0, details["post_send_sleep_requested_ns"])
-        self.assertEqual(1_100_000_000, details["post_send_loop_elapsed_ns"])
-        self.assertEqual("progress", details["post_send_buffer_progress"])
+        metrics = details["post_send_metrics"]
+        self.assertEqual(1, metrics["post_send_zero_timeout_expect_iterations"])
+        self.assertEqual(1, metrics["post_send_productive_count"])
+        self.assertEqual(0, metrics["post_send_no_progress_count"])
+        self.assertEqual(0, metrics["post_send_unknown_count"])
+        self.assertEqual(0, metrics["post_send_sleep_requested_ns"])
+        self.assertEqual(1_100_000_000, metrics["post_send_loop_elapsed_ns"])
+        self.assertEqual("progress", metrics["post_send_buffer_progress"])
         self.assertEqual(1, manifest["boundary"]["post_send_zero_timeout_expect_iterations"])
         self.assertEqual(1, manifest["boundary"]["post_send_productive_count"])
         self.assertEqual(0, manifest["boundary"]["post_send_no_progress_count"])

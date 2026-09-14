@@ -607,13 +607,6 @@ class DeferredQueueIntent:
     # results. Consume one short grace tick before terminalizing so a result
     # that arrived by the deadline can become authoritative in that phase.
     rescan_deadline_grace_consumed: bool = False
-    # The controlled 600-second experiment emits at most one fixed-schema
-    # progress record per ten-second bucket. Normal Queue handling leaves it
-    # untouched.
-    rescan_progress_bucket: int = -1
-    rescan_experiment_recorded_sides: set[str] = field(default_factory=set)
-
-
 @dataclass
 class _LftpOperation:
     action: str
@@ -755,10 +748,10 @@ class Controller:
     __AUXILIARY_WORKER_IDLE_GRACE_IN_SECS = 2.0
     _ACTIVE_PROCESS_INTERVAL_SECONDS = 0.1
     _IDLE_HEALTH_INTERVAL_SECONDS = 10.0
-    # Reuse the established controller setup/API wait bound for the initial
-    # scan authority handoff.  A later collision rescan keeps its existing
-    # generation/failure policy and is intentionally not covered here.
-    _DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS = Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
+    # The initial scan-authority handoff has its own normal bound.  A later
+    # collision rescan keeps its existing generation/failure policy and is
+    # intentionally not covered here.
+    _DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS = Constants.INITIAL_SCAN_AUTHORITY_TIMEOUT_IN_SECS
     _EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV = "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS"
     _FULL_SCAN_OPERATION = "full_scan"
     _FULL_SCAN_SCHEMA = "full_scan.v1"
@@ -771,9 +764,8 @@ class Controller:
 
     @classmethod
     def _initial_rescan_timeout_seconds(cls) -> float:
-        """Use the maintainer-authorized 600s diagnostic window only when exact."""
-        return 600.0 if cls._incoming_recovery_debug_enabled() \
-            else cls._DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS
+        """Return the normal initial scan-authority fence."""
+        return float(cls._DEFERRED_INITIAL_RESCAN_TIMEOUT_IN_SECS)
 
     @classmethod
     def _full_scan_result(
@@ -3312,31 +3304,6 @@ class Controller:
                         side_tokens[pair_id] = pair_token
                     else:
                         side_tokens[pair_id] = (session_token, generation)
-                    if self._initial_rescan_timeout_seconds() == 600.0:
-                        side_index = 0 if side == "local" else 1
-                        for intent in self.__deferred_queue_intents_map().values():
-                            if intent.phase != "initial_rescan" or intent.path_pair_id != pair_id or \
-                                    side in intent.rescan_experiment_recorded_sides:
-                                continue
-                            baselines = intent.rescan_generations
-                            if not isinstance(baselines, tuple) or len(baselines) != 2:
-                                continue
-                            baseline = baselines[side_index]
-                            token = side_tokens[pair_id]
-                            if not isinstance(baseline, tuple) or len(baseline) != 2 or \
-                                    token[0] != baseline[0] or token[1] <= baseline[1]:
-                                continue
-                            intent.rescan_experiment_recorded_sides.add(side)
-                            # This method is called by ModelUpdater after it
-                            # consumed a ScannerResult, so one record proves
-                            # both that handoff and Controller token storage.
-                            self.__record_queue_readiness_trace(intent.file_id, "queue_authority_experiment", {
-                                "schema": "queue_authority_experiment.v1",
-                                "phase": "model_consumed_token_recorded",
-                                "side": side,
-                                "ready": False,
-                            })
-
             if callable(handoff_recorder):
                 side_index = 0 if side == "local" else 1
                 for intent in selected_intents:
@@ -9856,45 +9823,6 @@ class Controller:
             )
         return ready
 
-    def __record_initial_rescan_experiment_progress(
-            self, intent: DeferredQueueIntent, now_monotonic: float,
-    ) -> None:
-        """Project one bounded post-POST progress bucket for the 600s experiment."""
-        if self._initial_rescan_timeout_seconds() != 600.0:
-            return
-        # The ordinary terminal path repurposes the deadline for its one
-        # short grace tick.  That timestamp no longer represents experiment
-        # elapsed time, so do not emit a regressing periodic bucket from it.
-        if intent.rescan_deadline_grace_consumed:
-            return
-        deadline = getattr(intent, "rescan_deadline_monotonic", None)
-        if type(deadline) not in (int, float) or not math.isfinite(float(deadline)):
-            return
-        elapsed = max(0.0, 600.0 - max(0.0, float(deadline) - now_monotonic))
-        bucket = min(60, int(elapsed // 10.0))
-        if intent.rescan_progress_bucket == bucket:
-            return
-        intent.rescan_progress_bucket = bucket
-
-        def priority_state(process: object) -> str:
-            state = getattr(process, "priority_state", None)
-            if not callable(state):
-                return "absent"
-            try:
-                value = state(intent.path_pair_id)
-            except Exception:
-                return "absent"
-            return value if value in ("queued", "active", "absent") else "absent"
-
-        self.__record_queue_readiness_trace(intent.file_id, "queue_authority_experiment", {
-            "schema": "queue_authority_experiment.v1",
-            "phase": "progress",
-            "elapsed_bucket_10s": bucket,
-            "local_priority": priority_state(self.__local_scan_process),
-            "remote_priority": priority_state(self.__remote_scan_process),
-            "ready": False,
-        })
-
     def __cancel_deferred_queue_intent(
             self, file_id: str, reason: str, error_code: int = 409,
     ) -> Optional[DeferredQueueIntent]:
@@ -10014,7 +9942,6 @@ class Controller:
                         outcome="reenqueued",
                     )
                     continue
-                self.__record_initial_rescan_experiment_progress(intent, time.monotonic())
                 deadline = self.__ensure_initial_rescan_deadline(intent)
                 if deadline is not None and time.monotonic() >= deadline:
                     if not intent.rescan_deadline_grace_consumed:

@@ -1188,19 +1188,14 @@ def _record_lftp_status_poll_breadcrumb(
             if key in details
         }
         if post_send_metric_details:
-            # Keep the complete loop discriminator and the existing terminal
-            # outcome fields within the collector's fixed mapping bound; this
-            # is schema ordering, not an unbounded detail expansion.
-            for key in (
-                "schema", "phase", "boundary", "outcome", "process_alive",
-                "output_class", "read_buffer_byte_length_bucket", "failure_reason",
-                "raw_before_byte_length_bucket", "retained_byte_length_bucket",
-                "normalized_byte_length_bucket", "prompt_outcome", "error_class",
-                "pre_send_drain_class", "wall_time_ns", "monotonic_time_ns",
-            ):
-                if key in details:
-                    post_send_metric_details[key] = details[key]
-            details = post_send_metric_details
+            # Keep the complete loop discriminator in one fixed nested map so
+            # the collector's outer 24-key bound cannot evict later boundary
+            # fields such as ``prompt_reached``.  The collector supports this
+            # depth, and the private timeout manifest retains its separate
+            # flat boundary payload.  Its outer timestamp is authoritative;
+            # omit the redundant callback-only wall-clock pair here.
+            details.pop("wall_time_ns", None)
+            details["post_send_metrics"] = post_send_metric_details
         details["monotonic_time_ns"] = time.monotonic_ns()
         if isinstance(boundary_state, dict):
             details.update({key: value for key, value in boundary_state.items()

@@ -1,14 +1,17 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 from threading import Event, Thread
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.parse import quote
 
 from webtest import TestApp
 
 from tests.integration.test_web.test_web_app import BaseTestWebApp
-from controller import Controller
+from controller import Controller, ControllerPersist
 from web.handler.controller import ControllerHandler
+from model import ModelFile
+from web import WebAppBuilder
 
 
 class _PathPairIdentityMatchStr(str):
@@ -38,11 +41,229 @@ class TestControllerHandler(BaseTestWebApp):
             )
         )
 
-    def test_queue_timeout_uses_only_the_exact_authorized_experiment_gate(self):
+    def test_queue_timeout_is_derived_from_the_normal_authority_fence(self):
         with patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(ControllerHandler._ACTION_TIMEOUT, ControllerHandler._queue_action_timeout())
+            self.assertEqual(125.0, ControllerHandler._queue_action_timeout())
         with patch.dict("os.environ", {"INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS": "600"}):
-            self.assertEqual(605.0, ControllerHandler._queue_action_timeout())
+            self.assertEqual(125.0, ControllerHandler._queue_action_timeout())
+
+    def _build_real_authority_controller_composition(self):
+        config = self.context.config
+        lftp_config = config.lftp
+        for name, value in {
+            "remote_address": "remote.server.com",
+            "remote_username": "user",
+            "remote_password": "password",
+            "remote_port": 22,
+            "remote_path": "/remote",
+            "remote_path_to_scan_script": "/scanfs",
+            "local_path": self.temp_dir,
+            "use_ssh_key": False,
+            "num_max_parallel_downloads": 1,
+            "num_max_parallel_files_per_download": 1,
+            "num_max_connections_per_root_file": 1,
+            "num_max_connections_per_dir_file": 1,
+            "num_max_total_connections": 1,
+            "use_temp_file": False,
+            "rate_limit": None,
+            "net_socket_buffer": "8M",
+            "staging_path": None,
+            "protocol": "sftp",
+            "remote_ftp_port": 21,
+            "ftp_ssl_verify_certificate": True,
+        }.items():
+            setattr(lftp_config, name, value)
+        for name, value in {
+            "interval_ms_remote_scan": 1,
+            "interval_ms_local_scan": 1,
+            "interval_ms_downloading_scan": 1,
+            "extract_path": "/extract",
+            "use_local_path_as_extract_path": False,
+        }.items():
+            setattr(config.controller, name, value)
+        config.general.verbose = False
+        config.autoqueue.enabled = False
+        config.autoqueue.patterns_only = False
+        config.autoqueue.auto_extract = False
+        self.context.args.local_path_to_scanfs = "/scanfs"
+
+        with patch("controller.controller.create_transfer_backend") as create_backend:
+            backend = MagicMock()
+            backend.backend_name = "sync-test"
+            create_backend.return_value = backend
+            controller = Controller(self.context, ControllerPersist())
+
+        files = {}
+        for name in ("authority-success", "authority-expiry", "authority-pending"):
+            model_file = ModelFile(name, True)
+            model_file.path_pair_id = "pair-a"
+            model_file.remote_size = 10
+            model_file.remote_has_transferable_content = True
+            files[model_file.file_id] = model_file
+
+        controller._Controller__model = MagicMock()
+        controller._Controller__model.get_file.side_effect = lambda file_id: files[file_id]
+        controller._Controller__model_builder = MagicMock()
+        controller._Controller__model_builder.has_unresolved_staging_collision.return_value = False
+        controller._Controller__model_builder.get_terminalizable_staging_collision_file_ids.return_value = set()
+        controller._Controller__model_builder.get_remote_resume_source_identity.return_value = None
+        controller._Controller__path_pairs_by_id = {
+            "pair-a": SimpleNamespace(remote_path="/remote", local_path="/local"),
+        }
+        controller._Controller__path_pair_staging_paths = {"pair-a": "/local/incomplete"}
+        controller._Controller__local_scan_process = MagicMock()
+        controller._Controller__remote_scan_process = MagicMock()
+        controller._Controller__local_scan_process.session_token = "local-test-session"
+        controller._Controller__remote_scan_process.session_token = "remote-test-session"
+        controller._Controller__local_scan_process.generation = 0
+        controller._Controller__remote_scan_process.generation = 0
+        controller._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
+        controller._Controller__reconciled_local_path_pair_ids = set()
+        controller._Controller__reconciled_remote_path_pair_ids = set()
+        controller._Controller__lftp = MagicMock()
+        controller._Controller__lftp.backend_name = "sync-test"
+        controller._Controller__lftp.net_socket_buffer = ""
+        controller.get_model_file_command_identities = MagicMock(
+            side_effect=lambda: tuple(
+                (model_file.file_id, model_file.name, model_file.path_pair_id)
+                for model_file in files.values()
+            )
+        )
+        controller.get_model_summary = MagicMock(return_value={"model_version": 1})
+        controller.record_queue_http_wait_trace = MagicMock()
+        controller.get_model_files_and_add_listener = MagicMock(return_value=[])
+        controller.remove_model_listener = MagicMock()
+
+        builder = WebAppBuilder(
+            self.context, controller, self.auto_queue_persist, self.auth_store,
+        )
+        builder.controller_handler = ControllerHandler(controller, local_path=self.temp_dir)
+        test_app = TestApp(
+            builder.build(),
+            extra_environ={
+                "HTTP_AUTHORIZATION": "Bearer {}".format(self.integration_admin_secret),
+            },
+        )
+        return controller, files, test_app
+
+    def test_real_controller_and_handler_share_bounded_authority_and_http_waits(self):
+        """TestApp cannot model a disconnected client; timeout does not cancel an intent."""
+        self.assertEqual(125.0, ControllerHandler._queue_action_timeout())
+        controller, files, test_app = self._build_real_authority_controller_composition()
+        issued_commands = []
+        command_enqueued = Event()
+        original_queue_command = controller.queue_command
+
+        def capture_queue_command(command):
+            issued_commands.append(command)
+            original_queue_command(command)
+            command_enqueued.set()
+
+        controller.queue_command = capture_queue_command
+        clock = [0.0]
+
+        def queue_url(model_file):
+            return "/server/command/queue/{}?file_id={}".format(
+                model_file.name, quote(model_file.file_id, safe=""),
+            )
+
+        def reset_authority():
+            clock[0] = 0.0
+            controller._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
+            controller._Controller__reconciled_local_path_pair_ids.clear()
+            controller._Controller__reconciled_remote_path_pair_ids.clear()
+            command_enqueued.clear()
+
+        def issue_queue_request(model_file, responses, key):
+            responses[key] = test_app.post(queue_url(model_file), expect_errors=True)
+
+        with patch("controller.controller.time.monotonic", side_effect=lambda: clock[0]), \
+                patch.object(ControllerHandler, "_QUEUE_ACTION_TIMEOUT", 1.0):
+            success_file = files['["pair-a","authority-success"]']
+            reset_authority()
+            responses = {}
+            success_thread = Thread(
+                target=issue_queue_request,
+                args=(success_file, responses, "success"),
+            )
+            success_thread.start()
+            self.assertTrue(command_enqueued.wait(timeout=1.0))
+            controller._Controller__process_commands()
+            self.assertEqual(120.0, controller._Controller__deferred_queue_intents[
+                success_file.file_id
+            ].rescan_deadline_monotonic)
+            clock[0] = 96.0
+            controller._Controller__scan_authority_tokens = {
+                "local": {"pair-a": ("local-test-session", 1)},
+                "remote": {"pair-a": ("remote-test-session", 1)},
+            }
+            controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+            controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+            controller._Controller__process_commands()
+            success_thread.join(timeout=1.0)
+
+            self.assertFalse(success_thread.is_alive())
+            self.assertEqual(200, responses["success"].status_code)
+            self.assertEqual(1, controller._Controller__lftp.queue.call_count)
+
+            expiry_file = files['["pair-a","authority-expiry"]']
+            reset_authority()
+            expiry_responses = {}
+            expiry_thread = Thread(
+                target=issue_queue_request,
+                args=(expiry_file, expiry_responses, "expiry"),
+            )
+            expiry_thread.start()
+            self.assertTrue(command_enqueued.wait(timeout=1.0))
+            controller._Controller__process_commands()
+            expiry_intent = controller._Controller__deferred_queue_intents[expiry_file.file_id]
+            expiry_command = next(
+                command for command in issued_commands if command.filename == expiry_file.file_id
+            )
+            expiry_callback = expiry_command.callbacks[0]
+            expiry_callback.on_failure = MagicMock(wraps=expiry_callback.on_failure)
+            expiry_intent.rescan_deadline_grace_consumed = True
+            clock[0] = 120.0
+            controller._Controller__process_commands()
+            expiry_thread.join(timeout=1.0)
+
+            self.assertFalse(expiry_thread.is_alive())
+            self.assertEqual(409, expiry_responses["expiry"].status_code)
+            self.assertNotIn(expiry_file.file_id, controller._Controller__deferred_queue_intents)
+            expiry_callback.on_failure.assert_called_once_with(
+                "Queue preflight cancelled: initial_scan_authority_deadline", 409,
+            )
+
+            clock[0] = 121.0
+            controller._Controller__scan_authority_tokens = {
+                "local": {"pair-a": ("local-test-session", 1)},
+                "remote": {"pair-a": ("remote-test-session", 1)},
+            }
+            controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+            controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+            controller._Controller__process_commands()
+            self.assertEqual(1, controller._Controller__lftp.queue.call_count)
+            self.assertFalse(expiry_callback.success)
+            expiry_callback.on_failure.assert_called_once()
+
+            pending_file = files['["pair-a","authority-pending"]']
+            reset_authority()
+            pending_responses = {}
+            pending_thread = Thread(
+                target=issue_queue_request,
+                args=(pending_file, pending_responses, "pending"),
+            )
+            pending_thread.start()
+            self.assertTrue(command_enqueued.wait(timeout=1.0))
+            controller._Controller__process_commands()
+            summary_response = test_app.get("/server/model/v1/summary")
+            pending_thread.join(timeout=1.0)
+
+            self.assertFalse(pending_thread.is_alive())
+            self.assertEqual(200, summary_response.status_code)
+            self.assertEqual({"model_version": 1}, summary_response.json)
+            self.assertEqual(504, pending_responses["pending"].status_code)
+            self.assertIn(pending_file.file_id, controller._Controller__deferred_queue_intents)
 
     def test_full_scan_requires_admin_authentication(self):
         self.controller.request_full_scan = MagicMock(return_value={
@@ -1054,7 +1275,7 @@ class TestControllerHandler(BaseTestWebApp):
 
         self.controller.queue_command = MagicMock(side_effect=side_effect)
 
-        with patch.object(ControllerHandler, "_ACTION_TIMEOUT", 0.01):
+        with patch.object(ControllerHandler, "_QUEUE_ACTION_TIMEOUT", 0.01):
             first_response = self.test_app.post_json(
                 "/server/command/bulk/queue",
                 {"filenames": ["test1", "test2"]},
@@ -1077,7 +1298,7 @@ class TestControllerHandler(BaseTestWebApp):
     def test_bulk_queue_times_out_when_callback_never_completes(self):
         self.controller.queue_command = MagicMock()
 
-        with patch.object(ControllerHandler, "_ACTION_TIMEOUT", 0.01):
+        with patch.object(ControllerHandler, "_QUEUE_ACTION_TIMEOUT", 0.01):
             response = self.test_app.post_json(
                 "/server/command/bulk/queue",
                 {"filenames": ["test1"]},
@@ -1101,7 +1322,7 @@ class TestControllerHandler(BaseTestWebApp):
 
         self.controller.queue_command = MagicMock(side_effect=side_effect)
 
-        with patch.object(ControllerHandler, "_ACTION_TIMEOUT", 0.01):
+        with patch.object(ControllerHandler, "_QUEUE_ACTION_TIMEOUT", 0.01):
             response = self.test_app.post_json(
                 "/server/command/bulk/queue",
                 {"filenames": ["test1", "test2"]},
@@ -1146,7 +1367,7 @@ class TestControllerHandler(BaseTestWebApp):
     def test_queue_times_out_when_callback_never_completes(self):
         self.controller.queue_command = MagicMock()
 
-        with patch.object(ControllerHandler, "_ACTION_TIMEOUT", 0.01):
+        with patch.object(ControllerHandler, "_QUEUE_ACTION_TIMEOUT", 0.01):
             response = self.test_app.post("/server/command/queue/test1", expect_errors=True)
 
         self.assertEqual(504, response.status_code)
@@ -1155,6 +1376,49 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(Controller.Command.Action.QUEUE, command.action)
         self.assertEqual("test1", command.filename)
         self.controller.record_queue_http_wait_trace.assert_called_once_with("test1", False, None)
+
+    def test_queue_controller_failure_is_distinct_from_http_timeout(self):
+        def fail(command: Controller.Command):
+            command.callbacks[0].on_failure("initial authority expired", 409)
+
+        self.controller.queue_command = MagicMock(side_effect=fail)
+
+        response = self.test_app.post("/server/command/queue/test1", expect_errors=True)
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("initial authority expired", response.text)
+        self.controller.record_queue_http_wait_trace.assert_called_once_with("test1", True, False)
+
+    def test_pending_queue_http_wait_does_not_block_unrelated_summary_get(self):
+        request_started = Event()
+        request_finished = Event()
+        responses = {}
+
+        def hold(command: Controller.Command):
+            request_started.set()
+
+        self.controller.queue_command = MagicMock(side_effect=hold)
+        self.controller.get_model_summary.return_value = {"model_version": 1}
+
+        def issue_queue_request():
+            try:
+                responses["queue"] = self.test_app.post(
+                    "/server/command/queue/test1", expect_errors=True,
+                )
+            finally:
+                request_finished.set()
+
+        queue_thread = Thread(target=issue_queue_request)
+        with patch.object(ControllerHandler, "_QUEUE_ACTION_TIMEOUT", 0.2):
+            queue_thread.start()
+            self.assertTrue(request_started.wait(timeout=1.0))
+            summary_response = self.test_app.get("/server/model/v1/summary")
+            queue_thread.join(timeout=1.0)
+
+        self.assertTrue(request_finished.is_set())
+        self.assertEqual(200, summary_response.status_code)
+        self.assertEqual({"model_version": 1}, summary_response.json)
+        self.assertEqual(504, responses["queue"].status_code)
 
     def test_validate_times_out_when_callback_never_completes(self):
         self.controller.queue_command = MagicMock()

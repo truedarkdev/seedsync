@@ -9,7 +9,7 @@ from urllib.parse import unquote
 import bottle
 from bottle import HTTPResponse
 
-from common import overrides
+from common import Constants, overrides
 from controller.controller import Controller
 from ..web_app import IHandler, WebApp
 
@@ -54,14 +54,12 @@ class WebResponseActionCallback(Controller.Command.ICallback):
 
 class ControllerHandler(IHandler):
     _ACTION_TIMEOUT = 30.0
-    _EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV = "INCOMING_RECOVERY_EXPERIMENTAL_AUTHORITY_TIMEOUT_SECS"
-    _EXPERIMENTAL_QUEUE_ACTION_TIMEOUT = 605.0
+    _QUEUE_ACTION_TIMEOUT = Constants.QUEUE_HTTP_WAIT_TIMEOUT_IN_SECS
 
     @classmethod
     def _queue_action_timeout(cls) -> float:
-        """Leave terminal-callback margin beyond the controlled 600s authority fence."""
-        return cls._EXPERIMENTAL_QUEUE_ACTION_TIMEOUT if \
-            os.environ.get(cls._EXPERIMENTAL_AUTHORITY_TIMEOUT_ENV) == "600" else cls._ACTION_TIMEOUT
+        """Return the Queue HTTP wait derived from the authority fence."""
+        return float(cls._QUEUE_ACTION_TIMEOUT)
     _MAX_BULK_ITEMS = 100
     _MAX_CONCURRENT_BULK_REQUESTS = 1
     _GUARDED_ACTIONS = {
@@ -564,7 +562,11 @@ class ControllerHandler(IHandler):
                 callback, completed = self.__execute_action(
                     command_action,
                     identifier,
-                    timeout=self._ACTION_TIMEOUT
+                    timeout=(
+                        self._queue_action_timeout()
+                        if command_action == Controller.Command.Action.QUEUE
+                        else self._ACTION_TIMEOUT
+                    )
                 )
                 if not completed:
                     failures.append("'{}': Operation timed out".format(display_name))
