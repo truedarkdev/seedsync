@@ -594,19 +594,19 @@ class TestController(unittest.TestCase):
             "Unexpected error message: %s" % error_str
         )
 
-    def test_bad_config_remote_path_raises_exception(self):
+    def test_bad_config_remote_path_publishes_recoverable_error(self):
         self.context.config.lftp.remote_path = "<bad>"
         self.controller = Controller(self.context, self.controller_persist)
         self.controller.start()
-        # noinspection PyUnusedLocal
-        with self.assertRaises(AppError) as error:
-            while True:
-                self.controller.process()
-        # noinspection PyUnreachableCode
-        self.assertEqual(
-            Localization.Error.REMOTE_SERVER_SCAN.format("SystemScannerError: Path does not exist: <bad>"),
-            str(error.exception)
+        expected_error = "SystemScannerError: Path does not exist: <bad>"
+        self.__process_until(
+            lambda: self.context.status.controller.latest_remote_scan_error is not None,
+            "Recoverable remote path scan error was not published",
         )
+        self.assertIn(expected_error, self.context.status.controller.latest_remote_scan_error)
+        self.assertTrue(self.context.status.controller.latest_remote_scan_failed)
+        # A recoverable scan result must leave the controller lifecycle alive.
+        self.controller.process()
 
     def test_bad_config_local_path_raises_exception(self):
         self.context.config.lftp.local_path = "<bad>"

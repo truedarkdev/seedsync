@@ -538,7 +538,8 @@ class TestMultiPathRemoteScanner(unittest.TestCase):
         failing_scanner.path_pair_name = "TV"
         failing_scanner.export_recycled_state.return_value = (False, "~/scanfs")
         failing_scanner.scan.side_effect = ScannerError(
-            "temporary remote failure",
+            "An error occurred while scanning the remote server: "
+            "'SystemScannerError: Path does not exist: /remote/tv'.",
             recoverable=True,
             files=[partial_failure_file]
         )
@@ -555,7 +556,10 @@ class TestMultiPathRemoteScanner(unittest.TestCase):
         self.assertEqual("tv", ctx.exception.files[1].path_pair_id)
         self.assertEqual("TV", ctx.exception.files[1].path_pair_name)
         self.assertIn("TV", str(ctx.exception))
-        self.assertIn("temporary remote failure", str(ctx.exception))
+        self.assertIn("SystemScannerError: Path does not exist: /remote/tv", str(ctx.exception))
+        self.assertEqual({"tv"}, scanner.failed_path_pair_ids())
+        successful_scanner.scan.assert_called_once_with()
+        failing_scanner.scan.assert_called_once_with()
 
 
 class TestMultiPathLocalScanner(unittest.TestCase):

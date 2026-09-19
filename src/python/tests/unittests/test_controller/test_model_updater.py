@@ -2772,26 +2772,36 @@ class TestModelUpdater(unittest.TestCase):
             set(accumulator.snapshot()),
         )
 
-    def test_joint_reconciler_keeps_last_good_remote_root_unknown_during_setup_outage(self):
+    def test_joint_reconciler_keeps_last_good_remote_root_unknown_during_setup_outage_with_healthy_pair(self):
         remote = _ProgressiveScanAccumulator()
         local = _ProgressiveScanAccumulator()
         remote_root = SystemFile("last-good.bin", 1)
         remote_root.path_pair_id = "pair"
         local_root = SystemFile("last-good.bin", 1)
         local_root.path_pair_id = "pair"
-        remote.apply([ScannerResult(datetime.now(), [remote_root], scanned_path_pair_ids={"pair"},
-                                    generation=1, is_progress=True, completed_path_pair_ids={"pair"},
-                                    is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"})])
-        local.apply([ScannerResult(datetime.now(), [local_root], scanned_path_pair_ids={"pair"},
-                                   generation=1, is_progress=True, completed_path_pair_ids={"pair"},
-                                   is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"})])
+        healthy_remote_root = SystemFile("healthy.bin", 2)
+        healthy_remote_root.path_pair_id = "healthy-pair"
+        healthy_local_root = SystemFile("healthy.bin", 2)
+        healthy_local_root.path_pair_id = "healthy-pair"
+        remote.apply([ScannerResult(datetime.now(), [remote_root, healthy_remote_root],
+                                    scanned_path_pair_ids={"pair", "healthy-pair"},
+                                    generation=1, is_progress=True,
+                                    completed_path_pair_ids={"pair", "healthy-pair"},
+                                    is_full_snapshot=True,
+                                    full_snapshot_path_pair_ids={"pair", "healthy-pair"})])
+        local.apply([ScannerResult(datetime.now(), [local_root, healthy_local_root],
+                                   scanned_path_pair_ids={"pair", "healthy-pair"},
+                                   generation=1, is_progress=True,
+                                   completed_path_pair_ids={"pair", "healthy-pair"},
+                                   is_full_snapshot=True,
+                                   full_snapshot_path_pair_ids={"pair", "healthy-pair"})])
         reconciler = _JointProgressiveReconciler()
         first = reconciler.reconcile(
             local.snapshot(), local.authority(), local.incomplete_pairs(), local.completed_pairs(),
             remote.snapshot(), remote.authority(), remote.incomplete_pairs(), remote.completed_pairs(),
-            {"pair"},
+            {"pair", "healthy-pair"},
         )
-        self.assertEqual(["last-good.bin"], [file.name for file in first[1]])
+        self.assertEqual(["healthy.bin", "last-good.bin"], sorted(file.name for file in first[1]))
 
         remote.apply([ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=2,
                                     failed=True, is_progress=True,
@@ -2799,10 +2809,11 @@ class TestModelUpdater(unittest.TestCase):
         outage = reconciler.reconcile(
             local.snapshot(), local.authority(), local.incomplete_pairs(), local.completed_pairs(),
             remote.snapshot(), remote.authority(), remote.incomplete_pairs(), remote.completed_pairs(),
-            {"pair"},
+            {"pair", "healthy-pair"},
         )
-        self.assertEqual(["last-good.bin"], [file.name for file in outage[1]])
+        self.assertEqual(["healthy.bin", "last-good.bin"], sorted(file.name for file in outage[1]))
         self.assertIn("pair", outage[2])
+        self.assertNotIn("healthy-pair", outage[2])
 
     def test_joint_reconciler_excludes_disabled_pairs_from_live_output(self):
         reconciler = _JointProgressiveReconciler()

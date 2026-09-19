@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-from common import MultiprocessingLogger
+from common import Localization, MultiprocessingLogger
 from common.breadcrumb_trace import BreadcrumbTraceCollector
 from common.performance_diagnostics import (
     DURATION_REMOTE_SCAN_AGGREGATION,
@@ -32,6 +32,7 @@ from controller.scan.scanner_process import (
     _build_root_shape_details, _record_root_shape_breadcrumb, _record_scan_breadcrumb, _run_scanner_once,
 )
 from controller.extract import ExtractProcess
+from ssh import SshcpError
 from system import SystemFile
 
 
@@ -1672,6 +1673,40 @@ class TestScannerProcess(unittest.TestCase):
         warning_message = process.logger.warning.call_args[0][0]
         self.assertIn("recoverable error", warning_message)
         self.assertIn("failed result", warning_message.lower())
+
+    def test_remote_missing_path_error_is_published_as_recoverable_result(self):
+        expected_error = "SystemScannerError: Path does not exist: /remote/path/to/scan"
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=__file__,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        mock_ssh = MagicMock()
+        mock_ssh.shell_stream = None
+        mock_ssh.shell.side_effect = [b"not-installed", SshcpError(expected_error)]
+        scanner._RemoteScanner__ssh = mock_ssh
+
+        process = ScannerProcess(scanner=scanner, interval_in_ms=100, verbose=False)
+        wake_event = MagicMock()
+        process._ScannerProcess__wake_event = wake_event
+        process.run_loop()
+        result = process.pop_latest_result()
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.failed)
+        self.assertEqual(
+            Localization.Error.REMOTE_SERVER_SCAN.format(expected_error),
+            result.error_message,
+        )
+        self.assertEqual({None}, result.unknown_path_pair_ids)
+        self.assertEqual({None}, result.recoverable_failure_path_pair_ids)
+        wake_event.wait.assert_called_once()
+        self.assertGreater(wake_event.wait.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(wake_event.wait.call_args.kwargs["timeout"], 0.1)
 
     def test_scanner_result_preserves_legacy_positional_error_message_binding(self):
         result = ScannerResult(

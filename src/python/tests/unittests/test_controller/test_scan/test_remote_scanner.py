@@ -2443,6 +2443,39 @@ class TestRemoteScanner(unittest.TestCase):
         )
         self.assertFalse(ctx.exception.recoverable)
 
+    def test_raises_recoverable_error_on_missing_remote_scan_path(self):
+        scanner = RemoteScanner(
+            remote_address="my remote address",
+            remote_username="my remote user",
+            remote_password="my password",
+            remote_port=1234,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script"
+        )
+
+        self.ssh_run_command_count = 0
+
+        def ssh_shell(*args):
+            self.ssh_run_command_count += 1
+            if self.ssh_run_command_count == 1:
+                # md5sum check
+                return b''
+            raise SshcpError("SystemScannerError: Path does not exist: /remote/path/to/scan")
+
+        self.mock_ssh.shell.side_effect = ssh_shell
+
+        with self.assertRaises(ScannerError) as ctx:
+            scanner.scan()
+
+        self.assertEqual(
+            Localization.Error.REMOTE_SERVER_SCAN.format(
+                "SystemScannerError: Path does not exist: /remote/path/to/scan"
+            ),
+            str(ctx.exception)
+        )
+        self.assertTrue(ctx.exception.recoverable)
+
     def test_progressive_v2_retains_compact_unchanged_root_marker(self):
         scanner = RemoteScanner(
             remote_address="host", remote_username="user", remote_password="password", remote_port=22,

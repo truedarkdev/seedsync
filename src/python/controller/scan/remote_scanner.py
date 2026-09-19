@@ -198,6 +198,15 @@ class RemoteScanner(IScanner):
         return any(pattern in error_message for pattern in TRANSIENT_ERROR_PATTERNS)
 
     @staticmethod
+    def _is_missing_remote_scan_path_error(error: SshcpError) -> bool:
+        """Identify the scanfs error for a missing remote scan root."""
+        message = str(error).strip()
+        return re.fullmatch(
+            r"SystemScannerError: Path does not exist: .+",
+            message,
+        ) is not None or message == "SystemScannerError: Path does not exist"
+
+    @staticmethod
     def __is_unsupported_stream_option_error(error: SshcpError) -> bool:
         message = str(error).lower()
         return "--stream" in message and any(
@@ -844,12 +853,14 @@ class RemoteScanner(IScanner):
         except SshcpError as e:
             self.logger.warning("Caught an SshcpError: {}".format(str(e)))
             recoverable = True
-            # Any scanner errors are fatal
+            missing_remote_scan_path = self._is_missing_remote_scan_path_error(e)
+            # Scanner errors remain fatal except for a missing remote scan root,
+            # which follows the existing recoverable failed-result flow.
             if "SystemScannerError" in str(e):
-                recoverable = False
+                recoverable = missing_remote_scan_path
             # First run errors are only recoverable for transient SSH issues.
             # Non-transient first-run errors should still prompt user correction.
-            if self.__first_run and not self._is_transient_ssh_error(e):
+            if self.__first_run and not self._is_transient_ssh_error(e) and not missing_remote_scan_path:
                 recoverable = False
             raise ScannerError(
                 Localization.Error.REMOTE_SERVER_SCAN.format(str(e).strip()),
