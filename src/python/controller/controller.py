@@ -8505,6 +8505,16 @@ class Controller:
                     self._mark_successful_final_move_handoff(child_file_id)
                     self._mark_current_process_final_publication(child_file_id)
                 self._sync_final_move_succeeded_files_to_model()
+                record_completion_arbitration = getattr(
+                    self.__model_builder, "record_lifecycle_completion_arbitration", None,
+                )
+                if callable(record_completion_arbitration):
+                    record_completion_arbitration(
+                        child_file_id,
+                        "completed" if result == Controller.MoveFromStagingResult.COMPLETED
+                        else "already_completed",
+                        self.has_current_process_final_publication(child_file),
+                    )
             elif result in (Controller.MoveFromStagingResult.FAILED,
                             Controller.MoveFromStagingResult.CONFLICT):
                 count = min(max_failures,
@@ -11873,6 +11883,16 @@ class Controller:
                         )
                         self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
                         self._sync_final_move_succeeded_files_to_model()
+                        record_completion_arbitration = getattr(
+                            self.__model_builder, "record_lifecycle_completion_arbitration", None,
+                        )
+                        if callable(record_completion_arbitration):
+                            record_completion_arbitration(
+                                file.file_id,
+                                "completed" if result == Controller.MoveFromStagingResult.COMPLETED
+                                else "already_completed",
+                                self.has_current_process_final_publication(file),
+                            )
                         self.__model_builder.set_move_failed_files({
                             file_id for file_id, count in self.__persist.move_failure_counts.items()
                             if count >= Controller.__MAX_MOVE_FAILURES

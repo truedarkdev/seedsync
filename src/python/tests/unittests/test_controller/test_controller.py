@@ -10595,6 +10595,9 @@ class TestController(unittest.TestCase):
             self.controller._Controller__model_builder.set_downloaded_files.assert_called_with(
                 self.controller._Controller__persist.downloaded_file_names,
             )
+            self.controller._Controller__model_builder.record_lifecycle_completion_arbitration.assert_called_once_with(
+                child_id, "completed", True,
+            )
 
     def test_directory_child_finalization_rechecks_parent_stop_before_move(self):
         self.controller._Controller__is_explicitly_stopped = MagicMock(return_value=True)
@@ -14881,6 +14884,9 @@ class TestController(unittest.TestCase):
         self.assertIn(file.file_id, self.controller._Controller__persist.downloaded_timestamps)
         self.assertIn(file.file_id, self.controller._Controller__successful_final_move_handoff_file_ids)
         self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_progress_floors)
+        self.controller._Controller__model_builder.record_lifecycle_completion_arbitration.assert_called_once_with(
+            file.file_id, "completed", True,
+        )
         self.controller._Controller__model_builder.evict_active_file_ids.assert_called_once_with({file.file_id})
         self.controller._Controller__active_scan_process.force_scan.assert_called_once_with()
 
@@ -14924,6 +14930,9 @@ class TestController(unittest.TestCase):
         self.assertIn(file.file_id, self.controller._Controller__persist.downloaded_file_names)
         self.assertNotIn(file.file_id, self.controller._Controller__persist.final_move_succeeded_file_names)
         self.assertIn(file.file_id, self.controller._Controller__persist.downloaded_timestamps)
+        self.controller._Controller__model_builder.record_lifecycle_completion_arbitration.assert_called_once_with(
+            file.file_id, "already_completed", False,
+        )
         self.controller._Controller__active_scan_process.force_scan.assert_not_called()
 
     def test_new_queue_clears_terminal_move_lifecycle(self):

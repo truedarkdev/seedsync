@@ -88,6 +88,8 @@ _ACTIVE_TRANSFER_DELTA_INVALIDATION_CATEGORIES = {
     MODEL_BUILDER_INVALIDATION_EXPLICIT: "authority",
 }
 
+_LIFECYCLE_COMPLETION_OUTCOMES = frozenset({"completed", "already_completed"})
+
 
 def _breadcrumb_effectively_enabled(
         breadcrumb: object, category: str, level: str = "info",
@@ -738,6 +740,145 @@ class ModelBuilder:
                 "build_kind": build_kind,
                 "adoption_kind": adoption_kind,
             })
+
+    def record_lifecycle_completion_arbitration(
+            self, file_id: str, completion_outcome: str,
+            current_process_final_publication: bool,
+    ) -> None:
+        """Record raw post-finalization inputs without inferring a winner."""
+        if not self.__is_stop_resume_trace_enabled("lifecycle.persist", "info"):
+            return
+        if not isinstance(file_id, str) or completion_outcome not in _LIFECYCLE_COMPLETION_OUTCOMES:
+            return
+        try:
+            downloaded_marker_present = self.__downloaded_files is not None and \
+                file_id in self.__downloaded_files
+        except Exception:
+            downloaded_marker_present = False
+        try:
+            final_move_marker_present = file_id in self.__final_move_succeeded_files
+        except Exception:
+            final_move_marker_present = False
+        details: dict[str, object] = {
+            "completion_outcome": completion_outcome,
+            "arbitration_source": "unresolved",
+            "direct_child_status_observed": "unknown",
+            "root_status_observed": False,
+            "root_status_state": "absent",
+            "root_status_active_child_match": False,
+            "root_status_active_child_state": "not_observed",
+            "snapshot_candidate_present": False,
+            "downloaded_marker_present": downloaded_marker_present,
+            "final_move_marker_present": final_move_marker_present,
+            "current_process_final_publication": current_process_final_publication is True,
+            "built_model_state": "unknown",
+        }
+        try:
+            details.update(self.__completion_status_observations(file_id))
+        except Exception:
+            pass
+        try:
+            snapshot = self.__completion_snapshot_candidate(file_id)
+            details["snapshot_candidate_present"] = snapshot is not None
+            if snapshot is not None:
+                try:
+                    updated_at_ns = getattr(snapshot, "updated_at_ns", None)
+                    if type(updated_at_ns) is int and updated_at_ns > 0:
+                        age_ms = (time.monotonic_ns() - updated_at_ns) // 1_000_000
+                        details["snapshot_age_ms"] = max(0, min(age_ms, 2_147_483_647))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            cached_model = self.__cached_model
+            if cached_model is not None:
+                details["built_model_state"] = self.__state_category(cached_model.get_file(file_id))
+        except Exception:
+            pass
+        try:
+            self.__record_lifecycle_persist_breadcrumb_for_file_id(
+                "completion_finalized_arbitration", file_id, details,
+            )
+        except Exception:
+            # Diagnostics must never affect the completion or publication path.
+            try:
+                self.logger.debug("Ignoring lifecycle completion arbitration failure", exc_info=True)
+            except Exception:
+                pass
+
+    def __completion_snapshot_candidate(
+            self, file_id: str,
+    ) -> Optional[_RecentLiveTransferSnapshot]:
+        """Read one pure-resolved snapshot candidate without judging eligibility."""
+        remote = self.__remote_file(file_id)
+        local = self.__local_file(file_id)
+        root_file_id = self.__resolve_root_file_id(file_id, remote, local)
+        for snapshots in (
+                self.__recent_live_transfer_snapshots,
+                self.__retained_stopped_transfer_snapshots,
+        ):
+            _, snapshot = self.__resolve_transfer_snapshot(
+                snapshots, file_id, root_file_id,
+            )
+            if snapshot is not None:
+                return snapshot
+        return None
+
+    @staticmethod
+    def __completion_status_state(status: Optional[LftpJobStatus]) -> str:
+        if status is None:
+            return "absent"
+        try:
+            if status.state == LftpJobStatus.State.RUNNING:
+                return "running"
+            if status.state == LftpJobStatus.State.QUEUED:
+                return "queued"
+        except Exception:
+            pass
+        return "unknown"
+
+    @staticmethod
+    def __completion_file_path(file_id: str) -> tuple[Optional[str], Optional[str]]:
+        """Return the local path/pair projection of an existing model id."""
+        if not isinstance(file_id, str):
+            return None, None
+        try:
+            parsed = json.loads(file_id)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return file_id, None
+        if isinstance(parsed, list) and len(parsed) == 2 and \
+                isinstance(parsed[0], str) and isinstance(parsed[1], str):
+            return parsed[1], parsed[0]
+        return file_id, None
+
+    def __completion_status_observations(self, file_id: str) -> dict[str, object]:
+        """Capture direct/root status observations without selecting authority."""
+        child_path, child_pair_id = self.__completion_file_path(file_id)
+        direct_status = self.__lftp_statuses.get(file_id)
+        observations: dict[str, object] = {
+            "direct_child_status_observed": self.__completion_status_state(direct_status),
+        }
+        if not isinstance(child_path, str):
+            return observations
+        for status in self.__lftp_statuses.values():
+            if status.file_id == file_id or status.path_pair_id != child_pair_id:
+                continue
+            root_path = status.name
+            if not isinstance(root_path, str) or not child_path.startswith(root_path + os.sep):
+                continue
+            observations["root_status_observed"] = True
+            observations["root_status_state"] = self.__completion_status_state(status)
+            child_status_path = "/".join(child_path.split(os.sep)[1:])
+            try:
+                active_paths = status.get_active_file_transfer_states()
+            except Exception:
+                continue
+            if any(active_name == child_status_path for active_name, _ in active_paths):
+                observations["root_status_active_child_match"] = True
+                observations["root_status_active_child_state"] = observations["root_status_state"]
+            break
+        return observations
 
     def is_stop_resume_trace_enabled(self) -> bool:
         """Expose the current fail-closed diagnostic gate to stream emitters."""

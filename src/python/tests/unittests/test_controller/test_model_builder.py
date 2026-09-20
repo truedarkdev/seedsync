@@ -7832,6 +7832,64 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DOWNLOADED, rebuilt_finished.state)
         self.assertTrue(rebuilt_finished.final_move_succeeded)
 
+    def test_finalized_regular_child_status_precedence_clears_on_next_build(self):
+        """A live child status must yield to persisted final state after it clears."""
+        path_pair_id = "pair-a"
+        remote_root = SystemFile("release", 10, True)
+        remote_child = SystemFile("completed.bin", 10, False)
+        remote_root.add_child(remote_child)
+        remote_root.path_pair_id = path_pair_id
+
+        # Both sides are already physical final files.  The persisted
+        # identities model the completion/finalization handoff after staging
+        # has been retired.
+        local_root = SystemFile("release", 10, True)
+        local_root.add_child(SystemFile("completed.bin", 10, False))
+        local_root.path_pair_id = path_pair_id
+        completed_path = os.path.join("release", "completed.bin")
+        child_id = ModelFile.build_file_id(completed_path, path_pair_id)
+
+        builder = ModelBuilder()
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        builder.set_downloaded_files({child_id})
+        builder.set_downloaded_timestamps({child_id: 1_786_400_000.0})
+        builder.set_final_move_succeeded_files({child_id})
+
+        running = LftpJobStatus(
+            7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            completed_path, "",
+        )
+        running.path_pair_id = path_pair_id
+        running.total_transfer_state = LftpJobStatus.TransferState(6, 10, 60, 100, 1)
+        builder.set_lftp_statuses([running])
+
+        live_model = builder.build_model()
+        root_id = ModelFile.build_file_id("release", path_pair_id)
+        live_child = live_model.get_file(root_id).get_children()[0]
+        self.assertEqual(ModelFile.State.DOWNLOADING, live_child.state)
+        self.assertTrue(live_child.final_move_succeeded)
+        self.assertEqual(1_786_400_000.0, live_child.downloaded_timestamp.timestamp())
+        before_version = live_model.version
+
+        # Clearing the status invalidates the builder cache.  The next build
+        # must expose the physical final and persisted completion identity.
+        builder.set_lftp_statuses([])
+        candidate = builder.build_model()
+        candidate_child = candidate.get_file(root_id).get_children()[0]
+        self.assertEqual(ModelFile.State.DOWNLOADED, candidate_child.state)
+        self.assertTrue(candidate_child.final_move_succeeded)
+        self.assertEqual(1_786_400_000.0, candidate_child.downloaded_timestamp.timestamp())
+        self.assertEqual(10, candidate_child.transferred_size)
+
+        # Apply the built root through the existing model-adoption seam so the
+        # lifecycle correction is also observed as a versioned publication.
+        live_model.update_file(candidate.get_file(root_id))
+        builder.adopt_applied_model(candidate, live_model)
+        self.assertEqual(ModelFile.State.DOWNLOADED, live_model.get_file(root_id).get_children()[0].state)
+        self.assertEqual(before_version + 1, live_model.version)
+        self.assertFalse(builder.has_changes())
+
     def test_mixed_directory_recent_snapshot_survives_status_gap_with_partial_staging(self):
         self.__set_mixed_directory_sources()
         baseline = self.model_builder.build_model().get_file("sample-directory")
@@ -10502,6 +10560,137 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual("absent", missing_entry["details"]["candidate_state"])
         self.assertNotIn(subject_name, str(missing_entry))
         self.assertNotIn(subject_id, str(missing_entry))
+
+    def test_completion_arbitration_trace_is_gated_opaque_and_bounded(self):
+        subject_id = ModelFile.build_file_id("completion-subject.bin", None)
+        collector = self.__enable_trace(False)
+        self.model_builder.record_lifecycle_completion_arbitration(subject_id, "completed", True)
+        self.assertEqual([], self.__trace_entries(collector))
+
+        self.__trace_enabled[0] = True
+        collector.sync_enabled_state()
+        running = LftpJobStatus(
+            7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            subject_id, "",
+        )
+        self.model_builder.set_lftp_statuses([running])
+        self.model_builder.record_lifecycle_completion_arbitration(subject_id, "completed", True)
+        self.model_builder.set_lftp_statuses([])
+        self.model_builder.set_downloaded_files({subject_id})
+        self.model_builder.record_lifecycle_completion_arbitration(subject_id, "already_completed", False)
+
+        entries = [
+            entry for entry in self.__trace_entries(collector)
+            if entry["message"] == "completion_finalized_arbitration"
+        ]
+        self.assertEqual(2, len(entries))
+        self.assertNotIn(subject_id, str(entries))
+        self.assertTrue(all(entry["corr_id"] and entry["file_id"] is None for entry in entries))
+        self.assertEqual("completed", entries[0]["details"]["completion_outcome"])
+        self.assertEqual("unresolved", entries[0]["details"]["arbitration_source"])
+        self.assertEqual("running", entries[0]["details"]["direct_child_status_observed"])
+        self.assertFalse(entries[0]["details"]["snapshot_candidate_present"])
+        self.assertTrue(entries[0]["details"]["current_process_final_publication"])
+        self.assertEqual("already_completed", entries[1]["details"]["completion_outcome"])
+        self.assertEqual("unresolved", entries[1]["details"]["arbitration_source"])
+        self.assertEqual("absent", entries[1]["details"]["direct_child_status_observed"])
+        self.assertTrue(entries[1]["details"]["downloaded_marker_present"])
+        self.assertFalse(entries[1]["details"]["current_process_final_publication"])
+
+    def test_completion_arbitration_trace_reports_bounded_recent_snapshot_age(self):
+        collector = self.__enable_trace()
+        subject_id = ModelFile.build_file_id("snapshot-completion.bin", None)
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[subject_id] = _RecentLiveTransferSnapshot(
+            root_file_id=subject_id,
+            size_local=5,
+            percent_local=5,
+            speed=1,
+            eta=1,
+            updated_at_ns=time.monotonic_ns() - (60 * 1_000_000_000),
+        )
+        self.model_builder.record_lifecycle_completion_arbitration(subject_id, "completed", True)
+        entry = next(
+            item for item in self.__trace_entries(collector)
+            if item["message"] == "completion_finalized_arbitration"
+        )
+        self.assertEqual("unresolved", entry["details"]["arbitration_source"])
+        self.assertTrue(entry["details"]["snapshot_candidate_present"])
+        self.assertGreaterEqual(entry["details"]["snapshot_age_ms"], 0)
+        self.assertLessEqual(entry["details"]["snapshot_age_ms"], 2_147_483_647)
+
+    def test_completion_arbitration_trace_reports_unambiguous_root_alias_snapshot(self):
+        collector = self.__enable_trace()
+        root = SystemFile("alias-root", 10, True)
+        root.path_pair_id = "pair-a"
+        self.model_builder.set_remote_files([root])
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots["alias-root"] = _RecentLiveTransferSnapshot(
+            root_file_id="alias-root",
+            size_local=5,
+            percent_local=50,
+            speed=1,
+            eta=1,
+            updated_at_ns=time.monotonic_ns(),
+        )
+        subject_id = ModelFile.build_file_id("alias-root", "pair-a")
+
+        self.model_builder.record_lifecycle_completion_arbitration(subject_id, "completed", True)
+
+        entry = next(
+            item for item in self.__trace_entries(collector)
+            if item["message"] == "completion_finalized_arbitration"
+        )
+        self.assertEqual("unresolved", entry["details"]["arbitration_source"])
+        self.assertTrue(entry["details"]["snapshot_candidate_present"])
+
+    def test_completion_arbitration_trace_detects_active_child_under_running_root_status(self):
+        collector = self.__enable_trace()
+        root = SystemFile("release", 10, True)
+        root.path_pair_id = "pair-a"
+        nested = SystemFile("nested", 10, True)
+        nested.add_child(SystemFile("child.bin", 10, False))
+        root.add_child(nested)
+        self.model_builder.set_remote_files([root])
+
+        status = LftpJobStatus(
+            7, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING,
+            "release", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(5, 10, 50, 1, 1)
+        status.add_active_file_transfer_state(
+            "nested/child.bin", LftpJobStatus.TransferState(5, 10, 50, 1, 1),
+        )
+        self.model_builder.set_lftp_statuses([status])
+        child_id = ModelFile.build_file_id(
+            os.path.join("release", "nested", "child.bin"), "pair-a",
+        )
+
+        self.model_builder.record_lifecycle_completion_arbitration(child_id, "completed", True)
+
+        entry = next(
+            item for item in self.__trace_entries(collector)
+            if item["message"] == "completion_finalized_arbitration"
+        )
+        self.assertEqual("unresolved", entry["details"]["arbitration_source"])
+        self.assertTrue(entry["details"]["root_status_observed"])
+        self.assertEqual("running", entry["details"]["root_status_state"])
+        self.assertTrue(entry["details"]["root_status_active_child_match"])
+        self.assertEqual("running", entry["details"]["root_status_active_child_state"])
+
+    def test_completion_arbitration_trace_isolates_emitter_failure(self):
+        class FailingEmitter:
+            @staticmethod
+            def is_effectively_enabled(category, level="info"):
+                return category == "lifecycle.persist" and level == "info"
+
+            @staticmethod
+            def record(*args, **kwargs):
+                raise RuntimeError("completion diagnostic failure")
+
+        self.model_builder.set_stop_resume_trace_breadcrumb(FailingEmitter())
+        self.model_builder.record_lifecycle_completion_arbitration(
+            "opaque-file-id", "completed", True,
+        )
 
     def test_stable_downloaded_model_requires_explicit_lifecycle_marker_for_persist_trace(self):
         collector = self.__enable_trace()
