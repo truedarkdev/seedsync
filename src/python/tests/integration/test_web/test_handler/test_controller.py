@@ -1346,14 +1346,24 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual("missing", response.text)
 
     def test_queue_wait_trace_forwards_completed_outcomes(self):
+        success_flow = "fractional-queue:0123456789abcdef"
+
         def succeed(command: Controller.Command):
+            command.queue_trace_flow_id = success_flow
+            command.callbacks[0].queue_trace_flow_id = success_flow
             command.callbacks[0].on_success()
 
         self.controller.queue_command = MagicMock(side_effect=succeed)
         self.assertEqual(200, self.test_app.post("/server/command/queue/test1").status_code)
-        self.controller.record_queue_http_wait_trace.assert_called_once_with("test1", True, True)
+        self.controller.record_queue_http_wait_trace.assert_called_once_with(
+            "test1", True, True, flow_id=success_flow,
+        )
+
+        failure_flow = "fractional-queue:fedcba9876543210"
 
         def fail(command: Controller.Command):
+            command.queue_trace_flow_id = failure_flow
+            command.callbacks[0].queue_trace_flow_id = failure_flow
             command.callbacks[0].on_failure("missing", 404)
 
         self.controller.record_queue_http_wait_trace.reset_mock()
@@ -1362,7 +1372,11 @@ class TestControllerHandler(BaseTestWebApp):
             404,
             self.test_app.post("/server/command/queue/test2", expect_errors=True).status_code,
         )
-        self.controller.record_queue_http_wait_trace.assert_called_once_with("test2", True, False)
+        self.controller.record_queue_http_wait_trace.assert_called_once_with(
+            "test2", True, False, flow_id=failure_flow,
+        )
+        self.assertRegex(success_flow, r"^fractional-queue:[0-9a-f]{16}$")
+        self.assertRegex(failure_flow, r"^fractional-queue:[0-9a-f]{16}$")
 
     def test_queue_times_out_when_callback_never_completes(self):
         self.controller.queue_command = MagicMock()
@@ -1375,7 +1389,9 @@ class TestControllerHandler(BaseTestWebApp):
         command = self.controller.queue_command.call_args[0][0]
         self.assertEqual(Controller.Command.Action.QUEUE, command.action)
         self.assertEqual("test1", command.filename)
-        self.controller.record_queue_http_wait_trace.assert_called_once_with("test1", False, None)
+        self.controller.record_queue_http_wait_trace.assert_called_once_with(
+            "test1", False, None, flow_id=None,
+        )
 
     def test_queue_controller_failure_is_distinct_from_http_timeout(self):
         def fail(command: Controller.Command):
@@ -1387,7 +1403,9 @@ class TestControllerHandler(BaseTestWebApp):
 
         self.assertEqual(409, response.status_code)
         self.assertEqual("initial authority expired", response.text)
-        self.controller.record_queue_http_wait_trace.assert_called_once_with("test1", True, False)
+        self.controller.record_queue_http_wait_trace.assert_called_once_with(
+            "test1", True, False, flow_id=None,
+        )
 
     def test_pending_queue_http_wait_does_not_block_unrelated_summary_get(self):
         request_started = Event()

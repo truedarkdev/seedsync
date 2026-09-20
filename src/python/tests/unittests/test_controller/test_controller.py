@@ -251,6 +251,7 @@ class TestController(unittest.TestCase):
         }, set(details))
         self.assertEqual("lftp", details["source"])
         self.assertEqual("command_error", details["error_class"])
+        self.assertEqual("error", details["command_outcome"])
         self.assertNotIn("12345", repr(entry))
         self.assertNotIn("private", repr(entry))
         logged_details = self.controller.logger.warning.call_args.args[1]
@@ -7138,6 +7139,8 @@ class TestController(unittest.TestCase):
         ]
         self.assertEqual(1, len(entries))
         entry = entries[0]
+        expected_flow = command.queue_trace_flow_id
+        self.assertEqual(expected_flow, entry["flow_id"])
         self.assertEqual(
             {
                 "schema": "queue_readiness.v1",
@@ -7188,6 +7191,17 @@ class TestController(unittest.TestCase):
             },
             entries[0]["details"],
         )
+        expected_flow = command.queue_trace_flow_id
+        self.assertEqual(expected_flow, entries[0]["flow_id"])
+        self.assertEqual(expected_flow, callback.queue_trace_flow_id)
+        self.controller.record_queue_http_wait_trace(
+            file.file_id, True, False, flow_id=expected_flow,
+        )
+        wait_entry = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "queue_http_wait"
+        )
+        self.assertEqual(expected_flow, wait_entry["flow_id"])
         self.assertNotIn("callback-failure", str(entries[0]))
 
     def test_queue_callback_trace_is_default_off(self):
@@ -7209,6 +7223,23 @@ class TestController(unittest.TestCase):
 
         callback.on_success.assert_called_once_with()
         self.assertEqual([], trace.snapshot()["entries"])
+
+    def test_queue_preflight_callback_does_not_reuse_stale_operation_flow(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=8,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        file_id = ModelFile.build_file_id("preflight-rejection", None)
+        self.controller._Controller__lftp_operation_sequences = {file_id: 1}
+        command = Controller.Command(Controller.Command.Action.QUEUE, file_id)
+        command.add_callback(MagicMock())
+
+        self.controller._Controller__record_queue_callback_trace(command, 0, "failure", 409)
+
+        entry = trace.snapshot()["entries"][0]
+        self.assertIsNone(entry["flow_id"])
 
     def test_queue_http_wait_trace_records_only_fixed_outcomes(self):
         trace = BreadcrumbTraceCollector(
@@ -7282,6 +7313,23 @@ class TestController(unittest.TestCase):
         self.assertEqual(expected_flow, sidecar["flow_id"])
         self.assertNotIn("private-wait.bin", repr(entries))
         self.assertNotIn("private-sidecar.bin", repr(entries))
+
+    def test_queue_http_wait_does_not_reuse_retired_operation_sequence(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=8,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        file_id = ModelFile.build_file_id("private-retired-wait.bin", None)
+        self.controller._Controller__lftp_operation_sequences = {file_id: 4}
+
+        self.controller.record_queue_http_wait_trace(file_id, False, None)
+
+        entry = trace.snapshot()["entries"][0]
+        self.assertIsNone(entry["flow_id"])
+        self.assertEqual("timeout", entry["details"]["outcome"])
+        self.assertNotIn("private-retired-wait.bin", repr(entry))
 
     def test_async_queue_rejection_stays_rejected_during_idle_reconciliation(self):
         file = ModelFile("async-rejected", False)
@@ -7516,6 +7564,72 @@ class TestController(unittest.TestCase):
         self.assertEqual("success", outcome["details"]["future_outcome"])
         self.assertTrue(outcome["details"]["command_prompt_timed_out"])
         self.assertEqual("prompt_timeout", outcome["details"]["outcome"])
+        retirement = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "queue_lifecycle_operation_retired"
+        )
+        self.assertEqual("prompt_timeout", retirement["details"]["command_outcome"])
+        self.assertEqual(outcome["flow_id"], retirement["flow_id"])
+
+    def test_cancelled_queue_future_retirement_keeps_one_opaque_flow(self):
+        file = ModelFile("cancelled-queue", False)
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "debug"}, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        future = Future()
+        self.assertTrue(future.cancel())
+        self.controller._Controller__lftp_operation_sequences = {file.file_id: 1}
+        self.controller._Controller__lftp_operations = [
+            _LftpOperation("queue", future, file.file_id, 1),
+        ]
+
+        self.controller._Controller__drain_lftp_operations()
+
+        entries = trace.snapshot()["entries"]
+        retirement = next(
+            entry for entry in entries
+            if entry["message"] == "queue_lifecycle_operation_retired"
+        )
+        self.assertEqual("error", retirement["details"]["command_outcome"])
+        self.assertEqual(
+            {entry["flow_id"] for entry in entries},
+            {self.controller._Controller__fractional_queue_flow_id(file.file_id, 1)},
+        )
+
+    def test_queue_callback_and_retirement_share_flow_after_pending_dispatch_retirement(self):
+        file = ModelFile("callback-retirement", False)
+        file.remote_size = 10
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "debug"}, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__model.get_file.return_value = file
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(MagicMock())
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        admitted_flow = command.queue_trace_flow_id
+        self.assertRegex(admitted_flow, r"^fractional-queue:[0-9a-f]{16}$")
+        self.assertEqual(admitted_flow, command.callbacks[0].queue_trace_flow_id)
+
+        operation = self.controller._Controller__lftp_operations[0]
+        operation.future.result(timeout=1)
+        self.controller._Controller__drain_lftp_operations()
+        self.controller._Controller__pending_queue_dispatches.clear()
+        self.controller._Controller__record_queue_callback_trace(command, 0, "success")
+        self.controller.record_queue_http_wait_trace(
+            file.file_id, True, True, flow_id=command.callbacks[0].queue_trace_flow_id,
+        )
+
+        entries = trace.snapshot()["entries"]
+        lifecycle = next(
+            entry for entry in entries
+            if entry["message"] == "queue_lifecycle_operation_retired"
+        )
+        callback = next(entry for entry in entries if entry["message"] == "queue_callback")
+        http_wait = next(entry for entry in entries if entry["message"] == "queue_http_wait")
+        self.assertEqual(admitted_flow, lifecycle["flow_id"])
+        self.assertEqual(lifecycle["flow_id"], callback["flow_id"])
+        self.assertEqual(lifecycle["flow_id"], http_wait["flow_id"])
 
     def test_queue_future_trace_keeps_prompt_success_before_later_timeout(self):
         file = ModelFile("successful-queue", False)

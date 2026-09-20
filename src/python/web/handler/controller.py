@@ -35,6 +35,9 @@ class WebResponseActionCallback(Controller.Command.ICallback):
         self.success: bool | None = None
         self.error: str | None = None
         self.error_code = 400
+        # Transient diagnostic transport from the admitted Queue command;
+        # never derive this from the request file identity or retained state.
+        self.queue_trace_flow_id: str | None = None
 
     @overrides(Controller.Command.ICallback)
     def on_failure(self, error: str, error_code: int = 400) -> None:
@@ -271,6 +274,7 @@ class ControllerHandler(IHandler):
         )
         self.__controller.record_queue_http_wait_trace(
             file_identifier, completed, callback.success,
+            flow_id=callback.queue_trace_flow_id,
         )
         if not completed:
             return HTTPResponse(body="Operation timed out", status=504)

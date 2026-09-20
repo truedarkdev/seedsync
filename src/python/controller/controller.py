@@ -929,6 +929,11 @@ class Controller:
             self.action = action
             self.filename = filename
             self.flow_id = flow_id
+            # Diagnostic-only identity for the admitted Queue operation.  It
+            # is assigned once an operation sequence exists so callbacks can
+            # still join the same opaque flow after pending dispatch state is
+            # retired; it never participates in Queue decisions.
+            self.queue_trace_flow_id: Optional[str] = None
             self.origin = origin
             self.callbacks: List[Controller.Command.ICallback] = []
             self.duplicate_waiter_count = 0
@@ -5929,6 +5934,18 @@ class Controller:
         """Record a bounded Queue callback entry without callback payloads."""
         if command.action != Controller.Command.Action.QUEUE:
             return
+        callback_flow_id = getattr(command, "queue_trace_flow_id", None)
+        if callback_flow_id is None:
+            callback_flow_id = self.__queue_flow_id_for_pending_file(command.filename)
+        if type(callback_index) is int and 0 <= callback_index < len(command.callbacks):
+            try:
+                # Web callbacks use this transient value to bind their HTTP
+                # wait result to the same admitted Queue operation. Generic
+                # callbacks may reject attributes; diagnostics stay best
+                # effort in that case.
+                setattr(command.callbacks[callback_index], "queue_trace_flow_id", callback_flow_id)
+            except Exception:
+                pass
         self.__record_queue_readiness_trace(command.filename, "queue_callback", {
             "schema": "queue_readiness.v1",
             "phase": "entry",
@@ -5936,10 +5953,11 @@ class Controller:
             "callback_index": callback_index,
             "callback_count": len(command.callbacks),
             "error_code": error_code if type(error_code) is int else 0,
-        }, flow_id=self.__queue_flow_id_for_pending_file(command.filename))
+        }, flow_id=callback_flow_id)
 
     def record_queue_http_wait_trace(
             self, file_id: str, completed: bool, callback_success: object,
+            flow_id: Optional[str] = None,
     ) -> None:
         """Record the Queue HTTP wait result without request identity."""
         outcome = "timeout"
@@ -5950,7 +5968,8 @@ class Controller:
             "schema": "queue_readiness.v1",
             "phase": "wait_return",
             "outcome": outcome,
-        }, flow_id=self.__queue_flow_id_for_pending_file(file_id))
+        }, flow_id=(flow_id if isinstance(flow_id, str) else
+                    self.__queue_flow_id_for_pending_file(file_id)))
 
     def __queue_flow_id_for_pending_file(self, file_id: object) -> Optional[str]:
         """Reuse the existing pending dispatch identity when it is available."""
@@ -5959,7 +5978,7 @@ class Controller:
         pending = getattr(self, "_Controller__pending_queue_dispatches", None)
         dispatch = pending.get(file_id) if isinstance(pending, dict) else None
         operation_sequence = getattr(dispatch, "operation_sequence", None)
-        if dispatch is None or type(operation_sequence) is not int:
+        if dispatch is None or type(operation_sequence) is not int or operation_sequence < 1:
             return None
         return self.__fractional_queue_flow_id(file_id, operation_sequence)
 
@@ -10852,6 +10871,18 @@ class Controller:
                         queue_trace_flow_id = _fractional_queue_flow_id(
                             self, file.file_id, operation_sequence,
                         )
+                        # Keep the existing operation flow available to the
+                        # caller boundary even when a failed/cancelled Queue
+                        # dispatch removes its pending registry entry before
+                        # callbacks are delivered.
+                        command.queue_trace_flow_id = queue_trace_flow_id
+                        for callback in command.callbacks:
+                            try:
+                                setattr(callback, "queue_trace_flow_id", queue_trace_flow_id)
+                            except Exception:
+                                # Diagnostic transport must not reject Queue
+                                # admission for callbacks with fixed slots.
+                                pass
                         exclude_patterns = self.__transfer_exclude_patterns(
                             file.file_id,
                             file.is_dir,

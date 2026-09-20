@@ -2275,6 +2275,16 @@ class BreadcrumbTraceCollector:
         "joint_authoritative_after",
         "joint_authoritative",
     })
+    # A producer may first project a closed enum before sending diagnostic
+    # details to the collector.  Preserve only those exact enum values when
+    # the field name also matches the command-key redaction rule; arbitrary
+    # command-shaped payloads remain redacted below.
+    __SAFE_DIAGNOSTIC_ENUM_FIELDS = {
+        "command_kind": frozenset({"queue", "status", "unknown"}),
+        "command_outcome": frozenset({
+            "success", "prompt_timeout", "eof", "error", "unknown",
+        }),
+    }
     __COMMAND_KEYWORDS = (
         "command",
         "cmd",
@@ -5706,6 +5716,11 @@ class BreadcrumbTraceCollector:
         if _node_budget[0] <= 0:
             return "<truncated>"
         _node_budget[0] -= 1
+        if key is not None and key.lower() in self.__SAFE_DIAGNOSTIC_ENUM_FIELDS:
+            allowed_values = self.__SAFE_DIAGNOSTIC_ENUM_FIELDS[key.lower()]
+            if type(value) is str and allowed_values is not None and value in allowed_values:
+                return value
+            return "<redacted>"
         if value is None:
             return None
         if key is not None and self.__is_sensitive_key(key):

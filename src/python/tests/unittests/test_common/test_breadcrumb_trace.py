@@ -283,6 +283,64 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual("<redacted>", details["authoritative_authentication"])
         self.assertEqual("<redacted>", details["authoritative_auth"])
 
+    def test_record_preserves_allowlisted_queue_command_outcome_only(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+
+        collector.record(
+            "controller",
+            "queue_lifecycle_operation_retired",
+            {
+                "command_kind": "queue",
+                "command_outcome": "prompt_timeout",
+                "command_prompt_timed_out": True,
+                "command_outcome_untrusted": "private-command-output",
+                "command": "private-command-output",
+            },
+            category="queue.lifecycle",
+            level="info",
+        )
+        collector.record(
+            "controller",
+            "queue_lifecycle_operation_retired",
+            {"command_outcome": "private-command-output"},
+            category="queue.lifecycle",
+            level="info",
+        )
+
+        entries = collector.snapshot()["entries"]
+        details = entries[0]["details"]
+        self.assertEqual("queue", details["command_kind"])
+        self.assertEqual("prompt_timeout", details["command_outcome"])
+        self.assertTrue(details["command_prompt_timed_out"])
+        self.assertEqual("<redacted>", details["command_outcome_untrusted"])
+        self.assertEqual("<redacted>", details["command"])
+        self.assertEqual("<redacted>", entries[1]["details"]["command_outcome"])
+
+        def sanitize_command_field(field, value):
+            candidate = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+            candidate.record(
+                "controller",
+                "queue_lifecycle_operation_retired",
+                {field: value},
+                category="queue.lifecycle",
+                level="info",
+            )
+            return candidate.snapshot()["entries"][0]["details"][field]
+
+        self.assertEqual("<redacted>", sanitize_command_field("command_outcome", 7))
+        self.assertEqual("<redacted>", sanitize_command_field("command_outcome", True))
+        self.assertEqual("<redacted>", sanitize_command_field("command_outcome", 1.5))
+        self.assertEqual(
+            "<redacted>",
+            sanitize_command_field("command_outcome", {"nested": "private-command-output"}),
+        )
+        self.assertEqual("<redacted>", sanitize_command_field("command_outcome", object()))
+        self.assertEqual("<redacted>", sanitize_command_field("command_kind", 7))
+        self.assertEqual(
+            "<redacted>",
+            sanitize_command_field("command_kind", {"nested": "private-command-output"}),
+        )
+
     def test_record_redacts_ftp_and_ftps_urls_with_reserved_characters(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
 
