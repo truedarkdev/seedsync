@@ -7631,6 +7631,40 @@ class TestController(unittest.TestCase):
         self.assertEqual(lifecycle["flow_id"], callback["flow_id"])
         self.assertEqual(lifecycle["flow_id"], http_wait["flow_id"])
 
+    def test_queue_lifecycle_reset_trace_clears_final_move_marker(self):
+        file = ModelFile("private-reset-target", False)
+        file.remote_size = 10
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.exclusion": "info"}},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__persist.final_move_succeeded_file_names = {file.file_id}
+        self.controller._Controller__model.get_file.return_value = file
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        reset = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "queue_lifecycle_reset"
+        )
+        self.assertFalse(reset["details"]["marker_after"])
+        self.assertTrue(reset["details"]["marker_before"])
+        self.assertEqual("final_move_succeeded", reset["details"]["marker_name"])
+        self.assertEqual("accepted", reset["details"]["outcome"])
+        self.assertRegex(reset["flow_id"], r"^fractional-queue:[0-9a-f]{16}$")
+        self.assertEqual(
+            "child:{}".format(opaque_trace_correlation(file.file_id)),
+            reset["details"]["target_correlation"],
+        )
+        self.assertIsNone(reset["details"]["transfer_lifecycle_epoch_before"])
+        self.assertEqual(1, reset["details"]["transfer_lifecycle_epoch_after"])
+        self.assertNotIn(file.file_id, self.controller._Controller__persist.final_move_succeeded_file_names)
+        self.assertNotIn("private-reset-target", repr(reset))
+
     def test_queue_future_trace_keeps_prompt_success_before_later_timeout(self):
         file = ModelFile("successful-queue", False)
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)

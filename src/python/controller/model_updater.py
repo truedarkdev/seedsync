@@ -1102,6 +1102,7 @@ def details_state_is_active(status: object) -> bool:
 _CHILD_FINALIZATION_TRACE_CATEGORY = "finalization.child"
 _CHILD_FINALIZATION_TRACE_SCHEMA = "finalization_child.v1"
 _CHILD_FINALIZATION_TRACE_COUNT_LIMIT = 4096
+_CHILD_FINALIZATION_TRACE_MAX_EPOCH = 2_147_483_647
 _CHILD_FINALIZATION_RESULT_NAMES = frozenset({
     "completed", "already_completed", "deferred", "failed",
     "no_move_applicable", "conflict", "exception", "unknown",
@@ -1130,6 +1131,13 @@ def _bounded_child_finalization_count(value: object) -> int:
     return max(0, min(value, _CHILD_FINALIZATION_TRACE_COUNT_LIMIT))
 
 
+def _bounded_child_finalization_epoch(value: object) -> Optional[int]:
+    """Return only a finite non-negative scan/reconciliation epoch."""
+    if type(value) is not int or value < 0:
+        return None
+    return min(value, _CHILD_FINALIZATION_TRACE_MAX_EPOCH)
+
+
 def _child_finalization_trace_result(result: object) -> str:
     result_name = getattr(result, "name", None)
     if isinstance(result_name, str):
@@ -1148,6 +1156,11 @@ def _child_finalization_trace_identity(
         )
     except Exception:
         return None
+
+
+def _child_finalization_trace_flow_id(child_identity: Optional[str]) -> Optional[str]:
+    """Return the exact opaque flow value used by child-finalization events."""
+    return None if child_identity is None else "child:{}".format(child_identity)
 
 
 def _record_child_finalization_breadcrumb(
@@ -9235,6 +9248,20 @@ class ModelUpdater(_ControllerCoreAccess):
             child_trace_warning_enabled = _controller_breadcrumb_effectively_enabled(
                 controller, _CHILD_FINALIZATION_TRACE_CATEGORY, "warning",
             )
+            child_trace_epochs = {
+                "scan_generation": _bounded_child_finalization_epoch(max(
+                    scan_generation(latest_local_scan), scan_generation(latest_remote_scan),
+                )),
+                "local_scan_generation": _bounded_child_finalization_epoch(
+                    scan_generation(latest_local_scan),
+                ),
+                "remote_scan_generation": _bounded_child_finalization_epoch(
+                    scan_generation(latest_remote_scan),
+                ),
+                "reconciliation_epoch": _bounded_child_finalization_epoch(
+                    getattr(controller, "_Controller__progress_publication_epoch", None),
+                ),
+            }
             candidate_discovery_reason = "available"
             try:
                 candidates = leaf_candidates()
@@ -9291,8 +9318,14 @@ class ModelUpdater(_ControllerCoreAccess):
                             "phase": "candidate_discovery",
                             "outcome": "available" if candidate_discovery_reason == "available" else "failed",
                             "reason": candidate_discovery_reason,
+                            # A discovery event may represent several targets;
+                            # its aggregate correlation cannot be reused as a
+                            # target correlation.
+                            "target_correlation": None,
+                            "correlation_reason": "aggregate_candidate_set",
                             "candidate_count": bounded_candidate_count,
                             "valid_candidate_count": bounded_valid_candidate_count,
+                            **child_trace_epochs,
                         },
                         level=candidate_trace_level,
                         trace_scope="aggregate",
@@ -9330,6 +9363,15 @@ class ModelUpdater(_ControllerCoreAccess):
                                 "reason": _CHILD_FINALIZATION_AUTHORITY_REASONS[
                                     (local_authoritative, remote_authoritative)
                                 ],
+                                "target_correlation": _child_finalization_trace_flow_id(
+                                    child_trace_identity,
+                                ),
+                                "correlation_reason": (
+                                    "opaque_child_identity"
+                                    if child_trace_identity is not None
+                                    else "target_identity_unavailable"
+                                ),
+                                **child_trace_epochs,
                             },
                             level="info",
                             child_identity=child_trace_identity,
@@ -9349,6 +9391,15 @@ class ModelUpdater(_ControllerCoreAccess):
                             "reason": _CHILD_FINALIZATION_AUTHORITY_REASONS[
                                 (local_authoritative, remote_authoritative)
                             ],
+                            "target_correlation": _child_finalization_trace_flow_id(
+                                child_trace_identity,
+                            ),
+                            "correlation_reason": (
+                                "opaque_child_identity"
+                                if child_trace_identity is not None
+                                else "target_identity_unavailable"
+                            ),
+                            **child_trace_epochs,
                         },
                         level="info",
                         child_identity=child_trace_identity,
@@ -9371,6 +9422,15 @@ class ModelUpdater(_ControllerCoreAccess):
                                 "outcome": "exception",
                                 "reason": _CHILD_FINALIZATION_RESULT_REASONS["exception"],
                                 "attempt_failure": True,
+                                "target_correlation": _child_finalization_trace_flow_id(
+                                    child_trace_identity,
+                                ),
+                                "correlation_reason": (
+                                    "opaque_child_identity"
+                                    if child_trace_identity is not None
+                                    else "target_identity_unavailable"
+                                ),
+                                **child_trace_epochs,
                             },
                             level="warning",
                             child_identity=child_trace_identity,
@@ -9419,6 +9479,15 @@ class ModelUpdater(_ControllerCoreAccess):
                             "outcome": result_name,
                             "reason": result_reason,
                             "attempt_failure": result_level == "warning",
+                            "target_correlation": _child_finalization_trace_flow_id(
+                                child_trace_identity,
+                            ),
+                            "correlation_reason": (
+                                "opaque_child_identity"
+                                if child_trace_identity is not None
+                                else "target_identity_unavailable"
+                            ),
+                            **child_trace_epochs,
                         },
                         level=result_level,
                         child_identity=child_trace_identity,

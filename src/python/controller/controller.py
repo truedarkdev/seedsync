@@ -715,6 +715,8 @@ _TRANSFER_STOP_TRACE_REASONS = frozenset({
     "none", "backend_error", "backend_rejected", "executor_unavailable",
     "stale_operation", "marker_not_observed",
 })
+_QUEUE_LIFECYCLE_RESET_TRACE_SCHEMA = "fractional_mtime_redownload.queue_lifecycle_reset.v1"
+_QUEUE_TRACE_MAX_EPOCH = 2_147_483_647
 
 
 _COLLISION_COMPARE_MAX_BYTES = 16 * 1024 * 1024 * 1024
@@ -11091,8 +11093,44 @@ class Controller:
                         if is_new_transfer_lifecycle:
                             # A genuinely new queue invalidates all final-move
                             # identity from the prior transfer lifecycle.
+                            final_move_marker_before = file.file_id in self.__persist.final_move_succeeded_file_names
+                            lifecycle_epoch_before = getattr(
+                                self, "_Controller__transfer_lifecycle_epochs", {}
+                            ).get(file.file_id)
                             self.__persist.final_move_succeeded_file_names.discard(file.file_id)
                             self.__advance_transfer_lifecycle(file.file_id)
+                            final_move_marker_after = file.file_id in self.__persist.final_move_succeeded_file_names
+                            lifecycle_epoch_after = getattr(
+                                self, "_Controller__transfer_lifecycle_epochs", {}
+                            ).get(file.file_id)
+                            _record_fractional_queue_trace(
+                                self, file.file_id, "queue_lifecycle_reset", lambda: {
+                                    "schema": _QUEUE_LIFECYCLE_RESET_TRACE_SCHEMA,
+                                    "phase": "lifecycle_reset",
+                                    "outcome": "accepted",
+                                    "reason": "new_transfer_lifecycle",
+                                    "marker_name": "final_move_succeeded",
+                                    "target_correlation": "child:{}".format(
+                                        opaque_trace_correlation(file.file_id)
+                                    ),
+                                    "marker_before": final_move_marker_before,
+                                    "marker_after": final_move_marker_after,
+                                    "transfer_lifecycle_epoch_before": (
+                                        lifecycle_epoch_before
+                                        if type(lifecycle_epoch_before) is int and
+                                        0 <= lifecycle_epoch_before <= _QUEUE_TRACE_MAX_EPOCH
+                                        else None
+                                    ),
+                                    "transfer_lifecycle_epoch_after": (
+                                        lifecycle_epoch_after
+                                        if type(lifecycle_epoch_after) is int and
+                                        0 <= lifecycle_epoch_after <= _QUEUE_TRACE_MAX_EPOCH
+                                        else None
+                                    ),
+                                }, flow_id=_fractional_queue_flow_id(
+                                    self, file.file_id, operation_sequence,
+                                ),
+                            )
                             getattr(self, "_Controller__current_process_final_publication_file_ids", set()).discard(file.file_id)
                             self._sync_final_move_succeeded_files_to_model()
                         self.__retire_deferred_queue_intent(file.file_id, "queue_dispatched")

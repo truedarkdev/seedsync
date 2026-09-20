@@ -44,6 +44,7 @@ from controller.model_updater import (
     _ModelUpdateStageTimer,
     _ModelUpdateTimedModelLock,
     _MoveRetryRebuildGate,
+    _bounded_child_finalization_epoch,
     _filter_actionable_move_retry_ids,
     _request_model_rebuild,
 )
@@ -10846,6 +10847,7 @@ class TestModelUpdater(unittest.TestCase):
         )
         controller._Controller__reconciled_local_path_pair_ids = {"accepted-private-pair"}
         controller._Controller__reconciled_remote_path_pair_ids = {"accepted-private-pair"}
+        controller._Controller__progress_publication_epoch = 3
         controller._finalize_staging_child = MagicMock(
             return_value=Controller.MoveFromStagingResult.FAILED,
         )
@@ -10911,6 +10913,12 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("failed", result["details"]["outcome"])
         self.assertEqual("move_failed", result["details"]["reason"])
         self.assertTrue(result["details"]["attempt_failure"])
+        self.assertEqual(result["flow_id"], result["details"]["target_correlation"])
+        self.assertEqual(accepted["flow_id"], accepted["details"]["target_correlation"])
+        self.assertEqual(rejected["flow_id"], rejected["details"]["target_correlation"])
+        self.assertEqual("opaque_child_identity", result["details"]["correlation_reason"])
+        self.assertIsNotNone(result["details"]["scan_generation"])
+        self.assertIsNotNone(result["details"]["reconciliation_epoch"])
         self.assertNotIn("terminal_failure", result["details"])
         self.assertEqual("warning", result["level"])
         self.assertEqual("state_transition", accepted["event_type"])
@@ -10924,6 +10932,11 @@ class TestModelUpdater(unittest.TestCase):
         controller._finalize_staging_child.assert_called_once_with(
             "private-root", "private-complete.bin", "accepted-private-pair",
         )
+
+    def test_child_finalization_epoch_projection_is_bounded_and_sanitized(self):
+        self.assertIsNone(_bounded_child_finalization_epoch(-1))
+        self.assertIsNone(_bounded_child_finalization_epoch("7"))
+        self.assertEqual(2_147_483_647, _bounded_child_finalization_epoch(2_147_483_648))
 
     def test_child_finalization_state_transitions_survive_idle_retention(self):
         controller, model_builder = self._make_progressive_update_controller(
