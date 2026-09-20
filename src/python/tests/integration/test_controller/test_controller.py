@@ -2,6 +2,7 @@
 
 import unittest
 from unittest.mock import MagicMock, patch, PropertyMock
+import json
 import os
 import tempfile
 import shutil
@@ -3187,3 +3188,235 @@ class TestController(unittest.TestCase):
         fcmp = cmp(os.path.join(TestController.temp_dir, "remote", "rc"),
                    final_target)
         self.assertTrue(fcmp)
+
+@unittest.skipUnless(
+    os.name == "posix" and os.path.isdir("/proc/self/fd"),
+    "child finalization requires descriptor-anchored POSIX directories",
+)
+class TestControllerLifecycleTraceComposition(unittest.TestCase):
+    """Join real child finalization, model tracing, and durable retrieval."""
+
+    def test_real_child_finalization_persists_opaque_arbitration_trace(self):
+        pair_id = None
+        root_name = "release"
+        relative_path = "complete.bin"
+        child_name = root_name + "/" + relative_path
+        child_id = ModelFile.build_file_id(child_name, pair_id)
+
+        with tempfile.TemporaryDirectory(prefix="controller-causal-g7-7-") as temp_dir:
+            remote_root = os.path.join(temp_dir, "remote")
+            local_root = os.path.join(temp_dir, "local")
+            logdir = os.path.join(temp_dir, "log")
+            durable_root = os.path.join(logdir, "breadcrumbs")
+            os.makedirs(remote_root)
+            os.makedirs(local_root)
+
+            config = Config.from_dict({
+                "General": {
+                    "debug": "False",
+                    "verbose": "False",
+                    "breadcrumb_trace_enabled": "True",
+                    "breadcrumb_trace_max_entries": "64",
+                    "breadcrumb_trace_policy": json.dumps({
+                        "default": "off",
+                        "rules": {
+                            "finalization.child": "info",
+                            "lifecycle.persist": "info",
+                        },
+                    }),
+                },
+                "Lftp": {
+                    "remote_address": "controller-causal-g7-7.invalid",
+                    "remote_username": "user",
+                    "remote_password": "password",
+                    "remote_port": "22",
+                    "remote_path": remote_root,
+                    "local_path": local_root,
+                    "remote_path_to_scan_script": "unused",
+                    "use_ssh_key": "False",
+                    "protocol": "sftp",
+                    "num_max_parallel_downloads": "1",
+                    "num_max_parallel_files_per_download": "1",
+                    "num_max_connections_per_root_file": "1",
+                    "num_max_connections_per_dir_file": "1",
+                    "num_max_total_connections": "1",
+                    "use_temp_file": "False",
+                    "rate_limit": "0",
+                    "net_socket_buffer": "512K",
+                },
+                "Controller": {
+                    "interval_ms_remote_scan": "1",
+                    "interval_ms_local_scan": "1",
+                    "interval_ms_downloading_scan": "1",
+                    "extract_path": local_root,
+                    "use_local_path_as_extract_path": "True",
+                    "managed_extract_folders_enabled": "True",
+                },
+                "Web": {"port": "8800"},
+                "AutoQueue": {
+                    "enabled": "False",
+                    "patterns_only": "False",
+                    "auto_extract": "False",
+                },
+            })
+            args = Args()
+            args.local_path_to_scanfs = "unused"
+            args.logdir = logdir
+            logger = logging.getLogger("controller-causal-g7-7")
+            context = Context(
+                logger=logger,
+                web_access_logger=logger,
+                config=config,
+                args=args,
+                status=Status(),
+            )
+            collector = context.breadcrumb_trace
+            controller = None
+            try:
+                with patch(
+                    "controller.controller.create_transfer_backend",
+                    return_value=MagicMock(),
+                ):
+                    controller = Controller(context, ControllerPersist())
+
+                staging_root = os.path.join(local_root, "incomplete")
+                staging_target = os.path.join(staging_root, root_name, relative_path)
+                os.makedirs(os.path.dirname(staging_target))
+                with open(staging_target, "wb") as handle:
+                    handle.write(b"complete")
+                controller._Controller__staging_path = staging_root
+                controller._Controller__legacy_local_path = local_root
+
+                result = controller._finalize_staging_child(root_name, relative_path, pair_id)
+                self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
+                final_target = os.path.join(local_root, root_name, relative_path)
+                with open(final_target, "rb") as handle:
+                    self.assertEqual(b"complete", handle.read())
+                self.assertFalse(os.path.exists(staging_target))
+
+                self.assertTrue(collector.flush_durable(2.0))
+                entries = collector.snapshot()["entries"]
+                retained = [
+                    entry for entry in entries
+                    if entry["message"] == "completion_finalized_arbitration"
+                ]
+                self.assertEqual(1, len(retained))
+                event = retained[0]
+                self.assertEqual("lifecycle.persist", event["category"])
+                self.assertEqual("persist_authority", event["stage"])
+                self.assertEqual("diagnostic", event["event_type"])
+                self.assertEqual("flow", event["trace_scope"])
+                self.assertTrue(event["corr_id"])
+                self.assertIsNone(event["flow_id"])
+                self.assertIsNone(event["file_id"])
+                self.assertNotEqual(child_id, event["corr_id"])
+                self.assertNotIn(child_id, json.dumps(event, sort_keys=True))
+                hook_events = [
+                    entry for entry in entries
+                    if entry["message"] == "completion_arbitration_hook"
+                ]
+                self.assertEqual(
+                    ["entered", "returned"],
+                    [entry["details"]["phase"] for entry in hook_events],
+                )
+                for hook_event in hook_events:
+                    self.assertEqual("finalization.child", hook_event["category"])
+                    self.assertEqual("finalization_child", hook_event["stage"])
+                    self.assertEqual("state_transition", hook_event["event_type"])
+                    self.assertTrue(hook_event["details"]["hook_callable"])
+                    self.assertTrue(hook_event["details"]["effective_gate"])
+                    self.assertEqual("child:" + event["corr_id"], hook_event["corr_id"])
+                    self.assertEqual(hook_event["corr_id"], hook_event["flow_id"])
+                    self.assertNotIn(child_id, json.dumps(hook_event, sort_keys=True))
+
+                failing_relative_path = "emitter-failure.bin"
+                failing_staging_target = os.path.join(
+                    staging_root, root_name, failing_relative_path,
+                )
+                os.makedirs(os.path.dirname(failing_staging_target), exist_ok=True)
+                with open(failing_staging_target, "wb") as handle:
+                    handle.write(b"emitter-failure")
+                failing_child_id = ModelFile.build_file_id(
+                    root_name + "/" + failing_relative_path, pair_id,
+                )
+                with patch.object(
+                    controller._Controller__model_builder,
+                    "record_lifecycle_completion_arbitration",
+                    side_effect=RuntimeError("simulated diagnostic emitter failure"),
+                ):
+                    failing_result = controller._finalize_staging_child(
+                        root_name, failing_relative_path, pair_id,
+                    )
+                self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, failing_result)
+                failing_final_target = os.path.join(
+                    local_root, root_name, failing_relative_path,
+                )
+                with open(failing_final_target, "rb") as handle:
+                    self.assertEqual(b"emitter-failure", handle.read())
+                self.assertFalse(os.path.exists(failing_staging_target))
+                self.assertNotEqual(child_id, failing_child_id)
+                failing_hook_events = [
+                    entry for entry in collector.snapshot()["entries"]
+                    if entry["message"] == "completion_arbitration_hook"
+                    and entry["corr_id"] != "child:" + event["corr_id"]
+                ]
+                self.assertEqual(
+                    ["entered", "error"],
+                    [entry["details"]["phase"] for entry in failing_hook_events],
+                )
+                self.assertEqual(
+                    ["hook_exception"],
+                    [entry["details"]["error"] for entry in failing_hook_events
+                     if entry["details"]["phase"] == "error"],
+                )
+
+                # Neither global disable nor category denial may add a lifecycle event.
+                context.config.general.breadcrumb_trace_enabled = False
+                collector.sync_enabled_state()
+                controller._Controller__model_builder.record_lifecycle_completion_arbitration(
+                    ModelFile.build_file_id("globally-denied.bin", pair_id), "completed", True,
+                )
+                context.config.general.breadcrumb_trace_enabled = True
+                collector.sync_enabled_state()
+                collector.apply_policy({
+                    "default": "off",
+                    "rules": {"lifecycle.persist": "off"},
+                })
+                controller._Controller__model_builder.record_lifecycle_completion_arbitration(
+                    ModelFile.build_file_id("category-denied.bin", pair_id), "completed", True,
+                )
+                self.assertEqual(
+                    1,
+                    sum(
+                        entry["message"] == "completion_finalized_arbitration"
+                        for entry in collector.snapshot()["entries"]
+                    ),
+                )
+
+                self.assertTrue(collector.flush_durable(2.0))
+                durable_file = os.path.join(durable_root, "breadcrumbs.jsonl")
+                self.assertTrue(os.path.isfile(durable_file))
+                with open(durable_file, encoding="utf-8") as handle:
+                    durable_records = [
+                        json.loads(line) for line in handle if line.strip()
+                    ]
+                durable_matches = [
+                    record for record in durable_records
+                    if record.get("message") == "completion_finalized_arbitration"
+                ]
+                self.assertEqual(1, len(durable_matches))
+                durable_hook_matches = [
+                    record for record in durable_records
+                    if record.get("message") == "completion_arbitration_hook"
+                    and record.get("corr_id") == "child:" + event["corr_id"]
+                ]
+                self.assertEqual(
+                    ["entered", "returned"],
+                    [record["details"]["phase"] for record in durable_hook_matches],
+                )
+                self.assertLessEqual(len(durable_records), 8)
+                self.assertLessEqual(os.path.getsize(durable_file), 64 * 1024)
+            finally:
+                if controller is not None:
+                    controller.exit()
+                collector.close(timeout=2.0)

@@ -5821,6 +5821,53 @@ class Controller:
             **metadata,
         )
 
+    def __record_child_completion_hook_breadcrumb(
+            self,
+            child_file_id: str,
+            phase: str,
+            hook_callable: bool,
+            effective_gate: Optional[bool] = None,
+            error: Optional[str] = None,
+    ) -> None:
+        """Record bounded completion-hook phases without affecting finalization."""
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        if not _breadcrumb_effectively_enabled(breadcrumb_trace, "finalization.child", "info"):
+            return
+        if phase not in {"entered", "returned", "error"}:
+            return
+        if type(hook_callable) is not bool:
+            return
+        if error is not None and error != "hook_exception":
+            return
+        try:
+            child_identity = opaque_trace_correlation(child_file_id)
+            correlation = "child:{}".format(child_identity)
+            details: dict[str, object] = {
+                "schema": "finalization_child.v1",
+                "phase": phase,
+                "hook_callable": hook_callable,
+            }
+            if type(effective_gate) is bool:
+                details["effective_gate"] = effective_gate
+            if error is not None:
+                details["error"] = error
+            self.__record_breadcrumb(
+                stage="finalization_child",
+                message="completion_arbitration_hook",
+                details=details,
+                event_type="state_transition",
+                category="finalization.child",
+                level="info",
+                corr_id=correlation,
+                flow_id=correlation,
+                trace_scope="flow",
+            )
+        except Exception:
+            try:
+                self.logger.debug("Ignoring completion hook breadcrumb failure", exc_info=True)
+            except Exception:
+                pass
+
     def __record_fractional_queue_trace(
             self, file_id: str, event: str,
             details: dict[str, object] | Callable[[], dict[str, object]],
@@ -8508,12 +8555,52 @@ class Controller:
                 record_completion_arbitration = getattr(
                     self.__model_builder, "record_lifecycle_completion_arbitration", None,
                 )
-                if callable(record_completion_arbitration):
-                    record_completion_arbitration(
+                hook_callable = callable(record_completion_arbitration)
+                effective_gate = None
+                breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+                public_gate = getattr(breadcrumb_trace, "is_effectively_enabled", None)
+                if callable(public_gate):
+                    try:
+                        public_gate_result = public_gate("finalization.child", "info")
+                    except Exception:
+                        public_gate_result = None
+                    if type(public_gate_result) is bool:
+                        effective_gate = public_gate_result
+                self.__record_child_completion_hook_breadcrumb(
+                    child_file_id,
+                    "entered",
+                    hook_callable,
+                    effective_gate,
+                )
+                if hook_callable:
+                    try:
+                        record_completion_arbitration(
+                            child_file_id,
+                            "completed" if result == Controller.MoveFromStagingResult.COMPLETED
+                            else "already_completed",
+                            self.has_current_process_final_publication(child_file),
+                        )
+                    except Exception:
+                        self.__record_child_completion_hook_breadcrumb(
+                            child_file_id,
+                            "error",
+                            hook_callable,
+                            effective_gate,
+                            "hook_exception",
+                        )
+                    else:
+                        self.__record_child_completion_hook_breadcrumb(
+                            child_file_id,
+                            "returned",
+                            hook_callable,
+                            effective_gate,
+                        )
+                else:
+                    self.__record_child_completion_hook_breadcrumb(
                         child_file_id,
-                        "completed" if result == Controller.MoveFromStagingResult.COMPLETED
-                        else "already_completed",
-                        self.has_current_process_final_publication(child_file),
+                        "returned",
+                        hook_callable,
+                        effective_gate,
                     )
             elif result in (Controller.MoveFromStagingResult.FAILED,
                             Controller.MoveFromStagingResult.CONFLICT):
