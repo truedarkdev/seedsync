@@ -1,5 +1,7 @@
 import json
 import logging
+import os
+import tempfile
 import unittest
 import threading
 import time
@@ -286,18 +288,24 @@ class TestModelApi(unittest.TestCase):
         stream.close()
 
         entries = trace.snapshot()["entries"]
+        handshake_entries = [
+            entry for entry in entries
+            if entry["message"] in {
+                "scoped_stream_atomic_registered", "scoped_stream_initial_page_emitted",
+            }
+        ]
         self.assertEqual(["scoped_stream_atomic_registered", "scoped_stream_initial_page_emitted"],
-                         [entry["message"] for entry in entries])
+                         [entry["message"] for entry in handshake_entries])
         authority = {
             "scan_publication_id": 17, "scan_global_version": 29,
             "scan_local_generation": 11, "scan_remote_generation": 13,
             "scan_outcome": "adopt", "scan_reason": "source_buckets_adopted",
         }
         self.assertEqual(authority, {
-            key: entries[0]["details"][key] for key in authority
+            key: handshake_entries[0]["details"][key] for key in authority
         })
         self.assertEqual(authority, {
-            key: entries[1]["details"][key] for key in authority
+            key: handshake_entries[1]["details"][key] for key in authority
         })
         self.assertNotIn("_scan_authority_projection", body)
         self.assertNotIn("private-pair", body)
@@ -329,12 +337,16 @@ class TestModelApi(unittest.TestCase):
         stream = ModelApiHandler(self.controller)._ModelApiHandler__handle_stream("pair-a")
         body = next(stream)
         stream.close()
+        atomic_entry = next(
+            entry for entry in enabled.snapshot()["entries"]
+            if entry["message"] == "scoped_stream_atomic_registered"
+        )
         self.assertEqual({
             "scan_publication_id": None, "scan_global_version": None,
             "scan_local_generation": None, "scan_remote_generation": None,
             "scan_outcome": "unknown", "scan_reason": "unknown",
         }, {
-            key: enabled.snapshot()["entries"][0]["details"][key] for key in (
+            key: atomic_entry["details"][key] for key in (
                 "scan_publication_id", "scan_global_version",
                 "scan_local_generation", "scan_remote_generation",
                 "scan_outcome", "scan_reason",
@@ -356,6 +368,170 @@ class TestModelApi(unittest.TestCase):
         self.assertIn("event: model-page", next(stream))
         self.assertEqual(["atomic_registered", "initial_page_emitted"], events)
         stream.close()
+
+    def test_scoped_stream_timing_breadcrumbs_cover_handler_to_initial_yield_and_close(self):
+        self.model.add_file(self._file("root", "pair-a"))
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model_stream": "debug"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+
+        stream = ModelApiHandler(self.controller)._ModelApiHandler__handle_stream("pair-a")
+        self.assertIn("event: model-page", next(stream))
+        stream.close()
+
+        entries = trace.snapshot(category="model_stream")["entries"]
+        messages = [entry["message"] for entry in entries]
+        self.assertIn("scoped_stream_handler_entry", messages)
+        self.assertIn("scoped_stream_priority", messages)
+        self.assertIn("scoped_stream_page_listener_snapshot", messages)
+        self.assertIn("scoped_stream_initial_sse_preparation", messages)
+        self.assertIn("scoped_stream_generator_finally", messages)
+        timing_entries = [
+            entry for entry in entries
+            if entry["message"] == "scoped_stream_priority"
+        ]
+        self.assertEqual(
+            ["started", "completed"],
+            [entry["details"]["outcome"] for entry in timing_entries],
+        )
+        final = next(
+            entry for entry in entries
+            if entry["message"] == "scoped_stream_generator_finally"
+        )
+        self.assertEqual("cancelled", final["details"]["outcome"])
+        self.assertEqual("opaque_scope_time_version", final["details"]["browser_correlation"])
+        self.assertEqual("unresolved", final["details"]["correlation_ambiguity"])
+        self.assertEqual("collector_utc", final["details"]["timestamp_basis"])
+        preparation = next(
+            entry for entry in entries
+            if entry["message"] == "scoped_stream_initial_sse_preparation"
+            and entry["details"]["outcome"] == "completed"
+        )
+        self.assertEqual("prepared_before_yield_not_sent", preparation["details"]["delivery_semantic"])
+        self.assertNotIn("pair-a", str(entries))
+
+    def test_scoped_stream_timing_records_page_error_without_registering_stream(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model_stream": "debug"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        handler = ModelApiHandler(self.controller)
+        with patch.object(
+            handler, "_ModelApiHandler__get_page", return_value={"error": "cursor_reset_required"},
+        ):
+            response = handler._ModelApiHandler__handle_stream("pair-a")
+
+        self.assertEqual(409, response.status_code)
+        entries = trace.snapshot(category="model_stream")["entries"]
+        page_entries = [
+            entry for entry in entries
+            if entry["message"] == "scoped_stream_page_listener_snapshot"
+        ]
+        self.assertEqual(["started", "error"], [entry["details"]["outcome"] for entry in page_entries])
+        self.assertNotIn("scoped_stream_atomic_registered", [entry["message"] for entry in entries])
+        self.assertNotIn("scoped_stream_generator_finally", [entry["message"] for entry in entries])
+
+    def test_scoped_stream_timing_records_generator_error_and_swallows_trace_failure(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"model_stream": "debug"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        handler = ModelApiHandler(self.controller)
+        stream = handler._ModelApiHandler__handle_stream("pair-a")
+        with patch.object(handler, "_ModelApiHandler__sse", side_effect=RuntimeError("private failure")):
+            with self.assertRaises(RuntimeError):
+                next(stream)
+        final = next(
+            entry for entry in trace.snapshot(category="model_stream")["entries"]
+            if entry["message"] == "scoped_stream_generator_finally"
+        )
+        self.assertEqual("error", final["details"]["outcome"])
+
+        # The diagnostic hook is deliberately the only failing surface; the
+        # handler must still return and close a normal stream.
+        with patch.object(
+            self.controller, "record_scoped_model_stream_breadcrumb",
+            side_effect=RuntimeError("diagnostic failure"),
+        ):
+            safe_stream = ModelApiHandler(self.controller)._ModelApiHandler__handle_stream("pair-a")
+            self.assertIn("event: model-page", next(safe_stream))
+            safe_stream.close()
+
+    def test_scoped_stream_timing_is_disabled_without_timestamp_overhead(self):
+        self.model.add_file(self._file("root", "pair-a"))
+        disabled = BreadcrumbTraceCollector(lambda: True, policy={"default": "off"})
+        self.controller._Controller__context.breadcrumb_trace = disabled
+        handler = ModelApiHandler(self.controller)
+        with patch("web.handler.model_api.time.monotonic_ns") as monotonic_ns:
+            stream = handler._ModelApiHandler__handle_stream("pair-a")
+        self.assertEqual([], disabled.snapshot(category="model_stream")["entries"])
+        monotonic_ns.assert_not_called()
+        stream.close()
+
+    def test_scoped_stream_disable_recheck_suppresses_final_timing_after_yield(self):
+        self.model.add_file(self._file("root", "pair-a"))
+        for termination in ("close", "error"):
+            with self.subTest(termination=termination):
+                trace = BreadcrumbTraceCollector(
+                    lambda: True,
+                    policy={"default": "off", "rules": {"model_stream": "debug"}},
+                )
+                self.controller._Controller__context.breadcrumb_trace = trace
+                stream = ModelApiHandler(self.controller)._ModelApiHandler__handle_stream("pair-a")
+                self.assertIn("event: model-page", next(stream))
+                before_disable = len(trace.snapshot(category="model_stream")["entries"])
+                trace.apply_policy({"default": "off"})
+                with patch("web.handler.model_api.time.monotonic_ns") as monotonic_ns:
+                    if termination == "close":
+                        stream.close()
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            stream.throw(RuntimeError("consumer cancelled"))
+                monotonic_ns.assert_not_called()
+                after_disable = trace.snapshot(category="model_stream")["entries"]
+                self.assertEqual(before_disable, len(after_disable))
+                self.assertNotIn(
+                    "scoped_stream_generator_finally",
+                    [entry["message"] for entry in after_disable[before_disable:]],
+                )
+
+    def test_scoped_stream_timing_fields_are_bounded_and_spool_composable(self):
+        with tempfile.TemporaryDirectory() as spool_path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True, durable_enabled=True, durable_path=spool_path,
+                policy={"default": "off", "rules": {"model_stream": "debug"}},
+            )
+            self.controller._Controller__context.breadcrumb_trace = trace
+            self.controller.record_scoped_model_stream_breadcrumb(
+                "priority", "private-pair", {"model_version": -1},
+                {
+                    "outcome": "private-outcome",
+                    "duration_ms": 10 ** 50,
+                    "browser_correlation": "private-browser-id",
+                },
+            )
+            entries = trace.snapshot(category="model_stream")["entries"]
+            self.assertEqual(1, len(entries))
+            details = entries[0]["details"]
+            self.assertEqual("unknown", details["outcome"])
+            self.assertEqual(2_147_483_647, details["duration_ms"])
+            self.assertEqual("2000+", details["duration_bucket"])
+            self.assertEqual("opaque_scope_time_version", details["browser_correlation"])
+            self.assertEqual("unresolved", details["correlation_ambiguity"])
+            self.assertEqual("collector_utc", details["timestamp_basis"])
+            self.assertNotIn("private-pair", str(entries))
+            self.assertNotIn("private-browser-id", str(entries))
+            flushed = trace.flush_durable(1.0)
+            if os.name != "nt":
+                self.assertTrue(flushed)
+                self.assertGreaterEqual(trace.durable_snapshot()["written"], 1)
+            else:
+                # Windows' existing spool implementation is buffered
+                # best-effort and explicitly does not claim a durable write.
+                self.assertEqual("buffered_best_effort", trace.durable_snapshot()["durability"])
+            trace.close()
+            self.assertTrue(os.path.isdir(spool_path))
 
     def test_sse_publication_uses_context_supplied_bounded_collectors_without_payload_metadata(self):
         diagnostics_enabled = [True]

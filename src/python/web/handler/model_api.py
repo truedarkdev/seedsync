@@ -240,6 +240,81 @@ class ModelApiHandler(IHandler):
         self.__performance_diagnostics = performance_diagnostics
         self.__breadcrumb_trace = breadcrumb_trace
 
+    def __scoped_stream_trace_enabled(self, recorder: object) -> bool:
+        """Gate timing work before taking monotonic timestamps."""
+        if not callable(recorder):
+            return False
+        checker = getattr(self.__controller, "is_scoped_model_stream_breadcrumb_enabled", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        # Keep compatibility with small test/controller fakes that expose
+        # only the recorder hook; the real Controller always supplies the
+        # policy gate above.
+        return True
+
+    @staticmethod
+    def __scoped_stream_duration_ms(started_ns: Optional[int]) -> Optional[int]:
+        if type(started_ns) is not int:
+            return None
+        return max(0, int((time.monotonic_ns() - started_ns) / 1_000_000))
+
+    def __scoped_stream_capture_start(self, recorder: object) -> Optional[int]:
+        """Capture a monotonic start only while the current gate is enabled."""
+        if not self.__scoped_stream_trace_enabled(recorder):
+            return None
+        return time.monotonic_ns()
+
+    def __scoped_stream_phase_start(
+        self, recorder: object, phase: str, scope_id: str, page: object = None,
+    ) -> Optional[int]:
+        started_ns = self.__scoped_stream_capture_start(recorder)
+        if started_ns is not None:
+            self.__record_scoped_stream_breadcrumb(
+                recorder, phase, scope_id, page, {"outcome": "started"},
+            )
+        return started_ns
+
+    def __scoped_stream_phase_finish(
+        self, recorder: object, phase: str, scope_id: str, page: object,
+        started_ns: Optional[int], outcome: str,
+    ) -> None:
+        if started_ns is None or not self.__scoped_stream_trace_enabled(recorder):
+            return
+        self.__record_scoped_stream_breadcrumb(
+            recorder, phase, scope_id, page,
+            {
+                "outcome": outcome,
+                "duration_ms": self.__scoped_stream_duration_ms(started_ns),
+            },
+        )
+
+    @staticmethod
+    def __record_scoped_stream_breadcrumb(
+        recorder: object, phase: str, scope_id: str, page: object = None,
+        details: Optional[dict[str, object]] = None,
+    ) -> None:
+        """Call the optional diagnostic hook without affecting model delivery."""
+        if not callable(recorder):
+            return
+        try:
+            if details is None:
+                recorder(phase, scope_id, page)
+            else:
+                recorder(phase, scope_id, page, details)
+        except TypeError:
+            # Preserve compatibility with the pre-timing three-argument hook
+            # used by lightweight test/controller fakes.
+            if details is not None:
+                try:
+                    recorder(phase, scope_id, page)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp) -> None:
         web_app.add_handler(
@@ -742,40 +817,98 @@ class ModelApiHandler(IHandler):
 
     def __handle_stream(self, path_pair_id: str) -> Iterator[str]:
         scope_id = self.__validate_scope_id(path_pair_id)
+        trace_scoped_stream = getattr(self.__controller, "record_scoped_model_stream_breadcrumb", None)
+        handler_entry_started_ns = self.__scoped_stream_phase_start(
+            trace_scoped_stream, "handler_entry", scope_id,
+        )
         prioritize = getattr(self.__controller, "prioritize_path_pair_scan", None)
-        if callable(prioritize):
-            prioritize(scope_id)
+        priority_started_ns = self.__scoped_stream_phase_start(
+            trace_scoped_stream, "priority", scope_id,
+        )
+        try:
+            if callable(prioritize):
+                prioritize(scope_id)
+        except BaseException:
+            self.__scoped_stream_phase_finish(
+                trace_scoped_stream, "priority", scope_id, None,
+                priority_started_ns, "error",
+            )
+            self.__scoped_stream_phase_finish(
+                trace_scoped_stream, "handler_entry", scope_id, None,
+                handler_entry_started_ns, "error",
+            )
+            raise
+        self.__scoped_stream_phase_finish(
+            trace_scoped_stream, "priority", scope_id, None,
+            priority_started_ns, "completed" if callable(prioritize) else "unavailable",
+        )
         listener = ScopedModelListener(scope_id)
-        page = self.__get_page(
-            scope_id, None, add_listener=listener, preserve_global_model_version=True,
-            preserve_stream_authority_projection=True,
+        page_started_ns = self.__scoped_stream_phase_start(
+            trace_scoped_stream, "page_listener_snapshot", scope_id,
+        )
+        try:
+            page = self.__get_page(
+                scope_id, None, add_listener=listener, preserve_global_model_version=True,
+                preserve_stream_authority_projection=True,
+            )
+        except BaseException:
+            self.__scoped_stream_phase_finish(
+                trace_scoped_stream, "page_listener_snapshot", scope_id, None,
+                page_started_ns, "error",
+            )
+            self.__scoped_stream_phase_finish(
+                trace_scoped_stream, "handler_entry", scope_id, None,
+                handler_entry_started_ns, "error",
+            )
+            raise
+        self.__scoped_stream_phase_finish(
+            trace_scoped_stream, "page_listener_snapshot", scope_id, page,
+            page_started_ns, "error" if page.get("error") else "completed",
         )
         if page.get("error"):
+            self.__scoped_stream_phase_finish(
+                trace_scoped_stream, "handler_entry", scope_id, page,
+                handler_entry_started_ns, "error",
+            )
             listener.close()
             return self.__json_response(
                 page, 409 if page.get("error") == "cursor_reset_required" else 400,
                 scope_id=scope_id,
             )
-        trace_scoped_stream = getattr(self.__controller, "record_scoped_model_stream_breadcrumb", None)
-        if callable(trace_scoped_stream):
-            trace_scoped_stream("atomic_registered", scope_id, page)
+        self.__record_scoped_stream_breadcrumb(trace_scoped_stream, "atomic_registered", scope_id, page)
         reconnect_id = bottle.request.get_header("Last-Event-ID", "").strip()
         bottle.response.content_type = "text/event-stream"
         bottle.response.cache_control = "no-cache"
 
         def stream() -> Iterator[str]:
+            generator_started_ns = self.__scoped_stream_capture_start(trace_scoped_stream)
+            generator_outcome = "completed"
             try:
                 version = page.get("model_version")
                 global_model_version = page.pop("_global_model_version", None)
                 last_keepalive_at = time.monotonic()
-                if callable(trace_scoped_stream):
-                    trace_scoped_stream("initial_page_emitted", scope_id, page)
-                page.pop("_scan_authority_projection", None)
-                yield self.__sse(
-                    "scoped", "model-page", page, version if isinstance(version, int) else None,
-                    global_model_version if isinstance(global_model_version, int) else None,
-                    scope_id, global_model_version if isinstance(global_model_version, int) else None,
+                initial_sse_started_ns = self.__scoped_stream_phase_start(
+                    trace_scoped_stream, "initial_sse_preparation", scope_id, page,
                 )
+                self.__record_scoped_stream_breadcrumb(trace_scoped_stream, "initial_page_emitted", scope_id, page)
+                page.pop("_scan_authority_projection", None)
+                try:
+                    initial_event = self.__sse(
+                        "scoped", "model-page", page, version if isinstance(version, int) else None,
+                        global_model_version if isinstance(global_model_version, int) else None,
+                        scope_id, global_model_version if isinstance(global_model_version, int) else None,
+                    )
+                except BaseException:
+                    self.__scoped_stream_phase_finish(
+                        trace_scoped_stream, "initial_sse_preparation", scope_id, page,
+                        initial_sse_started_ns, "error",
+                    )
+                    raise
+                self.__scoped_stream_phase_finish(
+                    trace_scoped_stream, "initial_sse_preparation", scope_id, page,
+                    initial_sse_started_ns, "completed",
+                )
+                yield initial_event
                 if reconnect_id:
                     yield self.__sse(
                         "scoped", "model-reset",
@@ -829,8 +962,22 @@ class ModelApiHandler(IHandler):
                         listener.wait_for_event(
                             last_keepalive_at + self._KEEPALIVE_INTERVAL_SECONDS - time.monotonic()
                         )
+            except GeneratorExit:
+                generator_outcome = "cancelled"
+                raise
+            except BaseException:
+                generator_outcome = "error"
+                raise
             finally:
+                self.__scoped_stream_phase_finish(
+                    trace_scoped_stream, "generator_finally", scope_id, page,
+                    generator_started_ns, generator_outcome,
+                )
                 listener.close()
                 self.__controller.remove_model_listener(listener)
 
+        self.__scoped_stream_phase_finish(
+            trace_scoped_stream, "handler_entry", scope_id, page,
+            handler_entry_started_ns, "completed",
+        )
         return stream()

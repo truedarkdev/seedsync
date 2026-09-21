@@ -290,6 +290,32 @@ _SCAN_AUTHORITY_STREAM_REASONS = frozenset({
     "no_change",
 })
 
+_SCOPED_MODEL_STREAM_TIMING_PHASES = frozenset({
+    "handler_entry", "priority", "page_listener_snapshot", "initial_sse_preparation",
+    "generator_finally",
+})
+_SCOPED_MODEL_STREAM_TIMING_OUTCOMES = frozenset({
+    "started", "completed", "error", "cancelled", "unavailable",
+})
+_SCOPED_MODEL_STREAM_TIMING_DURATION_MAX_MS = 2_147_483_647
+_SCOPED_MODEL_STREAM_TIMING_CORRELATION = "opaque_scope_time_version"
+
+
+def _scoped_model_stream_duration_bucket(duration_ms: object) -> str:
+    if type(duration_ms) is not int or duration_ms < 0:
+        return "unknown"
+    if duration_ms < 5:
+        return "0-4"
+    if duration_ms < 20:
+        return "5-19"
+    if duration_ms < 100:
+        return "20-99"
+    if duration_ms < 500:
+        return "100-499"
+    if duration_ms < 2000:
+        return "500-1999"
+    return "2000+"
+
 
 def _bounded_scan_authority_stream_projection(snapshot: object) -> dict[str, object]:
     """Return the bounded, identity-free scan authority stream projection."""
@@ -4840,15 +4866,33 @@ class Controller:
             self.__model.add_listener(listener)
             return summary
 
+    def is_scoped_model_stream_breadcrumb_enabled(self) -> bool:
+        """Return the fail-closed gate for opt-in scoped-stream timing."""
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        return _breadcrumb_effectively_enabled(breadcrumb_trace, "model_stream", "debug")
+
     def record_scoped_model_stream_breadcrumb(
-            self, phase: str, scope_id: object, page: object,
+            self, phase: str, scope_id: object, page: object = None,
+            details: Optional[dict[str, object]] = None,
     ) -> None:
-        """Record opt-in, identity-free scoped-stream handshake evidence."""
+        """Record bounded, identity-free scoped-stream handshake/timing evidence.
+
+        Timing records intentionally carry only an opaque scope correlation,
+        the collector's UTC timestamp, bounded model versions, and monotonic
+        duration buckets.  Browser joins therefore remain temporal and
+        scope/version based, with ambiguity unresolved; no browser/session
+        identity is accepted here.
+        """
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
         if not _breadcrumb_effectively_enabled(breadcrumb_trace, "model_stream", "debug"):
             return
-        if phase not in {"atomic_registered", "initial_page_emitted"} or not isinstance(page, dict):
+        if phase not in {"atomic_registered", "initial_page_emitted"} and \
+                phase not in _SCOPED_MODEL_STREAM_TIMING_PHASES:
             return
+        if phase in {"atomic_registered", "initial_page_emitted"} and not isinstance(page, dict):
+            return
+        if not isinstance(page, dict):
+            page = {}
         records = page.get("records")
         record_count = len(records) if isinstance(records, list) else 0
         version = page.get("model_version")
@@ -4856,23 +4900,53 @@ class Controller:
             page.get(_SCAN_AUTHORITY_STREAM_PROJECTION_KEY),
         )
         try:
-            details = {
-                "phase": phase,
-                "scope_kind": "legacy" if scope_id == MODEL_LEGACY_SCOPE_ID else "scoped",
-                "record_count_bucket": "0" if record_count < 1 else "1" if record_count == 1 else "2-4" if record_count <= 4 else "5+",
-                "model_version": version if type(version) is int and version >= 0 else None,
-                "next_page": type(page.get("next_cursor")) is str,
-                # Preserve the scoped-page version separately from the
-                # aggregate scan publication, without retaining scope or
-                # record identities.
-                "stream_linkage": "linked" if type(version) is int and version >= 0 else "unlinked",
-                "scan_publication_id": authority["publication_id"],
-                "scan_global_version": authority["model_version"],
-                "scan_local_generation": authority["local_scan_generation"],
-                "scan_remote_generation": authority["remote_scan_generation"],
-                "scan_outcome": authority["outcome"],
-                "scan_reason": authority["reason"],
-            }
+            if phase in {"atomic_registered", "initial_page_emitted"}:
+                details = {
+                    "phase": phase,
+                    "scope_kind": "legacy" if scope_id == MODEL_LEGACY_SCOPE_ID else "scoped",
+                    "record_count_bucket": "0" if record_count < 1 else "1" if record_count == 1 else "2-4" if record_count <= 4 else "5+",
+                    "model_version": version if type(version) is int and version >= 0 else None,
+                    "next_page": type(page.get("next_cursor")) is str,
+                    # Preserve the scoped-page version separately from the
+                    # aggregate scan publication, without retaining scope or
+                    # record identities.
+                    "stream_linkage": "linked" if type(version) is int and version >= 0 else "unlinked",
+                    "scan_publication_id": authority["publication_id"],
+                    "scan_global_version": authority["model_version"],
+                    "scan_local_generation": authority["local_scan_generation"],
+                    "scan_remote_generation": authority["remote_scan_generation"],
+                    "scan_outcome": authority["outcome"],
+                    "scan_reason": authority["reason"],
+                }
+            else:
+                supplied = details if isinstance(details, dict) else {}
+                supplied_outcome = supplied.get("outcome")
+                outcome = supplied_outcome if (
+                    type(supplied_outcome) is str and
+                    supplied_outcome in _SCOPED_MODEL_STREAM_TIMING_OUTCOMES
+                ) else "unknown"
+                supplied_duration = supplied.get("duration_ms")
+                duration_ms = (
+                    min(_SCOPED_MODEL_STREAM_TIMING_DURATION_MAX_MS, supplied_duration)
+                    if type(supplied_duration) is int and supplied_duration >= 0
+                    else None
+                )
+                details = {
+                    "phase": phase,
+                    "outcome": outcome,
+                    "duration_ms": duration_ms,
+                    "duration_bucket": _scoped_model_stream_duration_bucket(duration_ms),
+                    "scope_kind": "legacy" if scope_id == MODEL_LEGACY_SCOPE_ID else "scoped",
+                    "record_count_bucket": "0" if record_count < 1 else "1" if record_count == 1 else "2-4" if record_count <= 4 else "5+",
+                    "model_version": version if type(version) is int and 0 <= version <= _SCOPED_MODEL_STREAM_TIMING_DURATION_MAX_MS else None,
+                    "scope_version": version if type(version) is int and 0 <= version <= _SCOPED_MODEL_STREAM_TIMING_DURATION_MAX_MS else None,
+                    "next_page": type(page.get("next_cursor")) is str,
+                    "browser_correlation": _SCOPED_MODEL_STREAM_TIMING_CORRELATION,
+                    "correlation_ambiguity": "unresolved",
+                    "timestamp_basis": "collector_utc",
+                }
+                if phase == "initial_sse_preparation":
+                    details["delivery_semantic"] = "prepared_before_yield_not_sent"
             breadcrumb_trace.record(
                 "model_stream", "scoped_stream_{}".format(phase), details,
                 stage="scoped_model_stream", event_type="diagnostic",
