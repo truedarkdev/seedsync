@@ -422,6 +422,188 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual(10000, collector._BreadcrumbTraceCollector__version)
         self.assertEqual(0, collector._BreadcrumbTraceCollector__evicted_count)
 
+    def test_eviction_candidate_selection_uses_entry_snapshot(self):
+        class IndexedReadCountingDeque(deque):
+            indexed_reads = 0
+
+            def __getitem__(self, index):
+                if isinstance(index, int):
+                    type(self).indexed_reads += 1
+                return super().__getitem__(index)
+
+        entry_count = 128
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=None)
+        for index in range(entry_count):
+            collector.record("worker", "event-{}".format(index), category="noise")
+
+        collector._BreadcrumbTraceCollector__entries = IndexedReadCountingDeque(
+            collector._BreadcrumbTraceCollector__entries,
+        )
+        collector._BreadcrumbTraceCollector__max_entries = entry_count // 2
+        IndexedReadCountingDeque.indexed_reads = 0
+
+        evicted = collector._BreadcrumbTraceCollector__evict_to_budget()
+
+        self.assertTrue(evicted)
+        self.assertEqual(entry_count // 2, collector.snapshot()["entry_count"])
+        self.assertEqual(entry_count // 2, collector.snapshot()["accounting"]["evicted_count"])
+        # Candidate selection reads entries from one immutable tuple per
+        # eviction pass; the single remaining indexed read is the final
+        # signature lookup after the pass completes.
+        self.assertEqual(1, IndexedReadCountingDeque.indexed_reads)
+
+    def test_eviction_matches_pre_change_selection_for_mixed_retention_stream(self):
+        policy = {"retention": {"protected_categories": ["protected"]}}
+        mixed_stream = [
+            {"message": "noise-a", "category": "noise"},
+            {"message": "noise-b", "category": "noise"},
+            {"message": "quiet", "category": "quiet"},
+            {"message": "tie-a", "category": "tie"},
+            {"message": "tie-b", "category": "tie"},
+            {"message": "decision-old", "category": "decision", "event_type": "decision"},
+            {"message": "decision-new", "category": "decision", "event_type": "decision"},
+            {"message": "protected-level", "category": "level-protected", "level": "warning"},
+            {"message": "protected-category", "category": "protected.audit"},
+            {
+                "message": "failure", "category": "failure", "event_type": "failure",
+                "level": "error", "_coalesce_key": "failure",
+            },
+            {
+                "message": "failure", "category": "failure", "event_type": "failure",
+                "level": "error", "_coalesce_key": "failure",
+            },
+            {"message": "protected-tail", "category": "tail-protected", "level": "warning"},
+        ]
+        all_protected_stream = [
+            {"message": "protected-level-a", "category": "level-a", "level": "warning"},
+            {"message": "protected-level-b", "category": "level-b", "level": "error"},
+            {"message": "protected-category", "category": "protected.audit"},
+            {"message": "protected-decision", "category": "decision", "event_type": "decision"},
+        ]
+
+        def populate(collector, stream):
+            with patch("common.breadcrumb_trace.time.time_ns", return_value=1_000_000_000):
+                for event in stream:
+                    metadata = dict(event)
+                    message = metadata.pop("message")
+                    collector.record("worker", message, **metadata)
+
+        def reference_evict(collector):
+            evictions = []
+            fallback_count = 0
+            entries_name = "_BreadcrumbTraceCollector__entries"
+            sizes_name = "_BreadcrumbTraceCollector__entry_sizes"
+            while getattr(collector, entries_name) and (
+                collector._BreadcrumbTraceCollector__retained_bytes
+                > collector._BreadcrumbTraceCollector__memory_budget_bytes
+                or collector._BreadcrumbTraceCollector__max_entries is not None
+                and len(getattr(collector, entries_name))
+                > collector._BreadcrumbTraceCollector__max_entries
+            ):
+                entries = getattr(collector, entries_name)
+                sizes = getattr(collector, sizes_name)
+                protected = collector._BreadcrumbTraceCollector__protected_indices()
+                candidate_indices = [index for index in range(len(entries)) if index not in protected]
+                if not candidate_indices:
+                    fallback_count += 1
+                    candidate_indices = list(range(len(entries)))
+                category_counts = {}
+                for index in candidate_indices:
+                    category = str(entries[index].get("category") or "unknown")
+                    category_counts[category] = category_counts.get(category, 0) + 1
+                chosen_index = max(candidate_indices, key=lambda index: (
+                    category_counts[str(entries[index].get("category") or "unknown")], -index,
+                ))
+                evicted = entries[chosen_index]
+                evicted_size = sizes[chosen_index]
+                evictions.append((
+                    evicted["message"],
+                    int(evicted.get("version", 0)),
+                    int(evicted.get("last_seen_version", evicted.get("version", 0))),
+                ))
+                del entries[chosen_index]
+                del sizes[chosen_index]
+                for signature, candidate in tuple(collector._BreadcrumbTraceCollector__coalesce_entries.items()):
+                    if candidate is evicted:
+                        del collector._BreadcrumbTraceCollector__coalesce_entries[signature]
+                collector._BreadcrumbTraceCollector__retained_bytes -= evicted_size
+                collector._BreadcrumbTraceCollector__evicted_count += 1
+                collector._BreadcrumbTraceCollector__category_counter(evicted)["evicted"] += 1
+                collector._BreadcrumbTraceCollector__record_gap_range(
+                    int(evicted.get("version", 0)),
+                    int(evicted.get("last_seen_version", evicted.get("version", 0))),
+                    "evicted",
+                )
+                collector._BreadcrumbTraceCollector__window_truncated_pending = True
+            collector._BreadcrumbTraceCollector__retained_bytes = max(
+                0, collector._BreadcrumbTraceCollector__retained_bytes,
+            )
+            collector._BreadcrumbTraceCollector__last_signature = (
+                collector._BreadcrumbTraceCollector__signature(
+                    getattr(collector, entries_name)[-1],
+                )
+                if getattr(collector, entries_name) else None
+            )
+            collector._BreadcrumbTraceCollector__refresh_failure_locked()
+            return evictions, fallback_count
+
+        def compare_stream(stream, max_entries):
+            candidate = BreadcrumbTraceCollector(lambda: True, max_entries=None, policy=policy)
+            reference = BreadcrumbTraceCollector(lambda: True, max_entries=None, policy=policy)
+            populate(candidate, stream)
+            populate(reference, stream)
+            before = candidate.snapshot()
+            self.assertEqual(
+                1 if stream is mixed_stream else 0,
+                before["accounting"]["coalesced_count"],
+            )
+            if stream is mixed_stream:
+                failure_entries = [entry for entry in before["entries"] if entry["message"] == "failure"]
+                self.assertEqual(1, len(failure_entries))
+                self.assertEqual(2, failure_entries[0]["repeat_count"])
+
+            candidate._BreadcrumbTraceCollector__max_entries = max_entries
+            reference._BreadcrumbTraceCollector__max_entries = max_entries
+            expected_evictions, fallback_count = reference_evict(reference)
+            version_to_message = {
+                int(entry["version"]): entry["message"]
+                for entry in candidate._BreadcrumbTraceCollector__entries
+            }
+            actual_evictions = []
+            record_gap = "_BreadcrumbTraceCollector__record_gap_range"
+            original_record_gap = getattr(candidate, record_gap)
+
+            def capture_gap(start, end, reason):
+                if reason == "evicted":
+                    actual_evictions.append((version_to_message[start], start, end))
+                return original_record_gap(start, end, reason)
+
+            with patch.object(candidate, record_gap, side_effect=capture_gap):
+                self.assertTrue(candidate._BreadcrumbTraceCollector__evict_to_budget())
+
+            self.assertEqual(expected_evictions, actual_evictions)
+            candidate_payload = candidate.snapshot()
+            reference_payload = reference.snapshot()
+            self.assertEqual(
+                [(entry["version"], entry["message"], entry["repeat_count"])
+                 for entry in reference_payload["entries"]],
+                [(entry["version"], entry["message"], entry["repeat_count"])
+                 for entry in candidate_payload["entries"]],
+            )
+            for key in (
+                "retained_bytes", "latest_failure_version", "latest_failure_entry",
+                "failure_summary", "gaps", "gap_watermark_to_version", "window_truncated",
+                "evictions", "accounting",
+            ):
+                self.assertEqual(reference_payload[key], candidate_payload[key], key)
+            return fallback_count, len(expected_evictions)
+
+        mixed_fallbacks, mixed_evictions = compare_stream(mixed_stream, max_entries=3)
+        self.assertGreater(mixed_fallbacks, 0)
+        self.assertEqual(8, mixed_evictions)
+        all_fallbacks, all_evictions = compare_stream(all_protected_stream, max_entries=1)
+        self.assertEqual(all_evictions, all_fallbacks)
+
     def test_coalesced_failure_keeps_latest_failure_in_entry_order(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
 

@@ -5230,19 +5230,23 @@ class BreadcrumbTraceCollector:
             self.__retained_bytes > self.__memory_budget_bytes
             or self.__max_entries is not None and len(self.__entries) > self.__max_entries
         ):
+            # Repeated candidate-indexed deque reads make eviction quadratic;
+            # this lock-held snapshot preserves the iteration's selection while
+            # live deques remain the deletion targets.
+            entries = tuple(self.__entries)
             protected = self.__protected_indices()
-            candidate_indices = [index for index in range(len(self.__entries)) if index not in protected]
+            candidate_indices = [index for index in range(len(entries)) if index not in protected]
             if not candidate_indices:
-                candidate_indices = list(range(len(self.__entries)))
+                candidate_indices = list(range(len(entries)))
             category_counts: Dict[str, int] = {}
             for index in candidate_indices:
-                category = str(self.__entries[index].get("category") or "unknown")
+                category = str(entries[index].get("category") or "unknown")
                 category_counts[category] = category_counts.get(category, 0) + 1
             # Prefer the oldest record from the noisiest eligible category.
             chosen_index = max(candidate_indices, key=lambda index: (
-                category_counts[str(self.__entries[index].get("category") or "unknown")], -index,
+                category_counts[str(entries[index].get("category") or "unknown")], -index,
             ))
-            evicted = self.__entries[chosen_index]
+            evicted = entries[chosen_index]
             evicted_size = self.__entry_sizes[chosen_index]
             del self.__entries[chosen_index]
             del self.__entry_sizes[chosen_index]
