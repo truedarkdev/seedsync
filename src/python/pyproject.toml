@@ -15,6 +15,7 @@ parameterized = "*"
 pexpect = ">=4.9.0"
 tblib = ">=3.2.2"
 six = "^1.17.0"
+py-spy = "==0.4.2"
 
 [tool.poetry.group.dev.dependencies]
 pyinstaller = ">=6.11,<7"

@@ -261,6 +261,7 @@ class TestConfig(unittest.TestCase):
             "performance_diagnostics_enabled": "True",
             "performance_diagnostics_retention_depth": "64",
             "performance_diagnostics_sample_interval_seconds": "10",
+            "py_spy_enabled": "True",
             "config_api_redact_remote_details": "False",
         }
         general = Config.General.from_dict(good_dict)
@@ -279,6 +280,7 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(general.performance_diagnostics_enabled)
         self.assertEqual(64, general.performance_diagnostics_retention_depth)
         self.assertEqual(10, general.performance_diagnostics_sample_interval_seconds)
+        self.assertTrue(general.py_spy_enabled)
         self.assertEqual(False, general.config_api_redact_remote_details)
 
         self.check_common(Config.General,
@@ -433,6 +435,7 @@ class TestConfig(unittest.TestCase):
         self.assertFalse(general.performance_diagnostics_enabled)
         self.assertEqual(120, general.performance_diagnostics_retention_depth)
         self.assertEqual(5, general.performance_diagnostics_sample_interval_seconds)
+        self.assertFalse(general.py_spy_enabled)
 
     def test_lftp(self):
         good_dict = {
@@ -1116,6 +1119,7 @@ class TestConfig(unittest.TestCase):
             performance_diagnostics_enabled = False
             performance_diagnostics_retention_depth = 120
             performance_diagnostics_sample_interval_seconds = 5
+            py_spy_enabled = False
             config_api_redact_remote_details = True
 
             [Lftp]

@@ -115,13 +115,16 @@ FROM seedsync_run_python AS seedsync_run
 LABEL org.opencontainers.image.source="https://github.com/truedarkdev/seedsync"
 COPY --from=seedsync_build_angular /build/dist /app/html
 COPY src/docker/build/docker-image/entrypoint.sh /scripts/
+COPY src/docker/build/docker-image/seedsync-py-spy /usr/local/sbin/seedsync-py-spy
 RUN set -eux; \
     python3 -m pip uninstall -y pip setuptools
 
 # Accept new host keys on first connection while still rejecting changed keys.
 RUN mkdir -p /root/.ssh && echo "StrictHostKeyChecking accept-new" > /root/.ssh/config
 
-RUN chmod 755 /scripts/entrypoint.sh
+RUN chmod 755 /scripts/entrypoint.sh \
+    && chown root:root /usr/local/sbin/seedsync-py-spy \
+    && chmod 700 /usr/local/sbin/seedsync-py-spy
 
 
 # Create non-root user and directories under that user

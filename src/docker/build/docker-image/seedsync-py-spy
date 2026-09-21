@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+# This is deliberately an operator-only surface.  It is copied into the image
+# as root:root mode 0700 and is intended to be invoked with an explicit
+# `docker exec --user root` action.
+CONFIG_FILE=/config/settings.cfg
+APP_SCRIPT=/app/python/seedsync.py
+PYSPY=/usr/local/bin/py-spy
+ARTIFACT_ROOT_PREFIX=/tmp/seedsync-py-spy.
+DEFAULT_DURATION_SECONDS=10
+DEFAULT_RATE_HZ=10
+MAX_DURATION_SECONDS=30
+MAX_RATE_HZ=20
+MAX_OUTPUT_BYTES=$((8 * 1024 * 1024))
+# Bash's ulimit -f operand is expressed in KiB on the runtime image.
+MAX_OUTPUT_KIB=$((MAX_OUTPUT_BYTES / 1024))
+MAX_STDERR_BYTES=$((64 * 1024))
+MAX_DUMP_OUTPUT_BYTES=$((1 * 1024 * 1024))
+MAX_DUMP_OUTPUT_KIB=$((MAX_DUMP_OUTPUT_BYTES / 1024))
+DUMP_TIMEOUT_SECONDS=5
+RECORD_GRACE_SECONDS=5
+RECORD_KILL_GRACE_SECONDS=1
+
+refuse() {
+    # Keep refusal text independent of config, process command lines, and
+    # operator paths.  The wrapper intentionally exposes no raw subprocess
+    # diagnostics.
+    printf '%s\n' 'ERROR: py-spy request refused' >&2
+    exit 1
+}
+
+require_root() {
+    [[ "$(id -u 2>/dev/null || printf '%s' 1)" == 0 ]] || refuse
+}
+
+enabled_by_config() {
+    local value
+    value="$(awk '
+        BEGIN { in_general = 0; found = 0 }
+        /^[[:space:]]*[#;]/ { next }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            in_general = (tolower($0) ~ /^[[:space:]]*\[[[:space:]]*general[[:space:]]*\][[:space:]]*$/)
+            next
+        }
+        in_general {
+            line = $0
+            sub(/[;#].*$/, "", line)
+            if (line ~ /^[[:space:]]*py_spy_enabled[[:space:]]*=/) {
+                sub(/^[[:space:]]*py_spy_enabled[[:space:]]*=[[:space:]]*/, "", line)
+                gsub(/[[:space:]]+$/, "", line)
+                print tolower(line)
+                found = 1
+                exit
+            }
+        }
+    ' "$CONFIG_FILE" 2>/dev/null || true)"
+    [[ "$value" == true || "$value" == 1 || "$value" == yes || "$value" == on ]]
+}
+
+app_target_pid() {
+    local proc pid uid arg
+    local -a args
+    local -a matches=()
+
+    for proc in /proc/[0-9]*; do
+        [[ -r "$proc/cmdline" ]] || continue
+        pid="${proc##*/}"
+        args=()
+        while IFS= read -r -d '' arg; do
+            args+=("$arg")
+        done < "$proc/cmdline" || true
+        (( ${#args[@]} >= 2 )) || continue
+        [[ "${args[1]}" == "$APP_SCRIPT" ]] || continue
+        case "${args[0]}" in
+            python|python3|/usr/local/bin/python|/usr/local/bin/python3|/usr/local/bin/python3.*)
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        uid="$(awk '/^Uid:/ { print $2; exit }' "$proc/status" 2>/dev/null || true)"
+        [[ "$uid" =~ ^[0-9]+$ && "$uid" != 0 ]] || continue
+        matches+=("$pid")
+    done
+
+    (( ${#matches[@]} == 1 )) || refuse
+    printf '%s\n' "${matches[0]}"
+}
+
+strip_leading_zeroes() {
+    local value="$1"
+    while [[ ${#value} -gt 1 && "${value:0:1}" == 0 ]]; do
+        value="${value:1}"
+    done
+    printf '%s\n' "$value"
+}
+
+positive_bounded_integer() {
+    local value="$1" maximum="$2" normalized
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    [[ ${#value} -le 64 ]] || return 1
+    # Strip leading zeroes before arithmetic; Bash otherwise interprets them
+    # as octal and rejects otherwise harmless decimal values such as 08.
+    normalized="$(strip_leading_zeroes "$value")"
+    [[ ${#normalized} -le ${#maximum} ]] || return 1
+    (( normalized >= 1 && normalized <= maximum ))
+}
+
+discard_profile() {
+    local run_dir="$1"
+    rm -f -- "$run_dir/profile.json" 2>/dev/null || true
+}
+
+secure_artifact_root() {
+    [[ -d /tmp && ! -L /tmp ]] || return 1
+    [[ "$(stat -c '%u:%g:%a:%F' -- /tmp 2>/dev/null || true)" == \
+        '0:0:1777:directory' ]]
+}
+
+dump_profile() {
+    local pid="$1" run_dir dump_output stderr_file stderr_pipe stderr_marker status_file
+    local capture_pid command_status timed_out stderr_size dump_size stderr_truncated state status_tmp
+    secure_artifact_root || refuse
+    run_dir="$(mktemp -d "${ARTIFACT_ROOT_PREFIX}XXXXXX" 2>/dev/null)" || refuse
+    [[ -d "$run_dir" && ! -L "$run_dir" ]] || { discard_profile "$run_dir"; refuse; }
+    [[ "$(stat -c '%u:%g:%a:%F' -- "$run_dir" 2>/dev/null || true)" == \
+        '0:0:700:directory' ]] || { discard_profile "$run_dir"; refuse; }
+    dump_output="$run_dir/dump.txt"
+    stderr_file="$run_dir/py-spy.stderr"
+    stderr_pipe="$run_dir/py-spy.stderr.pipe"
+    stderr_marker="$run_dir/py-spy.stderr.truncated"
+    status_file="$run_dir/status"
+    mkfifo -m 600 -- "$stderr_pipe" 2>/dev/null || { discard_profile "$run_dir"; refuse; }
+    printf 'state=started\nstderr_cap_bytes=%s\noutput_cap_bytes=%s\n' \
+        "$MAX_STDERR_BYTES" "$MAX_DUMP_OUTPUT_BYTES" > "$status_file" 2>/dev/null || {
+        discard_profile "$run_dir"
+        refuse
+    }
+    chmod 600 -- "$status_file" 2>/dev/null || { discard_profile "$run_dir"; refuse; }
+
+    (
+        exec 3<"$stderr_pipe"
+        dd iflag=fullblock bs="$MAX_STDERR_BYTES" count=1 status=none \
+            <&3 > "$stderr_file" 2>/dev/null
+        dd bs=1 count=1 status=none <&3 > "$stderr_marker" 2>/dev/null || true
+        if [[ -s "$stderr_marker" ]]; then
+            cat <&3 > /dev/null 2>/dev/null
+        fi
+        exec 3<&-
+    ) 2>/dev/null &
+    capture_pid=$!
+
+    # Capture dump stdout before returning it so the console cannot receive an
+    # unbounded stream.  The timeout owns only the spawned py-spy process.
+    set +e
+    timeout --foreground --preserve-status \
+        --signal=TERM --kill-after="${RECORD_KILL_GRACE_SECONDS}s" \
+        "${DUMP_TIMEOUT_SECONDS}s" \
+        bash -c 'ulimit -f "$1" || exit 1; shift; exec "$@"' \
+        bash "$MAX_DUMP_OUTPUT_KIB" \
+        "$PYSPY" dump --pid "$pid" --nonblocking \
+        > "$dump_output" 2> "$stderr_pipe"
+    command_status=$?
+    set -e
+    wait "$capture_pid" 2>/dev/null || true
+    rm -f -- "$stderr_pipe" 2>/dev/null || refuse
+    stderr_size="$(stat -c '%s' -- "$stderr_file" 2>/dev/null || true)"
+    dump_size="$(stat -c '%s' -- "$dump_output" 2>/dev/null || true)"
+    if ! [[ "$stderr_size" =~ ^[0-9]+$ && "$dump_size" =~ ^[0-9]+$ ]]; then
+        refuse
+    fi
+    if [[ -s "$stderr_marker" ]]; then
+        stderr_truncated=1
+    else
+        stderr_truncated=0
+    fi
+    chmod 600 -- "$stderr_file" "$dump_output" 2>/dev/null || refuse
+    rm -f -- "$stderr_marker" 2>/dev/null || refuse
+
+    timed_out=0
+    case "$command_status" in
+        124|137|143) timed_out=1 ;;
+    esac
+    if (( timed_out )); then
+        state=timeout
+    elif (( command_status != 0 )); then
+        state=failed
+    elif (( dump_size > MAX_DUMP_OUTPUT_BYTES )); then
+        state=invalid_output
+    else
+        state=completed
+    fi
+    status_tmp="$status_file.tmp"
+    printf 'state=%s\nexit_code=%s\ntimeout=%s\nstderr_bytes=%s\nstderr_truncated=%s\noutput_bytes=%s\noutput_cap_bytes=%s\n' \
+        "$state" "$command_status" "$timed_out" "$stderr_size" "$stderr_truncated" \
+        "$dump_size" "$MAX_DUMP_OUTPUT_BYTES" > "$status_tmp" 2>/dev/null || refuse
+    chmod 600 -- "$status_tmp" 2>/dev/null || refuse
+    mv -f -- "$status_tmp" "$status_file" 2>/dev/null || refuse
+    [[ "$state" == completed ]] || refuse
+    cat -- "$dump_output" || refuse
+}
+
+record_profile() {
+    local pid="$1" duration="$2" rate="$3" run_dir artifact stderr_file stderr_pipe
+    local stderr_marker status_file capture_pid
+    local size stderr_size timeout_seconds command_status timed_out artifact_stat
+    local stderr_truncated state status_tmp
+    # mktemp atomically creates a unique, root-owned 0700 directory directly
+    # under sticky /tmp.  No pre-existing fixed artifact root is followed.
+    secure_artifact_root || refuse
+    run_dir="$(mktemp -d "${ARTIFACT_ROOT_PREFIX}XXXXXX" 2>/dev/null)" || refuse
+    [[ -d "$run_dir" && ! -L "$run_dir" ]] || { discard_profile "$run_dir"; refuse; }
+    [[ "$(stat -c '%u:%g:%a:%F' -- "$run_dir" 2>/dev/null || true)" == \
+        '0:0:700:directory' ]] || { discard_profile "$run_dir"; refuse; }
+    artifact="$run_dir/profile.json"
+    stderr_file="$run_dir/py-spy.stderr"
+    stderr_pipe="$run_dir/py-spy.stderr.pipe"
+    stderr_marker="$run_dir/py-spy.stderr.truncated"
+    status_file="$run_dir/status"
+    mkfifo -m 600 -- "$stderr_pipe" 2>/dev/null || { discard_profile "$run_dir"; refuse; }
+    printf 'state=started\nstderr_cap_bytes=%s\noutput_cap_bytes=%s\n' \
+        "$MAX_STDERR_BYTES" "$MAX_OUTPUT_BYTES" > "$status_file" 2>/dev/null || {
+        discard_profile "$run_dir"
+        refuse
+    }
+    chmod 600 -- "$status_file" 2>/dev/null || { discard_profile "$run_dir"; refuse; }
+    timeout_seconds=$((duration + RECORD_GRACE_SECONDS))
+
+    # Drain the profiler's private stderr through one bounded sidecar.  The
+    # remainder is discarded so a noisy child cannot grow an unbounded file or
+    # block on a full pipe.  No profiler diagnostic reaches the console.
+    (
+        exec 3<"$stderr_pipe"
+        dd iflag=fullblock bs="$MAX_STDERR_BYTES" count=1 status=none \
+            <&3 > "$stderr_file" 2>/dev/null
+        dd bs=1 count=1 status=none <&3 > "$stderr_marker" 2>/dev/null || true
+        if [[ -s "$stderr_marker" ]]; then
+            cat <&3 > /dev/null 2>/dev/null
+        fi
+        exec 3<&-
+    ) 2>/dev/null &
+    capture_pid=$!
+
+    # Bound the owned py-spy child, not the application target.  The shell
+    # child applies the output file limit before replacing itself with py-spy.
+    set +e
+    timeout --foreground --preserve-status \
+        --signal=TERM --kill-after="${RECORD_KILL_GRACE_SECONDS}s" \
+        "${timeout_seconds}s" \
+        bash -c 'ulimit -f "$1" || exit 1; shift; exec "$@"' \
+        bash "$MAX_OUTPUT_KIB" \
+        "$PYSPY" record --pid "$pid" --duration "$duration" --rate "$rate" \
+        --format speedscope --output "$artifact" --nonblocking --idle \
+        > /dev/null 2> "$stderr_pipe"
+    command_status=$?
+    set -e
+    wait "$capture_pid" 2>/dev/null || true
+    rm -f -- "$stderr_pipe" 2>/dev/null || refuse
+    stderr_size="$(stat -c '%s' -- "$stderr_file" 2>/dev/null || true)"
+    if ! [[ "$stderr_size" =~ ^[0-9]+$ ]]; then
+        refuse
+    fi
+    if [[ -s "$stderr_marker" ]]; then
+        stderr_truncated=1
+    else
+        stderr_truncated=0
+    fi
+    chmod 600 -- "$stderr_file" 2>/dev/null || refuse
+    rm -f -- "$stderr_marker" 2>/dev/null || refuse
+
+    timed_out=0
+    case "$command_status" in
+        124|137|143) timed_out=1 ;;
+    esac
+    if (( timed_out )); then
+        state=timeout
+    elif (( command_status != 0 )); then
+        state=failed
+    else
+        state=completed
+    fi
+
+    if [[ "$state" == completed ]]; then
+        if [[ ! -f "$artifact" || -L "$artifact" ]]; then
+            state=invalid_output
+        else
+            chmod 600 -- "$artifact" 2>/dev/null || state=invalid_output
+            artifact_stat="$(stat -c '%u:%g:%a:%F' -- "$artifact" 2>/dev/null || true)"
+            [[ "$artifact_stat" == '0:0:600:regular file' ]] || state=invalid_output
+            size="$(stat -c '%s' -- "$artifact" 2>/dev/null || true)"
+            if ! [[ "$size" =~ ^[0-9]+$ ]] || (( size > MAX_OUTPUT_BYTES )); then
+                state=invalid_output
+            fi
+        fi
+    fi
+
+    status_tmp="$status_file.tmp"
+    printf 'state=%s\nexit_code=%s\ntimeout=%s\nstderr_bytes=%s\nstderr_truncated=%s\noutput_cap_bytes=%s\n' \
+        "$state" "$command_status" "$timed_out" "$stderr_size" "$stderr_truncated" \
+        "$MAX_OUTPUT_BYTES" > "$status_tmp" 2>/dev/null || refuse
+    chmod 600 -- "$status_tmp" 2>/dev/null || refuse
+    mv -f -- "$status_tmp" "$status_file" 2>/dev/null || refuse
+    if [[ "$state" != completed ]]; then
+        discard_profile "$run_dir"
+        refuse
+    fi
+    printf '%s\n' "$artifact"
+}
+
+require_root
+enabled_by_config || refuse
+[[ -x "$PYSPY" ]] || refuse
+command -v timeout >/dev/null 2>&1 || refuse
+
+[[ $# -ge 1 && $# -le 3 ]] || refuse
+mode="$1"
+shift
+
+case "$mode" in
+    dump)
+        [[ $# -eq 0 ]] || refuse
+        pid="$(app_target_pid)"
+        dump_profile "$pid"
+        ;;
+    record)
+        [[ $# -le 2 ]] || refuse
+        duration="${1:-$DEFAULT_DURATION_SECONDS}"
+        rate="${2:-$DEFAULT_RATE_HZ}"
+        positive_bounded_integer "$duration" "$MAX_DURATION_SECONDS" || refuse
+        positive_bounded_integer "$rate" "$MAX_RATE_HZ" || refuse
+        pid="$(app_target_pid)"
+        duration="$(strip_leading_zeroes "$duration")"
+        rate="$(strip_leading_zeroes "$rate")"
+        record_profile "$pid" "$duration" "$rate"
+        ;;
+    *)
+        refuse
+        ;;
+esac

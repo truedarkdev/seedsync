@@ -620,6 +620,7 @@ class Config(Persist):
         performance_diagnostics_sample_interval_seconds = PROP(
             "performance_diagnostics_sample_interval_seconds", Checkers.int_range(1, 3600), Converters.int
         )
+        py_spy_enabled = PROP("py_spy_enabled", Checkers.bool_value, Converters.bool)
         config_api_redact_remote_details = PROP("config_api_redact_remote_details",
                                                 Checkers.bool_value,
                                                 Converters.bool)
@@ -640,6 +641,7 @@ class Config(Persist):
             self.performance_diagnostics_enabled = False
             self.performance_diagnostics_retention_depth = 120
             self.performance_diagnostics_sample_interval_seconds = 5
+            self.py_spy_enabled = False
             self.config_api_redact_remote_details = True
 
         @classmethod
@@ -713,6 +715,9 @@ class Config(Persist):
             if "performance_diagnostics_sample_interval_seconds" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["performance_diagnostics_sample_interval_seconds"] = 5
+            if "py_spy_enabled" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["py_spy_enabled"] = False
             if "config_api_redact_remote_details" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["config_api_redact_remote_details"] = True
