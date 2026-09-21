@@ -13115,7 +13115,10 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotIn("sample-movie.mkv", str(entries))
         self.assertNotIn("path-pair-a", str(entries))
         self.assertNotIn("Path Pair A", str(entries))
-        self.assertTrue(all(entry["corr_id"].startswith("completion:") for entry in entries))
+        expected_correlation = "completion:{}".format(
+            opaque_trace_correlation(ModelFile.build_file_id(*active_entry[:2]))
+        )
+        self.assertTrue(all(entry["corr_id"] == expected_correlation for entry in entries))
 
     def test_lftp_completion_retirement_breadcrumb_records_unhealthy_and_inflight_blocks(self):
         for source, fresh in (("unhealthy_empty", True), ("inflight_empty", False)):

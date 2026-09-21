@@ -205,6 +205,17 @@ class TestControllerHandler(BaseTestWebApp):
             self.assertFalse(success_thread.is_alive())
             self.assertEqual(200, responses["success"].status_code)
             self.assertEqual(1, controller._Controller__lftp.queue.call_count)
+            success_command = next(
+                command for command in issued_commands if command.filename == success_file.file_id
+            )
+            self.assertEqual(
+                success_command.completion_trace_correlation,
+                responses["success"].headers["X-SeedSync-Completion-Correlation"],
+            )
+            self.assertRegex(
+                responses["success"].headers["X-SeedSync-Completion-Correlation"],
+                r"^completion:[0-9a-f]{16}$",
+            )
 
             expiry_file = files['["pair-a","authority-expiry"]']
             reset_authority()
@@ -229,6 +240,7 @@ class TestControllerHandler(BaseTestWebApp):
 
             self.assertFalse(expiry_thread.is_alive())
             self.assertEqual(409, expiry_responses["expiry"].status_code)
+            self.assertNotIn("X-SeedSync-Completion-Correlation", expiry_responses["expiry"].headers)
             self.assertNotIn(expiry_file.file_id, controller._Controller__deferred_queue_intents)
             expiry_callback.on_failure.assert_called_once_with(
                 "Queue preflight cancelled: initial_scan_authority_deadline", 409,
@@ -263,6 +275,7 @@ class TestControllerHandler(BaseTestWebApp):
             self.assertEqual(200, summary_response.status_code)
             self.assertEqual({"model_version": 1}, summary_response.json)
             self.assertEqual(504, pending_responses["pending"].status_code)
+            self.assertNotIn("X-SeedSync-Completion-Correlation", pending_responses["pending"].headers)
             self.assertIn(pending_file.file_id, controller._Controller__deferred_queue_intents)
 
     def test_full_scan_requires_admin_authentication(self):
@@ -1347,30 +1360,48 @@ class TestControllerHandler(BaseTestWebApp):
 
     def test_queue_wait_trace_forwards_completed_outcomes(self):
         success_flow = "fractional-queue:0123456789abcdef"
+        success_completion = "completion:0123456789abcdef"
 
         def succeed(command: Controller.Command):
             command.queue_trace_flow_id = success_flow
+            command.completion_trace_correlation = success_completion
             command.callbacks[0].queue_trace_flow_id = success_flow
+            command.callbacks[0].completion_trace_correlation = success_completion
             command.callbacks[0].on_success()
 
         self.controller.queue_command = MagicMock(side_effect=succeed)
-        self.assertEqual(200, self.test_app.post("/server/command/queue/test1").status_code)
+        success_response = self.test_app.post("/server/command/queue/test1")
+        self.assertEqual(200, success_response.status_code)
+        self.assertEqual("Queued file 'test1'", success_response.text)
+        self.assertEqual(success_flow, success_response.headers["X-SeedSync-Queue-Trace-Flow"])
+        self.assertEqual(
+            success_completion,
+            success_response.headers["X-SeedSync-Completion-Correlation"],
+        )
         self.controller.record_queue_http_wait_trace.assert_called_once_with(
             "test1", True, True, flow_id=success_flow,
         )
 
         failure_flow = "fractional-queue:fedcba9876543210"
+        failure_completion = "completion:fedcba9876543210"
 
         def fail(command: Controller.Command):
             command.queue_trace_flow_id = failure_flow
+            command.completion_trace_correlation = failure_completion
             command.callbacks[0].queue_trace_flow_id = failure_flow
+            command.callbacks[0].completion_trace_correlation = failure_completion
             command.callbacks[0].on_failure("missing", 404)
 
         self.controller.record_queue_http_wait_trace.reset_mock()
         self.controller.queue_command = MagicMock(side_effect=fail)
+        failure_response = self.test_app.post(
+            "/server/command/queue/test2", expect_errors=True,
+        )
+        self.assertEqual("missing", failure_response.text)
+        self.assertEqual(failure_flow, failure_response.headers["X-SeedSync-Queue-Trace-Flow"])
         self.assertEqual(
-            404,
-            self.test_app.post("/server/command/queue/test2", expect_errors=True).status_code,
+            failure_completion,
+            failure_response.headers["X-SeedSync-Completion-Correlation"],
         )
         self.controller.record_queue_http_wait_trace.assert_called_once_with(
             "test2", True, False, flow_id=failure_flow,
@@ -1391,6 +1422,48 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual("test1", command.filename)
         self.controller.record_queue_http_wait_trace.assert_called_once_with(
             "test1", False, None, flow_id=None,
+        )
+
+    def test_queue_response_omits_unavailable_or_injected_trace_headers(self):
+        def invalid(command: Controller.Command):
+            command.queue_trace_flow_id = "fractional-queue:0123456789abcdef\r\nX-Leak: yes"
+            command.completion_trace_correlation = "completion:not-a-digest"
+            command.callbacks[0].queue_trace_flow_id = command.queue_trace_flow_id
+            command.callbacks[0].completion_trace_correlation = command.completion_trace_correlation
+            command.callbacks[0].on_failure("rejected", 409)
+
+        self.controller.queue_command = MagicMock(side_effect=invalid)
+        response = self.test_app.post(
+            "/server/command/queue/test1", expect_errors=True,
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("rejected", response.text)
+        self.assertNotIn("X-SeedSync-Queue-Trace-Flow", response.headers)
+        self.assertNotIn("X-SeedSync-Completion-Correlation", response.headers)
+
+    def test_queue_timeout_after_admission_preserves_opaque_trace_headers(self):
+        def admitted(command: Controller.Command):
+            command.queue_trace_flow_id = "fractional-queue:0123456789abcdef"
+            command.completion_trace_correlation = "completion:fedcba9876543210"
+            command.callbacks[0].queue_trace_flow_id = command.queue_trace_flow_id
+            command.callbacks[0].completion_trace_correlation = command.completion_trace_correlation
+
+        self.controller.queue_command = MagicMock(side_effect=admitted)
+        with patch.object(ControllerHandler, "_QUEUE_ACTION_TIMEOUT", 0.01):
+            response = self.test_app.post(
+                "/server/command/queue/test1", expect_errors=True,
+            )
+
+        self.assertEqual(504, response.status_code)
+        self.assertEqual("Operation timed out", response.text)
+        self.assertEqual(
+            "fractional-queue:0123456789abcdef",
+            response.headers["X-SeedSync-Queue-Trace-Flow"],
+        )
+        self.assertEqual(
+            "completion:fedcba9876543210",
+            response.headers["X-SeedSync-Completion-Correlation"],
         )
 
     def test_queue_controller_failure_is_distinct_from_http_timeout(self):

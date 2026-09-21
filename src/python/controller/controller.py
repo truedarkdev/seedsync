@@ -936,6 +936,10 @@ class Controller:
             # still join the same opaque flow after pending dispatch state is
             # retired; it never participates in Queue decisions.
             self.queue_trace_flow_id: Optional[str] = None
+            # Diagnostic-only completion correlation for the admitted Queue
+            # operation.  This uses the same process-local opaque file identity
+            # as ModelUpdater's completion emitter and is never persisted.
+            self.completion_trace_correlation: Optional[str] = None
             self.origin = origin
             self.callbacks: List[Controller.Command.ICallback] = []
             self.duplicate_waiter_count = 0
@@ -10970,14 +10974,33 @@ class Controller:
                         queue_trace_flow_id = _fractional_queue_flow_id(
                             self, file.file_id, operation_sequence,
                         )
+                        completion_trace_correlation: Optional[str] = None
+                        try:
+                            completion_trace_correlation = "completion:{}".format(
+                                opaque_trace_correlation(file.file_id)
+                            )
+                        except Exception:
+                            # Diagnostic transport must never alter Queue
+                            # admission or dispatch for an unusual identity.
+                            self.logger.debug(
+                                "Ignoring Queue completion correlation failure",
+                                exc_info=True,
+                            )
                         # Keep the existing operation flow available to the
                         # caller boundary even when a failed/cancelled Queue
                         # dispatch removes its pending registry entry before
                         # callbacks are delivered.
                         command.queue_trace_flow_id = queue_trace_flow_id
+                        command.completion_trace_correlation = completion_trace_correlation
                         for callback in command.callbacks:
                             try:
                                 setattr(callback, "queue_trace_flow_id", queue_trace_flow_id)
+                            except Exception:
+                                # Diagnostic transport must not reject Queue
+                                # admission for callbacks with fixed slots.
+                                pass
+                            try:
+                                setattr(callback, "completion_trace_correlation", completion_trace_correlation)
                             except Exception:
                                 # Diagnostic transport must not reject Queue
                                 # admission for callbacks with fixed slots.

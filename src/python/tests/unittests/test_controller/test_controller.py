@@ -7610,6 +7610,12 @@ class TestController(unittest.TestCase):
         admitted_flow = command.queue_trace_flow_id
         self.assertRegex(admitted_flow, r"^fractional-queue:[0-9a-f]{16}$")
         self.assertEqual(admitted_flow, command.callbacks[0].queue_trace_flow_id)
+        admitted_completion = command.completion_trace_correlation
+        self.assertEqual(
+            "completion:{}".format(opaque_trace_correlation(file.file_id)),
+            admitted_completion,
+        )
+        self.assertEqual(admitted_completion, command.callbacks[0].completion_trace_correlation)
 
         operation = self.controller._Controller__lftp_operations[0]
         operation.future.result(timeout=1)
@@ -7630,6 +7636,65 @@ class TestController(unittest.TestCase):
         self.assertEqual(admitted_flow, lifecycle["flow_id"])
         self.assertEqual(lifecycle["flow_id"], callback["flow_id"])
         self.assertEqual(lifecycle["flow_id"], http_wait["flow_id"])
+
+    def test_admitted_queue_operations_have_distinct_completion_correlations(self):
+        files = {
+            "concurrent-one": ModelFile("concurrent-one", False),
+            "concurrent-two": ModelFile("concurrent-two", False),
+        }
+        for file in files.values():
+            file.remote_size = 10
+        self.controller._Controller__model.get_file.side_effect = files.__getitem__
+        self.controller._Controller__context.breadcrumb_trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "debug"}, max_entries=32,
+        )
+        self.controller._Controller__lftp.backend_name = "lftp"
+        commands = []
+        for file_id in files:
+            command = Controller.Command(Controller.Command.Action.QUEUE, file_id)
+            command.add_callback(MagicMock())
+            commands.append(command)
+            self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        completion_correlations = {
+            command.completion_trace_correlation for command in commands
+        }
+        queue_flows = {command.queue_trace_flow_id for command in commands}
+        self.assertEqual(2, len(completion_correlations))
+        self.assertEqual(2, len(queue_flows))
+        for command in commands:
+            self.assertEqual(
+                command.completion_trace_correlation,
+                command.callbacks[0].completion_trace_correlation,
+            )
+
+    def test_admitted_completion_correlation_does_not_enable_disabled_diagnostics(self):
+        file = ModelFile("completion-disabled", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off"}, max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__lftp.backend_name = "lftp"
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        self.assertEqual([], trace.snapshot()["entries"])
+        self.assertEqual(
+            "completion:{}".format(opaque_trace_correlation(file.file_id)),
+            command.completion_trace_correlation,
+        )
+        self.assertEqual(
+            command.completion_trace_correlation,
+            callback.completion_trace_correlation,
+        )
 
     def test_queue_lifecycle_reset_trace_clears_final_move_marker(self):
         file = ModelFile("private-reset-target", False)

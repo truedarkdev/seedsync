@@ -38,6 +38,7 @@ class WebResponseActionCallback(Controller.Command.ICallback):
         # Transient diagnostic transport from the admitted Queue command;
         # never derive this from the request file identity or retained state.
         self.queue_trace_flow_id: str | None = None
+        self.completion_trace_correlation: str | None = None
 
     @overrides(Controller.Command.ICallback)
     def on_failure(self, error: str, error_code: int = 400) -> None:
@@ -189,6 +190,32 @@ class ControllerHandler(IHandler):
         self.__controller.queue_command(command)
         return callback, callback.wait(timeout=timeout)
 
+    @staticmethod
+    def __queue_trace_headers(callback: WebResponseActionCallback) -> dict[str, str]:
+        """Return only validated opaque Queue diagnostics for an authenticated response."""
+        headers: dict[str, str] = {}
+        for header_name, value, prefix in (
+            (
+                "X-SeedSync-Queue-Trace-Flow",
+                getattr(callback, "queue_trace_flow_id", None),
+                "fractional-queue:",
+            ),
+            (
+                "X-SeedSync-Completion-Correlation",
+                getattr(callback, "completion_trace_correlation", None),
+                "completion:",
+            ),
+        ):
+            if type(value) is not str or not value.startswith(prefix):
+                continue
+            opaque_value = value[len(prefix):]
+            if len(opaque_value) != 16 or any(
+                    character not in "0123456789abcdef" for character in opaque_value
+            ):
+                continue
+            headers[header_name] = value
+        return headers
+
     def __resolve_command_identifier(
         self,
         file_name: str,
@@ -276,12 +303,13 @@ class ControllerHandler(IHandler):
             file_identifier, completed, callback.success,
             flow_id=callback.queue_trace_flow_id,
         )
+        headers = self.__queue_trace_headers(callback)
         if not completed:
-            return HTTPResponse(body="Operation timed out", status=504)
+            return HTTPResponse(body="Operation timed out", status=504, headers=headers)
         if callback.success:
-            return HTTPResponse(body="Queued file '{}'".format(file_name))
+            return HTTPResponse(body="Queued file '{}'".format(file_name), headers=headers)
         else:
-            return HTTPResponse(body=callback.error, status=callback.error_code)
+            return HTTPResponse(body=callback.error, status=callback.error_code, headers=headers)
 
     def __handle_action_stop(self, file_name: str) -> HTTPResponse:
         """
