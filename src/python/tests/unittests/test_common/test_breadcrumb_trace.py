@@ -1,5 +1,6 @@
 # Copyright 2026, SeedSync Contributors, All rights reserved.
 
+from collections import deque
 import queue
 import unittest
 from unittest.mock import patch
@@ -386,6 +387,114 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual(5, snapshot["version"])
         self.assertEqual("<redacted>", entry["details"]["command"])
         self.assertEqual("<redacted>", entry["details"]["api_token"])
+
+    def test_admission_skips_retention_scans_without_eviction(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        range_check = "_BreadcrumbTraceCollector__entry_range_is_retained"
+        refresh_failure = "_BreadcrumbTraceCollector__refresh_failure_locked"
+        with patch.object(collector, range_check, wraps=getattr(collector, range_check)) as range_method:
+            with patch.object(
+                    collector, refresh_failure, wraps=getattr(collector, refresh_failure),
+            ) as refresh_method:
+                for index in range(8):
+                    self.assertEqual("retained", collector.record("worker", "event-{}".format(index)))
+        self.assertEqual(0, range_method.call_count)
+        self.assertEqual(0, refresh_method.call_count)
+        self.assertEqual(8, collector.snapshot()["retained_count"])
+
+    def test_ordinary_admission_does_not_iterate_retained_entries(self):
+        class CountingDeque(deque):
+            yielded = 0
+
+            def __iter__(self):
+                for entry in super().__iter__():
+                    type(self).yielded += 1
+                    yield entry
+
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=10000)
+        collector._BreadcrumbTraceCollector__entries = CountingDeque()
+
+        for index in range(10000):
+            self.assertEqual("retained", collector.record("worker", "event-{}".format(index)))
+
+        self.assertEqual(0, CountingDeque.yielded)
+        self.assertEqual(10000, len(collector._BreadcrumbTraceCollector__entries))
+        self.assertEqual(10000, collector._BreadcrumbTraceCollector__version)
+        self.assertEqual(0, collector._BreadcrumbTraceCollector__evicted_count)
+
+    def test_coalesced_failure_keeps_latest_failure_in_entry_order(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+
+        collector.record(
+            "worker", "failure-a", event_type="failure", level="error",
+            category="failure.a", _coalesce_key="a",
+        )
+        collector.record(
+            "worker", "failure-b", event_type="failure", level="error",
+            category="failure.b", _coalesce_key="b",
+        )
+        collector.record(
+            "worker", "failure-a", event_type="failure", level="error",
+            category="failure.a", _coalesce_key="a",
+        )
+
+        payload = collector.snapshot()
+        self.assertEqual("failure-b", payload["latest_failure_entry"]["message"])
+        self.assertEqual(2, payload["latest_failure_version"])
+        self.assertEqual(2, len(payload["entries"]))
+        self.assertEqual(3, payload["entries"][0]["last_seen_version"])
+        self.assertEqual(2, payload["entries"][1]["last_seen_version"])
+
+    def test_coalesced_non_failure_refreshes_failure_projection(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+
+        collector.record(
+            "worker", "failure", event_type="failure", level="error",
+            category="failure", _coalesce_key="same-entry",
+        )
+        collector.record(
+            "worker", "failure", event_type="diagnostic", level="error",
+            category="failure", _coalesce_key="same-entry",
+        )
+
+        payload = collector.snapshot()
+        self.assertEqual("failure", payload["latest_failure_entry"]["message"])
+        self.assertEqual(2, payload["latest_failure_entry"]["last_seen_version"])
+        self.assertEqual(2, payload["latest_failure_version"])
+
+    def test_eviction_refreshes_latest_failure_by_entry_order(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=3)
+
+        collector.record(
+            "worker", "failure-a", event_type="failure", level="error",
+            category="failure.a", _coalesce_key="a",
+        )
+        collector.record(
+            "worker", "failure-b", event_type="failure", level="error",
+            category="failure.b", _coalesce_key="b",
+        )
+        collector.record(
+            "worker", "failure-a", event_type="failure", level="error",
+            category="failure.a", _coalesce_key="a",
+        )
+        collector.record("worker", "noise-1", category="noise")
+        collector.record("worker", "noise-2", category="noise")
+
+        payload = collector.snapshot()
+        self.assertEqual("failure-b", payload["latest_failure_entry"]["message"])
+        self.assertEqual(2, payload["latest_failure_version"])
+        self.assertEqual(1, payload["accounting"]["evicted_count"])
+        self.assertEqual(3, payload["entries"][0]["last_seen_version"])
+
+    def test_admission_preserves_stale_signature_without_coalesce_key(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+        collector.record("worker", "event", _coalesce_key="semantic-key")
+
+        entries = collector.snapshot()["entries"]
+        expected = collector._BreadcrumbTraceCollector__signature(entries[-1])
+        actual = collector._BreadcrumbTraceCollector__last_signature
+        self.assertEqual(expected, actual)
+        self.assertNotEqual("coalesce:semantic-key", actual)
 
     def test_snapshot_preserves_retained_entries_after_disable(self):
         enabled = {"value": True}

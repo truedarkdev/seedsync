@@ -5092,14 +5092,21 @@ class BreadcrumbTraceCollector:
             self.__category_counter(entry)["admitted"] += 1
             signature = self.__signature(entry, coalesce_key)
             coalesced_entry = self.__coalesce_entries.get(signature) if coalesce_key is not None else None
-            coalesced_index = next(
-                (index for index, candidate in enumerate(self.__entries) if candidate is coalesced_entry),
-                None,
-            )
+            coalesced_index = None
+            if coalesced_entry is not None:
+                coalesced_index = next(
+                    (index for index, candidate in enumerate(self.__entries) if candidate is coalesced_entry),
+                    None,
+                )
             if self.__entries and (signature == self.__last_signature or coalesced_index is not None):
                 if coalesced_index is None:
                     coalesced_index = len(self.__entries) - 1
                 last_entry = self.__entries[coalesced_index]
+                # Coalescing can raise an earlier entry's last-seen version;
+                # failure projection therefore remains ordered by entry position.
+                refresh_failure = (
+                    event_type == "failure" or last_entry.get("event_type") == "failure"
+                )
                 last_entry["repeat_count"] = last_entry.get("repeat_count", 1) + 1
                 last_entry["last_seen_ms"] = created_ms
                 last_entry["last_seen_ns"] = created_ns
@@ -5115,8 +5122,10 @@ class BreadcrumbTraceCollector:
                     self.__last_failure_entry = copy.deepcopy(last_entry)
                     self.__last_failure_version = self.__version
                 self.__enqueue_durable_entry(last_entry)
-                self.__evict_to_budget()
-                if self.__entry_range_is_retained(self.__version):
+                evicted = self.__evict_to_budget()
+                if refresh_failure and not evicted:
+                    self.__refresh_failure_locked()
+                if not evicted or self.__entry_range_is_retained(self.__version):
                     return "retained"
                 return "evicted" if root_progress_observation else "dropped"
 
@@ -5143,8 +5152,8 @@ class BreadcrumbTraceCollector:
                 self.__last_failure_entry = copy.deepcopy(entry)
                 self.__last_failure_version = self.__version
             self.__enqueue_durable_entry(entry)
-            self.__evict_to_budget()
-            if self.__entry_range_is_retained(self.__version):
+            evicted = self.__evict_to_budget()
+            if not evicted or self.__entry_range_is_retained(self.__version):
                 return "retained"
             return "evicted" if root_progress_observation else "dropped"
 
@@ -5215,7 +5224,8 @@ class BreadcrumbTraceCollector:
             self.__gap_watermark_to = max(self.__gap_watermark_to, int(removed["to_version"]))
         self.__lost_ranges.append({"from_version": start, "to_version": end, "reason": reason})
 
-    def __evict_to_budget(self) -> None:
+    def __evict_to_budget(self) -> bool:
+        evicted_any = False
         while self.__entries and (
             self.__retained_bytes > self.__memory_budget_bytes
             or self.__max_entries is not None and len(self.__entries) > self.__max_entries
@@ -5248,9 +5258,12 @@ class BreadcrumbTraceCollector:
                 "evicted",
             )
             self.__window_truncated_pending = True
+            evicted_any = True
         self.__retained_bytes = max(0, self.__retained_bytes)
         self.__last_signature = self.__signature(self.__entries[-1]) if self.__entries else None
-        self.__refresh_failure_locked()
+        if evicted_any:
+            self.__refresh_failure_locked()
+        return evicted_any
 
     def __refresh_failure_locked(self) -> None:
         latest: Optional[Dict[str, Any]] = None
