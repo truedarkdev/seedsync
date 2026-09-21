@@ -502,7 +502,20 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
             ):
                 entries = getattr(collector, entries_name)
                 sizes = getattr(collector, sizes_name)
-                protected = collector._BreadcrumbTraceCollector__protected_indices()
+                retention = collector._BreadcrumbTraceCollector__policy["retention"]
+                latest_decision = {}
+                for index, entry in enumerate(entries):
+                    if entry.get("event_type") in retention["latest_decision_event_types"]:
+                        latest_decision[str(entry.get("category") or "unknown")] = index
+                protected = set(latest_decision.values())
+                for index, entry in enumerate(entries):
+                    if (
+                        entry.get("level") in retention["protected_levels"]
+                        or collector._BreadcrumbTraceCollector__is_category_protected(
+                            str(entry.get("category") or ""),
+                        )
+                    ):
+                        protected.add(index)
                 candidate_indices = [index for index in range(len(entries)) if index not in protected]
                 if not candidate_indices:
                     fallback_count += 1
@@ -603,6 +616,69 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual(8, mixed_evictions)
         all_fallbacks, all_evictions = compare_stream(all_protected_stream, max_entries=1)
         self.assertEqual(all_evictions, all_fallbacks)
+
+    def test_protected_indices_snapshot_matches_oracle_and_recomputes_after_policy_replace(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=None,
+            policy={
+                "retention": {
+                    "protected_categories": ["protected.*"],
+                    "latest_decision_event_types": ["decision"],
+                },
+            },
+        )
+        entries = (
+            {"category": None, "event_type": "decision", "level": "info"},
+            {"category": "", "event_type": "decision", "level": "info"},
+            {"category": "protected.audit", "event_type": "breadcrumb", "level": "info"},
+            {"category": "wild.child", "event_type": "breadcrumb", "level": "info"},
+            {"category": "warning.only", "event_type": "breadcrumb", "level": "warning"},
+            {"category": "error.only", "event_type": "breadcrumb", "level": "error"},
+        )
+
+        classifier = "_BreadcrumbTraceCollector__is_category_protected"
+        original_classifier = getattr(collector, classifier)
+
+        def pre_change_protected(entries):
+            retention = collector._BreadcrumbTraceCollector__policy["retention"]
+            latest_decision = {}
+            for index, entry in enumerate(entries):
+                if entry.get("event_type") in retention["latest_decision_event_types"]:
+                    latest_decision[str(entry.get("category") or "unknown")] = index
+            protected = set(latest_decision.values())
+            for index, entry in enumerate(entries):
+                if (
+                    entry.get("level") in retention["protected_levels"]
+                    or original_classifier(str(entry.get("category") or ""))
+                ):
+                    protected.add(index)
+            return protected
+
+        with patch.object(collector, classifier, wraps=getattr(collector, classifier)) as protected_match:
+            first = collector._BreadcrumbTraceCollector__protected_indices(entries)
+            self.assertEqual(pre_change_protected(entries), first)
+            self.assertEqual({1, 2, 4, 5}, first)
+            self.assertEqual(["", "protected.audit", "wild.child"], [
+                call.args[0] for call in protected_match.call_args_list
+            ])
+            self.assertEqual(3, protected_match.call_count)
+
+            collector.apply_policy({
+                "retention": {
+                    "protected_categories": ["wild.*"],
+                    "latest_decision_event_types": ["decision"],
+                },
+            })
+            protected_match.reset_mock()
+            second = collector._BreadcrumbTraceCollector__protected_indices(entries)
+
+        self.assertEqual(pre_change_protected(entries), second)
+        self.assertEqual({1, 3, 4, 5}, second)
+        self.assertEqual(["", "protected.audit", "wild.child"], [
+            call.args[0] for call in protected_match.call_args_list
+        ])
+        self.assertEqual(3, protected_match.call_count)
 
     def test_coalesced_failure_keeps_latest_failure_in_entry_order(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)

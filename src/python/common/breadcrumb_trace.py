@@ -4413,16 +4413,33 @@ class BreadcrumbTraceCollector:
         return any(self.__category_match_score(pattern, category, category.split(".")) >= 0
                    for pattern in self.__policy["retention"]["protected_categories"])
 
-    def __protected_indices(self) -> set[int]:
+    def __protected_indices(
+        self,
+        entries: Optional[Iterable[Mapping[str, Any]]] = None,
+    ) -> set[int]:
+        """Return protected entry indices for one lock-held retention pass.
+
+        ``entries`` may be the immutable tuple snapshot already made by the
+        eviction caller.  Keeping the optional default preserves compatibility
+        for callers that inspect the collector's live entries directly.
+        """
         retention = self.__policy["retention"]
+        entries_to_scan = self.__entries if entries is None else entries
         latest_decision: Dict[str, int] = {}
-        for index, entry in enumerate(self.__entries):
+        protected = set()
+        protected_category_cache: Dict[str, bool] = {}
+        for index, entry in enumerate(entries_to_scan):
             if entry.get("event_type") in retention["latest_decision_event_types"]:
                 latest_decision[str(entry.get("category") or "unknown")] = index
-        protected = set(latest_decision.values())
-        for index, entry in enumerate(self.__entries):
-            if entry.get("level") in retention["protected_levels"] or self.__is_category_protected(str(entry.get("category") or "")):
+            if entry.get("level") in retention["protected_levels"]:
                 protected.add(index)
+                continue
+            category = str(entry.get("category") or "")
+            if category not in protected_category_cache:
+                protected_category_cache[category] = self.__is_category_protected(category)
+            if protected_category_cache[category]:
+                protected.add(index)
+        protected.update(latest_decision.values())
         return protected
 
     def __read_enabled_state(self) -> bool:
@@ -5234,7 +5251,7 @@ class BreadcrumbTraceCollector:
             # this lock-held snapshot preserves the iteration's selection while
             # live deques remain the deletion targets.
             entries = tuple(self.__entries)
-            protected = self.__protected_indices()
+            protected = self.__protected_indices(entries)
             candidate_indices = [index for index in range(len(entries)) if index not in protected]
             if not candidate_indices:
                 candidate_indices = list(range(len(entries)))
