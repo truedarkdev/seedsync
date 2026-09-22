@@ -748,10 +748,16 @@ def _sanitize_artifact(value: object) -> Mapping[str, object]:
                 )
                 state = item.get("state")
                 safe_snapshot["state"] = state if isinstance(state, str) and state in _ARTIFACT_ROOT_STATES else "unknown"
-                for field in ("size", "local_size", "remote_size", "progress", "bytes_done", "bytes_total"):
+                for field in (
+                    "size", "local_size", "remote_size", "transferred_size",
+                    "display_size_total", "display_transferred_size", "downloading_speed", "eta",
+                ):
                     number = item.get(field)
                     if type(number) is int and 0 <= number <= 2**63 - 1:
                         safe_snapshot[field] = number
+                download_progress = item.get("download_progress")
+                if type(download_progress) is int and 0 <= download_progress <= 100:
+                    safe_snapshot["download_progress"] = download_progress
                 model_version = item.get("model_version")
                 if type(model_version) is int and 0 <= model_version <= 2**31 - 1:
                     safe_snapshot["model_version"] = model_version

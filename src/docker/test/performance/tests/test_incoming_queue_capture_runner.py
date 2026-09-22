@@ -61,7 +61,10 @@ def _payload(version: int = 7) -> dict[str, object]:
         "path_pair_id": PAIR, "model_version": version, "records": [{
             "file_id": LEAF, "name": "leaf.bin", "path_pair_id": PAIR,
             "is_dir": False, "has_children": False, "children": [], "state": "active", "size": 0,
-            "local_size": 0, "remote_size": 12, "progress": 0, "complete_local_coverage": False,
+            "local_size": 0, "remote_size": 12, "transferred_size": 5, "display_size_total": 12,
+            "display_transferred_size": 5, "download_progress": 41, "downloading_speed": 7, "eta": 3,
+            "progress": 99, "bytes_done": 1, "bytes_total": 12, "private_detail": "private-response-body",
+            "complete_local_coverage": False,
             "remote_present": True, "local_present": True,
         }],
     }
@@ -180,7 +183,58 @@ def test_identity_hash_excludes_mutable_state_and_wire_model_version_is_projecte
     assert model_event["model_snapshot"]["local_size"] == 0
     assert model_event["model_snapshot"]["remote_size"] == 12
     assert model_event["model_snapshot"]["complete_local_coverage"] is False
+    assert {field: model_event["model_snapshot"][field] for field in (
+        "transferred_size", "display_size_total", "display_transferred_size",
+        "download_progress", "downloading_speed", "eta",
+    )} == {
+        "transferred_size": 5, "display_size_total": 12, "display_transferred_size": 5,
+        "download_progress": 41, "downloading_speed": 7, "eta": 3,
+    }
+    assert all(field not in model_event["model_snapshot"] for field in (
+        "progress", "bytes_done", "bytes_total", "private_detail",
+    ))
     assert result["completion_proven"] is False
+
+
+def test_model_snapshot_rejects_nonfinite_wire_numbers_and_private_fields():
+    identity = {"selector_hash": "0123456789abcdef", "leaf_hash": "fedcba9876543210"}
+    valid = {
+        "state": "active", "local_size": 0, "remote_size": 12,
+        "transferred_size": 5, "display_size_total": 12, "display_transferred_size": 5,
+        "download_progress": 41, "downloading_speed": 7, "eta": 3,
+    }
+    snapshot = runner._model_snapshot(identity, 8, {**valid, "private_detail": "private-response-body"})
+    assert all(snapshot[field] == valid[field] for field in (
+        "transferred_size", "display_size_total", "display_transferred_size",
+        "download_progress", "downloading_speed", "eta",
+    ))
+    assert "private_detail" not in snapshot
+    for field, malformed in (
+        ("transferred_size", True), ("display_size_total", -1),
+        ("display_transferred_size", 1.5), ("download_progress", 101),
+        ("downloading_speed", -1), ("eta", 1.5),
+    ):
+        rejected = runner._model_snapshot(identity, 8, {**valid, field: malformed})
+        assert field not in rejected
+    sanitized = runner._observer._sanitize_artifact({
+        "model_snapshot": {
+            **valid, "model_version": 8, "private_detail": "private-response-body",
+            "progress": 99, "bytes_done": 1, "bytes_total": 12,
+            "download_progress": 101,
+        },
+    })
+    safe_snapshot = sanitized["model_snapshot"]
+    assert {field: safe_snapshot[field] for field in (
+        "transferred_size", "display_size_total", "display_transferred_size",
+        "downloading_speed", "eta",
+    )} == {
+        "transferred_size": 5, "display_size_total": 12, "display_transferred_size": 5,
+        "downloading_speed": 7, "eta": 3,
+    }
+    assert "download_progress" not in safe_snapshot
+    assert all(field not in safe_snapshot for field in (
+        "progress", "bytes_done", "bytes_total", "private_detail",
+    ))
 
 
 def test_real_local_http_and_durable_writer_drain_while_one_leaf_get_waits(monkeypatch, tmp_path):

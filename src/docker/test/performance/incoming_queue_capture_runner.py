@@ -239,9 +239,12 @@ def _model_snapshot(identity: Mapping[str, object], model_version: int | None, r
         "leaf_hash": identity["leaf_hash"], "model_version": model_version,
         "state": record.get("state") if isinstance(record.get("state"), str) else "unknown",
     }
-    for key in ("size", "local_size", "remote_size", "progress", "bytes_done", "bytes_total"):
+    for key in (
+        "size", "local_size", "remote_size", "transferred_size", "display_size_total",
+        "display_transferred_size", "download_progress", "downloading_speed", "eta",
+    ):
         value = record.get(key)
-        if type(value) is int and 0 <= value <= 2**63 - 1:
+        if type(value) is int and 0 <= value <= 2**63 - 1 and (key != "download_progress" or value <= 100):
             snapshot[key] = value
     for key in ("remote_present", "local_present", "complete_local_coverage", "final_move_succeeded", "explicitly_stopped"):
         value = record.get(key)
