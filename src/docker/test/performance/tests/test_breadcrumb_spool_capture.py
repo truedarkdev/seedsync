@@ -24,6 +24,17 @@ assert spec.loader is not None
 sys.modules[spec.name] = capture
 spec.loader.exec_module(capture)
 
+_COMMON_ROOTS = [Path("/src/python")]
+_COMMON_ROOTS.extend(parent / "src/python" for parent in Path(__file__).resolve().parents)
+for _common_root in _COMMON_ROOTS:
+    if _common_root.is_dir():
+        sys.path.insert(0, str(_common_root))
+        break
+try:
+    from common.breadcrumb_trace import BreadcrumbTraceCollector
+except ImportError:
+    BreadcrumbTraceCollector = None
+
 
 def _health(path: Path, *, session: str = "session-1", lost: int = 0, rotation_count: int = 0) -> None:
     payload = {
@@ -54,16 +65,14 @@ def _row(*, category: str = "queue.lifecycle", event_type: str = "state_transiti
         "message": label,
         "created_ms": created,
         "details": details or {},
-        "metadata": {
-            "category": category,
-            "event_type": event_type,
-            "stage": stage,
-            "level": "info",
-            "flow_id": f"private-flow-label-{identity}",
-            "corr_id": f"private-correlation-label-{identity}",
-            "file_id": f"private-file-label-{identity}",
-            "path_pair_id": f"private-pair-label-{identity}",
-        },
+        "category": category,
+        "event_type": event_type,
+        "stage": stage,
+        "level": "info",
+        "flow_id": f"private-flow-label-{identity}",
+        "corr_id": f"private-correlation-label-{identity}",
+        "file_id": f"private-file-label-{identity}",
+        "path_pair_id": f"private-pair-label-{identity}",
     }, separators=(",", ":")) + "\n").encode()
 
 
@@ -522,6 +531,52 @@ def test_model_page_snapshot_source_projection_is_finite_and_redacted(tmp_path: 
         "outcome": "success", "scope_version": 4, "global_version": 9,
         "lock_wait_ms": 1, "lock_hold_ms": 2, "snapshot_elapsed_ms": 3,
     }
+
+
+@pytest.mark.skipif(BreadcrumbTraceCollector is None, reason="production breadcrumb collector is unavailable")
+def test_collector_durable_flat_envelope_reaches_reader_projection(tmp_path: Path) -> None:
+    spool = tmp_path / "collector-spool"
+    spool.mkdir()
+    artifact = tmp_path / "capture.jsonl"
+    collector = BreadcrumbTraceCollector(
+        lambda: True,
+        policy={"default": "off", "rules": {"queue.readiness": "info", "model_page_snapshot": "debug"}},
+        durable_enabled=True,
+        durable_path=str(spool),
+        durable_enabled_getter=lambda: True,
+    )
+    try:
+        assert collector.record(
+            "controller", "baseline", {"schema": "queue_readiness.v1", "phase": "entry", "outcome": "accepted"},
+            category="queue.readiness", event_type="callback", stage="queue_readiness", level="info",
+        ) in {"retained", "enqueued"}
+        assert collector.flush_durable(2.0)
+        reader = _reader(spool, artifact)
+        try:
+            reader.start()
+            assert collector.record(
+                "controller", "queue_callback", {"schema": "queue_readiness.v1", "phase": "entry", "outcome": "accepted"},
+                category="queue.readiness", event_type="callback", stage="queue_readiness", level="info",
+                corr_id="private-correlation", flow_id="private-flow",
+            ) in {"retained", "enqueued"}
+            assert collector.record(
+                "model_updater", "model_page_snapshot",
+                {"scope_version": 4, "global_version": 9, "lock_wait_ms": 1, "lock_hold_ms": 2, "snapshot_elapsed_ms": 3, "outcome": "success"},
+                category="model_page_snapshot", event_type="diagnostic", stage="model_page_snapshot", level="debug",
+            ) in {"retained", "enqueued"}
+            assert collector.flush_durable(2.0)
+            assert reader.poll() == 2
+        finally:
+            reader.close()
+        rows = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
+        final_rows = [row for row in rows if row.get("message") in {"queue_callback", "model_page_snapshot"}]
+        assert {row["category"] for row in final_rows} == {"queue.readiness", "model_page_snapshot"}
+        assert all("metadata" not in row and isinstance(row.get("details"), dict) for row in final_rows)
+    finally:
+        collector.close(timeout=2.0)
+    projections = [item["capture"]["projection"] for item in _artifacts(artifact) if item["capture"].get("state") == "record"]
+    assert any(item.get("queue_readiness", {}).get("event") == "queue_callback" for item in projections)
+    assert any(item.get("model_page_snapshot", {}).get("outcome") == "success" for item in projections)
 
 
 def test_poll_drains_beyond_single_eight_kib_chunk_with_budget_receipt(tmp_path: Path) -> None:

@@ -193,6 +193,17 @@ def _numeric_values(row: Mapping[str, object], metadata: Mapping[str, object], d
     return result
 
 
+def _allowed_field(
+    row: Mapping[str, object], metadata: Mapping[str, object], key: str, allowed: frozenset[str],
+) -> str:
+    """Read durable-envelope fields first, with bounded legacy compatibility."""
+    for source in (row, metadata):
+        value = source.get(key)
+        if isinstance(value, str) and value in allowed:
+            return value
+    return "unknown"
+
+
 def _queue_lifecycle_facts(details: Mapping[str, object]) -> dict[str, object] | None:
     if details.get("schema") != "queue.lifecycle.v1":
         return None
@@ -301,18 +312,13 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
     details = row.get("details") if isinstance(row.get("details"), Mapping) else {}
     assert isinstance(metadata, Mapping) and isinstance(details, Mapping)
-    raw_category = metadata.get("category")
-    category = raw_category if isinstance(raw_category, str) and raw_category in _CATEGORIES else "unknown"
+    category = _allowed_field(row, metadata, "category", _CATEGORIES)
     if category == "unknown":
         return None, True
-    raw_source = row.get("source", metadata.get("source"))
-    source = raw_source if isinstance(raw_source, str) and raw_source in _SOURCES else "unknown"
-    raw_event = metadata.get("event_type")
-    event_type = raw_event if isinstance(raw_event, str) and raw_event in _EVENT_TYPES else "unknown"
-    raw_stage = metadata.get("stage")
-    stage = raw_stage if isinstance(raw_stage, str) and raw_stage in _STAGES else "unknown"
-    raw_level = metadata.get("level")
-    level = raw_level if isinstance(raw_level, str) and raw_level in _LEVELS else "unknown"
+    source = _allowed_field(row, metadata, "source", _SOURCES)
+    event_type = _allowed_field(row, metadata, "event_type", _EVENT_TYPES)
+    stage = _allowed_field(row, metadata, "stage", _STAGES)
+    level = _allowed_field(row, metadata, "level", _LEVELS)
     numbers = _numeric_values(row, metadata, details)
     lifecycle = _queue_lifecycle_facts(details) if category == "queue.lifecycle" else None
     gate = _completion_gate_facts(details) if category == "completion.gate" else None
@@ -819,10 +825,10 @@ class BreadcrumbSpoolCapture:
             projection = dict(typed)
             projection.update(
                 {
-                    "flow_hash": _hash(metadata.get("flow_id")),
-                    "corr_hash": _hash(metadata.get("corr_id", metadata.get("correlation_id"))),
-                    "file_hash": _hash(metadata.get("file_id")),
-                    "pair_hash": _hash(metadata.get("path_pair_id")),
+                    "flow_hash": _hash(value.get("flow_id", metadata.get("flow_id"))),
+                    "corr_hash": _hash(value.get("corr_id", value.get("correlation_id", metadata.get("corr_id", metadata.get("correlation_id"))))),
+                    "file_hash": _hash(value.get("file_id", metadata.get("file_id"))),
+                    "pair_hash": _hash(value.get("path_pair_id", metadata.get("path_pair_id"))),
                 }
             )
             if not self._emit(
