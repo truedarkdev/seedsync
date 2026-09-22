@@ -18,7 +18,7 @@ from common.performance_diagnostics import PerformanceDiagnosticsCollector
 from controller import Controller
 from controller.controller import MODEL_LEGACY_SCOPE_ID
 from controller.model_builder import ModelBuilder
-from model import ActiveProgressOverlay, Model, ModelFile
+from model import ActiveProgressOverlay, Model, ModelError, ModelFile
 from system import SystemFile
 from web.handler.model_api import ModelApiHandler, ScopedModelListener, SummaryModelListener
 from web.web_app import WebApp
@@ -130,6 +130,143 @@ class TestModelApi(unittest.TestCase):
         self.assertNotIn("secret", str(entry))
         self.controller.get_model_summary.assert_not_called()
         model_lock.release.assert_not_called()
+
+    def test_model_page_snapshot_is_default_off_and_keeps_public_page_unchanged(self):
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"})
+        self.controller._Controller__context.breadcrumb_trace = trace
+        file = self._file("sample", "pair-a")
+        self.model.add_file(file)
+
+        page = self.controller.get_model_page("pair-a", 50)
+
+        self.assertEqual([file.file_id], [record["file_id"] for record in page["records"]])
+        self.assertIn("_global_model_version", page)
+        self.assertEqual([], trace.snapshot(category="model_page_snapshot")["entries"])
+
+    def test_model_page_snapshot_records_an_actual_model_lock_wait(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"model_page_snapshot": "debug"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        file = self._file("sample", "pair-a")
+        self.model.add_file(file)
+
+        real_lock = self.controller._Controller__model_lock
+        reader_attempted = threading.Event()
+        acquire_count_lock = threading.Lock()
+        acquire_count = [0]
+        release = threading.Event()
+
+        class LockProbe:
+            def acquire(self, *args, **kwargs):
+                with acquire_count_lock:
+                    acquire_count[0] += 1
+                    if acquire_count[0] >= 2:
+                        reader_attempted.set()
+                return real_lock.acquire(*args, **kwargs)
+
+            def release(self):
+                return real_lock.release()
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, *_args):
+                self.release()
+
+        self.controller._Controller__model_lock = LockProbe()
+        holder_entered = threading.Event()
+        holder_done = threading.Event()
+
+        def hold_model_lock():
+            with self.controller._Controller__model_lock:
+                holder_entered.set()
+                release.wait(2)
+            holder_done.set()
+
+        result = []
+        reader_done = threading.Event()
+
+        def read_page():
+            result.append(self.controller.get_model_page("pair-a", 50))
+            reader_done.set()
+
+        holder = threading.Thread(target=hold_model_lock)
+        reader = threading.Thread(target=read_page)
+        holder.start()
+        self.assertTrue(holder_entered.wait(1))
+        reader.start()
+        self.assertTrue(reader_attempted.wait(1))
+        self.assertFalse(reader_done.is_set())
+        release.set()
+        self.assertTrue(reader_done.wait(1))
+        self.assertTrue(holder_done.wait(1))
+        reader.join(1)
+        holder.join(1)
+
+        self.assertEqual([file.file_id], [record["file_id"] for record in result[0]["records"]])
+        entries = trace.snapshot(category="model_page_snapshot")["entries"]
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertEqual("model_page_snapshot", entry["message"])
+        self.assertEqual("success", entry["details"]["outcome"])
+        self.assertIsInstance(entry["details"]["scope_version"], int)
+        self.assertIsInstance(entry["details"]["global_version"], int)
+        self.assertIsInstance(entry["details"]["lock_wait_ms"], int)
+        self.assertIsInstance(entry["details"]["lock_hold_ms"], int)
+        self.assertIsInstance(entry["details"]["snapshot_elapsed_ms"], int)
+        self.assertNotIn("pair-a", str(entry))
+
+    def test_model_page_snapshot_failure_records_finally_without_swallowing_error(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"model_page_snapshot": "debug"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        failure = ModelError("page generation failed")
+        with patch.object(
+            self.controller, "_Controller__get_model_page_locked", side_effect=failure,
+        ):
+            with self.assertRaisesRegex(ModelError, "page generation failed"):
+                self.controller.get_model_page("pair-a", 50)
+
+        entries = trace.snapshot(category="model_page_snapshot")["entries"]
+        self.assertEqual(1, len(entries))
+        self.assertEqual("error", entries[0]["details"]["outcome"])
+        self.assertEqual("model_error", entries[0]["details"]["error_class"])
+
+        trace.record = MagicMock(side_effect=RuntimeError("diagnostic failure"))
+        with patch.object(
+            self.controller, "_Controller__get_model_page_locked", side_effect=failure,
+        ):
+            with self.assertRaisesRegex(ModelError, "page generation failed"):
+                self.controller.get_model_page("pair-a", 50)
+        trace.record.assert_called_once()
+
+    def test_model_page_snapshot_lock_acquire_exception_is_not_reported_as_success(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"model_page_snapshot": "debug"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+
+        class BrokenLock:
+            def acquire(self):
+                raise RuntimeError("private lock detail")
+
+            def release(self):
+                raise AssertionError("an unacquired lock must not be released")
+
+        self.controller._Controller__model_lock = BrokenLock()
+        with self.assertRaisesRegex(RuntimeError, "private lock detail"):
+            self.controller.get_model_page("pair-a", 50)
+
+        entries = trace.snapshot(category="model_page_snapshot")["entries"]
+        self.assertEqual(1, len(entries))
+        self.assertEqual("error", entries[0]["details"]["outcome"])
+        self.assertEqual("runtime_error", entries[0]["details"]["error_class"])
 
     def test_summary_lock_timeout_is_off_without_an_explicit_policy_rule(self):
         trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "off"})

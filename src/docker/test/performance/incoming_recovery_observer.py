@@ -395,6 +395,13 @@ _ARTIFACT_ALLOWED_KEYS = frozenset({
     "root_found", "target_verified", "root_verified", "first_failure", "evidence",
     "error", "failure", "capture_failure", "queue_evidence", "scan_lifecycle", "sample_index",
     "endpoint_class", "request_latency_ms", "classification", "reason", "request", "diagnostics", "capture",
+    "utc_ms", "monotonic_ms", "timeout_seconds", "timeout", "invocation_utc_ms", "invocation_monotonic_ms",
+    "response_utc_ms", "response_monotonic_ms", "timeout_utc_ms", "timeout_monotonic_ms", "completion_proven", "response_outcome", "physical_outcome",
+    "capture_start_utc_ms", "capture_start_monotonic_ms", "capture_end_utc_ms", "capture_end_monotonic_ms",
+    "model_outcome", "reader_outcome", "timed_out", "config_hash", "runtime_hash", "workload_hash",
+    "selector_hash", "leaf_hash", "model_version",
+    "model_snapshot",
+    "runtime_version",
 })
 _ARTIFACT_SAFE_REASONS = _QUEUE_PREFLIGHT_REASONS | frozenset({
     "queue_accepted", "success_response", "response_unavailable", "path_pair_relocation",
@@ -425,7 +432,7 @@ _CAPTURE_EVENTS = frozenset({
     "queue", "callback", "status", "completion", "progress", "state_transition", "failure", "diagnostic", "breadcrumb", "unknown",
 })
 _CAPTURE_CATEGORIES = frozenset({
-    "queue.lifecycle", "queue.admission", "queue.executor", "queue.authority", "queue.readiness", "queue.exclusion",
+    "queue.lifecycle", "queue.admission", "queue.executor", "queue.authority", "queue.readiness", "queue.exclusion", "model_page_snapshot",
     "model.lifecycle", "model.progress", "model.publication", "model.finalization", "model.root_progress", "status",
     "transfer.lftp", "transfer.lftp.executor", "transfer.lftp.membership", "transfer.lftp.status", "transfer.stop",
     "scan.authority", "scan.failure", "scan.result", "scan.terminal_publication", "final_move.publication",
@@ -435,7 +442,7 @@ _CAPTURE_CATEGORIES = frozenset({
 _CAPTURE_STAGES = frozenset({
     "admission", "dispatch", "publication", "terminal", "queue_lifecycle", "queue_authority_handoff", "queue_readiness",
     "queue_exclusion", "model", "model_progress", "model_delta", "model_update", "model_publication", "model_summary",
-    "model_finalization", "scan", "scan_adoption", "scan_authority", "scan_accumulator", "extract", "controller",
+    "model_finalization", "model_page_snapshot", "scan", "scan_adoption", "scan_authority", "scan_accumulator", "extract", "controller",
     "controller_boundary", "persist_transaction", "lifecycle", "completion_gate", "final_move_publication",
     "finalization_child", "transfer_stop", "command", "lftp_executor", "lftp_sidecar_validation",
     "lftp_path_pair_annotation", "lftp_status_poll", "lftp_command_boundary", "scoped_model_stream", "retirement_cleanup",
@@ -483,6 +490,15 @@ _CAPTURE_LIFECYCLE_BOOLS = {
     "fresh", "healthy", "process_alive_before", "process_alive_after", "process_alive", "pre_send_drain_queue_done",
     "pre_send_drain_job_or_progress", "pre_send_drain_prompt_or_echo",
 }
+_CAPTURE_READINESS_SCHEMAS = {"queue_readiness.v1", "queue_readiness.v2"}
+_CAPTURE_READINESS_EVENTS = {"queue_callback", "queue_http_wait"}
+_CAPTURE_READINESS_PHASES = {"entry", "wait_return", "unknown"}
+_CAPTURE_READINESS_OUTCOMES = {"accepted", "success", "failure", "failed", "timeout", "unknown"}
+_CAPTURE_READINESS_ORIGINS = {"auto_queue", "manual", "unknown"}
+_CAPTURE_READINESS_REASONS = {"none", "awaiting_scan_publication", "initial_scan_authority_deadline", "comparison_pending", "scoped_rescan_token_unknown", "scoped_rescan_request_failed", "scoped_rescan_requested", "unknown"}
+_CAPTURE_READINESS_BOOLEANS = {"ready"}
+_CAPTURE_MODEL_PAGE_SNAPSHOT_OUTCOMES = {"success", "error", "unknown"}
+_CAPTURE_MODEL_PAGE_SNAPSHOT_ERRORS = {"cancelled", "model_error", "runtime_error", "unknown"}
 _CAPTURE_GATE_DECISIONS = {"blocked", "no_retirement", "excluded", "pending", "attempt_eligible", "deferred", "unknown"}
 _CAPTURE_GATE_REASONS = {
     "completion_detection_not_authoritative", "still_active", "explicit_stop", "lftp_job_finished", "candidate_pair_unselected",
@@ -561,6 +577,42 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
         if type(command.get("process_alive")) is bool:
             safe_command["process_alive"] = command["process_alive"]
         result["lftp_command"] = safe_command
+    readiness = value.get("queue_readiness")
+    if isinstance(readiness, Mapping):
+        safe_readiness: dict[str, object] = {}
+        schema = readiness.get("schema")
+        safe_readiness["schema"] = schema if isinstance(schema, str) and schema in _CAPTURE_READINESS_SCHEMAS else "queue_readiness.v1"
+        event = readiness.get("event")
+        safe_readiness["event"] = event if isinstance(event, str) and event in _CAPTURE_READINESS_EVENTS else "unknown"
+        for key, allowed in (
+            ("phase", _CAPTURE_READINESS_PHASES),
+            ("outcome", _CAPTURE_READINESS_OUTCOMES),
+            ("origin", _CAPTURE_READINESS_ORIGINS),
+            ("reason", _CAPTURE_READINESS_REASONS),
+        ):
+            item = readiness.get(key)
+            safe_readiness[key] = item if isinstance(item, str) and item in allowed else "unknown"
+        for key in _CAPTURE_READINESS_BOOLEANS:
+            if type(readiness.get(key)) is bool:
+                safe_readiness[key] = readiness[key]
+        for key in ("callback_index", "callback_count", "error_code", "queue_depth"):
+            item = readiness.get(key)
+            if type(item) is int and 0 <= item <= 2**63 - 1:
+                safe_readiness[key] = item
+        result["queue_readiness"] = safe_readiness
+    model_page_snapshot = value.get("model_page_snapshot")
+    if isinstance(model_page_snapshot, Mapping):
+        safe_snapshot: dict[str, object] = {}
+        outcome = model_page_snapshot.get("outcome")
+        safe_snapshot["outcome"] = outcome if isinstance(outcome, str) and outcome in _CAPTURE_MODEL_PAGE_SNAPSHOT_OUTCOMES else "unknown"
+        if safe_snapshot["outcome"] == "error":
+            error_class = model_page_snapshot.get("error_class")
+            safe_snapshot["error_class"] = error_class if isinstance(error_class, str) and error_class in _CAPTURE_MODEL_PAGE_SNAPSHOT_ERRORS else "unknown"
+        for key in ("scope_version", "global_version", "lock_wait_ms", "lock_hold_ms", "snapshot_elapsed_ms"):
+            item = model_page_snapshot.get(key)
+            if type(item) is int and 0 <= item <= 2**31 - 1:
+                safe_snapshot[key] = item
+        result["model_page_snapshot"] = safe_snapshot
     return result
 
 
@@ -582,7 +634,7 @@ def _sanitize_capture(value: object) -> Mapping[str, object]:
         item = value.get(key)
         if item in values:
             result[key] = item
-    for key in ("utc_ms", "created_ms", "monotonic_ms", "cursor_start", "cursor_end", "bytes_read", "records", "lost", "rotation_count", "health_lost", "health_unknown", "health_unresolved", "irrelevant"):
+    for key in ("utc_ms", "created_ms", "monotonic_ms", "cursor_start", "cursor_end", "bytes_read", "records", "lost", "rotation_count", "health_lost", "health_unknown", "health_unresolved", "irrelevant", "unsupported", "discarded"):
         item = value.get(key)
         if type(item) is int and 0 <= item <= 2 ** 63 - 1:
             result[key] = item
@@ -655,6 +707,22 @@ def _sanitize_artifact(value: object) -> Mapping[str, object]:
                 if type(item) in (int, float) and math.isfinite(float(item))
                 and 0 <= float(item) <= _MAX_REQUEST_LATENCY_MS else None
             )
+        elif key in {"utc_ms", "monotonic_ms", "invocation_utc_ms", "invocation_monotonic_ms", "response_utc_ms", "response_monotonic_ms", "timeout_utc_ms", "timeout_monotonic_ms", "capture_start_utc_ms", "capture_start_monotonic_ms", "capture_end_utc_ms", "capture_end_monotonic_ms"}:
+            sanitized[key] = item if type(item) is int and 0 <= item <= 2**63 - 1 else None
+        elif key in {"timeout_seconds", "timeout"}:
+            sanitized[key] = item if type(item) in (int, float) and math.isfinite(float(item)) and 0 <= float(item) <= _MAX_REQUEST_LATENCY_MS / 1000 else None
+        elif key in {"config_hash", "runtime_hash", "workload_hash"}:
+            sanitized[key] = item if isinstance(item, str) and len(item) == 16 and all(char in "0123456789abcdef" for char in item) else None
+        elif key in {"selector_hash", "leaf_hash"}:
+            sanitized[key] = item if isinstance(item, str) and len(item) == 16 and all(char in "0123456789abcdef" for char in item) else None
+        elif key == "model_version":
+            sanitized[key] = item if type(item) is int and 0 <= item <= 2**31 - 1 else None
+        elif key == "runtime_version":
+            sanitized[key] = item if isinstance(item, str) and len(item) <= 32 and all(char.isdigit() or char == "." for char in item) else "unknown"
+        elif key in {"completion_proven", "timed_out"}:
+            sanitized[key] = item if type(item) is bool else False
+        elif key in {"response_outcome", "physical_outcome", "model_outcome", "reader_outcome"}:
+            sanitized[key] = item if isinstance(item, str) and len(item) <= 64 and item.replace("_", "").isalnum() else "unknown"
         elif key == "endpoint_class":
             sanitized[key] = item if isinstance(item, str) and item in _ENDPOINT_CLASSES else "unknown"
         elif key in {"classification", "reason"}:
@@ -666,6 +734,37 @@ def _sanitize_artifact(value: object) -> Mapping[str, object]:
             sanitized[key] = _sanitize_discriminator_diagnostics(item)
         elif key == "capture":
             sanitized[key] = _sanitize_capture(item)
+        elif key == "model_snapshot":
+            if isinstance(item, Mapping):
+                safe_snapshot: dict[str, object] = {
+                    "schema": "incoming-recovery-model-snapshot.v1", "kind": "leaf",
+                }
+                leaf_hash = item.get("leaf_hash")
+                safe_snapshot["leaf_hash"] = (
+                    leaf_hash
+                    if isinstance(leaf_hash, str) and len(leaf_hash) == 16
+                    and all(char in "0123456789abcdef" for char in leaf_hash)
+                    else "unknown"
+                )
+                state = item.get("state")
+                safe_snapshot["state"] = state if isinstance(state, str) and state in _ARTIFACT_ROOT_STATES else "unknown"
+                for field in ("size", "local_size", "remote_size", "progress", "bytes_done", "bytes_total"):
+                    number = item.get(field)
+                    if type(number) is int and 0 <= number <= 2**63 - 1:
+                        safe_snapshot[field] = number
+                model_version = item.get("model_version")
+                if type(model_version) is int and 0 <= model_version <= 2**31 - 1:
+                    safe_snapshot["model_version"] = model_version
+                for field in ("remote_present", "local_present", "complete_local_coverage", "final_move_succeeded", "explicitly_stopped"):
+                    boolean = item.get(field)
+                    if type(boolean) is bool:
+                        safe_snapshot[field] = boolean
+                sanitized[key] = safe_snapshot
+            else:
+                sanitized[key] = {
+                    "schema": "incoming-recovery-model-snapshot.v1", "kind": "leaf",
+                    "leaf_hash": "unknown", "state": "unknown",
+                }
         elif key in {"request_index", "sample_index"}:
             sanitized[key] = item if type(item) is int and item >= 0 else None
         elif key in {"root_found", "target_verified", "root_verified", "first_failure", "success"}:

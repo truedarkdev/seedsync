@@ -35,7 +35,7 @@ _READ_CHUNK_BYTES = 8192
 _CATEGORIES = frozenset(
     {
         "queue.lifecycle", "queue.admission", "queue.executor", "queue.authority",
-        "queue.readiness", "queue.exclusion", "model.lifecycle", "model.progress",
+        "queue.readiness", "queue.exclusion", "model.lifecycle", "model.progress", "model_page_snapshot",
         "model.publication", "model.finalization", "model.root_progress", "status",
         "transfer.lftp", "transfer.lftp.executor", "transfer.lftp.membership",
         "transfer.lftp.status", "transfer.stop", "scan.authority", "scan.failure",
@@ -59,7 +59,7 @@ _STAGES = frozenset(
         "completion_gate", "final_move_publication", "finalization_child", "transfer_stop", "command",
         "lftp_executor", "lftp_sidecar_validation", "lftp_path_pair_annotation", "lftp_status_poll",
         "lftp_command_boundary", "scoped_model_stream", "retirement_cleanup", "path_pair_runtime",
-        "root_progress_status", "completion_gate", "ordinary", "refresh", "finish", "transfer",
+        "root_progress_status", "completion_gate", "ordinary", "refresh", "finish", "transfer", "model_page_snapshot",
     }
 )
 _LEVELS = frozenset({"info", "warning", "error", "critical", "debug"})
@@ -116,6 +116,21 @@ _QUEUE_LIFECYCLE_ENUMS = {
     "reaped": frozenset({"signal", "exit", "alive", "not_alive", "unknown"}),
     "future_state": frozenset({"finalized", "pending", "unknown"}),
 }
+_QUEUE_READINESS_SCHEMAS = frozenset({"queue_readiness.v1", "queue_readiness.v2"})
+_QUEUE_READINESS_EVENTS = frozenset({"queue_callback", "queue_http_wait"})
+_QUEUE_READINESS_PHASES = frozenset({"entry", "wait_return", "unknown"})
+_QUEUE_READINESS_OUTCOMES = frozenset({"accepted", "success", "failure", "failed", "timeout", "unknown"})
+_QUEUE_READINESS_ORIGINS = frozenset({"auto_queue", "manual", "unknown"})
+_QUEUE_READINESS_REASONS = frozenset({
+    "none", "awaiting_scan_publication", "initial_scan_authority_deadline", "comparison_pending",
+    "scoped_rescan_token_unknown", "scoped_rescan_request_failed", "scoped_rescan_requested", "unknown",
+})
+_QUEUE_READINESS_BOOLEANS = frozenset({"ready"})
+_MODEL_PAGE_SNAPSHOT_OUTCOMES = frozenset({"success", "error"})
+_MODEL_PAGE_SNAPSHOT_ERRORS = frozenset({"cancelled", "model_error", "runtime_error", "unknown"})
+_MODEL_PAGE_SNAPSHOT_NUMBERS = frozenset({
+    "scope_version", "global_version", "lock_wait_ms", "lock_hold_ms", "snapshot_elapsed_ms",
+})
 _QUEUE_LIFECYCLE_BOOLS = frozenset({
     "fresh", "healthy", "process_alive_before", "process_alive_after", "process_alive",
     "pre_send_drain_queue_done", "pre_send_drain_job_or_progress", "pre_send_drain_prompt_or_echo",
@@ -235,6 +250,53 @@ def _lftp_command_facts(details: Mapping[str, object]) -> dict[str, object] | No
     return result
 
 
+def _queue_readiness_facts(message: object, details: Mapping[str, object]) -> dict[str, object] | None:
+    """Project only the finite, source-shaped Queue readiness discriminator."""
+    schema = details.get("schema")
+    # The maintained producer writes the event discriminator in row.message;
+    # details are the finite v1 payload and are not authoritative for it.
+    if schema not in _QUEUE_READINESS_SCHEMAS or message not in _QUEUE_READINESS_EVENTS:
+        return None
+    event = message
+    result: dict[str, object] = {"schema": schema, "event": event}
+    for key, allowed in (
+        ("phase", _QUEUE_READINESS_PHASES),
+        ("outcome", _QUEUE_READINESS_OUTCOMES),
+        ("origin", _QUEUE_READINESS_ORIGINS),
+        ("reason", _QUEUE_READINESS_REASONS),
+    ):
+        value = details.get(key)
+        if isinstance(value, str) and value in allowed:
+            result[key] = value
+        else:
+            result[key] = "unknown"
+    for key in _QUEUE_READINESS_BOOLEANS:
+        value = details.get(key)
+        if type(value) is bool:
+            result[key] = value
+    for key in ("callback_index", "callback_count", "error_code", "queue_depth"):
+        value = details.get(key)
+        if type(value) is int and 0 <= value <= 2**63 - 1:
+            result[key] = value
+    return result
+
+
+def _model_page_snapshot_facts(details: Mapping[str, object]) -> dict[str, object] | None:
+    """Project the maintained model-page diagnostic's finite source fields."""
+    outcome = details.get("outcome")
+    if not isinstance(outcome, str) or outcome not in _MODEL_PAGE_SNAPSHOT_OUTCOMES:
+        return None
+    result: dict[str, object] = {"outcome": outcome}
+    if outcome == "error":
+        error_class = details.get("error_class")
+        result["error_class"] = error_class if isinstance(error_class, str) and error_class in _MODEL_PAGE_SNAPSHOT_ERRORS else "unknown"
+    for key in _MODEL_PAGE_SNAPSHOT_NUMBERS:
+        value = details.get(key)
+        if type(value) is int and 0 <= value <= 2**31 - 1:
+            result[key] = value
+    return result
+
+
 def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bool]:
     metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
     details = row.get("details") if isinstance(row.get("details"), Mapping) else {}
@@ -255,6 +317,12 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     lifecycle = _queue_lifecycle_facts(details) if category == "queue.lifecycle" else None
     gate = _completion_gate_facts(details) if category == "completion.gate" else None
     command = _lftp_command_facts(details) if category == "transfer.lftp.command" else None
+    readiness = _queue_readiness_facts(row.get("message"), details) if category == "queue.readiness" else None
+    model_page_snapshot = _model_page_snapshot_facts(details) if category == "model_page_snapshot" else None
+    if category == "queue.readiness" and readiness is None:
+        return None, True
+    if category == "model_page_snapshot" and model_page_snapshot is None:
+        return None, True
     lifecycle_event = lifecycle.get("event") if lifecycle else None
     if event_type == "completion" or stage == "terminal" or lifecycle_event in {"queue_retired", "operation_retired"} or details.get("final") is True or details.get("completed") is True:
         kind = "completion"
@@ -279,6 +347,10 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["completion_gate"] = gate
     if command is not None:
         result["lftp_command"] = command
+    if readiness is not None:
+        result["queue_readiness"] = readiness
+    if model_page_snapshot is not None:
+        result["model_page_snapshot"] = model_page_snapshot
     return result, False
 
 
@@ -340,6 +412,10 @@ class BreadcrumbSpoolCapture:
         self._poll_index = 0
         self._emitted_records = 0
         self._emitted_bytes = 0
+        self._source_bytes = 0
+        self._unsupported_records = 0
+        self._loss_reason: str | None = None
+        self._loss_count = 0
 
     @classmethod
     def from_verified_directory_fd(cls, directory_fd: int, sink: JsonArtifactSink, **kwargs: object) -> "BreadcrumbSpoolCapture":
@@ -552,6 +628,8 @@ class BreadcrumbSpoolCapture:
         return True
 
     def _loss(self, reason: str, health: Mapping[str, object], **fields: object) -> None:
+        self._loss_reason = reason
+        self._loss_count += 1
         self._emit("loss", reason=reason, health=health, **fields)
         self._terminal = True
 
@@ -756,6 +834,7 @@ class BreadcrumbSpoolCapture:
             parsed += 1
             emitted += 1
         if irrelevant:
+            self._unsupported_records += irrelevant
             if not self._emit(
                 "unsupported", cursor_start=start, cursor_end=state.cursor, bytes_read=len(data), records=irrelevant,
                 reason="unsupported", health=health, irrelevant=irrelevant,
@@ -802,15 +881,26 @@ class BreadcrumbSpoolCapture:
             raise
         total = emitted = 0
         budget_hit = False
+        # A single read is deliberately capped at 8 KiB, but a poll must keep
+        # draining until its configured byte/time budget is reached.  Without
+        # this loop a nominal 256 KiB poll silently became an 8 KiB poll.
         for state in list(self._files.values()):
-            remaining = self.max_bytes - total
-            read, count, _irrelevant, hit = self._read_state(state, remaining, started, h0)
-            total += read
-            emitted += count
-            budget_hit = budget_hit or hit
-            if budget_hit or total >= self.max_bytes or (time.monotonic() - started) * 1000 >= self.max_millis:
-                budget_hit = True
-                break
+            while True:
+                remaining = self.max_bytes - total
+                read, count, _irrelevant, hit = self._read_state(state, remaining, started, h0)
+                total += read
+                self._source_bytes += read
+                emitted += count
+                budget_hit = budget_hit or hit
+                if (
+                    budget_hit
+                    or total >= self.max_bytes
+                    or (time.monotonic() - started) * 1000 >= self.max_millis
+                    or read == 0
+                ):
+                    if total >= self.max_bytes or (time.monotonic() - started) * 1000 >= self.max_millis:
+                        budget_hit = True
+                    break
         try:
             h1 = self._read_health()
         except ObserverCaptureError:
@@ -836,6 +926,26 @@ class BreadcrumbSpoolCapture:
                 budget=self._budget_snapshot(bytes_read=total, elapsed_ms=elapsed),
             )
         return emitted
+
+    def projection(self) -> dict[str, object]:
+        """Return bounded reader state without exposing source labels or paths."""
+        return {
+            "armed": self._armed,
+            "terminal": self._terminal,
+            "session_hash": _hash(self._session),
+            "polls": self._poll_index,
+            "records": self._emitted_records,
+            "bytes": self._emitted_bytes,
+            "source_bytes": self._source_bytes,
+            "unsupported": self._unsupported_records,
+            "discarded": self._unsupported_records,
+            "loss": {"count": self._loss_count, "reason": self._loss_reason},
+            "budget": self._budget_snapshot(),
+            "health": {
+                key: _counter(self._last_health.get(key))
+                for key in ("lost", "unknown", "unresolved", "rotation_count")
+            },
+        }
 
     def stop(self, *, health: Mapping[str, object] | None = None) -> None:
         if self._terminal:

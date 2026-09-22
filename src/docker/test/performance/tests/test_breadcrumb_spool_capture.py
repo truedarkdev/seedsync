@@ -469,3 +469,73 @@ def test_time_budget_is_reported_without_claiming_loss(tmp_path: Path) -> None:
     records = _artifacts(artifact)
     assert any(item["capture"].get("reason") == "budget" for item in records)
     assert not any(item["capture"].get("state") == "loss" for item in records)
+
+
+def test_queue_readiness_source_projection_is_finite_and_redacted(tmp_path: Path) -> None:
+    spool, artifact = _prepare(tmp_path)
+    row = _row(
+        category="queue.readiness", event_type="callback", stage="queue_readiness", label="queue_callback",
+        details={
+            "schema": "queue_readiness.v1", "phase": "entry",
+            "outcome": "failure", "origin": "manual", "callback_index": 0,
+            "callback_count": 1, "error_code": 503, "private_detail": "do-not-copy",
+        },
+    )
+    reader = _reader(spool, artifact)
+    try:
+        reader.start()
+        (spool / "breadcrumbs.jsonl").write_bytes(row)
+        assert reader.poll() == 1
+    finally:
+        reader.close()
+    text = artifact.read_text(encoding="utf-8")
+    assert "do-not-copy" not in text
+    projection = next(item["capture"]["projection"] for item in _artifacts(artifact) if item["capture"].get("state") == "record")
+    assert projection["queue_readiness"] == {
+        "schema": "queue_readiness.v1", "event": "queue_callback", "phase": "entry",
+        "outcome": "failure", "origin": "manual", "reason": "unknown", "callback_index": 0,
+        "callback_count": 1, "error_code": 503,
+    }
+
+
+def test_model_page_snapshot_source_projection_is_finite_and_redacted(tmp_path: Path) -> None:
+    spool, artifact = _prepare(tmp_path)
+    row = _row(
+        category="model_page_snapshot", event_type="diagnostic", stage="model_page_snapshot",
+        details={
+            "scope_version": 4, "global_version": 9, "lock_wait_ms": 1,
+            "lock_hold_ms": 2, "snapshot_elapsed_ms": 3, "outcome": "success",
+            "secret_detail": "do-not-copy",
+        }, label="private-message",
+    )
+    reader = _reader(spool, artifact)
+    try:
+        reader.start()
+        (spool / "breadcrumbs.jsonl").write_bytes(row)
+        assert reader.poll() == 1
+    finally:
+        reader.close()
+    text = artifact.read_text(encoding="utf-8")
+    assert "private-message" not in text and "do-not-copy" not in text
+    projection = next(item["capture"]["projection"] for item in _artifacts(artifact) if item["capture"].get("state") == "record")
+    assert projection["model_page_snapshot"] == {
+        "outcome": "success", "scope_version": 4, "global_version": 9,
+        "lock_wait_ms": 1, "lock_hold_ms": 2, "snapshot_elapsed_ms": 3,
+    }
+
+
+def test_poll_drains_beyond_single_eight_kib_chunk_with_budget_receipt(tmp_path: Path) -> None:
+    spool, artifact = _prepare(tmp_path)
+    payload = b"".join(_row(created=index, details={"bytes_done": index, "bytes_total": 100000}) for index in range(1, 220))
+    assert len(payload) > 8192
+    reader = _reader(spool, artifact, max_bytes=64 * 1024, max_millis=250, max_records=512, max_output_bytes=512 * 1024)
+    try:
+        reader.start()
+        # Bytes present before H0 are history and intentionally excluded.
+        (spool / "breadcrumbs.jsonl").write_bytes(payload)
+        reader.poll()
+        projection = reader.projection()
+    finally:
+        reader.close()
+    assert projection["source_bytes"] > 8192
+    assert projection["source_bytes"] <= 64 * 1024

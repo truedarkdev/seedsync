@@ -116,6 +116,14 @@ LABEL org.opencontainers.image.source="https://github.com/truedarkdev/seedsync"
 COPY --from=seedsync_build_angular /build/dist /app/html
 COPY src/docker/build/docker-image/entrypoint.sh /scripts/
 COPY src/docker/build/docker-image/seedsync-py-spy /usr/local/sbin/seedsync-py-spy
+# Inert, root-invoked Incoming recovery capture tooling.  Nothing in the
+# application entrypoint imports or executes these helpers by default.
+COPY src/docker/test/performance/incoming_queue_capture_runner.py \
+     src/docker/test/performance/incoming_recovery_observer.py \
+     src/docker/test/performance/incoming_live_queue_runner.py \
+     src/docker/test/performance/incoming_sftp_source_manifest.py \
+     src/docker/test/performance/breadcrumb_spool_capture.py \
+     /opt/seedsync/performance/
 RUN set -eux; \
     python3 -m pip uninstall -y pip setuptools
 

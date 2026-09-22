@@ -253,6 +253,92 @@ def _breadcrumb_effectively_enabled(trace: object, category: str, level: str = "
     return True
 
 
+_MODEL_PAGE_SNAPSHOT_TRACE_CATEGORY = "model_page_snapshot"
+_MODEL_PAGE_SNAPSHOT_TRACE_LEVEL = "debug"
+_MODEL_PAGE_SNAPSHOT_MAX_DURATION_MS = 2_147_483_647
+_MODEL_PAGE_SNAPSHOT_OUTCOMES = frozenset({"success", "error"})
+_MODEL_PAGE_SNAPSHOT_ERROR_CLASSES = frozenset({
+    "cancelled", "model_error", "runtime_error", "unknown",
+})
+
+
+def _model_page_snapshot_trace_enabled(controller: object) -> bool:
+    """Require an explicit opt-in for the per-page snapshot diagnostic."""
+    context = getattr(controller, "_Controller__context", None)
+    trace = getattr(context, "breadcrumb_trace", None)
+    if not _breadcrumb_effectively_enabled(
+            trace, _MODEL_PAGE_SNAPSHOT_TRACE_CATEGORY, _MODEL_PAGE_SNAPSHOT_TRACE_LEVEL):
+        return False
+    explicitly_configured = getattr(trace, "is_explicitly_configured", None)
+    if not callable(explicitly_configured):
+        return False
+    try:
+        return explicitly_configured(_MODEL_PAGE_SNAPSHOT_TRACE_CATEGORY) is True
+    except Exception:
+        return False
+
+
+def _model_page_snapshot_error_class(error: BaseException) -> str:
+    """Project page failures to a fixed, privacy-safe diagnostic enum."""
+    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+        return "cancelled"
+    if isinstance(error, ModelError):
+        return "model_error"
+    if isinstance(error, RuntimeError):
+        return "runtime_error"
+    return "unknown"
+
+
+def _model_page_snapshot_duration_ms(started_ns: Optional[int], ended_ns: Optional[int]) -> Optional[int]:
+    if type(started_ns) is not int or type(ended_ns) is not int:
+        return None
+    return min(
+        _MODEL_PAGE_SNAPSHOT_MAX_DURATION_MS,
+        max(0, (ended_ns - started_ns) // 1_000_000),
+    )
+
+
+def _record_model_page_snapshot(
+        controller: object,
+        scope_id: object,
+        scope_version: object,
+        global_version: object,
+        lock_wait_ms: Optional[int],
+        lock_hold_ms: Optional[int],
+        snapshot_elapsed_ms: Optional[int],
+        outcome: str,
+        error_class: str,
+) -> None:
+    """Emit one fixed-schema page snapshot record after model-lock release."""
+    context = getattr(controller, "_Controller__context", None)
+    trace = getattr(context, "breadcrumb_trace", None)
+    try:
+        details: dict[str, object] = {
+            "scope_version": scope_version
+            if type(scope_version) is int and 0 <= scope_version <= _MODEL_PAGE_SNAPSHOT_MAX_DURATION_MS
+            else None,
+            "global_version": global_version
+            if type(global_version) is int and 0 <= global_version <= _MODEL_PAGE_SNAPSHOT_MAX_DURATION_MS
+            else None,
+            "lock_wait_ms": lock_wait_ms,
+            "lock_hold_ms": lock_hold_ms,
+            "snapshot_elapsed_ms": snapshot_elapsed_ms,
+            "outcome": outcome if outcome in _MODEL_PAGE_SNAPSHOT_OUTCOMES else "error",
+        }
+        if details["outcome"] == "error":
+            details["error_class"] = error_class if error_class in _MODEL_PAGE_SNAPSHOT_ERROR_CLASSES else "unknown"
+        trace.record(
+            "controller", "model_page_snapshot", details,
+            stage="model_page_snapshot", event_type="diagnostic",
+            corr_id=opaque_trace_correlation(scope_id), trace_scope="flow",
+            category=_MODEL_PAGE_SNAPSHOT_TRACE_CATEGORY,
+            level=_MODEL_PAGE_SNAPSHOT_TRACE_LEVEL,
+        )
+    except Exception:
+        # Diagnostics must never affect page delivery or its production error.
+        return
+
+
 def _authority_handoff_trace_enabled(controller: object) -> bool:
     context = getattr(controller, "_Controller__context", None)
     return _breadcrumb_effectively_enabled(
@@ -4574,9 +4660,71 @@ class Controller:
         parent_file_id: Optional[str] = None, sort_mode: int = 1, status_filter: Optional[str] = None,
         name_filter: Optional[str] = None,
     ) -> dict[str, object]:
-        with self.__model_lock:
-            return self.__get_model_page_locked(
-                scope_id, limit, cursor_file_id, cursor_version, cursor_sort_key, parent_file_id, sort_mode, status_filter, name_filter
+        if not _model_page_snapshot_trace_enabled(self):
+            with self.__model_lock:
+                return self.__get_model_page_locked(
+                    scope_id, limit, cursor_file_id, cursor_version, cursor_sort_key,
+                    parent_file_id, sort_mode, status_filter, name_filter,
+                )
+
+        wait_started_ns = time.monotonic_ns()
+        lock_acquired_ns: Optional[int] = None
+        snapshot_started_ns: Optional[int] = None
+        snapshot_finished_ns: Optional[int] = None
+        lock_hold_finished_ns: Optional[int] = None
+        page: Optional[dict[str, object]] = None
+        scope_version: object = None
+        global_version: object = None
+        outcome = "success"
+        error_class = "unknown"
+        acquired = False
+        try:
+            try:
+                acquired = bool(self.__model_lock.acquire())
+            except BaseException as error:
+                outcome = "error"
+                error_class = _model_page_snapshot_error_class(error)
+                raise
+            if not acquired:
+                outcome = "error"
+                error_class = "unknown"
+                raise RuntimeError("model lock acquisition failed")
+            lock_acquired_ns = time.monotonic_ns()
+            snapshot_started_ns = lock_acquired_ns
+            try:
+                page = self.__get_model_page_locked(
+                    scope_id, limit, cursor_file_id, cursor_version, cursor_sort_key,
+                    parent_file_id, sort_mode, status_filter, name_filter,
+                )
+                if isinstance(page, dict):
+                    scope_version = page.get("model_version")
+                    global_version = page.get("_global_model_version")
+                return page
+            except BaseException as error:
+                outcome = "error"
+                error_class = _model_page_snapshot_error_class(error)
+                raise
+            finally:
+                snapshot_finished_ns = time.monotonic_ns()
+                lock_hold_finished_ns = snapshot_finished_ns
+                self.__model_lock.release()
+                acquired = False
+        finally:
+            if acquired:
+                # A production RLock acquire is always successful. Keep this
+                # fallback balanced for narrow test doubles without masking a
+                # page failure with diagnostic cleanup.
+                try:
+                    lock_hold_finished_ns = time.monotonic_ns()
+                    self.__model_lock.release()
+                except Exception:
+                    pass
+            _record_model_page_snapshot(
+                self, scope_id, scope_version, global_version,
+                _model_page_snapshot_duration_ms(wait_started_ns, lock_acquired_ns),
+                _model_page_snapshot_duration_ms(lock_acquired_ns, lock_hold_finished_ns),
+                _model_page_snapshot_duration_ms(snapshot_started_ns, snapshot_finished_ns),
+                outcome, error_class,
             )
 
     def get_model_page_and_add_listener(
