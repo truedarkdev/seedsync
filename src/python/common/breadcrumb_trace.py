@@ -5252,17 +5252,46 @@ class BreadcrumbTraceCollector:
             # live deques remain the deletion targets.
             entries = tuple(self.__entries)
             protected = self.__protected_indices(entries)
-            candidate_indices = [index for index in range(len(entries)) if index not in protected]
-            if not candidate_indices:
-                candidate_indices = list(range(len(entries)))
-            category_counts: Dict[str, int] = {}
-            for index in candidate_indices:
-                category = str(entries[index].get("category") or "unknown")
-                category_counts[category] = category_counts.get(category, 0) + 1
-            # Prefer the oldest record from the noisiest eligible category.
-            chosen_index = max(candidate_indices, key=lambda index: (
-                category_counts[str(entries[index].get("category") or "unknown")], -index,
-            ))
+            # Count and select in one pass.  Keep the all-protected fallback
+            # separate while it is still possible, because the fallback uses
+            # all entries rather than only the eligible set.
+            category_counts: Dict[str, tuple[int, int]] = {}
+            fallback_counts: Dict[str, tuple[int, int]] = {}
+            chosen_index: Optional[int] = None
+            chosen_count = 0
+            fallback_index: Optional[int] = None
+            fallback_count = 0
+            for index, entry in enumerate(entries):
+                category = str(entry.get("category") or "unknown")
+                if index not in protected:
+                    count, oldest_index = category_counts.get(category, (0, index))
+                    count += 1
+                    category_counts[category] = (count, oldest_index)
+                    if (
+                        chosen_index is None
+                        or count > chosen_count
+                        or count == chosen_count and oldest_index < chosen_index
+                    ):
+                        chosen_index = oldest_index
+                        chosen_count = count
+                    continue
+                if chosen_index is None:
+                    count, oldest_index = fallback_counts.get(category, (0, index))
+                    count += 1
+                    fallback_counts[category] = (count, oldest_index)
+                    if (
+                        fallback_index is None
+                        or count > fallback_count
+                        or count == fallback_count and oldest_index < fallback_index
+                    ):
+                        fallback_index = oldest_index
+                        fallback_count = count
+            # If every entry was protected, preserve the existing fallback:
+            # choose the oldest record from the noisiest category overall.
+            if chosen_index is None:
+                chosen_index = fallback_index
+            if chosen_index is None:
+                break
             evicted = entries[chosen_index]
             evicted_size = self.__entry_sizes[chosen_index]
             del self.__entries[chosen_index]

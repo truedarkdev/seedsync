@@ -452,34 +452,54 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         # signature lookup after the pass completes.
         self.assertEqual(1, IndexedReadCountingDeque.indexed_reads)
 
-    def test_eviction_matches_pre_change_selection_for_mixed_retention_stream(self):
+    def test_eviction_matches_frozen_baseline_oracle_for_mixed_and_fallback_streams(self):
         policy = {"retention": {"protected_categories": ["protected"]}}
-        mixed_stream = [
-            {"message": "noise-a", "category": "noise"},
-            {"message": "noise-b", "category": "noise"},
-            {"message": "quiet", "category": "quiet"},
-            {"message": "tie-a", "category": "tie"},
-            {"message": "tie-b", "category": "tie"},
-            {"message": "decision-old", "category": "decision", "event_type": "decision"},
-            {"message": "decision-new", "category": "decision", "event_type": "decision"},
-            {"message": "protected-level", "category": "level-protected", "level": "warning"},
-            {"message": "protected-category", "category": "protected.audit"},
-            {
-                "message": "failure", "category": "failure", "event_type": "failure",
-                "level": "error", "_coalesce_key": "failure",
-            },
-            {
-                "message": "failure", "category": "failure", "event_type": "failure",
-                "level": "error", "_coalesce_key": "failure",
-            },
-            {"message": "protected-tail", "category": "tail-protected", "level": "warning"},
-        ]
-        all_protected_stream = [
-            {"message": "protected-level-a", "category": "level-a", "level": "warning"},
-            {"message": "protected-level-b", "category": "level-b", "level": "error"},
-            {"message": "protected-category", "category": "protected.audit"},
-            {"message": "protected-decision", "category": "decision", "event_type": "decision"},
-        ]
+        cases = (
+            (
+                [
+                    {"message": "noise-a", "category": "noise"},
+                    {"message": "noise-b", "category": "noise"},
+                    {"message": "quiet", "category": "quiet"},
+                    {"message": "tie-a", "category": "tie"},
+                    {"message": "tie-b", "category": "tie"},
+                    {"message": "decision-old", "category": "decision", "event_type": "decision"},
+                    {"message": "decision-new", "category": "decision", "event_type": "decision"},
+                    {"message": "protected-level", "category": "level-protected", "level": "warning"},
+                    {"message": "protected-category", "category": "protected.audit"},
+                    {
+                        "message": "failure", "category": "failure", "event_type": "failure",
+                        "level": "error", "_coalesce_key": "failure",
+                    },
+                    {
+                        "message": "failure", "category": "failure", "event_type": "failure",
+                        "level": "error", "_coalesce_key": "failure",
+                    },
+                    {"message": "protected-tail", "category": "tail-protected", "level": "warning"},
+                ],
+                3,
+                [
+                    ("noise-a", 1, 1), ("tie-a", 4, 4), ("noise-b", 2, 2),
+                    ("quiet", 3, 3), ("tie-b", 5, 5), ("decision-old", 6, 6),
+                    ("decision-new", 7, 7), ("protected-level", 8, 8),
+                ],
+                ["protected-category", "failure", "protected-tail"],
+            ),
+            (
+                [
+                    {"message": "protected-level-a", "category": "level-a", "level": "warning"},
+                    {"message": "protected-level-b", "category": "level-b", "level": "error"},
+                    {"message": "protected-category", "category": "protected.audit"},
+                    {"message": "protected-decision", "category": "decision", "event_type": "decision"},
+                ],
+                1,
+                [
+                    ("protected-level-a", 1, 1),
+                    ("protected-level-b", 2, 2),
+                    ("protected-category", 3, 3),
+                ],
+                ["protected-decision"],
+            ),
+        )
 
         def populate(collector, stream):
             with patch("common.breadcrumb_trace.time.time_ns", return_value=1_000_000_000):
@@ -488,134 +508,160 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
                     message = metadata.pop("message")
                     collector.record("worker", message, **metadata)
 
-        def reference_evict(collector):
-            evictions = []
-            fallback_count = 0
-            entries_name = "_BreadcrumbTraceCollector__entries"
-            sizes_name = "_BreadcrumbTraceCollector__entry_sizes"
-            while getattr(collector, entries_name) and (
-                collector._BreadcrumbTraceCollector__retained_bytes
-                > collector._BreadcrumbTraceCollector__memory_budget_bytes
-                or collector._BreadcrumbTraceCollector__max_entries is not None
-                and len(getattr(collector, entries_name))
-                > collector._BreadcrumbTraceCollector__max_entries
-            ):
-                entries = getattr(collector, entries_name)
-                sizes = getattr(collector, sizes_name)
-                retention = collector._BreadcrumbTraceCollector__policy["retention"]
-                latest_decision = {}
-                for index, entry in enumerate(entries):
-                    if entry.get("event_type") in retention["latest_decision_event_types"]:
-                        latest_decision[str(entry.get("category") or "unknown")] = index
-                protected = set(latest_decision.values())
-                for index, entry in enumerate(entries):
-                    if (
-                        entry.get("level") in retention["protected_levels"]
-                        or collector._BreadcrumbTraceCollector__is_category_protected(
-                            str(entry.get("category") or ""),
-                        )
-                    ):
-                        protected.add(index)
-                candidate_indices = [index for index in range(len(entries)) if index not in protected]
-                if not candidate_indices:
-                    fallback_count += 1
-                    candidate_indices = list(range(len(entries)))
-                category_counts = {}
-                for index in candidate_indices:
-                    category = str(entries[index].get("category") or "unknown")
-                    category_counts[category] = category_counts.get(category, 0) + 1
-                chosen_index = max(candidate_indices, key=lambda index: (
-                    category_counts[str(entries[index].get("category") or "unknown")], -index,
-                ))
-                evicted = entries[chosen_index]
-                evicted_size = sizes[chosen_index]
-                evictions.append((
-                    evicted["message"],
-                    int(evicted.get("version", 0)),
-                    int(evicted.get("last_seen_version", evicted.get("version", 0))),
-                ))
-                del entries[chosen_index]
-                del sizes[chosen_index]
-                for signature, candidate in tuple(collector._BreadcrumbTraceCollector__coalesce_entries.items()):
-                    if candidate is evicted:
-                        del collector._BreadcrumbTraceCollector__coalesce_entries[signature]
-                collector._BreadcrumbTraceCollector__retained_bytes -= evicted_size
-                collector._BreadcrumbTraceCollector__evicted_count += 1
-                collector._BreadcrumbTraceCollector__category_counter(evicted)["evicted"] += 1
-                collector._BreadcrumbTraceCollector__record_gap_range(
-                    int(evicted.get("version", 0)),
-                    int(evicted.get("last_seen_version", evicted.get("version", 0))),
-                    "evicted",
-                )
-                collector._BreadcrumbTraceCollector__window_truncated_pending = True
-            collector._BreadcrumbTraceCollector__retained_bytes = max(
-                0, collector._BreadcrumbTraceCollector__retained_bytes,
-            )
-            collector._BreadcrumbTraceCollector__last_signature = (
-                collector._BreadcrumbTraceCollector__signature(
-                    getattr(collector, entries_name)[-1],
-                )
-                if getattr(collector, entries_name) else None
-            )
-            collector._BreadcrumbTraceCollector__refresh_failure_locked()
-            return evictions, fallback_count
-
-        def compare_stream(stream, max_entries):
-            candidate = BreadcrumbTraceCollector(lambda: True, max_entries=None, policy=policy)
-            reference = BreadcrumbTraceCollector(lambda: True, max_entries=None, policy=policy)
-            populate(candidate, stream)
-            populate(reference, stream)
-            before = candidate.snapshot()
-            self.assertEqual(
-                1 if stream is mixed_stream else 0,
-                before["accounting"]["coalesced_count"],
-            )
-            if stream is mixed_stream:
-                failure_entries = [entry for entry in before["entries"] if entry["message"] == "failure"]
-                self.assertEqual(1, len(failure_entries))
-                self.assertEqual(2, failure_entries[0]["repeat_count"])
-
-            candidate._BreadcrumbTraceCollector__max_entries = max_entries
-            reference._BreadcrumbTraceCollector__max_entries = max_entries
-            expected_evictions, fallback_count = reference_evict(reference)
+        # Immutable outputs captured from the current pre-change retention
+        # behavior.  This oracle deliberately does not reproduce candidate
+        # selection logic, so a refactor cannot make the test agree with itself.
+        for stream, max_entries, expected_evictions, expected_remaining in cases:
+            collector = BreadcrumbTraceCollector(lambda: True, max_entries=None, policy=policy)
+            populate(collector, stream)
+            collector._BreadcrumbTraceCollector__max_entries = max_entries
             version_to_message = {
                 int(entry["version"]): entry["message"]
-                for entry in candidate._BreadcrumbTraceCollector__entries
+                for entry in collector._BreadcrumbTraceCollector__entries
             }
             actual_evictions = []
             record_gap = "_BreadcrumbTraceCollector__record_gap_range"
-            original_record_gap = getattr(candidate, record_gap)
+            original_record_gap = getattr(collector, record_gap)
 
             def capture_gap(start, end, reason):
                 if reason == "evicted":
                     actual_evictions.append((version_to_message[start], start, end))
                 return original_record_gap(start, end, reason)
 
-            with patch.object(candidate, record_gap, side_effect=capture_gap):
-                self.assertTrue(candidate._BreadcrumbTraceCollector__evict_to_budget())
+            with patch.object(collector, record_gap, side_effect=capture_gap):
+                self.assertTrue(collector._BreadcrumbTraceCollector__evict_to_budget())
 
             self.assertEqual(expected_evictions, actual_evictions)
-            candidate_payload = candidate.snapshot()
-            reference_payload = reference.snapshot()
             self.assertEqual(
-                [(entry["version"], entry["message"], entry["repeat_count"])
-                 for entry in reference_payload["entries"]],
-                [(entry["version"], entry["message"], entry["repeat_count"])
-                 for entry in candidate_payload["entries"]],
+                expected_remaining,
+                [entry["message"] for entry in collector._BreadcrumbTraceCollector__entries],
             )
-            for key in (
-                "retained_bytes", "latest_failure_version", "latest_failure_entry",
-                "failure_summary", "gaps", "gap_watermark_to_version", "window_truncated",
-                "evictions", "accounting",
-            ):
-                self.assertEqual(reference_payload[key], candidate_payload[key], key)
-            return fallback_count, len(expected_evictions)
 
-        mixed_fallbacks, mixed_evictions = compare_stream(mixed_stream, max_entries=3)
-        self.assertGreater(mixed_fallbacks, 0)
-        self.assertEqual(8, mixed_evictions)
-        all_fallbacks, all_evictions = compare_stream(all_protected_stream, max_entries=1)
-        self.assertEqual(all_evictions, all_fallbacks)
+    def test_eviction_ties_use_oldest_and_falsey_categories_share_unknown_bucket(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=None)
+        for index in range(4):
+            collector.record("worker", "event-{}".format(index), category="seed")
+
+        entries = collector._BreadcrumbTraceCollector__entries
+        entries[0]["category"] = None
+        entries[1]["category"] = False
+        entries[2]["category"] = "other"
+        entries[3]["category"] = "other"
+        collector._BreadcrumbTraceCollector__max_entries = 2
+        version_to_message = {
+            int(entry["version"]): entry["message"] for entry in entries
+        }
+        evictions = []
+        record_gap = "_BreadcrumbTraceCollector__record_gap_range"
+        original_record_gap = getattr(collector, record_gap)
+
+        def capture_gap(start, end, reason):
+            if reason == "evicted":
+                evictions.append((version_to_message[start], start, end))
+            return original_record_gap(start, end, reason)
+
+        with patch.object(collector, record_gap, side_effect=capture_gap):
+            self.assertTrue(collector._BreadcrumbTraceCollector__evict_to_budget())
+
+        self.assertEqual([("event-0", 1, 1), ("event-2", 3, 3)], evictions)
+        self.assertEqual(["event-1", "event-3"], [
+            entry["message"] for entry in collector._BreadcrumbTraceCollector__entries
+        ])
+
+    def test_eviction_recomputes_candidates_after_retention_policy_transition(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=None,
+            policy={"retention": {"protected_categories": ["keep"]}},
+        )
+        collector.record("worker", "keep-old", category="keep")
+        collector.record("worker", "noise-a", category="noise")
+        collector.record("worker", "noise-b", category="noise")
+        collector.record("worker", "keep-new", category="keep")
+        collector.apply_policy({"retention": {"protected_categories": ["noise"]}})
+        collector._BreadcrumbTraceCollector__max_entries = 2
+
+        evictions = []
+        record_gap = "_BreadcrumbTraceCollector__record_gap_range"
+        original_record_gap = getattr(collector, record_gap)
+
+        def capture_gap(start, end, reason):
+            if reason == "evicted":
+                evictions.append(start)
+            return original_record_gap(start, end, reason)
+
+        with patch.object(collector, record_gap, side_effect=capture_gap):
+            self.assertTrue(collector._BreadcrumbTraceCollector__evict_to_budget())
+
+        self.assertEqual([1, 4], evictions)
+        self.assertEqual(["noise-a", "noise-b"], [
+            entry["message"] for entry in collector._BreadcrumbTraceCollector__entries
+        ])
+
+    def test_oversized_drop_and_multi_eviction_keep_accounting_unchanged(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True, max_entries=1, memory_budget_bytes=768,
+        )
+        self.assertEqual(
+            "dropped",
+            collector.record("worker", "oversized", {"payload": "x" * 10_000}),
+        )
+        for index in range(3):
+            self.assertEqual("retained", collector.record("worker", "event-{}".format(index)))
+
+        payload = collector.snapshot()
+        self.assertEqual(["event-2"], [
+            entry["message"] for entry in payload["entries"]
+        ])
+        self.assertEqual(1, payload["accounting"]["oversized_dropped_count"])
+        self.assertEqual(2, payload["accounting"]["evicted_count"])
+        self.assertTrue(any(gap["reason"] == "oversized" for gap in payload["gaps"]))
+        self.assertTrue(any(gap["reason"] == "evicted" for gap in payload["gaps"]))
+
+    def test_eviction_removes_coalescing_identity_and_preserves_ranges(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+        collector.record("worker", "first", category="alpha", _coalesce_key="stable")
+        collector.record("worker", "second", category="beta", _coalesce_key="other")
+        collector.record("worker", "first", category="alpha", _coalesce_key="stable")
+        collector.record("worker", "third", category="gamma", _coalesce_key="third")
+
+        self.assertEqual("retained", collector.record(
+            "worker", "first", category="alpha", _coalesce_key="stable",
+        ))
+        payload = collector.snapshot()
+        self.assertEqual(["third", "first"], [entry["message"] for entry in payload["entries"]])
+        self.assertEqual([1, 1], [entry["repeat_count"] for entry in payload["entries"]])
+        self.assertEqual(
+            {"from_version": 1, "to_version": 3, "reason": "evicted"},
+            next(gap for gap in payload["gaps"] if gap["reason"] == "evicted"),
+        )
+        self.assertIs(
+            collector._BreadcrumbTraceCollector__coalesce_entries["coalesce:stable"],
+            collector._BreadcrumbTraceCollector__entries[-1],
+        )
+
+    def test_eviction_does_not_change_durable_admission_or_loss_accounting(self):
+        class RecordingSpool:
+            def __init__(self):
+                self.calls = []
+
+            def enqueue(self, entry, is_critical):
+                self.calls.append((entry["message"], is_critical))
+                return len(self.calls) == 1
+
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=1)
+        spool = RecordingSpool()
+        collector._BreadcrumbTraceCollector__durable_spool = spool
+
+        self.assertEqual("retained", collector.record("worker", "first"))
+        self.assertEqual("retained", collector.record("worker", "second"))
+
+        self.assertEqual(["first", "second"], [call[0] for call in spool.calls])
+        self.assertEqual(1, collector._BreadcrumbTraceCollector__durable_enqueue_rejected_count)
+        self.assertEqual(["second"], [
+            entry["message"] for entry in collector.snapshot()["entries"]
+        ])
+        self.assertEqual(1, collector.snapshot()["accounting"]["evicted_count"])
 
     def test_protected_indices_snapshot_matches_oracle_and_recomputes_after_policy_replace(self):
         collector = BreadcrumbTraceCollector(
