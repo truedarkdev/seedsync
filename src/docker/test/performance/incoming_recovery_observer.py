@@ -394,7 +394,7 @@ _ARTIFACT_ALLOWED_KEYS = frozenset({
     "status_code", "body_reason", "request_index", "response_kind", "root_state",
     "root_found", "target_verified", "root_verified", "first_failure", "evidence",
     "error", "failure", "capture_failure", "queue_evidence", "scan_lifecycle", "sample_index",
-    "endpoint_class", "request_latency_ms", "classification", "reason", "request", "diagnostics",
+    "endpoint_class", "request_latency_ms", "classification", "reason", "request", "diagnostics", "capture",
 })
 _ARTIFACT_SAFE_REASONS = _QUEUE_PREFLIGHT_REASONS | frozenset({
     "queue_accepted", "success_response", "response_unavailable", "path_pair_relocation",
@@ -416,6 +416,192 @@ def _safe_body_reason(value: object) -> str:
         if len(code) == 3 and code.isdigit() and 100 <= int(code) <= 599:
             return value
     return "unknown"
+
+
+_CAPTURE_SOURCES = frozenset({
+    "controller", "model_updater", "status", "scanner", "scanner_process", "lftp", "web", "system", "unknown",
+})
+_CAPTURE_EVENTS = frozenset({
+    "queue", "callback", "status", "completion", "progress", "state_transition", "failure", "diagnostic", "breadcrumb", "unknown",
+})
+_CAPTURE_CATEGORIES = frozenset({
+    "queue.lifecycle", "queue.admission", "queue.executor", "queue.authority", "queue.readiness", "queue.exclusion",
+    "model.lifecycle", "model.progress", "model.publication", "model.finalization", "model.root_progress", "status",
+    "transfer.lftp", "transfer.lftp.executor", "transfer.lftp.membership", "transfer.lftp.status", "transfer.stop",
+    "scan.authority", "scan.failure", "scan.result", "scan.terminal_publication", "final_move.publication",
+    "finalization.child", "controller", "scanner_process", "lftp.sidecar", "lftp.command", "lftp.status",
+    "completion.gate", "transfer.lftp.command", "root.progress", "unknown",
+})
+_CAPTURE_STAGES = frozenset({
+    "admission", "dispatch", "publication", "terminal", "queue_lifecycle", "queue_authority_handoff", "queue_readiness",
+    "queue_exclusion", "model", "model_progress", "model_delta", "model_update", "model_publication", "model_summary",
+    "model_finalization", "scan", "scan_adoption", "scan_authority", "scan_accumulator", "extract", "controller",
+    "controller_boundary", "persist_transaction", "lifecycle", "completion_gate", "final_move_publication",
+    "finalization_child", "transfer_stop", "command", "lftp_executor", "lftp_sidecar_validation",
+    "lftp_path_pair_annotation", "lftp_status_poll", "lftp_command_boundary", "scoped_model_stream", "retirement_cleanup",
+    "path_pair_runtime", "root_progress_status", "completion_gate", "lftp_command_boundary", "ordinary", "refresh", "finish", "transfer", "unknown",
+})
+_CAPTURE_KINDS = frozenset({"event", "progress", "status", "completion", "unknown"})
+_CAPTURE_LEVELS = frozenset({"info", "warning", "error", "critical", "debug", "unknown"})
+_CAPTURE_NUMBER_KEYS = frozenset({
+    "attempt", "accepted", "age_ms", "bytes", "bytes_done", "bytes_total", "completed", "count", "duration_ms",
+    "elapsed_ms", "expected_size", "files", "files_done", "files_total", "generation", "matched", "pending",
+    "percent", "processed", "progress", "queue_depth", "retries", "scanned", "size", "status_code", "total",
+    "transferred", "unknown", "unresolved", "version", "written",
+})
+_CAPTURE_LIFECYCLE_EVENTS = frozenset({
+    "queue_admitted", "executor_start", "executor_return", "executor_error", "lftp_child", "status_membership",
+    "root_default", "queue_retired", "controller_force_close", "operation_scheduled", "operation_retired", "unknown",
+})
+_CAPTURE_LIFECYCLE_PHASES = frozenset({
+    "admission", "executor", "lftp", "status", "publication", "retirement", "teardown", "precheck", "drain", "send",
+    "prompt", "connecting", "error_recovery", "unknown",
+})
+_CAPTURE_LIFECYCLE_OUTCOMES = frozenset({
+    "accepted", "entered", "returned", "success", "observed", "present", "absent", "ambiguous", "published", "retired",
+    "scheduled", "error", "unknown",
+})
+_CAPTURE_LIFECYCLE_ERRORS = frozenset({
+    "none", "eof", "exit", "signal", "timeout", "command_error", "parser_error", "terminal_backlog", "unhealthy_snapshot", "unknown",
+})
+_CAPTURE_LIFECYCLE_BOUNDARIES = frozenset({
+    "queue_admission", "executor", "retirement", "lftp_command", "status_membership", "root_publication", "queue_retirement", "teardown", "unknown",
+})
+_CAPTURE_LIFECYCLE_ENUMS = {
+    "status_health": {"healthy", "unhealthy", "unknown"}, "membership": {"present", "absent", "ambiguous", "unknown"},
+    "status_parse": {"accepted_empty", "unknown"}, "status_result_shape": {"empty_or_prompt", "queue_done", "job_present", "ambiguous", "parse_error", "unknown"},
+    "status_recovery": {"none", "connection_grace", "unknown"}, "status_state": {"queued", "running", "none", "unknown"},
+    "membership_reason": {"filtered", "none", "unknown"}, "root_state": {"default", "unknown"}, "coverage": {"incomplete", "unknown"},
+    "publication_outcome": {"default_incomplete", "unknown"}, "read_buffer_source": {"public_buffer", "private_buffer", "unavailable"},
+    "duration_bucket": {"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+", "unknown"},
+    "read_buffer_byte_length_bucket": {"0", "1-64", "65-1024", "1025-16384", "16385-65536", "65537+", "unknown"},
+    "status_count_bucket": {"0", "1", "2+", "unknown"}, "command_kind": {"queue", "status", "unknown"},
+    "command_outcome": {"success", "prompt_timeout", "eof", "error", "unknown"}, "reaped": {"signal", "exit", "alive", "not_alive", "unknown"},
+    "future_state": {"finalized", "pending", "unknown"},
+}
+_CAPTURE_LIFECYCLE_BOOLS = {
+    "fresh", "healthy", "process_alive_before", "process_alive_after", "process_alive", "pre_send_drain_queue_done",
+    "pre_send_drain_job_or_progress", "pre_send_drain_prompt_or_echo",
+}
+_CAPTURE_GATE_DECISIONS = {"blocked", "no_retirement", "excluded", "pending", "attempt_eligible", "deferred", "unknown"}
+_CAPTURE_GATE_REASONS = {
+    "completion_detection_not_authoritative", "still_active", "explicit_stop", "lftp_job_finished", "candidate_pair_unselected",
+    "no_model_diff", "candidate_authorized", "adopted", "retry_or_failure_limit", "completion_evidence_missing", "completion_authority_missing", "complete_local_coverage", "unknown",
+}
+_CAPTURE_GATE_OUTCOMES = {"stopped", "deferred", "downloaded", "unknown"}
+_CAPTURE_COMMAND_KINDS = {"get", "mirror", "pget"}
+_CAPTURE_COMMAND_PHASES = {"submitted", "prompt_ready", "prompt_timeout", "process_eof", "backend_error"}
+_CAPTURE_COMMAND_OUTPUTS = {"empty", "connecting", "backend_error", "other"}
+_CAPTURE_COMMAND_COUNT_BUCKETS = {"0", "1", "2-4", "5-16", "17-64", "65-256", "257+", "unknown"}
+_CAPTURE_COMMAND_BYTE_BUCKETS = {"0", "1-127", "128-511", "512-2047", "2048-8191", "8192-32767", "32768+", "unknown"}
+
+
+def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        return {"kind": "unknown"}
+    result: dict[str, object] = {}
+    for key, allowed in (
+        ("kind", _CAPTURE_KINDS), ("source", _CAPTURE_SOURCES), ("category", _CAPTURE_CATEGORIES),
+        ("event_type", _CAPTURE_EVENTS), ("stage", _CAPTURE_STAGES), ("level", _CAPTURE_LEVELS),
+    ):
+        item = value.get(key)
+        result[key] = item if isinstance(item, str) and item in allowed else "unknown"
+    numbers = value.get("numbers")
+    if isinstance(numbers, Mapping):
+        bounded: dict[str, int | float] = {}
+        for key in _CAPTURE_NUMBER_KEYS:
+            item = numbers.get(key)
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                continue
+            if isinstance(item, float) and (not math.isfinite(item) or abs(item) > 2 ** 63 - 1):
+                continue
+            if abs(item) <= 2 ** 63 - 1:
+                bounded[key] = item
+        if bounded:
+            result["numbers"] = bounded
+    for key in ("flow_hash", "corr_hash", "file_hash", "pair_hash"):
+        item = value.get(key)
+        if isinstance(item, str) and len(item) == 16 and all(char in "0123456789abcdef" for char in item):
+            result[key] = item
+    lifecycle = value.get("lifecycle")
+    if isinstance(lifecycle, Mapping):
+        safe: dict[str, object] = {"schema": "queue.lifecycle.v1"} if lifecycle.get("schema") == "queue.lifecycle.v1" else {}
+        for key, allowed in (("event", _CAPTURE_LIFECYCLE_EVENTS), ("phase", _CAPTURE_LIFECYCLE_PHASES), ("boundary", _CAPTURE_LIFECYCLE_BOUNDARIES), ("outcome", _CAPTURE_LIFECYCLE_OUTCOMES), ("error_class", _CAPTURE_LIFECYCLE_ERRORS)):
+            item = lifecycle.get(key)
+            safe[key] = item if isinstance(item, str) and item in allowed else "unknown"
+        for key, allowed in _CAPTURE_LIFECYCLE_ENUMS.items():
+            item = lifecycle.get(key)
+            if isinstance(item, str) and item in allowed:
+                safe[key] = item
+        for key in _CAPTURE_LIFECYCLE_BOOLS:
+            item = lifecycle.get(key)
+            if type(item) is bool:
+                safe[key] = item
+        result["lifecycle"] = safe
+    gate = value.get("completion_gate")
+    if isinstance(gate, Mapping):
+        safe_gate: dict[str, object] = {"boundary": "completion_gate"}
+        for key, allowed in (("decision", _CAPTURE_GATE_DECISIONS), ("reason", _CAPTURE_GATE_REASONS), ("terminal_outcome", _CAPTURE_GATE_OUTCOMES)):
+            item = gate.get(key)
+            if isinstance(item, str) and item in allowed:
+                safe_gate[key] = item
+        if isinstance(gate.get("pending_transition"), str) and gate["pending_transition"] in {"registered", "cleared", "retained"}:
+            safe_gate["pending_transition"] = gate["pending_transition"]
+        for key in {"poll_eligible", "poll_fresh", "poll_healthy", "previous_active", "current_active", "marker_observed", "local_scan_forced", "explicit_stop", "build_ran", "candidate_present", "live_present", "local_size_present", "remote_size_present", "complete_local_coverage", "exact_final_file_proof", "model_diff_present", "completion_proved"}:
+            if type(gate.get(key)) is bool:
+                safe_gate[key] = gate[key]
+        result["completion_gate"] = safe_gate
+    command = value.get("lftp_command")
+    if isinstance(command, Mapping):
+        safe_command: dict[str, object] = {"schema": "lftp.command_boundary.v1"} if command.get("schema") == "lftp.command_boundary.v1" else {}
+        for key, allowed in (("transfer_kind", _CAPTURE_COMMAND_KINDS), ("phase", _CAPTURE_COMMAND_PHASES), ("output_class", _CAPTURE_COMMAND_OUTPUTS), ("argument_count_bucket", _CAPTURE_COMMAND_COUNT_BUCKETS), ("exclude_count_bucket", _CAPTURE_COMMAND_COUNT_BUCKETS), ("submission_byte_length_bucket", _CAPTURE_COMMAND_BYTE_BUCKETS)):
+            item = command.get(key)
+            if isinstance(item, str) and item in allowed:
+                safe_command[key] = item
+        if type(command.get("process_alive")) is bool:
+            safe_command["process_alive"] = command["process_alive"]
+        result["lftp_command"] = safe_command
+    return result
+
+
+def _sanitize_capture(value: object) -> Mapping[str, object]:
+    """Keep bounded, typed, correlation-safe incremental spool receipts only."""
+    if not isinstance(value, Mapping):
+        return {"state": "invalid"}
+    result: dict[str, object] = {}
+    allowed = {
+        "state": {"armed", "record", "loss", "stopped", "unsupported"},
+        "source": _CAPTURE_SOURCES,
+        "event_type": _CAPTURE_EVENTS,
+        "category": _CAPTURE_CATEGORIES,
+        "stage": _CAPTURE_STAGES,
+        "level": _CAPTURE_LEVELS,
+        "reason": {"session", "marker", "cursor", "unseen_rotation", "budget", "partial", "unsupported", "output", "health", "malformed", "oversized", "unread", "missing", "prune", "unknown"},
+    }
+    for key, values in allowed.items():
+        item = value.get(key)
+        if item in values:
+            result[key] = item
+    for key in ("utc_ms", "created_ms", "monotonic_ms", "cursor_start", "cursor_end", "bytes_read", "records", "lost", "rotation_count", "health_lost", "health_unknown", "health_unresolved", "irrelevant"):
+        item = value.get(key)
+        if type(item) is int and 0 <= item <= 2 ** 63 - 1:
+            result[key] = item
+    for key in ("flow_hash", "corr_hash", "file_hash", "pair_hash", "session_hash"):
+        item = value.get(key)
+        if isinstance(item, str) and len(item) == 16 and all(char in "0123456789abcdef" for char in item):
+            result[key] = item
+    if "projection" in value:
+        result["projection"] = _sanitize_capture_projection(value.get("projection"))
+    budget = value.get("budget")
+    if isinstance(budget, Mapping):
+        bounded_budget: dict[str, int] = {}
+        for key in ("max_bytes", "max_millis", "max_records", "max_output_bytes", "bytes_read", "elapsed_ms"):
+            item = budget.get(key)
+            if type(item) is int and 0 <= item <= 2 ** 63 - 1:
+                bounded_budget[key] = item
+        if bounded_budget:
+            result["budget"] = bounded_budget
+    return result or {"state": "invalid"}
 
 
 def _sanitize_scan_lifecycle(value: object) -> Mapping[str, object]:
@@ -478,6 +664,8 @@ def _sanitize_artifact(value: object) -> Mapping[str, object]:
             sanitized[key] = _sanitize_discriminator_request(item)
         elif key == "diagnostics":
             sanitized[key] = _sanitize_discriminator_diagnostics(item)
+        elif key == "capture":
+            sanitized[key] = _sanitize_capture(item)
         elif key in {"request_index", "sample_index"}:
             sanitized[key] = item if type(item) is int and item >= 0 else None
         elif key in {"root_found", "target_verified", "root_verified", "first_failure", "success"}:
