@@ -2,6 +2,7 @@
 
 from collections import deque
 import queue
+import time
 import unittest
 from unittest.mock import patch
 
@@ -1447,6 +1448,153 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertIsNone(snapshot["max_entries"])
         self.assertEqual(1100, snapshot["entry_count"])
         self.assertLessEqual(snapshot["retained_bytes"], DEFAULT_BREADCRUMB_MEMORY_BUDGET_BYTES)
+
+    def test_live_budget_workload_reports_bounded_multi_eviction_and_policy_drop(self):
+        bulk_details = {
+            "operation": "inspect_status",
+            "phase": "scan",
+            "state": "active",
+            "samples": {
+                "sample_{:02d}".format(index): "status" * 42
+                for index in range(24)
+            },
+        }
+        summary_details = {
+            "operation": "inspect_status",
+            "phase": "scan",
+            "state": "active",
+            "samples": [["status" * 40 for _ in range(16)] for _ in range(16)],
+        }
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=None,
+            memory_budget_bytes=DEFAULT_BREADCRUMB_MEMORY_BUDGET_BYTES,
+        )
+
+        collector.record(
+            "controller", "warning_observation", {"state": "degraded"},
+            category="retention.warning", level="warning", event_type="diagnostic",
+        )
+        collector.record(
+            "controller", "decision_observation", {"decision": "continue"},
+            category="retention.decision", event_type="decision",
+        )
+
+        # The 24 bounded status samples are representative of the live
+        # diagnostic shape and keep the fill payload below the 8 KiB ingress
+        # cap.  The larger summary is admitted directly to exercise one
+        # multi-eviction transition. This count leaves less than one small
+        # entry of headroom while remaining deterministic and avoiding
+        # eviction during the fill.
+        bulk_count = 37_715
+        fill_started = time.perf_counter()
+        for index in range(bulk_count):
+            collector.record(
+                "scanner", "status_update_{:05d}".format(index), bulk_details,
+                category=("scan.status", "scan.progress", "scan.metrics")[index % 3],
+                level="info", event_type="diagnostic",
+            )
+        fill_elapsed = time.perf_counter() - fill_started
+
+        before = collector.snapshot()
+        self.assertIsNone(before["max_entries"])
+        self.assertEqual(DEFAULT_BREADCRUMB_MEMORY_BUDGET_BYTES, before["memory_budget_bytes"])
+        self.assertEqual(0, before["accounting"]["evicted_count"])
+        self.assertEqual(bulk_count + 2, before["entry_count"])
+        self.assertLessEqual(before["retained_bytes"], DEFAULT_BREADCRUMB_MEMORY_BUDGET_BYTES)
+
+        evicted_ranges = []
+        gap_name = "_BreadcrumbTraceCollector__record_gap_range"
+        original_gap = getattr(collector, gap_name)
+        protected_name = "_BreadcrumbTraceCollector__protected_indices"
+
+        def capture_gap(start, end, reason):
+            if reason == "evicted":
+                evicted_ranges.append((start, end))
+            return original_gap(start, end, reason)
+
+        with patch.object(collector, gap_name, side_effect=capture_gap) as gap_method:
+            with patch.object(
+                collector,
+                "_BreadcrumbTraceCollector__evict_to_budget",
+                wraps=getattr(collector, "_BreadcrumbTraceCollector__evict_to_budget"),
+            ) as eviction_method:
+                with patch.object(
+                    collector,
+                    protected_name,
+                    wraps=getattr(collector, protected_name),
+                ) as protected_method:
+                    final_started = time.perf_counter()
+                    final_started_ns = time.perf_counter_ns()
+                    result = collector.record(
+                        "scanner", "status_summary", summary_details,
+                        category="scan.status", level="info", event_type="diagnostic",
+                    )
+        final_elapsed = time.perf_counter() - final_started
+        final_elapsed_ns = time.perf_counter_ns() - final_started_ns
+
+        after = collector.snapshot()
+        evicted_count = (
+            after["accounting"]["evicted_count"]
+            - before["accounting"]["evicted_count"]
+        )
+        self.assertEqual("retained", result)
+        self.assertEqual(1, eviction_method.call_count)
+        self.assertEqual(evicted_count, len(evicted_ranges))
+        self.assertGreater(evicted_count, 1)
+        self.assertEqual(evicted_count, gap_method.call_count)
+        self.assertEqual(evicted_count, protected_method.call_count)
+        self.assertTrue(after["gaps"])
+        self.assertTrue(all(gap["reason"] == "evicted" for gap in after["gaps"]))
+        self.assertLessEqual(len(after["gaps"]), evicted_count)
+        self.assertEqual(before["version"] + 1, after["version"])
+        self.assertEqual(
+            before["entry_count"] + 1 - evicted_count,
+            after["entry_count"],
+        )
+        self.assertLessEqual(after["retained_bytes"], DEFAULT_BREADCRUMB_MEMORY_BUDGET_BYTES)
+        messages = {entry["message"] for entry in after["entries"]}
+        self.assertIn("warning_observation", messages)
+        self.assertIn("decision_observation", messages)
+        self.assertIn("status_summary", messages)
+        categories = {entry["category"] for entry in after["entries"]}
+        self.assertTrue({"scan.status", "scan.progress", "scan.metrics"}.issubset(categories))
+
+        print(
+            "breadcrumb_collector_benchmark "
+            "workload_entry_count={} workload_retained_bytes={} "
+            "final_entry_count={} final_retained_bytes={} "
+            "final_admission_elapsed_ns={} evicted_count={} "
+            "protected_index_pass_count={} eviction_transaction_count={} "
+            "selection_pass_count={}".format(
+                before["entry_count"], before["retained_bytes"],
+                after["entry_count"], after["retained_bytes"],
+                final_elapsed_ns, evicted_count,
+                protected_method.call_count, eviction_method.call_count,
+                protected_method.call_count,
+            ),
+        )
+
+        policy_collector = BreadcrumbTraceCollector(lambda: True, max_entries=None)
+        policy_collector.apply_policy({"default": "off"})
+        # Keep the public collector.record path while making the policy
+        # transition deterministic between its gate and admission body.
+        with patch.object(policy_collector, "is_effectively_enabled", return_value=True):
+            self.assertEqual(
+                "dropped",
+                policy_collector.record(
+                    "scanner", "policy_filtered", {"state": "inactive"},
+                    category="scan.status", level="info", event_type="diagnostic",
+                ),
+            )
+        policy_snapshot = policy_collector.snapshot()
+        self.assertEqual(1, policy_snapshot["accounting"]["policy_dropped_count"])
+        self.assertEqual([], policy_snapshot["entries"])
+
+        # This is a gross runaway guard only; it is intentionally far above
+        # the normal local runtime and is not a performance threshold.
+        self.assertLess(fill_elapsed, 180.0)
+        self.assertLess(final_elapsed, 30.0)
 
     def test_memory_budget_and_count_accounting_report_evictions_and_gaps(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=2, memory_budget_bytes=10_000)

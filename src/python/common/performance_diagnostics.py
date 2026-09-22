@@ -34,6 +34,10 @@ DURATION_CONTROLLER_PROCESS = "controller_process"
 DURATION_AUTO_QUEUE_PROCESS = "auto_queue_process"
 DURATION_CONTROLLER_PROPAGATE_EXCEPTIONS = "controller_propagate_exceptions"
 DURATION_CONTROLLER_CLEANUP_COMMANDS = "controller_cleanup_commands"
+DURATION_CONTROLLER_CLEANUP_PROCESS_PROPAGATION = "controller_cleanup_process_propagation"
+DURATION_CONTROLLER_CLEANUP_POST_CALLBACK = "controller_cleanup_post_callback"
+DURATION_CONTROLLER_CLEANUP_DELETE_LIFECYCLE = "controller_cleanup_delete_lifecycle"
+DURATION_CONTROLLER_CLEANUP_CALLBACKS = "controller_cleanup_callbacks"
 DURATION_CONTROLLER_PROCESS_COMMANDS = "controller_process_commands"
 DURATION_CONTROLLER_CONFIGURATION = "controller_configuration"
 DURATION_CONTROLLER_AUXILIARY_REAP = "controller_auxiliary_reap"
@@ -149,6 +153,8 @@ DURATION_LOCAL_SCAN_PROGRESS = DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION
 _DURATION_METRICS_ORDER = (
     DURATION_MODEL_UPDATE, DURATION_CONTROLLER_JOB, DURATION_CONTROLLER_PROCESS, DURATION_AUTO_QUEUE_PROCESS,
     DURATION_CONTROLLER_PROPAGATE_EXCEPTIONS, DURATION_CONTROLLER_CLEANUP_COMMANDS,
+    DURATION_CONTROLLER_CLEANUP_PROCESS_PROPAGATION, DURATION_CONTROLLER_CLEANUP_POST_CALLBACK,
+    DURATION_CONTROLLER_CLEANUP_DELETE_LIFECYCLE, DURATION_CONTROLLER_CLEANUP_CALLBACKS,
     DURATION_CONTROLLER_PROCESS_COMMANDS, DURATION_CONTROLLER_CONFIGURATION,
     DURATION_CONTROLLER_AUXILIARY_REAP, DURATION_CONTROLLER_DIAGNOSTICS,
     DURATION_MODEL_BUILD, DURATION_MODEL_BUILDER_SET_LOCAL_FILES, DURATION_MODEL_BUILDER_SET_REMOTE_FILES,
@@ -198,6 +204,15 @@ _ATTRIBUTION_GROUPS = {
             DURATION_CONTROLLER_DIAGNOSTICS,
         ),
     ),
+    "controller_cleanup_commands": (
+        DURATION_CONTROLLER_CLEANUP_COMMANDS,
+        (
+            DURATION_CONTROLLER_CLEANUP_PROCESS_PROPAGATION,
+            DURATION_CONTROLLER_CLEANUP_POST_CALLBACK,
+            DURATION_CONTROLLER_CLEANUP_DELETE_LIFECYCLE,
+            DURATION_CONTROLLER_CLEANUP_CALLBACKS,
+        ),
+    ),
     "model_update": (
         DURATION_MODEL_UPDATE,
         (
@@ -237,6 +252,9 @@ _SAMPLE_FIELDS = frozenset((
 ))
 _COUNTERS = frozenset((
     "samples_collected", "samples_dropped", "sampler_failures",
+    "controller_cleanup_process_completed", "controller_cleanup_worker_exceptions",
+    "controller_cleanup_post_callback_exceptions", "controller_cleanup_delete_lifecycle_exceptions",
+    "controller_cleanup_callback_exceptions",
     "duration_spans_dropped",
     "model_full_snapshot_requests", "model_full_snapshot_listener_registrations",
     "model_scoped_snapshot_registrations",

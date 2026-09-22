@@ -11,6 +11,10 @@ from common.performance_diagnostics import (
     DURATION_AUTO_QUEUE_PROCESS,
     DURATION_CONTROLLER_AUXILIARY_REAP,
     DURATION_CONTROLLER_CLEANUP_COMMANDS,
+    DURATION_CONTROLLER_CLEANUP_CALLBACKS,
+    DURATION_CONTROLLER_CLEANUP_DELETE_LIFECYCLE,
+    DURATION_CONTROLLER_CLEANUP_POST_CALLBACK,
+    DURATION_CONTROLLER_CLEANUP_PROCESS_PROPAGATION,
     DURATION_CONTROLLER_CONFIGURATION,
     DURATION_CONTROLLER_DIAGNOSTICS,
     DURATION_CONTROLLER_JOB,
@@ -448,6 +452,28 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
             DURATION_MODEL_UPDATE_FINALIZATION_COMPLETION_GATE_PHYSICAL_PROOF,
         ):
             self.assertEqual(1, stage_window["metrics"][metric]["count"])
+
+    def test_cleanup_attribution_does_not_double_count_nested_cleanup_stages(self):
+        clock = [0.0]
+        collector = PerformanceDiagnosticsCollector(lambda: True, monotonic_fn=lambda: clock[0])
+        collector.observe_duration(DURATION_CONTROLLER_PROCESS, 1.0, 1.0)
+        collector.observe_duration(DURATION_CONTROLLER_CLEANUP_COMMANDS, 0.8, 0.8)
+        for metric in (
+            DURATION_CONTROLLER_CLEANUP_PROCESS_PROPAGATION,
+            DURATION_CONTROLLER_CLEANUP_POST_CALLBACK,
+            DURATION_CONTROLLER_CLEANUP_DELETE_LIFECYCLE,
+            DURATION_CONTROLLER_CLEANUP_CALLBACKS,
+        ):
+            collector.observe_duration(metric, 0.2, 0.2)
+
+        clock[0] = 1.0
+        collector.record_sample({}, close_window_at=clock[0])
+        attribution = collector.snapshot()["samples"][-1]["stage_window"]["attribution"]
+
+        self.assertEqual(0.8, attribution["controller_process"]["named_cpu_seconds"])
+        self.assertEqual(0.8, attribution["controller_cleanup_commands"]["named_cpu_seconds"])
+        self.assertEqual(80.0, attribution["controller_process"]["coverage_percent"])
+        self.assertEqual(100.0, attribution["controller_cleanup_commands"]["coverage_percent"])
 
     def test_model_builder_setter_durations_are_fixed_registered_metrics(self):
         collector = PerformanceDiagnosticsCollector(lambda: True)

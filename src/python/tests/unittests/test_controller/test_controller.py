@@ -35,6 +35,10 @@ from common import AppError, Config, Constants, PathPairError, PathPairManager
 from common.performance_diagnostics import (
     DURATION_CONTROLLER_AUXILIARY_REAP,
     DURATION_CONTROLLER_CLEANUP_COMMANDS,
+    DURATION_CONTROLLER_CLEANUP_CALLBACKS,
+    DURATION_CONTROLLER_CLEANUP_DELETE_LIFECYCLE,
+    DURATION_CONTROLLER_CLEANUP_POST_CALLBACK,
+    DURATION_CONTROLLER_CLEANUP_PROCESS_PROPAGATION,
     DURATION_CONTROLLER_CONFIGURATION,
     DURATION_CONTROLLER_DIAGNOSTICS,
     DURATION_CONTROLLER_PROCESS,
@@ -9355,6 +9359,8 @@ class TestController(unittest.TestCase):
             process.start.assert_called_once_with()
 
     def test_cleanup_commands_delete_local_reports_success_after_process_completion(self):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        self.controller._Controller__context.performance_diagnostics = diagnostics
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
         file.local_size = 10
@@ -9418,8 +9424,19 @@ class TestController(unittest.TestCase):
         self.controller._Controller__process_commands()
         self.assertEqual("eligible", self.controller._Controller__download_start_state[file.file_id].state)
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
+        snapshot = diagnostics.snapshot()
+        for metric in (
+            DURATION_CONTROLLER_CLEANUP_PROCESS_PROPAGATION,
+            DURATION_CONTROLLER_CLEANUP_POST_CALLBACK,
+            DURATION_CONTROLLER_CLEANUP_DELETE_LIFECYCLE,
+            DURATION_CONTROLLER_CLEANUP_CALLBACKS,
+        ):
+            self.assertEqual(1, snapshot["durations"][metric]["count"], metric)
+        self.assertEqual(1, snapshot["counters"]["controller_cleanup_process_completed"])
 
     def test_cleanup_commands_delete_local_surfaces_missing_file_failure(self):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        self.controller._Controller__context.performance_diagnostics = diagnostics
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
         file.local_size = 10
@@ -9456,6 +9473,60 @@ class TestController(unittest.TestCase):
         process.close_queues.assert_called_once_with()
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
         self.assertEqual("notified", self.controller._Controller__download_start_state[file.file_id].state)
+        snapshot = diagnostics.snapshot()
+        self.assertEqual(1, snapshot["durations"][DURATION_CONTROLLER_CLEANUP_PROCESS_PROPAGATION]["count"])
+        self.assertEqual(1, snapshot["durations"][DURATION_CONTROLLER_CLEANUP_CALLBACKS]["count"])
+        self.assertEqual(1, snapshot["counters"]["controller_cleanup_worker_exceptions"])
+        self.assertEqual(1, snapshot["counters"]["controller_cleanup_process_completed"])
+
+    def test_cleanup_commands_ignores_diagnostic_sink_failures(self):
+        diagnostics = MagicMock()
+        diagnostics.begin_duration.side_effect = RuntimeError("diagnostics unavailable")
+        diagnostics.finish_duration.side_effect = RuntimeError("diagnostics unavailable")
+        diagnostics.increment.side_effect = RuntimeError("diagnostics unavailable")
+        self.controller._Controller__context.performance_diagnostics = diagnostics
+        command = Controller.Command(Controller.Command.Action.QUEUE, "file-id")
+        callback = MagicMock()
+        command.add_callback(callback)
+        process = MagicMock()
+        process.is_alive.return_value = False
+        process.propagate_exception.return_value = None
+        post_callback = MagicMock()
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(
+                command, "file-id", "file", process, post_callback, True,
+            )
+        ]
+
+        self.controller._Controller__cleanup_commands()
+
+        post_callback.assert_called_once_with()
+        callback.on_success.assert_called_once_with()
+        process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
+        process.close_queues.assert_called_once_with()
+
+    def test_cleanup_commands_callback_failure_propagates_and_tears_down(self):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        self.controller._Controller__context.performance_diagnostics = diagnostics
+        command = Controller.Command(Controller.Command.Action.QUEUE, "file-id")
+        callback = MagicMock()
+        callback.on_success.side_effect = RuntimeError("callback failed")
+        command.add_callback(callback)
+        process = MagicMock()
+        process.is_alive.return_value = False
+        process.propagate_exception.return_value = None
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(
+                command, "file-id", "file", process, MagicMock(), True,
+            )
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "callback failed"):
+            self.controller._Controller__cleanup_commands()
+
+        process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
+        process.close_queues.assert_called_once_with()
+        self.assertEqual(1, diagnostics.snapshot()["counters"]["controller_cleanup_callback_exceptions"])
 
     def test_cleanup_commands_delete_remote_logs_failed_async_cleanup_without_crashing(self):
         file = ModelFile("dup", False)
