@@ -2381,6 +2381,13 @@ class BreadcrumbTraceCollector:
         "active_progress_overlay_admission", "direct_root_counter_publish",
         "model_mutation", "scoped_stream_emit",
     })
+    __PROGRESS_LINEAGE_SUMMARY_SCHEMA = "model_progress_lineage_summary.v1"
+    __PROGRESS_LINEAGE_SUMMARY_PHASES = (
+        "status_consume", "model_mutation", "updater_decision",
+    )
+    __PROGRESS_LINEAGE_SUMMARY_MISSING_PHASES = frozenset(
+        ("none", "status_consume", "model_mutation", "updater_decision", "multiple")
+    )
     __PROGRESS_LINEAGE_DETAIL_KEYS = frozenset({
         "outcome", "source", "fresh", "healthy", "status_count_bucket",
         "active_count_bucket", "queue_age_bucket", "lock_wait_bucket",
@@ -3863,6 +3870,8 @@ class BreadcrumbTraceCollector:
                     details["model_version"] = version
                     details["model_version_first"] = ranges[0][0]
                     details["model_version_last"] = version
+                    if type(safe.get("scope_version")) is int:
+                        details["scope_version"] = safe["scope_version"]
                     details["mutation_count_bucket"] = self.__progress_lineage_count_bucket(
                         sum((end - start) + 1 for start, end in ranges)
                     )
@@ -3913,6 +3922,162 @@ class BreadcrumbTraceCollector:
                 health["reject_counts"]["unmapped_model_version"] += 1
                 return False
             return self.__record_progress_lineage_locked(correlation, phase, details)
+
+    def record_progress_lineage_summary(
+            self, correlation: object, final_details: object = None,
+    ) -> bool:
+        """Project one lineage span from the production updater-cycle boundary.
+
+        The durable writer only understands ordinary collector entries.  Keep
+        the causal span in its bounded in-memory store, then make one fixed,
+        privacy-safe summary for the one production call per existing updater
+        cycle.  Existing bounded admission and loss accounting apply; this
+        projection makes no write-rate guarantee.
+        ``scoped_stream_emit`` remains intentionally in-memory-only; it is not
+        part of this updater-cycle projection.
+        """
+        return bool(self.__run_direct_mutation(
+            lambda: self.__record_progress_lineage_summary_body(correlation, final_details),
+            lambda: False,
+        ))
+
+    def __record_progress_lineage_summary_body(
+            self, correlation: object, final_details: object = None,
+    ) -> bool:
+        if self.__ingress_lifecycle_state() != _BREADCRUMB_LIFECYCLE_OPEN:
+            return False
+        if not self.is_effectively_enabled("model.progress", "debug"):
+            return False
+        if not isinstance(correlation, str) or not correlation.startswith("lftp-poll:") or \
+                len(correlation) != len("lftp-poll:") + 16 or \
+                any(character not in "0123456789abcdef" for character in correlation[len("lftp-poll:"):]):
+            return False
+        # Keep span lookup, reset generation, and the ordinary record
+        # admission in one existing collector lock scope.  A clear/reset can
+        # therefore never let an old span label a later updater cycle.
+        with self.__lock:
+            span = self.__progress_lineage.get(correlation)
+            if not isinstance(span, Mapping):
+                return False
+            # A status-consume step is the admission proof for this poll.  A
+            # leftover updater field alone is not allowed to create a fresh
+            # span or durable record after a reset/failed poll.
+            if not any(
+                    isinstance(step, Mapping) and step.get("phase") == "status_consume"
+                    for step in span.get("steps", ())
+            ):
+                return False
+            if isinstance(final_details, Mapping):
+                self.__record_progress_lineage_body(
+                    correlation, "updater_decision", final_details,
+                )
+            summary = self.__progress_lineage_summary_locked(span)
+            if summary is None:
+                return False
+            result = self.__record_entry(
+                "model_updater", "progress_lineage_summary", summary,
+                allow_when_disabled=True, _from_ingress=True,
+                category="model.progress", level="debug", stage="model_summary",
+                event_type="progress", corr_id=correlation,
+                _coalesce_key="{}:model_summary".format(correlation),
+            )
+        return result in {"retained", "evicted"}
+
+    def __progress_lineage_summary_locked(
+            self, span: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        steps = span.get("steps")
+        if not isinstance(steps, list):
+            return None
+        by_phase: Dict[str, Mapping[str, Any]] = {}
+        for candidate in steps:
+            if not isinstance(candidate, Mapping):
+                continue
+            phase = candidate.get("phase")
+            if phase in self.__PROGRESS_LINEAGE_SUMMARY_PHASES:
+                by_phase[str(phase)] = candidate
+        missing = [phase for phase in self.__PROGRESS_LINEAGE_SUMMARY_PHASES if phase not in by_phase]
+        missing_phase = missing[0] if len(missing) == 1 else "multiple" if missing else "none"
+        if missing_phase not in self.__PROGRESS_LINEAGE_SUMMARY_MISSING_PHASES:
+            return None
+        summary: Dict[str, Any] = {
+            "schema": self.__PROGRESS_LINEAGE_SUMMARY_SCHEMA,
+            "missing_phase": missing_phase,
+        }
+
+        status_step = by_phase.get("status_consume")
+        if status_step is not None:
+            details = status_step.get("details")
+            if not isinstance(details, Mapping):
+                details = {}
+            status: Dict[str, Any] = {}
+            source = details.get("source")
+            if isinstance(source, str) and source in self.__PROGRESS_LINEAGE_ENUMS.get("source", frozenset()):
+                status["source"] = source
+            for key in ("fresh", "healthy"):
+                value = details.get(key)
+                if type(value) is bool:
+                    status[key] = value
+            monotonic_ms = status_step.get("monotonic_ms")
+            if type(monotonic_ms) is int and monotonic_ms >= 0:
+                status["monotonic_ms"] = monotonic_ms
+            summary["status_consume"] = status
+
+        mutation_step = by_phase.get("model_mutation")
+        if mutation_step is not None:
+            details = mutation_step.get("details")
+            if not isinstance(details, Mapping):
+                details = {}
+            mutation: Dict[str, Any] = {}
+            ranges = span.get("mutation_version_ranges")
+            first_version = details.get("model_version_first")
+            last_version = details.get("model_version_last")
+            if isinstance(ranges, list) and ranges:
+                projected_ranges = []
+                for version_range in ranges[:self.__PROGRESS_LINEAGE_MAX_VERSION_RANGES]:
+                    if not isinstance(version_range, (list, tuple)) or len(version_range) != 2:
+                        continue
+                    start, end = version_range
+                    if type(start) is int and type(end) is int and 0 <= start <= end:
+                        projected_ranges.append([start, end])
+                if projected_ranges:
+                    # The explicit ranges are authoritative; first/last are
+                    # convenience bounds and do not imply a contiguous set.
+                    mutation["mutation_version_ranges"] = projected_ranges
+                    first_version = projected_ranges[0][0]
+                    last_version = projected_ranges[-1][1]
+            if type(first_version) is int and first_version >= 0:
+                mutation["model_version_first"] = first_version
+            if type(last_version) is int and last_version >= 0:
+                mutation["model_version_last"] = last_version
+            scope_version = details.get("scope_version")
+            if type(scope_version) is int and scope_version >= 0:
+                mutation["scope_version"] = scope_version
+            monotonic_ms = mutation_step.get("monotonic_ms")
+            if type(monotonic_ms) is int and monotonic_ms >= 0:
+                mutation["monotonic_ms"] = monotonic_ms
+            if type(span.get("mutation_ranges_truncated")) is bool:
+                mutation["mutation_ranges_truncated"] = span["mutation_ranges_truncated"]
+            if type(span.get("mutation_ranges_omitted_count")) is int and \
+                    0 <= span["mutation_ranges_omitted_count"] <= 2_147_483_647:
+                mutation["mutation_ranges_omitted_count"] = span["mutation_ranges_omitted_count"]
+            summary["model_mutation"] = mutation
+
+        decision_step = by_phase.get("updater_decision")
+        if decision_step is not None:
+            details = decision_step.get("details")
+            if not isinstance(details, Mapping):
+                details = {}
+            decision: Dict[str, Any] = {}
+            for key in ("decision", "build_kind", "status_count_bucket", "updater_cycle_duration_bucket"):
+                value = details.get(key)
+                if isinstance(value, str) and value in self.__PROGRESS_LINEAGE_ENUMS.get(key, frozenset()):
+                    decision[key] = value
+            monotonic_ms = decision_step.get("monotonic_ms")
+            if type(monotonic_ms) is int and monotonic_ms >= 0:
+                decision["monotonic_ms"] = monotonic_ms
+            summary["updater_decision"] = decision
+        return summary
 
     def __record_progress_lineage_locked(
             self, correlation: str, phase: object, details: object,

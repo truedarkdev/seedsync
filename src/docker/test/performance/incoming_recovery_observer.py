@@ -499,6 +499,18 @@ _CAPTURE_READINESS_REASONS = {"none", "awaiting_scan_publication", "initial_scan
 _CAPTURE_READINESS_BOOLEANS = {"ready"}
 _CAPTURE_MODEL_PAGE_SNAPSHOT_OUTCOMES = {"success", "error", "unknown"}
 _CAPTURE_MODEL_PAGE_SNAPSHOT_ERRORS = {"cancelled", "model_error", "runtime_error", "unknown"}
+_CAPTURE_PROGRESS_LINEAGE_SCHEMA = "model_progress_lineage_summary.v1"
+_CAPTURE_PROGRESS_LINEAGE_MAX_VERSION_RANGES = 8
+_CAPTURE_PROGRESS_LINEAGE_SOURCES = {
+    "fresh_healthy", "fresh_unhealthy", "cached_retry", "cached_idle", "retry_empty",
+    "cached_inflight", "inflight_empty", "cached_unhealthy", "unhealthy_empty",
+    "cached_error", "error_empty",
+}
+_CAPTURE_PROGRESS_LINEAGE_DECISIONS = {"full_build", "active_delta", "cached"}
+_CAPTURE_PROGRESS_LINEAGE_BUILD_KINDS = {"candidate", "full", "none"}
+_CAPTURE_PROGRESS_LINEAGE_STATUS_COUNT_BUCKETS = {"0", "1", "2-4", "5+"}
+_CAPTURE_PROGRESS_LINEAGE_DURATION_BUCKETS = {"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}
+_CAPTURE_PROGRESS_LINEAGE_MISSING_PHASES = {"none", "status_consume", "model_mutation", "updater_decision", "multiple"}
 _CAPTURE_GATE_DECISIONS = {"blocked", "no_retirement", "excluded", "pending", "attempt_eligible", "deferred", "unknown"}
 _CAPTURE_GATE_REASONS = {
     "completion_detection_not_authoritative", "still_active", "explicit_stop", "lftp_job_finished", "candidate_pair_unselected",
@@ -613,6 +625,97 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
             if type(item) is int and 0 <= item <= 2**31 - 1:
                 safe_snapshot[key] = item
         result["model_page_snapshot"] = safe_snapshot
+    lineage = value.get("model_progress_lineage")
+    if isinstance(lineage, Mapping):
+        safe_lineage = _sanitize_progress_lineage(lineage)
+        if safe_lineage is not None:
+            result["model_progress_lineage"] = safe_lineage
+    return result
+
+
+def _sanitize_progress_lineage(value: Mapping[str, object]) -> Mapping[str, object] | None:
+    if value.get("schema") != _CAPTURE_PROGRESS_LINEAGE_SCHEMA:
+        return None
+    missing_phase = value.get("missing_phase")
+    if not isinstance(missing_phase, str) or missing_phase not in _CAPTURE_PROGRESS_LINEAGE_MISSING_PHASES:
+        return None
+    result: dict[str, object] = {
+        "schema": _CAPTURE_PROGRESS_LINEAGE_SCHEMA,
+        "missing_phase": missing_phase,
+    }
+    status = value.get("status_consume")
+    if status is not None:
+        if not isinstance(status, Mapping):
+            return None
+        source = status.get("source")
+        monotonic_ms = status.get("monotonic_ms")
+        if not isinstance(source, str) or source not in _CAPTURE_PROGRESS_LINEAGE_SOURCES:
+            return None
+        if type(status.get("fresh")) is not bool or type(status.get("healthy")) is not bool:
+            return None
+        if type(monotonic_ms) is not int or not 0 <= monotonic_ms <= 2**63 - 1:
+            return None
+        result["status_consume"] = {
+            "source": source,
+            "fresh": status["fresh"],
+            "healthy": status["healthy"],
+            "monotonic_ms": monotonic_ms,
+        }
+    mutation = value.get("model_mutation")
+    if mutation is not None:
+        if not isinstance(mutation, Mapping):
+            return None
+        safe_mutation: dict[str, object] = {}
+        for key in ("model_version_first", "model_version_last", "scope_version", "monotonic_ms"):
+            item = mutation.get(key)
+            if type(item) is not int or not 0 <= item <= 2**63 - 1:
+                return None
+            safe_mutation[key] = item
+        ranges = mutation.get("mutation_version_ranges")
+        if ranges is not None:
+            if not isinstance(ranges, list) or len(ranges) > _CAPTURE_PROGRESS_LINEAGE_MAX_VERSION_RANGES:
+                return None
+            safe_ranges: list[list[int]] = []
+            for version_range in ranges:
+                if not isinstance(version_range, list) or len(version_range) != 2:
+                    return None
+                start, end = version_range
+                if type(start) is not int or type(end) is not int or not 0 <= start <= end <= 2**63 - 1:
+                    return None
+                safe_ranges.append([start, end])
+            safe_mutation["mutation_version_ranges"] = safe_ranges
+        truncated = mutation.get("mutation_ranges_truncated")
+        if truncated is not None:
+            if type(truncated) is not bool:
+                return None
+            safe_mutation["mutation_ranges_truncated"] = truncated
+        omitted_count = mutation.get("mutation_ranges_omitted_count")
+        if omitted_count is not None:
+            if type(omitted_count) is not int or not 0 <= omitted_count <= 2_147_483_647:
+                return None
+            safe_mutation["mutation_ranges_omitted_count"] = omitted_count
+        result["model_mutation"] = safe_mutation
+    decision = value.get("updater_decision")
+    if decision is not None:
+        if not isinstance(decision, Mapping):
+            return None
+        safe_decision: dict[str, object] = {}
+        for key, allowed in (
+                ("decision", _CAPTURE_PROGRESS_LINEAGE_DECISIONS),
+                ("build_kind", _CAPTURE_PROGRESS_LINEAGE_BUILD_KINDS),
+                ("status_count_bucket", _CAPTURE_PROGRESS_LINEAGE_STATUS_COUNT_BUCKETS),
+                ("updater_cycle_duration_bucket", _CAPTURE_PROGRESS_LINEAGE_DURATION_BUCKETS),
+        ):
+            item = decision.get(key)
+            if item is not None:
+                if not isinstance(item, str) or item not in allowed:
+                    return None
+                safe_decision[key] = item
+        monotonic_ms = decision.get("monotonic_ms")
+        if type(monotonic_ms) is not int or not 0 <= monotonic_ms <= 2**63 - 1:
+            return None
+        safe_decision["monotonic_ms"] = monotonic_ms
+        result["updater_decision"] = safe_decision
     return result
 
 
@@ -634,7 +737,7 @@ def _sanitize_capture(value: object) -> Mapping[str, object]:
         item = value.get(key)
         if item in values:
             result[key] = item
-    for key in ("utc_ms", "created_ms", "monotonic_ms", "cursor_start", "cursor_end", "bytes_read", "records", "lost", "rotation_count", "health_lost", "health_unknown", "health_unresolved", "irrelevant", "unsupported", "discarded"):
+    for key in ("utc_ms", "created_ms", "created_ns", "monotonic_ms", "cursor_start", "cursor_end", "bytes_read", "records", "lost", "rotation_count", "health_lost", "health_unknown", "health_unresolved", "irrelevant", "unsupported", "discarded"):
         item = value.get(key)
         if type(item) is int and 0 <= item <= 2 ** 63 - 1:
             result[key] = item

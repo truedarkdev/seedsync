@@ -645,6 +645,24 @@ def _record_progress_lineage(
         pass
 
 
+def _record_progress_lineage_summary(
+        controller: object, correlation: object,
+        final_details: Optional[Mapping[str, object]] = None,
+) -> bool:
+    """Project one current updater span into the ordinary durable lane."""
+    safe_correlation = _safe_lftp_status_poll_correlation(correlation)
+    if safe_correlation is None:
+        return False
+    try:
+        trace = getattr(getattr(controller, "_Controller__context", None), "breadcrumb_trace", None)
+        recorder = getattr(trace, "record_progress_lineage_summary", None)
+        if callable(recorder):
+            return bool(recorder(safe_correlation, final_details))
+    except Exception:
+        pass
+    return False
+
+
 def _progress_lineage_duration_bucket(duration_ms: int) -> str:
     if duration_ms <= 4:
         return "0-4"
@@ -4506,14 +4524,17 @@ class ModelUpdater(_ControllerCoreAccess):
                         diagnostics.finish_duration(DURATION_MODEL_UPDATE_TRACE_FINALIZATION, trace_finalization_started)
                     except Exception:
                             pass
-                self.__progress_lineage_correlation = None
-                if lineage_cycle_started_ns is not None:
-                    _record_progress_lineage(
-                        controller, lineage_cycle_correlation, "updater_decision",
+                current_lineage_correlation = self.__progress_lineage_correlation
+                if lineage_cycle_started_ns is not None and current_lineage_correlation is not None:
+                    _record_progress_lineage_summary(
+                        controller, current_lineage_correlation,
                         {"updater_cycle_duration_bucket": _progress_lineage_duration_bucket(
                             max(0, (time.monotonic_ns() - lineage_cycle_started_ns) // 1_000_000),
                         )},
                     )
+                # Clear only after the summary has consumed the current span;
+                # a stale token must never label the next updater cycle.
+                self.__progress_lineage_correlation = None
                 if callable(set_publication_callback):
                     try:
                         set_publication_callback(None)

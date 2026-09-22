@@ -51,6 +51,122 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertFalse(snapshot["window_reset"])
         self.assertEqual(0, snapshot["version"])
 
+    def test_progress_lineage_summary_projects_span_and_preserves_ranges(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        correlation = "lftp-poll:0123456789abcdef"
+        self.assertTrue(collector.record_progress_lineage(
+            correlation, "status_consume",
+            {"source": "fresh_healthy", "fresh": True, "healthy": True},
+        ))
+        self.assertTrue(collector.record_progress_lineage(
+            correlation, "model_mutation",
+            {"outcome": "mutated", "model_version": 4, "scope_version": 2},
+        ))
+        self.assertTrue(collector.record_progress_lineage(
+            correlation, "model_mutation",
+            {"outcome": "mutated", "model_version": 7, "scope_version": 3},
+        ))
+        self.assertTrue(collector.record_progress_lineage(
+            correlation, "updater_decision",
+            {"decision": "active_delta", "build_kind": "candidate", "status_count_bucket": "2-4",
+             "updater_cycle_duration_bucket": "20-99"},
+        ))
+
+        self.assertTrue(collector.record_progress_lineage_summary(correlation))
+        entries = [
+            entry for entry in collector.snapshot()["entries"]
+            if entry["message"] == "progress_lineage_summary"
+        ]
+        self.assertEqual(1, len(entries))
+        self.assertEqual(1, entries[0]["repeat_count"])
+        self.assertEqual("lftp-poll:0123456789abcdef", entries[0]["corr_id"])
+        summary = entries[0]["details"]
+        self.assertEqual("model_progress_lineage_summary.v1", summary["schema"])
+        self.assertEqual("none", summary["missing_phase"])
+        self.assertEqual(
+            {"source": "fresh_healthy", "fresh": True, "healthy": True,
+             "monotonic_ms": summary["status_consume"]["monotonic_ms"]},
+            summary["status_consume"],
+        )
+        self.assertEqual(4, summary["model_mutation"]["model_version_first"])
+        self.assertEqual(7, summary["model_mutation"]["model_version_last"])
+        self.assertEqual(3, summary["model_mutation"]["scope_version"])
+        self.assertEqual([[4, 4], [7, 7]], summary["model_mutation"]["mutation_version_ranges"])
+        covered_versions = [
+            version
+            for start, end in summary["model_mutation"]["mutation_version_ranges"]
+            for version in range(start, end + 1)
+        ]
+        self.assertNotIn(6, covered_versions)
+        self.assertEqual("active_delta", summary["updater_decision"]["decision"])
+        self.assertEqual("2-4", summary["updater_decision"]["status_count_bucket"])
+        self.assertEqual("20-99", summary["updater_decision"]["updater_cycle_duration_bucket"])
+
+    def test_progress_lineage_summary_reports_bounded_truncated_ranges(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        correlation = "lftp-poll:0123456789abcdef"
+        self.assertTrue(collector.record_progress_lineage(
+            correlation, "status_consume",
+            {"source": "fresh_healthy", "fresh": True, "healthy": True},
+        ))
+        for version in range(0, 20, 2):
+            accepted = collector.record_progress_lineage(
+                correlation, "model_mutation",
+                {"outcome": "mutated", "model_version": version, "scope_version": version},
+            )
+            self.assertEqual(version < 16, accepted)
+        self.assertTrue(collector.record_progress_lineage_summary(correlation))
+        summary = next(
+            item["details"] for item in collector.snapshot()["entries"]
+            if item["message"] == "progress_lineage_summary"
+        )
+        mutation = summary["model_mutation"]
+        self.assertEqual([[version, version] for version in range(0, 16, 2)], mutation["mutation_version_ranges"])
+        self.assertTrue(mutation["mutation_ranges_truncated"])
+        self.assertEqual(2, mutation["mutation_ranges_omitted_count"])
+
+    def test_progress_lineage_summary_reports_typed_missing_phase_and_reset_is_stale_safe(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        correlation = "lftp-poll:0123456789abcdef"
+        collector.record_progress_lineage(
+            correlation, "status_consume",
+            {"source": "cached_retry", "fresh": False, "healthy": False},
+        )
+        collector.record_progress_lineage(
+            correlation, "updater_decision", {"decision": "cached", "build_kind": "none"},
+        )
+        self.assertTrue(collector.record_progress_lineage_summary(correlation))
+        entry = next(
+            item for item in collector.snapshot()["entries"]
+            if item["message"] == "progress_lineage_summary"
+        )
+        self.assertEqual("model_mutation", entry["details"]["missing_phase"])
+        collector.clear({"category": "model.progress"})
+        self.assertFalse(collector.record_progress_lineage_summary(correlation))
+        self.assertFalse(any(
+            item["message"] == "progress_lineage_summary"
+            for item in collector.snapshot()["entries"]
+        ))
+
+    def test_progress_lineage_summary_is_inert_when_debug_policy_is_disabled(self):
+        collector = BreadcrumbTraceCollector(lambda: True)
+        correlation = "lftp-poll:0123456789abcdef"
+        self.assertFalse(collector.record_progress_lineage(
+            correlation, "status_consume",
+            {"source": "fresh_healthy", "fresh": True, "healthy": True},
+        ))
+        self.assertFalse(collector.record_progress_lineage_summary(correlation))
+        self.assertEqual([], collector.snapshot()["entries"])
+
     def test_record_reads_enabled_gate_once(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=2)
 

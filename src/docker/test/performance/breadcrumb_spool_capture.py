@@ -131,6 +131,22 @@ _MODEL_PAGE_SNAPSHOT_ERRORS = frozenset({"cancelled", "model_error", "runtime_er
 _MODEL_PAGE_SNAPSHOT_NUMBERS = frozenset({
     "scope_version", "global_version", "lock_wait_ms", "lock_hold_ms", "snapshot_elapsed_ms",
 })
+_MODEL_PROGRESS_LINEAGE_SCHEMA = "model_progress_lineage_summary.v1"
+_MODEL_PROGRESS_LINEAGE_MAX_VERSION_RANGES = 8
+_MODEL_PROGRESS_LINEAGE_SOURCES = frozenset({
+    "fresh_healthy", "fresh_unhealthy", "cached_retry", "cached_idle", "retry_empty",
+    "cached_inflight", "inflight_empty", "cached_unhealthy", "unhealthy_empty",
+    "cached_error", "error_empty",
+})
+_MODEL_PROGRESS_LINEAGE_DECISIONS = frozenset({"full_build", "active_delta", "cached"})
+_MODEL_PROGRESS_LINEAGE_BUILD_KINDS = frozenset({"candidate", "full", "none"})
+_MODEL_PROGRESS_LINEAGE_STATUS_COUNT_BUCKETS = frozenset({"0", "1", "2-4", "5+"})
+_MODEL_PROGRESS_LINEAGE_DURATION_BUCKETS = frozenset({
+    "0-4", "5-19", "20-99", "100-499", "500-1999", "2000+",
+})
+_MODEL_PROGRESS_LINEAGE_MISSING_PHASES = frozenset({
+    "none", "status_consume", "model_mutation", "updater_decision", "multiple",
+})
 _QUEUE_LIFECYCLE_BOOLS = frozenset({
     "fresh", "healthy", "process_alive_before", "process_alive_after", "process_alive",
     "pre_send_drain_queue_done", "pre_send_drain_job_or_progress", "pre_send_drain_prompt_or_echo",
@@ -308,6 +324,108 @@ def _model_page_snapshot_facts(details: Mapping[str, object]) -> dict[str, objec
     return result
 
 
+def _model_progress_lineage_facts(details: Mapping[str, object]) -> dict[str, object] | None:
+    """Project the fixed durable updater-lineage summary vocabulary."""
+    if details.get("schema") != _MODEL_PROGRESS_LINEAGE_SCHEMA:
+        return None
+    missing_phase = details.get("missing_phase")
+    if not isinstance(missing_phase, str) or missing_phase not in _MODEL_PROGRESS_LINEAGE_MISSING_PHASES:
+        return None
+    result: dict[str, object] = {
+        "schema": _MODEL_PROGRESS_LINEAGE_SCHEMA,
+        "missing_phase": missing_phase,
+    }
+
+    status = details.get("status_consume")
+    if status is not None:
+        if not isinstance(status, Mapping):
+            return None
+        projected_status: dict[str, object] = {}
+        source = status.get("source")
+        if isinstance(source, str) and source in _MODEL_PROGRESS_LINEAGE_SOURCES:
+            projected_status["source"] = source
+        else:
+            return None
+        for key in ("fresh", "healthy"):
+            value = status.get(key)
+            if type(value) is bool:
+                projected_status[key] = value
+            else:
+                return None
+        monotonic_ms = status.get("monotonic_ms")
+        if type(monotonic_ms) is not int or monotonic_ms < 0 or monotonic_ms > 2**63 - 1:
+            return None
+        projected_status["monotonic_ms"] = monotonic_ms
+        result["status_consume"] = projected_status
+
+    mutation = details.get("model_mutation")
+    if mutation is not None:
+        if not isinstance(mutation, Mapping):
+            return None
+        projected_mutation: dict[str, object] = {}
+        for key in ("model_version_first", "model_version_last", "scope_version", "monotonic_ms"):
+            value = mutation.get(key)
+            if type(value) is not int or value < 0 or value > 2**63 - 1:
+                return None
+            projected_mutation[key] = value
+        ranges = mutation.get("mutation_version_ranges")
+        if ranges is not None:
+            if not isinstance(ranges, list) or len(ranges) > _MODEL_PROGRESS_LINEAGE_MAX_VERSION_RANGES:
+                return None
+            projected_ranges: list[list[int]] = []
+            for version_range in ranges:
+                if not isinstance(version_range, list) or len(version_range) != 2:
+                    return None
+                start, end = version_range
+                if type(start) is not int or type(end) is not int or not 0 <= start <= end <= 2**63 - 1:
+                    return None
+                projected_ranges.append([start, end])
+            projected_mutation["mutation_version_ranges"] = projected_ranges
+        truncated = mutation.get("mutation_ranges_truncated")
+        if truncated is not None:
+            if type(truncated) is not bool:
+                return None
+            projected_mutation["mutation_ranges_truncated"] = truncated
+        omitted_count = mutation.get("mutation_ranges_omitted_count")
+        if omitted_count is not None:
+            if type(omitted_count) is not int or not 0 <= omitted_count <= 2_147_483_647:
+                return None
+            projected_mutation["mutation_ranges_omitted_count"] = omitted_count
+        result["model_mutation"] = projected_mutation
+
+    decision = details.get("updater_decision")
+    if decision is not None:
+        if not isinstance(decision, Mapping):
+            return None
+        projected_decision: dict[str, object] = {}
+        value = decision.get("decision")
+        if value is not None:
+            if not isinstance(value, str) or value not in _MODEL_PROGRESS_LINEAGE_DECISIONS:
+                return None
+            projected_decision["decision"] = value
+        value = decision.get("build_kind")
+        if value is not None:
+            if not isinstance(value, str) or value not in _MODEL_PROGRESS_LINEAGE_BUILD_KINDS:
+                return None
+            projected_decision["build_kind"] = value
+        value = decision.get("status_count_bucket")
+        if value is not None:
+            if not isinstance(value, str) or value not in _MODEL_PROGRESS_LINEAGE_STATUS_COUNT_BUCKETS:
+                return None
+            projected_decision["status_count_bucket"] = value
+        value = decision.get("updater_cycle_duration_bucket")
+        if value is not None:
+            if not isinstance(value, str) or value not in _MODEL_PROGRESS_LINEAGE_DURATION_BUCKETS:
+                return None
+            projected_decision["updater_cycle_duration_bucket"] = value
+        monotonic_ms = decision.get("monotonic_ms")
+        if type(monotonic_ms) is not int or monotonic_ms < 0 or monotonic_ms > 2**63 - 1:
+            return None
+        projected_decision["monotonic_ms"] = monotonic_ms
+        result["updater_decision"] = projected_decision
+    return result
+
+
 def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bool]:
     metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
     details = row.get("details") if isinstance(row.get("details"), Mapping) else {}
@@ -325,9 +443,12 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     command = _lftp_command_facts(details) if category == "transfer.lftp.command" else None
     readiness = _queue_readiness_facts(row.get("message"), details) if category == "queue.readiness" else None
     model_page_snapshot = _model_page_snapshot_facts(details) if category == "model_page_snapshot" else None
+    model_progress_lineage = _model_progress_lineage_facts(details) if category == "model.progress" else None
     if category == "queue.readiness" and readiness is None:
         return None, True
     if category == "model_page_snapshot" and model_page_snapshot is None:
+        return None, True
+    if details.get("schema") == _MODEL_PROGRESS_LINEAGE_SCHEMA and model_progress_lineage is None:
         return None, True
     lifecycle_event = lifecycle.get("event") if lifecycle else None
     if event_type == "completion" or stage == "terminal" or lifecycle_event in {"queue_retired", "operation_retired"} or details.get("final") is True or details.get("completed") is True:
@@ -357,6 +478,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["queue_readiness"] = readiness
     if model_page_snapshot is not None:
         result["model_page_snapshot"] = model_page_snapshot
+    if model_progress_lineage is not None:
+        result["model_progress_lineage"] = model_progress_lineage
     return result, False
 
 
@@ -833,7 +956,9 @@ class BreadcrumbSpoolCapture:
             )
             if not self._emit(
                 "record", cursor_start=start, cursor_end=state.cursor, bytes_read=len(data), records=1,
-                health=health, projection=projection, created_ms=_counter(value.get("created_ms")),
+                health=health, projection=projection,
+                created_ms=_counter(value.get("created_ms")),
+                created_ns=_counter(value.get("created_ns")),
             ):
                 self._loss("output", health, cursor_start=start, cursor_end=state.cursor, bytes_read=len(data), records=1)
                 raise ObserverCaptureError("capture output cap refused a parsed row")

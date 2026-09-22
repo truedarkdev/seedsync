@@ -779,6 +779,159 @@ class TestModelUpdater(unittest.TestCase):
         self.assertIsNone(updater._ModelUpdater__progress_lineage_correlation)
         self.assertEqual([], trace.snapshot()["progress_lineage"]["spans"])
 
+    def test_update_finalization_projects_one_summary_after_success_or_exception(self):
+        def run_update(should_fail=False, mutation_count=1):
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "off", "rules": {"model.progress": "debug"}},
+            )
+            correlation = "lftp-poll:0123456789abcdef"
+            builder = SimpleNamespace(
+                begin_stop_resume_trace_cycle=MagicMock(),
+                finish_stop_resume_trace_cycle=MagicMock(),
+            )
+            controller = SimpleNamespace(
+                _Controller__context=SimpleNamespace(
+                    breadcrumb_trace=trace, performance_diagnostics=None,
+                ),
+                _Controller__model_builder=builder,
+                _Controller__model=SimpleNamespace(
+                    set_version_publication_callback=MagicMock(),
+                ),
+                _Controller__work_state_lock=None,
+                _Controller__stop_resume_trace_cycle_id=0,
+                _Controller__lftp_status_poll_correlation=correlation,
+                logger=MagicMock(),
+            )
+            updater = ModelUpdater(controller)
+
+            def update_once():
+                trace.record_progress_lineage(
+                    correlation, "status_consume",
+                    {"source": "fresh_healthy", "fresh": True, "healthy": True},
+                )
+                updater._ModelUpdater__progress_lineage_correlation = correlation
+                if should_fail:
+                    raise RuntimeError("update failed")
+                for version in range(1, mutation_count + 1):
+                    trace.record_progress_lineage(
+                        correlation, "model_mutation",
+                        {"outcome": "mutated", "model_version": version, "scope_version": version},
+                    )
+                trace.record_progress_lineage(
+                    correlation, "updater_decision",
+                    {"decision": "active_delta", "build_kind": "candidate"},
+                )
+                return True
+
+            updater._update_once = update_once
+            return updater, trace, builder, controller
+
+        updater, trace, builder, controller = run_update(mutation_count=40)
+        updater.update()
+        summary_entries = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "progress_lineage_summary"
+        ]
+        self.assertEqual(1, len(summary_entries))
+        self.assertEqual(1, summary_entries[0]["repeat_count"])
+        self.assertEqual(1, summary_entries[0]["details"]["model_mutation"]["model_version_first"])
+        self.assertEqual(40, summary_entries[0]["details"]["model_mutation"]["model_version_last"])
+        builder.finish_stop_resume_trace_cycle.assert_called_once_with(
+            controller._Controller__model, True,
+        )
+
+        updater, trace, _builder, _controller = run_update(should_fail=True)
+        with self.assertRaisesRegex(RuntimeError, "update failed"):
+            updater.update()
+        summary_entries = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "progress_lineage_summary"
+        ]
+        self.assertEqual(1, len(summary_entries))
+        self.assertEqual("model_mutation", summary_entries[0]["details"]["missing_phase"])
+
+    def test_update_finalization_does_not_project_when_debug_policy_is_disabled(self):
+        trace = BreadcrumbTraceCollector(lambda: False)
+        correlation = "lftp-poll:0123456789abcdef"
+        builder = SimpleNamespace(
+            begin_stop_resume_trace_cycle=MagicMock(),
+            finish_stop_resume_trace_cycle=MagicMock(),
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(
+                breadcrumb_trace=trace, performance_diagnostics=None,
+            ),
+            _Controller__model_builder=builder,
+            _Controller__model=SimpleNamespace(set_version_publication_callback=MagicMock()),
+            _Controller__work_state_lock=None,
+            _Controller__stop_resume_trace_cycle_id=0,
+            _Controller__lftp_status_poll_correlation=correlation,
+            logger=MagicMock(),
+        )
+        updater = ModelUpdater(controller)
+        updater._update_once = MagicMock(return_value=True)
+        updater.update()
+        self.assertEqual([], trace.snapshot()["entries"])
+
+    def test_update_finalization_enqueue_failure_isolated_from_model_update(self):
+        class FailingSpool:
+            def enqueue(self, _entry, _is_critical):
+                raise RuntimeError("durable enqueue failed")
+
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"model.progress": "debug"}},
+        )
+        trace._BreadcrumbTraceCollector__durable_spool = FailingSpool()
+        correlation = "lftp-poll:0123456789abcdef"
+        builder = SimpleNamespace(
+            begin_stop_resume_trace_cycle=MagicMock(),
+            finish_stop_resume_trace_cycle=MagicMock(),
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(
+                breadcrumb_trace=trace, performance_diagnostics=None,
+            ),
+            _Controller__model_builder=builder,
+            _Controller__model=SimpleNamespace(
+                set_version_publication_callback=MagicMock(),
+            ),
+            _Controller__work_state_lock=None,
+            _Controller__stop_resume_trace_cycle_id=0,
+            _Controller__lftp_status_poll_correlation=correlation,
+            logger=MagicMock(),
+        )
+        updater = ModelUpdater(controller)
+        callback_ran = []
+
+        def update_once():
+            callback_ran.append(True)
+            trace.record_progress_lineage(
+                correlation, "status_consume",
+                {"source": "fresh_healthy", "fresh": True, "healthy": True},
+            )
+            updater._ModelUpdater__progress_lineage_correlation = correlation
+            trace.record_progress_lineage(
+                correlation, "model_mutation",
+                {"outcome": "mutated", "model_version": 3, "scope_version": 3},
+            )
+            return False
+
+        updater._update_once = update_once
+        updater.update()
+
+        self.assertEqual([True], callback_ran)
+        builder.finish_stop_resume_trace_cycle.assert_called_once_with(
+            controller._Controller__model, False,
+        )
+        self.assertEqual(1, len([
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "progress_lineage_summary"
+        ]))
+        self.assertGreaterEqual(trace._BreadcrumbTraceCollector__durable_enqueue_rejected_count, 1)
+        self.assertEqual(1, len(trace.snapshot()["progress_lineage"]["spans"]))
+
     def test_update_attributes_trace_setup_lock_wait_and_finalization(self):
         diagnostics = MagicMock()
         diagnostics.begin_duration.side_effect = lambda metric: (metric,)

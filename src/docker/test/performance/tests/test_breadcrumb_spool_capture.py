@@ -579,6 +579,89 @@ def test_collector_durable_flat_envelope_reaches_reader_projection(tmp_path: Pat
     assert any(item.get("model_page_snapshot", {}).get("outcome") == "success" for item in projections)
 
 
+@pytest.mark.skipif(BreadcrumbTraceCollector is None, reason="production breadcrumb collector is unavailable")
+def test_production_lineage_summary_durable_round_trip_preserves_timestamps_and_range(tmp_path: Path) -> None:
+    spool = tmp_path / "collector-spool"
+    spool.mkdir()
+    artifact = tmp_path / "capture.jsonl"
+    collector = BreadcrumbTraceCollector(
+        lambda: True,
+        policy={"default": "off", "rules": {"model.progress": "debug"}},
+        durable_enabled=True,
+        durable_path=str(spool),
+        durable_enabled_getter=lambda: True,
+    )
+    correlation = "lftp-poll:0123456789abcdef"
+    try:
+        # Lineage steps are retained in-memory until their summary is
+        # projected, so they cannot wake the durable writer by themselves.
+        # Admit one ordinary record and flush it first; this uses the real
+        # writer lifecycle to commit the session boundary and publish valid
+        # health before the reader arms at EOF.
+        assert collector.record(
+            "model_updater", "durable_boundary_probe", {},
+            category="model.progress", event_type="diagnostic",
+            stage="model_summary", level="debug",
+        ) in {"retained", "enqueued"}
+        assert collector.wait_for_ingress(2.0)
+        assert collector.flush_durable(2.0)
+        durable_state = collector.durable_snapshot()
+        assert durable_state["session_boundary_written"] is True
+        assert durable_state["written"] >= 1
+        assert collector.record_progress_lineage(
+            correlation, "status_consume",
+            {"source": "fresh_healthy", "fresh": True, "healthy": True},
+        )
+        for version in (4, 5, 7):
+            assert collector.record_progress_lineage(
+                correlation, "model_mutation",
+                {"outcome": "mutated", "model_version": version, "scope_version": version},
+            )
+        assert collector.record_progress_lineage(
+            correlation, "updater_decision",
+            {"decision": "active_delta", "build_kind": "candidate", "status_count_bucket": "2-4",
+             "updater_cycle_duration_bucket": "20-99"},
+        )
+        reader = _reader(spool, artifact)
+        try:
+            reader.start()
+            assert collector.record_progress_lineage_summary(correlation)
+            assert collector.flush_durable(2.0)
+            assert reader.poll() == 1
+        finally:
+            reader.close()
+        rows = [
+            json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        row = next(item for item in rows if item.get("message") == "progress_lineage_summary")
+        assert isinstance(row.get("created_ns"), int)
+        assert row["corr_id"] == correlation
+        assert row["details"]["model_mutation"] == {
+            "model_version_first": 4,
+            "model_version_last": 7,
+            "scope_version": 7,
+            "mutation_version_ranges": [[4, 5], [7, 7]],
+            "monotonic_ms": row["details"]["model_mutation"]["monotonic_ms"],
+        }
+    finally:
+        collector.close(timeout=2.0)
+    record = next(
+        item for item in _artifacts(artifact)
+        if item["capture"].get("state") == "record"
+    )
+    projection = record["capture"]["projection"]
+    assert record["capture"]["created_ns"] == row["created_ns"]
+    assert projection["model_progress_lineage"]["missing_phase"] == "none"
+    assert projection["model_progress_lineage"]["model_mutation"]["model_version_first"] == 4
+    assert projection["model_progress_lineage"]["model_mutation"]["model_version_last"] == 7
+    assert projection["model_progress_lineage"]["model_mutation"]["scope_version"] == 7
+    assert projection["model_progress_lineage"]["model_mutation"]["mutation_version_ranges"] == [[4, 5], [7, 7]]
+    assert all(
+        not start <= 6 <= end
+        for start, end in projection["model_progress_lineage"]["model_mutation"]["mutation_version_ranges"]
+    )
+
+
 def test_poll_drains_beyond_single_eight_kib_chunk_with_budget_receipt(tmp_path: Path) -> None:
     spool, artifact = _prepare(tmp_path)
     payload = b"".join(_row(created=index, details={"bytes_done": index, "bytes_total": 100000}) for index in range(1, 220))
