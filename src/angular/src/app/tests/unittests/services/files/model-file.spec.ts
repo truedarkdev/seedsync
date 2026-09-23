@@ -154,6 +154,13 @@ describe("Testing model file initialization", () => {
         expect(initialized.remote_has_transferable_content).toBe(false);
     });
 
+    it("keeps omitted local coverage unknown and preserves explicit false", () => {
+        expect(ModelFile.fromJson({name: "legacy", state: "default"}).complete_local_coverage).toBeNull();
+        expect(ModelFile.fromJson({
+            name: "partial", state: "default", complete_local_coverage: false,
+        }).complete_local_coverage).toBe(false);
+    });
+
     it("should recursively classify legacy remote children and zero-byte files", () => {
         const empty = ModelFile.fromJson({
             name: "empty",

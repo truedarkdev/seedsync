@@ -2,12 +2,22 @@ import {CommonModule} from "@angular/common";
 import {ChangeDetectorRef, Directive, Input, Pipe, PipeTransform, SimpleChange} from "@angular/core";
 import {ComponentFixture, TestBed} from "@angular/core/testing";
 import {By} from "@angular/platform-browser";
+import * as Immutable from "immutable";
 import {of} from "rxjs";
 
 import {Modal} from "../../../../services/utils/modal.service";
 
 import {FileAction, FileComponent} from "../../../../pages/files/file.component";
 import {ViewFile} from "../../../../services/files/view-file";
+import {ViewFileService} from "../../../../services/files/view-file.service";
+import {ModelFile} from "../../../../services/files/model-file";
+import {FileSelectionService} from "../../../../services/files/file-selection.service";
+import {LoggerService} from "../../../../services/utils/logger.service";
+import {StreamServiceRegistry} from "../../../../services/base/stream-service.registry";
+import {ConnectedService} from "../../../../services/utils/connected.service";
+import {LOCAL_STORAGE} from "../../../../services/utils/storage.service";
+import {MockStreamServiceRegistry} from "../../../mocks/mock-stream-service.registry";
+import {MockStorageService} from "../../../mocks/mock-storage.service";
 import {ModalAccessibilityService} from "../../../../services/utils/modal-accessibility.service";
 
 
@@ -53,6 +63,7 @@ function createViewFile(props: any = {}): ViewFile {
         name: props.name || "sample",
         status: props.status || ViewFile.Status.DEFAULT,
         isLocalOnly: props.isLocalOnly || false,
+        isIncomplete: props.isIncomplete || false,
         remoteHasTransferableContent: props.remoteHasTransferableContent || false,
         isArchive: props.isArchive || false,
         isQueueable: props.isQueueable || false,
@@ -95,7 +106,13 @@ describe("Testing file component", () => {
             providers: [
                 {provide: Modal, useClass: MockModal},
                 {provide: ModalAccessibilityService, useClass: MockModalAccessibilityService},
-                {provide: ChangeDetectorRef, useValue: changeDetector}
+                {provide: ChangeDetectorRef, useValue: changeDetector},
+                ViewFileService,
+                FileSelectionService,
+                LoggerService,
+                ConnectedService,
+                {provide: StreamServiceRegistry, useClass: MockStreamServiceRegistry},
+                {provide: LOCAL_STORAGE, useClass: MockStorageService}
             ]
         });
 
@@ -416,6 +433,54 @@ describe("Testing file component", () => {
         expect(composition.query(By.css(".size_info")).nativeElement.textContent).toContain("of");
     });
 
+    it("should render the service-mapped retained row as Incomplete with its remaining-byte cue", () => {
+        const registry = TestBed.inject(StreamServiceRegistry) as unknown as MockStreamServiceRegistry;
+        const service = TestBed.inject(ViewFileService);
+        let file: ViewFile = null;
+        service.files.subscribe(files => file = files.first());
+        registry.modelFileService._files.next(Immutable.Map<string, ModelFile>().set("sample", new ModelFile({
+            file_id: "sample-id", name: "sample", state: ModelFile.State.DEFAULT,
+            complete_local_coverage: false, explicitly_stopped: false,
+            remote_size: 1234567890, transferred_size: 1234567878,
+            display_size_total: 1234567890, display_transferred_size: 1234567878,
+            remote_present: true, local_present: true, remote_has_transferable_content: true,
+        })));
+        fixture.componentInstance.file = file;
+        fixture.componentInstance.options = of(null) as any;
+        fixture.detectChanges();
+
+        const status = fixture.debugElement.query(By.css(".status"));
+        expect(status.nativeElement.textContent).toContain("Incomplete");
+        expect(status.query(By.css("img#stopped"))).toBeNull();
+        expect(file.status).toBe(ViewFile.Status.STOPPED);
+        expect(fixture.componentInstance.file.visibleStatus).toBe(ViewFile.Status.INCOMPLETE);
+        expect(file.isQueueable).toBe(true);
+        const queueSpy = jasmine.createSpy("queue");
+        fixture.componentInstance.queueEvent.subscribe(queueSpy);
+        const queueButton = fixture.debugElement.query(By.css(".actions button")).nativeElement as HTMLButtonElement;
+        expect(queueButton.disabled).toBe(false);
+        queueButton.click();
+        expect(queueSpy).toHaveBeenCalledWith(file);
+        expect(fixture.debugElement.query(By.css(".progress-percent")).nativeElement.textContent.trim())
+            .toBe("99%");
+        expect(fixture.debugElement.query(By.css(".size_info")).nativeElement.textContent)
+            .toContain("12 B remaining");
+
+        registry.modelFileService._files.next(Immutable.Map<string, ModelFile>().set("sample", new ModelFile({
+            file_id: "sample-id", name: "sample", state: ModelFile.State.DEFAULT,
+            complete_local_coverage: false, explicitly_stopped: false,
+            remote_size: 100, transferred_size: 100,
+            display_size_total: 100, display_transferred_size: 100,
+            remote_present: true, local_present: true, remote_has_transferable_content: true,
+        })));
+        fixture.componentInstance.file = file;
+        fixture.detectChanges();
+        const sizeInfo = fixture.debugElement.query(By.css(".size_info")).nativeElement.textContent;
+        expect(file.visibleStatus).toBe(ViewFile.Status.INCOMPLETE);
+        expect(sizeInfo).toContain("Coverage incomplete");
+        expect(sizeInfo).not.toContain("remaining");
+    });
+
     it("should render unavailable downloading progress as an indeterminate accessible bar", () => {
         fixture.componentInstance.file = createViewFile({
             status: ViewFile.Status.DOWNLOADING,
@@ -524,6 +589,7 @@ describe("Testing file component", () => {
 
         fixture.detectChanges();
 
+        expect(fixture.debugElement.query(By.css(".status img#stopped"))).not.toBeNull();
         const stopButton = fixture.debugElement.query(By.css("button.stop-action")).nativeElement as HTMLButtonElement;
         stopButton.click();
 

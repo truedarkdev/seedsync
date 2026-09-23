@@ -304,6 +304,7 @@ const compareStatusLegacy = (a: ViewFile, b: ViewFile): number => {
             [ViewFile.Status.VALIDATED]: 6,
             [ViewFile.Status.DOWNLOADED]: 7,
             [ViewFile.Status.STOPPED]: 8,
+            [ViewFile.Status.INCOMPLETE]: 8.5,
             [ViewFile.Status.DEFAULT]: 9,
             [ViewFile.Status.LOCAL_ONLY]: 9,
             [ViewFile.Status.DELETED]: 9  // intermix deleted and default
@@ -326,6 +327,7 @@ const compareStatusImproved = (a: ViewFile, b: ViewFile): number => {
             [ViewFile.Status.MOVE_FAILED]: 4,
             [ViewFile.Status.CORRUPT]: 5,
             [ViewFile.Status.STOPPED]: 6,
+            [ViewFile.Status.INCOMPLETE]: 6.5,
             [ViewFile.Status.QUEUED]: 7,
             [ViewFile.Status.DEFAULT]: 8,
             [ViewFile.Status.MOVE_SUCCEEDED]: 9,

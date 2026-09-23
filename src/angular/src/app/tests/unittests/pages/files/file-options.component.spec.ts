@@ -172,6 +172,23 @@ describe("Testing file options component", () => {
         expect(component.isStatusDisabled(ViewFile.Status.QUEUED)).toBe(false);
         expect(component.isStatusDisabled(ViewFile.Status.STOPPED)).toBe(true);
 
+        viewFileService.emitFiles(Immutable.List([
+            new ViewFile({status: ViewFile.Status.STOPPED, isIncomplete: true}),
+            new ViewFile({status: ViewFile.Status.STOPPED}),
+        ]));
+        fixture.detectChanges();
+
+        expect(component.getStatusCount(ViewFile.Status.INCOMPLETE)).toBe(1);
+        expect(component.getStatusCount(ViewFile.Status.STOPPED)).toBe(1);
+        const incompleteButton = Array.from(
+            fixture.nativeElement.querySelectorAll("#filter-status .dropdown-menu .dropdown-item")
+        ).find((button: HTMLButtonElement) => (button.textContent || "").includes("Incomplete")) as HTMLButtonElement;
+        expect(incompleteButton).toBeDefined();
+        expect(incompleteButton.disabled).toBe(false);
+        const setStatusSpy = spyOn(viewFileOptionsService, "setSelectedStatusFilter");
+        incompleteButton.click();
+        expect(setStatusSpy).toHaveBeenCalledWith(ViewFile.Status.INCOMPLETE);
+
         viewFileOptionsService.emitOptions(new ViewFileOptions({
             showDetails: false,
             sortMethod: ViewFileOptions.SortMethod.SMART_STATUS,

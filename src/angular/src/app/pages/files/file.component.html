@@ -140,6 +140,12 @@
                         <ng-container *ngIf="file.percentDownloaded != null; else progressUnavailable">
                             {{file.transferredSize | fileSize:3}} of {{file.displaySizeTotal | fileSize:3}}
                         </ng-container>
+                        <span *ngIf="file.visibleStatus === ViewFile.Status.INCOMPLETE && file.transferredSize < file.displaySizeTotal">
+                            <br />{{file.displaySizeTotal - file.transferredSize}} B remaining
+                        </span>
+                        <span *ngIf="file.visibleStatus === ViewFile.Status.INCOMPLETE && file.transferredSize >= file.displaySizeTotal">
+                            <br />Coverage incomplete
+                        </span>
                         <ng-template #progressUnavailable>
                             <span class="progress-unavailable">Progress unavailable</span>
                         </ng-template>

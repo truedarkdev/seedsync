@@ -31,6 +31,7 @@ export class FileOptionsComponent implements OnInit, OnDestroy {
         [ViewFile.Status.DOWNLOADING]: 0,
         [ViewFile.Status.QUEUED]: 0,
         [ViewFile.Status.STOPPED]: 0,
+        [ViewFile.Status.INCOMPLETE]: 0,
         [ViewFile.Status.MOVE_FAILED]: 0,
         [ViewFile.Status.MOVE_SUCCEEDED]: 0
     };
@@ -70,6 +71,9 @@ export class FileOptionsComponent implements OnInit, OnDestroy {
             );
             this.statusCounts[ViewFile.Status.STOPPED] = FileOptionsComponent.getStatusCount(
                 files, ViewFile.Status.STOPPED
+            );
+            this.statusCounts[ViewFile.Status.INCOMPLETE] = FileOptionsComponent.getStatusCount(
+                files, ViewFile.Status.INCOMPLETE
             );
             this.statusCounts[ViewFile.Status.MOVE_FAILED] = FileOptionsComponent.getStatusCount(
                 files, ViewFile.Status.MOVE_FAILED

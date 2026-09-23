@@ -178,6 +178,11 @@ describe("Testing view file sort service", () => {
             new ViewFile({status: ViewFile.Status.STOPPED}),
             new ViewFile({status: ViewFile.Status.DOWNLOADED})
         )).toBeLessThan(0);
+        const incomplete = new ViewFile({status: ViewFile.Status.STOPPED, isIncomplete: true});
+        const stopped = new ViewFile({status: ViewFile.Status.STOPPED});
+        expect(isFinite(sortComparator(incomplete, stopped))).toBe(true);
+        expect(sortComparator(stopped, incomplete)).toBeLessThan(0);
+        expect(sortComparator(incomplete, new ViewFile({status: ViewFile.Status.QUEUED}))).toBeLessThan(0);
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.STOPPED}),
             new ViewFile({status: ViewFile.Status.DEFAULT})
@@ -267,6 +272,11 @@ describe("Testing view file sort service", () => {
             new ViewFile({status: ViewFile.Status.EXTRACTED}),
             new ViewFile({status: ViewFile.Status.STOPPED})
         )).toBeLessThan(0);
+        const incomplete = new ViewFile({status: ViewFile.Status.STOPPED, isIncomplete: true});
+        const stopped = new ViewFile({status: ViewFile.Status.STOPPED});
+        expect(isFinite(sortComparator(incomplete, stopped))).toBe(true);
+        expect(sortComparator(stopped, incomplete)).toBeLessThan(0);
+        expect(sortComparator(incomplete, new ViewFile({status: ViewFile.Status.DEFAULT}))).toBeLessThan(0);
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.EXTRACTED}),
             new ViewFile({status: ViewFile.Status.VALIDATED})

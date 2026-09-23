@@ -2085,6 +2085,7 @@ describe("Testing view file service", () => {
                 transferred_size: 10, remote_size: 40,
                 display_size_total: 100, display_transferred_size: 60,
                 expected: ViewFile.Status.STOPPED,
+                expectedVisibleStatus: ViewFile.Status.STOPPED, expectedPercent: 60,
             },
             {
                 state: ModelFile.State.DEFAULT,
@@ -2092,6 +2093,7 @@ describe("Testing view file service", () => {
                 display_size_total: 100, display_transferred_size: 100,
                 complete_local_coverage: false,
                 expected: ViewFile.Status.STOPPED,
+                expectedVisibleStatus: ViewFile.Status.INCOMPLETE, expectedPercent: 99,
             },
             {
                 state: ModelFile.State.DEFAULT,
@@ -2174,18 +2176,25 @@ describe("Testing view file service", () => {
             },
         ];
         for (const vector of vectors) {
-            mockModelService._files.next(Immutable.Map<string, ModelFile>().set("sample", new ModelFile({
+            const modelProps: any = {
                 name: "sample", state: vector.state,
                 remote_size: vector.remote_size, transferred_size: vector.transferred_size,
                 display_size_total: vector.display_size_total,
                 display_transferred_size: vector.display_transferred_size,
                 explicitly_stopped: vector.explicitly_stopped === true,
-                complete_local_coverage: vector.complete_local_coverage === true,
                 final_move_succeeded: vector.final_move_succeeded === true,
                 remote_present: true, local_present: true, remote_has_transferable_content: true,
-            })));
+            };
+            if (vector.complete_local_coverage !== undefined) {
+                modelProps.complete_local_coverage = vector.complete_local_coverage;
+            }
+            mockModelService._files.next(Immutable.Map<string, ModelFile>().set("sample", new ModelFile(modelProps)));
             tick();
             expect(latest.status).toBe(vector.expected);
+            if (vector.expectedVisibleStatus !== undefined) {
+                expect(latest.visibleStatus).toBe(vector.expectedVisibleStatus);
+                expect(latest.percentDownloaded).toBe(vector.expectedPercent);
+            }
         }
     }));
 });

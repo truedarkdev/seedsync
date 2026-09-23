@@ -25,7 +25,7 @@ interface IModelFile {
     full_path: string;
     is_extractable: boolean;
     explicitly_stopped: boolean;
-    complete_local_coverage: boolean;
+    complete_local_coverage: boolean | null;
     local_created_timestamp: Date;
     local_modified_timestamp: Date;
     remote_created_timestamp: Date;
@@ -61,7 +61,7 @@ const DefaultModelFile: IModelFile = {
     full_path: null,
     is_extractable: null,
     explicitly_stopped: false,
-    complete_local_coverage: false,
+    complete_local_coverage: null,
     local_created_timestamp: null,
     local_modified_timestamp: null,
     remote_created_timestamp: null,
@@ -103,7 +103,7 @@ export class ModelFile extends ModelFileRecord implements IModelFile {
     full_path: string;
     is_extractable: boolean;
     explicitly_stopped: boolean;
-    complete_local_coverage: boolean;
+    complete_local_coverage: boolean | null;
     local_created_timestamp: Date;
     local_modified_timestamp: Date;
     remote_created_timestamp: Date;

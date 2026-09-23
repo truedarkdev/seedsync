@@ -265,6 +265,20 @@ describe("Testing view file filter service", () => {
         }))).toBe(false);
     }));
 
+    it("filters retained incomplete rows separately from stopped rows", fakeAsync(() => {
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            selectedStatusFilter: ViewFile.Status.INCOMPLETE,
+        }));
+        tick();
+
+        expect(filterCriteria.meetsCriteria(new ViewFile({
+            status: ViewFile.Status.STOPPED, isIncomplete: true,
+        }))).toBe(true);
+        expect(filterCriteria.meetsCriteria(new ViewFile({
+            status: ViewFile.Status.STOPPED, isIncomplete: false,
+        }))).toBe(false);
+    }));
+
     it("correctly filters by name AND status", fakeAsync(() => {
         viewFileOptionsService._options.next(new ViewFileOptions({
             selectedStatusFilter: ViewFile.Status.DEFAULT,

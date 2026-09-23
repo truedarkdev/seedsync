@@ -16,6 +16,7 @@ interface IViewFile {
     localPresent: boolean;
     remoteHasTransferableContent: boolean;
     isLocalOnly: boolean;
+    isIncomplete: boolean;
     transferredSize: number | null;
     displaySizeTotal: number;
     percentDownloaded: number | null;
@@ -57,6 +58,7 @@ const DefaultViewFile: IViewFile = {
     localPresent: false,
     remoteHasTransferableContent: false,
     isLocalOnly: false,
+    isIncomplete: false,
     transferredSize: null,
     displaySizeTotal: null,
     percentDownloaded: null,
@@ -99,6 +101,7 @@ export class ViewFile extends ViewFileRecord implements IViewFile {
     localPresent: boolean;
     remoteHasTransferableContent: boolean;
     isLocalOnly: boolean;
+    isIncomplete: boolean;
     transferredSize: number | null;
     displaySizeTotal: number;
     percentDownloaded: number | null;
@@ -131,7 +134,10 @@ export class ViewFile extends ViewFileRecord implements IViewFile {
 
     /** Status represented by the row label/icon rather than persisted lineage. */
     get visibleStatus(): ViewFile.Status {
-        return this.isLocalOnly ? ViewFile.Status.LOCAL_ONLY : this.status;
+        if (this.isLocalOnly) {
+            return ViewFile.Status.LOCAL_ONLY;
+        }
+        return this.isIncomplete ? ViewFile.Status.INCOMPLETE : this.status;
     }
 }
 
@@ -150,6 +156,7 @@ export module ViewFile {
         CORRUPT         = <any> "corrupt",
         MOVE_FAILED     = <any> "move_failed",
         MOVE_SUCCEEDED  = <any> "move_succeeded",
+        INCOMPLETE      = <any> "incomplete",
         LOCAL_ONLY      = <any> "local_only"
     }
 }
