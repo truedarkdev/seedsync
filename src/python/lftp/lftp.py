@@ -666,6 +666,23 @@ def _lftp_status_drain_class(
     return "unknown"
 
 
+def _lftp_status_poll_trace_level(
+        breadcrumb_trace: object, phase: object, healthy: object = None,
+) -> str:
+    if phase in LFTP_STATUS_POLL_TRACE_FAILURE_PHASES or \
+            (phase == "health" and healthy is False):
+        return "warning"
+    if phase in {"jobs_read", "parse_complete"} and healthy is True:
+        # Keep detailed loop metrics on DEBUG records. INFO-only policies get
+        # the two healthy boundaries needed to join the status poll lifecycle.
+        if _breadcrumb_effectively_enabled(
+                breadcrumb_trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug",
+        ):
+            return "debug"
+        return "info"
+    return "debug"
+
+
 def _lftp_detect_errors_from_output(output: str) -> bool:
     """Use the class detector from module-level diagnostic helpers."""
     return Lftp._Lftp__detect_errors_from_output(output)
@@ -1066,8 +1083,7 @@ def _record_lftp_status_poll_breadcrumb(
     safe_correlation = _safe_lftp_status_poll_correlation(correlation)
     if safe_correlation is None or phase not in LFTP_STATUS_POLL_TRACE_PHASES:
         return
-    level = "warning" if phase in LFTP_STATUS_POLL_TRACE_FAILURE_PHASES or \
-        (phase == "health" and healthy is False) else "debug"
+    level = _lftp_status_poll_trace_level(breadcrumb_trace, phase, healthy)
     if not _breadcrumb_effectively_enabled(breadcrumb_trace, LFTP_STATUS_POLL_TRACE_CATEGORY, level):
         return
     try:
@@ -1978,6 +1994,7 @@ class Lftp:
         pty_flow_id = _safe_lftp_pty_correlation(trace_pty_correlation)
         status_trace_enabled = safe_status_poll_correlation is not None and (
             _breadcrumb_effectively_enabled(pty_trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug") or
+            _breadcrumb_effectively_enabled(pty_trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "info") or
             _breadcrumb_effectively_enabled(pty_trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "warning")
         )
         status_metrics_enabled = safe_status_poll_correlation is not None and \
@@ -2064,8 +2081,7 @@ class Lftp:
             if safe_status_poll_correlation is None:
                 return
             trace = getattr(self, "_Lftp__breadcrumb_trace", None)
-            level = "warning" if phase in LFTP_STATUS_POLL_TRACE_FAILURE_PHASES or \
-                (phase == "health" and healthy is False) else "debug"
+            level = _lftp_status_poll_trace_level(trace, phase, healthy)
             if not _breadcrumb_effectively_enabled(trace, LFTP_STATUS_POLL_TRACE_CATEGORY, level):
                 return
             try:
@@ -2400,7 +2416,7 @@ class Lftp:
                         "ready" if prompt_reached and out else
                         "empty" if prompt_reached else "timeout"
                     )
-                record_status_trace("jobs_read", out, boundary_state={
+                record_status_trace("jobs_read", out, healthy=prompt_reached, boundary_state={
                     "prior_prompt": pty_readiness,
                     "send_admitted": True,
                     "prompt_reached": prompt_reached,
@@ -2940,8 +2956,7 @@ class Lftp:
             if safe_trace_poll_correlation is None:
                 return
             trace = getattr(self, "_Lftp__breadcrumb_trace", None)
-            level = "warning" if phase in LFTP_STATUS_POLL_TRACE_FAILURE_PHASES or \
-                (phase == "health" and healthy is False) else "debug"
+            level = _lftp_status_poll_trace_level(trace, phase, healthy)
             if not _breadcrumb_effectively_enabled(trace, LFTP_STATUS_POLL_TRACE_CATEGORY, level):
                 return
             try:
@@ -3059,7 +3074,9 @@ class Lftp:
             self.__set_status_parse_outcome(statuses)
             self.__consecutive_status_errors = 0
             self.__last_status_poll_healthy = not timed_out
-            record_status_result("parse_complete", out, len(statuses))
+            record_status_result(
+                "parse_complete", out, len(statuses), healthy=self.__last_status_poll_healthy,
+            )
         except LftpJobStatusParserError as exc:
             self.__set_status_parse_outcome(statuses)
             self.__consecutive_status_errors += 1
@@ -3107,7 +3124,9 @@ class Lftp:
                 self.__set_status_parse_outcome(statuses)
                 self.__consecutive_status_errors = 0
                 self.__last_status_poll_healthy = not self.__last_command_timed_out
-                record_status_result("parse_complete", out, len(statuses))
+                record_status_result(
+                    "parse_complete", out, len(statuses), healthy=self.__last_status_poll_healthy,
+                )
             except LftpJobStatusParserError as exc:
                 self.__set_status_parse_outcome(statuses)
                 self.__consecutive_status_errors += 1

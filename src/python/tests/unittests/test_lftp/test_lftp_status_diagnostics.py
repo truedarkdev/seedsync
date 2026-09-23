@@ -95,6 +95,14 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
             policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
         )
 
+    @staticmethod
+    def _info_trace(max_entries=32):
+        return BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=max_entries,
+            policy={"default": "info"},
+        )
+
     def test_parser_reports_only_fixed_snapshot_outcomes(self):
         cases = (
             (
@@ -987,6 +995,155 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         self.assertEqual("none", parse_complete["details"]["error_class"])
         self.assertNotIn("prompt_timeout", [event["details"]["phase"] for event in events])
         self.assertNotIn("parse_error", [event["details"]["phase"] for event in events])
+
+    def test_healthy_fresh_and_repeated_polls_emit_two_correlated_info_boundaries(self):
+        lftp = self._build_lftp()
+        lftp._Lftp__process.before = (
+            "sftp://private-user@private-host/private/path\nprivate-file status"
+        )
+        trace = self._info_trace()
+        lftp.set_breadcrumb_trace(trace)
+
+        self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+        self.assertEqual([], lftp.status("lftp-poll:fedcba9876543210"))
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(
+            ["jobs_read", "parse_complete", "jobs_read", "parse_complete"],
+            [event["details"]["phase"] for event in entries],
+        )
+        for poll_id, pair in zip(
+                ("lftp-poll:0123456789abcdef", "lftp-poll:fedcba9876543210"),
+                (entries[:2], entries[2:]),
+        ):
+            self.assertEqual(["info", "info"], [event["level"] for event in pair])
+            self.assertEqual([poll_id, poll_id], [event["corr_id"] for event in pair])
+            self.assertEqual([poll_id, poll_id], [event["flow_id"] for event in pair])
+        rendered = repr(entries)
+        self.assertNotIn("private-user", rendered)
+        self.assertNotIn("private-host", rendered)
+        self.assertNotIn("private/path", rendered)
+        self.assertNotIn("private-file", rendered)
+
+    def test_connection_grace_emits_at_most_four_info_rows_for_one_poll(self):
+        lftp = self._build_lftp()
+        lftp._Lftp__status_poll_needs_connection_grace = True
+        trace = self._info_trace()
+        lftp.set_breadcrumb_trace(trace)
+        process = lftp._Lftp__process
+        expect_calls = []
+
+        def set_output_for_each_read(*_args, **_kwargs):
+            expect_calls.append(None)
+            process.before = "" if len(expect_calls) == 1 else "status payload"
+
+        process.expect.side_effect = set_output_for_each_read
+
+        self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(
+            ["jobs_read", "parse_complete", "jobs_read", "parse_complete"],
+            [event["details"]["phase"] for event in entries],
+        )
+        self.assertEqual(4, len(entries))
+        self.assertTrue(all(event["level"] == "info" for event in entries))
+        self.assertEqual(
+            ["lftp-poll:0123456789abcdef"] * 4,
+            [event["corr_id"] for event in entries],
+        )
+        self.assertEqual(2, lftp._Lftp__job_status_parser.parse.call_count)
+
+    def test_info_policy_keeps_failures_as_warnings_without_error_info(self):
+        lftp = self._build_lftp()
+        lftp._Lftp__process.expect.side_effect = pexpect.exceptions.TIMEOUT("timeout")
+        trace = self._info_trace()
+        lftp.set_breadcrumb_trace(trace)
+
+        with patch("lftp.lftp.time.monotonic", side_effect=[0.0, 1.01]), \
+                patch("lftp.lftp.time.sleep"):
+            self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        entries = trace.snapshot()["entries"]
+        self.assertTrue(entries)
+        self.assertTrue(all(event["level"] == "warning" for event in entries))
+        self.assertIn("prompt_timeout", [event["details"]["phase"] for event in entries])
+        self.assertNotIn("jobs_read", [event["details"]["phase"] for event in entries])
+        self.assertNotIn("parse_complete", [event["details"]["phase"] for event in entries])
+
+    def test_info_policy_disabled_capture_emits_no_status_boundaries(self):
+        lftp = self._build_lftp()
+        trace = BreadcrumbTraceCollector(
+            lambda: False,
+            max_entries=32,
+            policy={"default": "info"},
+        )
+        lftp.set_breadcrumb_trace(trace)
+
+        self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+        self.assertEqual([], trace.snapshot()["entries"])
+
+    def test_info_boundary_eviction_remains_visible_through_collector_snapshot(self):
+        lftp = self._build_lftp()
+        trace = self._info_trace(max_entries=1)
+        lftp.set_breadcrumb_trace(trace)
+
+        self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+
+        snapshot = trace.snapshot()
+        self.assertEqual(1, len(snapshot["entries"]))
+        self.assertEqual("parse_complete", snapshot["entries"][0]["details"]["phase"])
+        self.assertGreaterEqual(snapshot["accounting"]["evicted_count"], 1)
+        self.assertTrue(snapshot["gap_detected"])
+
+    def test_info_poll_rows_and_loss_health_are_retrievable_after_spool_close(self):
+        lftp = self._build_lftp()
+        with tempfile.TemporaryDirectory() as spool_dir:
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                max_entries=1,
+                policy={"default": "info"},
+                durable_enabled=True,
+                durable_path=spool_dir,
+            )
+            lftp.set_breadcrumb_trace(trace)
+            try:
+                self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+                flushed = trace.flush_durable(2.0)
+                health = trace.close(timeout=2.0)
+                trace = None
+
+                with open(os.path.join(spool_dir, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                    records = [json.loads(line) for line in handle if line.strip()]
+                events = [record for record in records if record.get("message") == "lftp_status_poll"]
+                self.assertEqual(["jobs_read", "parse_complete"], [
+                    event["details"]["phase"] for event in events
+                ])
+                self.assertTrue(all(event["level"] == "info" for event in events))
+                self.assertTrue(all(
+                    event["corr_id"] == "lftp-poll:0123456789abcdef" for event in events
+                ))
+                self.assertEqual(2, health["written"])
+                self.assertEqual(0, health["lost"])
+                self.assertEqual(0, health["unknown"])
+                if os.name == "nt":
+                    self.assertEqual("buffered_best_effort", health["durability"])
+                    self.assertEqual("INCOMPLETE", health["state"])
+                    self.assertFalse(health["closed"])
+                else:
+                    self.assertTrue(flushed)
+                    self.assertTrue(health["health_publish_ok"])
+                    with open(
+                            os.path.join(spool_dir, "breadcrumbs.health.json"),
+                            encoding="utf-8",
+                    ) as handle:
+                        persisted_health = json.load(handle)
+                    self.assertTrue(persisted_health["closed"])
+                    self.assertEqual(2, persisted_health["written"])
+                    self.assertEqual(0, persisted_health["lost"])
+            finally:
+                if trace is not None:
+                    trace.close(timeout=2.0)
 
     def test_parser_error_has_distinct_error_class(self):
         lftp = self._build_lftp()
