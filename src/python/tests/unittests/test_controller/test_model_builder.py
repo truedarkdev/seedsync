@@ -123,6 +123,115 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual((), self.model_builder.get_finalizable_staging_leaf_candidates())
 
+    def test_nested_download_marker_does_not_promote_staging_child_before_final_publication(self):
+        remote_root = SystemFile("release", 16, True)
+        remote_root.path_pair_id = "default"
+        remote_nested = SystemFile("nested", 16, True)
+        remote_child = SystemFile("complete.bin", 8, False, mtime_ns=1_000_000_000)
+        remote_sibling = SystemFile("sibling.bin", 8, False, mtime_ns=1_000_000_000)
+        remote_nested.add_child(remote_child)
+        remote_nested.add_child(remote_sibling)
+        remote_root.add_child(remote_nested)
+
+        staging_root = SystemFile("release", 16, True, is_staging=True)
+        staging_root.path_pair_id = "default"
+        staging_nested = SystemFile("nested", 16, True, is_staging=True)
+        staging_child = SystemFile(
+            "complete.bin", 8, False, is_staging=True, mtime_ns=1_000_000_000,
+        )
+        staging_sibling = SystemFile(
+            "sibling.bin", 8, False, is_staging=True, mtime_ns=1_000_000_000,
+        )
+        local_only_directory = SystemFile("local-only", 1, True)
+        local_only_directory.add_child(SystemFile("child.bin", 1, False))
+        staging_nested.add_child(staging_child)
+        staging_nested.add_child(staging_sibling)
+        staging_root.add_child(staging_nested)
+        staging_root.add_child(local_only_directory)
+
+        child_id = ModelFile.build_file_id(os.path.join("release", "nested", "complete.bin"), "default")
+        parent_id = ModelFile.build_file_id(os.path.join("release", "nested"), "default")
+        sibling_id = ModelFile.build_file_id(os.path.join("release", "nested", "sibling.bin"), "default")
+        local_only_id = ModelFile.build_file_id(os.path.join("release", "local-only", "child.bin"), "default")
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_downloaded_files({child_id, local_only_id})
+        self.model_builder.set_final_move_succeeded_files(set())
+
+        def find_by_id(model_file, file_id):
+            if model_file.file_id == file_id:
+                return model_file
+            for child in model_file.iter_children():
+                found = find_by_id(child, file_id)
+                if found is not None:
+                    return found
+            return None
+
+        root_id = ModelFile.build_file_id("release", "default")
+        absent_model = self.model_builder.build_model()
+        absent_root = absent_model.get_file(root_id)
+        absent_child = find_by_id(absent_root, child_id)
+        self.assertEqual(ModelFile.State.DEFAULT, absent_child.state)
+        self.assertFalse(absent_child.local_present)
+        self.assertFalse(absent_child.final_move_succeeded)
+        self.assertEqual(ModelFile.State.DEFAULT, find_by_id(absent_root, parent_id).state)
+        self.assertEqual(ModelFile.State.DEFAULT, find_by_id(absent_root, sibling_id).state)
+        self.assertIsNone(find_by_id(absent_root, local_only_id))
+
+        self.model_builder.set_local_files([staging_root])
+        staged_model = self.model_builder.build_model()
+        staged_root = staged_model.get_file(root_id)
+        staged_child = find_by_id(staged_root, child_id)
+        self.assertEqual(ModelFile.State.DEFAULT, find_by_id(staged_root, parent_id).state)
+        self.assertEqual(ModelFile.State.DEFAULT, staged_child.state)
+        self.assertEqual(ModelFile.State.DEFAULT, find_by_id(staged_root, sibling_id).state)
+        self.assertEqual(ModelFile.State.DOWNLOADED, find_by_id(staged_root, local_only_id).state)
+        self.assertEqual(
+            ((root_id, "nested/complete.bin"), (root_id, "nested/sibling.bin")),
+            self.model_builder.get_finalizable_staging_leaf_candidates(),
+        )
+
+        self.model_builder.set_downloaded_files({child_id})
+        self.model_builder.set_final_move_succeeded_files({child_id})
+        final_move_child = find_by_id(self.model_builder.build_model().get_file(root_id), child_id)
+        self.assertEqual(ModelFile.State.DOWNLOADED, final_move_child.state)
+        self.model_builder.set_final_move_succeeded_files(set())
+
+        undersized_root = SystemFile("release", 12, True)
+        undersized_root.path_pair_id = "default"
+        undersized_nested = SystemFile("nested", 12, True)
+        undersized_nested.add_child(SystemFile("complete.bin", 4, False, mtime_ns=1_000_000_000))
+        undersized_root.add_child(undersized_nested)
+        self.model_builder.set_local_files([undersized_root])
+        undersized_model = self.model_builder.build_model()
+        undersized_child = find_by_id(undersized_model.get_file(root_id), child_id)
+        self.assertTrue(undersized_child.local_present)
+        self.assertFalse(undersized_child.final_move_succeeded)
+        self.assertEqual(ModelFile.State.DEFAULT, undersized_child.state)
+
+        self.model_builder.set_local_files([staging_root])
+        queued = LftpJobStatus(
+            1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.QUEUED, "release", "",
+        )
+        queued.path_pair_id = "default"
+        self.model_builder.set_lftp_statuses([queued])
+        queued_child = find_by_id(self.model_builder.build_model().get_file(root_id), child_id)
+        self.assertEqual(ModelFile.State.QUEUED, queued_child.state)
+        self.assertEqual(
+            ((root_id, "nested/complete.bin"), (root_id, "nested/sibling.bin")),
+            self.model_builder.get_finalizable_staging_leaf_candidates(),
+        )
+
+        published_root = SystemFile("release", 16, True)
+        published_root.path_pair_id = "default"
+        published_nested = SystemFile("nested", 16, True)
+        published_nested.add_child(SystemFile("complete.bin", 8, False, mtime_ns=1_000_000_000))
+        published_nested.add_child(staging_sibling)
+        published_root.add_child(published_nested)
+        self.model_builder.set_lftp_statuses([])
+        self.model_builder.set_local_files([published_root])
+        published_child = find_by_id(self.model_builder.build_model().get_file(root_id), child_id)
+        self.assertEqual(ModelFile.State.DOWNLOADED, published_child.state)
+
     def test_parser_positive_zero_percent_is_not_a_model_reset_signal(self):
         status = LftpJobStatusParser().parse(
             "jobs -v\n"

@@ -7128,7 +7128,12 @@ class ModelBuilder:
                 )
                 if not _child_model_file.is_dir and \
                         _child_model_file.state == ModelFile.State.DEFAULT and \
-                        _child_file_id in (self.__downloaded_files or set()):
+                        _child_file_id in (self.__downloaded_files or set()) and \
+                        (_child_model_file.final_move_succeeded or
+                         (self.__local_file_proves_download_completion(
+                              _local_child, _remote_child,
+                          ) if _remote_child is not None else
+                          self.__is_authoritative_local_file(_local_child))):
                     _child_model_file.state = ModelFile.State.DOWNLOADED
                 _child_model_file.is_stoppable = self.__is_stoppable_model_file(
                     _child_model_file,
