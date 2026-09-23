@@ -6343,12 +6343,23 @@ class Controller:
             return file.path_pair_id or file.file_id or command.filename
         return command.filename
 
+    @staticmethod
+    def __delete_local_timing_correlation(command: "Controller.Command") -> Optional[str]:
+        if command.action != Controller.Command.Action.DELETE_LOCAL:
+            return None
+        flow_id = getattr(command, "flow_id", None)
+        return opaque_trace_correlation(flow_id) if isinstance(flow_id, str) else None
+
     def __record_command_breadcrumb(self,
                                     command: "Controller.Command",
                                     message: str,
                                     details: dict[str, object],
                                     event_type: str = "state_transition",
                                     file: Optional[ModelFile] = None) -> None:
+        timing_correlation = self.__delete_local_timing_correlation(command)
+        if timing_correlation is not None and message in {"command_dispatched", "command_finished"}:
+            details = dict(details)
+            details["timing_correlation"] = timing_correlation
         self.__record_breadcrumb(
             stage="command",
             message=message,
@@ -12540,15 +12551,61 @@ class Controller:
             except Exception:
                 pass
 
+        def invoke_callbacks(command_process, method, *args):
+            for callback in command_process.command.callbacks:
+                getattr(callback, method)(*args)
+
         def notify_callbacks(command_process, method, *args):
-            def invoke():
-                for callback in command_process.command.callbacks:
-                    getattr(callback, method)(*args)
             return observe_stage(
                 DURATION_CONTROLLER_CLEANUP_CALLBACKS,
                 "controller_cleanup_callback_exceptions",
-                invoke,
+                lambda: invoke_callbacks(command_process, method, *args),
             )
+
+        def observe_cleanup_stage(command_process, phase, metric, failure_counter, operation):
+            """Record sparse Delete Local cleanup timing without owning its outcome."""
+            is_delete_local = command_process.command.action == Controller.Command.Action.DELETE_LOCAL
+
+            def record(outcome):
+                if not is_delete_local:
+                    return
+                try:
+                    started_at = getattr(command_process, "started_at_monotonic", None)
+                    if isinstance(started_at, (int, float)):
+                        elapsed_ms = max(0, int((time.monotonic() - started_at) * 1000))
+                    else:
+                        elapsed_ms = 0
+                    timing_correlation = Controller.__delete_local_timing_correlation(
+                        command_process.command,
+                    )
+                    if timing_correlation is None:
+                        return
+                    self.__record_breadcrumb(
+                        stage="command",
+                        message="delete_local_cleanup_timing",
+                        details={
+                            "action": "DELETE_LOCAL",
+                            "phase": phase,
+                            "outcome": outcome,
+                            "elapsed_ms": elapsed_ms,
+                        },
+                        corr_id=timing_correlation,
+                        flow_id=timing_correlation,
+                        category="controller",
+                        level="info",
+                        event_type="failure" if outcome == "failed" else "state_transition",
+                    )
+                except Exception:
+                    # Timing evidence must never change cleanup or callback behavior.
+                    pass
+
+            try:
+                result = operation() if metric is None else observe_stage(metric, failure_counter, operation)
+            except Exception:
+                record("failed")
+                raise
+            record("completed")
+            return result
 
         now_monotonic = time.monotonic()
         still_active_processes: list[Controller.CommandProcessWrapper] = []
@@ -12591,22 +12648,40 @@ class Controller:
                         )
                         if command_process.await_completion:
                             self.__persist.stopped_file_names.discard(command_process.file_id)
-                        notify_callbacks(
-                            command_process,
-                            "on_failure",
-                            "Delete command for file '{}' timed out".format(command_process.file_name),
-                            504,
-                        )
+                            observe_cleanup_stage(
+                                command_process,
+                                "callback_signal",
+                                DURATION_CONTROLLER_CLEANUP_CALLBACKS,
+                                "controller_cleanup_callback_exceptions",
+                                lambda: invoke_callbacks(
+                                    command_process,
+                                    "on_failure",
+                                    "Delete command for file '{}' timed out".format(command_process.file_name),
+                                    504,
+                                ),
+                            )
+                        else:
+                            notify_callbacks(
+                                command_process,
+                                "on_failure",
+                                "Delete command for file '{}' timed out".format(command_process.file_name),
+                                504,
+                            )
                     finally:
                         self.__teardown_process("stale delete command process", command_process.process, terminate=False)
                     continue
                 still_active_processes.append(command_process)
             else:
+                observe_cleanup_stage(
+                    command_process, "child_complete", None, None, lambda: None,
+                )
                 increment("controller_cleanup_process_completed")
                 try:
                     if command_process.await_completion:
                         try:
-                            observe_stage(
+                            observe_cleanup_stage(
+                                command_process,
+                                "worker_propagation",
                                 DURATION_CONTROLLER_CLEANUP_PROCESS_PROPAGATION,
                                 "controller_cleanup_worker_exceptions",
                                 command_process.process.propagate_exception,
@@ -12632,11 +12707,17 @@ class Controller:
                                 )
                             )
                             self.__persist.stopped_file_names.discard(command_process.file_id)
-                            notify_callbacks(
+                            observe_cleanup_stage(
                                 command_process,
-                                "on_failure",
-                                "File '{}' does not exist locally".format(command_process.file_name),
-                                404,
+                                "callback_signal",
+                                DURATION_CONTROLLER_CLEANUP_CALLBACKS,
+                                "controller_cleanup_callback_exceptions",
+                                lambda: invoke_callbacks(
+                                    command_process,
+                                    "on_failure",
+                                    "File '{}' does not exist locally".format(command_process.file_name),
+                                    404,
+                                ),
                             )
                         except Exception as error:
                             self.__record_command_breadcrumb(
@@ -12659,20 +12740,30 @@ class Controller:
                                 )
                             )
                             self.__persist.stopped_file_names.discard(command_process.file_id)
-                            notify_callbacks(
+                            observe_cleanup_stage(
                                 command_process,
-                                "on_failure",
-                                "Failed to delete local file '{}'".format(command_process.file_name),
-                                500,
+                                "callback_signal",
+                                DURATION_CONTROLLER_CLEANUP_CALLBACKS,
+                                "controller_cleanup_callback_exceptions",
+                                lambda: invoke_callbacks(
+                                    command_process,
+                                    "on_failure",
+                                    "Failed to delete local file '{}'".format(command_process.file_name),
+                                    500,
+                                ),
                             )
                         else:
-                            observe_stage(
+                            observe_cleanup_stage(
+                                command_process,
+                                "post_callback",
                                 DURATION_CONTROLLER_CLEANUP_POST_CALLBACK,
                                 "controller_cleanup_post_callback_exceptions",
                                 command_process.post_callback,
                             )
                             if command_process.command.action == Controller.Command.Action.DELETE_LOCAL:
-                                observe_stage(
+                                observe_cleanup_stage(
+                                    command_process,
+                                    "delete_lifecycle",
                                     DURATION_CONTROLLER_CLEANUP_DELETE_LIFECYCLE,
                                     "controller_cleanup_delete_lifecycle_exceptions",
                                     lambda: self.__complete_delete_local_lifecycle(
@@ -12681,7 +12772,13 @@ class Controller:
                                         command_process.file_name,
                                     ),
                                 )
-                            notify_callbacks(command_process, "on_success")
+                            observe_cleanup_stage(
+                                command_process,
+                                "callback_signal",
+                                DURATION_CONTROLLER_CLEANUP_CALLBACKS,
+                                "controller_cleanup_callback_exceptions",
+                                lambda: invoke_callbacks(command_process, "on_success"),
+                            )
                             self.__record_command_breadcrumb(
                                 command=command_process.command,
                                 message="command_finished",

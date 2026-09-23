@@ -9732,6 +9732,8 @@ class TestController(unittest.TestCase):
         file.state = ModelFile.State.DOWNLOADED
 
         command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id)
+        callback = MagicMock()
+        command.add_callback(callback)
         process = MagicMock()
         process.name = "DeleteRemoteProcess"
         process.is_alive.return_value = True
@@ -9759,6 +9761,7 @@ class TestController(unittest.TestCase):
         process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
         process.close_queues.assert_not_called()
         self.assertEqual([], self.controller._Controller__active_command_processes)
+        callback.on_failure.assert_called_once_with("Delete command for file 'dup' timed out", 504)
         breadcrumb_calls = [
             call
             for call in self.controller._Controller__context.breadcrumb_trace.record.call_args_list
@@ -9979,6 +9982,152 @@ class TestController(unittest.TestCase):
                 }
             ]
         )
+
+    def test_delete_local_cleanup_timing_is_correlated_bounded_and_retrievable(self):
+        with tempfile.TemporaryDirectory() as spool_path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "info"},
+                max_entries=32,
+                durable_enabled=True,
+                durable_path=spool_path,
+            )
+            self.controller._Controller__context.breadcrumb_trace = trace
+            file = ModelFile("private/path-sentinel.bin", False)
+            file.path_pair_id = "private-pair-sentinel"
+            file.path_pair_name = "Private Pair"
+            file.local_size = 10
+            file.state = ModelFile.State.DEFAULT
+            self.controller._Controller__model.get_file.return_value = file
+            self.controller._Controller__path_pairs_by_id = {
+                file.path_pair_id: SimpleNamespace(local_path="/private/local-root")
+            }
+
+            with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+                process = MagicMock()
+                process.is_alive.return_value = False
+                process.propagate_exception.return_value = None
+                delete_local_process.return_value = process
+                command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+                self.controller._Controller__cleanup_commands()
+
+            trace.close(timeout=2.0)
+            spool_file = Path(spool_path) / "breadcrumbs.jsonl"
+            with patch("common.breadcrumb_trace._OPAQUE_TRACE_CORRELATION_KEY", b"simulated-restart-secret"):
+                records = [json.loads(line) for line in spool_file.read_text(encoding="utf-8").splitlines()]
+                restarted_correlation = opaque_trace_correlation(
+                    next(entry for entry in records if entry.get("message") == "command_dispatched")["flow_id"]
+                )
+
+        dispatch = next(entry for entry in records if entry.get("message") == "command_dispatched")
+        finished = next(entry for entry in records if entry.get("message") == "command_finished")
+        timing = [entry for entry in records if entry.get("message") == "delete_local_cleanup_timing"]
+        self.assertTrue(timing)
+        timing_correlation = dispatch["details"]["timing_correlation"]
+        self.assertEqual(timing_correlation, finished["details"]["timing_correlation"])
+        self.assertEqual(dispatch["flow_id"], finished["flow_id"])
+        self.assertEqual(16, len(timing_correlation))
+        self.assertNotEqual(
+            timing_correlation,
+            restarted_correlation,
+            "persisted correlation must remain joinable without the original process secret",
+        )
+        self.assertEqual({timing_correlation}, {entry["flow_id"] for entry in timing})
+        self.assertEqual({timing_correlation}, {entry["corr_id"] for entry in timing})
+        self.assertIn("child_complete", {entry["details"]["phase"] for entry in timing})
+        self.assertIn("callback_signal", {entry["details"]["phase"] for entry in timing})
+        for entry in timing:
+            self.assertIsNone(entry["file_id"])
+            self.assertIsNone(entry["path_pair_id"])
+            self.assertIsNone(entry["path_pair_name"])
+            details = entry["details"]
+            self.assertEqual({"action", "phase", "outcome", "elapsed_ms"}, set(details))
+            self.assertEqual("DELETE_LOCAL", details["action"])
+            self.assertIn(details["outcome"], {"completed", "failed"})
+            self.assertIs(type(details["elapsed_ms"]), int)
+        self.assertIn("private/path-sentinel.bin", dispatch["flow_id"])
+        self.assertNotIn("private/path-sentinel.bin", json.dumps(timing))
+
+    def test_delete_local_cleanup_timing_records_worker_and_callback_failures(self):
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"}, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DEFAULT
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        command.flow_id = "cmd:delete_local:opaque:1"
+        callback = MagicMock()
+        command.add_callback(callback)
+        callback.on_failure.side_effect = RuntimeError("callback sentinel")
+        process = MagicMock()
+        process.is_alive.return_value = False
+        process.propagate_exception.side_effect = FileNotFoundError("/private/error-path")
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(
+                command, file.file_id, file.name, process, MagicMock(), True,
+                started_at_monotonic=time.monotonic() - 0.1,
+            )
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "callback sentinel"):
+            self.controller._Controller__cleanup_commands()
+
+        entries = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "delete_local_cleanup_timing"
+        ]
+        by_phase = {entry["details"]["phase"]: entry for entry in entries}
+        self.assertEqual("completed", by_phase["child_complete"]["details"]["outcome"])
+        self.assertEqual("failed", by_phase["worker_propagation"]["details"]["outcome"])
+        self.assertEqual("failed", by_phase["callback_signal"]["details"]["outcome"])
+        self.assertEqual(
+            {opaque_trace_correlation(command.flow_id)},
+            {entry["flow_id"] for entry in entries},
+        )
+        self.assertNotIn("/private/error-path", json.dumps(entries))
+        callback.on_failure.assert_called_once_with("File 'dup' does not exist locally", 404)
+        process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
+        process.close_queues.assert_called_once_with()
+
+    def test_delete_local_cleanup_timing_records_post_callback_failure(self):
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"}, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, "opaque")
+        command.flow_id = "cmd:delete_local:opaque:2"
+        callback = MagicMock()
+        command.add_callback(callback)
+        process = MagicMock()
+        process.is_alive.return_value = False
+        process.propagate_exception.return_value = None
+        post_callback = MagicMock(side_effect=RuntimeError("post callback sentinel"))
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(
+                command, "opaque", "file", process, post_callback, True,
+                started_at_monotonic=time.monotonic() - 0.1,
+            )
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "post callback sentinel"):
+            self.controller._Controller__cleanup_commands()
+
+        entries = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "delete_local_cleanup_timing"
+        ]
+        by_phase = {entry["details"]["phase"]: entry for entry in entries}
+        self.assertEqual("completed", by_phase["worker_propagation"]["details"]["outcome"])
+        self.assertEqual("failed", by_phase["post_callback"]["details"]["outcome"])
+        self.assertEqual(
+            {opaque_trace_correlation(command.flow_id)},
+            {entry["flow_id"] for entry in entries},
+        )
+        callback.on_success.assert_not_called()
+        callback.on_failure.assert_not_called()
+        process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
+        process.close_queues.assert_called_once_with()
 
     def test_process_commands_delete_local_preserves_callbacks_for_failed_cleanup(self):
         file = ModelFile("dup", False)
