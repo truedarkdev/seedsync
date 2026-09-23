@@ -2,8 +2,10 @@
 
 import unittest
 import logging
+import json
 import os
 import tempfile
+import time
 from copy import copy
 from concurrent.futures import Future
 from datetime import datetime, timedelta
@@ -77,7 +79,7 @@ from common.performance_diagnostics import (
 from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation, trace_session_digest
 from common.exclude_patterns import ExactPathExclusion
 from controller.scan.scanner_process import ScannerProcess, ScannerResult
-from lftp import LftpJobStatus
+from lftp import LftpError, LftpJobStatus
 from model.diff import ModelDiff
 from model import ActiveProgressOverlay, Model, ModelFile
 from system import SystemFile
@@ -12765,6 +12767,102 @@ class TestModelUpdater(unittest.TestCase):
             {"build_ran": False, "reason": "no_model_build"}, entries[0]["details"],
         )
         self.assertNotIn("private-root", str(entries))
+
+    def test_lftp_poll_join_info_rows_are_correlated_private_and_durable(self):
+        correlation = "lftp-poll:0123456789abcdef"
+        sentinel = "C:/private/target-sentinel.bin"
+        with tempfile.TemporaryDirectory() as spool_path:
+            controller, _builder, _ = self._make_active_delta_lineage_fixture()
+            trace = BreadcrumbTraceCollector(
+                lambda: True, max_entries=1, durable_enabled=True,
+                durable_path=spool_path,
+                policy={
+                    "default": "info",
+                    "rules": {"model.progress": "off", "transfer.lftp": "off"},
+                },
+            )
+            controller._Controller__context.breadcrumb_trace = trace
+            controller._Controller__record_breadcrumb = (
+                self._model_finalization_trace_controller(trace)._Controller__record_breadcrumb
+            )
+            record = trace.record
+            admission_ns = []
+            def timed_record(source, message, *args, **kwargs):
+                started = time.perf_counter_ns() if message in {"status_consumed", "updater_finished"} else None
+                result = record(source, message, *args, **kwargs)
+                if started: admission_ns.append(time.perf_counter_ns() - started)
+                return result
+            trace.record = timed_record
+            correlations = iter((correlation, "lftp-poll:fedcba9876543210"))
+            controller._take_lftp_status_poll_correlation = lambda: next(correlations)
+            status = controller._Controller__lftp.status.return_value[0]
+            status.name = sentinel
+            try:
+                updater = ModelUpdater(controller)
+                updater.update()
+                versions = [controller._Controller__model.version]
+                controller._Controller__next_lftp_status_poll_at = None
+                controller._Controller__lftp_idle_status_authoritative = False
+                controller._Controller__last_lftp_statuses = [status]
+                controller._Controller__lftp.last_status_poll_healthy = False
+                updater.update()
+                versions.append(controller._Controller__model.version)
+                controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+                controller._Controller__lftp.status.side_effect = LftpError(sentinel)
+                updater.update()
+                memory = trace.snapshot()
+            finally:
+                health = trace.close()
+            self.assertGreaterEqual(memory["accounting"]["evicted_count"], 1)
+            self.assertTrue(health["written"] >= 4 and "lost" in health)
+            self.assertGreaterEqual(max(admission_ns) / 1_000_000, 0)
+            with open(os.path.join(spool_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                persisted = [json.loads(line) for line in handle if line.strip()]
+
+        rows = [
+            row for row in persisted
+            if row.get("message") in {"status_consumed", "updater_finished"}
+        ]
+        second_correlation = "lftp-poll:fedcba9876543210"
+        self.assertTrue(len(rows) == 4 and all((row["category"], row["level"]) == ("completion.gate", "info") for row in rows))
+        for index, poll_correlation in enumerate((correlation, second_correlation)):
+            poll_rows = [row for row in rows if row["flow_id"] == poll_correlation]
+            self.assertEqual({"status_consumed", "updater_finished"}, {row["message"] for row in poll_rows})
+            self.assertTrue(all(row["corr_id"] == poll_correlation for row in poll_rows))
+            consumed = next(row for row in poll_rows if row["message"] == "status_consumed")
+            finished = next(row for row in poll_rows if row["message"] == "updater_finished")
+            self.assertEqual({"source", "fresh", "healthy"}, set(consumed["details"]))
+            expected = ("fresh_healthy", True, True) if index == 0 else ("cached_unhealthy", False, False)
+            self.assertEqual(expected, tuple(consumed["details"][key] for key in ("source", "fresh", "healthy")))
+            self.assertEqual({"outcome", "model_version"}, set(finished["details"]))
+            self.assertEqual("success", finished["details"]["outcome"])
+            self.assertEqual(versions[index], finished["details"]["model_version"])
+        self.assertNotIn(sentinel, json.dumps(rows))
+
+    def test_lftp_poll_join_finalizer_records_failure_without_changing_error(self):
+        correlation = "lftp-poll:fedcba9876543210"
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "info", "rules": {"model.progress": "off"}},
+        )
+        controller = self._model_finalization_trace_controller(trace)
+        controller._Controller__model_builder = MagicMock()
+        controller._Controller__model = SimpleNamespace(version=4)
+        controller._Controller__work_state_lock = None
+        controller._Controller__stop_resume_trace_cycle_id = 0
+        updater = ModelUpdater(controller)
+
+        def fail_after_poll():
+            updater._ModelUpdater__progress_lineage_correlation = correlation
+            raise RuntimeError("expected updater failure")
+
+        updater._update_once = MagicMock(side_effect=fail_after_poll)
+        with self.assertRaisesRegex(RuntimeError, "expected updater failure"):
+            updater.update()
+
+        row = next(row for row in trace.snapshot()["entries"] if row.get("message") == "updater_finished")
+        self.assertEqual((correlation, correlation), (row["flow_id"], row["corr_id"]))
+        self.assertEqual({"outcome": "failure", "model_version": 4}, row["details"])
+        trace.close()
 
     def _make_lftp_completion_controller(self, prev_downloading_file_names=None):
         controller = SimpleNamespace(

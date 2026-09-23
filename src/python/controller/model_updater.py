@@ -663,6 +663,31 @@ def _record_progress_lineage_summary(
     return False
 
 
+def _record_lftp_poll_join_breadcrumb(
+        controller: object, correlation: object, message: str,
+        details: Mapping[str, object],
+) -> None:
+    """Record a bounded INFO join for one completed LFTP poll, best-effort."""
+    safe_correlation = _safe_lftp_status_poll_correlation(correlation)
+    category = "completion.gate"
+    if safe_correlation is None or not _controller_breadcrumb_effectively_enabled(controller, category, "info"):
+        return
+    try:
+        controller._Controller__record_breadcrumb(
+            stage="lftp_status",
+            message=message,
+            details=dict(details),
+            event_type="diagnostic",
+            category=category,
+            level="info",
+            corr_id=safe_correlation,
+            flow_id=safe_correlation,
+            trace_scope="flow",
+        )
+    except Exception:
+        pass
+
+
 def _progress_lineage_duration_bucket(duration_ms: int) -> str:
     if duration_ms <= 4:
         return "0-4"
@@ -4525,6 +4550,22 @@ class ModelUpdater(_ControllerCoreAccess):
                     except Exception:
                             pass
                 current_lineage_correlation = self.__progress_lineage_correlation
+                if current_lineage_correlation is not None:
+                    try:
+                        raw_model_version = getattr(
+                            controller._Controller__model, "version", None,
+                        )
+                        final_details: dict[str, object] = {
+                            "outcome": "success" if update_succeeded else "failure",
+                        }
+                        if type(raw_model_version) is int and raw_model_version >= 0:
+                            final_details["model_version"] = raw_model_version
+                        _record_lftp_poll_join_breadcrumb(
+                            controller, current_lineage_correlation,
+                            "updater_finished", final_details,
+                        )
+                    except Exception:
+                        pass
                 if lineage_cycle_started_ns is not None and current_lineage_correlation is not None:
                     _record_progress_lineage_summary(
                         controller, current_lineage_correlation,
@@ -5282,6 +5323,16 @@ class ModelUpdater(_ControllerCoreAccess):
                     )
                 except Exception:
                     lftp_status_poll_correlation = None
+            _record_lftp_poll_join_breadcrumb(
+                controller, lftp_status_poll_correlation,
+                "status_consumed",
+                {
+                    "source": lftp_status_source
+                    if lftp_status_source in _COMPLETION_GATE_LFTP_SOURCES else "unknown",
+                    "fresh": bool(lftp_status_snapshot_fresh),
+                    "healthy": bool(lftp_status_poll_healthy),
+                },
+            )
             _record_progress_lineage(
                 controller, lftp_status_poll_correlation, "status_consume",
                 {"source": lftp_status_source, "fresh": lftp_status_snapshot_fresh,
