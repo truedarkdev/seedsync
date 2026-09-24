@@ -14,6 +14,7 @@ import stat
 import tempfile
 import time
 from collections import OrderedDict, deque
+from datetime import datetime, timezone
 from threading import Event, Lock, RLock, Thread
 from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Protocol, cast
 
@@ -2840,6 +2841,125 @@ class BreadcrumbTraceCollector:
             "unresolved": self.__ingress_unresolved,
             "critical_burst": BREADCRUMB_INGRESS_CRITICAL_BURST,
         }
+
+    def performance_diagnostic_health_snapshot(self) -> Dict[str, Any]:
+        """Return fixed trace counters without waiting for collector locks."""
+        def timestamp() -> str:
+            return datetime.now(timezone.utc).isoformat()
+
+        def unavailable(fields: tuple[str, ...], reason: str) -> Dict[str, Any]:
+            result = {"known": False, "sample_started_at_utc": None}
+            result.update({field: False if field == "pending_known" else None for field in fields})
+            result.update({"sampled_at_utc": timestamp(), "reason": reason})
+            return result
+
+        ingress_fields = (
+            "pending_known", "critical_pending", "normal_pending", "critical_rejected",
+            "normal_rejected", "unresolved",
+        )
+        durable_fields = (
+            "accepted", "written", "lost", "critical_lost", "normal_lost", "unknown",
+        )
+
+        def durable_values(source: object) -> Optional[Dict[str, int]]:
+            if not isinstance(source, dict) or any(
+                    type(source.get(field)) is not int or source[field] < 0
+                    for field in durable_fields):
+                return None
+            return {field: source[field] for field in durable_fields}
+
+        ingress_started = timestamp()
+        try:
+            collector_acquired = self.__lock.acquire(False)
+        except Exception:
+            collector_acquired = False
+        if not collector_acquired:
+            ingress = unavailable(ingress_fields, "collector_busy")
+        else:
+            try:
+                rejected_values = []
+                for counter in (self.__critical_ingress_rejected_count, self.__normal_ingress_rejected_count):
+                    counter_lock = counter.get_lock()
+                    if not counter_lock.acquire(False):
+                        raise BlockingIOError("rejection counter busy")
+                    try:
+                        rejected_values.append(max(0, int(counter.value)))
+                    finally:
+                        counter_lock.release()
+                ingress = {
+                    "known": True,
+                    "pending_known": False,
+                    "critical_pending": None,
+                    "normal_pending": None,
+                    "critical_rejected": rejected_values[0],
+                    "normal_rejected": rejected_values[1],
+                    "unresolved": max(0, int(self.__ingress_unresolved)),
+                    "sample_started_at_utc": ingress_started,
+                    "sampled_at_utc": timestamp(),
+                    "reason": "pending_counters_not_sampled",
+                }
+            except BlockingIOError:
+                ingress = unavailable(ingress_fields, "shared_counter_busy")
+                ingress["sample_started_at_utc"] = ingress_started
+            except Exception:
+                ingress = unavailable(ingress_fields, "counter_read_failed")
+                ingress["sample_started_at_utc"] = ingress_started
+            finally:
+                self.__lock.release()
+
+        durable_started = timestamp()
+        try:
+            lifecycle_lock = self.__durable_lifecycle_lock
+            lifecycle_acquired = lifecycle_lock.acquire(False)
+        except Exception:
+            lifecycle_acquired = False
+        if not lifecycle_acquired:
+            durable = unavailable(durable_fields, "durable_lifecycle_busy")
+        else:
+            try:
+                spool = self.__durable_spool
+                if spool is None:
+                    collector_acquired = self.__lock.acquire(False)
+                    if not collector_acquired:
+                        durable = unavailable(durable_fields, "collector_busy")
+                    else:
+                        try:
+                            cached = self.__durable_last_snapshot
+                            values = durable_values(cached)
+                            if values is None:
+                                durable = unavailable(durable_fields, "durable_cache_incomplete")
+                            else:
+                                durable = {"known": True, **values}
+                                durable.update({
+                                    "sample_started_at_utc": durable_started,
+                                    "sampled_at_utc": timestamp(), "reason": None,
+                                })
+                        finally:
+                            self.__lock.release()
+                else:
+                    spool_lock = getattr(spool, "_BreadcrumbDurableSpool__lock", None)
+                    if spool_lock is None or not spool_lock.acquire(False):
+                        durable = unavailable(durable_fields, "durable_spool_busy")
+                    else:
+                        try:
+                            health = getattr(spool, "_BreadcrumbDurableSpool__health", None)
+                            values = durable_values(health)
+                            if values is None:
+                                durable = unavailable(durable_fields, "durable_health_incomplete")
+                            else:
+                                durable = {"known": True, **values}
+                                durable.update({
+                                    "sample_started_at_utc": durable_started,
+                                    "sampled_at_utc": timestamp(), "reason": None,
+                                })
+                        finally:
+                            spool_lock.release()
+            except Exception:
+                durable = unavailable(durable_fields, "durable_read_failed")
+            finally:
+                lifecycle_lock.release()
+
+        return {"ingress": ingress, "durable": durable}
 
     def wait_for_ingress(self, timeout: float = 1.0) -> bool:
         """Wait for the parent drainer to observe currently queued records."""

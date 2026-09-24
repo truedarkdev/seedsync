@@ -8,7 +8,7 @@ from threading import Condition, Event, Lock, RLock
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError
 from queue import Queue
 from enum import Enum
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import copy
 import hashlib
 import json
@@ -746,6 +746,7 @@ class _LftpQueueResult:
 
 
 _LFTP_STATUS_AUTHORITY_COUNT_LIMIT = 32
+_PERFORMANCE_DIAGNOSTIC_STATUS_SCAN_LIMIT = 10000
 
 _LFTP_EXECUTOR_TRACE_CATEGORY = "transfer.lftp.executor"
 _LFTP_EXECUTOR_TRACE_SCHEMA = "lftp.executor.v1"
@@ -12399,6 +12400,113 @@ class Controller:
             "active_download_count": len(self.__active_downloading_file_names),
             "active_extract_count": len(self.__active_extracting_file_names),
             "active_command_count": len(self.__active_command_processes),
+        }
+
+    def get_performance_diagnostic_runtime_counts(self) -> dict[str, object]:
+        """Return independently sampled, nonblocking controller counts."""
+        def timestamp() -> str:
+            return datetime.now(timezone.utc).isoformat()
+
+        def unknown(fields: tuple[str, ...], reason: str, started: Optional[str] = None) -> dict[str, object]:
+            return {
+                "known": False, **{field: None for field in fields},
+                "sample_started_at_utc": started, "sampled_at_utc": timestamp(),
+                "reason": reason,
+            }
+
+        def sample(lock: object, fields: tuple[str, ...], reader: Callable[[], object],
+                   busy_reason: str) -> dict[str, object]:
+            started = timestamp()
+            try:
+                acquired = lock is not None and lock.acquire(False)
+            except Exception:
+                acquired = False
+            if not acquired:
+                return unknown(fields, busy_reason)
+            try:
+                values = reader()
+                if isinstance(values, str):
+                    return unknown(fields, values, started)
+                if not isinstance(values, dict):
+                    return unknown(fields, "read_failed", started)
+                return {
+                    "known": True, **values, "sample_started_at_utc": started,
+                    "sampled_at_utc": timestamp(), "reason": None,
+                }
+            except Exception:
+                return unknown(fields, "read_failed", started)
+            finally:
+                lock.release()
+
+        queue = self.__command_queue
+        command_queue = sample(
+            getattr(queue, "mutex", None), ("queued",),
+            lambda: {"queued": max(0, len(queue.queue))}, "queue_busy",
+        )
+
+        work_state_lock = getattr(self, "_Controller__work_state_lock", None)
+
+        def read_dispatch() -> object:
+            pending = getattr(self, "_Controller__pending_queue_dispatches", None)
+            deferred = getattr(self, "_Controller__deferred_queue_intents", None)
+            command_dispatches = getattr(self, "_Controller__pending_command_dispatch_file_ids", None)
+            if not isinstance(pending, dict) or not isinstance(deferred, dict) or not isinstance(command_dispatches, set):
+                return "dispatch_state_unavailable"
+            return {
+                "pending_queue_dispatches": len(pending),
+                "deferred_queue_intents": len(deferred),
+                "pending_command_dispatches": len(command_dispatches),
+            }
+
+        dispatch = sample(
+            work_state_lock,
+            ("pending_queue_dispatches", "deferred_queue_intents", "pending_command_dispatches"),
+            read_dispatch, "work_state_busy",
+        )
+
+        def read_active_commands() -> object:
+            active = getattr(self, "_Controller__active_command_processes", None)
+            return {"count": len(active)} if isinstance(active, list) else "active_commands_unavailable"
+
+        active_commands = sample(
+            getattr(self, "_Controller__command_flow_lock", None), ("count",),
+            read_active_commands, "command_state_busy",
+        )
+
+        def read_lftp_status() -> object:
+            statuses = getattr(self, "_Controller__last_lftp_statuses", None)
+            expires_at = getattr(self, "_Controller__lftp_status_cache_expires_at", None)
+            if getattr(getattr(self, "_Controller__lftp", None), "last_status_poll_healthy", False) is not True:
+                return "status_unhealthy"
+            if getattr(self, "_Controller__lftp_status_poll_retry_active", None) is not False:
+                return "status_unhealthy"
+            if not isinstance(expires_at, datetime) or expires_at <= datetime.now():
+                return "status_cache_expired_or_missing"
+            if getattr(self, "_Controller__lftp_status_future", None) is not None:
+                return "status_poll_inflight_or_unharvested"
+            if not isinstance(statuses, list):
+                return "status_cache_unavailable"
+            if len(statuses) > _PERFORMANCE_DIAGNOSTIC_STATUS_SCAN_LIMIT:
+                return "status_count_scan_limit_exceeded"
+            return {
+                "queued": sum(status.state == LftpJobStatus.State.QUEUED for status in statuses),
+                "running": sum(status.state == LftpJobStatus.State.RUNNING for status in statuses),
+            }
+
+        lftp_status = sample(
+            work_state_lock, ("queued", "running"), read_lftp_status, "work_state_busy",
+        )
+        lftp_operations: dict[str, object] = {
+            "known": False, "count": None,
+            "sampled_at_utc": timestamp(), "reason": "unsynchronized_registry",
+        }
+
+        return {
+            "command_queue": command_queue,
+            "dispatch": dispatch,
+            "active_commands": active_commands,
+            "lftp_status": lftp_status,
+            "lftp_operations": lftp_operations,
         }
 
     def get_memory_ownership_census(self) -> dict[str, object]:

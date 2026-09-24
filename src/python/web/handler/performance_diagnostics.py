@@ -48,7 +48,34 @@ class PerformanceDiagnosticsHandler(IHandler):
             return limit
         if limit is not None and (limit < 1 or limit > self.__context.performance_diagnostics.retention_depth):
             return HTTPResponse(body="limit is outside the retained sample bounds", status=400)
-        return self.__json_response(self.__context.performance_diagnostics.snapshot(since_sequence, limit))
+        payload = self.__context.performance_diagnostics.snapshot(since_sequence, limit)
+        payload["runtime_counts"] = self.__controller.get_performance_diagnostic_runtime_counts()
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        health_snapshot = getattr(breadcrumb_trace, "performance_diagnostic_health_snapshot", None)
+        if callable(health_snapshot):
+            try:
+                payload["trace_health"] = health_snapshot()
+            except Exception:
+                payload["trace_health"] = self.__unknown_trace_health("snapshot_failed")
+        else:
+            payload["trace_health"] = self.__unknown_trace_health("collector_unavailable")
+        return self.__json_response(payload)
+
+    @staticmethod
+    def __unknown_trace_health(reason: str) -> dict[str, object]:
+        fields = {
+            "ingress": ("pending_known", "critical_pending", "normal_pending", "critical_rejected",
+                        "normal_rejected", "unresolved"),
+            "durable": ("accepted", "written", "lost", "critical_lost", "normal_lost", "unknown"),
+        }
+        return {
+            section: {
+                "known": False,
+                **{field: False if field == "pending_known" else None for field in section_fields},
+                "sample_started_at_utc": None, "sampled_at_utc": None, "reason": reason,
+            }
+            for section, section_fields in fields.items()
+        }
 
     def __reset(self) -> HTTPResponse:
         self.__context.performance_diagnostics.reset()
