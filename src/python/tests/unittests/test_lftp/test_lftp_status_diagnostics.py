@@ -1123,6 +1123,13 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
                 self.assertTrue(all(
                     event["corr_id"] == "lftp-poll:0123456789abcdef" for event in events
                 ))
+                jobs_read, parse_complete = events
+                self.assertTrue(jobs_read["details"]["healthy"])
+                self.assertTrue(parse_complete["details"]["healthy"])
+                self.assertTrue({
+                    "prior_prompt", "send_admitted", "prompt_reached", "retained_before",
+                }.issubset(jobs_read["details"]))
+                self.assertLessEqual(len(jobs_read["details"]), 24)
                 self.assertEqual(2, health["written"])
                 self.assertEqual(0, health["lost"])
                 self.assertEqual(0, health["unknown"])

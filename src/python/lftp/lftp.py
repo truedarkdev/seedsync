@@ -1212,6 +1212,10 @@ def _record_lftp_status_poll_breadcrumb(
             # omit the redundant callback-only wall-clock pair here.
             details.pop("wall_time_ns", None)
             details["post_send_metrics"] = post_send_metric_details
+        elif level == "info" and phase in {"jobs_read", "parse_complete"} and healthy is True:
+            # Durable collectors stamp created_ns; leave room for healthy and
+            # boundary fields in their bounded INFO envelope.
+            details.pop("wall_time_ns", None)
         details["monotonic_time_ns"] = time.monotonic_ns()
         if isinstance(boundary_state, dict):
             details.update({key: value for key, value in boundary_state.items()
