@@ -10992,6 +10992,129 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
         self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
 
+    def _run_child_finalization_candidate_update(
+            self, statuses, *, candidate_pair="pair-a", healthy=True,
+            cached_statuses=None, inflight=False,
+    ):
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None,
+        )
+        root_file_id = json.dumps([candidate_pair, "root"], separators=(",", ":"))
+        model_builder.get_finalizable_staging_leaf_candidates.return_value = (
+            (root_file_id, "child.bin"),
+        )
+        controller._Controller__reconciled_local_path_pair_ids = {candidate_pair}
+        controller._Controller__reconciled_remote_path_pair_ids = {candidate_pair}
+        controller._Controller__last_lftp_statuses = list(cached_statuses or [])
+        controller._Controller__lftp.status.return_value = statuses
+        controller._Controller__lftp.last_status_poll_healthy = healthy
+        if inflight:
+            controller._get_lftp_status_snapshot = MagicMock(return_value=None)
+        controller._finalize_staging_child = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED,
+        )
+
+        ModelUpdater(controller).update()
+        return controller
+
+    def test_fresh_exact_active_leaf_status_suppresses_child_finalization(self):
+        for job_type, state in (
+                (LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING),
+                (LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING),
+                (LftpJobStatus.Type.GET, LftpJobStatus.State.QUEUED),
+        ):
+            with self.subTest(job_type=job_type, state=state):
+                status = LftpJobStatus(1, job_type, state, "root/child.bin", "")
+                status.path_pair_id = "pair-a"
+                if state == LftpJobStatus.State.RUNNING:
+                    status.total_transfer_state = LftpJobStatus.TransferState(1, 2, 50, 1, 1)
+
+                controller = self._run_child_finalization_candidate_update([status])
+
+                controller._finalize_staging_child.assert_not_called()
+                authority_calls = [
+                    call.kwargs for call in controller._Controller__record_breadcrumb.call_args_list
+                    if call.kwargs.get("message") == "child_finalization_authority"
+                ]
+                self.assertEqual(1, len(authority_calls))
+                self.assertEqual("rejected", authority_calls[0]["details"]["decision"])
+                self.assertEqual("active_leaf_transfer", authority_calls[0]["details"]["reason"])
+
+    def test_same_leaf_name_in_another_path_pair_does_not_suppress_child_finalization(self):
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+            "root/child.bin", "",
+        )
+        status.path_pair_id = "pair-b"
+        status.total_transfer_state = LftpJobStatus.TransferState(1, 2, 50, 1, 1)
+
+        controller = self._run_child_finalization_candidate_update([status])
+
+        controller._finalize_staging_child.assert_called_once_with(
+            "root", "child.bin", "pair-a",
+        )
+
+    def test_duplicate_exact_active_leaf_status_suppresses_child_finalization(self):
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "root/child.bin", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(1, 2, 50, 1, 1)
+
+        controller = self._run_child_finalization_candidate_update([status, status])
+
+        controller._finalize_staging_child.assert_not_called()
+
+    def test_healthy_idle_status_allows_child_finalization(self):
+        controller = self._run_child_finalization_candidate_update([])
+
+        controller._finalize_staging_child.assert_called_once_with(
+            "root", "child.bin", "pair-a",
+        )
+
+    def test_unhealthy_cached_active_leaf_status_suppresses_child_finalization(self):
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "root/child.bin", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(1, 2, 50, 1, 1)
+
+        controller = self._run_child_finalization_candidate_update(
+            [], healthy=False, cached_statuses=[status],
+        )
+
+        controller._finalize_staging_child.assert_not_called()
+
+    def test_inflight_status_poll_uses_cached_active_leaf_ownership(self):
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "root/child.bin", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(1, 2, 50, 1, 1)
+
+        controller = self._run_child_finalization_candidate_update(
+            [], cached_statuses=[status], inflight=True,
+        )
+
+        controller._finalize_staging_child.assert_not_called()
+
+    def test_unknown_leaf_status_state_does_not_veto_child_finalization(self):
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "root/child.bin", "",
+        )
+        status.path_pair_id = "pair-a"
+        status._LftpJobStatus__state = object()
+
+        controller = self._run_child_finalization_candidate_update([status])
+
+        controller._finalize_staging_child.assert_called_once_with(
+            "root", "child.bin", "pair-a",
+        )
+
     def test_child_finalization_breadcrumbs_are_queryable_and_identity_free(self):
         controller, model_builder = self._make_progressive_update_controller(
             None, local_scan=None,

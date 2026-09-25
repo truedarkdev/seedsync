@@ -9314,6 +9314,14 @@ class ModelUpdater(_ControllerCoreAccess):
         # exact Path Pair checks below; its scanner identity proof is already
         # independent of the root's presentation state.
         if callable(leaf_candidates) and callable(finalize_child):
+            active_leaf_file_ids = {
+                status.file_id for status in raw_lftp_statuses
+                if getattr(status, "type", None) in (
+                    LftpJobStatus.Type.GET, LftpJobStatus.Type.PGET,
+                ) and getattr(status, "state", None) in (
+                    LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING,
+                ) and isinstance(getattr(status, "file_id", None), str)
+            }
             child_trace_info_enabled = _controller_breadcrumb_effectively_enabled(
                 controller, _CHILD_FINALIZATION_TRACE_CATEGORY, "info",
             )
@@ -9419,36 +9427,18 @@ class ModelUpdater(_ControllerCoreAccess):
                     path_pair_id, root_name = None, root_file_id
                 local_authoritative = path_pair_id in controller._Controller__reconciled_local_path_pair_ids
                 remote_authoritative = path_pair_id in controller._Controller__reconciled_remote_path_pair_ids
+                child_file_id = ModelFile.build_file_id(
+                    root_name + "/" + relative_path, path_pair_id,
+                )
+                active_leaf = child_file_id in active_leaf_file_ids
+                authority_accepted = local_authoritative and remote_authoritative
+                authority_reason = _CHILD_FINALIZATION_AUTHORITY_REASONS[
+                    (local_authoritative, remote_authoritative)
+                ]
+                if authority_accepted and active_leaf:
+                    authority_accepted = False
+                    authority_reason = "active_leaf_transfer"
                 child_trace_identity = None
-                if not local_authoritative or not remote_authoritative:
-                    if child_trace_info_enabled:
-                        child_trace_identity = _child_finalization_trace_identity(
-                            root_name, relative_path, path_pair_id,
-                        )
-                        _record_child_finalization_breadcrumb(
-                            controller,
-                            "child_finalization_authority",
-                            lambda: {
-                                "schema": _CHILD_FINALIZATION_TRACE_SCHEMA,
-                                "phase": "authority",
-                                "decision": "rejected",
-                                "reason": _CHILD_FINALIZATION_AUTHORITY_REASONS[
-                                    (local_authoritative, remote_authoritative)
-                                ],
-                                "target_correlation": _child_finalization_trace_flow_id(
-                                    child_trace_identity,
-                                ),
-                                "correlation_reason": (
-                                    "opaque_child_identity"
-                                    if child_trace_identity is not None
-                                    else "target_identity_unavailable"
-                                ),
-                                **child_trace_epochs,
-                            },
-                            level="info",
-                            child_identity=child_trace_identity,
-                        )
-                    continue
                 if child_trace_info_enabled:
                     child_trace_identity = _child_finalization_trace_identity(
                         root_name, relative_path, path_pair_id,
@@ -9459,10 +9449,8 @@ class ModelUpdater(_ControllerCoreAccess):
                         lambda: {
                             "schema": _CHILD_FINALIZATION_TRACE_SCHEMA,
                             "phase": "authority",
-                            "decision": "accepted",
-                            "reason": _CHILD_FINALIZATION_AUTHORITY_REASONS[
-                                (local_authoritative, remote_authoritative)
-                            ],
+                            "decision": "accepted" if authority_accepted else "rejected",
+                            "reason": authority_reason,
                             "target_correlation": _child_finalization_trace_flow_id(
                                 child_trace_identity,
                             ),
@@ -9476,6 +9464,8 @@ class ModelUpdater(_ControllerCoreAccess):
                         level="info",
                         child_identity=child_trace_identity,
                     )
+                if not authority_accepted:
+                    continue
                 try:
                     result = finalize_child(root_name, relative_path, path_pair_id)
                 except Exception:
