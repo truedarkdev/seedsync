@@ -5085,6 +5085,10 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__local_scan_process = self._progressive_process(
             local_token, [[initial_local], [], [], []],
         )
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"scan.pair_join": "info"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
         updater = ModelUpdater(controller)
         a_id = ModelFile.build_file_id("release", "pair-a")
 
@@ -5102,6 +5106,15 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(frozenset({"pair-a", "pair-b"}), builder.unknown_local_path_pair_ids_snapshot())
         self.assertEqual((), builder.get_trusted_final_leaf_paths(a_id))
         builder.build_model.assert_not_called()
+        rows = trace.query_events(category="scan.pair_join", limit=16)["events"]
+        self.assertEqual(7, len(rows))
+        final_rows = rows[-2:]
+        standing = controller._Controller__scan_authority_snapshot
+        self.assertEqual("no_op", standing["outcome"])
+        for row in final_rows:
+            self.assertEqual(standing["outcome"], row["details"]["outcome"])
+            self.assertEqual(standing["reason"], row["details"]["reason"])
+            self.assertEqual(standing["publication_id"], row["details"]["publication_id"])
 
     def test_running_mirror_progress_adopts_active_delta_during_unknown_overlay_churn(self):
         def root(path_pair_id: str, size: int) -> SystemFile:
@@ -6559,8 +6572,24 @@ class TestModelUpdater(unittest.TestCase):
         )
         controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
         controller._refresh_model_file_command_identities_locked = MagicMock()
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {"scan.pair_join": "info"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
 
         ModelUpdater(controller).update()
+
+        rows = trace.query_events(category="scan.pair_join", limit=8)["events"]
+        self.assertEqual(1, len(rows))
+        self.assertEqual("source_buckets_adopted_after_pair_fallback", rows[0]["details"]["reason"])
+        self.assertEqual(
+            controller._Controller__scan_authority_snapshot["outcome"],
+            rows[0]["details"]["outcome"],
+        )
+        self.assertEqual(
+            controller._Controller__scan_authority_snapshot["publication_id"],
+            rows[0]["details"]["publication_id"],
+        )
 
         self.assertEqual(
             {ModelFile.build_file_id("new.bin", "pair-a"), ModelFile.build_file_id("idle.bin", "pair-b")},
@@ -10267,11 +10296,15 @@ class TestModelUpdater(unittest.TestCase):
             is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
             is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
         )
+        final_local.session_token = "local-session-private"
+        final_local.generation = 7
         final_remote = ScannerResult(
             datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
             is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
             is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
         )
+        final_remote.session_token = "remote-session-private"
+        final_remote.generation = 11
         controller, _ = self._make_progressive_update_controller(
             final_remote, local_scan=final_local, model_builder=builder, model=live_model,
         )
@@ -10312,13 +10345,98 @@ class TestModelUpdater(unittest.TestCase):
 
         live_model.add_listener(Listener())
 
-        ModelUpdater(controller).update()
+        with tempfile.TemporaryDirectory() as trace_path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True, max_entries=2,
+                policy={"default": "off", "rules": {"scan.pair_join": "info"}},
+                durable_enabled=True, durable_path=trace_path,
+            )
+            controller._Controller__context.breadcrumb_trace = trace
+            with patch.object(trace, "create_emitter", wraps=trace.create_emitter) as create_emitter:
+                ModelUpdater(controller).update()
+                self.assertEqual(1, create_emitter.call_count)
+            self.assertEqual(1, len(trace.query_events(category="scan.pair_join")["events"]))
+            trace.close(2.0)
+            with open(os.path.join(trace_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                persisted = [json.loads(line) for line in handle if line.strip()]
+            rows = [row for row in persisted if row.get("message") == "scan_pair_join"]
+            self.assertEqual(1, len(rows))
+            row = rows[0]
+            expected = opaque_trace_correlation("scan-pair|pair-a")
+            self.assertEqual(expected, row["details"]["target_correlation"])
+            self.assertEqual(expected, row["corr_id"])
+            self.assertEqual(controller._Controller__scan_authority_snapshot["outcome"], row["details"]["outcome"])
+            self.assertEqual(controller._Controller__scan_authority_snapshot["reason"], row["details"]["reason"])
+            self.assertEqual(
+                controller._Controller__scan_authority_snapshot["publication_id"],
+                row["details"]["publication_id"],
+            )
+            self.assertEqual(7, row["details"]["local_generation"])
+            self.assertEqual(11, row["details"]["remote_generation"])
+            self.assertTrue(row["details"]["local_scanned"])
+            self.assertTrue(row["details"]["local_completed"])
+            self.assertTrue(row["details"]["remote_scanned"])
+            self.assertTrue(row["details"]["remote_completed"])
+            self.assertEqual(1, row["details"]["pair_total"])
+            self.assertFalse(row["details"]["pair_truncated"])
+            self.assertEqual(trace_session_digest("local-session-private"), row["details"]["local_scan_digest"])
+            self.assertEqual(trace_session_digest("remote-session-private"), row["details"]["remote_scan_digest"])
+            self.assertLessEqual(len(row["details"]), 24)
+            for private_value in ("pair-a", "local-session-private", "remote-session-private"):
+                self.assertNotIn(private_value, json.dumps(row))
 
         self.assertIn(ModelFile.build_file_id("new.bin", "pair-a"), live_model.get_file_ids())
         self.assertTrue(observed)
         self.assertEqual([75] * len(observed), observed)
         self.assertEqual(40, live_model.get_file(file_id).transferred_size)
         self.assertEqual(75, live_model.active_progress_overlay(file_id).transferred_size)
+
+    def test_scan_pair_join_disabled_and_busy_ingress_are_fail_isolated(self):
+        controller, _ = self._make_progressive_update_controller(None, local_scan=None)
+
+        class Emitter:
+            enabled = False
+
+            def __init__(self):
+                self.records = []
+
+            def is_effectively_enabled(self, category, level):
+                return self.enabled and category == "scan.pair_join" and level == "info"
+
+            def record(self, source, message, details, **metadata):
+                self.records.append((source, message, details, metadata))
+                return "dropped"
+
+        emitter = Emitter()
+        factory = MagicMock(return_value=emitter)
+        controller._Controller__context.breadcrumb_trace = SimpleNamespace(create_emitter=factory)
+        updater = ModelUpdater(controller)
+        self.assertEqual(1, factory.call_count)
+        local = ScannerResult(datetime.now(), [], generation=3, session_token="local-session-private")
+        remote = ScannerResult(
+            datetime.now(), [], generation=4, session_token="remote-session-private",
+            unknown_path_pair_ids={"private-pair-{}".format(index) for index in range(10)},
+        )
+        authority = {"outcome": "reject", "reason": "authorization_rejected", "publication_id": 2}
+
+        updater._record_scan_pair_joins(local, remote, authority)
+        self.assertEqual([], emitter.records)
+
+        emitter.enabled = True
+        updater._record_scan_pair_joins(local, remote, authority)
+        self.assertEqual(8, len(emitter.records))
+        for source, message, details, metadata in emitter.records:
+            self.assertEqual(("model_updater", "scan_pair_join"), (source, message))
+            self.assertEqual("reject", details["outcome"])
+            self.assertTrue(details["remote_unknown"])
+            self.assertEqual(details["target_correlation"], metadata["corr_id"])
+            self.assertEqual(10, details["pair_total"])
+            self.assertTrue(details["pair_truncated"])
+            self.assertLessEqual(len(details), 24)
+            self.assertNotIn("private-pair", json.dumps(details))
+        empty = ScannerResult(datetime.now(), [], scanned_path_pair_ids=set())
+        updater._record_scan_pair_joins(empty, None, authority)
+        self.assertEqual(8, len(emitter.records))
 
     def test_same_job_floored_overlay_survives_authoritative_replacement(self):
         """Replacement retention must use Model's normalized overlay, not raw status counters."""

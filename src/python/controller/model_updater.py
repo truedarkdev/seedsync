@@ -3403,6 +3403,121 @@ class ModelUpdater(_ControllerCoreAccess):
         self.__child_finalization_candidate_trace_signature: Optional[
             tuple[str, int, int]
         ] = None
+        breadcrumb_trace = getattr(
+            getattr(self._controller, "_Controller__context", None),
+            "breadcrumb_trace", None,
+        )
+        emitter_factory = getattr(breadcrumb_trace, "create_emitter", None)
+        try:
+            self.__scan_pair_join_emitter = emitter_factory() if callable(emitter_factory) else None
+        except Exception:
+            self.__scan_pair_join_emitter = None
+
+    def _record_scan_pair_joins(
+            self, local_scan: Optional[ScannerResult], remote_scan: Optional[ScannerResult],
+            authority: Mapping[str, object],
+    ) -> None:
+        """Queue bounded pair joins for the settled source-authority outcome."""
+        emitter = self.__scan_pair_join_emitter
+        if emitter is None:
+            return
+        try:
+            enabled = getattr(emitter, "is_effectively_enabled", None)
+            if callable(enabled) and not enabled("scan.pair_join", "info"):
+                return
+            controller = self._controller
+            def pair_set(result: Optional[ScannerResult], field_name: str) -> set[str]:
+                values = getattr(result, field_name, ()) if result is not None else ()
+                if not isinstance(values, (set, frozenset, list, tuple)):
+                    return set()
+                try:
+                    return {value for value in values if isinstance(value, str) and value}
+                except TypeError:
+                    return set()
+
+            local_scanned = pair_set(local_scan, "scanned_path_pair_ids")
+            local_completed = pair_set(local_scan, "completed_path_pair_ids")
+            local_unknown = pair_set(local_scan, "unknown_path_pair_ids")
+            remote_scanned = pair_set(remote_scan, "scanned_path_pair_ids")
+            remote_completed = pair_set(remote_scan, "completed_path_pair_ids")
+            remote_unknown = pair_set(remote_scan, "unknown_path_pair_ids")
+            all_pairs = local_scanned | local_completed | local_unknown | remote_scanned | remote_completed | remote_unknown
+            if not all_pairs:
+                return
+
+            def generation(result: Optional[ScannerResult]) -> Optional[int]:
+                if result is None:
+                    return None
+                try:
+                    return int(getattr(result, "generation", 0))
+                except (TypeError, ValueError):
+                    return None
+
+            def membership(values: object) -> set[str]:
+                try:
+                    return {value for value in values if isinstance(value, str)}
+                except TypeError:
+                    return set()
+
+            def digest(result: Optional[ScannerResult], side: str) -> Optional[str]:
+                value = getattr(result, "session_token", None)
+                if not isinstance(value, str):
+                    process = getattr(controller, "_Controller__{}_scan_process".format(side), None)
+                    value = getattr(process, "session_token", None)
+                return trace_session_digest(value) if isinstance(value, str) else None
+
+            total = len(all_pairs)
+            selected_pairs = sorted(all_pairs)[:8]
+            local_digest = digest(local_scan, "local")
+            remote_digest = digest(remote_scan, "remote")
+            local_generation = generation(local_scan)
+            remote_generation = generation(remote_scan)
+            local_reconciled = membership(getattr(
+                controller, "_Controller__reconciled_local_path_pair_ids", (),
+            ))
+            remote_reconciled = membership(getattr(
+                controller, "_Controller__reconciled_remote_path_pair_ids", (),
+            ))
+            for index, pair_id in enumerate(selected_pairs):
+                pair_token = opaque_trace_correlation("scan-pair|" + pair_id)
+                details: dict[str, object] = {
+                    "schema": "scan_pair_join.v1",
+                    "target_correlation": pair_token,
+                    "outcome": authority.get("outcome"),
+                    "reason": authority.get("reason"),
+                    "publication_id": authority.get("publication_id"),
+                    "local_scan_digest": local_digest,
+                    "local_generation": local_generation,
+                    "local_scanned": pair_id in local_scanned,
+                    "local_completed": pair_id in local_completed,
+                    "local_unknown": pair_id in local_unknown,
+                    "local_reconciled": pair_id in local_reconciled,
+                    "local_healthy": getattr(controller, "_Controller__last_local_reconciliation_healthy", None),
+                    "remote_scan_digest": remote_digest,
+                    "remote_generation": remote_generation,
+                    "remote_scanned": pair_id in remote_scanned,
+                    "remote_completed": pair_id in remote_completed,
+                    "remote_unknown": pair_id in remote_unknown,
+                    "remote_reconciled": pair_id in remote_reconciled,
+                    "remote_healthy": getattr(controller, "_Controller__last_remote_reconciliation_healthy", None),
+                    "pair_index": index,
+                    "pair_total": total,
+                    "pair_truncated": total > 8,
+                    "captured_monotonic_ns": time.monotonic_ns(),
+                }
+                emitter.record(
+                    "model_updater", "scan_pair_join", details,
+                    stage="scan_authority", event_type="state_transition",
+                    category="scan.pair_join", level="info",
+                    corr_id=pair_token, flow_id=pair_token, trace_scope="flow",
+                )
+        except Exception:
+            logger = getattr(self._controller, "logger", None)
+            if logger is not None:
+                try:
+                    logger.debug("Ignoring scan pair join breadcrumb failure", exc_info=True)
+                except Exception:
+                    pass
 
     def _completion_gate_trace_enabled(self) -> bool:
         """Check the global trace gate before diagnostic-only marker reads."""
@@ -9275,6 +9390,9 @@ class ModelUpdater(_ControllerCoreAccess):
                         })
                         controller._Controller__scan_authority_publication_id = publication_id
                         controller._Controller__scan_authority_snapshot = dict(standing_snapshot)
+            self._record_scan_pair_joins(
+                latest_local_scan, latest_remote_scan, standing_snapshot,
+            )
             authority_publication_recorder = getattr(
                 controller, "_record_authority_handoff_publication", None,
             )

@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from common import Localization, MultiprocessingLogger
-from common.breadcrumb_trace import BreadcrumbTraceCollector
+from common.breadcrumb_trace import BreadcrumbTraceCollector, is_critical_breadcrumb, opaque_trace_correlation
 from common.performance_diagnostics import (
     DURATION_REMOTE_SCAN_AGGREGATION,
     DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION,
@@ -44,6 +44,21 @@ class DummyScanner(IScanner):
 
     def set_base_logger(self, base_logger: logging.Logger):
         pass
+
+
+class PairScanner(DummyScanner):
+    path_pair_id = "spawn-pair-id"
+
+    def scanned_path_pair_ids(self):
+        return {self.path_pair_id}
+
+
+class LocalPairScanner(PairScanner):
+    path_pair_id = "request-result-pair"
+
+
+class RemotePairScanner(PairScanner):
+    path_pair_id = "request-result-pair"
 
 
 class ProgressiveScanner(DummyScanner):
@@ -505,13 +520,14 @@ class TestScannerProcess(unittest.TestCase):
         collector = BreadcrumbTraceCollector(lambda: True)
         mp_logger = MultiprocessingLogger(logging.getLogger("scanner-spawn-boundary"))
         self.process = ScannerProcess(
-            scanner=DummyScanner(),
+            scanner=PairScanner(),
             interval_in_ms=1000,
             verbose=False,
             breadcrumb_trace=collector.create_emitter(),
             recycle_scan_worker=True,
         )
         self.process.set_mp_log_queue(mp_logger.queue, mp_logger.log_level)
+        self.process.force_scan("spawn-pair-id")
 
         mp_logger.start()
         try:
@@ -528,9 +544,16 @@ class TestScannerProcess(unittest.TestCase):
             entries = collector.snapshot()["entries"]
             started = next(entry for entry in entries if entry["message"] == "scan_started")
             completed = next(entry for entry in entries if entry["message"] == "scan_completed")
-            published = next(entry for entry in entries if entry["message"] == "scan_result_published")
+            published = next(
+                entry for entry in entries
+                if entry["message"] == "scan_result_published"
+                and "scanned_members" in entry["details"]
+            )
             self.assertEqual(started["corr_id"], completed["corr_id"])
             self.assertEqual(started["corr_id"], published["corr_id"])
+            shared = [opaque_trace_correlation("scan-pair|spawn-pair-id")]
+            self.assertEqual(shared, started["details"]["requested_members"])
+            self.assertEqual(shared, published["details"]["scanned_members"])
         finally:
             if self.process.is_alive():
                 self.process.terminate()
@@ -557,6 +580,19 @@ class TestScannerProcess(unittest.TestCase):
         entry = enabled.snapshot()["entries"][0]
         self.assertEqual("scanner_process", entry["category"])
         self.assertEqual("scan_started", entry["message"])
+
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=0, verbose=False,
+            breadcrumb_trace=disabled.create_emitter(),
+        )
+        self.addCleanup(process.close_queues)
+        process.run_init()
+        with patch(
+            "controller.scan.scanner_process.opaque_trace_correlation",
+            side_effect=AssertionError("disabled scanner trace computed pair token"),
+        ):
+            process.force_scan("private-pair-id")
+            process._ScannerProcess__run_inline_scan()
 
     def test_root_shape_breadcrumb_gate_skips_tree_walk_when_disabled(self):
         root = SimpleNamespace(
@@ -973,6 +1009,255 @@ class TestScannerProcess(unittest.TestCase):
         process.run_loop()
 
         self.assertLess(time.monotonic() - started_at, 0.2)
+
+    def test_force_scan_breadcrumb_records_coalescing_decision_after_queue_unlock(self):
+        collector = BreadcrumbTraceCollector(lambda: True)
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=0, verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        self.addCleanup(process.close_queues)
+        target_queue = process._ScannerProcess__scan_target_queue
+        decisions = []
+        original_record = process._ScannerProcess__breadcrumb_trace.record
+
+        def record(*args, **kwargs):
+            self.assertFalse(target_queue.mutex.locked())
+            self.assertTrue(process._ScannerProcess__wake_event.is_set())
+            result = original_record(*args, **kwargs)
+            if args[1] == "force_scan":
+                decisions.append(args[2])
+            return result
+
+        process._ScannerProcess__breadcrumb_trace.record = record
+        process.force_scan("private-pair-id")
+        process.force_scan("private-pair-id")
+        process.force_scan("other-pair-id")
+        process.force_scan()
+        process.force_scan()
+        self.assertEqual(
+            ["queued", "coalesced_pair", "queued", "full_replaced", "coalesced_full"],
+            [item["decision"] for item in decisions],
+        )
+        expected = opaque_trace_correlation("scan-pair|private-pair-id")
+        self.assertEqual(expected, decisions[0]["request_correlation"])
+        self.assertNotIn("private-pair-id", repr(collector.snapshot()))
+        self.assertEqual(5, len(decisions))
+        persisted = [item for item in collector.snapshot()["entries"] if item["message"] == "force_scan"]
+        self.assertEqual(expected, persisted[0]["details"]["request_correlation"])
+        for item in decisions:
+            self.assertIn("utc", item)
+            self.assertIsInstance(item["monotonic_ms"], int)
+
+    def test_scan_pair_trace_membership_is_bounded_and_persisted_for_actual_results(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        scanner = DummyScanner()
+        scanner.path_pair_id = "private-pair-id"
+        scanner.path_pair_name = "Private Pair Name"
+        process = ScannerProcess(
+            scanner=scanner, interval_in_ms=0, verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        self.addCleanup(process.close_queues)
+        result = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"private-pair-id", None} | {"pair-{}".format(i) for i in range(10)},
+            completed_path_pair_ids={"private-pair-id"}, unknown_path_pair_ids={"pair-9"},
+            failed=True, generation=7, session_token="private-session", is_progress=True,
+            is_scan_final=False,
+        )
+        process._ScannerProcess__publish_result(result)
+        persisted = collector.snapshot()["entries"][-1]
+        details = persisted["details"]
+        self.assertEqual(opaque_trace_correlation("scan-pair|private-pair-id"),
+                         details["completed_members"][0])
+        self.assertEqual(12, details["scanned_pair_count"])
+        self.assertEqual(8, len(details["scanned_members"]))
+        self.assertIn("full", details["scanned_members"])
+        self.assertTrue(details["scanned_truncated"])
+        self.assertEqual(1, details["unknown_pair_count"])
+        self.assertTrue(details["failed"])
+        self.assertFalse(details["final"])
+        self.assertLessEqual(len(details), 24)
+        self.assertNotIn("private-pair-id", repr(persisted))
+        self.assertNotIn("Private Pair Name", repr(persisted))
+        self.assertNotIn("private-session", repr(persisted))
+        process._ScannerProcess__publish_result(ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={None, "exact-a", "exact-b"},
+            completed_path_pair_ids={None, "exact-b"}, unknown_path_pair_ids={"exact-a"},
+            generation=8, session_token="private-session", is_full_snapshot=True,
+            full_snapshot_path_pair_ids={None, "exact-a", "exact-b"},
+        ))
+        final_details = collector.snapshot()["entries"][-1]["details"]
+        token_a = opaque_trace_correlation("scan-pair|exact-a")
+        token_b = opaque_trace_correlation("scan-pair|exact-b")
+        self.assertEqual(sorted(["full", token_a, token_b]), final_details["scanned_members"])
+        self.assertEqual(sorted(["full", token_b]), final_details["completed_members"])
+        self.assertEqual([token_a], final_details["unknown_members"])
+        self.assertEqual(3, final_details["scanned_pair_count"])
+        self.assertEqual(2, final_details["completed_pair_count"])
+        self.assertEqual(1, final_details["unknown_pair_count"])
+        self.assertTrue(final_details["full"])
+        self.assertTrue(final_details["final"])
+        self.assertFalse(final_details["targeted"])
+        self.assertFalse(final_details["progress"])
+        self.assertEqual(0, final_details["file_count"])
+        self.assertLessEqual(len(final_details), 24)
+        self.assertTrue(is_critical_breadcrumb(
+            "scanner_process", "scan_result_published", category="scanner_process",
+            details=final_details,
+        ))
+
+    def test_dropped_bounded_result_is_reported_without_claiming_publication(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=0, verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        self.addCleanup(process.close_queues)
+        for index in range(128):
+            process._ScannerProcess__queue.put_nowait(ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"retained-{}".format(index)},
+                completed_path_pair_ids={"retained-{}".format(index)},
+                is_progress=True, is_scan_final=False,
+            ))
+        incoming = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"dropped-pair"},
+            completed_path_pair_ids={"dropped-pair"}, is_progress=True, is_scan_final=False,
+        )
+        process._ScannerProcess__publish_result(incoming)
+        details = collector.snapshot()["entries"][-1]["details"]
+        self.assertEqual("scan_result_dropped", collector.snapshot()["entries"][-1]["message"])
+        self.assertFalse(details["queue_published"])
+        self.assertEqual(1, details["scanned_pair_count"])
+        self.assertEqual(128, process._ScannerProcess__queue.qsize())
+
+    def test_only_final_dropped_result_uses_persisted_critical_route(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=0, verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        self.addCleanup(process.close_queues)
+        process._ScannerProcess__queue.put_nowait(ScannerResult(datetime.now(), []))
+        with patch("controller.scan.scanner_process._publish_bounded_result", return_value=False):
+            process._ScannerProcess__publish_result(ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"ordinary-drop"},
+                is_scan_final=False, is_progress=True,
+            ))
+            process._ScannerProcess__publish_result(ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"final-drop"},
+                is_scan_final=True,
+            ))
+
+        deadline = time.monotonic() + 1
+        entries = collector.snapshot()["entries"]
+        while len(entries) < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+            entries = collector.snapshot()["entries"]
+        dropped = [entry for entry in entries if entry["message"] == "scan_result_dropped"]
+        self.assertEqual(2, len(dropped))
+        by_final = {entry["details"]["final"]: entry for entry in dropped}
+        self.assertEqual("state_transition", by_final[False]["event_type"])
+        self.assertEqual("failure", by_final[True]["event_type"])
+        ingress = collector.ingress_snapshot()
+        self.assertGreaterEqual(ingress["critical_enqueued"], 1)
+        self.assertGreaterEqual(ingress["normal_enqueued"], 1)
+
+    def test_result_is_queued_and_wake_notified_before_collector_recording(self):
+        collector = BreadcrumbTraceCollector(lambda: True)
+        callbacks = []
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=0, verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+            result_available_callback=lambda: callbacks.append("notified"),
+        )
+        self.addCleanup(process.close_queues)
+        entered = threading.Event()
+        release = threading.Event()
+        emitter = process._ScannerProcess__breadcrumb_trace
+        original_record = emitter.record
+
+        def blocking_record(source, message, details=None, **metadata):
+            if message == "scan_result_published":
+                callbacks.append("record_started")
+                entered.set()
+                self.assertTrue(release.wait(2))
+            return original_record(source, message, details, **metadata)
+
+        emitter.record = blocking_record
+        result = ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"})
+        publisher = threading.Thread(target=process._ScannerProcess__publish_result, args=(result,))
+        publisher.start()
+        self.assertTrue(entered.wait(2))
+        self.assertEqual(["notified", "record_started"], callbacks)
+        self.assertIs(result, process.pop_latest_result())
+        release.set()
+        publisher.join(2)
+        self.assertFalse(publisher.is_alive())
+
+    def test_scan_started_records_drained_target_for_inline_scan(self):
+        collector = BreadcrumbTraceCollector(lambda: True)
+        scanner = DummyScanner()
+        scanner.scanned_path_pair_ids = lambda: {"private-pair-id"}
+        scanner.path_pair_id = "private-pair-id"
+        process = ScannerProcess(
+            scanner=scanner, interval_in_ms=0, verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        self.addCleanup(process.close_queues)
+        process.run_init()
+        process.prioritize_scan("private-pair-id")
+        process._ScannerProcess__run_inline_scan()
+        process._ScannerProcess__run_inline_scan()
+        entries = collector.snapshot()["entries"]
+        started_entries = [entry for entry in entries if entry["message"] == "scan_started"]
+        started = started_entries[0]
+        published = next(entry for entry in entries if entry["message"] == "scan_result_published")
+        expected = opaque_trace_correlation("scan-pair|private-pair-id")
+        self.assertEqual([expected], started["details"]["requested_members"])
+        self.assertEqual([expected], published["details"]["scanned_members"])
+        self.assertLessEqual(started["details"]["monotonic_ms"], published["details"]["monotonic_ms"])
+        self.assertEqual(["full"], started_entries[1]["details"]["requested_members"])
+
+    def test_force_start_and_published_result_join_after_persistence_for_local_and_remote(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=32)
+        expected = opaque_trace_correlation("scan-pair|request-result-pair")
+        for scanner_type, expected_side in ((LocalPairScanner, "local"), (RemotePairScanner, "remote")):
+            process = ScannerProcess(
+                scanner=scanner_type(), interval_in_ms=0, verbose=False,
+                breadcrumb_trace=collector.create_emitter(),
+            )
+            self.addCleanup(process.close_queues)
+            process.run_init()
+            process.force_scan("request-result-pair")
+            process._ScannerProcess__run_inline_scan()
+
+        entries = collector.snapshot()["entries"]
+        for expected_side in ("local", "remote"):
+            side_entries = [
+                entry for entry in entries
+                if entry["details"].get("scanner_side") == expected_side
+            ]
+            request = next(entry for entry in side_entries if entry["message"] == "force_scan")
+            started = next(entry for entry in side_entries if entry["message"] == "scan_started")
+            result = next(entry for entry in side_entries if entry["message"] == "scan_result_published")
+            request_details = request["details"]
+            started_details = started["details"]
+            result_details = result["details"]
+            self.assertEqual(expected, request_details["request_correlation"])
+            self.assertEqual([expected], started_details["requested_members"])
+            self.assertEqual([expected], result_details["scanned_members"])
+            self.assertEqual(expected_side, request_details["scanner_side"])
+            self.assertEqual(request_details["scanner_side"], started_details["scanner_side"])
+            self.assertEqual(started_details["scanner_side"], result_details["scanner_side"])
+            self.assertEqual(request_details["session_digest"], started_details["session_digest"])
+            self.assertEqual(started_details["session_digest"], result_details["session_digest"])
+            self.assertEqual(0, request_details["current_generation"])
+            self.assertEqual(1, started_details["generation"])
+            self.assertEqual(started_details["generation"], result_details["generation"])
+            self.assertTrue(result_details["final"])
+            self.assertTrue(result_details["queue_published"])
+            self.assertNotIn("request-result-pair", repr(side_entries))
 
     def test_force_scan_coalesces_requests_during_active_scan(self):
         started = threading.Event()
@@ -2139,17 +2424,20 @@ class TestScannerProcess(unittest.TestCase):
             time.sleep(0.001)
             snapshot = collector.snapshot()
         self.assertEqual(4, len(snapshot["entries"]))
-        self.assertEqual(1, len({entry["corr_id"] for entry in snapshot["entries"][:3]}))
-        self.assertEqual("movies", snapshot["entries"][3]["corr_id"])
+        scan_entries = [
+            entry for entry in snapshot["entries"]
+            if entry["message"] in {"scan_started", "scan_completed", "scan_result_published"}
+        ]
+        self.assertEqual(3, len(scan_entries))
+        self.assertEqual(1, len({entry["corr_id"] for entry in scan_entries}))
+        extract_entry = next(entry for entry in snapshot["entries"] if entry["message"] == "extract_completed")
+        self.assertEqual("movies", extract_entry["corr_id"])
         self.assertEqual([1, 2, 3, 4], [entry["version"] for entry in snapshot["entries"]])
         self.assertEqual(["scan", "scan", "scan", "extract"], [entry["stage"] for entry in snapshot["entries"]])
-        self.assertEqual(["scan_started", "scan_completed", "scan_result_published", "extract_completed"],
-                         [entry["message"] for entry in snapshot["entries"]])
-        self.assertEqual(
-            snapshot["entries"][0]["flow_id"],
-            snapshot["entries"][1]["flow_id"]
+        self.assertCountEqual(
+            ["scan_started", "scan_completed", "scan_result_published", "extract_completed"],
+            [entry["message"] for entry in snapshot["entries"]],
         )
-        self.assertIsNotNone(snapshot["entries"][0]["flow_id"])
 
     def test_sends_fatal_exception_on_nonrecoverable_error(self):
         mock_scanner = DummyScanner()

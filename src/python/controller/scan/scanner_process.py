@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 import multiprocessing
 import threading
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, List, Optional, Protocol
 import queue
 import uuid
@@ -304,6 +304,40 @@ _PUBLISH_LOCK = threading.Lock()
 # coordinator queue capacity and counts every queue item, including release
 # markers, toward the budget.
 _MAX_SCAN_QUEUE_ITEMS_PER_POP = 128
+_SCAN_PAIR_TRACE_TOKEN_LIMIT = 8
+
+
+def _scan_pair_trace_token(path_pair_id: Optional[str]) -> str:
+    """Return the shared opaque token for one pair, or the explicit full marker."""
+    if path_pair_id is None:
+        return "full"
+    return opaque_trace_correlation("scan-pair|" + path_pair_id)
+
+
+def _scan_pair_trace_membership(path_pair_ids: Optional[set[str | None]], prefix: str) -> dict[str, object]:
+    if path_pair_ids is None:
+        count = 1
+        tokens = ["full"]
+    else:
+        count = len(path_pair_ids)
+        if count <= _SCAN_PAIR_TRACE_TOKEN_LIMIT:
+            selected_ids = path_pair_ids
+        else:
+            # Keep diagnostic work fixed for very large installations while
+            # preserving the explicit full-scan marker in the bounded sample.
+            selected_ids = set()
+            if None in path_pair_ids:
+                selected_ids.add(None)
+            for path_pair_id in path_pair_ids:
+                if len(selected_ids) >= _SCAN_PAIR_TRACE_TOKEN_LIMIT:
+                    break
+                selected_ids.add(path_pair_id)
+        tokens = sorted(_scan_pair_trace_token(path_pair_id) for path_pair_id in selected_ids)
+    return {
+        prefix + "_members": tokens[:_SCAN_PAIR_TRACE_TOKEN_LIMIT],
+        prefix + "_pair_count": count,
+        prefix + "_truncated": count > _SCAN_PAIR_TRACE_TOKEN_LIMIT,
+    }
 
 
 def _is_authoritative_scan_result(item: object) -> bool:
@@ -386,7 +420,7 @@ def _replacement_index(retained: list[object], result: ScannerResult) -> Optiona
 
 
 def _publish_bounded_result(output_queue: object,
-                            result: ScannerResult) -> None:
+                            result: ScannerResult) -> bool:
     """Publish without blocking forever when a scan outruns its consumer.
 
     Ordinary root progress is deliberately lossy at the queue boundary. Pair
@@ -400,7 +434,7 @@ def _publish_bounded_result(output_queue: object,
             try:
                 put_nowait = getattr(output_queue, "put_nowait")
                 put_nowait(result)
-                return
+                return True
             except queue.Full:
                 retained: list[object] = []
                 try:
@@ -409,7 +443,7 @@ def _publish_bounded_result(output_queue: object,
                 except queue.Empty:
                     pass
                 except (OSError, EOFError, ValueError):
-                    return
+                    return False
                 if not retained:
                     # A consumer can drain the queue between the failed put
                     # and this producer's non-blocking drain. Retry the
@@ -424,17 +458,17 @@ def _publish_bounded_result(output_queue: object,
                         try:
                             output_queue.put_nowait(item)
                         except (queue.Full, OSError, EOFError, ValueError):
-                            return
-                    return
+                            return False
+                    return False
                 retained.pop(drop_index)
                 for item in retained:
                     try:
                         output_queue.put_nowait(item)
                     except (queue.Full, OSError, EOFError, ValueError):
-                        return
+                        return False
 
             except (OSError, EOFError, ValueError):
-                return
+                return False
 
 
 def _scanner_side(scanner: IScanner) -> str:
@@ -894,17 +928,7 @@ class ScannerProcess:
         scan_target_path_pair_ids = priority_target_path_pair_ids \
             if priority_target_path_pair_ids else self.__drain_scan_target_path_pair_ids()
         is_priority_targeted = bool(priority_target_path_pair_ids)
-        self.__record_breadcrumb(
-            "scan_started",
-            lambda: {
-                "targeted": scan_target_path_pair_ids is not None,
-                "scanner_side": _scanner_side(self.__scanner),
-                "generation": self.__scan_generation + 1,
-                "session_digest": trace_session_digest(self.__session_token),
-                "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
-            },
-            flow_id=flow_id,
-        )
+        self.__record_scan_started(scan_target_path_pair_ids, flow_id)
         if is_priority_targeted:
             # A priority queued before worker creation is already being
             # honored by this targeted generation; do not interrupt it.
@@ -951,13 +975,7 @@ class ScannerProcess:
         priority_target_path_pair_ids = self.__drain_priority_target_path_pair_ids()
         scan_target_path_pair_ids = priority_target_path_pair_ids \
             if priority_target_path_pair_ids else self.__drain_scan_target_path_pair_ids()
-        self.__record_breadcrumb("scan_started", lambda: {
-            "targeted": scan_target_path_pair_ids is not None,
-            "scanner_side": _scanner_side(self.__scanner),
-            "generation": self.__scan_generation + 1,
-            "session_digest": trace_session_digest(self.__session_token),
-            "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
-        }, flow_id=flow_id)
+        self.__record_scan_started(scan_target_path_pair_ids, flow_id)
         with self.__scan_admission_lock:
             self.__apply_pending_accepted_root_fingerprints()
             setter = getattr(self.__scanner, "set_scan_target_path_pair_ids", None)
@@ -1095,19 +1113,6 @@ class ScannerProcess:
         assert self.__queue is not None
         assert self.__queue is not None
         self.__publish_result(result)
-        self.__record_breadcrumb("scan_result_published", lambda: {
-            "targeted": scan_target_path_pair_ids is not None,
-            "scanner_side": _scanner_side(self.__scanner),
-            "final": bool(result.is_scan_final), "full": bool(result.is_full_snapshot),
-            "progress": bool(result.is_progress), "failed": bool(result.failed),
-            "scanned_pair_count": len(result.scanned_path_pair_ids),
-            "completed_pair_count": len(result.completed_path_pair_ids),
-            "unknown_pair_count": len(result.unknown_path_pair_ids),
-            "root_count": sum(len(files) for files in progress_files_by_pair.values()),
-            "file_count": len(result.files), "generation": self.__scan_generation,
-            "session_digest": trace_session_digest(self.__session_token),
-            "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
-        }, flow_id=flow_id)
         # Do not retain the completed graph in this long-lived coordinator.
         del result
         del files
@@ -1269,8 +1274,37 @@ class ScannerProcess:
 
     def __publish_result(self, result: ScannerResult) -> None:
         assert self.__queue is not None
-        _publish_bounded_result(self.__queue, result)
+        trace_enabled = _breadcrumb_effectively_enabled(self.__breadcrumb_trace, "scanner_process", "info")
+        before_enqueue_monotonic_ms = int(time.monotonic_ns() / 1_000_000) if trace_enabled else None
+        was_published = _publish_bounded_result(self.__queue, result)
+        after_enqueue_monotonic_ms = int(time.monotonic_ns() / 1_000_000) if trace_enabled else None
         self.__notify_result_available()
+        if trace_enabled:
+            details: dict[str, object] = {
+                "scanner_side": _scanner_side(self.__scanner),
+                "session_digest": trace_session_digest(result.session_token),
+                "generation": result.generation,
+                "targeted": result.is_targeted_scan,
+                "full": result.is_full_snapshot,
+                "final": result.is_scan_final,
+                "progress": result.is_progress,
+                "failed": result.failed,
+                "queue_published": was_published,
+                "monotonic_before_enqueue_ms": before_enqueue_monotonic_ms,
+                "monotonic_ms": after_enqueue_monotonic_ms,
+                "utc": datetime.now(timezone.utc).isoformat(),
+                "file_count": len(result.files),
+            }
+            # The parent sees one emitted result at a time; unlike the old
+            # inline path, it cannot report a scan-wide accumulated root_count.
+            details.update(_scan_pair_trace_membership(result.scanned_path_pair_ids, "scanned"))
+            details.update(_scan_pair_trace_membership(result.completed_path_pair_ids, "completed"))
+            details.update(_scan_pair_trace_membership(result.unknown_path_pair_ids, "unknown"))
+            self.__record_breadcrumb(
+                "scan_result_published" if was_published else "scan_result_dropped",
+                details,
+                event_type=("failure" if not was_published and result.is_scan_final else "state_transition"),
+            )
 
     def __notify_result_available(self) -> None:
         callback = self.__result_available_callback
@@ -1337,23 +1371,41 @@ class ScannerProcess:
             return
         if callable(details):
             details = details()
-        self.__breadcrumb_trace.record(
-            "scanner_process",
-            message,
-            details,
-            stage="scan",
-            event_type=event_type,
-            corr_id=corr_id if corr_id is not None else (
-                "{}:{}:{}".format(
-                    details.get("scanner_side", _scanner_side(self.__scanner)),
-                    details.get("session_digest", trace_session_digest(self.__session_token)),
-                    details["generation"],
-                ) if "generation" in details else self.__trace_corr_id()
-            ),
-            flow_id=opaque_trace_correlation(flow_id) if flow_id is not None else None,
-            category="scanner_process",
-            level="info",
+        try:
+            self.__breadcrumb_trace.record(
+                "scanner_process",
+                message,
+                details,
+                stage="scan",
+                event_type=event_type,
+                corr_id=corr_id if corr_id is not None else (
+                    "{}:{}:{}".format(
+                        details.get("scanner_side", _scanner_side(self.__scanner)),
+                        details.get("session_digest", trace_session_digest(self.__session_token)),
+                        details["generation"],
+                    ) if "generation" in details else self.__trace_corr_id()
+                ),
+                flow_id=opaque_trace_correlation(flow_id) if flow_id is not None else None,
+                category="scanner_process",
+                level="info",
             )
+        except Exception:
+            # Trace retention is advisory and cannot interrupt scanner work.
+            return
+
+    def __record_scan_started(self, scan_target_path_pair_ids: Optional[set[str]], flow_id: str) -> None:
+        if not _breadcrumb_effectively_enabled(self.__breadcrumb_trace, "scanner_process", "info"):
+            return
+        monotonic_ms = int(time.monotonic_ns() / 1_000_000)
+        self.__record_breadcrumb("scan_started", {
+            "targeted": scan_target_path_pair_ids is not None,
+            "scanner_side": _scanner_side(self.__scanner),
+            "generation": self.__scan_generation + 1,
+            "session_digest": trace_session_digest(self.__session_token),
+            "utc": datetime.now(timezone.utc).isoformat(),
+            "monotonic_ms": monotonic_ms,
+            **_scan_pair_trace_membership(scan_target_path_pair_ids, "requested"),
+        }, flow_id=flow_id)
 
     def pop_latest_result(self, max_items: int = _MAX_SCAN_QUEUE_ITEMS_PER_POP) -> Optional[ScannerResult]:
         """
@@ -1410,6 +1462,9 @@ class ScannerProcess:
         """Force process to wake and do an immediate scan"""
         target_queue = self.__scan_target_queue
         assert target_queue is not None
+        requested_utc = datetime.now(timezone.utc).isoformat()
+        requested_monotonic_ms = int(time.monotonic_ns() / 1_000_000)
+        requested_generation = self.__scan_generation
         # Coalesce force requests while a scan is active.  The queue is only
         # used by this coordinator thread, but its mutex gives the producer
         # side an atomic inspect/merge boundary with the drain at scan start.
@@ -1417,17 +1472,35 @@ class ScannerProcess:
             pending = list(target_queue.queue)
             if path_pair_id is None:
                 if None not in pending:
+                    decision = "full_replaced" if pending else "queued"
                     target_queue.queue.clear()
                     target_queue.unfinished_tasks = 0
                     target_queue._put(None)
                     target_queue.unfinished_tasks += 1
                     target_queue.not_empty.notify()
+                else:
+                    decision = "coalesced_full"
             elif None not in pending and path_pair_id not in pending:
+                decision = "queued"
                 target_queue._put(path_pair_id)
                 target_queue.unfinished_tasks += 1
                 target_queue.not_empty.notify()
+            elif None in pending:
+                decision = "coalesced_full"
+            else:
+                decision = "coalesced_pair"
         assert self.__wake_event is not None
         self.__wake_event.set()
+        if _breadcrumb_effectively_enabled(self.__breadcrumb_trace, "scanner_process", "info"):
+            self.__record_breadcrumb("force_scan", {
+                "decision": decision,
+                "request_correlation": _scan_pair_trace_token(path_pair_id),
+                "scanner_side": _scanner_side(self.__scanner),
+                "session_digest": trace_session_digest(self.__session_token),
+                "current_generation": requested_generation,
+                "utc": requested_utc,
+                "monotonic_ms": requested_monotonic_ms,
+            })
 
     def set_accepted_root_fingerprints(self, fingerprints: object) -> None:
         """Stage model-owned accepted root digests for the next scan admission."""
