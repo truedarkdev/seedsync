@@ -10,7 +10,7 @@ from copy import copy
 from concurrent.futures import Future
 from datetime import datetime, timedelta
 from queue import Queue
-from threading import RLock
+from threading import Event, Lock as ThreadLock, RLock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -292,6 +292,155 @@ class TestModelUpdater(unittest.TestCase):
             grouped["update_lock_release"][0]["corr_id"],
         )
 
+    def test_model_update_lock_deferred_breadcrumbs_do_not_block_lock_contenders(self):
+        for blocked_stage, blocked_phase in (
+                ("update_lock_wait", "complete"),
+                ("update_lock_hold", "entry"),
+                ("update_lock_hold", "complete"),
+                ("update_lock_release", "entry")):
+            with self.subTest(stage=blocked_stage, phase=blocked_phase):
+                trace = BreadcrumbTraceCollector(lambda: True)
+                controller = self._model_finalization_trace_controller(trace)
+                controller._Controller__model = SimpleNamespace(
+                    set_version_publication_callback=MagicMock(),
+                )
+                controller._Controller__model_builder = SimpleNamespace(
+                    begin_stop_resume_trace_cycle=MagicMock(),
+                    finish_stop_resume_trace_cycle=MagicMock(),
+                )
+                controller._Controller__stop_resume_trace_cycle_id = 0
+                work_lock = ThreadLock()
+                controller._Controller__work_state_lock = work_lock
+                updater = ModelUpdater(controller)
+                updater._update_once = lambda: True
+                callback_blocked = Event()
+                resume_callback = Event()
+                original_recorder = controller._Controller__record_breadcrumb
+
+                def blocking_recorder(**kwargs):
+                    details = kwargs["details"]
+                    if (details.get("stage"), details.get("phase")) == (
+                            blocked_stage, blocked_phase):
+                        callback_blocked.set()
+                        self.assertTrue(resume_callback.wait(2))
+                    original_recorder(**kwargs)
+
+                controller._Controller__record_breadcrumb = blocking_recorder
+                worker = Thread(target=updater.update)
+                worker.start()
+                self.assertTrue(callback_blocked.wait(2))
+                contender_acquired = work_lock.acquire(timeout=0.5)
+                if contender_acquired:
+                    work_lock.release()
+                resume_callback.set()
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+                self.assertTrue(contender_acquired)
+
+    def test_model_update_lock_release_uses_safe_fallback_for_invalid_rotated_correlation(self):
+        trace = BreadcrumbTraceCollector(lambda: True)
+        controller = self._model_finalization_trace_controller(trace)
+        controller._Controller__model = SimpleNamespace(
+            set_version_publication_callback=MagicMock(),
+        )
+        controller._Controller__model_builder = SimpleNamespace(
+            begin_stop_resume_trace_cycle=MagicMock(),
+            finish_stop_resume_trace_cycle=MagicMock(),
+        )
+        controller._Controller__stop_resume_trace_cycle_id = 0
+        controller._Controller__work_state_lock = RLock()
+        updater = ModelUpdater(controller)
+        updater._update_once = lambda: setattr(
+            controller, "_Controller__lftp_status_poll_correlation", "invalid-token",
+        ) or True
+
+        updater.update()
+        events = trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=16,
+        )["events"]
+        release = [event for event in events if event["details"]["stage"] == "update_lock_release"]
+        wait = [event for event in events if event["details"]["stage"] == "update_lock_wait"]
+        self.assertTrue(release)
+        self.assertTrue(wait)
+        self.assertEqual({"model-update:aggregate"}, {event["corr_id"] for event in release})
+        self.assertEqual({"lftp-poll:0123456789abcdef"}, {event["corr_id"] for event in wait})
+
+    def test_model_update_lock_breadcrumb_pairs_fit_saturated_bounded_collector(self):
+        budget = 4096
+        trace = BreadcrumbTraceCollector(lambda: True, memory_budget_bytes=budget)
+        fill_index = 0
+        while trace.retained_bytes < budget - 700:
+            trace.record(
+                "test", "budget_fill_{}".format(fill_index), {"payload": "x" * 200},
+                category="test.budget_fill",
+            )
+            fill_index += 1
+        self.assertLessEqual(trace.retained_bytes, budget)
+        controller = self._model_finalization_trace_controller(trace)
+        controller._Controller__model = SimpleNamespace(
+            set_version_publication_callback=MagicMock(),
+        )
+        controller._Controller__model_builder = SimpleNamespace(
+            begin_stop_resume_trace_cycle=MagicMock(),
+            finish_stop_resume_trace_cycle=MagicMock(),
+        )
+        controller._Controller__stop_resume_trace_cycle_id = 0
+        controller._Controller__work_state_lock = RLock()
+        updater = ModelUpdater(controller)
+        updater._update_once = lambda: True
+
+        updater.update()
+
+        events = trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=8,
+        )["events"]
+        lock_events = [event for event in events if event["details"]["stage"].startswith("update_lock_")]
+        self.assertLessEqual(len(lock_events), 6)
+        for event in lock_events:
+            self.assertIsInstance(event["details"]["boundary_monotonic_ns"], int)
+        snapshot = trace.snapshot()
+        self.assertLessEqual(snapshot["retained_bytes"], budget)
+        self.assertGreater(snapshot["accounting"]["evicted_count"], 0)
+
+    def test_model_update_lock_boundary_stamp_survives_durable_writer_reader(self):
+        if os.name == "nt":
+            self.skipTest("Windows durable file acknowledgement is buffered/unverified")
+        with tempfile.TemporaryDirectory() as path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                max_entries=1,
+                durable_enabled=True,
+                durable_path=path,
+            )
+            controller = self._model_finalization_trace_controller(trace)
+            controller._Controller__model = SimpleNamespace(
+                set_version_publication_callback=MagicMock(),
+            )
+            controller._Controller__model_builder = SimpleNamespace(
+                begin_stop_resume_trace_cycle=MagicMock(),
+                finish_stop_resume_trace_cycle=MagicMock(),
+            )
+            controller._Controller__stop_resume_trace_cycle_id = 0
+            controller._Controller__work_state_lock = RLock()
+            updater = ModelUpdater(controller)
+            updater._update_once = lambda: True
+            try:
+                updater.update()
+                self.assertTrue(trace.flush_durable(2.0))
+                with open(os.path.join(path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                    records = [json.loads(line) for line in handle if line.strip()]
+                hold_terminal = [
+                    record for record in records
+                    if record.get("details", {}).get("stage") == "update_lock_hold"
+                    and record.get("details", {}).get("phase") == "complete"
+                ]
+                self.assertEqual(1, len(hold_terminal))
+                boundary_ns = hold_terminal[0]["details"]["boundary_monotonic_ns"]
+                self.assertIs(type(boundary_ns), int)
+                self.assertGreater(boundary_ns, 0)
+            finally:
+                trace.close()
+
     def test_timed_model_lock_release_survives_baseexception_breadcrumb_gate_or_recorder(self):
         class BreadcrumbFailure(BaseException):
             pass
@@ -372,6 +521,135 @@ class TestModelUpdater(unittest.TestCase):
         updater.update()
 
         self.assertEqual(["acquire", "release"], lock.events)
+
+    def test_model_update_work_lock_acquire_work_and_release_failures_preserve_errors(self):
+        class OperationFailure(BaseException):
+            pass
+
+        class TrackingLock:
+            def __init__(self, *, acquire_error=None, release_error=None):
+                self.acquire_error = acquire_error
+                self.release_error = release_error
+                self.acquire_count = 0
+                self.release_count = 0
+                self.held = False
+
+            def acquire(self):
+                self.acquire_count += 1
+                if self.acquire_error is not None:
+                    raise self.acquire_error
+                self.held = True
+
+            def release(self):
+                self.release_count += 1
+                if self.release_error is not None:
+                    raise self.release_error
+                self.held = False
+
+        def create_updater(lock, trace):
+            controller = self._model_finalization_trace_controller(trace)
+            controller._Controller__model = SimpleNamespace(
+                set_version_publication_callback=MagicMock(),
+            )
+            controller._Controller__model_builder = SimpleNamespace(
+                begin_stop_resume_trace_cycle=MagicMock(),
+                finish_stop_resume_trace_cycle=MagicMock(),
+            )
+            controller._Controller__stop_resume_trace_cycle_id = 0
+            controller._Controller__work_state_lock = lock
+            updater = ModelUpdater(controller)
+            original_recorder = controller._Controller__record_breadcrumb
+
+            def assert_unlocked_recorder(**kwargs):
+                self.assertFalse(lock.held)
+                original_recorder(**kwargs)
+
+            controller._Controller__record_breadcrumb = assert_unlocked_recorder
+            return updater
+
+        acquire_error = OperationFailure("acquire")
+        acquire_trace = BreadcrumbTraceCollector(lambda: True)
+        acquire_lock = TrackingLock(acquire_error=acquire_error)
+        acquire_updater = create_updater(acquire_lock, acquire_trace)
+        acquire_updater._update_once = lambda: True
+        with self.assertRaises(OperationFailure) as raised:
+            acquire_updater.update()
+        self.assertIs(acquire_error, raised.exception)
+        self.assertEqual(1, acquire_lock.acquire_count)
+        self.assertEqual(0, acquire_lock.release_count)
+        acquire_events = acquire_trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=8,
+        )["events"]
+        self.assertEqual(
+            ["entry", "error"],
+            [event["details"]["phase"] for event in acquire_events
+             if event["details"]["stage"] == "update_lock_wait"],
+        )
+
+        work_error = OperationFailure("work")
+        work_trace = BreadcrumbTraceCollector(lambda: True)
+        work_lock = TrackingLock()
+        work_updater = create_updater(work_lock, work_trace)
+
+        def fail_work():
+            raise work_error
+
+        work_updater._update_once = fail_work
+        with self.assertRaises(OperationFailure) as raised:
+            work_updater.update()
+        self.assertIs(work_error, raised.exception)
+        self.assertEqual(1, work_lock.release_count)
+        self.assertFalse(work_lock.held)
+        work_events = work_trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=12,
+        )["events"]
+        phases = {
+            event["details"]["stage"]: event["details"]["phase"]
+            for event in work_events
+        }
+        self.assertEqual("error", phases["update_lock_hold"])
+        self.assertEqual("complete", phases["update_lock_release"])
+
+        release_error = OperationFailure("release")
+        release_trace = BreadcrumbTraceCollector(lambda: True)
+        release_lock = TrackingLock(release_error=release_error)
+        release_updater = create_updater(release_lock, release_trace)
+        release_updater._update_once = lambda: True
+        with self.assertRaises(OperationFailure) as raised:
+            release_updater.update()
+        self.assertIs(release_error, raised.exception)
+        self.assertEqual(1, release_lock.release_count)
+        self.assertTrue(release_lock.held)
+        release_events = release_trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=8,
+        )["events"]
+        self.assertEqual(
+            [("update_lock_wait", "entry")],
+            [(event["details"]["stage"], event["details"]["phase"])
+             for event in release_events],
+        )
+
+    def test_model_update_lock_disabled_trace_keeps_update_and_records_nothing(self):
+        trace = BreadcrumbTraceCollector(lambda: False)
+        controller = self._model_finalization_trace_controller(trace)
+        controller._Controller__model = SimpleNamespace(
+            set_version_publication_callback=MagicMock(),
+        )
+        controller._Controller__model_builder = SimpleNamespace(
+            begin_stop_resume_trace_cycle=MagicMock(),
+            finish_stop_resume_trace_cycle=MagicMock(),
+        )
+        controller._Controller__stop_resume_trace_cycle_id = 0
+        lock = RLock()
+        controller._Controller__work_state_lock = lock
+        updater = ModelUpdater(controller)
+        updater._update_once = lambda: True
+
+        updater.update()
+
+        self.assertTrue(lock.acquire(blocking=False))
+        lock.release()
+        self.assertEqual(0, trace.snapshot()["entry_count"])
 
     def test_model_update_work_lock_release_survives_baseexception_wait_finish_or_hold_begin(self):
         class DiagnosticFailure(BaseException):

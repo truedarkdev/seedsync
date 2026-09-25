@@ -1475,17 +1475,17 @@ def _bounded_model_finalization_duration_ms(value: object) -> int:
 class _ModelFinalizationBreadcrumbSpan:
     """Record a bounded entry/terminal pair for one model stage.
 
-    The entry is emitted before the wrapped operation, so a non-returning
-    operation leaves the last retained stage visible.  Terminal records are
-    best-effort and contain only fixed enums, wall time, and thread CPU time
-    when ``thread_time_ns`` is available.  CPU time is explicitly marked
-    unavailable rather than falling back to a process-wide clock.  Breadcrumb
-    failures never affect the wrapped operation.
+    Entries normally precede their operation. Lock-sensitive stages instead
+    retain fixed entry and terminal records until the raw lock is released;
+    the wait entry remains eager to identify a blocked acquire. CPU time uses
+    ``thread_time_ns`` when available. Breadcrumb failures do not affect the
+    wrapped operation.
     """
 
     def __init__(
         self, controller: object, stage: str,
             correlation: Optional[str] = None,
+            *, defer_recording: bool = False, eager_entry: bool = False,
     ) -> None:
         self.__controller = controller
         self.__stage = stage if (
@@ -1498,8 +1498,18 @@ class _ModelFinalizationBreadcrumbSpan:
         self.__started_cpu_ns: Optional[int] = None
         self.__cpu_clock: Optional[Callable[[], int]] = None
         self.__cpu_clock_name = "unavailable"
+        self.__boundary_ns: Optional[int] = None
+        self.__prepared = False
+        self.__defer_recording = defer_recording is True
+        self.__eager_entry = eager_entry is True
+        self.__pending_entry: Optional[tuple[object, ...]] = None
+        self.__pending_terminal: Optional[tuple[object, ...]] = None
 
-    def __enter__(self) -> "_ModelFinalizationBreadcrumbSpan":
+    def prepare(self) -> None:
+        """Resolve the gate and correlation before entering a sensitive lock."""
+        if self.__prepared:
+            return
+        self.__prepared = True
         controller = self.__controller
         try:
             self.__enabled = _controller_breadcrumb_effectively_enabled(
@@ -1507,17 +1517,30 @@ class _ModelFinalizationBreadcrumbSpan:
             )
         except BaseException:
             self.__enabled = False
+        if self.__enabled:
+            self.__effective_correlation = self.__resolve_correlation()
+
+    def __enter__(
+            self, *, boundary_ns: Optional[int] = None,
+            boundary_cpu_ns: Optional[int] = None,
+    ) -> "_ModelFinalizationBreadcrumbSpan":
+        self.prepare()
         if not self.__enabled:
             return self
         try:
-            self.__started_wall_ns = time.monotonic_ns()
+            self.__started_wall_ns = (
+                boundary_ns if type(boundary_ns) is int else time.monotonic_ns()
+            )
+            self.__boundary_ns = self.__started_wall_ns
         except BaseException:
             self.__enabled = False
             return self
         try:
             cpu_clock = getattr(time, "thread_time_ns", None)
             if callable(cpu_clock):
-                started_cpu_ns = cpu_clock()
+                started_cpu_ns = (
+                    boundary_cpu_ns if type(boundary_cpu_ns) is int else cpu_clock()
+                )
                 if type(started_cpu_ns) is int:
                     self.__cpu_clock = cpu_clock
                     self.__started_cpu_ns = started_cpu_ns
@@ -1525,7 +1548,6 @@ class _ModelFinalizationBreadcrumbSpan:
         except BaseException:
             self.__cpu_clock = None
             self.__started_cpu_ns = None
-        self.__effective_correlation = self.__resolve_correlation()
         self.__record(
             "entry", "started", 0,
             0 if self.__cpu_clock is not None else None,
@@ -1533,10 +1555,24 @@ class _ModelFinalizationBreadcrumbSpan:
         )
         return self
 
-    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+    def __exit__(
+            self, exc_type: object, exc_value: object, traceback: object,
+            *, boundary_ns: Optional[int] = None,
+            boundary_cpu_ns: Optional[int] = None,
+    ) -> bool:
         if not self.__enabled:
             return False
-        wall_ms, thread_cpu_ms = self.__elapsed_ms()
+        if type(boundary_ns) is not int:
+            try:
+                boundary_ns = time.monotonic_ns()
+            except BaseException:
+                boundary_ns = None
+        if boundary_cpu_ns is None and self.__cpu_clock is not None:
+            try:
+                boundary_cpu_ns = self.__cpu_clock()
+            except BaseException:
+                boundary_cpu_ns = None
+        wall_ms, thread_cpu_ms = self.__elapsed_ms(boundary_ns, boundary_cpu_ns)
         failed = exc_type is not None
         lock_wait_ms = wall_ms if self.__stage.endswith("_lock_wait") else None
         lock_hold_ms = wall_ms if self.__stage.endswith("_lock_hold") else None
@@ -1547,15 +1583,20 @@ class _ModelFinalizationBreadcrumbSpan:
             thread_cpu_ms,
             lock_wait_ms=lock_wait_ms,
             lock_hold_ms=lock_hold_ms,
+            boundary_ns=boundary_ns,
         )
         return False
 
-    def __elapsed_ms(self) -> tuple[int, Optional[int]]:
+    def __elapsed_ms(
+            self, boundary_ns: Optional[int] = None,
+            boundary_cpu_ns: Optional[int] = None,
+    ) -> tuple[int, Optional[int]]:
         try:
             started_wall_ns = self.__started_wall_ns
             if type(started_wall_ns) is not int:
                 return 0, None
-            wall_ns = time.monotonic_ns() - started_wall_ns
+            ended_wall_ns = boundary_ns if type(boundary_ns) is int else time.monotonic_ns()
+            wall_ns = ended_wall_ns - started_wall_ns
         except BaseException:
             return 0, None
         thread_cpu_ms: Optional[int] = None
@@ -1563,7 +1604,8 @@ class _ModelFinalizationBreadcrumbSpan:
         started_cpu_ns = self.__started_cpu_ns
         if cpu_clock is not None and type(started_cpu_ns) is int:
             try:
-                cpu_ns = cpu_clock() - started_cpu_ns
+                ended_cpu_ns = boundary_cpu_ns if type(boundary_cpu_ns) is int else cpu_clock()
+                cpu_ns = ended_cpu_ns - started_cpu_ns
                 thread_cpu_ms = _bounded_model_finalization_duration_ms(
                     max(0, cpu_ns // 1_000_000),
                 )
@@ -1578,6 +1620,40 @@ class _ModelFinalizationBreadcrumbSpan:
     def __record(
             self, phase: str, outcome: str, wall_ms: int, thread_cpu_ms: Optional[int],
             *, lock_wait_ms: Optional[int], lock_hold_ms: Optional[int],
+            boundary_ns: Optional[int] = None,
+    ) -> None:
+        if self.__defer_recording and not (self.__eager_entry and phase == "entry"):
+            event = (
+                phase, outcome, wall_ms, thread_cpu_ms, lock_wait_ms, lock_hold_ms,
+                boundary_ns if type(boundary_ns) is int else self.__boundary_ns,
+            )
+            if phase == "entry":
+                self.__pending_entry = event
+            else:
+                self.__pending_terminal = event
+            return
+        self.__emit(phase, outcome, wall_ms, thread_cpu_ms, lock_wait_ms, lock_hold_ms,
+                    boundary_ns if type(boundary_ns) is int else self.__boundary_ns)
+
+    def flush(self) -> None:
+        """Emit this span's bounded captured events after the raw lock releases."""
+        pending_entry = self.__pending_entry
+        self.__pending_entry = None
+        if pending_entry is not None:
+            self.__emit(*pending_entry)
+        pending_terminal = self.__pending_terminal
+        self.__pending_terminal = None
+        if pending_terminal is not None:
+            self.__emit(*pending_terminal)
+
+    def set_correlation_snapshot(self, value: object) -> None:
+        """Sanitize a raw boundary snapshot after leaving the sensitive lock."""
+        self.__effective_correlation = _safe_lftp_status_poll_correlation(value)
+
+    def __emit(
+            self, phase: str, outcome: str, wall_ms: int, thread_cpu_ms: Optional[int],
+            lock_wait_ms: Optional[int], lock_hold_ms: Optional[int],
+            boundary_ns: Optional[int],
     ) -> None:
         controller = self.__controller
         try:
@@ -1603,6 +1679,7 @@ class _ModelFinalizationBreadcrumbSpan:
             "cpu_clock": self.__cpu_clock_name,
             "lock_wait_ms": lock_wait_ms,
             "lock_hold_ms": lock_hold_ms,
+            "boundary_monotonic_ns": boundary_ns,
         }
         try:
             recorder(
@@ -4456,25 +4533,57 @@ class ModelUpdater(_ControllerCoreAccess):
                 build_triggered = self._update_once()
                 update_succeeded = True
             else:
+                wait_breadcrumb = _ModelFinalizationBreadcrumbSpan(
+                    controller, "update_lock_wait", lineage_cycle_correlation,
+                    defer_recording=True, eager_entry=True,
+                )
+                hold_breadcrumb = _ModelFinalizationBreadcrumbSpan(
+                    controller, "update_lock_hold", lineage_cycle_correlation,
+                    defer_recording=True,
+                )
+                release_breadcrumb = _ModelFinalizationBreadcrumbSpan(
+                    controller, "update_lock_release", lineage_cycle_correlation,
+                    defer_recording=True,
+                )
+                for span in (wait_breadcrumb, hold_breadcrumb, release_breadcrumb):
+                    span.prepare()
+                wait_breadcrumb.__enter__()
                 lock_wait_started = None
                 try:
                     lock_wait_started = diagnostics.begin_duration(DURATION_MODEL_UPDATE_LOCK_WAIT) \
                         if diagnostics is not None else None
                 except Exception:
                     pass
-                with _ModelFinalizationBreadcrumbSpan(
-                        controller, "update_lock_wait", lineage_cycle_correlation,
-                ):
-                    try:
-                        work_state_lock.acquire()
-                    except BaseException:
-                        if diagnostics is not None:
-                            try:
-                                diagnostics.finish_duration(DURATION_MODEL_UPDATE_LOCK_WAIT, lock_wait_started)
-                            except Exception:
-                                pass
-                        raise
                 try:
+                    work_state_lock.acquire()
+                except BaseException as error:
+                    wait_breadcrumb.__exit__(type(error), error, error.__traceback__)
+                    wait_breadcrumb.flush()
+                    if diagnostics is not None:
+                        try:
+                            diagnostics.finish_duration(DURATION_MODEL_UPDATE_LOCK_WAIT, lock_wait_started)
+                        except Exception:
+                            pass
+                    raise
+                acquired_ns: Optional[int] = None
+                acquired_cpu_ns: Optional[int] = None
+                try:
+                    acquired_ns = time.monotonic_ns()
+                except BaseException:
+                    pass
+                try:
+                    thread_clock = getattr(time, "thread_time_ns", None)
+                    acquired_cpu_ns = thread_clock() if callable(thread_clock) else None
+                except BaseException:
+                    pass
+                hold_breadcrumb_started = False
+                work_exception: Optional[tuple[object, object, object]] = None
+                try:
+                    wait_breadcrumb.__exit__(
+                        None, None, None,
+                        boundary_ns=acquired_ns,
+                        boundary_cpu_ns=acquired_cpu_ns,
+                    )
                     if diagnostics is not None:
                         try:
                             diagnostics.finish_duration(DURATION_MODEL_UPDATE_LOCK_WAIT, lock_wait_started)
@@ -4486,44 +4595,76 @@ class ModelUpdater(_ControllerCoreAccess):
                             if diagnostics is not None else None
                     except Exception:
                         pass
-                    with _ModelFinalizationBreadcrumbSpan(
-                            controller, "update_lock_hold", lineage_cycle_correlation,
-                    ):
+                    hold_breadcrumb.__enter__(
+                        boundary_ns=acquired_ns,
+                        boundary_cpu_ns=acquired_cpu_ns,
+                    )
+                    hold_breadcrumb_started = True
+                    try:
+                        build_triggered = self._update_once()
+                        update_succeeded = True
+                    except BaseException as error:
+                        work_exception = (type(error), error, error.__traceback__)
+                        raise
+                finally:
+                    try:
+                        release_breadcrumb.__enter__()
+                    except BaseException:
+                        pass
+                    release_error: Optional[BaseException] = None
+                    release_correlation_snapshot = None
+                    released_ns: Optional[int] = None
+                    released_cpu_ns: Optional[int] = None
+                    try:
+                        release_correlation_snapshot = getattr(
+                            controller, "_Controller__lftp_status_poll_correlation", None,
+                        )
+                    except BaseException:
+                        pass
+                    try:
+                        work_state_lock.release()
+                    except BaseException as error:
+                        release_error = error
+                    if release_error is None:
                         try:
-                            build_triggered = self._update_once()
-                            update_succeeded = True
-                        finally:
-                            if diagnostics is not None:
+                            released_ns = time.monotonic_ns()
+                        except BaseException:
+                            released_ns = None
+                        try:
+                            thread_clock = getattr(time, "thread_time_ns", None)
+                            released_cpu_ns = thread_clock() if callable(thread_clock) else None
+                        except BaseException:
+                            released_cpu_ns = None
+                    if release_error is None:
+                        release_breadcrumb.set_correlation_snapshot(
+                            release_correlation_snapshot,
+                        )
+                        if hold_breadcrumb_started:
+                            hold_breadcrumb.__exit__(
+                                *(work_exception or (None, None, None)),
+                                boundary_ns=released_ns,
+                                boundary_cpu_ns=released_cpu_ns,
+                            )
+                        release_breadcrumb.__exit__(
+                            None, None, None,
+                            boundary_ns=released_ns,
+                            boundary_cpu_ns=released_cpu_ns,
+                        )
+                        if diagnostics is not None:
+                            if hold_breadcrumb_started:
                                 try:
                                     diagnostics.finish_duration(DURATION_MODEL_UPDATE_LOCK_HOLD, lock_hold_started)
                                 except Exception:
                                     pass
-                finally:
-                        release_breadcrumb = _ModelFinalizationBreadcrumbSpan(
-                            controller, "update_lock_release", lineage_cycle_correlation,
+                        wait_breadcrumb.flush()
+                        if hold_breadcrumb_started:
+                            hold_breadcrumb.flush()
+                        release_breadcrumb.flush()
+                    else:
+                        release_breadcrumb.__exit__(
+                            type(release_error), release_error, release_error.__traceback__,
                         )
-                        release_breadcrumb_started = False
-                        try:
-                            release_breadcrumb.__enter__()
-                            release_breadcrumb_started = True
-                        except BaseException:
-                            # Breadcrumb setup must never block the raw lock release.
-                            pass
-                        try:
-                            work_state_lock.release()
-                        except BaseException as error:
-                            if release_breadcrumb_started:
-                                try:
-                                    release_breadcrumb.__exit__(type(error), error, error.__traceback__)
-                                except BaseException:
-                                    pass
-                            raise
-                        else:
-                            if release_breadcrumb_started:
-                                try:
-                                    release_breadcrumb.__exit__(None, None, None)
-                                except BaseException:
-                                    pass
+                        raise release_error
         finally:
             # Keep the no-rebuild case observable and finish only after all
             # model listeners have seen the applied diff.
