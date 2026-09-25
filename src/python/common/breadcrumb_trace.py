@@ -5425,7 +5425,7 @@ class BreadcrumbTraceCollector:
                     self.__last_failure_version = self.__version
                 self.__enqueue_durable_entry(last_entry)
                 evicted = self.__evict_to_budget()
-                if refresh_failure and not evicted:
+                if refresh_failure:
                     self.__refresh_failure_locked()
                 if not evicted or self.__entry_range_is_retained(self.__version):
                     return "retained"
@@ -5455,7 +5455,7 @@ class BreadcrumbTraceCollector:
                 self.__last_failure_version = self.__version
             self.__enqueue_durable_entry(entry)
             evicted = self.__evict_to_budget()
-            if not evicted or self.__entry_range_is_retained(self.__version):
+            if not evicted or self.__entries and self.__entries[-1] is entry:
                 return "retained"
             return "evicted" if root_progress_observation else "dropped"
 
@@ -5528,6 +5528,7 @@ class BreadcrumbTraceCollector:
 
     def __evict_to_budget(self) -> bool:
         evicted_any = False
+        evicted_failure = False
         while self.__entries and (
             self.__retained_bytes > self.__memory_budget_bytes
             or self.__max_entries is not None and len(self.__entries) > self.__max_entries
@@ -5594,9 +5595,10 @@ class BreadcrumbTraceCollector:
             )
             self.__window_truncated_pending = True
             evicted_any = True
+            evicted_failure = evicted_failure or evicted.get("event_type") == "failure"
         self.__retained_bytes = max(0, self.__retained_bytes)
         self.__last_signature = self.__signature(self.__entries[-1]) if self.__entries else None
-        if evicted_any:
+        if evicted_failure:
             self.__refresh_failure_locked()
         return evicted_any
 

@@ -907,6 +907,55 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual(1, payload["accounting"]["evicted_count"])
         self.assertEqual(3, payload["entries"][0]["last_seen_version"])
 
+    def test_nonfailure_eviction_refreshes_coalesced_failure_projection(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=None,
+            policy={"retention": {"protected_categories": ["failure"]}},
+        )
+        collector.record(
+            "worker", "failure", event_type="failure", level="error",
+            category="failure", _coalesce_key="same-entry",
+        )
+        collector.record("worker", "noise-a", category="noise")
+        collector.record("worker", "noise-b", category="noise")
+        collector._BreadcrumbTraceCollector__max_entries = 2
+        self.assertTrue(collector._BreadcrumbTraceCollector__evict_to_budget())
+
+        collector._BreadcrumbTraceCollector__max_entries = 1
+        refresh_failure = "_BreadcrumbTraceCollector__refresh_failure_locked"
+        with patch.object(
+                collector, refresh_failure, wraps=getattr(collector, refresh_failure),
+        ) as refresh_method:
+            self.assertEqual("retained", collector.record(
+                "worker", "failure", event_type="failure", level="error",
+                category="failure", _coalesce_key="same-entry",
+            ))
+
+        self.assertEqual(1, refresh_method.call_count)
+        payload = collector.snapshot()
+        self.assertEqual(["failure"], [entry["message"] for entry in payload["entries"]])
+        self.assertEqual("failure", payload["latest_failure_entry"]["message"])
+        self.assertEqual(4, payload["latest_failure_entry"]["last_seen_version"])
+
+    def test_failure_victim_refreshes_latest_failure_projection(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=None)
+        collector.record("worker", "failure-a", event_type="failure", category="failure")
+        collector.record("worker", "failure-b", event_type="failure", category="failure")
+        collector.record("worker", "noise", category="noise")
+        collector._BreadcrumbTraceCollector__max_entries = 2
+
+        refresh_failure = "_BreadcrumbTraceCollector__refresh_failure_locked"
+        with patch.object(
+                collector, refresh_failure, wraps=getattr(collector, refresh_failure),
+        ) as refresh_method:
+            self.assertTrue(collector._BreadcrumbTraceCollector__evict_to_budget())
+
+        self.assertEqual(1, refresh_method.call_count)
+        payload = collector.snapshot()
+        self.assertEqual(["failure-b", "noise"], [entry["message"] for entry in payload["entries"]])
+        self.assertEqual("failure-b", payload["latest_failure_entry"]["message"])
+
     def test_admission_preserves_stale_signature_without_coalesce_key(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
         collector.record("worker", "event", _coalesce_key="semantic-key")
