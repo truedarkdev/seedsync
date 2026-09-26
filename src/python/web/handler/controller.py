@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from threading import BoundedSemaphore, Event
 from typing import Optional, TypeGuard
 from urllib.parse import unquote
@@ -183,8 +184,11 @@ class ControllerHandler(IHandler):
         action: Controller.Command.Action,
         file_name: str,
         timeout: float | None = None,
+        timing_context: dict[str, object] | None = None,
     ) -> tuple[WebResponseActionCallback, bool]:
         command = Controller.Command(action, file_name)
+        if timing_context is not None:
+            command.diagnostic_timing = timing_context
         callback = WebResponseActionCallback()
         command.add_callback(callback)
         self.__controller.queue_command(command)
@@ -276,12 +280,33 @@ class ControllerHandler(IHandler):
             return file_name, matches[0][1], None
         return file_name, file_name, None
 
+    def __command_timing_started(self) -> int | None:
+        try:
+            started_ns = time.monotonic_ns()
+        except BaseException:
+            return None
+        try:
+            return started_ns if self.__controller.command_timing_enabled() is True else None
+        except BaseException:
+            return None
+
+    @staticmethod
+    def __command_timing_context(started_ns: int | None) -> dict[str, object] | None:
+        if started_ns is None:
+            return None
+        try:
+            return {"handler_entry_ns": started_ns, "handler_resolved_ns": time.monotonic_ns()}
+        except BaseException:
+            return {"handler_entry_ns": started_ns, "handler_resolved_ns": None}
+
     def __handle_action_queue(self, file_name: str) -> HTTPResponse:
         """
         Request a QUEUE action
         :param file_name:
         :return:
         """
+        handler_entry_ns = self.__command_timing_started()
+
         # value is double encoded
         file_name = unquote(file_name)
 
@@ -294,10 +319,13 @@ class ControllerHandler(IHandler):
             return error_response
         assert file_identifier is not None
 
+        timing_context = self.__command_timing_context(handler_entry_ns)
+
         callback, completed = self.__execute_action(
             Controller.Command.Action.QUEUE,
             file_identifier,
-            timeout=self._queue_action_timeout()
+            timeout=self._queue_action_timeout(),
+            timing_context=timing_context,
         )
         self.__controller.record_queue_http_wait_trace(
             file_identifier, completed, callback.success,
@@ -417,6 +445,8 @@ class ControllerHandler(IHandler):
         :param file_name:
         :return:
         """
+        handler_entry_ns = self.__command_timing_started()
+
         # value is double encoded
         file_name = unquote(file_name)
 
@@ -434,10 +464,13 @@ class ControllerHandler(IHandler):
         if guard_response:
             return guard_response
 
+        timing_context = self.__command_timing_context(handler_entry_ns)
+
         callback, completed = self.__execute_action(
             Controller.Command.Action.DELETE_LOCAL,
             file_identifier,
-            timeout=self._ACTION_TIMEOUT
+            timeout=self._ACTION_TIMEOUT,
+            timing_context=timing_context,
         )
         if not completed:
             return HTTPResponse(body="Operation timed out", status=504)

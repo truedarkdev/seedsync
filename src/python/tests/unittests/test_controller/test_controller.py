@@ -55,6 +55,7 @@ from lftp.lftp import _incoming_recovery_child_record, _record_lftp_sidecar_brea
 from model import ActiveProgressOverlay, IModelListener, Model, ModelDiff, ModelError, ModelFile
 from system import SystemFile
 from transfer import RcloneTransferError
+from web.handler.controller import ControllerHandler
 
 
 class TestController(unittest.TestCase):
@@ -10193,6 +10194,25 @@ class TestController(unittest.TestCase):
         delete_local_process.assert_not_called()
 
     def test_delete_local_command_lifecycle_breadcrumbs_keep_same_flow_id(self):
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"}, max_entries=32)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        flow_attempted = threading.Event()
+        queued_record_entered = threading.Event()
+        queued_record_release = threading.Event()
+        work_lock_held = threading.Event()
+        work_lock_release = threading.Event()
+        handler_entry_ns = time.monotonic_ns()
+        handler_resolved_ns = time.monotonic_ns()
+        handler_results = []
+        original_record = trace.record
+
+        def block_queued_record(source, message, details=None, **metadata):
+            if message == "command_queued":
+                queued_record_entered.set()
+                queued_record_release.wait(timeout=2)
+            return original_record(source, message, details, **metadata)
+
+        trace.record = block_queued_record
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
         file.path_pair_name = "Movies"
@@ -10208,19 +10228,61 @@ class TestController(unittest.TestCase):
             process.is_alive.return_value = False
             process.propagate_exception.return_value = None
             delete_local_process.return_value = process
-            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
-            self.controller.queue_command(command)
-            self.controller._Controller__process_commands()
+            handler = ControllerHandler(self.controller, local_path="/local")
+            command_state_lock = self.controller._Controller__command_state_lock()
+            original_state_lock = self.controller._Controller__command_state_lock
+
+            def observed_state_lock():
+                flow_attempted.set()
+                return original_state_lock()
+
+            command_state_lock.acquire()
+            with patch.object(self.controller, "_Controller__command_state_lock", side_effect=observed_state_lock):
+                handler_thread = threading.Thread(target=lambda: handler_results.append(
+                    handler._ControllerHandler__execute_action(
+                        Controller.Command.Action.DELETE_LOCAL,
+                        file.file_id,
+                        timeout=2.0,
+                        timing_context={
+                            "handler_entry_ns": handler_entry_ns,
+                            "handler_resolved_ns": handler_resolved_ns,
+                        },
+                    )
+                ))
+                handler_thread.start()
+                self.assertTrue(flow_attempted.wait(timeout=1))
+                command_state_lock.release()
+                self.assertTrue(queued_record_entered.wait(timeout=1))
+                time.sleep(0.02)
+                queued_record_release.set()
+
+            work_lock = self.controller._Controller__work_state_lock
+
+            def hold_work_lock():
+                with work_lock:
+                    work_lock_held.set()
+                    work_lock_release.wait(timeout=2)
+
+            holder_thread = threading.Thread(target=hold_work_lock)
+            holder_thread.start()
+            self.assertTrue(work_lock_held.wait(timeout=1))
+            drain_thread = threading.Thread(target=self.controller._Controller__process_commands)
+            drain_thread.start()
+            time.sleep(0.02)
+            work_lock_release.set()
+            holder_thread.join(timeout=2)
+            drain_thread.join(timeout=2)
             self.controller._Controller__cleanup_commands()
+            handler_thread.join(timeout=2)
+            self.assertFalse(holder_thread.is_alive())
+            self.assertFalse(drain_thread.is_alive())
+            self.assertFalse(handler_thread.is_alive())
+            self.assertTrue(handler_results[0][1])
 
         lifecycle_entries = [
-            call.kwargs
-            for call in self.controller._Controller__context.breadcrumb_trace.record.call_args_list
-            if len(call.args) >= 2 and call.args[1] in {
-                "command_queued",
-                "command_dequeued",
-                "command_dispatched",
-                "command_finished",
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] in {
+                "command_queued", "command_dequeued", "command_dispatched", "command_finished",
             }
         ]
         self.assertEqual(4, len(lifecycle_entries))
@@ -10229,14 +10291,84 @@ class TestController(unittest.TestCase):
         self.assertEqual({"cmd:delete_local:{}:1".format(file.file_id)}, flow_ids)
         self.assertEqual(
             ["command_queued", "command_dequeued", "command_dispatched", "command_finished"],
-            [
-                call.args[1]
-                for call in self.controller._Controller__context.breadcrumb_trace.record.call_args_list
-                if len(call.args) >= 2 and call.args[1] in {
-                    "command_queued", "command_dequeued", "command_dispatched", "command_finished"
-                }
-            ]
+            [entry["message"] for entry in lifecycle_entries]
         )
+        timing = [entry["details"]["admission_timing"] for entry in lifecycle_entries]
+        self.assertEqual(1, len({entry["correlation"] for entry in timing}))
+        self.assertEqual(opaque_trace_correlation(next(iter(flow_ids))), timing[0]["correlation"])
+        self.assertTrue(all(entry["schema"] == "command_admission_timing.v1" for entry in timing))
+        self.assertTrue(all(len(entry) <= 24 for entry in timing))
+        self.assertLessEqual(timing[0]["admission_attempt_ns"], timing[0]["flow_lock_attempt_ns"])
+        self.assertLessEqual(timing[0]["flow_lock_attempt_ns"], timing[0]["flow_lock_acquired_ns"])
+        self.assertLessEqual(timing[0]["flow_lock_acquired_ns"], timing[0]["queue_put_ns"])
+        self.assertLessEqual(timing[0]["queue_put_ns"], timing[0]["admission_complete_ns"])
+        self.assertLessEqual(timing[1]["work_lock_attempt_ns"], timing[1]["work_lock_acquired_ns"])
+        self.assertGreaterEqual(
+            timing[1]["work_lock_acquired_ns"] - timing[1]["work_lock_attempt_ns"], 10_000_000,
+        )
+        self.assertLessEqual(timing[1]["queue_get_ns"], timing[1]["model_resolved_ns"])
+        previous_record = timing[1]["previous_record_timing"]
+        self.assertEqual("command_queued", previous_record[0])
+        self.assertGreaterEqual(previous_record[2] - previous_record[1], 10_000_000)
+        self.assertEqual(previous_record[2] - previous_record[1], previous_record[3])
+        self.assertLessEqual(timing[0]["queue_put_start_ns"], timing[0]["queue_put_ns"])
+        self.assertEqual(handler_entry_ns, timing[0]["handler_entry_ns"])
+        self.assertEqual(handler_resolved_ns, timing[0]["handler_resolved_ns"])
+
+    def test_command_admission_timing_is_opt_in_and_clock_failure_is_inert(self):
+        disabled_trace = MagicMock()
+        disabled_trace.is_effectively_enabled.return_value = False
+        self.controller._Controller__context.breadcrumb_trace = disabled_trace
+        disabled_command = Controller.Command(Controller.Command.Action.QUEUE, "disabled")
+        self.controller.queue_command(disabled_command)
+        self.assertIsNone(disabled_command.diagnostic_timing)
+
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"}, max_entries=8)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        enabled_command = Controller.Command(Controller.Command.Action.QUEUE, "enabled")
+        self.controller.queue_command(enabled_command)
+        enabled_record = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "command_queued"
+        )
+        enabled_timing = enabled_record["details"]["admission_timing"]
+        previous_record = enabled_timing["previous_record_timing"]
+        self.assertEqual("queue_readiness", previous_record[0])
+        self.assertIs(type(previous_record[1]), int)
+        self.assertIs(type(previous_record[2]), int)
+        self.assertEqual(previous_record[2] - previous_record[1], previous_record[3])
+
+        gate_started_ns = []
+
+        def delayed_enabled_gate():
+            gate_started_ns.append(time.monotonic_ns())
+            time.sleep(0.01)
+            return True
+
+        delayed_command = Controller.Command(Controller.Command.Action.QUEUE, "delayed-gate")
+        with patch.object(self.controller, "command_timing_enabled", side_effect=delayed_enabled_gate):
+            self.controller.queue_command(delayed_command)
+        delayed_record = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "command_queued" and entry["flow_id"] == delayed_command.flow_id
+        )
+        self.assertLess(
+            delayed_record["details"]["admission_timing"]["admission_attempt_ns"], gate_started_ns[0],
+        )
+
+        clock_failed_command = Controller.Command(Controller.Command.Action.QUEUE, "clock-failed")
+        with patch("controller.controller.time.monotonic_ns", side_effect=KeyboardInterrupt):
+            self.controller.queue_command(clock_failed_command)
+        queued = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "command_queued" and entry["flow_id"] == clock_failed_command.flow_id
+        )
+        timing = queued["details"]["admission_timing"]
+        self.assertIsNone(timing["admission_attempt_ns"])
+        self.assertIsNone(timing["flow_id_lock_attempt_ns"])
+        self.assertIsNone(timing["flow_id_lock_acquired_ns"])
+        self.assertEqual(["unknown", None, None, None], timing["previous_record_timing"])
+        self.assertLessEqual(len(timing), 24)
 
     def test_delete_local_cleanup_timing_is_correlated_bounded_and_retrievable(self):
         with tempfile.TemporaryDirectory() as spool_path:
@@ -10263,10 +10395,36 @@ class TestController(unittest.TestCase):
                 process.is_alive.return_value = False
                 process.propagate_exception.return_value = None
                 delete_local_process.return_value = process
-                command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
-                self.controller.queue_command(command)
+                handler = ControllerHandler(self.controller, local_path="/private/local-root")
+                handler_result = []
+                handler_entry_ns = time.monotonic_ns()
+                handler_resolved_ns = time.monotonic_ns()
+                queued = threading.Event()
+                original_queue_command = self.controller.queue_command
+
+                def enqueue_and_signal(command):
+                    original_queue_command(command)
+                    queued.set()
+
+                self.controller.queue_command = enqueue_and_signal
+                handler_thread = threading.Thread(target=lambda: handler_result.append(
+                    handler._ControllerHandler__execute_action(
+                        Controller.Command.Action.DELETE_LOCAL,
+                        file.file_id,
+                        timeout=2.0,
+                        timing_context={
+                            "handler_entry_ns": handler_entry_ns,
+                            "handler_resolved_ns": handler_resolved_ns,
+                        },
+                    )
+                ))
+                handler_thread.start()
+                self.assertTrue(queued.wait(timeout=1))
                 self.controller._Controller__process_commands()
                 self.controller._Controller__cleanup_commands()
+                handler_thread.join(timeout=2)
+                self.assertFalse(handler_thread.is_alive())
+                self.assertTrue(handler_result[0][1])
 
             trace.close(timeout=2.0)
             spool_file = Path(spool_path) / "breadcrumbs.jsonl"
@@ -10278,6 +10436,28 @@ class TestController(unittest.TestCase):
 
         dispatch = next(entry for entry in records if entry.get("message") == "command_dispatched")
         finished = next(entry for entry in records if entry.get("message") == "command_finished")
+        queued = next(entry for entry in records if entry.get("message") == "command_queued")
+        dequeued = next(entry for entry in records if entry.get("message") == "command_dequeued")
+        admission = queued["details"]["admission_timing"]
+        drained = dequeued["details"]["admission_timing"]
+        self.assertEqual("command_admission_timing.v1", admission["schema"])
+        self.assertEqual(admission["correlation"], drained["correlation"])
+        self.assertEqual(opaque_trace_correlation(queued["flow_id"]), admission["correlation"])
+        self.assertEqual(handler_entry_ns, admission["handler_entry_ns"])
+        self.assertEqual(handler_resolved_ns, admission["handler_resolved_ns"])
+        self.assertTrue(all(
+            type(value) is int for key, value in admission.items()
+            if key.endswith("_ns") and value is not None
+        ))
+        previous_record = drained["previous_record_timing"]
+        self.assertEqual("command_queued", previous_record[0])
+        self.assertIs(type(previous_record[1]), int)
+        self.assertIs(type(previous_record[2]), int)
+        self.assertIs(type(previous_record[3]), int)
+        self.assertEqual(previous_record[2] - previous_record[1], previous_record[3])
+        self.assertLessEqual(len(admission), 24)
+        self.assertNotIn("private/path-sentinel.bin", json.dumps(admission))
+        self.assertNotIn("private-pair-sentinel", json.dumps(admission))
         timing = [entry for entry in records if entry.get("message") == "delete_local_cleanup_timing"]
         self.assertTrue(timing)
         timing_correlation = dispatch["details"]["timing_correlation"]

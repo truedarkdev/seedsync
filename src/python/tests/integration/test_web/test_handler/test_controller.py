@@ -693,6 +693,28 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(Controller.Command.Action.DELETE_LOCAL, command.action)
         self.assertEqual("value\"with\"doublequote", command.filename)
 
+    def test_delete_local_carries_handler_timing_into_existing_command(self):
+        self.controller.queue_command = MagicMock(
+            side_effect=lambda command: command.callbacks[0].on_success(),
+        )
+        with patch.object(self.controller, "command_timing_enabled", return_value=True):
+            response = self.test_app.delete("/server/command/delete_local/test1")
+
+        self.assertEqual(200, response.status_code)
+        command = self.controller.queue_command.call_args.args[0]
+        timing = command.diagnostic_timing
+        self.assertIs(type(timing["handler_entry_ns"]), int)
+        self.assertIs(type(timing["handler_resolved_ns"]), int)
+        self.assertLessEqual(timing["handler_entry_ns"], timing["handler_resolved_ns"])
+
+        with patch.object(self.controller, "command_timing_enabled", return_value=True):
+            queue_response = self.test_app.post("/server/command/queue/test1")
+        self.assertEqual(200, queue_response.status_code)
+        queue_command = self.controller.queue_command.call_args.args[0]
+        self.assertEqual(Controller.Command.Action.QUEUE, queue_command.action)
+        self.assertIs(type(queue_command.diagnostic_timing["handler_entry_ns"]), int)
+        self.assertIs(type(queue_command.diagnostic_timing["handler_resolved_ns"]), int)
+
     def test_delete_local_returns_failure_response(self):
         def side_effect(cmd: Controller.Command):
             cmd.callbacks[0].on_failure("File 'test1' does not exist locally", 404)

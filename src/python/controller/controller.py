@@ -84,6 +84,13 @@ _QUEUE_EXECUTOR_INFO_PHASES = frozenset({"submit", "worker_start", "worker_termi
 _QUEUE_EXECUTOR_INFO_OUTCOMES = frozenset({
     "accepted", "rejected", "started", "returned", "error", "cancelled",
 })
+_COMMAND_ADMISSION_TIMING_FIELDS = (
+    "handler_entry_ns", "handler_resolved_ns", "admission_attempt_ns",
+    "flow_id_lock_attempt_ns", "flow_id_lock_acquired_ns",
+    "flow_lock_attempt_ns", "flow_lock_acquired_ns", "queue_put_start_ns", "queue_put_ns",
+    "admission_complete_ns", "work_lock_attempt_ns", "work_lock_acquired_ns",
+    "queue_get_ns", "model_resolved_ns", "previous_record_timing",
+)
 _QUEUE_LIFECYCLE_EVENTS = frozenset({
     "queue_admitted", "executor_start", "executor_return", "executor_error",
     "lftp_child", "status_membership", "root_default", "queue_retired",
@@ -1062,6 +1069,9 @@ class Controller:
             # operation.  This uses the same process-local opaque file identity
             # as ModelUpdater's completion emitter and is never persisted.
             self.completion_trace_correlation: Optional[str] = None
+            # Optional fixed-shape source timing for existing command INFO
+            # breadcrumbs. It never participates in command decisions.
+            self.diagnostic_timing: Optional[dict[str, object]] = None
             self.origin = origin
             self.callbacks: List[Controller.Command.ICallback] = []
             self.duplicate_waiter_count = 0
@@ -5653,6 +5663,14 @@ class Controller:
         return model_files
 
     def queue_command(self, command: Command):
+        admission_entry_ns = self.__command_monotonic_ns()
+        timing_enabled = self.command_timing_enabled()
+        timing = self.__command_timing_context(command, create=timing_enabled)
+        if timing is not None:
+            try:
+                timing["admission_attempt_ns"] = admission_entry_ns
+            except BaseException:
+                pass
         startup_validation_error = getattr(self, "_Controller__startup_validation_error", None)
         if startup_validation_error is not None:
             self.logger.warning("Rejecting command because controller startup config is incomplete: %s",
@@ -5691,7 +5709,9 @@ class Controller:
 
         if is_delete_command:
             delete_identity = self.__canonical_delete_command_identity(command)
+            self.__command_timing_stamp(timing, "flow_lock_attempt_ns")
             with self.__command_state_lock():
+                self.__command_timing_stamp(timing, "flow_lock_acquired_ns")
                 duplicate_delete_command = self.__find_pending_delete_command_unlocked(
                     delete_identity,
                     command.action
@@ -5700,7 +5720,9 @@ class Controller:
                     queued_delete_count = self.__pending_delete_command_count_unlocked()
                     delete_backpressure = queued_delete_count >= Controller._MAX_PENDING_DELETE_COMMANDS
                 if not duplicate_delete_command and not delete_backpressure:
+                    self.__command_timing_stamp(timing, "queue_put_start_ns")
                     self.__command_queue.put(command)
+                    self.__command_timing_stamp(timing, "queue_put_ns")
                     queue_size = self.__safe_command_queue_size()
                 if duplicate_delete_command:
                     duplicate_waiter_count = getattr(duplicate_delete_command, "duplicate_waiter_count", 0)
@@ -5727,17 +5749,32 @@ class Controller:
                         duplicate_delete_command.duplicate_waiter_count = \
                             duplicate_waiter_count + requested_waiters
         else:
+            self.__command_timing_stamp(timing, "queue_put_start_ns")
             self.__command_queue.put(command)
+            self.__command_timing_stamp(timing, "queue_put_ns")
             queue_size = self.__safe_command_queue_size()
             if command.action == Controller.Command.Action.QUEUE:
-                self.__record_queue_readiness_trace(command.filename, "queue_admission", {
-                    "schema": "queue_readiness.v1",
-                    "phase": "admission",
-                    "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
-                    "accepted": True,
-                    "queue_depth": queue_size if type(queue_size) is int else 0,
-                    "queue_depth_known": type(queue_size) is int,
-                })
+                readiness_started_ns = (
+                    self.__command_monotonic_ns() if timing is not None else None
+                )
+                self.__command_timing_recording_started(
+                    timing, "queue_readiness", readiness_started_ns,
+                )
+                try:
+                    self.__record_queue_readiness_trace(command.filename, "queue_admission", {
+                        "schema": "queue_readiness.v1",
+                        "phase": "admission",
+                        "origin": "auto_queue" if getattr(command, "origin", "manual") == "auto_queue" else "manual",
+                        "accepted": True,
+                        "queue_depth": queue_size if type(queue_size) is int else 0,
+                        "queue_depth_known": type(queue_size) is int,
+                    })
+                finally:
+                    self.__command_timing_recorded(
+                        timing, "queue_readiness", readiness_started_ns,
+                    )
+
+        self.__command_timing_stamp(timing, "admission_complete_ns")
 
         if duplicate_waiter_backpressure:
             self.logger.warning(
@@ -6447,8 +6484,11 @@ class Controller:
         return lock
 
     def __next_command_flow_id(self, command: "Controller.Command") -> str:
+        timing = self.__command_timing_context(command)
         lock = self.__command_state_lock()
+        self.__command_timing_stamp(timing, "flow_id_lock_attempt_ns")
         with lock:
+            self.__command_timing_stamp(timing, "flow_id_lock_acquired_ns")
             sequence = getattr(self, "_Controller__command_flow_sequence", 0) + 1
             self.__command_flow_sequence = sequence
         action_name = getattr(command.action, "name", str(command.action)).lower()
@@ -6467,27 +6507,132 @@ class Controller:
         flow_id = getattr(command, "flow_id", None)
         return opaque_trace_correlation(flow_id) if isinstance(flow_id, str) else None
 
+    def command_timing_enabled(self) -> bool:
+        """Return the existing INFO gate used for command timing breadcrumbs."""
+        return _breadcrumb_effectively_enabled(
+            getattr(self.__context, "breadcrumb_trace", None), "controller", "info",
+        )
+
+    @staticmethod
+    def __command_timing_context(
+            command: "Controller.Command", *, create: bool = False,
+    ) -> Optional[dict[str, object]]:
+        try:
+            timing = getattr(command, "diagnostic_timing", None)
+            if timing is None and create:
+                timing = {key: None for key in _COMMAND_ADMISSION_TIMING_FIELDS}
+                command.diagnostic_timing = timing
+            elif create and isinstance(timing, dict) and set(timing) == {"handler_entry_ns", "handler_resolved_ns"}:
+                supplied = timing
+                timing = {key: None for key in _COMMAND_ADMISSION_TIMING_FIELDS}
+                timing.update({
+                    key: value if type(value) is int and value >= 0 else None
+                    for key, value in supplied.items()
+                })
+                command.diagnostic_timing = timing
+            if not isinstance(timing, dict) or len(timing) != len(_COMMAND_ADMISSION_TIMING_FIELDS) or \
+                    any(key not in timing for key in _COMMAND_ADMISSION_TIMING_FIELDS):
+                return None
+            return timing
+        except Exception:
+            return None
+
+    @staticmethod
+    def __command_timing_stamp(
+            timing: Optional[dict[str, object]], field_name: str,
+    ) -> None:
+        if timing is None:
+            return
+        try:
+            timing[field_name] = Controller.__command_monotonic_ns()
+        except BaseException:
+            timing[field_name] = None
+
+    @staticmethod
+    def __command_monotonic_ns() -> Optional[int]:
+        try:
+            return time.monotonic_ns()
+        except BaseException:
+            return None
+
+    @staticmethod
+    def __command_timing_recorded(
+            timing: Optional[dict[str, object]], message: str,
+            started_ns: Optional[int],
+    ) -> None:
+        if timing is None:
+            return
+        try:
+            completed_ns = Controller.__command_monotonic_ns()
+            if started_ns is None or completed_ns is None:
+                timing["previous_record_timing"] = ("unknown", None, None, None)
+            else:
+                timing["previous_record_timing"] = (
+                    message, started_ns, completed_ns, max(0, completed_ns - started_ns),
+                )
+        except BaseException:
+            try:
+                timing["previous_record_timing"] = ("unknown", None, None, None)
+            except BaseException:
+                pass
+
+    @staticmethod
+    def __command_timing_recording_started(
+            timing: Optional[dict[str, object]], message: str,
+            started_ns: Optional[int],
+    ) -> None:
+        if timing is None:
+            return
+        try:
+            timing["previous_record_timing"] = (
+                message if started_ns is not None else "unknown", started_ns, None, None,
+            )
+        except BaseException:
+            pass
+
     def __record_command_breadcrumb(self,
                                     command: "Controller.Command",
                                     message: str,
                                     details: dict[str, object],
                                     event_type: str = "state_transition",
                                     file: Optional[ModelFile] = None) -> None:
-        timing_correlation = self.__delete_local_timing_correlation(command)
+        timing = self.__command_timing_context(command)
+        timing_correlation = (
+            opaque_trace_correlation(command.flow_id)
+            if timing is not None and isinstance(getattr(command, "flow_id", None), str)
+            else self.__delete_local_timing_correlation(command)
+        )
+        record_started_ns = None
+        if timing is not None:
+            try:
+                details = dict(details)
+                details["admission_timing"] = {
+                    "schema": "command_admission_timing.v1",
+                    "correlation": timing_correlation,
+                    **dict(timing),
+                }
+            except Exception:
+                record_started_ns = None
         if timing_correlation is not None and message in {"command_dispatched", "command_finished"}:
             details = dict(details)
             details["timing_correlation"] = timing_correlation
-        self.__record_breadcrumb(
-            stage="command",
-            message=message,
-            details=details,
-            event_type=event_type,
-            file_id=file.file_id if file is not None else None,
-            path_pair_id=file.path_pair_id if file is not None else None,
-            path_pair_name=file.path_pair_name if file is not None else None,
-            corr_id=self.__command_corr_id(command, file),
-            flow_id=getattr(command, "flow_id", None),
-        )
+        try:
+            if timing is not None:
+                record_started_ns = self.__command_monotonic_ns()
+            self.__command_timing_recording_started(timing, message, record_started_ns)
+            self.__record_breadcrumb(
+                stage="command",
+                message=message,
+                details=details,
+                event_type=event_type,
+                file_id=file.file_id if file is not None else None,
+                path_pair_id=file.path_pair_id if file is not None else None,
+                path_pair_name=file.path_pair_name if file is not None else None,
+                corr_id=self.__command_corr_id(command, file),
+                flow_id=getattr(command, "flow_id", None),
+            )
+        finally:
+            self.__command_timing_recorded(timing, message, record_started_ns)
 
     def __safe_command_queue_size(self):
         try:
@@ -10794,8 +10939,10 @@ class Controller:
         try:
             # The same outer lock protects the relocation busy snapshot and
             # all command-side lifecycle mutations in this drain.
+            work_lock_attempt_ns = self.__command_monotonic_ns()
             with self.__work_state_lock:
-                self.__process_commands_impl()
+                work_lock_acquired_ns = self.__command_monotonic_ns()
+                self.__process_commands_impl(work_lock_attempt_ns, work_lock_acquired_ns)
         finally:
             with self.__work_state_lock:
                 getattr(self, "_Controller__pending_command_dispatch_file_ids", set()).difference_update(
@@ -10803,7 +10950,10 @@ class Controller:
                 )
             self.__command_dispatch_drain_file_ids = None
 
-    def __process_commands_impl(self):
+    def __process_commands_impl(
+            self, work_lock_attempt_ns: Optional[int] = None,
+            work_lock_acquired_ns: Optional[int] = None,
+    ):
         def _notify_failure(_command: Controller.Command,
                             _msg: str,
                             _error_code: int = 400,
@@ -10843,10 +10993,19 @@ class Controller:
         stopped_queue_lifecycle_ids: set[str] = set()
         while not self.__command_queue.empty():
             command = self.__command_queue.get()
+            timing = self.__command_timing_context(command)
+            if timing is not None:
+                try:
+                    timing["work_lock_attempt_ns"] = work_lock_attempt_ns
+                    timing["work_lock_acquired_ns"] = work_lock_acquired_ns
+                    timing["queue_get_ns"] = self.__command_monotonic_ns()
+                except Exception:
+                    pass
             self.logger.info("Received command {} for file {}".format(str(command.action), command.filename))
             try:
                 file = self.__get_command_model_file(command.filename)
             except ModelError:
+                self.__command_timing_stamp(timing, "model_resolved_ns")
                 self.__record_command_breadcrumb(
                     command=command,
                     message="command_dequeued",
@@ -10858,6 +11017,7 @@ class Controller:
                 )
                 _notify_failure(command, "File '{}' not found".format(command.filename), 404)
                 continue
+            self.__command_timing_stamp(timing, "model_resolved_ns")
             self.__record_command_breadcrumb(
                 command=command,
                 message="command_dequeued",
