@@ -4,6 +4,7 @@
 ``uniform`` is the historical six-pair x 32,000-files-per-side fixture.
 ``mixed`` adds one ordinary active pair and one >=200k-node idle pair.
 ``cadence`` adds one asymmetric active pair and five small isolation pairs.
+``completion`` adds a small, naturally completing directory transfer.
 The normalized topology returned by :func:`normalize_topology_spec` is the shared
 authority used by this generator and ``seed_config.py``.
 """
@@ -44,6 +45,9 @@ CADENCE_TARGET_STORAGE_SIZE_BYTES = (
     CADENCE_TARGET_LARGE_FILE_SIZE_BYTES + CADENCE_TARGET_SMALL_FILE_SIZE_BYTES
 )
 CADENCE_TARGET_DIRECTORY_NAME = "remote-workload"
+COMPLETION_TARGET_DIRECTORY_NAME = "completion-workload"
+COMPLETION_CHILD_SIZE_BYTES = 512 * 1024
+COMPLETION_CHILD_NAMES = tuple(f"child-{index:02d}.bin" for index in range(1, 5))
 EXTENSIONS = (".bin", ".dat", ".json", ".part", ".txt", ".tmp")
 PAIR_LOCAL_DIRECTORIES = tuple(
     f"path-pair-{number:02d}" for number in range(1, DEFAULT_PAIRS + 1)
@@ -62,8 +66,8 @@ def normalize_topology_spec(
     high_card_enabled: bool = True,
 ) -> dict[str, Any]:
     """Return one canonical, JSON-safe topology/config specification."""
-    if profile not in {"uniform", "mixed", "cadence"}:
-        raise ValueError("profile must be uniform, mixed, or cadence")
+    if profile not in {"uniform", "mixed", "cadence", "completion"}:
+        raise ValueError("profile must be uniform, mixed, cadence, or completion")
     if profile == "uniform":
         if pairs < 1 or pairs > len(PAIR_LOCAL_DIRECTORIES):
             raise ValueError("pairs must be between 1 and 6")
@@ -119,6 +123,48 @@ def normalize_topology_spec(
                 "remote_only_targets": [],
             },
         ]
+    elif profile == "completion":
+        if pairs < 1 or pairs > DEFAULT_PAIRS:
+            raise ValueError("completion profile uses between one and six pairs")
+        total_bytes = len(COMPLETION_CHILD_NAMES) * COMPLETION_CHILD_SIZE_BYTES
+        target = {
+            "kind": "directory",
+            "relative_path": f"{PAIR_LOCAL_DIRECTORIES[0]}/{COMPLETION_TARGET_DIRECTORY_NAME}",
+            "size_bytes": total_bytes,
+            "storage_mode": "real-bytes",
+            "storage_size_bytes": total_bytes,
+            "file_count": len(COMPLETION_CHILD_NAMES),
+            "directory_count": 1,
+            "max_depth": 0,
+            "files": [
+                {"relative_path": name, "size_bytes": COMPLETION_CHILD_SIZE_BYTES}
+                for name in COMPLETION_CHILD_NAMES
+            ],
+        }
+        entries = []
+        for number in range(1, pairs + 1):
+            directory = PAIR_LOCAL_DIRECTORIES[number - 1]
+            pair = {
+                "id": f"path-pair-{number:02d}",
+                "name": f"Path Pair {number:02d}",
+                "directory": directory,
+                "role": "ordinary-active" if number == 1 else "isolation",
+                "nodes_local": 1,
+                "nodes_remote": 1,
+                "enabled": True,
+                "auto_queue": number != 1,
+                "remote_only_targets": [target] if number == 1 else [],
+            }
+            if number == 1:
+                pair["local_only_targets"] = [{
+                    "kind": "directory",
+                    "relative_path": f"{directory}/local-only-sentinel",
+                    "size_bytes": 1024,
+                    "file_count": 1,
+                    "directory_count": 1,
+                    "files": [{"relative_path": "sentinel.bin", "size_bytes": 1024}],
+                }]
+            entries.append(pair)
     else:
         if pairs != DEFAULT_PAIRS:
             raise ValueError("cadence profile uses exactly six pairs")
@@ -194,6 +240,8 @@ def _data_spec(spec: dict[str, Any]) -> dict[str, Any]:
             "nodes_remote": pair["nodes_remote"],
             "remote_only_targets": pair["remote_only_targets"],
         }
+        if "local_only_targets" in pair:
+            entry["local_only_targets"] = pair["local_only_targets"]
         # These fields describe physical fixture identity.  Keep them out of
         # the historical profiles so their retained fingerprints remain
         # byte-for-byte compatible with existing volumes.
@@ -374,6 +422,37 @@ def _write_cadence_directory_target(
     return file_paths, directory_paths, depth_histogram, extension_histogram
 
 
+def _write_small_directory_target(
+    root: Path, target: dict[str, Any], uid: int, gid: int, seed_prefix: str
+) -> tuple[set[str], set[Path], Counter[int], Counter[str]]:
+    """Write a small explicit directory descriptor without hardlinking files."""
+    target_root = Path(*str(target["relative_path"]).split("/"))
+    directory_path = root / target_root
+    directory_path.mkdir(parents=True, exist_ok=True)
+    _set_owner(directory_path, uid, gid, 0o775)
+    file_paths: set[str] = set()
+    depth_histogram: Counter[int] = Counter()
+    extension_histogram: Counter[str] = Counter()
+    total_bytes = 0
+    for item in target["files"]:
+        relative_path = Path(str(item["relative_path"]))
+        if relative_path.is_absolute() or ".." in relative_path.parts or len(relative_path.parts) != 1:
+            raise RuntimeError("small directory child path must be a filename")
+        destination = directory_path / relative_path
+        size = int(item["size_bytes"])
+        _write_real_bytes(destination, size, f"{seed_prefix}:{relative_path.as_posix()}")
+        _set_owner(destination, uid, gid, 0o664)
+        file_paths.add((target_root / relative_path).as_posix())
+        depth_histogram[0] += 1
+        extension_histogram[destination.suffix] += 1
+        total_bytes += size
+    if (len(file_paths) != int(target["file_count"])
+            or total_bytes != int(target["size_bytes"])
+            or int(target.get("directory_count", 1)) != 1):
+        raise RuntimeError("small directory target does not match its descriptor")
+    return file_paths, {target_root}, depth_histogram, extension_histogram
+
+
 def _side_entries(pair: dict[str, Any], side: str) -> list[tuple[Path, str]]:
     if pair.get("layout") != "asymmetric-shared-sides-v1":
         return [
@@ -493,6 +572,8 @@ def _manifest_for_spec(spec: dict[str, Any], topology: dict[str, Any], fixture_f
             "auto_queue": pair["auto_queue"],
             "remote_only_targets": pair["remote_only_targets"],
         }
+        if "local_only_targets" in pair:
+            entry["local_only_targets"] = pair["local_only_targets"]
         for key in CADENCE_FIELDS:
             if key in pair:
                 entry[key] = pair[key]
@@ -718,11 +799,28 @@ def _generate_cadence_fixture(
         remote_directory_paths.update(remote_paths)
         target_file_paths: set[str] = set()
         target_directory_paths: set[Path] = set()
+        local_target_file_paths: set[str] = set()
+        local_target_directory_paths: set[Path] = set()
+        for target in pair.get("local_only_targets", []):
+            files, directories, target_depth, target_extensions = _write_small_directory_target(
+                local_root, target, 99, 100, "seedsync-performance-local-only"
+            )
+            local_target_file_paths.update(files)
+            local_target_directory_paths.update(directories)
+            local_paths.update(directories)
+            local_directory_paths.update(directories)
+            depth_histogram.update(target_depth)
+            extension_histogram.update(target_extensions)
         for target in pair["remote_only_targets"]:
             if target.get("kind") == "directory":
-                files, directories, target_depth, target_extensions = _write_cadence_directory_target(
-                    remote_root, target, 1000, 1000
-                )
+                if "files" in target:
+                    files, directories, target_depth, target_extensions = _write_small_directory_target(
+                        remote_root, target, 1000, 1000, "seedsync-performance-completion"
+                    )
+                else:
+                    files, directories, target_depth, target_extensions = _write_cadence_directory_target(
+                        remote_root, target, 1000, 1000
+                    )
                 target_file_paths.update(files)
                 target_directory_paths.update(directories)
                 remote_paths.update(directories)
@@ -785,7 +883,8 @@ def _generate_cadence_fixture(
             staging_file_count += 2
             staging_directory_count += 1
             staging_bytes += staging["size_bytes"] + status_path.stat().st_size
-        local_files = {directory_path.joinpath(filename).as_posix() for directory_path, filename in local_entries}
+        local_files = ({directory_path.joinpath(filename).as_posix() for directory_path, filename in local_entries}
+                       | local_target_file_paths)
         remote_files = {directory_path.joinpath(filename).as_posix() for directory_path, filename in remote_entries}
         target_files = target_file_paths
         union_files = local_files | remote_files | target_files
@@ -926,6 +1025,10 @@ def generate_fixture(
         return _generate_cadence_fixture(
             local_root, remote_root, manifest_path, spec, data_spec, fixture_fp,
         )
+    if profile == "completion":
+        return _generate_cadence_fixture(
+            local_root, remote_root, manifest_path, spec, data_spec, fixture_fp,
+        )
 
     pair_entries = []
     depth_histogram: Counter[int] = Counter()
@@ -1010,7 +1113,7 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--pairs", type=int, default=DEFAULT_PAIRS)
     parser.add_argument("--nodes-per-pair", type=int, default=DEFAULT_NODES_PER_PAIR)
-    parser.add_argument("--profile", choices=("uniform", "mixed", "cadence"), default="uniform")
+    parser.add_argument("--profile", choices=("uniform", "mixed", "cadence", "completion"), default="uniform")
     parser.add_argument("--high-card-enabled", choices=("on", "off"), default="on")
     args = parser.parse_args()
     manifest = generate_fixture(

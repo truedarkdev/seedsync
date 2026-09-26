@@ -32,6 +32,7 @@ def rate_limit_for_profile(profile: str) -> int:
         "uniform": 0,
         "mixed": MIXED_RATE_LIMIT_BYTES_PER_SECOND,
         "cadence": CADENCE_RATE_LIMIT_BYTES_PER_SECOND,
+        "completion": CADENCE_RATE_LIMIT_BYTES_PER_SECOND,
     }[profile]
 
 
@@ -111,7 +112,7 @@ def seed_config(config_dir: Path, api_token: str, pairs: int = 6, breadcrumb_mod
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     spec = normalize_topology_spec(profile, pairs, high_card_enabled=high_card_enabled)
     rate_limit = rate_limit_for_profile(profile)
-    if profile == "cadence":
+    if profile in {"cadence", "completion"}:
         parallel_files = 4
         connections_per_root_file = 1
         connections_per_dir_file = 1
@@ -190,7 +191,7 @@ interval_ms_remote_scan = 120000
 interval_ms_local_scan = 86400000
 interval_ms_downloading_scan = {
     CADENCE_INTERVAL_MS_DOWNLOADING_SCAN
-    if profile == "cadence" else LEGACY_INTERVAL_MS_DOWNLOADING_SCAN
+    if profile in {"cadence", "completion"} else LEGACY_INTERVAL_MS_DOWNLOADING_SCAN
 }
 extract_path = /tmp
 use_local_path_as_extract_path = True
@@ -293,7 +294,7 @@ def main() -> int:
     parser.add_argument("--breadcrumb-mode", choices=("on", "off"), default="on")
     parser.add_argument("--move-failure-mode", choices=("stale", "none"), default="stale")
     parser.add_argument("--remote-address", default="remote")
-    parser.add_argument("--profile", choices=("uniform", "mixed", "cadence"), default="uniform")
+    parser.add_argument("--profile", choices=("uniform", "mixed", "cadence", "completion"), default="uniform")
     parser.add_argument("--high-card-enabled", choices=("on", "off"), default="on")
     parser.add_argument("--diagnostics-mode", choices=("on", "off"), default="on")
     args = parser.parse_args()

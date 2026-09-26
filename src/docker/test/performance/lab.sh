@@ -30,6 +30,9 @@ if [[ "$PERF_PROFILE" == cadence ]]; then
   # Cadence is intentionally a small asymmetric isolation fixture; keep a
   # fixed floor below its expected merged tree without weakening uniform/mixed.
   PERF_MINIMUM_MERGED_NODES=2000
+elif [[ "$PERF_PROFILE" == completion ]]; then
+  # The completion profile intentionally has only a few real nodes.
+  PERF_MINIMUM_MERGED_NODES=1
 else
   PERF_MINIMUM_MERGED_NODES=200000
 fi
@@ -74,8 +77,8 @@ if [[ "$PERF_MOVE_FAILURE_MODE" != stale && "$PERF_MOVE_FAILURE_MODE" != none ]]
   echo "PERF_MOVE_FAILURE_MODE must be stale or none" >&2
   exit 2
 fi
-if [[ "$PERF_PROFILE" != uniform && "$PERF_PROFILE" != mixed && "$PERF_PROFILE" != cadence ]]; then
-  echo "PERF_PROFILE must be uniform, mixed, or cadence" >&2
+if [[ "$PERF_PROFILE" != uniform && "$PERF_PROFILE" != mixed && "$PERF_PROFILE" != cadence && "$PERF_PROFILE" != completion ]]; then
+  echo "PERF_PROFILE must be uniform, mixed, cadence, or completion" >&2
   exit 2
 fi
 if [[ "$PERF_HIGH_CARD_ENABLED" != on && "$PERF_HIGH_CARD_ENABLED" != off ]]; then
@@ -1110,13 +1113,23 @@ kind = descriptor.get("kind", "file")
 if kind not in ("file", "directory"):
     raise SystemExit("manifest browser target kind is unsupported")
 if kind == "directory":
-    for field in ("size_bytes", "file_count", "directory_count", "max_depth", "storage_size_bytes"):
+    for field in ("size_bytes", "file_count", "directory_count", "storage_size_bytes"):
         if not isinstance(descriptor.get(field), int) or descriptor[field] <= 0:
             raise SystemExit(f"manifest browser directory target has invalid {field}")
+    minimum_depth = 0 if manifest.get("profile") == "completion" else 1
+    if not isinstance(descriptor.get("max_depth"), int) or descriptor["max_depth"] < minimum_depth:
+        raise SystemExit("manifest browser directory target has invalid max_depth")
     if descriptor["storage_size_bytes"] > descriptor["size_bytes"]:
         raise SystemExit("manifest browser directory target storage bound exceeds logical aggregate")
-    if descriptor.get("storage_mode") != "real-bytes-hardlink-deduplicated":
+    expected_storage_mode = "real-bytes" if manifest.get("profile") == "completion" else "real-bytes-hardlink-deduplicated"
+    if descriptor.get("storage_mode") != expected_storage_mode:
         raise SystemExit("manifest browser directory target has unexpected storage mode")
+    if manifest.get("profile") == "completion":
+        children = descriptor.get("files")
+        if not isinstance(children, list) or len(children) != descriptor["file_count"]:
+            raise SystemExit("completion target child list does not match its declared file count")
+        if sum(int(child.get("size_bytes", -1)) for child in children) != descriptor["size_bytes"]:
+            raise SystemExit("completion target child sizes do not match its aggregate")
 def digest(value):
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
 topology_payload = json.dumps(manifest.get("data_topology_spec"), sort_keys=True, separators=(",", ":"))

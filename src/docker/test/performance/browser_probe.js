@@ -349,6 +349,12 @@ function cleanupPass(record) {
       && record.residual_local_absent === true;
   }
   const actionAccepted = record.queue_accepted === true || record.mutation_accepted === true;
+  if (record.profile === 'completion') {
+    return record.attempted === true
+      && Array.isArray(record.errors) && record.errors.length === 0
+      && ['downloaded', 'complete', 'completed', 'stopped'].includes(record.residual_state)
+      && record.transfer_quiescent === true;
+  }
   if (!actionAccepted) {
     return record.attempted === true
       && Array.isArray(record.errors) && record.errors.length === 0
@@ -455,6 +461,27 @@ function pathPairReconciled(summary, targetPairId) {
 function runSelfTest() {
   assert(percentile([10, 20, 30, 40]) === 40, 'p95 nearest-rank statistic failed');
   assert(maximum([1, 8, 3]) === 8, 'max statistic failed');
+  const completionExpected = new Map([['child-a.bin', 10], ['child-b.bin', 20]]);
+  const completionParent = {status: 'downloaded', transferred_size: 30, download_progress: 100};
+  const completionChildren = [
+    {id: 'a', name: 'child-a.bin', status: 'downloaded', size_bytes: 10, transferred_size: 10},
+    {id: 'b', name: 'child-b.bin', status: 'downloaded', size_bytes: 20, transferred_size: 20},
+  ];
+  assert(completionCoverageIsExact(completionParent, completionChildren, completionExpected),
+    'exact completed parent and child coverage was rejected');
+  assert(!completionCoverageIsExact({...completionParent, transferred_size: 29}, completionChildren, completionExpected)
+    && !completionCoverageIsExact({...completionParent, download_progress: 99}, completionChildren, completionExpected)
+    && !completionCoverageIsExact(completionParent, [
+      {...completionChildren[0], transferred_size: 11}, completionChildren[1],
+    ], completionExpected)
+    && !completionCoverageIsExact(completionParent, [
+      completionChildren[0], {...completionChildren[1], status: 'downloading'},
+    ], completionExpected)
+    && !completionCoverageIsExact(completionParent, [...completionChildren, completionChildren[0]], completionExpected),
+  'inexact byte coverage, duplicate child, or nonterminal child was accepted');
+  assert(completionSampleWindowMs(150_000) === 5_000
+    && completionSampleWindowMs(900) === 900
+    && completionSampleWindowMs(0) === 1, 'completion API iteration did not honor its shared time cap');
   const c = cadence([{t_ms: 0}, {t_ms: 100}, {t_ms: 250}]);
   assert(c.p95_ms === 150 && c.max_ms === 150, 'cadence statistic failed');
   const gap = progressGap([
@@ -814,6 +841,8 @@ function runSelfTest() {
       progress_monotonic_pass_fail: true, progress_wait_zero_regression: true,
       raw_progress_wait_byte_values: true, raw_progress_activity_above_percent_zero: true,
       target_apply_causal_attribution: true,
+      completion_exact_coverage: true,
+      completion_shared_iteration_deadline: true,
       main_thread_responsiveness: true,
       measurement_boundary: true,
       reconciliation_summary_readiness: true,
@@ -940,7 +969,7 @@ async function main() {
       await captureBreadcrumbsBeforeCleanup(
         baseUrl, apiToken, breadcrumbsBeforeCleanupPath, timeoutMs,
       );
-    });
+    }, {baseUrl, apiToken});
     const timeline = await page.evaluate(() => window.__seedSyncPerfTimeline?.snapshot?.() || {});
     evidence.samples.event_source_receive = sanitizeTimelinePaths(timeline.eventSourceReceive);
     evidence.samples.event_source_apply = sanitizeTimelinePaths(timeline.eventSourceApply);
@@ -1097,6 +1126,7 @@ function discoverTarget(manifest) {
     throw new Error('ordinary-active pair must have a non-empty string id');
   }
   const remoteTarget = pair.remote_only_targets[0];
+  const completionProfile = manifest.profile === 'completion';
   const kind = remoteTarget.kind || 'file';
   if (!['file', 'directory'].includes(kind)) {
     throw new Error('ordinary-active browser target kind is unsupported');
@@ -1105,8 +1135,8 @@ function discoverTarget(manifest) {
       !Number.isInteger(remoteTarget.size_bytes) || remoteTarget.size_bytes <= 0
       || !Number.isInteger(remoteTarget.file_count) || remoteTarget.file_count < 1
       || !Number.isInteger(remoteTarget.directory_count) || remoteTarget.directory_count < 1
-      || !Number.isInteger(remoteTarget.max_depth) || remoteTarget.max_depth < 1
-      || remoteTarget.storage_mode !== 'real-bytes-hardlink-deduplicated'
+      || !Number.isInteger(remoteTarget.max_depth) || remoteTarget.max_depth < (completionProfile ? 0 : 1)
+      || remoteTarget.storage_mode !== (completionProfile ? 'real-bytes' : 'real-bytes-hardlink-deduplicated')
       || !Number.isInteger(remoteTarget.storage_size_bytes)
       || remoteTarget.storage_size_bytes <= 0
       || remoteTarget.storage_size_bytes > remoteTarget.size_bytes)) {
@@ -1136,6 +1166,21 @@ function discoverTarget(manifest) {
       directory_count: remoteTarget.directory_count,
       max_depth: remoteTarget.max_depth,
     });
+    if (completionProfile) {
+      if (!Array.isArray(remoteTarget.files) || remoteTarget.files.length !== remoteTarget.file_count
+          || remoteTarget.files.reduce((sum, child) => sum + Number(child.size_bytes || 0), 0) !== remoteTarget.size_bytes) {
+        throw new Error('completion target child manifest does not match its aggregate');
+      }
+      target.children = remoteTarget.files.map(child => ({
+        name: String(child.relative_path || ''), size_bytes: Number(child.size_bytes),
+      }));
+      if (target.children.some(child => !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(child.name)
+          || !Number.isInteger(child.size_bytes) || child.size_bytes <= 0)) {
+        throw new Error('completion target child descriptor is invalid');
+      }
+      target.profile = 'completion';
+      target.local_only_targets = Array.isArray(pair.local_only_targets) ? pair.local_only_targets : [];
+    }
   }
   Object.defineProperty(target, 'pair_id', {value: pair.id, enumerable: false});
   return target;
@@ -1197,7 +1242,9 @@ function installPageDiagnostics(page, evidence) {
       if (!targetSelector || !record) return false;
       const recordId = record.file_id == null ? '' : String(record.file_id);
       const recordName = record.name == null ? '' : String(record.name);
-      return targetSelector.id ? recordId === targetSelector.id : recordName === targetSelector.name;
+      return (targetSelector.id && recordId === targetSelector.id)
+        || targetSelector.childNames.includes(recordName)
+        || (!targetSelector.id && recordName === targetSelector.name);
     };
     const recordTargetProgress = (source, event, received) => {
       if (measurementEpochMs == null || !event || !event.data || !targetSelector) return;
@@ -1220,9 +1267,16 @@ function installPageDiagnostics(page, evidence) {
           apply_t_ms: null,
           receive_to_apply_ms: null,
           is_dir: record.is_dir === true,
+          id: record.file_id == null ? null : String(record.file_id),
+          name: String(record.name || ''),
+          role: String(record.file_id || '') === targetSelector.id ? 'parent' : `child:${String(record.name || '')}`,
           status: String(record.state || '').toLowerCase() || null,
           transferred_size: Number.isFinite(transferred) ? transferred : null,
           download_progress: Number.isFinite(progress) ? progress : null,
+          downloading_speed: record.downloading_speed != null && Number.isFinite(Number(record.downloading_speed))
+            ? Number(record.downloading_speed)
+            : record.speed != null && Number.isFinite(Number(record.speed)) ? Number(record.speed) : null,
+          eta: record.eta == null ? null : record.eta,
         };
         add(targetRawProgress, targetSample);
         targetSamples.push(targetSample);
@@ -1353,8 +1407,9 @@ function installPageDiagnostics(page, evidence) {
         return measuredQueueMs;
       },
       markTransferEnded() { transferActive = false; },
-      attachTarget(targetId, targetName, scopedPath) {
-        targetSelector = {id: targetId ? String(targetId) : '', name: String(targetName || '')};
+      attachTarget(targetId, targetName, scopedPath, childNames) {
+        targetSelector = {id: targetId ? String(targetId) : '', name: String(targetName || ''),
+          childNames: Array.isArray(childNames) ? childNames.map(item => String(item.name || '')) : []};
         startHeartbeat();
         const root = document.querySelector('#file-list') || document.body;
         const find = () => Array.from(document.querySelectorAll('#file-list .file')).find(row => {
@@ -1676,10 +1731,10 @@ function preconditionControl(precondition, name) {
   return precondition?.controls?.[name] || {present: false, enabled: false, disabled: true};
 }
 
-async function attachTargetObserver(page, targetId, targetName, scopedPath) {
-  await page.evaluate(({targetId: id, targetName: name, scopedPath: pathName}) => {
-    window.__seedSyncPerfTimeline?.attachTarget?.(id, name, pathName);
-  }, {targetId, targetName, scopedPath});
+async function attachTargetObserver(page, targetId, targetName, scopedPath, target) {
+  await page.evaluate(({targetId: id, targetName: name, scopedPath: pathName, childNames}) => {
+    window.__seedSyncPerfTimeline?.attachTarget?.(id, name, pathName, childNames);
+  }, {targetId, targetName, scopedPath, childNames: target?.children || []});
 }
 
 async function fetchSummaryForReconciliation(page, targetPairId, timeoutMs) {
@@ -2033,8 +2088,12 @@ async function clickAction(page, target, targetId, name, endpointAction, allowed
   const clickAt = await page.evaluate(() => performance.now());
   const clickIdentity = await verifyTargetIdentity(row, targetId, target.name);
   const responsePromise = page.waitForResponse(responseMatcher(endpointAction), {timeout: timeoutMs});
+  const clickWall = Date.now();
+  const clickMono = process.hrtime.bigint();
   await button.click();
   const response = await responsePromise;
+  const responseWall = Date.now();
+  const responseMono = process.hrtime.bigint();
   const responseAt = await page.evaluate(() => performance.now());
   const httpStatus = requireAcceptedActionResponse(response, name, endpointAction);
   const acceptedMarker = typeof onAccepted === 'function'
@@ -2048,6 +2107,8 @@ async function clickAction(page, target, targetId, name, endpointAction, allowed
     endpoint_action: endpointAction, http_status: httpStatus, response_reported: true,
     rendered_state: renderedState, click_to_http_response_ms: Number((responseAt - clickAt).toFixed(3)),
     click_to_rendered_state_ms: Number((renderedAt - clickAt).toFixed(3)),
+    click_at_utc: new Date(clickWall).toISOString(), response_at_utc: new Date(responseWall).toISOString(),
+    click_monotonic_ns: clickMono.toString(), response_monotonic_ns: responseMono.toString(),
   };
   if (acceptedMarker != null) result.accepted_marker_t_ms = acceptedMarker;
   return result;
@@ -2206,8 +2267,11 @@ async function cleanupDirectoryTarget(page, target, targetId, timeoutMs, evidenc
     record.pass = cleanupPass(record);
     return;
   }
-  const stopRequired = !observedState || observedState.status !== 'stopped'
-    || observedState.controls?.Stop?.enabled === true;
+  const naturallyComplete = target.profile === 'completion'
+    && ['downloaded', 'complete', 'completed'].includes(String(observedState?.status || '').toLowerCase())
+    && observedState?.controls?.Stop?.enabled !== true;
+  const stopRequired = !naturallyComplete && (!observedState || observedState.status !== 'stopped'
+    || observedState.controls?.Stop?.enabled === true);
   if (stopRequired) {
     const stopStep = {name: 'cleanup_stop', measured: false, attempted: true};
     try {
@@ -2229,7 +2293,8 @@ async function cleanupDirectoryTarget(page, target, targetId, timeoutMs, evidenc
     const residual = await readTargetState(page, targetId, target.name, timeoutMs);
     record.residual_state = residual?.status || null;
     record.residual_identity = residual?.identity || null;
-    record.transfer_quiescent = residual?.status === 'stopped'
+    record.transfer_quiescent = (residual?.status === 'stopped'
+      || (target.profile === 'completion' && ['downloaded', 'complete', 'completed'].includes(String(residual?.status || '').toLowerCase())))
       && residual?.controls?.Stop?.enabled !== true;
   }
   catch (error) {
@@ -2307,11 +2372,11 @@ async function cleanupTarget(page, target, targetId, timeoutMs, evidence, record
   return cleanupLegacyTarget(page, target, targetId, timeoutMs, evidence, record);
 }
 
-async function exerciseActions(page, target, targetId, timeoutMs, evidence, scopedPath, captureBeforeCleanup) {
+async function exerciseActions(page, target, targetId, timeoutMs, evidence, scopedPath, captureBeforeCleanup, runtime = {}) {
   const actions = evidence.actions;
   const legacy = target.kind !== 'directory';
   const cleanupRecord = {name: 'cleanup', measured: false, required: false, attempted: false,
-    profile: legacy ? 'legacy-file' : 'cadence-directory',
+    profile: target.profile === 'completion' ? 'completion' : legacy ? 'legacy-file' : 'cadence-directory',
     steps: [], errors: [], observed_state: null, restored_state: null, residual_state: null,
     residual_local_absent: false, residual_remote_only_queueable: false, transfer_quiescent: false,
     queue_accepted: false, mutation_accepted: false, noop: false, pass: false};
@@ -2324,7 +2389,7 @@ async function exerciseActions(page, target, targetId, timeoutMs, evidence, scop
       evidence.cleanup.required = true;
     }
     await establishReadiness(page, target, targetId, timeoutMs, evidence);
-    await attachTargetObserver(page, targetId, target.name, scopedPath);
+    await attachTargetObserver(page, targetId, target.name, scopedPath, target);
     if (target.kind === 'directory') {
       await waitForPathPairReconciliation(page, target, timeoutMs, evidence);
     }
@@ -2354,12 +2419,26 @@ async function exerciseActions(page, target, targetId, timeoutMs, evidence, scop
     );
     actions.push(queueAction);
     evidence.measurement.measured_queue_t_ms = queueAction.accepted_marker_t_ms ?? null;
+    if (target.profile === 'completion') {
+      const completion = await waitForNaturalCompletion(
+        runtime.baseUrl, runtime.apiToken, target, targetId,
+        Math.min(150_000, timeoutMs), evidence,
+      );
+      evidence.completion = completion;
+      if (!completion.pass) {
+        const error = new Error('completion profile did not reach exact parent and child coverage within its bound');
+        error.failure_classification = 'completion-timeout';
+        throw error;
+      }
+      await page.evaluate(() => window.__seedSyncPerfTimeline?.markTransferEnded?.());
+    } else {
     await waitForActiveMaterialization(page, targetId, target.name, timeoutMs);
     const stopControlWaitMs = await waitForEnabledAction(page, targetId, target.name, 'Stop', timeoutMs);
     const stopAction = await clickAction(page, target, targetId, 'Stop', 'stop', ['stopped'], timeoutMs, false);
     stopAction.control_enabled_wait_ms = stopControlWaitMs;
     actions.push(stopAction);
     await page.evaluate(() => window.__seedSyncPerfTimeline?.markTransferEnded?.());
+    }
     if (legacy) {
       await waitForEnabledAction(page, targetId, target.name, 'Delete Local', timeoutMs);
       actions.push(await clickAction(
@@ -2383,6 +2462,149 @@ async function exerciseActions(page, target, targetId, timeoutMs, evidence, scop
       actions.push(cleanupRecord);
     }
   }
+}
+
+function completionSampleWindowMs(remainingMs) {
+  return Math.max(1, Math.min(5_000, Math.floor(Number(remainingMs) || 0)));
+}
+
+function completionCoverageIsExact(parent, children, expected) {
+  if (!parent || !Array.isArray(children) || !(expected instanceof Map)
+      || children.length !== expected.size || children.length === 0) return false;
+  if (!['downloaded', 'complete', 'completed'].includes(String(parent.status || '').toLowerCase())
+      || parent.transferred_size !== [...expected.values()].reduce((sum, size) => sum + size, 0)
+      || parent.download_progress !== 100) return false;
+  const seenNames = new Set();
+  const seenIds = new Set();
+  return children.every(child => {
+    const size = expected.get(String(child?.name || ''));
+    const id = String(child?.id || '');
+    const name = String(child?.name || '');
+    if (!id || seenIds.has(id) || !name || seenNames.has(name) || size == null
+        || child.size_bytes !== size || child.transferred_size !== size
+        || !['downloaded', 'complete', 'completed'].includes(String(child.status || '').toLowerCase())) return false;
+    seenIds.add(id);
+    seenNames.add(name);
+    return true;
+  });
+}
+
+async function fetchModelRecords(baseUrl, apiToken, endpoint, signal) {
+  const records = [];
+  let cursor = null;
+  for (let pageIndex = 0; pageIndex < 4; pageIndex++) {
+    if (signal.aborted) throw new DOMException('completion sample deadline elapsed', 'AbortError');
+    const url = new URL(endpoint, baseUrl);
+    url.searchParams.set('limit', '100');
+    if (cursor) url.searchParams.set('cursor', cursor);
+    const response = await fetch(url, {
+      headers: {Authorization: `Bearer ${apiToken}`}, cache: 'no-store',
+      signal,
+    });
+    if (!response.ok) throw new Error(`completion scoped model page returned HTTP ${response.status}`);
+    const payload = await response.json();
+    if (signal.aborted) throw new DOMException('completion sample deadline elapsed', 'AbortError');
+    if (!Array.isArray(payload?.records)) throw new Error('completion scoped model page had no records array');
+    records.push(...payload.records);
+    cursor = typeof payload.next_cursor === 'string' ? payload.next_cursor : null;
+    if (!cursor) break;
+    if (pageIndex === 3) throw new Error('completion model page exceeded the four-page capture bound');
+  }
+  return records;
+}
+
+async function waitForNaturalCompletion(baseUrl, apiToken, target, parentId, timeoutMs, evidence) {
+  const startedWall = Date.now();
+  const startedMono = process.hrtime.bigint();
+  const result = {
+    required: true, source: 'scoped-model-roots-and-children-api',
+    parent_id: String(parentId), expected_child_count: target.children.length,
+    expected_bytes: target.children.reduce((sum, child) => sum + child.size_bytes, 0),
+    local_sentinel_name: String(target.local_only_targets?.[0]?.relative_path || '').split('/').filter(Boolean).pop() || null,
+    samples: [], pass: false, elapsed_ms: null,
+  };
+  const expected = new Map(target.children.map(child => [child.name, child.size_bytes]));
+  const basePath = `/server/model/v1/pairs/${encodeURIComponent(target.pair_id)}`;
+  const deadline = startedWall + timeoutMs;
+  while (Date.now() < deadline) {
+    const iterationTimeoutMs = completionSampleWindowMs(deadline - Date.now());
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), iterationTimeoutMs);
+    let rootRecords;
+    let children;
+    try {
+      rootRecords = await fetchModelRecords(baseUrl, apiToken, `${basePath}/roots`, controller.signal);
+      children = await fetchModelRecords(baseUrl, apiToken,
+        `${basePath}/children?parent_file_id=${encodeURIComponent(String(parentId))}`, controller.signal);
+    } catch (error) {
+      result.capture_error = {name: String(error?.name || 'Error'), message: safeText(error?.message || error)};
+      result.timed_out = controller.signal.aborted || Date.now() >= deadline;
+      result.failure_classification = result.timed_out ? 'completion-capture-timeout' : 'completion-api-failure';
+      break;
+    } finally {
+      clearTimeout(timer);
+    }
+    const parent = rootRecords.find(record => String(record?.file_id || '') === String(parentId));
+    if (!parent) {
+      result.capture_error = {name: 'TargetMissing', message: 'completion parent disappeared from scoped root page'};
+      result.failure_classification = 'completion-api-failure';
+      break;
+    }
+    const byName = new Map(children.map(record => [String(record?.name || ''), record]));
+    const sentinelRecord = result.local_sentinel_name
+      ? rootRecords.find(record => String(record?.name || '') === result.local_sentinel_name) : null;
+    const childRows = [...expected.entries()].map(([name, size]) => {
+      const record = byName.get(name);
+      return {
+        role: `child:${name}`, id: record?.file_id == null ? null : String(record.file_id),
+        name,
+        status: String(record?.state || '').toLowerCase() || null,
+        size_bytes: size,
+        transferred_size: record?.transferred_size != null && Number.isFinite(Number(record.transferred_size)) ? Number(record.transferred_size) : null,
+        download_progress: record?.download_progress != null && Number.isFinite(Number(record.download_progress)) ? Number(record.download_progress) : null,
+        downloading_speed: record?.downloading_speed != null && Number.isFinite(Number(record.downloading_speed)) ? Number(record.downloading_speed)
+          : record?.speed != null && Number.isFinite(Number(record.speed)) ? Number(record.speed) : null,
+        eta: record?.eta == null ? null : record.eta,
+      };
+    });
+    const parentRow = {
+      role: 'parent', id: String(parent.file_id), status: String(parent.state || '').toLowerCase() || null,
+      transferred_size: parent.transferred_size != null && Number.isFinite(Number(parent.transferred_size)) ? Number(parent.transferred_size) : null,
+      download_progress: parent.download_progress != null && Number.isFinite(Number(parent.download_progress)) ? Number(parent.download_progress) : null,
+      downloading_speed: parent.downloading_speed != null && Number.isFinite(Number(parent.downloading_speed)) ? Number(parent.downloading_speed)
+        : parent.speed != null && Number.isFinite(Number(parent.speed)) ? Number(parent.speed) : null,
+      eta: parent.eta == null ? null : parent.eta,
+    };
+    const sample = {
+      utc: new Date().toISOString(),
+      monotonic_ms: Number((process.hrtime.bigint() - startedMono) / 1_000_000n),
+      iteration_timeout_ms: iterationTimeoutMs,
+      children_api_record_count: children.length,
+      children_api_names_exact: children.length === expected.size && byName.size === expected.size
+        && [...expected.keys()].every(name => byName.has(name)),
+      parent: parentRow, children: childRows,
+      local_sentinel: sentinelRecord ? {
+        id: sentinelRecord.file_id == null ? null : String(sentinelRecord.file_id),
+        status: String(sentinelRecord.state || '').toLowerCase() || null,
+      } : null,
+    };
+    boundedPush(result.samples, sample, 600);
+    if (sample.children_api_names_exact && completionCoverageIsExact(parentRow, childRows, expected)) {
+      result.pass = true;
+      result.terminal = sample;
+      break;
+    }
+    const pauseMs = Math.min(250, Math.max(0, deadline - Date.now()));
+    if (pauseMs > 0) await new Promise(resolve => setTimeout(resolve, pauseMs));
+  }
+  result.elapsed_ms = Date.now() - startedWall;
+  if (!result.pass && !result.failure_classification) {
+    result.timed_out = Date.now() >= deadline;
+    result.failure_classification = result.timed_out ? 'completion-deadline' : 'completion-incomplete';
+  }
+  if (!result.terminal && result.samples.length) result.last = result.samples[result.samples.length - 1];
+  result.capture_limits = 'Scoped API state only; no independent filesystem scanner completion evidence is available in this profile.';
+  return result;
 }
 
 async function captureBreadcrumbsBeforeCleanup(baseUrl, apiToken, outputPath, timeoutMs) {
@@ -2498,7 +2720,8 @@ function finalizeEvidence(evidence) {
   };
   evidence.thresholds.measurement_boundary.pass = measurementBoundary;
   const legacy = evidence.target?.kind !== 'directory';
-  const requiredActions = legacy ? ['queue', 'stop', 'delete_local', 'requeue'] : ['queue', 'stop'];
+  const completionProfile = evidence.target?.profile === 'completion';
+  const requiredActions = completionProfile ? ['queue'] : legacy ? ['queue', 'stop', 'delete_local', 'requeue'] : ['queue', 'stop'];
   const rendered = evidence.statistics.action_rendered_state;
   evidence.thresholds.action_rendered_state_p95_ms.observed = {
     queue: rendered.queue || null, stop: rendered.stop || null,
@@ -2513,8 +2736,13 @@ function finalizeEvidence(evidence) {
     && measured.every(action => action.response_reported === true && Number(action.http_status) >= 200 && Number(action.http_status) < 300);
   evidence.thresholds.browser_errors.observed = evidence.errors.length;
   evidence.thresholds.browser_errors.pass = evidence.errors.length === 0;
-  evidence.cleanup.pass = cleanupPass({...evidence.cleanup, profile: legacy ? 'legacy-file' : 'cadence-directory'});
-  evidence.pass = evidence.thresholds.target_dom_p95_ms.pass
+  evidence.cleanup.pass = cleanupPass({...evidence.cleanup,
+    profile: completionProfile ? 'completion' : legacy ? 'legacy-file' : 'cadence-directory'});
+  evidence.pass = completionProfile
+    ? Boolean(evidence.completion?.pass && evidence.thresholds.measurement_boundary.pass
+      && evidence.thresholds.action_http_response_reported.pass && evidence.readiness.pass
+      && evidence.cleanup.pass && evidence.thresholds.browser_errors.pass)
+    : evidence.thresholds.target_dom_p95_ms.pass
     && evidence.thresholds.target_dom_max_ms.pass
     && evidence.thresholds.minimum_progress_gap_count.pass
     && evidence.thresholds.progress_gap_p50_ms.pass

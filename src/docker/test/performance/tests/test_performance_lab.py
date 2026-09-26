@@ -354,6 +354,44 @@ def test_cadence_fixture_timing_contract_supports_genuine_forward_gaps():
     assert transfer_seconds > first_wave_seconds
 
 
+def test_completion_profile_is_small_remote_directory_with_local_sentinel(tmp_path):
+    spec = normalize_topology_spec("completion", pairs=1)
+    active = spec["pairs"][0]
+    target = active["remote_only_targets"][0]
+    assert len(spec["pairs"]) == 1
+    assert active["auto_queue"] is False
+    assert target["kind"] == "directory"
+    assert target["size_bytes"] == 4 * 512 * 1024
+    assert target["file_count"] == 4
+    assert target["directory_count"] == 1
+    assert target["storage_mode"] == "real-bytes"
+    assert sum(child["size_bytes"] for child in target["files"]) == target["size_bytes"]
+    sentinel = active["local_only_targets"][0]
+    assert sentinel["relative_path"] == "path-pair-01/local-only-sentinel"
+
+    local_root, remote_root = tmp_path / "local", tmp_path / "remote"
+    manifest = generate_fixture(
+        local_root, remote_root, tmp_path / "completion.json", pairs=1, profile="completion",
+    )
+    target_path = remote_root / target["relative_path"]
+    assert sorted(path.stat().st_size for path in target_path.iterdir()) == [512 * 1024] * 4
+    assert not (local_root / target["relative_path"]).exists()
+    sentinel_path = local_root / sentinel["relative_path"]
+    assert (sentinel_path / "sentinel.bin").stat().st_size == 1024
+    assert not (remote_root / sentinel["relative_path"]).exists()
+    counts = manifest["topology"]["file_counts_by_pair"]["path-pair-01"]
+    assert counts["remote_only"] == 4
+    assert counts["local_only"] == 1
+    cli = subprocess.run([
+        sys.executable, str(PERF_DIR / "generate_fixture.py"),
+        "--local-root", str(tmp_path / "cli-local"),
+        "--remote-root", str(tmp_path / "cli-remote"),
+        "--manifest", str(tmp_path / "cli-completion.json"),
+        "--pairs", "1", "--profile", "completion",
+    ], capture_output=True, text=True, check=False)
+    assert cli.returncode == 0, cli.stderr
+
+
 def test_cadence_fixture_records_asymmetric_counts_staging_mtimes_and_retained_reuse(tmp_path):
     local_root, remote_root = tmp_path / "local", tmp_path / "remote"
     first = generate_fixture(local_root, remote_root, tmp_path / "first.json", profile="cadence")
@@ -1647,7 +1685,13 @@ def test_browser_harness_is_lazy_configurable_and_manifest_driven():
     assert "residual_remote_only_queueable" in source
     assert "measurement_boundary" in source and "progress_monotonic" in source
     assert "ACTION_RENDER_LIMITS_MS[action]" in source
-    assert "await exerciseActions(page, target, targetId, timeoutMs, evidence, modelStreamPath)" in source
+    assert "await exerciseActions(page, target, targetId, timeoutMs, evidence, modelStreamPath, async () =>" in source
+    assert "completionCoverageIsExact(parentRow, childRows, expected)" in source
+    assert "controller.abort(), iterationTimeoutMs" in source
+    completion_capture = source[source.index("async function waitForNaturalCompletion"):source.index("async function captureBreadcrumbsBeforeCleanup")]
+    assert completion_capture.count("controller.signal") >= 3
+    assert "completionSampleWindowMs(deadline - Date.now())" in completion_capture
+    assert "descriptor[\"max_depth\"] < minimum_depth" in lab_source
     assert "readTargetId(page, target.name, timeoutMs, target)" in source
     assert "async function readTargetId(page, name, timeoutMs, target = null)" in source
     assert "synthetic browser target row is not a directory" in source
@@ -1795,6 +1839,8 @@ def test_browser_probe_self_test_runs_without_playwright():
         "raw_progress_wait_byte_values": True,
         "raw_progress_activity_above_percent_zero": True,
         "target_apply_causal_attribution": True,
+        "completion_exact_coverage": True,
+        "completion_shared_iteration_deadline": True,
         "main_thread_responsiveness": True,
         "measurement_boundary": True,
         "reconciliation_summary_readiness": True,
