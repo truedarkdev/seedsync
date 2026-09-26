@@ -1201,6 +1201,15 @@ def _child_finalization_trace_identity(
         return None
 
 
+def _child_finalization_monotonic_ns() -> Optional[int]:
+    """Read a source clock for child-finalization diagnostics, fail-isolated."""
+    try:
+        value = time.monotonic_ns()
+        return value if type(value) is int and value >= 0 else None
+    except Exception:
+        return None
+
+
 def _child_finalization_trace_flow_id(child_identity: Optional[str]) -> Optional[str]:
     """Return the exact opaque flow value used by child-finalization events."""
     return None if child_identity is None else "child:{}".format(child_identity)
@@ -9912,10 +9921,21 @@ class ModelUpdater(_ControllerCoreAccess):
                     authority_accepted = False
                     authority_reason = "active_leaf_transfer"
                 child_trace_identity = None
+                parent_correlation = None
+                if child_trace_info_enabled or child_trace_warning_enabled:
+                    try:
+                        parent_correlation = "completion:{}".format(
+                            opaque_trace_correlation(
+                                ModelFile.build_file_id(root_name, path_pair_id),
+                            ),
+                        )
+                    except Exception:
+                        parent_correlation = None
                 if child_trace_info_enabled:
                     child_trace_identity = _child_finalization_trace_identity(
                         root_name, relative_path, path_pair_id,
                     )
+                    source_monotonic_ns = _child_finalization_monotonic_ns()
                     _record_child_finalization_breadcrumb(
                         controller,
                         "child_finalization_authority",
@@ -9932,6 +9952,8 @@ class ModelUpdater(_ControllerCoreAccess):
                                 if child_trace_identity is not None
                                 else "target_identity_unavailable"
                             ),
+                            "parent_correlation": parent_correlation,
+                            "source_monotonic_ns": source_monotonic_ns,
                             **child_trace_epochs,
                         },
                         level="info",
@@ -9939,9 +9961,24 @@ class ModelUpdater(_ControllerCoreAccess):
                     )
                 if not authority_accepted:
                     continue
+                finalize_timing_enabled = (
+                    child_trace_info_enabled or child_trace_warning_enabled
+                )
+                finalize_started_monotonic_ns = (
+                    _child_finalization_monotonic_ns()
+                    if finalize_timing_enabled else None
+                )
                 try:
                     result = finalize_child(root_name, relative_path, path_pair_id)
+                    finalize_returned_monotonic_ns = (
+                        _child_finalization_monotonic_ns()
+                        if finalize_timing_enabled else None
+                    )
                 except Exception:
+                    finalize_returned_monotonic_ns = (
+                        _child_finalization_monotonic_ns()
+                        if finalize_timing_enabled else None
+                    )
                     controller.logger.debug("Ignoring independent child finalization failure", exc_info=True)
                     if child_trace_warning_enabled:
                         if child_trace_identity is None:
@@ -9965,6 +10002,9 @@ class ModelUpdater(_ControllerCoreAccess):
                                     if child_trace_identity is not None
                                     else "target_identity_unavailable"
                                 ),
+                                "parent_correlation": parent_correlation,
+                                "finalize_started_monotonic_ns": finalize_started_monotonic_ns,
+                                "finalize_returned_monotonic_ns": finalize_returned_monotonic_ns,
                                 **child_trace_epochs,
                             },
                             level="warning",
@@ -10022,6 +10062,9 @@ class ModelUpdater(_ControllerCoreAccess):
                                 if child_trace_identity is not None
                                 else "target_identity_unavailable"
                             ),
+                            "parent_correlation": parent_correlation,
+                            "finalize_started_monotonic_ns": finalize_started_monotonic_ns,
+                            "finalize_returned_monotonic_ns": finalize_returned_monotonic_ns,
                             **child_trace_epochs,
                         },
                         level=result_level,

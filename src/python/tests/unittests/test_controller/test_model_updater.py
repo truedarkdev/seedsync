@@ -12002,6 +12002,195 @@ class TestModelUpdater(unittest.TestCase):
             "private-root", "private-complete.bin", "accepted-private-pair",
         )
 
+    def test_child_finalization_timing_and_parent_join_survive_durable_trace(self):
+        with tempfile.TemporaryDirectory() as path:
+            controller, model_builder = self._make_progressive_update_controller(
+                None, local_scan=None,
+            )
+            root_name = "example-root"
+            pair_id = "example-pair"
+            model_builder.get_finalizable_staging_leaf_candidates.return_value = (
+                (json.dumps([pair_id, root_name], separators=(",", ":")), "child.bin"),
+            )
+            controller._Controller__reconciled_local_path_pair_ids = {pair_id}
+            controller._Controller__reconciled_remote_path_pair_ids = {pair_id}
+            controller._Controller__prev_downloading_file_names = {
+                (root_name, pair_id, None),
+            }
+            controller._Controller__lftp.status.return_value = []
+            controller._finalize_staging_child = MagicMock(
+                return_value=Controller.MoveFromStagingResult.COMPLETED,
+            )
+            trace = BreadcrumbTraceCollector(
+                lambda: True, max_entries=32,
+                policy={
+                    "default": "off",
+                    "rules": {"completion.gate": "info", "finalization.child": "info"},
+                },
+                durable_enabled=True, durable_path=path,
+            )
+            controller._Controller__context.breadcrumb_trace = trace
+
+            def record_breadcrumb(**kwargs):
+                trace.record(
+                    "controller", kwargs["message"], kwargs["details"],
+                    stage=kwargs["stage"], event_type=kwargs["event_type"],
+                    category=kwargs["category"], level=kwargs["level"],
+                    corr_id=kwargs["corr_id"], flow_id=kwargs.get("flow_id"),
+                    trace_scope=kwargs.get("trace_scope", "flow"),
+                )
+
+            controller._Controller__record_breadcrumb = record_breadcrumb
+            with patch(
+                "controller.model_updater._child_finalization_monotonic_ns",
+                side_effect=[101, 102, 103],
+            ):
+                ModelUpdater(controller).update()
+            trace.close()
+
+            with open(os.path.join(path, "breadcrumbs.jsonl"), encoding="utf-8") as stream:
+                durable_events = [json.loads(line) for line in stream if line.strip()]
+            root_event = next(
+                event for event in durable_events
+                if event.get("message") == "completion_pending_registered"
+            )
+            authority = next(
+                event for event in durable_events
+                if event.get("message") == "child_finalization_authority"
+                and event["details"]["decision"] == "accepted"
+            )
+            result = next(
+                event for event in durable_events
+                if event.get("message") == "child_finalization_result"
+            )
+            self.assertEqual(
+                "completion:{}".format(
+                    opaque_trace_correlation(ModelFile.build_file_id(root_name, pair_id)),
+                ),
+                root_event["corr_id"],
+            )
+            self.assertEqual(root_event["corr_id"], authority["details"]["parent_correlation"])
+            self.assertEqual(root_event["corr_id"], result["details"]["parent_correlation"])
+            self.assertEqual(101, authority["details"]["source_monotonic_ns"])
+            self.assertEqual(102, result["details"]["finalize_started_monotonic_ns"])
+            self.assertEqual(103, result["details"]["finalize_returned_monotonic_ns"])
+            self.assertNotIn(root_name, str(durable_events))
+            self.assertNotIn(pair_id, str(durable_events))
+
+    def test_child_finalization_monotonic_clock_failure_is_isolated(self):
+        from controller.model_updater import _child_finalization_monotonic_ns
+
+        with patch("controller.model_updater.time.monotonic_ns", side_effect=RuntimeError):
+            self.assertIsNone(_child_finalization_monotonic_ns())
+
+    def test_child_finalization_warning_only_result_keeps_parent_join(self):
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None,
+        )
+        root_name = "example-root"
+        pair_id = "example-pair"
+        model_builder.get_finalizable_staging_leaf_candidates.return_value = (
+            (json.dumps([pair_id, root_name], separators=(",", ":")), "child.bin"),
+        )
+        controller._Controller__reconciled_local_path_pair_ids = {pair_id}
+        controller._Controller__reconciled_remote_path_pair_ids = {pair_id}
+        controller._Controller__prev_downloading_file_names = {(root_name, pair_id, None)}
+        controller._Controller__lftp.status.return_value = []
+        controller._finalize_staging_child = MagicMock(side_effect=RuntimeError("expected"))
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=16,
+            policy={
+                "default": "off",
+                "rules": {"completion.gate": "info", "finalization.child": "warning"},
+            },
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+
+        def record_breadcrumb(**kwargs):
+            trace.record(
+                "controller", kwargs["message"], kwargs["details"],
+                stage=kwargs["stage"], event_type=kwargs["event_type"],
+                category=kwargs["category"], level=kwargs["level"],
+                corr_id=kwargs["corr_id"], flow_id=kwargs.get("flow_id"),
+                trace_scope=kwargs.get("trace_scope", "flow"),
+            )
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        with patch(
+            "controller.model_updater._child_finalization_monotonic_ns",
+            side_effect=[11, 12],
+        ):
+            ModelUpdater(controller).update()
+
+        events = trace.query_events(limit=16)["events"]
+        root_event = next(
+            event for event in events
+            if event["category"] == "completion.gate"
+            and event["message"] == "completion_pending_registered"
+        )
+        child_events = [event for event in events if event["category"] == "finalization.child"]
+        self.assertEqual(["child_finalization_result"], [event["message"] for event in child_events])
+        result = child_events[0]
+        self.assertEqual("warning", result["level"])
+        self.assertEqual(root_event["corr_id"], result["details"]["parent_correlation"])
+        self.assertEqual(11, result["details"]["finalize_started_monotonic_ns"])
+        self.assertEqual(12, result["details"]["finalize_returned_monotonic_ns"])
+        trace.close()
+
+    def test_child_finalization_exception_keeps_timing_and_rejection_is_unchanged(self):
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None,
+        )
+        model_builder.get_finalizable_staging_leaf_candidates.return_value = (
+            ('["pair-a","root"]', "accepted.bin"),
+            ('["pair-b","root"]', "rejected.bin"),
+        )
+        controller._Controller__reconciled_local_path_pair_ids = {"pair-a"}
+        controller._Controller__reconciled_remote_path_pair_ids = {"pair-a"}
+        controller._finalize_staging_child = MagicMock(side_effect=RuntimeError("expected"))
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        controller._Controller__context.breadcrumb_trace = trace
+
+        def record_breadcrumb(**kwargs):
+            trace.record(
+                "controller", kwargs["message"], kwargs["details"],
+                stage=kwargs["stage"], event_type=kwargs["event_type"],
+                category=kwargs["category"], level=kwargs["level"],
+                corr_id=kwargs["corr_id"], flow_id=kwargs.get("flow_id"),
+                trace_scope=kwargs.get("trace_scope", "flow"),
+            )
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        with patch(
+            "controller.model_updater._child_finalization_monotonic_ns",
+            side_effect=[100, 101, 102, 103],
+        ):
+            ModelUpdater(controller).update()
+
+        events = trace.query_events(
+            category="finalization.child", stage="finalization_child", limit=16,
+        )["events"]
+        authority = [
+            event for event in events if event["message"] == "child_finalization_authority"
+        ]
+        self.assertEqual({"accepted", "rejected"}, {
+            event["details"]["decision"] for event in authority
+        })
+        accepted = next(event for event in authority if event["details"]["decision"] == "accepted")
+        rejected = next(event for event in authority if event["details"]["decision"] == "rejected")
+        self.assertEqual(100, accepted["details"]["source_monotonic_ns"])
+        self.assertEqual(103, rejected["details"]["source_monotonic_ns"])
+        result = next(
+            event for event in events if event["message"] == "child_finalization_result"
+        )
+        self.assertEqual("exception", result["details"]["outcome"])
+        self.assertEqual(101, result["details"]["finalize_started_monotonic_ns"])
+        self.assertEqual(102, result["details"]["finalize_returned_monotonic_ns"])
+        controller._finalize_staging_child.assert_called_once_with(
+            "root", "accepted.bin", "pair-a",
+        )
+        trace.close()
+
     def test_child_finalization_epoch_projection_is_bounded_and_sanitized(self):
         self.assertIsNone(_bounded_child_finalization_epoch(-1))
         self.assertIsNone(_bounded_child_finalization_epoch("7"))
