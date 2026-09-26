@@ -58,11 +58,6 @@
                         <span class="text">Stopped</span>
                     </div>
                     <div class="sel-item"
-                         *ngIf="(options | async)?.selectedStatusFilter == ViewFile.Status.INCOMPLETE">
-                        <div class="icon"></div>
-                        <span class="text">Incomplete</span>
-                    </div>
-                    <div class="sel-item"
                          *ngIf="(options | async)?.selectedStatusFilter == ViewFile.Status.MOVE_FAILED">
                         <div class="icon"><img src="assets/icons/move-failed.png" class="move-failed" /></div>
                         <span class="text">Final move failed</span>
@@ -152,15 +147,6 @@
                     <div class="icon"><img src="assets/icons/stopped.svg" class="stopped" /></div>
                     <span class="text">Stopped</span>
                     <span class="count">{{ getStatusCount(ViewFile.Status.STOPPED) }}</span>
-                </button>
-                <button type="button" class="dropdown-item"
-                        [class.active]="(options | async)?.selectedStatusFilter == ViewFile.Status.INCOMPLETE"
-                        [class.disabled]="isStatusDisabled(ViewFile.Status.INCOMPLETE) ? true : null"
-                        [disabled]="isStatusDisabled(ViewFile.Status.INCOMPLETE)"
-                        (click)="onFilterByStatus(ViewFile.Status.INCOMPLETE)">
-                    <div class="icon"></div>
-                    <span class="text">Incomplete</span>
-                    <span class="count">{{ getStatusCount(ViewFile.Status.INCOMPLETE) }}</span>
                 </button>
             </div>
         </div>

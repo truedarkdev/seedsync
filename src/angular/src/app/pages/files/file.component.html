@@ -62,6 +62,8 @@
                   class="text">Moved to destination</span>
             <span *ngIf="file.visibleStatus === ViewFile.Status.LOCAL_ONLY"
                   class="text">Local Only</span>
+            <span *ngIf="file.visibleStatus === ViewFile.Status.DEFAULT && file.remoteHasTransferableContent"
+                  class="text">Remote Only</span>
         </div>
         <div class="name">
             <img src="assets/icons/file-light.svg" *ngIf="!file.isDir && !file.isArchive" alt="" aria-hidden="true" />
@@ -138,14 +140,8 @@
                     </span>
                     <div class="size_info">
                         <ng-container *ngIf="file.percentDownloaded != null; else progressUnavailable">
-                            {{file.transferredSize | fileSize:3}} of {{file.displaySizeTotal | fileSize:3}}
+                            {{file.transferredSize | fileSize:3:file.displaySizeTotal}} of {{file.displaySizeTotal | fileSize:3}}
                         </ng-container>
-                        <span *ngIf="file.visibleStatus === ViewFile.Status.INCOMPLETE && file.transferredSize < file.displaySizeTotal">
-                            <br />{{file.displaySizeTotal - file.transferredSize}} B remaining
-                        </span>
-                        <span *ngIf="file.visibleStatus === ViewFile.Status.INCOMPLETE && file.transferredSize >= file.displaySizeTotal">
-                            <br />Coverage incomplete
-                        </span>
                         <ng-template #progressUnavailable>
                             <span class="progress-unavailable">Progress unavailable</span>
                         </ng-template>

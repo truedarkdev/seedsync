@@ -524,11 +524,6 @@ export class ViewFileService {
             displaySizeTotal > 0
             && (transferredSize > 0 || (modelFile.download_progress != null && modelFile.download_progress > 0))
         );
-        const isIncomplete: boolean = modelFile.state === ModelFile.State.DEFAULT
-            && hasRetainedProgress
-            && hasDisplayUnion
-            && modelFile.complete_local_coverage === false
-            && modelFile.explicitly_stopped !== true;
         let percentDownloaded: number | null = 0;
         // Prefer the live transfer percentage for active downloads; fall back to size ratios otherwise.
         if (hasUnknownDownloadingProgress) {
@@ -552,9 +547,6 @@ export class ViewFileService {
             ModelFile.State.CORRUPT
         ].includes(modelFile.state)) {
             percentDownloaded = 100;
-        }
-        if (isIncomplete && percentDownloaded != null) {
-            percentDownloaded = Math.min(99, percentDownloaded);
         }
 
         // Translate the status
@@ -678,7 +670,6 @@ export class ViewFileService {
             localPresent: localPresent,
             remoteHasTransferableContent: remoteHasTransferableContent,
             isLocalOnly: isLocalOnly,
-            isIncomplete: isIncomplete,
             transferredSize: transferredSize,
             displaySizeTotal: displaySizeTotal,
             percentDownloaded: percentDownloaded,

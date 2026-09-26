@@ -2093,7 +2093,6 @@ describe("Testing view file service", () => {
                 display_size_total: 100, display_transferred_size: 100,
                 complete_local_coverage: false,
                 expected: ViewFile.Status.STOPPED,
-                expectedVisibleStatus: ViewFile.Status.INCOMPLETE, expectedPercent: 99,
             },
             {
                 state: ModelFile.State.DEFAULT,
