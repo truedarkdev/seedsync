@@ -79,6 +79,11 @@ from system import SystemFile
 
 _QUEUE_LIFECYCLE_TRACE_CATEGORY = "queue.lifecycle"
 _QUEUE_LIFECYCLE_TRACE_SCHEMA = "queue.lifecycle.v1"
+_QUEUE_EXECUTOR_INFO_SCHEMA = "queue.executor_info.v1"
+_QUEUE_EXECUTOR_INFO_PHASES = frozenset({"submit", "worker_start", "worker_terminal"})
+_QUEUE_EXECUTOR_INFO_OUTCOMES = frozenset({
+    "accepted", "rejected", "started", "returned", "error", "cancelled",
+})
 _QUEUE_LIFECYCLE_EVENTS = frozenset({
     "queue_admitted", "executor_start", "executor_return", "executor_error",
     "lftp_child", "status_membership", "root_default", "queue_retired",
@@ -1402,6 +1407,12 @@ class Controller:
         if self.__temp_diag_file_id is not None and not self.__temp_diag_file_id.strip():
             self.__temp_diag_file_id = None
         self.__temp_diag_last_signature = None
+        trace = getattr(self.__context, "breadcrumb_trace", None)
+        create_emitter = getattr(trace, "create_emitter", None)
+        try:
+            self.__queue_executor_info_emitter = create_emitter() if callable(create_emitter) else None
+        except Exception:
+            self.__queue_executor_info_emitter = None
 
         # The command queue
         self.__command_queue = Queue()
@@ -1819,6 +1830,49 @@ class Controller:
             # Executor diagnostics must never affect PTY ownership or transfer state.
             return
 
+    def __record_queue_executor_info(
+            self, flow_id: Optional[str], phase: str, outcome: str,
+            *, monotonic_ns: Optional[int] = None,
+            submit_return_monotonic_ns: Optional[int] = None,
+            exception_family: Optional[str] = None,
+    ) -> None:
+        """Record one bounded Queue executor edge through the owned emitter."""
+        if not isinstance(flow_id, str) or not flow_id:
+            return
+        if phase not in _QUEUE_EXECUTOR_INFO_PHASES or outcome not in _QUEUE_EXECUTOR_INFO_OUTCOMES:
+            return
+        try:
+            source_monotonic_ns = time.monotonic_ns() if monotonic_ns is None else monotonic_ns
+            if type(source_monotonic_ns) is not int or source_monotonic_ns < 0:
+                return
+            emitter = getattr(self, "_Controller__queue_executor_info_emitter", None)
+            level = "warning" if outcome in {"rejected", "error", "cancelled"} else "info"
+            if not _breadcrumb_effectively_enabled(emitter, _QUEUE_LIFECYCLE_TRACE_CATEGORY, level):
+                return
+            details: dict[str, object] = {
+                "schema": _QUEUE_EXECUTOR_INFO_SCHEMA,
+                "phase": phase,
+                "outcome": outcome,
+                "monotonic_ns": source_monotonic_ns,
+            }
+            if phase == "submit":
+                if type(submit_return_monotonic_ns) is not int or submit_return_monotonic_ns < source_monotonic_ns:
+                    return
+                details["submit_return_monotonic_ns"] = submit_return_monotonic_ns
+            if exception_family is not None:
+                details["exception_family"] = (
+                    exception_family if exception_family in _LFTP_EXECUTOR_EXCEPTION_FAMILIES else "unknown"
+                )
+            emitter.record(
+                "controller", "queue_executor_edge", details,
+                stage="queue_executor", event_type="failure" if level == "warning" else "state_transition",
+                category=_QUEUE_LIFECYCLE_TRACE_CATEGORY, level=level,
+                corr_id=flow_id, flow_id=flow_id, trace_scope="flow",
+            )
+        except Exception:
+            # Queue diagnostics cannot affect executor admission or ownership.
+            return
+
     def __ensure_lftp_executor(self) -> Optional[ThreadPoolExecutor]:
         if not self.__uses_async_lftp_owner() or getattr(self, "_Controller__lftp_executor_closing", False):
             return None
@@ -1843,15 +1897,25 @@ class Controller:
             diagnostic_recorder = self.__incoming_recovery_flow_recorder(
                 file_id, operation_sequence,
             )
+        queue_flow_id = _fractional_queue_flow_id(
+            self, file_id, operation_sequence,
+        ) if action == "queue" and isinstance(file_id, str) else None
         executor = self.__ensure_lftp_executor()
         if executor is None:
+            if action == "queue" and queue_flow_id is not None:
+                try:
+                    rejected_at = time.monotonic_ns()
+                    self.__record_queue_executor_info(
+                        queue_flow_id, "submit", "rejected",
+                        monotonic_ns=rejected_at,
+                        submit_return_monotonic_ns=rejected_at,
+                    )
+                except Exception:
+                    pass
             if diagnostic_recorder is not None:
                 diagnostic_recorder("executor_error", {"classification": "command_error"})
             return False
 
-        queue_flow_id = _fractional_queue_flow_id(
-            self, file_id, operation_sequence,
-        ) if action == "queue" and isinstance(file_id, str) else None
         queue_correlation_flow_id = queue_flow_id
         if diagnostic_recorder is not None:
             diagnostic_recorder("queue_admitted", {})
@@ -1859,6 +1923,7 @@ class Controller:
         submitted_operation = operation
         if action == "queue":
             def queue_operation() -> _LftpQueueResult:
+                self.__record_queue_executor_info(queue_flow_id, "worker_start", "started")
                 if diagnostic_recorder is not None:
                     diagnostic_recorder("executor_start", {})
                 if isinstance(file_id, str):
@@ -1873,10 +1938,19 @@ class Controller:
                     )
                 try:
                     result = operation()
-                except BaseException:
+                except BaseException as exc:
+                    try:
+                        exception_family = _lftp_executor_exception_family(exc)
+                    except BaseException:
+                        exception_family = "unknown"
+                    self.__record_queue_executor_info(
+                        queue_flow_id, "worker_terminal", "error",
+                        exception_family=exception_family,
+                    )
                     if diagnostic_recorder is not None:
                         diagnostic_recorder("executor_error", {"classification": "command_error"})
                     raise
+                self.__record_queue_executor_info(queue_flow_id, "worker_terminal", "returned")
                 if diagnostic_recorder is not None:
                     diagnostic_recorder("executor_return", {})
                 # Capture before this worker future completes. A later PTY
@@ -1925,9 +1999,33 @@ class Controller:
 
                 submit_callable = observed_operation
 
+        submit_monotonic_ns = None
+        if action == "queue" and queue_flow_id is not None:
+            try:
+                submit_monotonic_ns = time.monotonic_ns()
+            except Exception:
+                pass
         try:
             future = executor.submit(submit_callable)
         except RuntimeError as exc:
+            submit_return_monotonic_ns = None
+            if action == "queue" and queue_flow_id is not None:
+                try:
+                    submit_return_monotonic_ns = time.monotonic_ns()
+                except Exception:
+                    pass
+            if action == "queue" and queue_flow_id is not None and submit_monotonic_ns is not None and \
+                    submit_return_monotonic_ns is not None:
+                try:
+                    exception_family = _lftp_executor_exception_family(exc)
+                except BaseException:
+                    exception_family = "unknown"
+                self.__record_queue_executor_info(
+                    queue_flow_id, "submit", "rejected",
+                    monotonic_ns=submit_monotonic_ns,
+                    submit_return_monotonic_ns=submit_return_monotonic_ns,
+                    exception_family=exception_family,
+                )
             if executor_trace_enabled:
                 self.__record_lftp_executor_observation(
                     executor_correlation, action, "enqueue_failed", "failed", error=exc,
@@ -1936,6 +2034,19 @@ class Controller:
             if diagnostic_recorder is not None:
                 diagnostic_recorder("executor_error", {"classification": "command_error"})
             return False
+        submit_return_monotonic_ns = None
+        if action == "queue" and queue_flow_id is not None:
+            try:
+                submit_return_monotonic_ns = time.monotonic_ns()
+            except Exception:
+                pass
+        if action == "queue" and queue_flow_id is not None and submit_monotonic_ns is not None and \
+                submit_return_monotonic_ns is not None:
+            self.__record_queue_executor_info(
+                queue_flow_id, "submit", "accepted",
+                monotonic_ns=submit_monotonic_ns,
+                submit_return_monotonic_ns=submit_return_monotonic_ns,
+            )
         if diagnostic_recorder is not None:
             # ``submit`` returning a Future is the existing executor admission
             # boundary. Keep the state projection fixed and do not retain the
@@ -1948,8 +2059,13 @@ class Controller:
             )
 
         def on_lftp_future_done(done_future: Future[object]) -> None:
-            if action == "queue" and diagnostic_recorder is not None and done_future.cancelled():
-                diagnostic_recorder("executor_error", {"classification": "command_error"})
+            if action == "queue" and done_future.cancelled():
+                self.__record_queue_executor_info(
+                    queue_flow_id, "worker_terminal", "cancelled",
+                    exception_family="cancelled",
+                )
+                if diagnostic_recorder is not None:
+                    diagnostic_recorder("executor_error", {"classification": "command_error"})
             if action == "status" and executor_trace_enabled:
                 harvest_error = None
                 harvest_outcome = "accepted"

@@ -9,7 +9,7 @@ import threading
 import time
 import tempfile
 import unittest
-from concurrent.futures import CancelledError, Future
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from pathlib import Path
 from queue import Queue
 from threading import Lock
@@ -79,6 +79,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__context.status.controller = MagicMock()
         self.controller._Controller__context.status.server = SimpleNamespace(up=True, error_msg=None)
         self.controller._Controller__context.breadcrumb_trace = MagicMock()
+        self.controller._Controller__queue_executor_info_emitter = None
         self.controller._Controller__context.path_pair_manager = None
         self.controller._Controller__context.config.lftp.local_path = "/local"
         self.controller._Controller__context.config.lftp.net_socket_buffer = ""
@@ -1196,6 +1197,260 @@ class TestController(unittest.TestCase):
             entry for entry in trace.snapshot()["entries"]
             if entry.get("category") == "transfer.lftp.executor"
         ])
+
+    def test_queue_executor_info_records_actual_submit_and_worker_edges_to_durable_writer(self):
+        with tempfile.TemporaryDirectory() as spool_dir:
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "off", "rules": {
+                    "queue.lifecycle": "info", "queue.exclusion": "off",
+                }},
+                durable_enabled=True, durable_path=spool_dir,
+            )
+            self.controller._Controller__context.breadcrumb_trace = trace
+            self.controller._Controller__queue_executor_info_emitter = trace.create_emitter()
+            self.controller._Controller__lftp.backend_name = "lftp"
+            executor = ThreadPoolExecutor(max_workers=1)
+            self.controller._Controller__lftp_executor = executor
+            self.controller._Controller__lftp_operations = []
+            file_id = "private-file-id-sentinel"
+            started = threading.Event()
+            blocker_started = threading.Event()
+            release_blocker = threading.Event()
+
+            def block_executor():
+                blocker_started.set()
+                self.assertTrue(release_blocker.wait(2))
+
+            blocker = executor.submit(block_executor)
+            self.assertTrue(blocker_started.wait(2))
+
+            def operation():
+                started.set()
+                return True
+
+            try:
+                self.assertTrue(self.controller._Controller__submit_lftp_operation(
+                    "queue", operation, file_id, 1, diagnostic_admission_attempted=True,
+                ))
+                release_blocker.set()
+                self.assertTrue(started.wait(2))
+                blocker.result(timeout=2)
+                result = self.controller._Controller__lftp_operations[0].future.result(timeout=2)
+                trace.close(timeout=2.0)
+                with open(os.path.join(spool_dir, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                    records = [json.loads(line) for line in handle if line.strip()]
+            finally:
+                executor.shutdown(wait=True)
+
+        entries = [record for record in records if record.get("message") == "queue_executor_edge"]
+        self.assertEqual(3, len(entries), repr(records))
+        self.assertEqual(
+            [("submit", "accepted"), ("worker_start", "started"), ("worker_terminal", "returned")],
+            [(entry["details"]["phase"], entry["details"]["outcome"]) for entry in entries],
+        )
+        expected_flow = self.controller._Controller__fractional_queue_flow_id(file_id, 1)
+        self.assertTrue(all(entry["flow_id"] == expected_flow for entry in entries))
+        self.assertTrue(all(entry["corr_id"] == expected_flow for entry in entries))
+        submit = entries[0]["details"]
+        self.assertEqual("queue.executor_info.v1", submit["schema"])
+        self.assertLessEqual(len(submit), 24)
+        self.assertLessEqual(submit["monotonic_ns"], submit["submit_return_monotonic_ns"])
+        start = next(entry["details"]["monotonic_ns"] for entry in entries
+                     if entry["details"]["phase"] == "worker_start")
+        terminal = next(entry["details"]["monotonic_ns"] for entry in entries
+                        if entry["details"]["phase"] == "worker_terminal")
+        self.assertGreaterEqual(start, submit["monotonic_ns"])
+        self.assertGreaterEqual(terminal, start)
+        self.assertIs(result.result, True)
+        self.assertFalse(result.command_prompt_timed_out)
+        self.assertNotIn(file_id, repr(entries))
+
+    def test_queue_executor_info_error_cancel_and_disabled_paths_preserve_results(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {
+                "queue.lifecycle": "info", "queue.exclusion": "off",
+            }},
+            max_entries=32,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.controller._Controller__queue_executor_info_emitter = trace.create_emitter()
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__lftp_operations = []
+
+        error = KeyboardInterrupt("worker sentinel")
+        error_future = Future()
+        submitted = []
+        executor = MagicMock()
+        executor.submit.side_effect = lambda operation: submitted.append(operation) or error_future
+        self.controller._Controller__lftp_executor = executor
+        self.assertTrue(self.controller._Controller__submit_lftp_operation(
+            "queue", lambda: (_ for _ in ()).throw(error), "private-error-id", 1,
+            diagnostic_admission_attempted=True,
+        ))
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            submitted[-1]()
+        self.assertIs(error, raised.exception)
+        error_future.set_exception(error)
+
+        cancel_future = Future()
+        executor.submit.side_effect = lambda operation: submitted.append(operation) or cancel_future
+        self.assertTrue(self.controller._Controller__submit_lftp_operation(
+            "queue", lambda: True, "private-cancel-id", 2,
+            diagnostic_admission_attempted=True,
+        ))
+        self.assertTrue(cancel_future.cancel())
+
+        before_disabled = len(trace.snapshot()["entries"])
+        self.controller._Controller__queue_executor_info_emitter = None
+        disabled_future = Future()
+        executor.submit.side_effect = lambda operation: submitted.append(operation) or disabled_future
+        self.assertTrue(self.controller._Controller__submit_lftp_operation(
+            "queue", lambda: True, "private-disabled-id", 3,
+            diagnostic_admission_attempted=True,
+        ))
+        disabled_result = submitted[-1]()
+        self.assertIs(disabled_result.result, True)
+        self.assertFalse(disabled_result.command_prompt_timed_out)
+        self.assertEqual(before_disabled, len(trace.snapshot()["entries"]))
+
+        entries = [entry for entry in trace.snapshot()["entries"]
+                   if entry.get("message") == "queue_executor_edge"]
+        error_flow = self.controller._Controller__fractional_queue_flow_id("private-error-id", 1)
+        cancel_flow = self.controller._Controller__fractional_queue_flow_id("private-cancel-id", 2)
+        errors = [entry for entry in entries if entry["flow_id"] == error_flow]
+        cancels = [entry for entry in entries if entry["flow_id"] == cancel_flow]
+        self.assertEqual(["submit", "worker_start", "worker_terminal"],
+                         [entry["details"]["phase"] for entry in errors])
+        self.assertEqual("error", errors[-1]["details"]["outcome"])
+        self.assertEqual(["submit", "worker_terminal"],
+                         [entry["details"]["phase"] for entry in cancels])
+        self.assertEqual("cancelled", cancels[-1]["details"]["outcome"])
+        self.assertLessEqual(len(errors), 3)
+        self.assertLessEqual(len(cancels), 3)
+        self.assertNotIn("private-error-id", repr(entries))
+        self.assertNotIn("private-cancel-id", repr(entries))
+
+    def test_queue_executor_info_submit_rejection_is_recorded_without_changing_rejection(self):
+        with tempfile.TemporaryDirectory() as spool_dir:
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "off", "rules": {
+                    "queue.lifecycle": "info", "queue.exclusion": "off",
+                }},
+                durable_enabled=True, durable_path=spool_dir,
+            )
+            self.controller._Controller__context.breadcrumb_trace = trace
+            emitter = trace.create_emitter()
+            attempted = []
+            record = emitter.record
+
+            def record_attempt(*args, **kwargs):
+                attempted.append(args[1] if len(args) > 1 else None)
+                return record(*args, **kwargs)
+
+            emitter.record = record_attempt
+            self.controller._Controller__queue_executor_info_emitter = emitter
+            self.controller._Controller__lftp.backend_name = "lftp"
+            executor = MagicMock()
+            executor.submit.side_effect = RuntimeError("executor closed")
+            self.controller._Controller__lftp_executor = executor
+            self.controller._Controller__lftp_operations = []
+
+            self.assertFalse(self.controller._Controller__submit_lftp_operation(
+                "queue", lambda: True, "private-reject-id", 1,
+                diagnostic_admission_attempted=True,
+            ))
+            trace.close(timeout=2.0)
+            with open(os.path.join(spool_dir, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+
+        entries = [record for record in records if record.get("message") == "queue_executor_edge"]
+        self.assertEqual(1, len(entries))
+        self.assertEqual(("submit", "rejected"), (
+            entries[0]["details"]["phase"], entries[0]["details"]["outcome"],
+        ))
+        self.assertEqual("queue.executor_info.v1", entries[0]["details"]["schema"])
+        self.assertNotIn("private-reject-id", repr(entries))
+
+    def test_queue_executor_info_emission_failure_does_not_change_operation(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {
+                "queue.lifecycle": "info", "queue.exclusion": "off",
+            }},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        emitter = trace.create_emitter()
+        self.controller._Controller__queue_executor_info_emitter = emitter
+        with patch.object(emitter, "record", side_effect=RuntimeError("diagnostic failure")):
+            self.controller._Controller__lftp.backend_name = "lftp"
+            executor = ThreadPoolExecutor(max_workers=1)
+            self.controller._Controller__lftp_executor = executor
+            self.controller._Controller__lftp_operations = []
+            try:
+                self.assertTrue(self.controller._Controller__submit_lftp_operation(
+                    "queue", lambda: True, "private-failure-id", 1,
+                    diagnostic_admission_attempted=True,
+                ))
+                self.assertTrue(self.controller._Controller__lftp_operations[0].future.result(timeout=2))
+            finally:
+                executor.shutdown(wait=True)
+                trace.close(timeout=2.0)
+        self.assertEqual([], [
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("message") == "queue_executor_edge"
+        ])
+
+    def test_queue_executor_info_admission_does_not_wait_for_collector_retention_lock(self):
+        with tempfile.TemporaryDirectory() as spool_dir:
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "off", "rules": {
+                    "queue.lifecycle": "info", "queue.exclusion": "off",
+                }},
+                durable_enabled=True, durable_path=spool_dir,
+            )
+            self.controller._Controller__context.breadcrumb_trace = trace
+            emitter = trace.create_emitter()
+            attempted = []
+            record = emitter.record
+
+            def record_attempt(*args, **kwargs):
+                attempted.append(args[1] if len(args) > 1 else None)
+                return record(*args, **kwargs)
+
+            emitter.record = record_attempt
+            self.controller._Controller__queue_executor_info_emitter = emitter
+            self.controller._Controller__lftp.backend_name = "lftp"
+            executor = ThreadPoolExecutor(max_workers=1)
+            self.controller._Controller__lftp_executor = executor
+            self.controller._Controller__lftp_operations = []
+            retention_lock = trace._BreadcrumbTraceCollector__lock
+            retention_lock.acquire()
+            try:
+                started_at = time.monotonic()
+                self.assertTrue(self.controller._Controller__submit_lftp_operation(
+                    "queue", lambda: True, "private-lock-id", 1,
+                    diagnostic_admission_attempted=True,
+                ))
+                elapsed = time.monotonic() - started_at
+                self.assertLess(elapsed, 0.5)
+            finally:
+                retention_lock.release()
+            try:
+                self.assertTrue(self.controller._Controller__lftp_operations[0].future.result(timeout=2))
+                trace.close(timeout=2.0)
+                with open(os.path.join(spool_dir, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                    records = [json.loads(line) for line in handle if line.strip()]
+            finally:
+                executor.shutdown(wait=True)
+
+        entries = [record for record in records if record.get("message") == "queue_executor_edge"]
+        self.assertIn("queue_executor_edge", attempted)
+        self.assertNotIn("private-lock-id", repr(entries))
 
     def test_lftp_executor_trace_records_local_lifecycle(self):
         trace = BreadcrumbTraceCollector(
