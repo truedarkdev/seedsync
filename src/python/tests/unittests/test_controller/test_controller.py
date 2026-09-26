@@ -10485,6 +10485,54 @@ class TestController(unittest.TestCase):
         self.assertIn("private/path-sentinel.bin", dispatch["flow_id"])
         self.assertNotIn("private/path-sentinel.bin", json.dumps(timing))
 
+    def test_queue_command_breadcrumb_persists_existing_opaque_operation_flow(self):
+        with tempfile.TemporaryDirectory() as spool_path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "info"},
+                max_entries=16,
+                durable_enabled=True,
+                durable_path=spool_path,
+            )
+            self.controller._Controller__context.breadcrumb_trace = trace
+            command = Controller.Command(Controller.Command.Action.QUEUE, "private-file-sentinel")
+            command.queue_trace_flow_id = self.controller._Controller__fractional_queue_flow_id(
+                "private-file-sentinel", 7,
+            )
+            self.assertRegex(command.queue_trace_flow_id, r"^fractional-queue:[0-9a-f]{16}$")
+
+            for message in ("command_dispatched", "command_finished"):
+                self.controller._Controller__record_command_breadcrumb(
+                    command,
+                    message,
+                    {"command": "QUEUE", "mode": "lftp_queue"},
+                )
+
+            self.controller._Controller__model = Model()
+            rejected = Controller.Command(Controller.Command.Action.QUEUE, "rejected-file-sentinel")
+            self.controller._Controller__command_queue.put(rejected)
+            self.controller._Controller__process_commands()
+            trace.close(timeout=2.0)
+
+            spool_file = Path(spool_path) / "breadcrumbs.jsonl"
+            records = [json.loads(line) for line in spool_file.read_text(encoding="utf-8").splitlines()]
+
+        keyed = {
+            record["message"]: record
+            for record in records
+            if record.get("message") in {"command_dispatched", "command_finished"}
+            and record.get("details", {}).get("mode") == "lftp_queue"
+        }
+        self.assertEqual({"command_dispatched", "command_finished"}, set(keyed))
+        for record in keyed.values():
+            self.assertEqual(command.queue_trace_flow_id, record["details"]["queue_operation_flow"])
+            self.assertRegex(record["details"]["queue_operation_flow"], r"^fractional-queue:[0-9a-f]{16}$")
+            self.assertNotIn("private-file-sentinel", json.dumps(record["details"]))
+
+        rejected_rows = [record for record in records if record.get("message") == "command_failed"]
+        self.assertEqual(1, len(rejected_rows))
+        self.assertTrue(all("queue_operation_flow" not in row["details"] for row in rejected_rows))
+
     def test_delete_local_cleanup_timing_records_worker_and_callback_failures(self):
         trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"}, max_entries=16)
         self.controller._Controller__context.breadcrumb_trace = trace

@@ -6616,6 +6616,15 @@ class Controller:
         if timing_correlation is not None and message in {"command_dispatched", "command_finished"}:
             details = dict(details)
             details["timing_correlation"] = timing_correlation
+        queue_operation_flow = getattr(command, "queue_trace_flow_id", None)
+        if (
+            message in {"command_dispatched", "command_finished"}
+            and getattr(command, "action", None) == self.Command.Action.QUEUE
+            and isinstance(queue_operation_flow, str)
+            and re.fullmatch(r"fractional-queue:[0-9a-f]{16}", queue_operation_flow)
+        ):
+            details = dict(details)
+            details["queue_operation_flow"] = queue_operation_flow
         try:
             if timing is not None:
                 record_started_ns = self.__command_monotonic_ns()
