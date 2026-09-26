@@ -256,7 +256,7 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__work_state_lock = RLock()
         updater = ModelUpdater(controller)
 
-        def update_once():
+        def update_once(**kwargs):
             controller._Controller__lftp_status_poll_correlation = "lftp-poll:fedcba9876543210"
             return True
 
@@ -312,7 +312,7 @@ class TestModelUpdater(unittest.TestCase):
                 work_lock = ThreadLock()
                 controller._Controller__work_state_lock = work_lock
                 updater = ModelUpdater(controller)
-                updater._update_once = lambda: True
+                updater._update_once = lambda **kwargs: True
                 callback_blocked = Event()
                 resume_callback = Event()
                 original_recorder = controller._Controller__record_breadcrumb
@@ -350,7 +350,7 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__stop_resume_trace_cycle_id = 0
         controller._Controller__work_state_lock = RLock()
         updater = ModelUpdater(controller)
-        updater._update_once = lambda: setattr(
+        updater._update_once = lambda **kwargs: setattr(
             controller, "_Controller__lftp_status_poll_correlation", "invalid-token",
         ) or True
 
@@ -387,7 +387,7 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__stop_resume_trace_cycle_id = 0
         controller._Controller__work_state_lock = RLock()
         updater = ModelUpdater(controller)
-        updater._update_once = lambda: True
+        updater._update_once = lambda **kwargs: True
 
         updater.update()
 
@@ -423,7 +423,7 @@ class TestModelUpdater(unittest.TestCase):
             controller._Controller__stop_resume_trace_cycle_id = 0
             controller._Controller__work_state_lock = RLock()
             updater = ModelUpdater(controller)
-            updater._update_once = lambda: True
+            updater._update_once = lambda **kwargs: True
             try:
                 updater.update()
                 self.assertTrue(trace.flush_durable(2.0))
@@ -783,7 +783,7 @@ class TestModelUpdater(unittest.TestCase):
         lock = RLock()
         controller._Controller__work_state_lock = lock
         updater = ModelUpdater(controller)
-        updater._update_once = lambda: True
+        updater._update_once = lambda **kwargs: True
 
         updater.update()
 
