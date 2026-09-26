@@ -5533,49 +5533,51 @@ class BreadcrumbTraceCollector:
             self.__retained_bytes > self.__memory_budget_bytes
             or self.__max_entries is not None and len(self.__entries) > self.__max_entries
         ):
-            # Repeated candidate-indexed deque reads make eviction quadratic;
-            # this lock-held snapshot preserves the iteration's selection while
-            # live deques remain the deletion targets.
+            # Reverse-scan the lock-held snapshot so latest decisions are
+            # protected when first encountered and category counts identify
+            # the same oldest victim without a protected-index set.
             entries = tuple(self.__entries)
-            protected = self.__protected_indices(entries)
-            # Count and select in one pass.  Keep the all-protected fallback
-            # separate while it is still possible, because the fallback uses
-            # all entries rather than only the eligible set.
             category_counts: Dict[str, tuple[int, int]] = {}
-            fallback_counts: Dict[str, tuple[int, int]] = {}
+            all_counts: Dict[str, tuple[int, int]] = {}
+            latest_decision_seen: set[str] = set()
+            protected_category_cache: Dict[str, bool] = {}
+            eligible_found = False
+            retention = self.__policy["retention"]
+            for index in range(len(entries) - 1, -1, -1):
+                entry = entries[index]
+                category = str(entry.get("category") or "unknown")
+                latest = entry.get("event_type") in retention["latest_decision_event_types"]
+                is_latest_decision = latest and category not in latest_decision_seen
+                if latest:
+                    latest_decision_seen.add(category)
+                protected_key = str(entry.get("category") or "")
+                protected_category = protected_category_cache.get(protected_key)
+                if protected_category is None:
+                    protected_category = self.__is_category_protected(protected_key)
+                    protected_category_cache[protected_key] = protected_category
+                protected = (
+                    entry.get("level") in retention["protected_levels"]
+                    or protected_category or is_latest_decision
+                )
+                if not protected:
+                    eligible_found = True
+                    count, _ = category_counts.get(category, (0, index))
+                    count += 1
+                    category_counts[category] = (count, index)
+                elif not eligible_found:
+                    count, _ = all_counts.get(category, (0, index))
+                    count += 1
+                    all_counts[category] = (count, index)
+            counts = category_counts if eligible_found else all_counts
             chosen_index: Optional[int] = None
             chosen_count = 0
-            fallback_index: Optional[int] = None
-            fallback_count = 0
-            for index, entry in enumerate(entries):
-                category = str(entry.get("category") or "unknown")
-                if index not in protected:
-                    count, oldest_index = category_counts.get(category, (0, index))
-                    count += 1
-                    category_counts[category] = (count, oldest_index)
-                    if (
-                        chosen_index is None
-                        or count > chosen_count
-                        or count == chosen_count and oldest_index < chosen_index
-                    ):
-                        chosen_index = oldest_index
-                        chosen_count = count
-                    continue
-                if chosen_index is None:
-                    count, oldest_index = fallback_counts.get(category, (0, index))
-                    count += 1
-                    fallback_counts[category] = (count, oldest_index)
-                    if (
-                        fallback_index is None
-                        or count > fallback_count
-                        or count == fallback_count and oldest_index < fallback_index
-                    ):
-                        fallback_index = oldest_index
-                        fallback_count = count
-            # If every entry was protected, preserve the existing fallback:
-            # choose the oldest record from the noisiest category overall.
-            if chosen_index is None:
-                chosen_index = fallback_index
+            for count, oldest_index in counts.values():
+                if (
+                    chosen_index is None or count > chosen_count
+                    or count == chosen_count and oldest_index < chosen_index
+                ):
+                    chosen_index = oldest_index
+                    chosen_count = count
             if chosen_index is None:
                 break
             evicted = entries[chosen_index]

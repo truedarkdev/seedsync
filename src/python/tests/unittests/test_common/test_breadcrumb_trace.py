@@ -715,6 +715,64 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
             entry["message"] for entry in collector._BreadcrumbTraceCollector__entries
         ])
 
+    def test_protected_indices_snapshot_matches_oracle_and_recomputes_after_policy_replace(self):
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=None,
+            policy={"retention": {
+                "protected_categories": ["protected.*"],
+                "latest_decision_event_types": ["decision"],
+            }},
+        )
+        entries = (
+            {"category": None, "event_type": "decision", "level": "info"},
+            {"category": "", "event_type": "decision", "level": "info"},
+            {"category": "protected.audit", "event_type": "breadcrumb", "level": "info"},
+            {"category": "wild.child", "event_type": "breadcrumb", "level": "info"},
+            {"category": "warning.only", "event_type": "breadcrumb", "level": "warning"},
+            {"category": "error.only", "event_type": "breadcrumb", "level": "error"},
+        )
+
+        classifier = "_BreadcrumbTraceCollector__is_category_protected"
+        original_classifier = getattr(collector, classifier)
+
+        def baseline_protected(values):
+            retention = collector._BreadcrumbTraceCollector__policy["retention"]
+            latest_decision = {}
+            for index, entry in enumerate(values):
+                if entry.get("event_type") in retention["latest_decision_event_types"]:
+                    latest_decision[str(entry.get("category") or "unknown")] = index
+            protected = set(latest_decision.values())
+            for index, entry in enumerate(values):
+                if entry.get("level") in retention["protected_levels"] or original_classifier(
+                    str(entry.get("category") or "")
+                ):
+                    protected.add(index)
+            return protected
+
+        with patch.object(collector, classifier, wraps=getattr(collector, classifier)) as match:
+            first = collector._BreadcrumbTraceCollector__protected_indices(entries)
+            self.assertEqual(baseline_protected(entries), first)
+            self.assertEqual({1, 2, 4, 5}, first)
+            self.assertEqual(["", "protected.audit", "wild.child"], [
+                call.args[0] for call in match.call_args_list
+            ])
+            self.assertEqual(3, match.call_count)
+
+            collector.apply_policy({"retention": {
+                "protected_categories": ["wild.*"],
+                "latest_decision_event_types": ["decision"],
+            }})
+            match.reset_mock()
+            second = collector._BreadcrumbTraceCollector__protected_indices(entries)
+
+        self.assertEqual(baseline_protected(entries), second)
+        self.assertEqual({1, 3, 4, 5}, second)
+        self.assertEqual(["", "protected.audit", "wild.child"], [
+            call.args[0] for call in match.call_args_list
+        ])
+        self.assertEqual(3, match.call_count)
+
     def test_oversized_drop_and_multi_eviction_keep_accounting_unchanged(self):
         collector = BreadcrumbTraceCollector(
             lambda: True, max_entries=1, memory_budget_bytes=768,
@@ -780,30 +838,16 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         ])
         self.assertEqual(1, collector.snapshot()["accounting"]["evicted_count"])
 
-    def test_protected_indices_snapshot_matches_oracle_and_recomputes_after_policy_replace(self):
+    def test_reverse_eviction_matches_baseline_during_real_admission_and_coalescing(self):
         collector = BreadcrumbTraceCollector(
-            lambda: True,
-            max_entries=None,
-            policy={
-                "retention": {
-                    "protected_categories": ["protected.*"],
-                    "latest_decision_event_types": ["decision"],
-                },
-            },
-        )
-        entries = (
-            {"category": None, "event_type": "decision", "level": "info"},
-            {"category": "", "event_type": "decision", "level": "info"},
-            {"category": "protected.audit", "event_type": "breadcrumb", "level": "info"},
-            {"category": "wild.child", "event_type": "breadcrumb", "level": "info"},
-            {"category": "warning.only", "event_type": "breadcrumb", "level": "warning"},
-            {"category": "error.only", "event_type": "breadcrumb", "level": "error"},
+            lambda: True, max_entries=None,
+            policy={"retention": {
+                "protected_categories": ["keep.*"],
+                "latest_decision_event_types": ["decision"],
+            }},
         )
 
-        classifier = "_BreadcrumbTraceCollector__is_category_protected"
-        original_classifier = getattr(collector, classifier)
-
-        def pre_change_protected(entries):
+        def baseline_victim(entries):
             retention = collector._BreadcrumbTraceCollector__policy["retention"]
             latest_decision = {}
             for index, entry in enumerate(entries):
@@ -811,37 +855,141 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
                     latest_decision[str(entry.get("category") or "unknown")] = index
             protected = set(latest_decision.values())
             for index, entry in enumerate(entries):
-                if (
-                    entry.get("level") in retention["protected_levels"]
-                    or original_classifier(str(entry.get("category") or ""))
-                ):
+                category = str(entry.get("category") or "")
+                if entry.get("level") in retention["protected_levels"] or \
+                        collector._BreadcrumbTraceCollector__is_category_protected(category):
                     protected.add(index)
-            return protected
+            candidates = [index for index in range(len(entries)) if index not in protected]
+            if not candidates:
+                candidates = list(range(len(entries)))
+            counts = {}
+            for index in candidates:
+                category = str(entries[index].get("category") or "unknown")
+                count, oldest = counts.get(category, (0, index))
+                counts[category] = (count + 1, oldest)
+            category = max(counts, key=lambda key: (counts[key][0], -counts[key][1]))
+            return entries[counts[category][1]]
 
-        with patch.object(collector, classifier, wraps=getattr(collector, classifier)) as protected_match:
-            first = collector._BreadcrumbTraceCollector__protected_indices(entries)
-            self.assertEqual(pre_change_protected(entries), first)
-            self.assertEqual({1, 2, 4, 5}, first)
-            self.assertEqual(["", "protected.audit", "wild.child"], [
-                call.args[0] for call in protected_match.call_args_list
-            ])
-            self.assertEqual(3, protected_match.call_count)
+        def record_with_baseline_evictions(*args, **kwargs):
+            original = collector._BreadcrumbTraceCollector__evict_to_budget
+            removed = []
 
-            collector.apply_policy({
-                "retention": {
-                    "protected_categories": ["wild.*"],
-                    "latest_decision_event_types": ["decision"],
-                },
-            })
-            protected_match.reset_mock()
-            second = collector._BreadcrumbTraceCollector__protected_indices(entries)
+            def compare_each_eviction():
+                state = tuple(collector._BreadcrumbTraceCollector__entries)
+                sizes = {
+                    id(entry): size for entry, size in zip(
+                        state, collector._BreadcrumbTraceCollector__entry_sizes
+                    )
+                }
+                remaining_state = list(state)
+                remaining_bytes = collector._BreadcrumbTraceCollector__retained_bytes
+                expected = []
+                while remaining_state and (
+                    remaining_bytes > collector._BreadcrumbTraceCollector__memory_budget_bytes
+                    or collector._BreadcrumbTraceCollector__max_entries is not None
+                    and len(remaining_state) > collector._BreadcrumbTraceCollector__max_entries
+                ):
+                    victim = baseline_victim(remaining_state)
+                    expected.append(victim)
+                    remaining_state = [entry for entry in remaining_state if entry is not victim]
+                    remaining_bytes -= sizes[id(victim)]
+                result = original()
+                remaining = tuple(collector._BreadcrumbTraceCollector__entries)
+                removed_now = [
+                    entry for entry in state
+                    if not any(entry is other for other in remaining)
+                ]
+                self.assertCountEqual(expected, removed_now)
+                removed.extend(expected)
+                return result
 
-        self.assertEqual(pre_change_protected(entries), second)
-        self.assertEqual({1, 3, 4, 5}, second)
-        self.assertEqual(["", "protected.audit", "wild.child"], [
-            call.args[0] for call in protected_match.call_args_list
-        ])
-        self.assertEqual(3, protected_match.call_count)
+            with patch.object(
+                collector, "_BreadcrumbTraceCollector__evict_to_budget",
+                side_effect=compare_each_eviction,
+            ):
+                result = collector.record(*args, **kwargs)
+            return result, removed
+
+        for message, category, event_type, level, key in (
+            ("noise-a", "noise", "diagnostic", "info", None),
+            ("noise-b", "noise", "diagnostic", "info", None),
+            ("tie-a", "tie", "diagnostic", "info", None),
+            ("tie-b", "tie", "diagnostic", "info", None),
+            ("decision-empty", "", "decision", "info", None),
+            ("decision-unknown", None, "decision", "info", None),
+            ("kept", "keep.audit", "diagnostic", "warning", None),
+            ("failure", "failure", "failure", "error", "failure-key"),
+            ("failure", "failure", "failure", "error", "failure-key"),
+        ):
+            metadata = {"category": category, "event_type": event_type, "level": level}
+            if key is not None:
+                metadata["_coalesce_key"] = key
+            collector.record("worker", message, **metadata)
+
+        # A changed policy and an incoming record exercise the live record path
+        # and compare the actual victim against the pre-change selection rule.
+        collector.apply_policy({"retention": {
+            "protected_categories": ["noise"],
+            "latest_decision_event_types": ["decision"],
+        }})
+        collector._BreadcrumbTraceCollector__max_entries = len(
+            collector._BreadcrumbTraceCollector__entries
+        )
+        result, removed = record_with_baseline_evictions(
+            "worker", "incoming-noise", category="noise", event_type="diagnostic",
+        )
+        self.assertEqual("retained", result)
+        self.assertEqual(1, len(removed))
+
+        # Coalescing a failure at a tighter count budget still refreshes its
+        # latest-failure projection while the baseline chooses the same victim.
+        collector._BreadcrumbTraceCollector__max_entries = len(
+            collector._BreadcrumbTraceCollector__entries
+        ) - 1
+        result, evicted = record_with_baseline_evictions(
+            "worker", "failure", event_type="failure", level="error",
+            category="failure", _coalesce_key="failure-key",
+        )
+        self.assertEqual("retained", result)
+        self.assertEqual(1, len(evicted))
+        snapshot = collector.snapshot()
+        self.assertEqual("failure", snapshot["latest_failure_entry"]["message"])
+        self.assertGreaterEqual(snapshot["latest_failure_entry"]["repeat_count"], 3)
+
+        # A byte-budget transition through the same record path chooses each
+        # victim by the frozen selector and still meets the retained-byte cap.
+        collector._BreadcrumbTraceCollector__max_entries = None
+        collector._BreadcrumbTraceCollector__memory_budget_bytes = (
+            collector._BreadcrumbTraceCollector__retained_bytes
+        )
+        result, byte_evictions = record_with_baseline_evictions(
+            "worker", "byte-pressure", category="noise", event_type="diagnostic",
+        )
+        self.assertEqual("retained", result)
+        self.assertTrue(byte_evictions)
+        self.assertLessEqual(
+            collector.snapshot()["retained_bytes"],
+            collector.snapshot()["memory_budget_bytes"],
+        )
+
+        # Incoming self-eviction remains a dropped admission, with the protected
+        # failure and its projection intact.
+        self_eviction = BreadcrumbTraceCollector(lambda: True, max_entries=1)
+        self_eviction.record(
+            "worker", "failure", event_type="failure", category="same", level="error",
+        )
+        # This collector has a separate policy and exercises protected failure
+        # fallback through the actual record/admission path.
+        baseline_collector = collector
+        collector = self_eviction
+        result, self_removed = record_with_baseline_evictions(
+            "worker", "ordinary", category="same", event_type="diagnostic",
+        )
+        collector = baseline_collector
+        self.assertEqual("dropped", result)
+        self.assertEqual(1, len(self_removed))
+        self.assertEqual(["failure"], [entry["message"] for entry in self_eviction.snapshot()["entries"]])
+        self.assertEqual("failure", self_eviction.snapshot()["latest_failure_entry"]["message"])
 
     def test_coalesced_failure_keeps_latest_failure_in_entry_order(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
@@ -1555,7 +1703,6 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         evicted_ranges = []
         gap_name = "_BreadcrumbTraceCollector__record_gap_range"
         original_gap = getattr(collector, gap_name)
-        protected_name = "_BreadcrumbTraceCollector__protected_indices"
 
         def capture_gap(start, end, reason):
             if reason == "evicted":
@@ -1568,17 +1715,12 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
                 "_BreadcrumbTraceCollector__evict_to_budget",
                 wraps=getattr(collector, "_BreadcrumbTraceCollector__evict_to_budget"),
             ) as eviction_method:
-                with patch.object(
-                    collector,
-                    protected_name,
-                    wraps=getattr(collector, protected_name),
-                ) as protected_method:
-                    final_started = time.perf_counter()
-                    final_started_ns = time.perf_counter_ns()
-                    result = collector.record(
-                        "scanner", "status_summary", summary_details,
-                        category="scan.status", level="info", event_type="diagnostic",
-                    )
+                final_started = time.perf_counter()
+                final_started_ns = time.perf_counter_ns()
+                result = collector.record(
+                    "scanner", "status_summary", summary_details,
+                    category="scan.status", level="info", event_type="diagnostic",
+                )
         final_elapsed = time.perf_counter() - final_started
         final_elapsed_ns = time.perf_counter_ns() - final_started_ns
 
@@ -1592,7 +1734,6 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual(evicted_count, len(evicted_ranges))
         self.assertGreater(evicted_count, 1)
         self.assertEqual(evicted_count, gap_method.call_count)
-        self.assertEqual(evicted_count, protected_method.call_count)
         self.assertTrue(after["gaps"])
         self.assertTrue(all(gap["reason"] == "evicted" for gap in after["gaps"]))
         self.assertLessEqual(len(after["gaps"]), evicted_count)
@@ -1614,13 +1755,11 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
             "workload_entry_count={} workload_retained_bytes={} "
             "final_entry_count={} final_retained_bytes={} "
             "final_admission_elapsed_ns={} evicted_count={} "
-            "protected_index_pass_count={} eviction_transaction_count={} "
-            "selection_pass_count={}".format(
+            "eviction_transaction_count={}".format(
                 before["entry_count"], before["retained_bytes"],
                 after["entry_count"], after["retained_bytes"],
                 final_elapsed_ns, evicted_count,
-                protected_method.call_count, eviction_method.call_count,
-                protected_method.call_count,
+                eviction_method.call_count,
             ),
         )
 
