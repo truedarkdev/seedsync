@@ -1040,7 +1040,7 @@ validate_browser_target_binding() (
     echo "live app /mounts mount is not the exact synthetic Docker volume; refusing browser target binding" >&2
     return 1
   }
-  docker run --rm --mount "type=volume,source=$volume_name,target=/fixture,readonly" \
+  MSYS2_ARG_CONV_EXCL=type=volume, docker run --rm --mount "type=volume,source=$volume_name,target=/fixture,readonly" \
     "${PERF_FIXTURE_IMAGE:-python:3.12-slim}" python3 -c \
     'import json; print(json.dumps(json.load(open("/fixture/.seedsync-performance-fixture.json"))))' \
     > "$marker_path"

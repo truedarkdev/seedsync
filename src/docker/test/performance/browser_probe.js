@@ -1637,7 +1637,7 @@ async function captureActionPrecondition(row, targetId, targetName) {
     const statusIcon = node.querySelector('.status img[id]')?.id || null;
     const progressAttribute = node.querySelector('.progress-bar')?.getAttribute('aria-valuenow');
     const progress = Number(progressAttribute);
-    const status = statusText || (statusIcon === 'default-remote' ? 'default-remote' : statusIcon);
+    const status = statusIcon === 'default-remote' ? 'default-remote' : (statusText || statusIcon);
     const controls = {};
     for (const action of ['Queue', 'Stop', 'Delete Local']) {
       const button = Array.from(node.querySelectorAll('.actions .button')).find(item =>
