@@ -8724,6 +8724,236 @@ class TestController(unittest.TestCase):
         self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_progress_floors)
         self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_progress_floor_overlay_ids)
 
+    def test_confirmed_delete_invalidates_only_existing_canonical_ancestor_contexts(self):
+        pair_id = "pair-a"
+        file_path = os.path.join("ExampleRoot", "nested", "target.bin")
+        file_id = ModelFile.build_file_id(file_path, pair_id)
+        root_id = ModelFile.build_file_id("ExampleRoot", pair_id)
+        sibling_root_id = ModelFile.build_file_id("ExampleRootElse", pair_id)
+        other_pair_root_id = ModelFile.build_file_id("ExampleRoot", "pair-b")
+        identity = (17, "MIRROR")
+        self.controller._Controller__pending_completion_file_names = {
+            ("ExampleRoot", pair_id, "pair"),
+        }
+        self.controller._Controller__pending_completion_progress_floors = {
+            root_id: (100, 4100),
+            sibling_root_id: (100, 2000),
+            other_pair_root_id: (100, 3000),
+        }
+        self.controller._Controller__pending_completion_progress_floor_identities = {
+            root_id: identity,
+            sibling_root_id: (19, "MIRROR"),
+            other_pair_root_id: (20, "MIRROR"),
+        }
+        self.controller._Controller__pending_completion_progress_floor_overlay_ids = {
+            root_id, sibling_root_id, other_pair_root_id,
+        }
+        self.controller._Controller__pending_completion_publications = {
+            root_id: _PendingCompletionPublication(
+                ActiveProgressOverlay(100, 4100, None, None), identity,
+            ),
+        }
+        model = Model()
+        model._Model__published_file_job_identities[root_id] = identity
+        self.controller._Controller__model = model
+
+        count = self.controller._Controller__complete_delete_local_lifecycle(
+            file_id, pair_id, "target.bin", file_path,
+        )
+
+        self.assertEqual(1, count)
+        self.assertNotIn(root_id, self.controller._Controller__pending_completion_progress_floors)
+        self.assertIsNone(self.controller._Controller__pending_completion_progress_floor_identities[root_id])
+        self.assertNotIn(root_id, self.controller._Controller__pending_completion_progress_floor_overlay_ids)
+        self.assertNotIn(root_id, self.controller._Controller__pending_completion_publications)
+        self.assertNotIn(root_id, model._Model__published_file_job_identities)
+        self.assertIn(sibling_root_id, self.controller._Controller__pending_completion_progress_floors)
+        self.assertIn(other_pair_root_id, self.controller._Controller__pending_completion_progress_floors)
+        self.assertEqual({("ExampleRoot", pair_id, "pair")}, self.controller._Controller__pending_completion_file_names)
+
+    def test_confirmed_delete_ancestor_invalidation_preserves_newer_published_identity(self):
+        pair_id = "pair-a"
+        file_path = os.path.join("ExampleRoot", "target.bin")
+        file_id = ModelFile.build_file_id(file_path, pair_id)
+        root_id = ModelFile.build_file_id("ExampleRoot", pair_id)
+        old_identity = (17, "MIRROR")
+        fresh_identity = (18, "PGET")
+        self.controller._Controller__pending_completion_progress_floors = {root_id: (100, 4100)}
+        self.controller._Controller__pending_completion_progress_floor_identities = {root_id: old_identity}
+        model = Model()
+        model._Model__published_file_job_identities[root_id] = fresh_identity
+        fresh_overlay = ActiveProgressOverlay(100, 4100, None, None)
+        model._Model__active_progress_overlays[root_id] = fresh_overlay
+        model._Model__active_progress_overlay_job_identities[root_id] = fresh_identity
+        self.controller._Controller__model = model
+
+        count = self.controller._Controller__invalidate_pending_completion_ancestor_contexts(
+            file_path, pair_id,
+        )
+
+        self.assertEqual(1, count)
+        self.assertEqual(fresh_identity, model.published_file_job_identity(root_id))
+        self.assertIs(fresh_overlay, model._Model__active_progress_overlays[root_id])
+        self.assertEqual(fresh_identity, model._Model__active_progress_overlay_job_identities[root_id])
+
+    def test_confirmed_delete_with_no_pending_ancestor_context_reports_zero(self):
+        file_path = os.path.join("ExampleRoot", "target.bin")
+        file_id = ModelFile.build_file_id(file_path, None)
+        root_id = "ExampleRoot"
+        # An invalidation tombstone alone is not a retained context or a new action.
+        self.controller._Controller__pending_completion_progress_floor_identities = {root_id: None}
+
+        count = self.controller._Controller__complete_delete_local_lifecycle(
+            file_id, None, "target.bin", file_path,
+        )
+
+        self.assertEqual(0, count)
+        self.assertIsNone(self.controller._Controller__pending_completion_progress_floor_identities[root_id])
+
+    def test_metadata_only_delete_cleanup_without_path_keeps_ancestor_context(self):
+        pair_id = "pair-a"
+        root_id = ModelFile.build_file_id("ExampleRoot", pair_id)
+        leaf_id = ModelFile.build_file_id(os.path.join("ExampleRoot", "target.bin"), pair_id)
+        self.controller._Controller__pending_completion_progress_floors = {root_id: (100, 4100)}
+        self.controller._Controller__pending_completion_progress_floor_identities = {
+            root_id: (17, "MIRROR"),
+        }
+
+        count = self.controller._Controller__complete_delete_local_lifecycle(
+            leaf_id, pair_id, "target.bin",
+        )
+
+        self.assertEqual(0, count)
+        self.assertIn(root_id, self.controller._Controller__pending_completion_progress_floors)
+        self.assertEqual((17, "MIRROR"), self.controller._Controller__pending_completion_progress_floor_identities[root_id])
+
+    def test_real_delete_local_cleanup_invalidates_retired_parent_floor_before_rebuild(self):
+        pair_id = "test-pair"
+        staging_root = tempfile.mkdtemp(prefix="delete-parent-floor-")
+        target_path = os.path.join(staging_root, "ExampleRoot", "target.iso")
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        with open(target_path, "wb") as handle:
+            handle.write(b"x" * 1000)
+        self.controller._Controller__path_pairs_by_id[pair_id] = SimpleNamespace(
+            id=pair_id,
+            name="fixture",
+            local_path=os.path.join(staging_root, "final"),
+            remote_path="/fixture-remote",
+        )
+        self.controller._Controller__path_pair_staging_paths[pair_id] = staging_root
+        self.controller._Controller__mp_logger.queue = None
+        self.controller._Controller__mp_logger.log_level = None
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"}, max_entries=256)
+        self.controller._Controller__context.breadcrumb_trace = trace
+
+        root_name = "ExampleRoot"
+        root_id = ModelFile.build_file_id(root_name, pair_id)
+        remote = SystemFile(root_name, 4100, True)
+        remote.path_pair_id = pair_id
+        remote.add_child(SystemFile("target.iso", 3000, False, mtime_ns=1_000_000_000))
+        remote.add_child(SystemFile("companion.bin", 1100, False, mtime_ns=1_000_000_000))
+        local = SystemFile(root_name, 33000, True)
+        local.path_pair_id = pair_id
+        local.add_child(SystemFile("target.iso", 1000, False, mtime_ns=2_000_000_000))
+        local.add_child(SystemFile("companion.bin", 1100, False, mtime_ns=1_000_000_000))
+        local.add_child(SystemFile("local-only.bin", 30900, False, mtime_ns=1_000_000_000))
+        running = LftpJobStatus(17, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, root_name, "")
+        running.path_pair_id = pair_id
+        running.total_transfer_state = LftpJobStatus.TransferState(4100, 4100, 100, 0, 0)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        builder.set_lftp_statuses([running])
+        self.controller._Controller__model = builder.build_model()
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__prev_downloading_file_names = {(root_name, pair_id, None)}
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+
+        ModelUpdater(self.controller).update()
+        self.assertIn(root_id, self.controller._Controller__pending_completion_progress_floors)
+        target = next(
+            child for child in self.controller._Controller__model.get_file(root_id).get_children()
+            if child.name == "target.iso"
+        )
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, target.file_id)
+        callback = MagicMock()
+        command.add_callback(callback)
+        self.assertEqual((target_path,), Controller._Controller__delete_local_artifact_plan(
+            self.controller, target,
+        )[0])
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        wrapper = self.controller._Controller__active_command_processes[-1]
+        wrapper.process.join(timeout=15)
+        self.assertFalse(wrapper.process.is_alive())
+        self.assertEqual(0, wrapper.process.exitcode)
+        self.controller._Controller__cleanup_commands()
+
+        self.assertFalse(os.path.exists(target_path))
+        callback.on_success.assert_called_once_with()
+        callback.on_failure.assert_not_called()
+        self.assertNotIn(root_id, self.controller._Controller__pending_completion_progress_floors)
+        finished = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "command_finished" and
+            entry["details"].get("invalidated_ancestor_count") == 1
+        )
+        self.assertEqual("controller", finished["source"])
+        self.assertEqual("command", finished["stage"])
+        self.assertEqual(1, finished["details"]["invalidated_ancestor_count"])
+
+        local_after = SystemFile(root_name, 32000, True)
+        local_after.path_pair_id = pair_id
+        local_after.add_child(SystemFile("companion.bin", 1100, False, mtime_ns=1_000_000_000))
+        local_after.add_child(SystemFile("local-only.bin", 30900, False, mtime_ns=1_000_000_000))
+        builder.set_local_files([local_after])
+        builder.set_lftp_statuses([])
+        ModelUpdater(self.controller).update()
+        updated_root = self.controller._Controller__model.get_file(root_id)
+        self.assertEqual(1100, updated_root.transferred_size)
+        self.assertEqual(32000, updated_root.display_transferred_size)
+        self.assertEqual(35000, updated_root.display_size_total)
+        self.assertFalse(updated_root.complete_local_coverage)
+
+    def test_failed_delete_local_cleanup_keeps_pending_ancestor_context(self):
+        pair_id = "pair-a"
+        file = ModelFile("target.bin", False)
+        file.path_pair_id = pair_id
+        parent = ModelFile("ExampleRoot", True)
+        parent.path_pair_id = pair_id
+        parent.add_child(file)
+        file_path = os.path.join("ExampleRoot", file.name)
+        self.assertEqual(file_path, file.full_path)
+        root_id = ModelFile.build_file_id("ExampleRoot", pair_id)
+        self.controller._Controller__pending_completion_progress_floors = {root_id: (100, 4100)}
+        self.controller._Controller__pending_completion_progress_floor_identities = {
+            root_id: (17, "MIRROR"),
+        }
+        failed_process = MagicMock()
+        failed_process.is_alive.return_value = False
+        failed_process.propagate_exception.side_effect = RuntimeError("delete failed")
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        command.add_callback(callback)
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(
+                command, file.file_id, file.name, failed_process, MagicMock(), True,
+                event_file=file,
+            ),
+        ]
+        self.assertEqual(file_path, self.controller._Controller__active_command_processes[0].event_file.full_path)
+
+        self.controller._Controller__cleanup_commands()
+
+        callback.on_failure.assert_called_once()
+        self.assertIn(root_id, self.controller._Controller__pending_completion_progress_floors)
+        self.assertEqual((17, "MIRROR"), self.controller._Controller__pending_completion_progress_floor_identities[root_id])
+        self.assertEqual(0, self.controller._Controller__invalidate_pending_completion_ancestor_contexts(
+            None, pair_id,
+        ))
+
     def test_pending_completion_delete_local_blocks_queue_until_success_settles(self):
         file = ModelFile("pending-recovery", False)
         file.remote_size = 1000

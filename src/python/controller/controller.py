@@ -9356,7 +9356,8 @@ class Controller:
 
     def __complete_delete_local_lifecycle(
             self, file_id: str, path_pair_id: Optional[str], file_name: Optional[str] = None,
-    ) -> None:
+            file_path: Optional[str] = None,
+    ) -> int:
         """Apply the shared metadata transition after a confirmed local delete."""
         self.__advance_transfer_lifecycle(file_id)
         confirm_local_deletions = getattr(
@@ -9380,6 +9381,34 @@ class Controller:
         self.__reset_download_start_after_local_delete(file_id, path_pair_id)
         if isinstance(file_name, str):
             self.__clear_resume_source_if_staging_absent(file_id, file_name, path_pair_id)
+        return self.__invalidate_pending_completion_ancestor_contexts(file_path, path_pair_id)
+
+    def __invalidate_pending_completion_ancestor_contexts(
+            self, file_path: Optional[str], path_pair_id: Optional[str],
+    ) -> int:
+        """Invalidate only retained pending contexts for strict canonical ancestors."""
+        if not isinstance(file_path, str) or not file_path:
+            return 0
+        floors = getattr(self, "_Controller__pending_completion_progress_floors", {})
+        identities = getattr(self, "_Controller__pending_completion_progress_floor_identities", {})
+        overlays = getattr(self, "_Controller__pending_completion_progress_floor_overlay_ids", set())
+        publications = getattr(self, "_Controller__pending_completion_publications", {})
+        if not isinstance(floors, dict) or not isinstance(identities, dict) or \
+                not isinstance(overlays, set) or not isinstance(publications, dict):
+            return 0
+
+        invalidated = 0
+        ancestor_path = os.path.dirname(file_path)
+        while ancestor_path and ancestor_path != file_path:
+            ancestor_id = ModelFile.build_file_id(ancestor_path, path_pair_id)
+            has_context = ancestor_id in floors or \
+                identities.get(ancestor_id) is not None or \
+                ancestor_id in overlays or ancestor_id in publications
+            if has_context:
+                ModelUpdater._invalidate_pending_completion_progress_floor(self, ancestor_id)
+                invalidated += 1
+            file_path, ancestor_path = ancestor_path, os.path.dirname(ancestor_path)
+        return invalidated
 
     def __has_pending_completion_transaction(self, file_id: str) -> bool:
         """Whether one exact retired-job publication still owns this row."""
@@ -12368,6 +12397,7 @@ class Controller:
                                     "mode": "failed_move_metadata_repair",
                                     "lifecycle_phase": "dispatch",
                                     "completion": "completed",
+                                    "invalidated_ancestor_count": 0,
                                 },
                                 file=file,
                             )
@@ -13188,6 +13218,7 @@ class Controller:
                                 ),
                             )
                         else:
+                            invalidated_ancestor_count = 0
                             observe_cleanup_stage(
                                 command_process,
                                 "post_callback",
@@ -13196,7 +13227,7 @@ class Controller:
                                 command_process.post_callback,
                             )
                             if command_process.command.action == Controller.Command.Action.DELETE_LOCAL:
-                                observe_cleanup_stage(
+                                invalidated_ancestor_count = observe_cleanup_stage(
                                     command_process,
                                     "delete_lifecycle",
                                     DURATION_CONTROLLER_CLEANUP_DELETE_LIFECYCLE,
@@ -13205,6 +13236,7 @@ class Controller:
                                         command_process.file_id,
                                         getattr(command_process.event_file, "path_pair_id", None),
                                         command_process.file_name,
+                                        getattr(command_process.event_file, "full_path", None),
                                     ),
                                 )
                             observe_cleanup_stage(
@@ -13214,14 +13246,17 @@ class Controller:
                                 "controller_cleanup_callback_exceptions",
                                 lambda: invoke_callbacks(command_process, "on_success"),
                             )
+                            completion_details = {
+                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                "lifecycle_phase": "cleanup",
+                                "completion": "completed",
+                            }
+                            if command_process.command.action == Controller.Command.Action.DELETE_LOCAL:
+                                completion_details["invalidated_ancestor_count"] = invalidated_ancestor_count
                             self.__record_command_breadcrumb(
                                 command=command_process.command,
                                 message="command_finished",
-                                details={
-                                    "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
-                                    "lifecycle_phase": "cleanup",
-                                    "completion": "completed",
-                                },
+                                details=completion_details,
                             )
                     else:
                         # Do the post callback
