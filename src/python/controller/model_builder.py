@@ -2976,6 +2976,61 @@ class ModelBuilder:
                 visit(remote_root, local_root, "")
         return tuple(sorted(candidates))
 
+    def get_finalizable_staging_leaf_candidate_reason(
+            self, root_file_id: str, relative_path: str,
+    ) -> Optional[str]:
+        """Explain the staging predicate for one exact regular remote leaf.
+
+        ``None`` means the subject is not an extant regular leaf in this exact
+        Path Pair.  Otherwise the fixed result mirrors the full candidate
+        provider without scanning other roots or descendants.
+        """
+        if not isinstance(root_file_id, str) or not isinstance(relative_path, str) or \
+                not relative_path or "\\" in relative_path:
+            return None
+        parts = relative_path.split("/")
+        if any(not part for part in parts):
+            return None
+        remote = self.__remote_file(root_file_id)
+        local = self.__local_file(root_file_id)
+        if remote is None or not remote.is_dir:
+            return None
+
+        local_collision = False
+        for part in parts:
+            if not remote.is_dir:
+                return None
+            remote_child = next((child for child in remote.iter_children() if child.name == part), None)
+            if remote_child is None:
+                return None
+            if local is not None:
+                if local.is_dir != remote.is_dir:
+                    return "type"
+                local_collision |= bool(getattr(local, "has_staging_collision", False))
+                local = next((child for child in local.iter_children() if child.name == part), None)
+            remote = remote_child
+        if remote.is_dir:
+            return None
+        if local is not None and local.is_dir != remote.is_dir:
+            return "type"
+        if local is None:
+            return "missing"
+        local_collision |= bool(getattr(local, "has_staging_collision", False))
+        if local_collision:
+            return "collision"
+        if not bool(getattr(local, "is_staging", False)):
+            return "not_staging"
+        if bool(getattr(local, "status_sidecar_ready", False)):
+            return "sidecar"
+        if local.size != remote.size:
+            return "size"
+        local_mtime_ns = local.mtime_ns
+        remote_mtime_ns = remote.mtime_ns
+        if type(local_mtime_ns) is not int or type(remote_mtime_ns) is not int or \
+                local_mtime_ns // 1_000_000_000 != remote_mtime_ns // 1_000_000_000:
+            return "mtime"
+        return "match"
+
     def has_verified_complete_staging_remote_identity(self, file_id: str) -> bool:
         """Prove a pending automatic move has exact staged source identity.
 

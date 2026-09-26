@@ -11528,6 +11528,53 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(set(), controller._Controller__persist.downloaded_file_names)
         self.assertEqual(set(), controller._Controller__persist.final_move_succeeded_file_names)
 
+    def test_candidate_gate_runs_on_full_scanner_adoption_path(self):
+        remote_root = SystemFile("root", 10, True)
+        remote_root.add_child(SystemFile("child.bin", 10, False, mtime_ns=1))
+        local_root = SystemFile("root", 10, True, is_staging=True)
+        local_root.add_child(SystemFile("child.bin", 10, False, is_staging=True, mtime_ns=1))
+        builder = ModelBuilder()
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        live_model = builder.build_model()
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "root/child.bin", "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(1, 10, 10, 1, 1)
+        builder.set_lftp_statuses([running])
+        remote_scan = ScannerResult(
+            datetime.now(), [remote_root], scanned_path_pair_ids={None},
+            completed_path_pair_ids={None}, is_scan_final=True,
+        )
+        local_scan = ScannerResult(
+            datetime.now(), [local_root], scanned_path_pair_ids={None},
+            completed_path_pair_ids={None}, is_scan_final=True,
+        )
+        controller, _ = self._make_progressive_update_controller(
+            remote_scan, local_scan=local_scan, model_builder=builder, model=live_model,
+        )
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__record_breadcrumb = MagicMock()
+        controller._Controller__lftp.status.return_value = [running]
+        controller._finalize_staging_child = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED,
+        )
+        build_model = builder.build_model
+        with patch.object(builder, "build_model", wraps=build_model) as build_spy:
+            ModelUpdater(controller).update()
+
+        rows = [
+            event for event in trace.query_events(
+                category="finalization.child", stage="finalization_child", limit=16,
+            )["events"] if event["message"] == "child_finalization_candidate_gate"
+        ]
+        self.assertEqual(1, len(rows))
+        self.assertEqual("match", rows[0]["details"]["reason"])
+        self.assertTrue(rows[0]["details"]["active_leaf"])
+        self.assertGreaterEqual(build_spy.call_count, 1)
+
     def _run_child_finalization_candidate_update(
             self, statuses, *, candidate_pair="pair-a", healthy=True,
             cached_statuses=None, inflight=False,
@@ -11575,6 +11622,214 @@ class TestModelUpdater(unittest.TestCase):
                 self.assertEqual(1, len(authority_calls))
                 self.assertEqual("rejected", authority_calls[0]["details"]["decision"])
                 self.assertEqual("active_leaf_transfer", authority_calls[0]["details"]["reason"])
+
+    def test_candidate_gate_observes_active_then_actual_retired_pending_on_no_build_ticks(self):
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None,
+        )
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=32)
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__record_breadcrumb = MagicMock()
+        model_builder.get_finalizable_staging_leaf_candidates.return_value = ()
+        model_builder.get_finalizable_staging_leaf_candidate_reason.side_effect = [
+            "match", "mtime", "mtime",
+        ]
+        controller._finalize_staging_child = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED,
+        )
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "root/child.bin", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(1, 2, 50, 1, 1)
+        controller._Controller__lftp.status.return_value = [status]
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        running_rows = [
+            event for event in trace.query_events(
+                category="finalization.child", stage="finalization_child", limit=16,
+            )["events"] if event["message"] == "child_finalization_candidate_gate"
+        ]
+        self.assertEqual(1, len(running_rows))
+        self.assertTrue(running_rows[0]["details"]["active_leaf"])
+        self.assertEqual("active_GET_PGET", running_rows[0]["details"]["subject_source"])
+        self.assertEqual("fresh_healthy", running_rows[0]["details"]["lftp_status_source"])
+        self.assertEqual(
+            call(ModelFile.build_file_id("root", "pair-a"), "child.bin"),
+            model_builder.get_finalizable_staging_leaf_candidate_reason.call_args,
+        )
+        model_builder.build_model.assert_not_called()
+        self.assertIn(
+            ("root/child.bin", "pair-a", None),
+            controller._Controller__prev_downloading_file_names,
+        )
+
+        controller._Controller__lftp.status.return_value = []
+        controller._Controller__next_lftp_status_poll_at = None
+        updater.update()
+        self.assertIn(
+            ("root/child.bin", "pair-a", None),
+            controller._Controller__pending_completion_file_names,
+        )
+        all_rows = [
+            event for event in trace.query_events(
+                category="finalization.child", stage="finalization_child", limit=32,
+            )["events"] if event["message"] == "child_finalization_candidate_gate"
+        ]
+        self.assertEqual(2, len(all_rows))
+        retired = all_rows[-1]["details"]
+        self.assertFalse(retired["active_leaf"])
+        self.assertEqual("pending_completion", retired["subject_source"])
+        self.assertEqual("fresh_healthy", retired["lftp_status_source"])
+        self.assertEqual("mtime", retired["reason"])
+        self.assertEqual("finalization_child_candidate.v1", all_rows[-1]["details"]["schema"])
+        self.assertEqual("candidate_gate", all_rows[-1]["details"]["phase"])
+        self.assertNotIn("root/child.bin", str(all_rows))
+        self.assertNotIn("pair-a", str(all_rows))
+        updater.update()
+        still_two = [
+            event for event in trace.query_events(
+                category="finalization.child", stage="finalization_child", limit=32,
+            )["events"] if event["message"] == "child_finalization_candidate_gate"
+        ]
+        self.assertEqual(2, len(still_two), "unchanged observations stay deduped after drain")
+        self.assertEqual(3, model_builder.get_finalizable_staging_leaf_candidate_reason.call_count)
+        trace.close()
+
+    def test_candidate_gate_query_failure_does_not_change_active_suppression(self):
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None,
+        )
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__record_breadcrumb = MagicMock()
+        model_builder.get_finalizable_staging_leaf_candidates.return_value = ()
+        model_builder.get_finalizable_staging_leaf_candidate_reason.side_effect = RuntimeError(
+            "diagnostic query unavailable",
+        )
+        controller._finalize_staging_child = MagicMock()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "root/child.bin", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(1, 2, 50, 1, 1)
+        controller._Controller__lftp.status.return_value = [status]
+
+        ModelUpdater(controller).update()
+
+        model_builder.get_finalizable_staging_leaf_candidate_reason.assert_called_once_with(
+            ModelFile.build_file_id("root", "pair-a"), "child.bin",
+        )
+        controller._finalize_staging_child.assert_not_called()
+        trace.close()
+
+    def test_candidate_gate_emitter_does_not_wait_for_retention_and_reaches_writer(self):
+        with tempfile.TemporaryDirectory() as path:
+            controller, model_builder = self._make_progressive_update_controller(
+                None, local_scan=None,
+            )
+            trace = BreadcrumbTraceCollector(
+                lambda: True, max_entries=8,
+                policy={"default": "off", "rules": {"finalization.child": "info"}},
+                durable_enabled=True, durable_path=path,
+            )
+            controller._Controller__context.breadcrumb_trace = trace
+            controller._Controller__record_breadcrumb = MagicMock()
+            model_builder.get_finalizable_staging_leaf_candidates.return_value = ()
+            model_builder.get_finalizable_staging_leaf_candidate_reason.return_value = "match"
+            controller._finalize_staging_child = MagicMock()
+            status = LftpJobStatus(
+                1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+                "root/child.bin", "",
+            )
+            status.path_pair_id = "pair-a"
+            status.total_transfer_state = LftpJobStatus.TransferState(1, 2, 50, 1, 1)
+            controller._Controller__lftp.status.return_value = [status]
+            updater = ModelUpdater(controller)
+            retention_lock = trace._BreadcrumbTraceCollector__lock
+            retention_lock.acquire()
+            worker = Thread(target=updater.update)
+            try:
+                worker.start()
+                worker.join(1.0)
+                self.assertFalse(worker.is_alive(), "candidate emitter waited on collector retention")
+            finally:
+                retention_lock.release()
+                if worker.is_alive():
+                    worker.join(2.0)
+                trace.close()
+            with open(os.path.join(path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+            rows = [
+                record for record in records
+                if record.get("message") == "child_finalization_candidate_gate"
+            ]
+            self.assertEqual(1, len(rows))
+            self.assertEqual("finalization_child_candidate.v1", rows[0]["details"]["schema"])
+            self.assertEqual("model_updater", rows[0]["source"])
+            self.assertEqual("finalization_child", rows[0]["stage"])
+            self.assertEqual("finalization.child", rows[0]["category"])
+            self.assertEqual("info", rows[0]["level"])
+            self.assertEqual({
+                "schema", "phase", "reason", "subject_source", "active_leaf",
+                "lftp_status_source", "lftp_status_fresh", "lftp_status_healthy",
+                "source_monotonic_ns", "scan_generation", "local_scan_generation",
+                "remote_scan_generation", "reconciliation_epoch", "target_correlation",
+                "correlation_reason",
+            }, set(rows[0]["details"]))
+            self.assertTrue(rows[0]["details"]["active_leaf"])
+            self.assertNotIn("root/child.bin", str(rows))
+            self.assertNotIn("pair-a", str(rows))
+
+    def test_candidate_gate_caps_target_queries_and_reports_omission(self):
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None,
+        )
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=32)
+        controller._Controller__context.breadcrumb_trace = trace
+
+        def record_breadcrumb(**kwargs):
+            trace.record(
+                "controller", kwargs["message"], kwargs["details"],
+                stage=kwargs["stage"], event_type=kwargs["event_type"],
+                category=kwargs["category"], level=kwargs["level"],
+                corr_id=kwargs["corr_id"], flow_id=kwargs.get("flow_id"),
+                trace_scope=kwargs.get("trace_scope", "flow"),
+            )
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        controller._finalize_staging_child = MagicMock()
+        model_builder.get_finalizable_staging_leaf_candidates.return_value = ()
+        model_builder.get_finalizable_staging_leaf_candidate_reason.return_value = "match"
+        statuses = []
+        for index in range(9):
+            status = LftpJobStatus(
+                index + 1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+                "root/child-{}.bin".format(index), "",
+            )
+            status.path_pair_id = "pair-a"
+            status.total_transfer_state = LftpJobStatus.TransferState(1, 2, 50, 1, 1)
+            statuses.append(status)
+        controller._Controller__lftp.status.return_value = statuses
+
+        ModelUpdater(controller).update()
+
+        query = model_builder.get_finalizable_staging_leaf_candidate_reason
+        self.assertEqual(8, query.call_count)
+        events = trace.query_events(
+            category="finalization.child", stage="finalization_child", limit=32,
+        )["events"]
+        rows = [event for event in events if event["message"] == "child_finalization_candidate_gate"]
+        self.assertEqual(8, len(rows))
+        aggregate = next(
+            event for event in events if event["message"] == "child_finalization_candidates"
+        )
+        self.assertEqual(1, aggregate["details"]["omitted_subject_count"])
+        self.assertTrue(aggregate["details"]["subjects_truncated"])
+        trace.close()
 
     def test_same_leaf_name_in_another_path_pair_does_not_suppress_child_finalization(self):
         status = LftpJobStatus(
@@ -11887,6 +12142,7 @@ class TestModelUpdater(unittest.TestCase):
         controller._finalize_staging_child.assert_called_once_with(
             "private-root", "private-child.bin", "private-pair",
         )
+        model_builder.get_finalizable_staging_leaf_candidate_reason.assert_not_called()
         self.assertFalse(any(
             call.kwargs.get("category") == "finalization.child"
             for call in controller._Controller__record_breadcrumb.call_args_list

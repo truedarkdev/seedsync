@@ -3418,7 +3418,7 @@ class ModelUpdater(_ControllerCoreAccess):
         # authority and is intentionally updated only while its trace gate is
         # enabled, so normal empty discoveries do not flood retention.
         self.__child_finalization_candidate_trace_signature: Optional[
-            tuple[str, int, int]
+            tuple[str, int, int, int, bool]
         ] = None
         breadcrumb_trace = getattr(
             getattr(self._controller, "_Controller__context", None),
@@ -3429,6 +3429,35 @@ class ModelUpdater(_ControllerCoreAccess):
             self.__scan_pair_join_emitter = emitter_factory() if callable(emitter_factory) else None
         except Exception:
             self.__scan_pair_join_emitter = None
+
+    def __child_finalization_candidate_trace_is_enabled(self) -> bool:
+        emitter = self.__scan_pair_join_emitter
+        if emitter is None:
+            return False
+        try:
+            enabled = getattr(emitter, "is_effectively_enabled", None)
+            return callable(enabled) and enabled(_CHILD_FINALIZATION_TRACE_CATEGORY, "info") is True
+        except Exception:
+            return False
+
+    def __flush_child_finalization_candidate_events(
+            self, events: list[tuple[dict[str, object], Optional[str], Optional[str]]],
+    ) -> None:
+        emitter = self.__scan_pair_join_emitter
+        if emitter is None:
+            return
+        for details, child_identity, coalesce_key in events:
+            corr_id = _child_finalization_trace_flow_id(child_identity)
+            try:
+                emitter.record(
+                    "model_updater", "child_finalization_candidate_gate", details,
+                    stage="finalization_child", event_type="state_transition",
+                    category=_CHILD_FINALIZATION_TRACE_CATEGORY, level="info",
+                    corr_id=corr_id, flow_id=corr_id,
+                    _coalesce_key=coalesce_key,
+                )
+            except Exception:
+                continue
 
     def _record_scan_pair_joins(
             self, local_scan: Optional[ScannerResult], remote_scan: Optional[ScannerResult],
@@ -4627,6 +4656,10 @@ class ModelUpdater(_ControllerCoreAccess):
     def update(self) -> None:
         """Run one model refresh bracketed by the optional trace cycle."""
         controller = self._controller
+        child_candidate_trace_enabled = self.__child_finalization_candidate_trace_is_enabled()
+        child_candidate_events: list[
+            tuple[dict[str, object], Optional[str], Optional[str]]
+        ] = []
         diagnostics = getattr(getattr(controller, "_Controller__context", None), "performance_diagnostics", None)
         model_builder = controller._Controller__model_builder
         trace_setup_started = None
@@ -4657,12 +4690,16 @@ class ModelUpdater(_ControllerCoreAccess):
         if callable(set_publication_callback):
             set_publication_callback(None)
         work_state_lock = getattr(controller, "_Controller__work_state_lock", None)
+        work_state_lock_released = work_state_lock is None
         try:
             # Relocation snapshots treat these runtime collections as one
             # coherent unit.  Hold the same outer lock across this update so
             # an alias switch cannot observe a halfway scan/status transition.
             if work_state_lock is None:
-                build_triggered = self._update_once()
+                build_triggered = self._update_once(
+                    child_candidate_trace_enabled=child_candidate_trace_enabled,
+                    child_candidate_events=child_candidate_events,
+                )
                 update_succeeded = True
             else:
                 wait_breadcrumb = _ModelFinalizationBreadcrumbSpan(
@@ -4733,7 +4770,10 @@ class ModelUpdater(_ControllerCoreAccess):
                     )
                     hold_breadcrumb_started = True
                     try:
-                        build_triggered = self._update_once()
+                        build_triggered = self._update_once(
+                            child_candidate_trace_enabled=child_candidate_trace_enabled,
+                            child_candidate_events=child_candidate_events,
+                        )
                         update_succeeded = True
                     except BaseException as error:
                         work_exception = (type(error), error, error.__traceback__)
@@ -4758,6 +4798,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     except BaseException as error:
                         release_error = error
                     if release_error is None:
+                        work_state_lock_released = True
                         try:
                             released_ns = time.monotonic_ns()
                         except BaseException:
@@ -4798,6 +4839,8 @@ class ModelUpdater(_ControllerCoreAccess):
                         )
                         raise release_error
         finally:
+            if work_state_lock_released and child_candidate_events:
+                self.__flush_child_finalization_candidate_events(child_candidate_events)
             # Keep the no-rebuild case observable and finish only after all
             # model listeners have seen the applied diff.
             trace_finalization_started = None
@@ -4855,16 +4898,31 @@ class ModelUpdater(_ControllerCoreAccess):
                     except Exception:
                         pass
 
-    def _update_once(self) -> bool:
+    def _update_once(
+            self, *, child_candidate_trace_enabled: bool = False,
+            child_candidate_events: Optional[
+                list[tuple[dict[str, object], Optional[str], Optional[str]]]
+            ] = None,
+    ) -> bool:
         diagnostics = getattr(getattr(self._controller, "_Controller__context", None), "performance_diagnostics", None)
         stage_timer = _ModelUpdateStageTimer(diagnostics)
         stage_timer.switch(DURATION_MODEL_UPDATE_STATE_PREPARATION)
         try:
-            return self._update_once_impl(stage_timer)
+            return self._update_once_impl(
+                stage_timer,
+                child_candidate_trace_enabled=child_candidate_trace_enabled,
+                child_candidate_events=child_candidate_events,
+            )
         finally:
             stage_timer.finish()
 
-    def _update_once_impl(self, stage_timer: _ModelUpdateStageTimer) -> bool:
+    def _update_once_impl(
+            self, stage_timer: _ModelUpdateStageTimer, *,
+            child_candidate_trace_enabled: bool = False,
+            child_candidate_events: Optional[
+                list[tuple[dict[str, object], Optional[str], Optional[str]]]
+            ] = None,
+    ) -> bool:
         controller = self._controller
         diagnostics = getattr(getattr(controller, "_Controller__context", None), "performance_diagnostics", None)
         model_builder = controller._Controller__model_builder
@@ -9590,20 +9648,6 @@ class ModelUpdater(_ControllerCoreAccess):
         # exact Path Pair checks below; its scanner identity proof is already
         # independent of the root's presentation state.
         if callable(leaf_candidates) and callable(finalize_child):
-            active_leaf_file_ids = {
-                status.file_id for status in raw_lftp_statuses
-                if getattr(status, "type", None) in (
-                    LftpJobStatus.Type.GET, LftpJobStatus.Type.PGET,
-                ) and getattr(status, "state", None) in (
-                    LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING,
-                ) and isinstance(getattr(status, "file_id", None), str)
-            }
-            child_trace_info_enabled = _controller_breadcrumb_effectively_enabled(
-                controller, _CHILD_FINALIZATION_TRACE_CATEGORY, "info",
-            )
-            child_trace_warning_enabled = _controller_breadcrumb_effectively_enabled(
-                controller, _CHILD_FINALIZATION_TRACE_CATEGORY, "warning",
-            )
             child_trace_epochs = {
                 "scan_generation": _bounded_child_finalization_epoch(max(
                     scan_generation(latest_local_scan), scan_generation(latest_remote_scan),
@@ -9618,6 +9662,153 @@ class ModelUpdater(_ControllerCoreAccess):
                     getattr(controller, "_Controller__progress_publication_epoch", None),
                 ),
             }
+            active_leaf_file_ids = {
+                status.file_id for status in raw_lftp_statuses
+                if getattr(status, "type", None) in (
+                    LftpJobStatus.Type.GET, LftpJobStatus.Type.PGET,
+                ) and getattr(status, "state", None) in (
+                    LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING,
+                ) and isinstance(getattr(status, "file_id", None), str)
+            }
+            candidate_reason_query = getattr(
+                model_builder, "get_finalizable_staging_leaf_candidate_reason", None,
+            )
+            candidate_subject_sources: dict[tuple[str, str], set[str]] = {}
+            active_candidate_subjects: set[tuple[str, str]] = set()
+
+            def add_candidate_subject(file_name: object, path_pair_id: object, source: str) -> None:
+                if not isinstance(file_name, str) or "/" not in file_name or "\\" in file_name or \
+                        path_pair_id is not None and not isinstance(path_pair_id, str):
+                    return
+                parts = file_name.split("/")
+                if len(parts) < 2 or any(not part for part in parts):
+                    return
+                root_file_id = ModelFile.build_file_id(parts[0], path_pair_id)
+                relative_path = "/".join(parts[1:])
+                subject = (root_file_id, relative_path)
+                candidate_subject_sources.setdefault(subject, set()).add(source)
+                if source == "active_GET_PGET":
+                    active_candidate_subjects.add(subject)
+
+            if child_candidate_trace_enabled and callable(candidate_reason_query):
+                for status in raw_lftp_statuses:
+                    if getattr(status, "type", None) not in (
+                            LftpJobStatus.Type.GET, LftpJobStatus.Type.PGET,
+                    ) or getattr(status, "state", None) not in (
+                            LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING,
+                    ):
+                        continue
+                    add_candidate_subject(
+                        getattr(status, "name", None),
+                        getattr(status, "path_pair_id", None),
+                        "active_GET_PGET",
+                    )
+                pending_completion_subjects = getattr(
+                    controller, "_Controller__pending_completion_file_names", set(),
+                )
+                try:
+                    for pending_entry in tuple(pending_completion_subjects):
+                        if isinstance(pending_entry, tuple) and len(pending_entry) == 3:
+                            add_candidate_subject(
+                                pending_entry[0], pending_entry[1], "pending_completion",
+                            )
+                except Exception:
+                    pass
+
+                subject_items = sorted(candidate_subject_sources.items())
+                query_subjects = subject_items[:8]
+                failed_subject_queries = 0
+                for (root_file_id, relative_path), sources in query_subjects:
+                    try:
+                        reason = candidate_reason_query(root_file_id, relative_path)
+                    except Exception:
+                        failed_subject_queries += 1
+                        continue
+                    if reason not in {
+                            "missing", "type", "collision", "not_staging", "sidecar",
+                            "size", "mtime", "match",
+                    }:
+                        continue
+                    try:
+                        parsed_root = json.loads(root_file_id)
+                    except (TypeError, ValueError):
+                        parsed_root = None
+                    pair_id, root_name = (
+                        (parsed_root[0], parsed_root[1])
+                        if isinstance(parsed_root, list) and len(parsed_root) == 2
+                        and isinstance(parsed_root[0], str) and isinstance(parsed_root[1], str)
+                        else (None, root_file_id)
+                    )
+                    source = "both" if len(sources) > 1 else next(iter(sources))
+                    active_leaf = (root_file_id, relative_path) in active_candidate_subjects
+                    bounded_status_source = (
+                        lftp_status_source
+                        if lftp_status_source in _COMPLETION_GATE_LFTP_SOURCES
+                        else "unknown"
+                    )
+                    child_identity = _child_finalization_trace_identity(
+                        root_name, relative_path, pair_id,
+                    )
+                    if child_candidate_events is not None:
+                        try:
+                            source_monotonic_ns = time.monotonic_ns()
+                        except Exception:
+                            failed_subject_queries += 1
+                            continue
+                        details = {
+                            "schema": "finalization_child_candidate.v1",
+                            "phase": "candidate_gate",
+                            "reason": reason,
+                            "subject_source": source,
+                            "active_leaf": active_leaf,
+                            "lftp_status_source": bounded_status_source,
+                            "lftp_status_fresh": bool(lftp_status_snapshot_fresh),
+                            "lftp_status_healthy": bool(lftp_status_poll_healthy),
+                            "source_monotonic_ns": source_monotonic_ns,
+                            "scan_generation": child_trace_epochs["scan_generation"],
+                            "local_scan_generation": child_trace_epochs["local_scan_generation"],
+                            "remote_scan_generation": child_trace_epochs["remote_scan_generation"],
+                            "reconciliation_epoch": child_trace_epochs["reconciliation_epoch"],
+                            "target_correlation": _child_finalization_trace_flow_id(child_identity),
+                            "correlation_reason": (
+                                "opaque_child_identity"
+                                if child_identity is not None else "target_identity_unavailable"
+                            ),
+                        }
+                        coalesce_key = (
+                            "child_candidate_gate:{}:{}:{}".format(
+                                child_identity, source, reason,
+                            ) if child_identity is not None else None
+                        )
+                        signature_key = "child_candidate_gate:{}".format(
+                            child_identity if child_identity is not None else "unknown",
+                        )
+                        signature = "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}".format(
+                            source, reason, active_leaf, bounded_status_source,
+                            bool(lftp_status_snapshot_fresh), bool(lftp_status_poll_healthy),
+                            child_trace_epochs["scan_generation"],
+                            child_trace_epochs["local_scan_generation"],
+                            child_trace_epochs["remote_scan_generation"],
+                            child_trace_epochs["reconciliation_epoch"],
+                        )
+                        if self.__completion_gate_trace_signatures.get(signature_key) == signature:
+                            continue
+                        self.__completion_gate_trace_signatures[signature_key] = signature
+                        self.__completion_gate_trace_signatures.move_to_end(signature_key)
+                        while len(self.__completion_gate_trace_signatures) > self._COMPLETION_GATE_TRACE_SIGNATURE_LIMIT:
+                            self.__completion_gate_trace_signatures.popitem(last=False)
+                        child_candidate_events.append((details, child_identity, coalesce_key))
+
+                omitted_subject_count = max(0, len(subject_items) - len(query_subjects)) + \
+                    failed_subject_queries
+            else:
+                omitted_subject_count = 0
+            child_trace_info_enabled = _controller_breadcrumb_effectively_enabled(
+                controller, _CHILD_FINALIZATION_TRACE_CATEGORY, "info",
+            )
+            child_trace_warning_enabled = _controller_breadcrumb_effectively_enabled(
+                controller, _CHILD_FINALIZATION_TRACE_CATEGORY, "warning",
+            )
             candidate_discovery_reason = "available"
             try:
                 candidates = leaf_candidates()
@@ -9658,6 +9849,8 @@ class ModelUpdater(_ControllerCoreAccess):
                     candidate_discovery_reason,
                     bounded_candidate_count,
                     bounded_valid_candidate_count,
+                    _bounded_child_finalization_count(omitted_subject_count),
+                    omitted_subject_count > 0,
                 )
                 if (
                     self.__child_finalization_candidate_trace_signature
@@ -9681,6 +9874,10 @@ class ModelUpdater(_ControllerCoreAccess):
                             "correlation_reason": "aggregate_candidate_set",
                             "candidate_count": bounded_candidate_count,
                             "valid_candidate_count": bounded_valid_candidate_count,
+                            "omitted_subject_count": _bounded_child_finalization_count(
+                                omitted_subject_count,
+                            ),
+                            "subjects_truncated": omitted_subject_count > 0,
                             **child_trace_epochs,
                         },
                         level=candidate_trace_level,

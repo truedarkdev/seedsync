@@ -123,6 +123,77 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual((), self.model_builder.get_finalizable_staging_leaf_candidates())
 
+    def test_finalizable_staging_leaf_reason_matches_authoritative_provider(self):
+        root_id = ModelFile.build_file_id("release", "pair-a")
+        reasons = {}
+        for case in ("match", "missing", "type", "collision", "not_staging", "sidecar", "size", "mtime"):
+            with self.subTest(case=case):
+                remote_root = SystemFile("release", 10, True)
+                remote_root.path_pair_id = "pair-a"
+                remote_leaf = SystemFile("child.bin", 10, False, mtime_ns=2_000_000_000)
+                remote_root.add_child(remote_leaf)
+                local_root = SystemFile("release", 10, True, is_staging=True)
+                local_root.path_pair_id = "pair-a"
+                if case != "missing":
+                    local_leaf = SystemFile(
+                        "child.bin",
+                        9 if case == "size" else 10,
+                        case == "type",
+                        is_staging=case != "not_staging",
+                        mtime_ns=3_000_000_000 if case == "mtime" else 2_500_000_000,
+                    )
+                    local_leaf.status_sidecar_ready = case == "sidecar"
+                    local_root.add_child(local_leaf)
+                if case == "collision":
+                    local_root.has_staging_collision = True
+                self.model_builder.set_remote_files([remote_root])
+                self.model_builder.set_local_files([local_root])
+
+                reason = self.model_builder.get_finalizable_staging_leaf_candidate_reason(
+                    root_id, "child.bin",
+                )
+                candidates = self.model_builder.get_finalizable_staging_leaf_candidates()
+                reasons[case] = reason
+                self.assertEqual(case == "match", reason == "match")
+                self.assertEqual(case == "match", (root_id, "child.bin") in candidates)
+
+        self.assertEqual(
+            {
+                "match": "match", "missing": "missing", "type": "type",
+                "collision": "collision", "not_staging": "not_staging",
+                "sidecar": "sidecar", "size": "size", "mtime": "mtime",
+            },
+            reasons,
+        )
+
+    def test_finalizable_staging_leaf_reason_uses_exact_pair_and_skips_nonleaf_subjects(self):
+        remote_a = SystemFile("release", 10, True)
+        remote_a.path_pair_id = "pair-a"
+        remote_a.add_child(SystemFile("child.bin", 10, False, mtime_ns=2_000_000_000))
+        local_a = SystemFile("release", 10, True, is_staging=True)
+        local_a.path_pair_id = "pair-a"
+        local_a.add_child(SystemFile("child.bin", 10, False, is_staging=True, mtime_ns=2_500_000_000))
+        remote_b = SystemFile("release", 10, True)
+        remote_b.path_pair_id = "pair-b"
+        remote_b.add_child(SystemFile("child.bin", 10, False, mtime_ns=2_000_000_000))
+        self.model_builder.set_remote_files([remote_a, remote_b])
+        self.model_builder.set_local_files([local_a])
+        root_a = ModelFile.build_file_id("release", "pair-a")
+        root_b = ModelFile.build_file_id("release", "pair-b")
+
+        self.assertEqual("match", self.model_builder.get_finalizable_staging_leaf_candidate_reason(
+            root_a, "child.bin",
+        ))
+        self.assertEqual("missing", self.model_builder.get_finalizable_staging_leaf_candidate_reason(
+            root_b, "child.bin",
+        ))
+        self.assertIsNone(self.model_builder.get_finalizable_staging_leaf_candidate_reason(
+            root_a, "",
+        ))
+        self.assertIsNone(self.model_builder.get_finalizable_staging_leaf_candidate_reason(
+            root_a, "child.bin/nested.bin",
+        ))
+
     def test_nested_download_marker_does_not_promote_staging_child_before_final_publication(self):
         remote_root = SystemFile("release", 16, True)
         remote_root.path_pair_id = "default"
