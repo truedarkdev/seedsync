@@ -505,6 +505,40 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual("<redacted>", entry["details"]["command"])
         self.assertEqual("<redacted>", entry["details"]["api_token"])
 
+    def test_retained_signature_cache_is_only_for_explicit_coalesce_keys(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+        entries = collector._BreadcrumbTraceCollector__entries
+        coalesce_entries = collector._BreadcrumbTraceCollector__coalesce_entries
+
+        self.assertEqual("retained", collector.record("worker", "plain", category="plain"))
+        plain = entries.last()
+        plain_signature = collector._BreadcrumbTraceCollector__last_signature
+        self.assertIsNone(plain.signature)
+        self.assertIsNotNone(plain_signature)
+        self.assertEqual({}, coalesce_entries)
+        self.assertEqual("retained", collector.record("worker", "plain", category="plain"))
+        self.assertIs(entries.last(), plain)
+        self.assertEqual(2, plain["repeat_count"])
+        self.assertEqual({}, coalesce_entries)
+
+        self.assertEqual("retained", collector.record(
+            "worker", "keyed", category="keyed", _coalesce_key="stable",
+        ))
+        keyed = entries.last()
+        self.assertEqual("coalesce:stable", keyed.signature)
+        self.assertIs(coalesce_entries["coalesce:stable"], keyed)
+        self.assertEqual("retained", collector.record(
+            "worker", "keyed", category="keyed", _coalesce_key="stable",
+        ))
+        self.assertEqual(2, keyed["repeat_count"])
+
+        collector.record("worker", "third", category="third")
+        self.assertNotIn(plain.sequence, entries.nodes)
+        self.assertIs(coalesce_entries["coalesce:stable"], keyed)
+        collector.record("worker", "fourth", category="fourth")
+        self.assertNotIn(keyed.sequence, entries.nodes)
+        self.assertNotIn("coalesce:stable", coalesce_entries)
+
     def test_admission_skips_retention_scans_without_eviction(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
         range_check = "_BreadcrumbTraceCollector__entry_range_is_retained"
@@ -520,54 +554,43 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual(8, collector.snapshot()["retained_count"])
 
     def test_ordinary_admission_does_not_iterate_retained_entries(self):
-        class CountingDeque(deque):
-            yielded = 0
-
-            def __iter__(self):
-                for entry in super().__iter__():
-                    type(self).yielded += 1
-                    yield entry
-
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=10000)
-        collector._BreadcrumbTraceCollector__entries = CountingDeque()
-
-        for index in range(10000):
-            self.assertEqual("retained", collector.record("worker", "event-{}".format(index)))
-
-        self.assertEqual(0, CountingDeque.yielded)
+        retained_window = collector._BreadcrumbTraceCollector__entries
+        with patch.object(retained_window, "values", side_effect=AssertionError("bulk iteration on admission")):
+            for index in range(10000):
+                self.assertEqual("retained", collector.record("worker", "event-{}".format(index)))
         self.assertEqual(10000, len(collector._BreadcrumbTraceCollector__entries))
         self.assertEqual(10000, collector._BreadcrumbTraceCollector__version)
         self.assertEqual(0, collector._BreadcrumbTraceCollector__evicted_count)
 
-    def test_eviction_candidate_selection_uses_entry_snapshot(self):
-        class IndexedReadCountingDeque(deque):
-            indexed_reads = 0
-
-            def __getitem__(self, index):
-                if isinstance(index, int):
-                    type(self).indexed_reads += 1
-                return super().__getitem__(index)
-
+    def test_indexed_eviction_reselects_after_each_victim(self):
         entry_count = 128
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=None)
         for index in range(entry_count):
             collector.record("worker", "event-{}".format(index), category="noise")
 
-        collector._BreadcrumbTraceCollector__entries = IndexedReadCountingDeque(
-            collector._BreadcrumbTraceCollector__entries,
-        )
         collector._BreadcrumbTraceCollector__max_entries = entry_count // 2
-        IndexedReadCountingDeque.indexed_reads = 0
 
-        evicted = collector._BreadcrumbTraceCollector__evict_to_budget()
+        retained_window = collector._BreadcrumbTraceCollector__entries
+        with patch.object(retained_window, "values", side_effect=AssertionError("bulk iteration during eviction")):
+            evicted = collector._BreadcrumbTraceCollector__evict_to_budget()
 
         self.assertTrue(evicted)
         self.assertEqual(entry_count // 2, collector.snapshot()["entry_count"])
         self.assertEqual(entry_count // 2, collector.snapshot()["accounting"]["evicted_count"])
-        # Candidate selection reads entries from one immutable tuple per
-        # eviction pass; the single remaining indexed read is the final
-        # signature lookup after the pass completes.
-        self.assertEqual(1, IndexedReadCountingDeque.indexed_reads)
+        self.assertEqual(entry_count // 2, len(collector._BreadcrumbTraceCollector__entries))
+
+    def test_retention_category_indexes_release_evicted_category_refs(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+        for index in range(40):
+            collector.record("worker", "event-{}".format(index), category="category-{}".format(index))
+        window = collector._BreadcrumbTraceCollector__entries
+        self.assertEqual(2, len(window))
+        self.assertLessEqual(len(window.categories), 2)
+        self.assertTrue(all(
+            state.eligible_count or state.decisions
+            for state in window.categories.values()
+        ))
 
     def test_eviction_matches_frozen_baseline_oracle_for_mixed_and_fallback_streams(self):
         policy = {"retention": {"protected_categories": ["protected"]}}
@@ -659,11 +682,12 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         for index in range(4):
             collector.record("worker", "event-{}".format(index), category="seed")
 
-        entries = collector._BreadcrumbTraceCollector__entries
+        entries = list(collector._BreadcrumbTraceCollector__entries.values())
         entries[0]["category"] = None
         entries[1]["category"] = False
         entries[2]["category"] = "other"
         entries[3]["category"] = "other"
+        collector._BreadcrumbTraceCollector__rebuild_retention_indexes_locked()
         collector._BreadcrumbTraceCollector__max_entries = 2
         version_to_message = {
             int(entry["version"]): entry["message"] for entry in entries
@@ -812,7 +836,7 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         )
         self.assertIs(
             collector._BreadcrumbTraceCollector__coalesce_entries["coalesce:stable"],
-            collector._BreadcrumbTraceCollector__entries[-1],
+            collector._BreadcrumbTraceCollector__entries.last(),
         )
 
     def test_eviction_does_not_change_durable_admission_or_loss_accounting(self):
@@ -877,9 +901,7 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
             def compare_each_eviction():
                 state = tuple(collector._BreadcrumbTraceCollector__entries)
                 sizes = {
-                    id(entry): size for entry, size in zip(
-                        state, collector._BreadcrumbTraceCollector__entry_sizes
-                    )
+                    id(entry): entry.size for entry in state
                 }
                 remaining_state = list(state)
                 remaining_bytes = collector._BreadcrumbTraceCollector__retained_bytes
@@ -893,14 +915,22 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
                     expected.append(victim)
                     remaining_state = [entry for entry in remaining_state if entry is not victim]
                     remaining_bytes -= sizes[id(victim)]
-                result = original()
-                remaining = tuple(collector._BreadcrumbTraceCollector__entries)
-                removed_now = [
-                    entry for entry in state
-                    if not any(entry is other for other in remaining)
-                ]
-                self.assertCountEqual(expected, removed_now)
-                removed.extend(expected)
+                actual = []
+                by_version = {entry["version"]: entry for entry in state}
+                gap_name = "_BreadcrumbTraceCollector__record_gap_range"
+                original_gap = getattr(collector, gap_name)
+
+                def capture_removal(start, end, reason):
+                    if reason == "evicted":
+                        victim = by_version[start]
+                        self.assertEqual(victim.get("last_seen_version", start), end)
+                        actual.append(victim)
+                    return original_gap(start, end, reason)
+
+                with patch.object(collector, gap_name, side_effect=capture_removal):
+                    result = original()
+                self.assertEqual(expected, actual)
+                removed.extend(actual)
                 return result
 
             with patch.object(
@@ -990,6 +1020,26 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual(1, len(self_removed))
         self.assertEqual(["failure"], [entry["message"] for entry in self_eviction.snapshot()["entries"]])
         self.assertEqual("failure", self_eviction.snapshot()["latest_failure_entry"]["message"])
+
+        # The noisy category is evicted before the earlier quiet entry. A
+        # retained-set difference would report insertion order and fail here.
+        out_of_order = BreadcrumbTraceCollector(lambda: True, max_entries=None)
+        out_of_order.record("worker", "quiet-first", category="quiet")
+        out_of_order.record("worker", "noisy-first", category="noise")
+        out_of_order.record("worker", "noisy-second", category="noise")
+        out_of_order._BreadcrumbTraceCollector__max_entries = 1
+        baseline_collector = collector
+        collector = out_of_order
+        result, actual_order = record_with_baseline_evictions(
+            "worker", "noisy-last", category="noise",
+        )
+        collector = baseline_collector
+        self.assertEqual("retained", result)
+        self.assertEqual(
+            ["noisy-first", "noisy-second", "quiet-first"],
+            [entry["message"] for entry in actual_order],
+        )
+        self.assertEqual(["noisy-last"], [entry["message"] for entry in out_of_order.snapshot()["entries"]])
 
     def test_coalesced_failure_keeps_latest_failure_in_entry_order(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)

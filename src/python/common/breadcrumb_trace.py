@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import heapq
 import hashlib
 import json
 import math
@@ -2231,6 +2232,188 @@ class BreadcrumbTraceNoopEmitter:
         return False
 
 
+class _RetainedEntry(dict):
+    """One retained record and its measured size; policy flags are derived."""
+
+    __slots__ = ("size", "sequence", "category", "base_protected", "decision", "signature", "eligible")
+
+    def __init__(self, entry: Mapping[str, Any], size: int):
+        super().__init__(entry)
+        self.size = size
+        self.sequence = int(entry.get("version", 0))
+        self.category = str(entry.get("category") or "unknown")
+        self.base_protected = False
+        self.decision = False
+        self.signature: Optional[str] = None
+        self.eligible = False
+
+
+class _RetentionCategory:
+    __slots__ = ("eligible_heap", "eligible_count", "decisions")
+
+    def __init__(self):
+        self.eligible_heap: List[int] = []
+        self.eligible_count = 0
+        self.decisions: Optional[OrderedDict[int, None]] = None
+
+
+class _RetainedWindow:
+    """Ordered authoritative entries with lock-owned category selector refs."""
+
+    def __init__(self):
+        self.nodes: OrderedDict[int, _RetainedEntry] = OrderedDict()
+        self.categories: Dict[str, _RetentionCategory] = {}
+
+    def __len__(self) -> int:
+        return len(self.nodes)
+
+    def __bool__(self) -> bool:
+        return bool(self.nodes)
+
+    def values(self):
+        return self.nodes.values()
+
+    def __iter__(self):
+        return iter(self.nodes.values())
+
+    def last(self) -> Optional[_RetainedEntry]:
+        return next(reversed(self.nodes.values()), None)
+
+    def append(self, entry: Mapping[str, Any], size: int,
+               is_category_protected: Callable[[str], bool],
+               protected_levels: Iterable[str], latest_types: Iterable[str],
+               signature: Optional[str]) -> _RetainedEntry:
+        node = _RetainedEntry(entry, size)
+        protected_key = str(entry.get("category") or "")
+        node.base_protected = (entry.get("level") in protected_levels
+                               or is_category_protected(protected_key))
+        node.decision = entry.get("event_type") in latest_types
+        node.signature = signature
+        state = self.categories.setdefault(node.category, _RetentionCategory())
+        if node.decision:
+            if state.decisions is None:
+                state.decisions = OrderedDict()
+            decisions = state.decisions
+            previous = next(reversed(decisions), None)
+            decisions[node.sequence] = None
+            if previous is not None:
+                old = self.nodes[previous]
+                if not old.base_protected:
+                    self._insert_eligible(old)
+        elif not node.base_protected:
+            self._insert_eligible(node)
+        self.nodes[node.sequence] = node
+        return node
+
+    def _insert_eligible(self, node: _RetainedEntry) -> None:
+        state = self.categories.setdefault(node.category, _RetentionCategory())
+        if not node.eligible:
+            node.eligible = True
+            state.eligible_count += 1
+            heapq.heappush(state.eligible_heap, node.sequence)
+
+    def _oldest_eligible(self, category: str) -> Optional[int]:
+        state = self.categories.get(category)
+        if state is None:
+            return None
+        while state.eligible_heap:
+            node = self.nodes.get(state.eligible_heap[0])
+            if node is not None and node.eligible:
+                return state.eligible_heap[0]
+            heapq.heappop(state.eligible_heap)
+        return None
+
+    def select_victim(self) -> Optional[_RetainedEntry]:
+        use_eligible = any(state.eligible_count for state in self.categories.values())
+        selected_category = None
+        selected_count = 0
+        selected_oldest = None
+        if use_eligible:
+            for category, state in self.categories.items():
+                count = state.eligible_count
+                if not count:
+                    continue
+                oldest = self._oldest_eligible(category)
+                if oldest is None:
+                    continue
+                if count > selected_count or count == selected_count and (
+                    selected_oldest is None or oldest < selected_oldest
+                ):
+                    selected_category, selected_count, selected_oldest = category, count, oldest
+        else:
+            fallback_counts: Dict[str, tuple[int, int]] = {}
+            for sequence, node in self.nodes.items():
+                previous = fallback_counts.get(node.category)
+                if previous is None:
+                    fallback_counts[node.category] = (1, sequence)
+                else:
+                    count, oldest = previous
+                    fallback_counts[node.category] = (count + 1, oldest)
+            for category, (count, oldest) in fallback_counts.items():
+                if count > selected_count or count == selected_count and (
+                    selected_oldest is None or oldest < selected_oldest
+                ):
+                    selected_category, selected_count, selected_oldest = category, count, oldest
+        return self.nodes.get(selected_oldest) if selected_category is not None else None
+
+    def remove(self, node: _RetainedEntry) -> None:
+        self.nodes.pop(node.sequence, None)
+        state = self.categories.get(node.category)
+        if node.eligible and state is not None:
+            node.eligible = False
+            state.eligible_count -= 1
+            if len(state.eligible_heap) > 2 * max(1, state.eligible_count) + 32:
+                state.eligible_heap = [sequence for sequence in state.eligible_heap
+                                       if (candidate := self.nodes.get(sequence)) is not None and candidate.eligible]
+                heapq.heapify(state.eligible_heap)
+        decisions = state.decisions if state is not None else None
+        if decisions is not None and node.sequence in decisions:
+            decisions.pop(node.sequence)
+            if not decisions:
+                state.decisions = None
+        if state is not None and state.eligible_count == 0 and state.decisions is None:
+            self.categories.pop(node.category, None)
+
+    def clear(self) -> None:
+        self.nodes.clear()
+        self.categories.clear()
+
+    def rebuild(self, nodes: Iterable[_RetainedEntry],
+                is_category_protected: Callable[[str], bool],
+                protected_levels: Iterable[str], latest_types: Iterable[str]) -> None:
+        retained = list(nodes)
+        self.clear()
+        for node in retained:
+            node.eligible = False
+        for old in retained:
+            node = old
+            node.category = str(node.get("category") or "unknown")
+            protected_key = str(node.get("category") or "")
+            node.base_protected = (node.get("level") in protected_levels
+                                   or is_category_protected(protected_key))
+            node.decision = node.get("event_type") in latest_types
+            node.signature = old.signature
+            self.nodes[node.sequence] = node
+            state = self.categories.setdefault(node.category, _RetentionCategory())
+            if node.decision:
+                if state.decisions is None:
+                    state.decisions = OrderedDict()
+                state.decisions[node.sequence] = None
+            elif not node.base_protected:
+                self._insert_eligible(node)
+        for category, state in self.categories.items():
+            decisions = state.decisions
+            if decisions is None:
+                continue
+            latest = next(reversed(decisions))
+            for sequence in decisions:
+                if sequence == latest:
+                    continue
+                node = self.nodes[sequence]
+                if not node.base_protected:
+                    self._insert_eligible(node)
+
+
 class BreadcrumbTraceCollector:
     """
     Small bounded in-memory breadcrumb collector.
@@ -2517,8 +2700,7 @@ class BreadcrumbTraceCollector:
         self.__ingress_drainer_active = False
         self.__max_entries = max_entries
         self.__memory_budget_bytes = memory_budget_bytes
-        self.__entries: Deque[Dict[str, Any]] = deque()
-        self.__entry_sizes: Deque[int] = deque()
+        self.__entries = _RetainedWindow()
         self.__retained_bytes = 0
         self.__accepted_count = 0
         self.__coalesced_count = 0
@@ -2596,7 +2778,7 @@ class BreadcrumbTraceCollector:
         self.__external_queue_drain_limited = False
         self.__external_queue_last_drain_monotonic: Optional[float] = None
         self.__last_signature: Optional[str] = None
-        self.__coalesce_entries: Dict[str, Dict[str, Any]] = {}
+        self.__coalesce_entries: Dict[str, _RetainedEntry] = {}
         self.__last_failure_entry: Optional[Dict[str, Any]] = None
         self.__last_failure_version: Optional[int] = None
         # This is deliberately independent of the chronological deque.  It
@@ -4433,6 +4615,7 @@ class BreadcrumbTraceCollector:
             old_policy = self.__policy
             old_revision = self.__policy_revision
             self.__policy = cast(Dict[str, Any], result["policy"])
+            self.__rebuild_retention_indexes_locked()
             self.__effective_policy = _EffectiveBreadcrumbPolicy.from_policy(self.__policy)
             self.__policy_revision += 1
             self.__policy_epoch += 1
@@ -4444,6 +4627,7 @@ class BreadcrumbTraceCollector:
             if persist:
                 if self.__policy_persist is None:
                     self.__policy = old_policy
+                    self.__rebuild_retention_indexes_locked()
                     self.__effective_policy = _EffectiveBreadcrumbPolicy.from_policy(self.__policy)
                     self.__policy_revision = old_revision
                     self.__policy_epoch += 1
@@ -4459,6 +4643,7 @@ class BreadcrumbTraceCollector:
                     self.__policy_persistence_state = "persisted"
                 except Exception:
                     self.__policy = old_policy
+                    self.__rebuild_retention_indexes_locked()
                     self.__effective_policy = _EffectiveBreadcrumbPolicy.from_policy(self.__policy)
                     self.__policy_revision = old_revision
                     self.__policy_epoch += 1
@@ -4474,6 +4659,13 @@ class BreadcrumbTraceCollector:
             response = self.policy_snapshot()
             response.update({"applied": True, "ok": True, "conflict": False})
             return response
+
+    def __rebuild_retention_indexes_locked(self) -> None:
+        retention = self.__policy["retention"]
+        self.__entries.rebuild(
+            self.__entries.values(), self.__is_category_protected,
+            retention["protected_levels"], retention["latest_decision_event_types"],
+        )
 
     def __closed_policy_result(self) -> Dict[str, Any]:
         response = self.policy_snapshot()
@@ -4657,7 +4849,8 @@ class BreadcrumbTraceCollector:
     def __category_accounting_snapshot(self) -> Dict[str, Dict[str, int]]:
         result = copy.deepcopy(self.__category_accounting)
         response_limit = max(16, min(256, self.__memory_budget_bytes // 4096))
-        for entry, size in zip(self.__entries, self.__entry_sizes):
+        for entry in self.__entries.values():
+            size = entry.size
             # Keep retained values snapshot-local rather than accumulating
             # stale retained bytes across evictions and clears.
             category = str(entry.get("category") or "unknown")
@@ -4709,7 +4902,7 @@ class BreadcrumbTraceCollector:
         for callers that inspect the collector's live entries directly.
         """
         retention = self.__policy["retention"]
-        entries_to_scan = self.__entries if entries is None else entries
+        entries_to_scan = self.__entries.values() if entries is None else entries
         latest_decision: Dict[str, int] = {}
         protected = set()
         protected_category_cache: Dict[str, bool] = {}
@@ -4923,16 +5116,15 @@ class BreadcrumbTraceCollector:
             if not clear_filters:
                 removed_count = len(self.__entries)
                 self.__entries.clear()
-                self.__entry_sizes.clear()
                 self.__retained_bytes = 0
                 self.__latest_active_delta_rejection_summary = None
                 self.__reset_root_progress_health_locked()
             else:
-                kept_entries: Deque[Dict[str, Any]] = deque()
-                kept_sizes: Deque[int] = deque()
+                kept_entries: List[_RetainedEntry] = []
                 removed_count = 0
                 retained_bytes = 0
-                for entry, size in zip(self.__entries, self.__entry_sizes):
+                for entry in self.__entries.values():
+                    size = entry.size
                     if self.__entry_matches(entry, clear_filters):
                         removed_count += 1
                         self.__record_gap_range(
@@ -4942,14 +5134,17 @@ class BreadcrumbTraceCollector:
                         )
                     else:
                         kept_entries.append(entry)
-                        kept_sizes.append(size)
                         retained_bytes += size
-                self.__entries = kept_entries
-                self.__entry_sizes = kept_sizes
+                self.__entries.rebuild(
+                    kept_entries, self.__is_category_protected,
+                    self.__policy["retention"]["protected_levels"],
+                    self.__policy["retention"]["latest_decision_event_types"],
+                )
                 self.__retained_bytes = retained_bytes
                 if self.__active_delta_rejection_summary_matches(clear_filters):
                     self.__latest_active_delta_rejection_summary = None
-            self.__last_signature = self.__signature(self.__entries[-1]) if self.__entries else None
+            last_entry = self.__entries.last()
+            self.__last_signature = self.__signature(last_entry) if last_entry is not None else None
             self.__coalesce_entries.clear()
             self.__refresh_failure_locked()
             if self.__clear_scope_includes_root_progress(clear_filters):
@@ -4985,7 +5180,6 @@ class BreadcrumbTraceCollector:
         with self.__lock:
             cleared_count = len(self.__entries)
             self.__entries.clear()
-            self.__entry_sizes.clear()
             self.__retained_bytes = 0
             self.__last_signature = None
             self.__coalesce_entries.clear()
@@ -5394,16 +5588,11 @@ class BreadcrumbTraceCollector:
             self.__category_counter(entry)["admitted"] += 1
             signature = self.__signature(entry, coalesce_key)
             coalesced_entry = self.__coalesce_entries.get(signature) if coalesce_key is not None else None
-            coalesced_index = None
-            if coalesced_entry is not None:
-                coalesced_index = next(
-                    (index for index, candidate in enumerate(self.__entries) if candidate is coalesced_entry),
-                    None,
-                )
-            if self.__entries and (signature == self.__last_signature or coalesced_index is not None):
-                if coalesced_index is None:
-                    coalesced_index = len(self.__entries) - 1
-                last_entry = self.__entries[coalesced_index]
+            last_node = self.__entries.last()
+            coalesced_node = coalesced_entry
+            if last_node is not None and (signature == self.__last_signature or coalesced_node is not None):
+                last_node = coalesced_node if coalesced_node is not None else last_node
+                last_entry = last_node
                 # Coalescing can raise an earlier entry's last-seen version;
                 # failure projection therefore remains ordered by entry position.
                 refresh_failure = (
@@ -5416,9 +5605,9 @@ class BreadcrumbTraceCollector:
                 self.__coalesced_count += 1
                 self.__category_counter(last_entry)["coalesced"] += 1
                 last_entry["last_seen_version"] = self.__version
-                old_size = self.__entry_sizes[coalesced_index]
+                old_size = last_node.size
                 new_size = self.__estimate_entry_bytes(last_entry)
-                self.__entry_sizes[coalesced_index] = new_size
+                last_node.size = new_size
                 self.__retained_bytes += new_size - old_size
                 if event_type == "failure":
                     self.__last_failure_entry = copy.deepcopy(last_entry)
@@ -5444,18 +5633,22 @@ class BreadcrumbTraceCollector:
                 self.__category_counter(entry)["oversized_dropped"] += 1
                 self.__record_gap_range(self.__version, self.__version, "oversized")
                 return "dropped"
-            self.__entries.append(entry)
-            self.__entry_sizes.append(entry_size)
+            node = self.__entries.append(
+                entry, entry_size, self.__is_category_protected,
+                self.__policy["retention"]["protected_levels"],
+                self.__policy["retention"]["latest_decision_event_types"],
+                signature if coalesce_key is not None else None,
+            )
             self.__retained_bytes += entry_size
             self.__last_signature = signature
             if coalesce_key is not None:
-                self.__coalesce_entries[signature] = entry
+                self.__coalesce_entries[signature] = node
             if event_type == "failure":
                 self.__last_failure_entry = copy.deepcopy(entry)
                 self.__last_failure_version = self.__version
             self.__enqueue_durable_entry(entry)
             evicted = self.__evict_to_budget()
-            if not evicted or self.__entries and self.__entries[-1] is entry:
+            if not evicted or self.__entries.last() is node:
                 return "retained"
             return "evicted" if root_progress_observation else "dropped"
 
@@ -5464,7 +5657,7 @@ class BreadcrumbTraceCollector:
             int(entry.get("version", 0)) <= version <= int(
                 entry.get("last_seen_version", entry.get("version", 0)),
             )
-            for entry in self.__entries
+            for entry in self.__entries.values()
         )
 
     def __enqueue_durable_entry(self, entry: Mapping[str, Any]) -> None:
@@ -5533,61 +5726,13 @@ class BreadcrumbTraceCollector:
             self.__retained_bytes > self.__memory_budget_bytes
             or self.__max_entries is not None and len(self.__entries) > self.__max_entries
         ):
-            # Reverse-scan the lock-held snapshot so latest decisions are
-            # protected when first encountered and category counts identify
-            # the same oldest victim without a protected-index set.
-            entries = tuple(self.__entries)
-            category_counts: Dict[str, tuple[int, int]] = {}
-            all_counts: Dict[str, tuple[int, int]] = {}
-            latest_decision_seen: set[str] = set()
-            protected_category_cache: Dict[str, bool] = {}
-            eligible_found = False
-            retention = self.__policy["retention"]
-            for index in range(len(entries) - 1, -1, -1):
-                entry = entries[index]
-                category = str(entry.get("category") or "unknown")
-                latest = entry.get("event_type") in retention["latest_decision_event_types"]
-                is_latest_decision = latest and category not in latest_decision_seen
-                if latest:
-                    latest_decision_seen.add(category)
-                protected_key = str(entry.get("category") or "")
-                protected_category = protected_category_cache.get(protected_key)
-                if protected_category is None:
-                    protected_category = self.__is_category_protected(protected_key)
-                    protected_category_cache[protected_key] = protected_category
-                protected = (
-                    entry.get("level") in retention["protected_levels"]
-                    or protected_category or is_latest_decision
-                )
-                if not protected:
-                    eligible_found = True
-                    count, _ = category_counts.get(category, (0, index))
-                    count += 1
-                    category_counts[category] = (count, index)
-                elif not eligible_found:
-                    count, _ = all_counts.get(category, (0, index))
-                    count += 1
-                    all_counts[category] = (count, index)
-            counts = category_counts if eligible_found else all_counts
-            chosen_index: Optional[int] = None
-            chosen_count = 0
-            for count, oldest_index in counts.values():
-                if (
-                    chosen_index is None or count > chosen_count
-                    or count == chosen_count and oldest_index < chosen_index
-                ):
-                    chosen_index = oldest_index
-                    chosen_count = count
-            if chosen_index is None:
+            evicted = self.__entries.select_victim()
+            if evicted is None:
                 break
-            evicted = entries[chosen_index]
-            evicted_size = self.__entry_sizes[chosen_index]
-            del self.__entries[chosen_index]
-            del self.__entry_sizes[chosen_index]
-            for signature, candidate in tuple(self.__coalesce_entries.items()):
-                if candidate is evicted:
-                    del self.__coalesce_entries[signature]
-            self.__retained_bytes -= evicted_size
+            self.__entries.remove(evicted)
+            if evicted.signature is not None and self.__coalesce_entries.get(evicted.signature) is evicted:
+                del self.__coalesce_entries[evicted.signature]
+            self.__retained_bytes -= evicted.size
             self.__evicted_count += 1
             self.__category_counter(evicted)["evicted"] += 1
             self.__record_gap_range(
@@ -5599,14 +5744,15 @@ class BreadcrumbTraceCollector:
             evicted_any = True
             evicted_failure = evicted_failure or evicted.get("event_type") == "failure"
         self.__retained_bytes = max(0, self.__retained_bytes)
-        self.__last_signature = self.__signature(self.__entries[-1]) if self.__entries else None
+        last_entry = self.__entries.last()
+        self.__last_signature = self.__signature(last_entry) if last_entry is not None else None
         if evicted_failure:
             self.__refresh_failure_locked()
         return evicted_any
 
     def __refresh_failure_locked(self) -> None:
         latest: Optional[Dict[str, Any]] = None
-        for entry in self.__entries:
+        for entry in self.__entries.values():
             if entry.get("event_type") == "failure":
                 latest = entry
         if latest is None:
@@ -5739,7 +5885,12 @@ class BreadcrumbTraceCollector:
         end_time_ms: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         result: List[Dict[str, Any]] = []
-        iterator = reversed(entries) if order == "desc" and isinstance(entries, deque) else entries
+        if order == "desc" and isinstance(entries, _RetainedWindow):
+            iterator = reversed(entries.values())
+        elif order == "desc" and isinstance(entries, deque):
+            iterator = reversed(entries)
+        else:
+            iterator = entries
         filters = {"source": source, "category": category, "level": level, "corr_id": corr_id,
                    "flow_id": flow_id, "stage": stage, "event_type": event_type,
                    "path_pair_id": path_pair_id, "file_id": file_id}
