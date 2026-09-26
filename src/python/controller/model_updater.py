@@ -1757,12 +1757,13 @@ class _ModelUpdateTimedModelLock:
         self.__diagnostics = diagnostics
         self.__wait_breadcrumb = _ModelFinalizationBreadcrumbSpan(
             controller, "model_lock_wait", correlation,
+            defer_recording=True, eager_entry=True,
         ) if controller is not None else None
         self.__hold_breadcrumb = _ModelFinalizationBreadcrumbSpan(
-            controller, "model_lock_hold", correlation,
+            controller, "model_lock_hold", correlation, defer_recording=True,
         ) if controller is not None else None
         self.__release_breadcrumb = _ModelFinalizationBreadcrumbSpan(
-            controller, "model_lock_release", correlation,
+            controller, "model_lock_release", correlation, defer_recording=True,
         ) if controller is not None else None
         self.__wait_span = _ModelUpdateDurationSpan(
             diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_WAIT,
@@ -1772,6 +1773,11 @@ class _ModelUpdateTimedModelLock:
         )
 
     def __enter__(self) -> object:
+        for span in (
+                self.__wait_breadcrumb, self.__hold_breadcrumb,
+                self.__release_breadcrumb):
+            if span is not None:
+                span.prepare()
         if self.__wait_breadcrumb is not None:
             self.__wait_breadcrumb.__enter__()
         self.__wait_span.__enter__()
@@ -1781,6 +1787,7 @@ class _ModelUpdateTimedModelLock:
             self.__wait_span.__exit__(type(exc), exc, exc.__traceback__)
             if self.__wait_breadcrumb is not None:
                 self.__wait_breadcrumb.__exit__(type(exc), exc, exc.__traceback__)
+                self.__wait_breadcrumb.flush()
             raise
         try:
             self.__wait_span.__exit__(None, None, None)
@@ -1796,12 +1803,17 @@ class _ModelUpdateTimedModelLock:
             self.__model_lock.__exit__(type(exc), exc, exc.__traceback__)
             if self.__hold_breadcrumb is not None:
                 self.__hold_breadcrumb.__exit__(type(exc), exc, exc.__traceback__)
+            if self.__wait_breadcrumb is not None:
+                self.__wait_breadcrumb.flush()
+            if self.__hold_breadcrumb is not None:
+                self.__hold_breadcrumb.flush()
             raise
         return entered
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
-        # Finish while the original lock remains held.  The wrapped context
-        # still owns its normal release and exception-suppression semantics.
+        # Capture boundaries while the original lock remains held, then emit
+        # only after its normal release so a blocked recorder cannot extend
+        # the critical section.
         diagnostic_error: Optional[BaseException] = None
         try:
             self.__hold_span.__exit__(exc_type, exc_value, traceback)
@@ -1833,6 +1845,11 @@ class _ModelUpdateTimedModelLock:
                         self.__release_breadcrumb.__exit__(None, None, None)
                     except BaseException:
                         pass
+        for span in (
+                self.__wait_breadcrumb, self.__hold_breadcrumb,
+                self.__release_breadcrumb):
+            if span is not None:
+                span.flush()
         if diagnostic_error is not None:
             raise diagnostic_error
         return suppressed

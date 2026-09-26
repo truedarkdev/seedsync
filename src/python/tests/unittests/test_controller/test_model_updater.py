@@ -479,6 +479,146 @@ class TestModelUpdater(unittest.TestCase):
                 pass
             self.assertEqual(["entered", "exited"], lock.events)
 
+    def test_timed_model_lock_deferred_breadcrumbs_do_not_block_lock_contenders(self):
+        for blocked_stage, blocked_phase in (
+                ("model_lock_wait", "complete"),
+                ("model_lock_hold", "entry"),
+                ("model_lock_hold", "complete"),
+                ("model_lock_release", "entry")):
+            with self.subTest(stage=blocked_stage, phase=blocked_phase):
+                blocked = Event()
+                resume = Event()
+                hold_metric_finished = Event()
+                lock = ThreadLock()
+
+                class Trace:
+                    def is_effectively_enabled(self, category, level):
+                        return True
+
+                class Diagnostics:
+                    def begin_duration(self, metric):
+                        return metric
+
+                    def finish_duration(self, metric, token):
+                        if metric == DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD:
+                            hold_metric_finished.set()
+
+                def recorder(**kwargs):
+                    details = kwargs["details"]
+                    if (details.get("stage"), details.get("phase")) == (
+                            blocked_stage, blocked_phase):
+                        blocked.set()
+                        self.assertTrue(resume.wait(2))
+
+                controller = SimpleNamespace(
+                    _Controller__context=SimpleNamespace(breadcrumb_trace=Trace()),
+                    _Controller__record_breadcrumb=recorder,
+                    logger=MagicMock(),
+                )
+                errors = []
+
+                def run_lock_context():
+                    try:
+                        with _ModelUpdateTimedModelLock(
+                                lock, Diagnostics(), controller, "model-update:aggregate"):
+                            pass
+                    except BaseException as error:
+                        errors.append(error)
+
+                worker = Thread(target=run_lock_context)
+                worker.start()
+                self.assertTrue(blocked.wait(2))
+                contender_acquired = lock.acquire(timeout=0.5)
+                if contender_acquired:
+                    lock.release()
+                metric_finished_while_blocked = hold_metric_finished.is_set()
+                resume.set()
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual([], errors)
+                self.assertTrue(contender_acquired)
+                self.assertTrue(metric_finished_while_blocked)
+
+    def test_timed_model_lock_disabled_breadcrumb_gate_keeps_lock_behavior(self):
+        recorder = MagicMock()
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(
+                breadcrumb_trace=SimpleNamespace(
+                    is_effectively_enabled=lambda category, level: False,
+                ),
+            ),
+            _Controller__record_breadcrumb=recorder,
+            logger=MagicMock(),
+        )
+        lock = ThreadLock()
+        with _ModelUpdateTimedModelLock(lock, None, controller):
+            self.assertFalse(lock.acquire(blocking=False))
+        self.assertTrue(lock.acquire(blocking=False))
+        lock.release()
+        recorder.assert_not_called()
+
+    def test_timed_model_lock_emits_bounded_correlated_span_pairs(self):
+        trace = BreadcrumbTraceCollector(lambda: True)
+        controller = self._model_finalization_trace_controller(trace)
+        correlation = "lftp-poll:0123456789abcdef"
+
+        with _ModelUpdateTimedModelLock(ThreadLock(), None, controller, correlation):
+            pass
+
+        events = trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=8,
+        )["events"]
+        self.assertEqual(
+            [
+                ("model_lock_wait", "entry"),
+                ("model_lock_wait", "complete"),
+                ("model_lock_hold", "entry"),
+                ("model_lock_hold", "complete"),
+                ("model_lock_release", "entry"),
+                ("model_lock_release", "complete"),
+            ],
+            [(event["details"]["stage"], event["details"]["phase"]) for event in events],
+        )
+        self.assertEqual({correlation}, {event["corr_id"] for event in events})
+
+    def test_timed_model_lock_preserves_wrapped_exception_suppression(self):
+        class SuppressingLock:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return exc_type is RuntimeError
+
+        with _ModelUpdateTimedModelLock(SuppressingLock(), None):
+            raise RuntimeError("suppressed")
+
+    def test_timed_model_lock_deferred_pairs_fit_saturated_bounded_collector(self):
+        budget = 4096
+        trace = BreadcrumbTraceCollector(lambda: True, memory_budget_bytes=budget)
+        fill_index = 0
+        while trace.retained_bytes < budget - 700:
+            trace.record(
+                "test", "budget_fill_{}".format(fill_index), {"payload": "x" * 200},
+                category="test.budget_fill",
+            )
+            fill_index += 1
+        self.assertLessEqual(trace.retained_bytes, budget)
+        controller = self._model_finalization_trace_controller(trace)
+
+        with _ModelUpdateTimedModelLock(
+                ThreadLock(), None, controller, "lftp-poll:0123456789abcdef"):
+            pass
+
+        events = trace.query_events(
+            category="model.finalization", stage="model_finalization", limit=8,
+        )["events"]
+        self.assertLessEqual(len(events), 6)
+        for event in events:
+            self.assertIsInstance(event["details"]["boundary_monotonic_ns"], int)
+        snapshot = trace.snapshot()
+        self.assertLessEqual(snapshot["retained_bytes"], budget)
+        self.assertGreater(snapshot["accounting"]["evicted_count"], 0)
+
     def test_model_update_work_lock_release_survives_baseexception_breadcrumb_gate(self):
         class BreadcrumbFailure(BaseException):
             pass
