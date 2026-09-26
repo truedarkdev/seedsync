@@ -2290,6 +2290,7 @@ class Controller:
             backend_outcome: str,
             marker_observed: Optional[bool] = None,
             operation_sequence: Optional[int] = None,
+            descendant_stop_markers_cleared: Optional[int] = None,
             rejection_reason: str = "none",
             message: str = "transfer_stop_transition",
     ) -> None:
@@ -2333,6 +2334,9 @@ class Controller:
                 ),
                 "rejection_reason": rejection_reason,
             }
+            if type(descendant_stop_markers_cleared) is int and \
+                    0 <= descendant_stop_markers_cleared <= 2_147_483_647:
+                details["descendant_stop_markers_cleared"] = descendant_stop_markers_cleared
             self.__record_breadcrumb(
                 stage="transfer_stop",
                 message=message,
@@ -5916,6 +5920,40 @@ class Controller:
     @staticmethod
     def __clear_persist_key(keys: set[str], name: str, path_pair_id: Optional[str] = None) -> None:
         keys.difference_update(Controller.__persist_key_candidates(name, path_pair_id))
+
+    def __clear_stopped_subtree(self, root: ModelFile) -> int:
+        """Clear canonical Stop markers within one explicitly queued directory."""
+        root_path = root.full_path
+        descendant_prefix = root_path + "/"
+        path_pair_id = root.path_pair_id
+        stopped = self.__persist.stopped_file_names
+        cleared = 0
+        for key in tuple(stopped):
+            path: Optional[str] = None
+            if path_pair_id is None:
+                # Default-pair IDs are plain paths. Leave JSON-looking values
+                # alone because they may be malformed or ambiguous identities.
+                if key.startswith("["):
+                    continue
+                path = key
+            else:
+                try:
+                    identity = json.loads(key)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(identity, list) or len(identity) != 2 or \
+                        identity[0] != path_pair_id or not isinstance(identity[1], str) or \
+                        ModelFile.build_file_id(identity[1], path_pair_id) != key:
+                    continue
+                path = identity[1]
+            if not isinstance(path, str) or "\\" in path or any(
+                    component in ("", ".", "..") for component in path.split("/")
+            ):
+                continue
+            if path == root_path or path.startswith(descendant_prefix):
+                stopped.discard(key)
+                cleared += 1
+        return cleared
 
     def __is_previously_downloaded(self, name: str, path_pair_id: Optional[str] = None) -> bool:
         return Controller.__has_persist_key(self.__persist.downloaded_file_names, name, path_pair_id)
@@ -11712,6 +11750,9 @@ class Controller:
                             file.full_path,
                             file.path_pair_id
                         )
+                        descendant_stop_markers_cleared = 0
+                        if file.is_dir and getattr(command, "origin", "manual") == "manual":
+                            descendant_stop_markers_cleared = self.__clear_stopped_subtree(file)
                         self.__record_transfer_stop_breadcrumb(
                             file.file_id,
                             source="queue",
@@ -11730,6 +11771,7 @@ class Controller:
                                 file.path_pair_id,
                             ),
                             operation_sequence=operation_sequence,
+                            descendant_stop_markers_cleared=descendant_stop_markers_cleared,
                             rejection_reason="none",
                             message="transfer_stop_queue_marker_clear",
                         )

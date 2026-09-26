@@ -9052,6 +9052,124 @@ class TestController(unittest.TestCase):
 
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
 
+    def test_clear_stopped_subtree_uses_canonical_pair_and_component_boundaries(self):
+        root = ModelFile("root", True)
+        root.path_pair_id = "pair-a"
+        selected = {
+            root.file_id,
+            ModelFile.build_file_id("root/nested/leaf.bin", "pair-a"),
+        }
+        retained = {
+            ModelFile.build_file_id("rooted/leaf.bin", "pair-a"),
+            ModelFile.build_file_id("root/nested/leaf.bin", "pair-b"),
+            ModelFile.build_file_id("root/../outside.bin", "pair-a"),
+            ModelFile.build_file_id("root//ambiguous.bin", "pair-a"),
+            ModelFile.build_file_id("root\\alias.bin", "pair-a"),
+        }
+        malformed = '["pair-a", "root/nested/leaf.bin"]'
+        markers = selected | retained | {malformed}
+        self.controller._Controller__persist.stopped_file_names = set(markers)
+
+        self.controller._Controller__clear_stopped_subtree(root)
+
+        self.assertEqual(retained | {malformed}, self.controller._Controller__persist.stopped_file_names)
+
+        default_root = ModelFile("plain", True)
+        default_root.path_pair_id = None
+        default_selected = {"plain", "plain/child/leaf.bin"}
+        ambiguous = '["pair-a","plain/child/leaf.bin"]'
+        self.controller._Controller__persist.stopped_file_names = default_selected | {"plainish/file", ambiguous}
+        self.controller._Controller__clear_stopped_subtree(default_root)
+        self.assertEqual({"plainish/file", ambiguous}, self.controller._Controller__persist.stopped_file_names)
+
+    def test_real_delete_then_accepted_manual_root_queue_resumes_only_its_subtree(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final = Path(temp_dir) / "final"
+            staging = Path(temp_dir) / "staging"
+            other_final = Path(temp_dir) / "other-final"
+            other_staging = Path(temp_dir) / "other-staging"
+            for directory in (final, staging, other_final, other_staging):
+                directory.mkdir()
+
+            root = ModelFile("root", True)
+            root.path_pair_id = "pair-a"
+            root.remote_size = 11
+            root.remote_has_transferable_content = True
+            child = ModelFile("child.bin", False)
+            child.path_pair_id = "pair-a"
+            child.local_size = 5
+            child.remote_size = 5
+            root.add_child(child)
+            target = final / "root" / "child.bin"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"local")
+
+            self.controller._Controller__mp_logger.queue = None
+            self.controller._Controller__mp_logger.log_level = 20
+            self.controller._Controller__model.get_file.side_effect = {
+                root.file_id: root, child.file_id: child,
+            }.__getitem__
+            self.controller._Controller__path_pairs_by_id = {
+                "pair-a": SimpleNamespace(local_path=str(final), remote_path="/remote/a"),
+                "pair-b": SimpleNamespace(local_path=str(other_final), remote_path="/remote/b"),
+            }
+            self.controller._Controller__path_pair_staging_paths = {
+                "pair-a": str(staging), "pair-b": str(other_staging),
+            }
+            self.controller._Controller__legacy_local_path = str(final)
+            trace = BreadcrumbTraceCollector(lambda: True, max_entries=128)
+            self.controller._Controller__context.breadcrumb_trace = trace
+
+            delete = Controller.Command(Controller.Command.Action.DELETE_LOCAL, child.file_id)
+            delete.add_callback(SimpleNamespace(on_success=lambda: None, on_failure=lambda *args: None))
+            self.controller.queue_command(delete)
+            self.controller._Controller__process_commands()
+            delete_process = self.controller._Controller__active_command_processes[-1].process
+            delete_process.join(5)
+            self.assertFalse(delete_process.is_alive())
+            self.controller._Controller__cleanup_commands()
+            self.assertFalse(target.exists())
+            self.assertIn(child.file_id, self.controller._Controller__persist.stopped_file_names)
+
+            root_marker = root.file_id
+            outside_marker = ModelFile.build_file_id("rooted/leaf.bin", "pair-a")
+            other_pair_marker = ModelFile.build_file_id("other/leaf.bin", "pair-b")
+            self.controller._Controller__persist.stopped_file_names.update(
+                {root_marker, outside_marker, other_pair_marker}
+            )
+            queue = Controller.Command(Controller.Command.Action.QUEUE, root.file_id)
+            queue.add_callback(SimpleNamespace(on_success=lambda: None, on_failure=lambda *args: None))
+            self.controller.queue_command(queue)
+            self.controller._Controller__process_commands()
+            intent = self.controller._Controller__deferred_queue_intents[root.file_id]
+            local_session, remote_session = intent.rescan_generations[0][0], intent.rescan_generations[1][0]
+            self.controller._Controller__scan_authority_tokens = {
+                "local": {"pair-a": (local_session, 1)},
+                "remote": {"pair-a": (remote_session, 1)},
+            }
+            self.controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
+            self.controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+            self.controller._Controller__process_commands()
+
+            self.controller._Controller__lftp.queue.assert_called_once()
+            markers = self.controller._Controller__persist.stopped_file_names
+            self.assertNotIn(root_marker, markers)
+            self.assertNotIn(child.file_id, markers)
+            self.assertIn(outside_marker, markers)
+            self.assertIn(other_pair_marker, markers)
+            queue_clear = next(
+                entry for entry in trace.snapshot()["entries"]
+                if entry["message"] == "transfer_stop_queue_marker_clear"
+            )
+            self.assertEqual(1, queue_clear["details"]["descendant_stop_markers_cleared"])
+
+            staged = staging / "root" / "child.bin"
+            staged.parent.mkdir(parents=True)
+            staged.write_bytes(b"staged")
+            result = self.controller._finalize_staging_child("root", "child.bin", "pair-a")
+            self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
+            self.assertTrue((final / "root" / "child.bin").exists())
+
     def test_persist_key_helpers_require_canonical_keys(self):
         pair_id = "12345678-1234-1234-1234-123456789abc"
         file_name = "dup"
@@ -13018,6 +13136,113 @@ class TestController(unittest.TestCase):
         }
         self.controller._Controller__model_builder.has_unresolved_staging_collision.return_value = False
         return file
+
+    def _release_manual_directory_scan_readiness_fixture(self, file):
+        intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+        local_session, remote_session = intent.rescan_generations[0][0], intent.rescan_generations[1][0]
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {file.path_pair_id: (local_session, 1)},
+            "remote": {file.path_pair_id: (remote_session, 1)},
+        }
+        self.controller._Controller__reconciled_local_path_pair_ids.add(file.path_pair_id)
+        self.controller._Controller__reconciled_remote_path_pair_ids.add(file.path_pair_id)
+
+    def test_manual_directory_queue_sync_rejection_preserves_subtree_stops(self):
+        root = self._seed_manual_directory_scan_readiness_fixture()
+        child_marker = ModelFile.build_file_id("sample-directory/child.bin", "pair-a")
+        self.controller._Controller__persist.stopped_file_names.update({root.file_id, child_marker})
+        self.controller._Controller__lftp.queue.return_value = False
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, root.file_id))
+        self.controller._Controller__process_commands()
+        self._release_manual_directory_scan_readiness_fixture(root)
+
+        self.controller._Controller__process_commands()
+
+        self.assertIn(root.file_id, self.controller._Controller__persist.stopped_file_names)
+        self.assertIn(child_marker, self.controller._Controller__persist.stopped_file_names)
+
+    def test_async_directory_queue_submission_rejection_preserves_subtree_stops(self):
+        root = self._seed_manual_directory_scan_readiness_fixture()
+        child_marker = ModelFile.build_file_id("sample-directory/child.bin", "pair-a")
+        self.controller._Controller__persist.stopped_file_names.update({root.file_id, child_marker})
+        self.controller._Controller__context.breadcrumb_trace = SimpleNamespace(
+            is_effectively_enabled=lambda category, level="info": False,
+        )
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, root.file_id))
+        with (
+                patch.object(self.controller, "_Controller__uses_async_lftp_owner", return_value=True),
+                patch.object(self.controller, "_Controller__submit_lftp_operation", return_value=False),
+        ):
+            self.controller._Controller__process_commands()
+            self._release_manual_directory_scan_readiness_fixture(root)
+            self.controller._Controller__process_commands()
+
+        self.assertIn(root.file_id, self.controller._Controller__persist.stopped_file_names)
+        self.assertIn(child_marker, self.controller._Controller__persist.stopped_file_names)
+
+    def test_auto_queue_does_not_clear_explicit_descendant_stop(self):
+        root = self._seed_manual_directory_scan_readiness_fixture()
+        child_marker = ModelFile.build_file_id("sample-directory/child.bin", "pair-a")
+        self.controller._Controller__persist.stopped_file_names.add(child_marker)
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=32)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        command = Controller.Command(
+            Controller.Command.Action.QUEUE, root.file_id, origin="auto_queue",
+        )
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once()
+        self.assertIn(child_marker, self.controller._Controller__persist.stopped_file_names)
+        queue_clear = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "transfer_stop_queue_marker_clear"
+        )
+        self.assertEqual(0, queue_clear["details"]["descendant_stop_markers_cleared"])
+
+    def test_async_directory_queue_later_stop_survives_failed_queue_future(self):
+        root = self._seed_manual_directory_scan_readiness_fixture()
+        child_marker = ModelFile.build_file_id("sample-directory/child.bin", "pair-a")
+        self.controller._Controller__persist.stopped_file_names.update({root.file_id, child_marker})
+        self.controller._Controller__context.breadcrumb_trace = SimpleNamespace(
+            is_effectively_enabled=lambda category, level="info": False,
+        )
+        self.controller._Controller__lftp_operations = []
+        self.controller._Controller__lftp_operation_sequences = {}
+        futures = {}
+
+        def submit(action, _operation, file_id, operation_sequence, *args, **kwargs):
+            future = Future()
+            if action == "stop":
+                future.set_result(True)
+            futures[action] = future
+            self.controller._Controller__lftp_operations.append(_LftpOperation(
+                action, future, file_id, operation_sequence,
+                pending_dispatch=kwargs.get("pending_dispatch"),
+                download_start_lifecycle_before=kwargs.get("download_start_lifecycle_before"),
+            ))
+            self.controller._Controller__lftp_operation_sequences[file_id] = operation_sequence
+            return True
+
+        queue = Controller.Command(Controller.Command.Action.QUEUE, root.file_id)
+        self.controller.queue_command(queue)
+        with (
+                patch.object(self.controller, "_Controller__uses_async_lftp_owner", return_value=True),
+                patch.object(self.controller, "_Controller__submit_lftp_operation", side_effect=submit),
+        ):
+            self.controller._Controller__process_commands()
+            self._release_manual_directory_scan_readiness_fixture(root)
+            self.controller._Controller__process_commands()
+            self.assertNotIn(child_marker, self.controller._Controller__persist.stopped_file_names)
+
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, root.file_id))
+            self.controller._Controller__process_commands()
+            self.assertIn(root.file_id, self.controller._Controller__persist.stopped_file_names)
+
+            futures["queue"].set_exception(RuntimeError("late queue failure"))
+            self.controller._Controller__drain_lftp_operations()
+
+        self.assertIn(root.file_id, self.controller._Controller__persist.stopped_file_names)
 
     def test_manual_directory_queue_retains_intent_until_initial_scan_authority_is_ready(self):
         file = self._seed_manual_directory_scan_readiness_fixture()
