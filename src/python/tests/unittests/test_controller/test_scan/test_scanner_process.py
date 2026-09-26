@@ -2,14 +2,17 @@
 
 import unittest
 import inspect
+import json
 import multiprocessing
 import logging
+import os
 import pickle
 import queue
 import threading
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
@@ -17,7 +20,10 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from common import Localization, MultiprocessingLogger
-from common.breadcrumb_trace import BreadcrumbTraceCollector, is_critical_breadcrumb, opaque_trace_correlation
+from common.breadcrumb_trace import (
+    BreadcrumbTraceCollector, is_critical_breadcrumb, opaque_trace_correlation,
+    trace_session_digest,
+)
 from common.performance_diagnostics import (
     DURATION_REMOTE_SCAN_AGGREGATION,
     DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION,
@@ -1402,6 +1408,309 @@ class TestScannerProcess(unittest.TestCase):
         process.prioritize_scan("pair-6", require_successor=True)
 
         self.assertEqual({"pair-6"}, process._ScannerProcess__drain_priority_target_path_pair_ids())
+
+    def test_priority_request_breadcrumb_records_queue_and_coalescing_with_opaque_identity(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        scanner = LocalPairScanner()
+        scanner.path_pair_id = "private-pair-id"
+        scanner.path_pair_name = "Private Pair Name"
+        process = ScannerProcess(
+            scanner=scanner, interval_in_ms=1000, verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        self.addCleanup(process.close_queues)
+        process._ScannerProcess__scan_generation = 7
+        process._ScannerProcess__session_token = "private-session-token"
+        emitter = process._ScannerProcess__breadcrumb_trace
+        original_record = emitter.record
+        ingress_details = []
+
+        def record(*args, **kwargs):
+            if args[1] == "scan_priority_requested":
+                ingress_details.append(args[2])
+            return original_record(*args, **kwargs)
+
+        emitter.record = record
+
+        process.prioritize_scan("private-pair-id")
+        process.prioritize_scan("private-pair-id")
+        process._ScannerProcess__inline_scan_active.set()
+        process._ScannerProcess__inline_scan_target_path_pair_ids = {"private-pair-id"}
+        process._ScannerProcess__wake_event.clear()
+        process.prioritize_scan("private-pair-id")
+        self.assertFalse(process._ScannerProcess__wake_event.is_set())
+        process.prioritize_scan("private-pair-id", require_successor=True)
+
+        entries = [
+            entry for entry in collector.snapshot()["entries"]
+            if entry["message"] == "scan_priority_requested"
+        ]
+        self.assertEqual(
+            ["queued", "coalesced_pending", "coalesced_active", "coalesced_pending"],
+            [entry["details"]["decision"] for entry in entries],
+        )
+        expected_pair = opaque_trace_correlation("scan-pair|private-pair-id")
+        self.assertEqual(4, len(ingress_details))
+        self.assertTrue(all(
+            details["scan_digest"] == trace_session_digest("private-session-token")
+            for details in ingress_details
+        ))
+        expected_corr_id = "local:{}:7".format(trace_session_digest("private-session-token"))
+        for entry in entries:
+            details = entry["details"]
+            self.assertEqual("scan_priority_request.v1", details["schema"])
+            self.assertEqual(expected_pair, details["request_correlation"])
+            self.assertEqual("local", details["scanner_side"])
+            self.assertEqual(trace_session_digest("private-session-token"), details["scan_digest"])
+            self.assertEqual(7, details["current_generation"])
+            self.assertIsInstance(details["utc"], str)
+            self.assertIsInstance(details["monotonic_ms"], int)
+            self.assertEqual(9, len(details))
+            self.assertEqual("scanner_process", entry["category"])
+            self.assertEqual("scan", entry["stage"])
+            self.assertEqual(expected_corr_id, entry["corr_id"])
+        self.assertFalse(entries[2]["details"]["require_successor"])
+        self.assertTrue(entries[3]["details"]["require_successor"])
+        self.assertTrue(process._ScannerProcess__wake_event.is_set())
+        serialized = repr(collector.snapshot())
+        self.assertNotIn("private-pair-id", serialized)
+        self.assertNotIn("Private Pair Name", serialized)
+        self.assertNotIn("private-session-token", serialized)
+
+    def test_priority_request_breadcrumb_joins_actual_scan_start_and_result(self):
+        with tempfile.TemporaryDirectory() as spool_dir:
+            collector = BreadcrumbTraceCollector(
+                lambda: True, max_entries=16, policy={"default": "info"},
+                durable_enabled=True, durable_path=spool_dir,
+            )
+            scanner = LocalPairScanner()
+            scanner.path_pair_id = "private-pair-id"
+            scanner.path_pair_name = "Private Pair Name"
+            process = ScannerProcess(
+                scanner=scanner, interval_in_ms=1000, verbose=False,
+                breadcrumb_trace=collector.create_emitter(),
+            )
+            self.addCleanup(process.close_queues)
+            process._ScannerProcess__session_token = "joinable-session"
+
+            process.run_init()
+            process.prioritize_scan("private-pair-id")
+            process.run_loop()
+            collector.close(timeout=2.0)
+
+            with open(os.path.join(spool_dir, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+
+        request = next(entry for entry in records if entry.get("message") == "scan_priority_requested")
+        started = next(entry for entry in records if entry.get("message") == "scan_started")
+        result = next(entry for entry in records if entry.get("message") == "scan_result_published")
+        details = request["details"]
+        expected_digest = trace_session_digest("joinable-session")
+        self.assertEqual(0, details["current_generation"])
+        self.assertEqual("queued", details["decision"])
+        self.assertEqual(expected_digest, details["scan_digest"])
+        self.assertEqual("local", details["scanner_side"])
+        self.assertEqual("local:{}:0".format(expected_digest), request["corr_id"])
+        self.assertEqual("local:{}:1".format(expected_digest), started["corr_id"])
+        self.assertEqual(started["corr_id"], result["corr_id"])
+        self.assertEqual(1, started["details"]["generation"])
+        self.assertEqual(started["details"]["generation"], result["details"]["generation"])
+        expected_pair = opaque_trace_correlation("scan-pair|private-pair-id")
+        self.assertEqual(expected_pair, details["request_correlation"])
+        self.assertEqual([expected_pair], started["details"]["requested_members"])
+        self.assertEqual([expected_pair], result["details"]["scanned_members"])
+        self.assertNotIn("private-pair-id", repr(records))
+        self.assertNotIn("Private Pair Name", repr(records))
+        self.assertNotIn("joinable-session", repr(records))
+
+    def test_priority_request_breadcrumb_preserves_pre_wake_timestamps(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=1000, verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        self.addCleanup(process.close_queues)
+        before_utc = datetime(2026, 9, 26, 1, 2, 3, tzinfo=timezone.utc)
+        after_utc = datetime(2026, 9, 26, 4, 5, 6, tzinfo=timezone.utc)
+        clock = {"utc": before_utc, "monotonic_ns": 123_000_000}
+        wake_event = threading.Event()
+
+        class AdvancingWakeEvent:
+            def set(self):
+                clock["utc"] = after_utc
+                clock["monotonic_ns"] = 456_000_000
+                wake_event.set()
+
+            def is_set(self):
+                return wake_event.is_set()
+
+            def clear(self):
+                wake_event.clear()
+
+        process._ScannerProcess__wake_event = AdvancingWakeEvent()
+        with patch(
+            "controller.scan.scanner_process.datetime",
+            SimpleNamespace(now=lambda _timezone: clock["utc"]),
+        ), patch(
+            "controller.scan.scanner_process.time.monotonic_ns",
+            side_effect=lambda: clock["monotonic_ns"],
+        ):
+            process.prioritize_scan("pair-6")
+
+        entry = next(
+            item for item in collector.snapshot()["entries"]
+            if item["message"] == "scan_priority_requested"
+        )
+        self.assertEqual(before_utc.isoformat(), entry["details"]["utc"])
+        self.assertEqual(123, entry["details"]["monotonic_ms"])
+        self.assertEqual(after_utc, clock["utc"])
+        self.assertEqual(456_000_000, clock["monotonic_ns"])
+        self.assertTrue(process._ScannerProcess__wake_event.is_set())
+
+    def test_recycled_priority_request_breadcrumb_records_active_coalescing_without_wake(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        process = ScannerProcess(
+            scanner=RemotePairScanner(), interval_in_ms=1000, verbose=False,
+            recycle_scan_worker=True, breadcrumb_trace=collector.create_emitter(),
+        )
+        self.addCleanup(process.close_queues)
+        process._ScannerProcess__scan_generation = 3
+        process._ScannerProcess__scan_worker_target_path_pair_ids = {"pair-6"}
+        process.prioritize_scan("pair-6")
+
+        entry = next(
+            item for item in collector.snapshot()["entries"]
+            if item["message"] == "scan_priority_requested"
+        )
+        self.assertEqual("coalesced_active", entry["details"]["decision"])
+        self.assertEqual("remote", entry["details"]["scanner_side"])
+        self.assertEqual(3, entry["details"]["current_generation"])
+        self.assertFalse(process._ScannerProcess__wake_event.is_set())
+        self.assertEqual(set(), process._ScannerProcess__drain_priority_target_path_pair_ids())
+
+    def test_recycled_priority_request_breadcrumb_records_queued_successor(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        process = ScannerProcess(
+            scanner=RemotePairScanner(), interval_in_ms=1000, verbose=False,
+            recycle_scan_worker=True, breadcrumb_trace=collector.create_emitter(),
+        )
+        self.addCleanup(process.close_queues)
+        process._ScannerProcess__scan_generation = 3
+        process._ScannerProcess__scan_worker_target_path_pair_ids = {"pair-6"}
+
+        process.prioritize_scan("pair-6", require_successor=True)
+
+        entry = next(
+            item for item in collector.snapshot()["entries"]
+            if item["message"] == "scan_priority_requested"
+        )
+        self.assertEqual("queued", entry["details"]["decision"])
+        self.assertTrue(entry["details"]["require_successor"])
+        self.assertEqual({"pair-6"}, process._ScannerProcess__drain_priority_target_path_pair_ids())
+        self.assertTrue(process._ScannerProcess__priority_interrupt_event.is_set())
+        self.assertTrue(process._ScannerProcess__wake_event.is_set())
+
+    def test_priority_request_ingress_rejects_busy_collector_admission_without_waiting(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=1000, verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        self.addCleanup(process.close_queues)
+        admission_lock = collector._BreadcrumbTraceCollector__ingress_admission_lock
+        self.assertIsNotNone(admission_lock)
+        admission_lock.acquire()
+        try:
+            started = time.monotonic()
+            process.prioritize_scan("pair-6")
+            elapsed = time.monotonic() - started
+        finally:
+            admission_lock.release()
+
+        self.assertLess(elapsed, 0.2)
+        self.assertTrue(process._ScannerProcess__wake_event.is_set())
+        self.assertEqual({"pair-6"}, process._ScannerProcess__drain_priority_target_path_pair_ids())
+
+    def test_priority_request_ingress_does_not_wait_for_collector_retention_lock(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=1000, verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        self.addCleanup(process.close_queues)
+        retention_lock = collector._BreadcrumbTraceCollector__lock
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_retention_lock():
+            with retention_lock:
+                lock_held.set()
+                self.assertTrue(release_lock.wait(2))
+
+        holder = threading.Thread(target=hold_retention_lock)
+        holder.start()
+        self.assertTrue(lock_held.wait(2))
+        try:
+            started = time.monotonic()
+            process.prioritize_scan("pair-6")
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 0.2)
+            self.assertTrue(process._ScannerProcess__wake_event.is_set())
+            self.assertEqual({"pair-6"}, process._ScannerProcess__drain_priority_target_path_pair_ids())
+        finally:
+            release_lock.set()
+            holder.join(2)
+        self.assertFalse(holder.is_alive())
+
+        deadline = time.monotonic() + 1
+        entries = []
+        while time.monotonic() < deadline:
+            entries = [
+                item for item in collector.snapshot()["entries"]
+                if item["message"] == "scan_priority_requested"
+            ]
+            if entries:
+                break
+            time.sleep(0.001)
+        self.assertEqual(1, len(entries))
+        self.assertEqual("queued", entries[0]["details"]["decision"])
+
+    def test_priority_request_diagnostic_clock_and_recorder_failures_do_not_change_scheduling(self):
+        clock_process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=1000, verbose=False)
+        self.addCleanup(clock_process.close_queues)
+        with patch("controller.scan.scanner_process.time.monotonic_ns", side_effect=RuntimeError("clock unavailable")):
+            clock_process.prioritize_scan("clock-pair")
+
+        self.assertTrue(clock_process._ScannerProcess__wake_event.is_set())
+        self.assertEqual({"clock-pair"}, clock_process._ScannerProcess__drain_priority_target_path_pair_ids())
+
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        recorder_process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=1000, verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        self.addCleanup(recorder_process.close_queues)
+        recorder_process._ScannerProcess__breadcrumb_trace.record = MagicMock(
+            side_effect=RuntimeError("recorder unavailable"),
+        )
+        recorder_process.prioritize_scan("recorder-pair")
+
+        self.assertTrue(recorder_process._ScannerProcess__wake_event.is_set())
+        self.assertEqual({"recorder-pair"}, recorder_process._ScannerProcess__drain_priority_target_path_pair_ids())
+
+    def test_disabled_priority_request_breadcrumb_preserves_enqueue(self):
+        collector = BreadcrumbTraceCollector(lambda: False, max_entries=8)
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=1000, verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        self.addCleanup(process.close_queues)
+
+        process.prioritize_scan("pair-6")
+
+        self.assertEqual({"pair-6"}, process._ScannerProcess__drain_priority_target_path_pair_ids())
+        self.assertTrue(process._ScannerProcess__wake_event.is_set())
+        self.assertEqual([], collector.snapshot()["entries"])
 
     def test_priority_state_distinguishes_queued_active_and_absent_pairs(self):
         process = ScannerProcess(

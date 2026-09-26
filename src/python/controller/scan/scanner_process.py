@@ -1527,44 +1527,96 @@ class ScannerProcess:
         """Move one selected pair ahead of ordinary full-scan work."""
         if not isinstance(path_pair_id, str) or not path_pair_id:
             return
+        requested_utc = None
+        requested_monotonic_ms = None
+        try:
+            requested_utc = datetime.now(timezone.utc).isoformat()
+            requested_monotonic_ms = int(time.monotonic_ns() / 1_000_000)
+        except Exception:
+            # Missing diagnostic timestamps omit the event, never the request.
+            requested_utc = requested_monotonic_ms = None
+        current_generation = self.__scan_generation
         if not self.__recycle_scan_worker:
             self.__increment_diagnostic("scan_priority_requests")
-            self.__record_breadcrumb(
-                "scan_priority_requested",
-                {"scanner": self.__scanner.__class__.__name__},
-                path_pair_id=path_pair_id,
-            )
             if not require_successor and self.__inline_scan_active.is_set():
                 active_targets = self.__inline_scan_target_path_pair_ids
                 if active_targets is not None and path_pair_id in active_targets:
+                    self.__record_priority_request(
+                        path_pair_id, "coalesced_active", current_generation,
+                        require_successor, requested_utc, requested_monotonic_ms,
+                    )
                     return
             # Queue admission uses the active scoped scan as its authority
             # baseline and therefore explicitly requests a successor. Browser
             # stream priority retains its existing active-target coalescing.
             with self.__priority_target_lock:
+                decision = "coalesced_pending" if path_pair_id in self.__priority_target_path_pair_ids else "queued"
                 self.__priority_target_path_pair_ids.add(path_pair_id)
             if self.__scan_generation == 0:
                 self.__priority_requires_full_followup = True
             assert self.__wake_event is not None
             self.__wake_event.set()
+            self.__record_priority_request(
+                path_pair_id, decision, current_generation,
+                require_successor, requested_utc, requested_monotonic_ms,
+            )
             return
         with self.__priority_target_lock:
             if not require_successor:
                 active_targets = self.__scan_worker_target_path_pair_ids
                 if active_targets is not None and path_pair_id in active_targets:
-                    return
-            self.__priority_target_path_pair_ids.add(path_pair_id)
+                    decision = "coalesced_active"
+                else:
+                    decision = "coalesced_pending" if path_pair_id in self.__priority_target_path_pair_ids else "queued"
+            else:
+                decision = "coalesced_pending" if path_pair_id in self.__priority_target_path_pair_ids else "queued"
+            if decision != "coalesced_active":
+                self.__priority_target_path_pair_ids.add(path_pair_id)
+        if decision == "coalesced_active":
+            self.__record_priority_request(
+                path_pair_id, decision, current_generation,
+                require_successor, requested_utc, requested_monotonic_ms,
+            )
+            return
         if self.__scan_generation == 0:
             self.__priority_requires_full_followup = True
         self.__increment_diagnostic("scan_priority_requests")
-        self.__record_breadcrumb(
-            "scan_priority_requested",
-            {"scanner": self.__scanner.__class__.__name__},
-            path_pair_id=path_pair_id,
-        )
         self.__priority_interrupt_event.set()
         assert self.__wake_event is not None
         self.__wake_event.set()
+        self.__record_priority_request(
+            path_pair_id, decision, current_generation,
+            require_successor, requested_utc, requested_monotonic_ms,
+        )
+
+    def __record_priority_request(
+            self, path_pair_id: str, decision: str, current_generation: int,
+            require_successor: bool, requested_utc: Optional[str],
+            requested_monotonic_ms: Optional[int],
+    ) -> None:
+        """Emit bounded priority-request evidence outside scheduler locks."""
+        try:
+            if requested_utc is None or requested_monotonic_ms is None:
+                return
+            scanner_side = _scanner_side(self.__scanner)
+            session_digest = trace_session_digest(self.__session_token)
+            request_correlation = _scan_pair_trace_token(path_pair_id)
+            self.__record_breadcrumb("scan_priority_requested", {
+                "schema": "scan_priority_request.v1",
+                "decision": decision,
+                "request_correlation": request_correlation,
+                "scanner_side": scanner_side,
+                "scan_digest": session_digest,
+                "current_generation": current_generation,
+                "require_successor": bool(require_successor),
+                "utc": requested_utc,
+                "monotonic_ms": requested_monotonic_ms,
+            }, event_type="diagnostic", corr_id="{}:{}:{}".format(
+                scanner_side, session_digest, current_generation,
+            ))
+        except Exception:
+            # Priority scheduling must remain independent of diagnostic work.
+            return
 
     def __drain_priority_target_path_pair_ids(self) -> set[str]:
         with self.__priority_target_lock:
