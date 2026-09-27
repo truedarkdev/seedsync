@@ -68,6 +68,21 @@ class TestLftpJobStatusParser(unittest.TestCase):
         self.assertEqual(1610612736, LftpJobStatusParser._size_to_bytes("1.5gb"))
         self.assertEqual(2147483648, LftpJobStatusParser._size_to_bytes("2GiB"))
 
+    def test_mirror_size_to_bytes_uses_decimal_bare_units_and_explicit_iec_units(self):
+        for size, expected in (
+                ("0", 0), ("345", 345), ("1000B", 1000),
+                ("1k", 1000), ("1kb", 1000), ("1K", 1000), ("1KB", 1000),
+                ("1KiB", 1024), ("1Kib", 1024),
+                ("1m", 1000000), ("1mb", 1000000), ("1M", 1000000), ("1MB", 1000000),
+                ("1MiB", 1024**2), ("1Mib", 1024**2),
+                ("1g", 1000000000), ("1gb", 1000000000), ("1G", 1000000000), ("1GB", 1000000000),
+                ("1GiB", 1024**3), ("1Gib", 1024**3)):
+            with self.subTest(size=size):
+                self.assertEqual(expected, LftpJobStatusParser._mirror_size_to_bytes(size))
+
+        # The generic parser remains binary for legacy chunk sizes and speeds.
+        self.assertEqual(1024**2, LftpJobStatusParser._size_to_bytes("1M"))
+
     def test_eta_to_seconds(self):
         self.assertEqual(100, LftpJobStatusParser._eta_to_seconds("100s"))
         self.assertEqual(100*60, LftpJobStatusParser._eta_to_seconds("100m"))
@@ -288,6 +303,24 @@ class TestLftpJobStatusParser(unittest.TestCase):
                 self.assertEqual("/remote/sample-directory", statuses[0].remote_path)
                 self.assertEqual("/local/staging/", statuses[0].local_path)
                 self.assertEqual("sample-directory", statuses[0].name)
+
+    def test_mirror_known_options_progress_uses_mirror_size_units(self):
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/remote\n"
+            "Queue is running.\n"
+            "[1] mirror -c --exclude sample /remote/sample-directory /local/staging/ "
+            "-- 1KiB/2MiB (50%) 3.18 MiB/s\n"
+        )
+
+        statuses = LftpJobStatusParser().parse(output)
+
+        self.assertEqual(1, len(statuses))
+        self.assertEqual(
+            LftpJobStatus.TransferState(1024, 2*1024**2, 50, 3334471, None),
+            statuses[0].total_transfer_state,
+        )
 
     def test_mirror_unquoted_exclusion_preserves_escaped_space_backslash_and_quote(self):
         for exclusion in (r"sample\ pattern", r"sample\\pattern", r"sample\"pattern"):
@@ -913,7 +946,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="a",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(17*1024, 26*1024*1024, 0, 5*1024, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(17000, 26000000, 0, 5*1024, None)
         golden_job1.add_active_file_transfer_state(
             "aa", LftpJobStatus.TransferState(None, None, None, 997, 22)
         )
@@ -925,7 +958,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="b",
                                     flags="-c")
-        golden_job2.total_transfer_state = LftpJobStatus.TransferState(35*1024, 394*1024, 8, 11059, None)
+        golden_job2.total_transfer_state = LftpJobStatus.TransferState(35000, 394000, 8, 11059, None)
         golden_job2.add_active_file_transfer_state(
             "bb", LftpJobStatus.TransferState(12333, 131072, 9, 3993, 30)
         )
@@ -1015,7 +1048,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="a",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(152*1024, 26*1024*1024, 0, 3993, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(152000, 26000000, 0, 3993, None)
         golden_job1.add_active_file_transfer_state(
             "ab", LftpJobStatus.TransferState(126558, 25165824, 0, 3993, 1*3600+45*60)
         )
@@ -1024,7 +1057,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="b",
                                     flags="-c")
-        golden_job2.total_transfer_state = LftpJobStatus.TransferState(350*1024, 394*1024, 88, 11980, None)
+        golden_job2.total_transfer_state = LftpJobStatus.TransferState(350000, 394000, 88, 11980, None)
         golden_job2.add_active_file_transfer_state(
             "bb", LftpJobStatus.TransferState(124150, 131072, 94, 3993, 2)
         )
@@ -1204,14 +1237,14 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="ra",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(0, 1126, 0, None, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(0, 1100, 0, None, None)
         golden_job1.add_active_file_transfer_state("raa", LftpJobStatus.TransferState(None, None, None, None, None))
         golden_job2 = LftpJobStatus(job_id=2,
                                     job_type=LftpJobStatus.Type.MIRROR,
                                     state=LftpJobStatus.State.RUNNING,
                                     name="rb",
                                     flags="-c")
-        golden_job2.total_transfer_state = LftpJobStatus.TransferState(20, 9523, 0, None, None)
+        golden_job2.total_transfer_state = LftpJobStatus.TransferState(20, 9300, 0, None, None)
         golden_job2.add_active_file_transfer_state("rba", LftpJobStatus.TransferState(None, None, None, None, None))
         golden_job2.add_active_file_transfer_state("rbb", LftpJobStatus.TransferState(None, None, None, None, None))
         golden_jobs = [golden_job1, golden_job2]
@@ -1256,14 +1289,14 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="ra",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(0, 1126, 0, None, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(0, 1100, 0, None, None)
         golden_job1.add_active_file_transfer_state("raa", LftpJobStatus.TransferState(None, None, None, None, None))
         golden_job2 = LftpJobStatus(job_id=2,
                                     job_type=LftpJobStatus.Type.MIRROR,
                                     state=LftpJobStatus.State.RUNNING,
                                     name="rb",
                                     flags="-c")
-        golden_job2.total_transfer_state = LftpJobStatus.TransferState(49, 9523, 0, None, None)
+        golden_job2.total_transfer_state = LftpJobStatus.TransferState(49, 9300, 0, None, None)
         golden_job2.add_active_file_transfer_state("rba", LftpJobStatus.TransferState(None, None, None, None, None))
         golden_job2.add_active_file_transfer_state("rbb", LftpJobStatus.TransferState(None, None, None, None, None))
         golden_jobs = [golden_job1, golden_job2]
@@ -1310,7 +1343,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="ra",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(249, 8396, 3, 100, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(249, 8200, 3, 100, None)
         golden_job1.add_active_file_transfer_state("raa", LftpJobStatus.TransferState(None, None, None, 100, 8))
         golden_job1.add_active_file_transfer_state("rab/raba", LftpJobStatus.TransferState(None, None, None, None, None))
         golden_job1.add_active_file_transfer_state("rab/rabb", LftpJobStatus.TransferState(None, None, None, None, None))
@@ -1319,7 +1352,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="rb",
                                     flags="-c")
-        golden_job2.total_transfer_state = LftpJobStatus.TransferState(374, 9523, 4, 153, None)
+        golden_job2.total_transfer_state = LftpJobStatus.TransferState(374, 9300, 4, 153, None)
         golden_job2.add_active_file_transfer_state("rba", LftpJobStatus.TransferState(None, None, None, 77, 51))
         golden_job2.add_active_file_transfer_state("rbb", LftpJobStatus.TransferState(None, None, None, 76, 66))
         golden_jobs = [golden_job1, golden_job2]
@@ -1369,7 +1402,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="a",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(345, 26*1024*1024, 0, 90, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(345, 26000000, 0, 90, None)
         golden_job1.add_active_file_transfer_state(
             "aa", LftpJobStatus.TransferState(None, None, None, 90, 4*60)
         )
@@ -1431,7 +1464,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="e e",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(0, 132*1024, 0, None, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(0, 132000, 0, None, None)
         golden_job1.add_active_file_transfer_state(
             "e e a", LftpJobStatus.TransferState(None, None, None, 1003, 2*60)
         )
@@ -1522,7 +1555,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="ra",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(0, 1126, 0, None, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(0, 1100, 0, None, None)
         golden_job1.add_active_file_transfer_state(
             "raa", LftpJobStatus.TransferState(None, None, None, None, None)
         )
@@ -2130,14 +2163,14 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="Space.Trek.S23E03.720p",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(1032847360, 1032847360, 100, None, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(985000000, 985000000, 100, None, None)
 
         golden_job2 = LftpJobStatus(job_id=4,
                                     job_type=LftpJobStatus.Type.MIRROR,
                                     state=LftpJobStatus.State.RUNNING,
                                     name="Star.Battle.Movie",
                                     flags="-c")
-        golden_job2.total_transfer_state = LftpJobStatus.TransferState(121634816, 1288490188, 9, 12855541, None)
+        golden_job2.total_transfer_state = LftpJobStatus.TransferState(116000000, 1200000000, 9, 12855541, None)
         golden_job2.add_active_file_transfer_state(
             "star.battle.movie.720p.r07",
             LftpJobStatus.TransferState(44628032, 50000000, 89, 1153433, 5)
@@ -2186,7 +2219,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="Space.Trek",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(3174, 646971392, 0, 1843, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(3100, 617000000, 0, 1843, None)
         golden_job1.add_active_file_transfer_state(
             "Space.Trek.S08E05/space.trek.s08e05.r06",
             LftpJobStatus.TransferState(None, None, None, None, None)
@@ -2235,7 +2268,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="Space.Trek",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(8178892, 449839104, 1, 1059061, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(7800000, 429000000, 1, 1059061, None)
         golden_job1.add_active_file_transfer_state(
             "Space.Trek.mkv",
             LftpJobStatus.TransferState(7700480, 425302375, 1, 1059061, 420)
@@ -2259,7 +2292,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="a",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(345, 26*1024*1024, 0, 90, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(345, 26000000, 0, 90, None)
         golden_jobs = [golden_job1]
         self.assertEqual(len(golden_jobs), len(statuses))
         statuses_jobs = [j for j in statuses if j.state == LftpJobStatus.State.RUNNING]
@@ -2282,7 +2315,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="a",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(345, 26*1024*1024, 0, 90, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(345, 26000000, 0, 90, None)
         golden_jobs = [golden_job1]
         self.assertEqual(len(golden_jobs), len(statuses))
         statuses_jobs = [j for j in statuses if j.state == LftpJobStatus.State.RUNNING]
@@ -2303,7 +2336,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="a",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(345, 26*1024*1024, 0, 90, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(345, 26000000, 0, 90, None)
         golden_jobs = [golden_job1]
         self.assertEqual(len(golden_jobs), len(statuses))
         statuses_jobs = [j for j in statuses if j.state == LftpJobStatus.State.RUNNING]
@@ -2325,7 +2358,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="a",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(345, 26*1024*1024, 0, 90, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(345, 26000000, 0, 90, None)
         golden_jobs = [golden_job1]
         self.assertEqual(len(golden_jobs), len(statuses))
         statuses_jobs = [j for j in statuses if j.state == LftpJobStatus.State.RUNNING]
@@ -2367,7 +2400,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     name="movie",
                                     flags="-c")
         golden_job1.total_transfer_state = LftpJobStatus.TransferState(
-            628*1024*1024, 21*1024*1024*1024, 3, 3334471, None
+            628000000, 21000000000, 3, 3334471, None
         )
         golden_job1.add_active_file_transfer_state(
             "movie.mkv", LftpJobStatus.TransferState(627933184, 20757383669, 3, 3334471, 69*60)
@@ -2394,7 +2427,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                     state=LftpJobStatus.State.RUNNING,
                                     name="a",
                                     flags="-c")
-        golden_job1.total_transfer_state = LftpJobStatus.TransferState(17*1024, 26*1024*1024, 0, 5*1024, None)
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(17000, 26000000, 0, 5*1024, None)
 
         self.assertEqual(1, len(statuses))
         self.assertEqual(golden_job1, statuses[0])
@@ -2418,7 +2451,7 @@ class TestLftpJobStatusParser(unittest.TestCase):
                                             state=LftpJobStatus.State.RUNNING,
                                             name="a",
                                             flags="-c")
-                golden_job1.total_transfer_state = LftpJobStatus.TransferState(17*1024, 26*1024*1024, 0, 5*1024, None)
+                golden_job1.total_transfer_state = LftpJobStatus.TransferState(17000, 26000000, 0, 5*1024, None)
 
                 self.assertEqual(1, len(statuses))
                 self.assertEqual(golden_job1, statuses[0])

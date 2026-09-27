@@ -110,6 +110,26 @@ class LftpJobStatusParser:
         return int(number*multipliers[unit])
 
     @staticmethod
+    def _mirror_size_to_bytes(size: str) -> int:
+        """Parse MIRROR totals, whose bare units are decimal in LFTP output."""
+        result = re.fullmatch(
+            r"\s*(?P<number>\d+\.?\d*)\s*(?P<units>{})?\s*".format(
+                LftpJobStatusParser.__SIZE_UNITS_REGEX,
+            ), size,
+        )
+        if result is None:
+            raise ValueError("String '{}' does not match the MIRROR size pattern".format(size))
+        number = float(result.group("number"))
+        unit = (result.group("units") or "b").lower()
+        if unit == "b":
+            multiplier = 1
+        else:
+            power = "kmg".index(unit[0]) + 1
+            base = 1024 if unit.endswith("ib") else 1000
+            multiplier = base ** power
+        return int(number * multiplier)
+
+    @staticmethod
     def _eta_to_seconds(eta: str) -> int:
         """
         Parse the time string and return number of seconds
@@ -673,8 +693,8 @@ class LftpJobStatusParser:
                                        remote_path=remote_path,
                                        local_path=local_path)
                 if progress is not None:
-                    size_local = LftpJobStatusParser._size_to_bytes(progress[0])
-                    size_remote = LftpJobStatusParser._size_to_bytes(progress[1])
+                    size_local = LftpJobStatusParser._mirror_size_to_bytes(progress[0])
+                    size_remote = LftpJobStatusParser._mirror_size_to_bytes(progress[1])
                     percent_local = int(progress[2])
                     speed = LftpJobStatusParser._size_to_bytes(progress[3]) if progress[3] else None
                     transfer_state = LftpJobStatus.TransferState(
@@ -704,8 +724,8 @@ class LftpJobStatusParser:
                                        flags=flags,
                                        remote_path=result.group("remote"),
                                        local_path=result.group("local"))
-                size_local = LftpJobStatusParser._size_to_bytes(result.group("szlocal"))
-                size_remote = LftpJobStatusParser._size_to_bytes(result.group("szremote"))
+                size_local = LftpJobStatusParser._mirror_size_to_bytes(result.group("szlocal"))
+                size_remote = LftpJobStatusParser._mirror_size_to_bytes(result.group("szremote"))
                 percent_local = int(result.group("pctlocal"))
                 speed = None
                 if result.group("speed"):
