@@ -81,6 +81,12 @@ class TestBreadcrumbDurableSpool(unittest.TestCase):
         self.assertFalse(is_critical_breadcrumb(
             "lftp", "arbitrary", category="transfer.lftp",
         ))
+        self.assertTrue(is_critical_breadcrumb(
+            "controller", "downloaded_marker_added", category="completion.gate",
+        ))
+        self.assertFalse(is_critical_breadcrumb(
+            "controller", "other_completion_event", category="completion.gate",
+        ))
 
     def test_default_off_does_not_create_files(self):
         with tempfile.TemporaryDirectory() as path:

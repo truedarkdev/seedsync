@@ -114,6 +114,85 @@ _SCAN_ADOPTION_TRACE_CATEGORY = "scan.adoption"
 _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT = 16
 
 
+def _record_selected_root_scan_join(
+        controller: "Controller", scan: object, *, side: str,
+        pending_targets: object,
+) -> None:
+    """Join an accepted scan's opaque session identity to selected roots, boundedly."""
+    try:
+        if not _controller_breadcrumb_effectively_enabled(controller, "scan.authority", "info"):
+            return
+        session_token = getattr(scan, "session_token", None)
+        generation = getattr(scan, "generation", None)
+        roots = getattr(scan, "files", None)
+        if type(session_token) is not str or not session_token or type(generation) is not int or \
+                generation < 0 or not isinstance(roots, (list, tuple)) or \
+                not isinstance(pending_targets, (set, list, tuple)):
+            return
+        completed = getattr(scan, "completed_path_pair_ids", set())
+        scanned = getattr(scan, "scanned_path_pair_ids", set())
+        unknown = getattr(scan, "unknown_path_pair_ids", set())
+        completed = completed if isinstance(completed, set) else set()
+        scanned = scanned if isinstance(scanned, set) else set()
+        unknown = unknown if isinstance(unknown, set) else set()
+        final = getattr(scan, "is_scan_final", None)
+        covered = sorted(
+            {
+                (entry[0], entry[1]) for entry in pending_targets
+                if isinstance(entry, tuple) and len(entry) >= 2
+                and isinstance(entry[0], str) and (entry[1] is None or isinstance(entry[1], str))
+                and (entry[1] in completed or (
+                    final is True and entry[1] in scanned and entry[1] not in unknown
+                ))
+            },
+            key=lambda item: (item[0], item[1] or ""),
+        )
+        omitted = len(covered) > _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT
+        covered_targets = set(covered[:_SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT])
+        if not covered_targets:
+            return
+        present_targets = {
+            (root.name, root.path_pair_id) for root in roots
+            if isinstance(root, SystemFile) and (root.name, root.path_pair_id) in covered_targets
+        }
+        for name, pair_id in sorted(covered_targets, key=lambda item: (item[0], item[1] or "")):
+            pair_tokens = getattr(scan, "_scan_authority_tokens_by_pair", None)
+            if isinstance(pair_tokens, dict):
+                token = pair_tokens.get(pair_id)
+                if not isinstance(token, tuple) or len(token) != 2:
+                    continue
+                pair_session, pair_generation = token
+            else:
+                pair_session, pair_generation = session_token, generation
+            if type(pair_session) is not str or not pair_session or type(pair_generation) is not int or \
+                    pair_generation < 0:
+                continue
+            root_id = ModelFile.build_file_id(name, pair_id)
+            scan_identity = {
+                "local_scan_digest" if side == "local" else "remote_scan_digest":
+                    trace_session_digest(pair_session),
+            }
+            controller._record_completion_scan_join_breadcrumb(
+                root_id,
+                "scan_root_adopted",
+                {
+                    "scan_side": side,
+                    **scan_identity,
+                    "scan_generation": pair_generation,
+                    "scan_final": final if type(final) is bool else None,
+                    "scan_final_known": type(final) is bool,
+                    "adopted": True,
+                    "root_present": (name, pair_id) in present_targets,
+                    "selected_root_omissions": omitted,
+                    "captured_monotonic_ns": time.monotonic_ns(),
+                },
+            )
+    except Exception:
+        logger = getattr(controller, "logger", None)
+        if logger is not None:
+            logger.debug("Ignoring selected-root scan join breadcrumb failure", exc_info=True)
+
+
 def _scan_adoption_root_sample(
         roots: Iterable[object], *, system: bool, population: str, scope: str,
 ) -> tuple[dict[str, object], tuple[str, ...]]:
@@ -6031,6 +6110,11 @@ class ModelUpdater(_ControllerCoreAccess):
                 controller._Controller__last_remote_reconciliation_healthy = not remote_scan_failed
             if not remote_scan_failed and not progressive_mode:
                 model_builder.set_remote_files(remote_files)
+            if not remote_scan_failed:
+                _record_selected_root_scan_join(
+                    controller, latest_remote_scan, side="remote",
+                    pending_targets=controller._Controller__pending_completion_file_names,
+                )
             if _controller_breadcrumb_effectively_enabled(controller, "scan.result", "info"):
                 controller._Controller__record_breadcrumb(
                     stage="scan",
@@ -6064,6 +6148,11 @@ class ModelUpdater(_ControllerCoreAccess):
             local_final = bool(getattr(latest_local_scan, "is_scan_final", True)) and \
                 not bool(getattr(latest_local_scan, "unknown_path_pair_ids", set()))
             inventory_observer = getattr(model_builder, "observe_local_scan_result", None)
+            if not local_scan_failed and local_scan_new_authority:
+                _record_selected_root_scan_join(
+                    controller, latest_local_scan, side="local",
+                    pending_targets=controller._Controller__pending_completion_file_names,
+                )
             if callable(inventory_observer):
                 raw_scanned_ids = getattr(latest_local_scan, "scanned_path_pair_ids", set())
                 raw_completed_ids = getattr(latest_local_scan, "completed_path_pair_ids", set())
@@ -8068,6 +8157,11 @@ class ModelUpdater(_ControllerCoreAccess):
                         # harvest to retire a presentation-only floor.
                         getattr(persist, "display_progress_floors", {}).pop(file.file_id, None)
                         persist.downloaded_file_names.add(file.file_id)
+                        if file.parent is None:
+                            controller._record_completion_scan_join_breadcrumb(
+                                file.file_id, "downloaded_marker_added",
+                                {"marker_mutation": "inserted", "captured_monotonic_ns": time.monotonic_ns()},
+                            )
                         invalidation_token = model_builder.set_downloaded_files(
                             persist.downloaded_file_names
                         )

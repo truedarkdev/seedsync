@@ -209,6 +209,8 @@ def is_critical_breadcrumb(
         "scan.missing_root", "scan.failure", "scan.terminal_publication",
     }:
         return True
+    if category_text == "completion.gate" and message_text == "downloaded_marker_added":
+        return True
     # A scanner failure/authority marker that predates the more specific
     # category names still has an exact message boundary.  Do not use a broad
     # "scan" prefix, which would make ordinary root-shape traffic critical.

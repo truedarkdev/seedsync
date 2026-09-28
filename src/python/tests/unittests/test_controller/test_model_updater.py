@@ -29,6 +29,7 @@ from controller.model_updater import (
     _fresh_unique_replacement_statuses,
     _record_active_delta_rejection_summary,
     _record_scan_adoption_breadcrumb,
+    _record_selected_root_scan_join,
     _record_lftp_status_breadcrumb,
     _record_lftp_status_membership_transition,
     _lftp_status_lineage_trace_enabled,
@@ -111,6 +112,88 @@ class TestModelUpdater(unittest.TestCase):
 
         controller._Controller__record_breadcrumb = record_breadcrumb
         return controller
+
+    def test_selected_root_scan_join_matches_pending_pair_and_persists_opaque_envelope(self):
+        if os.name == "nt":
+            self.skipTest("Windows durable writer acknowledgement is not verified")
+        with tempfile.TemporaryDirectory() as path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True, durable_enabled=True, durable_path=path,
+            )
+            controller = SimpleNamespace(
+                _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+                logger=MagicMock(),
+            )
+
+            def record_breadcrumb(**kwargs):
+                values = dict(kwargs)
+                message = values.pop("message")
+                details = values.pop("details")
+                trace.record("controller", message, details, **values)
+
+            controller._Controller__record_breadcrumb = record_breadcrumb
+            controller._record_completion_scan_join_breadcrumb = lambda file_id, message, details: \
+                Controller._record_completion_scan_join_breadcrumb(
+                    controller, file_id, message, details,
+                )
+            target = SystemFile("private-root-name", 4)
+            target.path_pair_id = "private-pair-id"
+            unrelated = SystemFile("unrelated-root", 2)
+            unrelated.path_pair_id = "other-pair"
+            result = ScannerResult(
+                datetime.now(), [unrelated, target], scanned_path_pair_ids={"private-pair-id"},
+                completed_path_pair_ids={"private-pair-id"}, generation=3,
+                session_token="private-session-token",
+            )
+            result._scan_authority_tokens_by_pair = {
+                "private-pair-id": ("private-session-token", 9),
+            }
+            root_id = ModelFile.build_file_id(target.name, target.path_pair_id)
+
+            _record_selected_root_scan_join(
+                controller, result, side="local",
+                pending_targets={(target.name, target.path_pair_id, "opaque")},
+            )
+            self.assertTrue(trace.flush_durable(2.0))
+            entry = next(item for item in trace.snapshot()["entries"]
+                         if item["message"] == "scan_root_adopted")
+            self.assertEqual("completion:{}".format(opaque_trace_correlation(root_id)), entry["corr_id"])
+            self.assertEqual(trace_session_digest("private-session-token"), entry["details"]["local_scan_digest"])
+            self.assertEqual(9, entry["details"]["scan_generation"])
+            self.assertTrue(entry["details"]["root_present"])
+            with open(os.path.join(path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+            persisted = next(item for item in records if item.get("message") == "scan_root_adopted")
+            self.assertEqual(entry["corr_id"], persisted["corr_id"])
+            serialized = json.dumps(persisted)
+            self.assertNotIn("private-root-name", serialized)
+            self.assertNotIn("private-pair-id", serialized)
+            self.assertNotIn("private-session-token", serialized)
+            trace.close()
+
+    def test_selected_root_scan_join_records_covered_absence_and_isolates_recorder_failure(self):
+        controller = SimpleNamespace(
+            logger=MagicMock(),
+            _record_completion_scan_join_breadcrumb=MagicMock(),
+        )
+        result = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair"},
+            completed_path_pair_ids={"pair"}, generation=1, session_token="session",
+        )
+        result._scan_authority_tokens_by_pair = {"pair": ("session", 4)}
+        target = ("pending-root", "pair", "opaque")
+        with patch("controller.model_updater._controller_breadcrumb_effectively_enabled", return_value=True):
+            _record_selected_root_scan_join(
+                controller, result, side="remote", pending_targets={target},
+            )
+        controller._record_completion_scan_join_breadcrumb.assert_called_once()
+        self.assertFalse(controller._record_completion_scan_join_breadcrumb.call_args.args[2]["root_present"])
+
+        controller._record_completion_scan_join_breadcrumb.side_effect = RuntimeError("recorder")
+        with patch("controller.model_updater._controller_breadcrumb_effectively_enabled", return_value=True):
+            _record_selected_root_scan_join(
+                controller, result, side="remote", pending_targets={target},
+            )
 
     def test_model_finalization_entry_survives_nonreturning_stage(self):
         trace = BreadcrumbTraceCollector(lambda: True)
@@ -4881,6 +4964,10 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__local_scan_process = self._progressive_process(
             local_token, [[local_final], []],
         )
+        controller._Controller__pending_completion_file_names = {("root", None, None)}
+        selected_events = []
+        controller._record_completion_scan_join_breadcrumb = lambda file_id, message, details: \
+            selected_events.append((file_id, message, details))
         updater = ModelUpdater(controller)
 
         updater.update()
@@ -4902,6 +4989,10 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("retained_local_builder", published["builder"]["population"])
         self.assertEqual("published_model", published["published"]["population"])
         self.assertEqual("subset", published["builder_to_published_sample_relation"])
+        self.assertEqual({"local", "remote"}, {
+            details["scan_side"] for _, message, details in selected_events
+            if message == "scan_root_adopted"
+        })
 
     def test_scan_adoption_remote_only_publication_marks_local_authority_retained(self):
         local = SystemFile("root", 1)
@@ -13035,6 +13126,20 @@ class TestModelUpdater(unittest.TestCase):
 
     def test_v092_pending_completion_authority_wake_retries_quiet_no_diff(self):
         controller = self._make_v092_pending_completion_controller()
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        controller._Controller__context.breadcrumb_trace = trace
+
+        def record_breadcrumb(**kwargs):
+            values = dict(kwargs)
+            message = values.pop("message")
+            details = values.pop("details")
+            trace.record("controller", message, details, **values)
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        controller._record_completion_scan_join_breadcrumb = lambda file_id, message, details: \
+            Controller._record_completion_scan_join_breadcrumb(
+                controller, file_id, message, details,
+            )
         controller._Controller__reconciled_local_path_pair_ids = set()
         controller._Controller__reconciled_remote_path_pair_ids = set()
         builder = controller._Controller__model_builder
@@ -13058,6 +13163,14 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(set(), controller._Controller__pending_completion_file_names)
         self.assertEqual({file_id}, controller._Controller__persist.downloaded_file_names)
         self.assertNotIn(file_id, controller._Controller__persist.stopped_file_names)
+        marker = next(
+            event for event in trace.snapshot()["entries"]
+            if event["message"] == "downloaded_marker_added"
+        )
+        self.assertEqual("completion.gate", marker["category"])
+        self.assertEqual("completion_gate", marker["stage"])
+        self.assertEqual("completion:{}".format(opaque_trace_correlation(file_id)), marker["corr_id"])
+        self.assertNotIn("pending.bin", json.dumps(marker))
 
     def test_v092_pending_completion_wake_is_acknowledged_after_candidate_authority(self):
         """A pre-build wake must not consume an authority change mid-build."""

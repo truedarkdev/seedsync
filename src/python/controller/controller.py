@@ -6243,6 +6243,33 @@ class Controller:
             **metadata,
         )
 
+    def _record_completion_scan_join_breadcrumb(
+            self, file_id: str, message: str, details: dict[str, object],
+    ) -> None:
+        """Emit a privacy-safe root scan/completion join through existing lanes."""
+        try:
+            if message == "scan_root_adopted":
+                category = "scan.authority"
+            elif message == "downloaded_marker_added":
+                category = "completion.gate"
+            else:
+                return
+            if not _breadcrumb_effectively_enabled(
+                    getattr(self.__context, "breadcrumb_trace", None), category, "info"):
+                return
+            correlation = opaque_trace_correlation(file_id)
+            self.__record_breadcrumb(
+                stage=("scan_authority" if message == "scan_root_adopted" else "completion_gate"),
+                message=message, event_type="state_transition",
+                category=category, level="info", trace_scope="flow",
+                corr_id="completion:{}".format(correlation),
+                details={"schema": "completion_scan_join.v1", "root": True, **details},
+            )
+        except Exception:
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.debug("Ignoring completion scan-join breadcrumb failure", exc_info=True)
+
     def __record_child_completion_hook_breadcrumb(
             self,
             child_file_id: str,
@@ -12566,6 +12593,11 @@ class Controller:
                         self.__move_retry_due.pop(file.file_id, None)
                         self._record_download_completion(file)
                         self.__persist.downloaded_file_names.add(file.file_id)
+                        if file.parent is None:
+                            self._record_completion_scan_join_breadcrumb(
+                                file.file_id, "downloaded_marker_added",
+                                {"marker_mutation": "inserted", "captured_monotonic_ns": time.monotonic_ns()},
+                            )
                         self.__persist.resume_source_identities.pop(file.file_id, None)
                         if result == Controller.MoveFromStagingResult.COMPLETED:
                             self.__persist.final_move_succeeded_file_names.add(file.file_id)
