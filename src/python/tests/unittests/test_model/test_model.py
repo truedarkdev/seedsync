@@ -4,7 +4,7 @@ import logging
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 from common import BreadcrumbTraceCollector, overrides
 from model import ActiveProgressOverlay, Model, ModelFile, IModelListener, ModelError
@@ -526,6 +526,54 @@ class TestLftpModel(unittest.TestCase):
         self.model.add_file(file)
         recv_file = self.model.get_file("test")
         self.assertEqual("test", recv_file.name)
+
+    def test_add_file_without_listeners_skips_recursive_legacy_copy_but_publishes_version(self):
+        file = ModelFile("no-listener", False)
+        version_callback = MagicMock()
+        versioned_dispatch = MagicMock(wraps=self.model._Model__notify_versioned_change)
+        self.model.set_version_publication_callback(version_callback)
+        with patch.object(
+                self.model, "_Model__full_effective_file",
+                side_effect=AssertionError("empty legacy listener snapshot must skip deepcopy")):
+            with patch.object(self.model, "_Model__notify_versioned_change", versioned_dispatch):
+                self.model.add_file(file)
+
+        self.assertIs(file, self.model.get_file(file.file_id))
+        published = self.model.published_file(file.file_id)
+        self.assertIsNot(file, published)
+        self.assertEqual(1, self.model.version)
+        self.assertEqual(1, self.model.scope_version(None))
+        version_callback.assert_called_once_with(1, 1)
+        versioned_dispatch.assert_called_once_with(file, 1, 1)
+
+    def test_add_file_listener_keeps_detached_recursive_legacy_payload(self):
+        root = ModelFile("recursive", True)
+        root.local_size = 12
+        root.display_size_total = 12
+        root.display_transferred_size = 7
+        root.download_progress = 58
+        child = ModelFile("leaf", False)
+        child.local_size = 12
+        root.add_child(child)
+        listener = MagicMock()
+        self.model.add_listener(listener)
+        with patch.object(self.model, "_Model__full_effective_file", wraps=self.model._Model__full_effective_file) as freeze:
+            self.model.add_file(root)
+
+        freeze.assert_called_once_with(root)
+        payload = listener.file_added.call_args.args[0]
+        self.assertIsNot(root, payload)
+        self.assertIsNot(child, payload.get_children()[0])
+        self.assertEqual(7, payload.display_transferred_size)
+        self.assertEqual(58, payload.download_progress)
+        # add_file clears active overlays before publication, so this callback
+        # preserves the explicit effective fields supplied on the new root.
+        root.local_size = 99
+        child.local_size = 99
+        self.assertEqual(12, payload.local_size)
+        self.assertEqual(12, payload.get_children()[0].local_size)
+        payload.get_children()[0].local_size = 77
+        self.assertEqual(99, self.model.get_file(root.file_id).get_children()[0].local_size)
 
     def test_get_unknown_file(self):
         with self.assertRaises(ModelError):

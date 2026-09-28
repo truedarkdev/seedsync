@@ -957,12 +957,13 @@ class Model:
             self.__file_ids_by_name[file.name] = set()
         self.__file_ids_by_name[file.name].add(file_id)
         published = self.__refresh_published_file(self.__files_by_id[file_id])
-        legacy_published = self.__full_effective_file(self.__files_by_id[file_id])
-        global_version, scope_version = self.__advance_version(file)
         with self.__listeners_lock:
             listeners = list(self.__listeners)
-        for listener in listeners:
-            listener.file_added(legacy_published)
+        legacy_published = self.__full_effective_file(self.__files_by_id[file_id]) if listeners else None
+        global_version, scope_version = self.__advance_version(file)
+        if legacy_published is not None:
+            for listener in listeners:
+                listener.file_added(legacy_published)
         self.__notify_versioned_change(self.__files_by_id[file_id], global_version, scope_version)
 
     def __resolve_file_id(self, identifier: str) -> str:
