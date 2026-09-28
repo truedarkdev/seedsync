@@ -3574,16 +3574,17 @@ class ModelUpdater(_ControllerCoreAccess):
                 except Exception:
                     pass
 
-    def _completion_gate_trace_enabled(self) -> bool:
+    def _completion_gate_trace_enabled(self, level: str = "info") -> bool:
         """Check the global trace gate before diagnostic-only marker reads."""
         breadcrumb_trace = getattr(
             getattr(self._controller, "_Controller__context", None), "breadcrumb_trace", None,
         )
-        return _breadcrumb_effectively_enabled(breadcrumb_trace, "completion.gate", "info")
+        return _breadcrumb_effectively_enabled(breadcrumb_trace, "completion.gate", level)
 
     def _record_completion_gate_breadcrumb(
             self, file_id: str, message: str, details: dict[str, object],
             poll_correlation: Optional[str] = None,
+            level: str = "info",
     ) -> None:
         """Emit bounded, identity-free completion-gate transitions when enabled."""
         breadcrumb_trace = getattr(
@@ -3594,7 +3595,7 @@ class ModelUpdater(_ControllerCoreAccess):
         try:
             # This must precede correlation/signature work and every model
             # lookup performed by callers solely for diagnostics.
-            if not _breadcrumb_effectively_enabled(breadcrumb_trace, "completion.gate", "info"):
+            if not _breadcrumb_effectively_enabled(breadcrumb_trace, "completion.gate", level):
                 return
             safe_poll_correlation = _safe_lftp_status_poll_correlation(poll_correlation)
             if safe_poll_correlation is not None:
@@ -3612,7 +3613,7 @@ class ModelUpdater(_ControllerCoreAccess):
             breadcrumb_trace.record(
                 "model_updater", message, details,
                 stage="completion_gate", event_type="diagnostic",
-                category="completion.gate", level="info", corr_id=corr_id,
+                category="completion.gate", level=level, corr_id=corr_id,
                 flow_id=safe_poll_correlation,
                 trace_scope="flow",
             )
@@ -3626,13 +3627,19 @@ class ModelUpdater(_ControllerCoreAccess):
             details: dict[str, object],
             poll_correlation: Optional[str] = None,
     ) -> None:
-        """Record an incomplete root returning to DEFAULT with visible progress."""
+        """Record an incomplete root returning to DEFAULT."""
         if old_file.state != ModelFile.State.DOWNLOADING or \
                 new_file.state != ModelFile.State.DEFAULT or new_file.parent is not None:
             return
         transferred = new_file.transferred_size
-        if type(transferred) is not int or transferred <= 0 or \
-                new_file.complete_local_coverage is not False:
+        transferred_positive = type(transferred) is int and transferred > 0
+        if new_file.complete_local_coverage is not False:
+            return
+        if new_file.explicitly_stopped is False:
+            level = "warning"
+        elif new_file.explicitly_stopped is True and transferred_positive:
+            level = "info"
+        else:
             return
         self._record_completion_gate_breadcrumb(
             new_file.file_id,
@@ -3644,6 +3651,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 **details,
             },
             poll_correlation=poll_correlation,
+            level=level,
         )
 
     def _record_root_progress_decision(
@@ -7509,6 +7517,7 @@ class ModelUpdater(_ControllerCoreAccess):
             not active_progress_overlay_applied
         )
         completion_trace_enabled = self._completion_gate_trace_enabled()
+        completion_transition_warning_enabled = self._completion_gate_trace_enabled("warning")
         if not full_build_triggered and completion_trace_enabled:
             for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names:
                 self._record_completion_gate_breadcrumb(
@@ -8456,7 +8465,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         assert new_file is not None
                         apply_model_replacement(lambda: model.update_file(new_file))
 
-                    if completion_trace_enabled and \
+                    if (completion_trace_enabled or completion_transition_warning_enabled) and \
                             diff.change == ModelDiff.Change.UPDATED and \
                             old_file is not None and new_file is not None and \
                             old_file.state == ModelFile.State.DOWNLOADING and \

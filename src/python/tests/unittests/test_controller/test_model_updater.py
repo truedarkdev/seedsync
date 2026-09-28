@@ -14406,6 +14406,7 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(1, len(entries))
         self.assertEqual("completion_gate", entries[0]["stage"])
         self.assertEqual("completion_gate_candidate", entries[0]["message"])
+        self.assertEqual("info", entries[0]["level"])
         self.assertEqual(details, entries[0]["details"])
         self.assertNotIn("private-file-id", str(entries))
 
@@ -14448,7 +14449,7 @@ class TestModelUpdater(unittest.TestCase):
                     "remote_scan_final_relevant": True,
                     "joint_reconciliation_final": True,
                     "complete_local_coverage": complete_coverage,
-                    "transferred_positive": transferred > 0,
+                    "transferred_positive": type(transferred) is int and transferred > 0,
                     "explicit_stop": stopped,
                 }
 
@@ -14461,6 +14462,7 @@ class TestModelUpdater(unittest.TestCase):
                 entry = entries[0]
                 self.assertEqual("completion_gate_presentation_transition", entry["message"])
                 self.assertEqual("completion_gate", entry["stage"])
+                self.assertEqual("info" if stopped else "warning", entry["level"])
                 self.assertEqual("completion_gate_presentation_transition.v1", entry["details"]["schema"])
                 self.assertEqual("downloading", entry["details"]["old_state"])
                 self.assertEqual("default", entry["details"]["new_state"])
@@ -14483,7 +14485,8 @@ class TestModelUpdater(unittest.TestCase):
                 trace.close()
 
         qualification_cases = (
-            (0, 100, False, False, False),
+            (0, 100, False, False, True),
+            (None, 100, False, False, True),
             (100, 100, False, False, True),
             (101, 100, False, False, True),
             (25, 100, True, False, False),
@@ -14509,7 +14512,11 @@ class TestModelUpdater(unittest.TestCase):
                     parent.add_child(new_file)
 
                 ModelUpdater(controller)._record_completion_gate_presentation_transition(
-                    old_file, new_file, {"transferred_positive": transferred > 0},
+                    old_file,
+                    new_file,
+                    {
+                        "transferred_positive": type(transferred) is int and transferred > 0,
+                    },
                 )
 
                 entries = trace.snapshot()["entries"]
@@ -14553,11 +14560,54 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("default", event["details"]["new_state"])
         self.assertTrue(event["details"]["pending_member"])
         self.assertTrue(event["details"]["transferred_positive"])
+        self.assertEqual("warning", event["level"])
         self.assertFalse(event["details"]["local_scan_final_relevant"])
         self.assertFalse(event["details"]["remote_scan_final_relevant"])
         self.assertFalse(event["details"]["joint_reconciliation_final"])
         self.assertNotIn(file_name, json.dumps(event))
         self.assertIn((file_name, None, None), controller._Controller__pending_completion_file_names)
+        trace.close()
+
+    def test_model_update_warns_for_incomplete_zero_progress_when_info_is_disabled(self):
+        file_name = "private-label.bin"
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile(file_name, 100, False)])
+        builder.set_local_files([SystemFile(file_name, 0, False, is_staging=True)])
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(0, 100, 0, 10, 2)
+        builder.set_lftp_statuses([running])
+        live_model = builder.build_model()
+        self.assertEqual(ModelFile.State.DOWNLOADING, live_model.get_file(file_name).state)
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__prev_downloading_file_names = {(file_name, None, None)}
+        controller._Controller__lftp.status.return_value = []
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=32,
+            policy={"default": "warning"},
+        )
+        self.assertFalse(trace.is_effectively_enabled("completion.gate", "info"))
+        self.assertTrue(trace.is_effectively_enabled("completion.gate", "warning"))
+        controller._Controller__context.breadcrumb_trace = trace
+
+        ModelUpdater(controller).update()
+
+        event = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("message") == "completion_gate_presentation_transition"
+        )
+        self.assertEqual("warning", event["level"])
+        self.assertFalse(event["details"]["explicit_stop"])
+        self.assertFalse(event["details"]["transferred_positive"])
+        self.assertNotIn(file_name, json.dumps(event))
+        self.assertFalse(any(
+            entry.get("message") == "completion_gate_decision"
+            for entry in trace.snapshot()["entries"]
+        ))
         trace.close()
 
     def test_completion_gate_presentation_transition_is_hot_gated_and_fail_isolated(self):
@@ -14642,6 +14692,7 @@ class TestModelUpdater(unittest.TestCase):
                 if record.get("message") == "completion_gate_presentation_transition"
             )
             self.assertEqual("completion_gate_presentation_transition.v1", event["details"]["schema"])
+            self.assertEqual("warning", event["level"])
             self.assertTrue(event["details"]["transferred_positive"])
             self.assertTrue(event["corr_id"].startswith("completion:"))
             self.assertEqual(
