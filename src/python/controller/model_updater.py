@@ -3621,6 +3621,31 @@ class ModelUpdater(_ControllerCoreAccess):
             if logger is not None:
                 logger.debug("Ignoring completion-gate breadcrumb failure", exc_info=True)
 
+    def _record_completion_gate_presentation_transition(
+            self, old_file: ModelFile, new_file: ModelFile,
+            details: dict[str, object],
+            poll_correlation: Optional[str] = None,
+    ) -> None:
+        """Record an incomplete root returning to DEFAULT with visible progress."""
+        if old_file.state != ModelFile.State.DOWNLOADING or \
+                new_file.state != ModelFile.State.DEFAULT or new_file.parent is not None:
+            return
+        transferred = new_file.transferred_size
+        if type(transferred) is not int or transferred <= 0 or \
+                new_file.complete_local_coverage is not False:
+            return
+        self._record_completion_gate_breadcrumb(
+            new_file.file_id,
+            "completion_gate_presentation_transition",
+            {
+                "schema": "completion_gate_presentation_transition.v1",
+                "old_state": "downloading",
+                "new_state": "default",
+                **details,
+            },
+            poll_correlation=poll_correlation,
+        )
+
     def _record_root_progress_decision(
             self, identity: object, *, outcome: str, reason: str,
             decision: str, target_count: int = 0,
@@ -8430,6 +8455,103 @@ class ModelUpdater(_ControllerCoreAccess):
                     elif diff.change == ModelDiff.Change.UPDATED:
                         assert new_file is not None
                         apply_model_replacement(lambda: model.update_file(new_file))
+
+                    if completion_trace_enabled and \
+                            diff.change == ModelDiff.Change.UPDATED and \
+                            old_file is not None and new_file is not None and \
+                            old_file.state == ModelFile.State.DOWNLOADING and \
+                            new_file.state == ModelFile.State.DEFAULT and \
+                            new_file.parent is None:
+                        try:
+                            file_id = new_file.file_id
+                            pending_entries = getattr(
+                                controller, "_Controller__pending_completion_file_names", set(),
+                            )
+                            pending = (
+                                new_file.name,
+                                new_file.path_pair_id,
+                                new_file.path_pair_name,
+                            ) in pending_entries
+                            floors = getattr(
+                                controller, "_Controller__pending_completion_progress_floors", {},
+                            )
+                            floor = floors.get(file_id) if isinstance(floors, dict) else None
+                            floor_identities = getattr(
+                                controller,
+                                "_Controller__pending_completion_progress_floor_identities", {},
+                            )
+                            floor_identity = floor_identities.get(file_id) \
+                                if isinstance(floor_identities, dict) else None
+                            floor_identity_valid = isinstance(floor_identity, tuple) and \
+                                len(floor_identity) == 2 and type(floor_identity[0]) is int and \
+                                floor_identity[0] >= 0 and isinstance(floor_identity[1], str) and \
+                                bool(floor_identity[1])
+                            publications = getattr(
+                                controller, "_Controller__pending_completion_publications", {},
+                            )
+                            publication = publications.get(file_id) \
+                                if isinstance(publications, dict) else None
+                            publication_identity = getattr(publication, "job_identity", None)
+                            publication_valid = isinstance(publication, _PendingCompletionPublication) and \
+                                isinstance(publication_identity, tuple) and \
+                                len(publication_identity) == 2 and \
+                                type(publication_identity[0]) is int and publication_identity[0] >= 0 and \
+                                isinstance(publication_identity[1], str) and bool(publication_identity[1]) and \
+                                not self._pending_completion_progress_floor_invalidated(
+                                    controller, file_id,
+                                )
+                            floor_overlay_ids = getattr(
+                                controller,
+                                "_Controller__pending_completion_progress_floor_overlay_ids", set(),
+                            )
+                            presentation_eligible = pending and (
+                                file_id in floor_overlay_ids or publication_valid
+                            )
+
+                            overlay = direct_published_overlays.get(file_id) or \
+                                direct_prior_overlays.get(file_id) or getattr(publication, "overlay", None)
+                            overlay_identity = direct_published_job_identities.get(file_id) or \
+                                direct_prior_job_identities.get(file_id) or publication_identity
+                            overlay_identity_valid = isinstance(overlay_identity, tuple) and \
+                                len(overlay_identity) == 2 and type(overlay_identity[0]) is int and \
+                                overlay_identity[0] >= 0 and isinstance(overlay_identity[1], str) and \
+                                bool(overlay_identity[1])
+                            local_scan_failed = getattr(latest_local_scan, "failed", None) \
+                                if latest_local_scan is not None else None
+                            remote_scan_failed = getattr(latest_remote_scan, "failed", None) \
+                                if latest_remote_scan is not None else None
+                            self._record_completion_gate_presentation_transition(
+                                old_file,
+                                new_file,
+                                {
+                                    "pending_member": pending,
+                                    "floor_present": floor is not None,
+                                    "floor_identity_present": floor_identity_valid,
+                                    "publication_valid": publication_valid,
+                                    "presentation_eligible": presentation_eligible,
+                                    "overlay_present": isinstance(overlay, ActiveProgressOverlay),
+                                    "overlay_job_identity_present": overlay_identity_valid,
+                                    "status_snapshot_fresh": lftp_status_snapshot_fresh,
+                                    "status_healthy": lftp_status_poll_healthy,
+                                    "local_scan_present": latest_local_scan is not None,
+                                    "remote_scan_present": latest_remote_scan is not None,
+                                    "local_scan_healthy": not local_scan_failed
+                                    if type(local_scan_failed) is bool else None,
+                                    "remote_scan_healthy": not remote_scan_failed
+                                    if type(remote_scan_failed) is bool else None,
+                                    "local_scan_final_relevant": local_scan_final_relevant,
+                                    "remote_scan_final_relevant": remote_scan_final_relevant,
+                                    "joint_reconciliation_final": joint_reconciliation_final,
+                                    "complete_local_coverage": new_file.complete_local_coverage,
+                                    "transferred_positive": type(new_file.transferred_size) is int and
+                                    new_file.transferred_size > 0,
+                                    "explicit_stop": new_file.explicitly_stopped,
+                                },
+                                poll_correlation=lftp_status_poll_correlation,
+                            )
+                        except Exception:
+                            # Diagnostic extraction must never affect model publication.
+                            pass
 
                     if (
                         diff.change == ModelDiff.Change.REMOVED

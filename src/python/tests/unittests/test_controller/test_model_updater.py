@@ -14409,6 +14409,255 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(details, entries[0]["details"])
         self.assertNotIn("private-file-id", str(entries))
 
+    def test_completion_gate_presentation_transition_records_frozen_scalar_projection(self):
+        cases = (
+            ("missing_pending", False, False, False, 25, 100, False),
+            ("ineligible", True, False, False, 25, 100, False),
+            ("normal_pending", True, True, False, 25, 100, False),
+            ("explicit_stop", True, True, True, 100, 100, False),
+        )
+        for name, pending, eligible, stopped, transferred, total, complete_coverage in cases:
+            with self.subTest(name=name):
+                trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+                controller = self._make_lftp_completion_controller()
+                controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+                updater = ModelUpdater(controller)
+                old_file = ModelFile("private-label.bin", False)
+                old_file.state = ModelFile.State.DOWNLOADING
+                new_file = ModelFile("private-label.bin", False)
+                new_file.state = ModelFile.State.DEFAULT
+                new_file.remote_size = total
+                new_file.transferred_size = transferred
+                new_file.complete_local_coverage = complete_coverage
+                new_file.explicitly_stopped = stopped
+                details = {
+                    "pending_member": pending,
+                    "floor_present": True,
+                    "floor_identity_present": True,
+                    "publication_valid": True,
+                    "presentation_eligible": eligible,
+                    "overlay_present": True,
+                    "overlay_job_identity_present": True,
+                    "status_snapshot_fresh": True,
+                    "status_healthy": True,
+                    "local_scan_present": True,
+                    "remote_scan_present": True,
+                    "local_scan_healthy": True,
+                    "remote_scan_healthy": True,
+                    "local_scan_final_relevant": True,
+                    "remote_scan_final_relevant": True,
+                    "joint_reconciliation_final": True,
+                    "complete_local_coverage": complete_coverage,
+                    "transferred_positive": transferred > 0,
+                    "explicit_stop": stopped,
+                }
+
+                updater._record_completion_gate_presentation_transition(
+                    old_file, new_file, details,
+                )
+
+                entries = trace.snapshot()["entries"]
+                self.assertEqual(1, len(entries))
+                entry = entries[0]
+                self.assertEqual("completion_gate_presentation_transition", entry["message"])
+                self.assertEqual("completion_gate", entry["stage"])
+                self.assertEqual("completion_gate_presentation_transition.v1", entry["details"]["schema"])
+                self.assertEqual("downloading", entry["details"]["old_state"])
+                self.assertEqual("default", entry["details"]["new_state"])
+                self.assertEqual(pending, entry["details"]["pending_member"])
+                self.assertEqual(eligible, entry["details"]["presentation_eligible"])
+                self.assertEqual(stopped, entry["details"]["explicit_stop"])
+                self.assertNotIn("private-label.bin", json.dumps(entry))
+                self.assertEqual(
+                    {
+                        "schema", "old_state", "new_state", "pending_member", "floor_present",
+                        "floor_identity_present", "publication_valid", "presentation_eligible",
+                        "overlay_present", "overlay_job_identity_present", "status_snapshot_fresh",
+                        "status_healthy", "local_scan_present", "remote_scan_present",
+                        "local_scan_healthy", "remote_scan_healthy", "local_scan_final_relevant",
+                        "remote_scan_final_relevant", "joint_reconciliation_final", "complete_local_coverage",
+                        "transferred_positive", "explicit_stop",
+                    },
+                    set(entry["details"]),
+                )
+                trace.close()
+
+        qualification_cases = (
+            (0, 100, False, False, False),
+            (100, 100, False, False, True),
+            (101, 100, False, False, True),
+            (25, 100, True, False, False),
+            (25, 100, False, True, False),
+        )
+        for transferred, total, complete_coverage, child, emits in qualification_cases:
+            with self.subTest(
+                    transferred=transferred, total=total,
+                    complete_coverage=complete_coverage, child=child,
+            ):
+                trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+                controller = self._make_lftp_completion_controller()
+                controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+                old_file = ModelFile("private-label.bin", False)
+                old_file.state = ModelFile.State.DOWNLOADING
+                new_file = ModelFile("private-label.bin", False)
+                new_file.state = ModelFile.State.DEFAULT
+                new_file.remote_size = total
+                new_file.transferred_size = transferred
+                new_file.complete_local_coverage = complete_coverage
+                if child:
+                    parent = ModelFile("private-root", True)
+                    parent.add_child(new_file)
+
+                ModelUpdater(controller)._record_completion_gate_presentation_transition(
+                    old_file, new_file, {"transferred_positive": transferred > 0},
+                )
+
+                entries = trace.snapshot()["entries"]
+                if emits:
+                    self.assertEqual(1, len(entries))
+                    self.assertEqual(
+                        "completion_gate_presentation_transition", entries[0]["message"],
+                    )
+                else:
+                    self.assertEqual([], entries)
+                trace.close()
+
+    def test_model_update_records_completion_gate_presentation_transition_before_pending_clear(self):
+        file_name = "private-label.bin"
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile(file_name, 100, False)])
+        builder.set_local_files([SystemFile(file_name, 25, False, is_staging=True)])
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 2)
+        builder.set_lftp_statuses([running])
+        live_model = builder.build_model()
+        self.assertEqual(ModelFile.State.DOWNLOADING, live_model.get_file(file_name).state)
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__prev_downloading_file_names = {(file_name, None, None)}
+        controller._Controller__lftp.status.return_value = []
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=32)
+        controller._Controller__context.breadcrumb_trace = trace
+
+        ModelUpdater(controller).update()
+
+        event = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("message") == "completion_gate_presentation_transition"
+        )
+        self.assertEqual("completion_gate_presentation_transition.v1", event["details"]["schema"])
+        self.assertEqual("downloading", event["details"]["old_state"])
+        self.assertEqual("default", event["details"]["new_state"])
+        self.assertTrue(event["details"]["pending_member"])
+        self.assertTrue(event["details"]["transferred_positive"])
+        self.assertFalse(event["details"]["local_scan_final_relevant"])
+        self.assertFalse(event["details"]["remote_scan_final_relevant"])
+        self.assertFalse(event["details"]["joint_reconciliation_final"])
+        self.assertNotIn(file_name, json.dumps(event))
+        self.assertIn((file_name, None, None), controller._Controller__pending_completion_file_names)
+        trace.close()
+
+    def test_completion_gate_presentation_transition_is_hot_gated_and_fail_isolated(self):
+        old_file = ModelFile("private-label.bin", False)
+        old_file.state = ModelFile.State.DOWNLOADING
+        new_file = ModelFile("private-label.bin", False)
+        new_file.state = ModelFile.State.DEFAULT
+        new_file.remote_size = 100
+        new_file.transferred_size = 25
+
+        disabled_trace = BreadcrumbTraceCollector(lambda: False, max_entries=8)
+        disabled_controller = self._make_lftp_completion_controller()
+        disabled_controller._Controller__context = SimpleNamespace(breadcrumb_trace=disabled_trace)
+        ModelUpdater(disabled_controller)._record_completion_gate_presentation_transition(
+            old_file, new_file, {"transferred_positive": True},
+        )
+        self.assertEqual([], disabled_trace.snapshot()["entries"])
+        disabled_trace.close()
+
+        class FailingTrace:
+            def is_effectively_enabled(self, _category, _level):
+                return True
+
+            def record(self, *_args, **_kwargs):
+                raise RuntimeError("recorder unavailable")
+
+        failing_controller = self._make_lftp_completion_controller()
+        failing_controller._Controller__context = SimpleNamespace(breadcrumb_trace=FailingTrace())
+        ModelUpdater(failing_controller)._record_completion_gate_presentation_transition(
+            old_file, new_file, {"transferred_positive": True},
+        )
+
+    def test_completion_gate_presentation_transition_persists_sanitized_envelope(self):
+        with tempfile.TemporaryDirectory() as path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                durable_enabled=True,
+                durable_path=path,
+            )
+            controller = self._make_lftp_completion_controller()
+            controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+            old_file = ModelFile("private-label.bin", False)
+            old_file.state = ModelFile.State.DOWNLOADING
+            new_file = ModelFile("private-label.bin", False)
+            new_file.state = ModelFile.State.DEFAULT
+            new_file.remote_size = 100
+            new_file.transferred_size = 25
+            try:
+                ModelUpdater(controller)._record_completion_gate_presentation_transition(
+                    old_file,
+                    new_file,
+                    {
+                        "pending_member": False,
+                        "floor_present": False,
+                        "floor_identity_present": False,
+                        "publication_valid": False,
+                        "presentation_eligible": False,
+                        "overlay_present": False,
+                        "overlay_job_identity_present": False,
+                        "status_snapshot_fresh": True,
+                        "status_healthy": True,
+                        "local_scan_present": False,
+                        "remote_scan_present": False,
+                        "local_scan_healthy": None,
+                        "remote_scan_healthy": None,
+                        "local_scan_final_relevant": False,
+                        "remote_scan_final_relevant": False,
+                        "joint_reconciliation_final": False,
+                        "complete_local_coverage": False,
+                        "transferred_positive": True,
+                        "explicit_stop": False,
+                    },
+                )
+                if os.name != "nt":
+                    self.assertTrue(trace.flush_durable(2.0))
+            finally:
+                trace.close()
+            with open(os.path.join(path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+            event = next(
+                record for record in records
+                if record.get("message") == "completion_gate_presentation_transition"
+            )
+            self.assertEqual("completion_gate_presentation_transition.v1", event["details"]["schema"])
+            self.assertTrue(event["details"]["transferred_positive"])
+            self.assertTrue(event["corr_id"].startswith("completion:"))
+            self.assertEqual(
+                {
+                    "schema", "old_state", "new_state", "pending_member", "floor_present",
+                    "floor_identity_present", "publication_valid", "presentation_eligible",
+                    "overlay_present", "overlay_job_identity_present", "status_snapshot_fresh",
+                    "status_healthy", "local_scan_present", "remote_scan_present",
+                    "local_scan_healthy", "remote_scan_healthy", "local_scan_final_relevant",
+                    "remote_scan_final_relevant", "joint_reconciliation_final", "complete_local_coverage",
+                    "transferred_positive", "explicit_stop",
+                },
+                set(event["details"]),
+            )
+            self.assertNotIn("private-label.bin", json.dumps(event))
+
     def test_lftp_completion_retirement_breadcrumb_records_pending_and_no_retirement(self):
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
         active_entry = ("sample-movie.mkv", "path-pair-a", "Path Pair A")
@@ -15954,3 +16203,175 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__active_scan_process.force_scan.assert_not_called()
         self.assertEqual(set(), controller._Controller__active_scan_force_file_ids)
         self.assertEqual(set(), controller._Controller__active_scan_ready_file_ids)
+
+    def test_mirror_pending_floor_survives_delayed_authoritative_scan_publications(self):
+        """Compare the last active MIRROR counter after a real updater overlay exists."""
+        scan_time = datetime(2026, 1, 1)
+
+        def run(last_transferred):
+            remote_root = SystemFile("root", 1010, True, mtime_ns=1)
+            remote_root.add_child(SystemFile("existing.bin", 10, False, mtime_ns=1))
+            remote_root.add_child(SystemFile("payload.bin", 1000, False, mtime_ns=2))
+
+            def local_tree(payload_size, staging=True):
+                root = SystemFile(
+                    "root", 10 + payload_size, True, is_staging=staging, mtime_ns=1,
+                )
+                root.add_child(SystemFile("existing.bin", 10, False, mtime_ns=1))
+                child = SystemFile(
+                    "payload.bin", payload_size, False, is_staging=staging, mtime_ns=2,
+                )
+                child.status_sidecar_ready = True
+                root.add_child(child)
+                return root
+
+            builder = ModelBuilder()
+            initial_local = local_tree(500)
+            builder.set_remote_files([remote_root])
+            builder.set_local_files([initial_local])
+            builder.set_active_files([initial_local])
+            initial = LftpJobStatus(
+                1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "",
+            )
+            initial.total_transfer_state = LftpJobStatus.TransferState(510, 1010, 50, 100, 5)
+            builder.set_lftp_statuses([initial])
+
+            def status(transferred):
+                value = LftpJobStatus(
+                    1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "",
+                )
+                value.total_transfer_state = LftpJobStatus.TransferState(
+                    transferred, 1010, transferred * 100 // 1010, 100, 5,
+                )
+                return value
+
+            common_active = status(400)
+            final_active = status(last_transferred)
+            model = builder.build_model()
+            controller, _ = self._make_progressive_update_controller(
+                None, local_scan=None, model_builder=builder, model=model,
+            )
+            controller._Controller__uses_async_lftp_owner = MagicMock(return_value=False)
+            controller._get_lftp_status_snapshot = (
+                Controller._get_lftp_status_snapshot.__get__(controller, Controller)
+            )
+            controller._take_lftp_status_poll_correlation = MagicMock(
+                side_effect=["lftp-poll:0123456789abcdef"] * 5,
+            )
+            controller._Controller__lftp.status.side_effect = [
+                [common_active], [final_active], [], [], [],
+            ]
+            controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+                ScannerResult(
+                    scan_time, [local_tree(1000)], scanned_path_pair_ids=set(),
+                    is_scan_final=False,
+                ), None, None, None, None,
+            ]
+            delayed_scan = ScannerResult(
+                scan_time, [local_tree(1000)], scanned_path_pair_ids=set(),
+                is_scan_final=False,
+            )
+            final_local = ScannerResult(
+                scan_time, [local_tree(1000, staging=False)], scanned_path_pair_ids={None},
+                completed_path_pair_ids={None}, is_scan_final=True,
+            )
+            final_remote = ScannerResult(
+                scan_time, [remote_root], scanned_path_pair_ids={None},
+                completed_path_pair_ids={None}, is_scan_final=True,
+            )
+            controller._Controller__local_scan_process.pop_latest_result.side_effect = [
+                None, None, None, delayed_scan, final_local,
+            ]
+            controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
+                None, None, None, None, final_remote,
+            ]
+            controller.MoveFromStagingResult = Controller.MoveFromStagingResult
+            controller._reserve_move_attempt = MagicMock(return_value=True)
+            controller._release_move_attempt = MagicMock()
+            controller._Controller__move_from_staging = MagicMock(
+                return_value=Controller.MoveFromStagingResult.COMPLETED,
+            )
+            controller._record_download_completion = MagicMock()
+            controller._complete_download_start_lifecycle = MagicMock()
+            controller.clear_extracted_marker = MagicMock()
+            controller._mark_successful_final_move_handoff = MagicMock()
+            controller._mark_current_process_final_publication = MagicMock()
+            controller._Controller__target_archive_trace_selector_matches_file = MagicMock(
+                return_value=False,
+            )
+
+            def publication():
+                root = model.get_file("root")
+                return {
+                    "state": root.state.name.lower(),
+                    "visible": Controller._model_record_visible_state(root),
+                    "coverage": root.complete_local_coverage,
+                    "stopped": root.explicitly_stopped,
+                    "transferred": root.display_transferred_size,
+                    "total": root.display_size_total,
+                    "pending": set(controller._Controller__pending_completion_file_names),
+                    "floors": dict(getattr(
+                        controller, "_Controller__pending_completion_progress_floors", {},
+                    )),
+                    "floor_identity_ids": set(getattr(
+                        controller, "_Controller__pending_completion_progress_floor_identities", {},
+                    )),
+                    "publication_ids": set(getattr(
+                        controller, "_Controller__pending_completion_publications", {},
+                    )),
+                    "presentation_ids": set(getattr(
+                        controller, "_Controller__pending_completion_progress_floor_overlay_ids", set(),
+                    )),
+                    "overlay": model.active_progress_overlay("root"),
+                    "overlay_identity": model.active_progress_overlay_job_identities_snapshot().get(
+                        "root",
+                    ),
+                    "idle_authoritative": bool(getattr(
+                        controller, "_Controller__lftp_idle_status_authoritative", False,
+                    )),
+                    "move_calls": controller._Controller__move_from_staging.call_count,
+                }
+
+            callbacks = []
+            original_callback_setter = model.set_version_publication_callback
+
+            def capture_callback(callback):
+                if callback is None:
+                    original_callback_setter(None)
+                    return
+                def capture(global_version, scope_version):
+                    callback(global_version, scope_version)
+                    callbacks.append((global_version, scope_version, publication()))
+                original_callback_setter(capture)
+
+            model.set_version_publication_callback = capture_callback
+            updater = ModelUpdater(controller)
+            observations = [publication()]
+            for _ in range(5):
+                controller._Controller__next_lftp_status_poll_at = None
+                updater.update()
+                observations.append(publication())
+            return observations, callbacks
+
+        half, half_callbacks = run(510)
+        complete, complete_callbacks = run(1010)
+        # The common first updater tick creates the active overlay in both cases;
+        # only the final active counter differs before the healthy empty retirement.
+        for observations, callbacks in ((half, half_callbacks), (complete, complete_callbacks)):
+            self.assertEqual("downloading", observations[1]["visible"], observations)
+            self.assertTrue(observations[1]["overlay_identity"], observations)
+            self.assertTrue(observations[3]["pending"], observations)
+            self.assertTrue(observations[3]["idle_authoritative"], observations)
+            self.assertTrue(callbacks)
+            self.assertTrue(observations[5]["coverage"], observations)
+            self.assertFalse(observations[5]["stopped"], observations)
+        self.assertEqual("downloading", half[3]["visible"], half)
+        self.assertEqual("downloading", complete[3]["visible"], complete)
+        self.assertEqual(510, half[2]["overlay"].transferred_size, half)
+        self.assertEqual(1010, complete[2]["overlay"].transferred_size, complete)
+        self.assertEqual((50, 510), half[3]["floors"]["root"], half)
+        self.assertEqual((100, 1010), complete[3]["floors"]["root"], complete)
+        self.assertEqual("downloading", half[4]["visible"], half)
+        self.assertEqual("downloading", complete[4]["visible"], complete)
+        self.assertEqual("downloaded", half[5]["visible"], half)
+        self.assertEqual("downloaded", complete[5]["visible"], complete)
