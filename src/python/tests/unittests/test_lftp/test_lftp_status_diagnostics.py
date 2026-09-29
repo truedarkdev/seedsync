@@ -130,11 +130,20 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         )
         poll = "lftp-poll:0123456789abcdef"
 
-        self.assertIsNone(lftp._Lftp__drain_status_poll_terminal(True, poll))
+        _, lines = self._capture_docker_lines(
+            lambda: lftp._Lftp__drain_status_poll_terminal(True, poll),
+        )
+        self.assertEqual(1, len(lines))
+        self.assertIn("source=pre_send_drain", lines[0])
+        self.assertIn("event=mirror_terminal", lines[0])
+        self.assertIn("result=unknown", lines[0])
+        self.assertLessEqual(len(lines[0].encode("ascii")), 320)
+        self.assertNotIn("private", lines[0])
 
         events = trace.snapshot()["entries"]
         self.assertEqual(1, len(events))
         detail = events[0]["details"]
+        self.assertIn("job_corr={}".format(detail["job_correlation"]), lines[0])
         self.assertEqual(("pre_send_drain", 4, "unknown"),
                          (detail["source"], detail["jobno"], detail["result"]))
         expected = LftpJobStatus(
@@ -182,12 +191,20 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
             "Total: 1 directory, 2 files, 0 symlinks\n"
         ))
 
-        lftp.status("lftp-poll:0123456789abcdef")
+        _, lines = self._capture_docker_lines(
+            lambda: lftp.status("lftp-poll:0123456789abcdef"),
+        )
+        self.assertEqual(2, len(lines))
+        mirror_line = next(line for line in lines if "event=mirror_terminal" in line)
+        self.assertIn("source=post_command", mirror_line)
+        self.assertIn("result=success", mirror_line)
+        self.assertNotIn("private", repr(lines))
 
         events = [event for event in trace.snapshot()["entries"]
                   if event["stage"] == "lftp_mirror_terminal"]
         self.assertEqual(1, len(events))
         detail = events[0]["details"]
+        self.assertIn("job_corr={}".format(detail["job_correlation"]), mirror_line)
         self.assertEqual(("post_command", 5, "success"),
                          (detail["source"], detail["jobno"], detail["result"]))
         expected = LftpJobStatus(
@@ -196,6 +213,23 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         )
         self.assertEqual(expected.job_correlation, detail["job_correlation"])
         self.assertNotIn("private", repr(events[0]))
+
+    def test_partial_post_command_terminal_line_is_unknown_in_docker_log(self):
+        lftp = self._build_lftp()
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+        lftp._Lftp__job_status_parser.parse.return_value = []
+        lftp._Lftp__run_command = MagicMock(return_value=(
+            "[13] Done (mirror -c /private/remote"
+        ))
+
+        _, lines = self._capture_docker_lines(
+            lambda: lftp.status("lftp-poll:0123456789abcdef"),
+        )
+        partial = next(line for line in lines if "event=mirror_terminal" in line)
+        self.assertIn("result=unknown", partial)
+        self.assertIn("complete=0", partial)
+        self.assertNotIn("private", repr(lines))
 
     def test_empty_status_observation_joins_prior_job_and_reports_bounded_no_match(self):
         lftp = self._build_lftp()
@@ -214,8 +248,20 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         ])
 
         self.assertEqual([running], lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
-        self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:1123456789abcdef"))
-        self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:2123456789abcdef"))
+        _, no_match_lines = self._capture_docker_lines(
+            lambda: lftp.status(trace_poll_correlation="lftp-poll:1123456789abcdef"),
+        )
+        _, truncated_lines = self._capture_docker_lines(
+            lambda: lftp.status(trace_poll_correlation="lftp-poll:2123456789abcdef"),
+        )
+        self.assertEqual(1, len(no_match_lines))
+        self.assertIn("event=empty_observation", no_match_lines[0])
+        self.assertIn("terminal_seen=no", no_match_lines[0])
+        self.assertEqual(2, len(truncated_lines))
+        self.assertTrue(any("event=evidence_lost" in line and "truncated=1" in line
+                            for line in truncated_lines))
+        self.assertTrue(all(len(line.encode("ascii")) <= 320 for line in truncated_lines))
+        self.assertNotIn("private", repr(truncated_lines))
 
         observations = [event for event in trace.snapshot()["entries"]
                         if event["stage"] == "lftp_empty_status_terminal_observation"]
@@ -258,7 +304,11 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         ))
         recorder = lambda *_args, **_kwargs: None
 
-        self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef", recorder))
+        _, lines = self._capture_docker_lines(
+            lambda: lftp.status("lftp-poll:0123456789abcdef", recorder),
+        )
+        self.assertEqual(2, len(lines))
+        self.assertTrue(any("result=error" in line for line in lines))
 
         events = trace.snapshot()["entries"]
         terminal = next(event for event in events
@@ -279,8 +329,78 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         }
         disabled._Lftp__job_status_parser.parse.return_value = []
         disabled._Lftp__run_command = MagicMock(return_value="")
-        self.assertEqual([], disabled.status("lftp-poll:1123456789abcdef", recorder))
+        _, disabled_lines = self._capture_docker_lines(
+            lambda: disabled.status("lftp-poll:1123456789abcdef", recorder),
+        )
+        self.assertEqual([], disabled_lines)
+        self.assertEqual([], disabled.status("lftp-poll:2123456789abcdef", recorder))
         self.assertEqual([], disabled_trace.snapshot()["entries"])
+
+    def test_empty_status_no_match_has_docker_log_line_on_active_to_empty_callsite(self):
+        lftp = self._build_lftp()
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+        running = LftpJobStatus(
+            job_id=7, job_type=LftpJobStatus.Type.MIRROR,
+            state=LftpJobStatus.State.RUNNING, name="private-name", flags="-c",
+        )
+        lftp._Lftp__job_status_parser.parse.side_effect = [[running], []]
+        lftp._Lftp__run_command = MagicMock(side_effect=[
+            "[7] mirror -c /private/remote /private/local\n",
+            "[0] Done (queue (private))\n",
+        ])
+        lftp.status("lftp-poll:0123456789abcdef")
+        trace.record = MagicMock(side_effect=OSError("diagnostic recorder unavailable"))
+
+        _, lines = self._capture_docker_lines(
+            lambda: lftp.status("lftp-poll:1123456789abcdef"),
+        )
+        self.assertEqual(1, len(lines))
+        self.assertIn("event=empty_observation", lines[0])
+        self.assertIn("terminal_seen=no", lines[0])
+        self.assertIn("prior_jobs=nonempty", lines[0])
+        self.assertIn("complete=1", lines[0])
+        self.assertNotIn("private", lines[0])
+
+    def test_terminal_docker_log_write_failures_are_isolated_and_trace_failure_is_independent(self):
+        payload = (
+            "[12] Done (mirror -c /private/remote /private/local)\n"
+            "Total: 1 directory, 0 files, 0 symlinks\n1 error detected\n"
+        )
+        for failure in ("select", "write", "recorder"):
+            with self.subTest(failure=failure):
+                lftp = self._build_lftp()
+                trace = self._trace()
+                if failure == "recorder":
+                    trace.record = MagicMock(side_effect=OSError("unavailable"))
+                lftp.set_breadcrumb_trace(trace)
+                lftp._Lftp__job_status_parser.parse.return_value = []
+                lftp._Lftp__run_command = MagicMock(return_value=payload)
+                writes = []
+                with patch("lftp.lftp.sys.stderr", MagicMock(fileno=MagicMock(return_value=2))), \
+                        patch("lftp.lftp.select.select",
+                              side_effect=OSError("unavailable") if failure == "select" else
+                              lambda _r, writable, _x, _timeout: ([], writable, [])), \
+                        patch("lftp.lftp.os.write",
+                              side_effect=OSError("unavailable") if failure == "write" else
+                              lambda fd, data: writes.append((fd, data)) or len(data)):
+                    self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef"))
+                self.assertTrue(lftp._Lftp__job_status_parser.parse.called)
+                if failure == "recorder":
+                    self.assertEqual(1, len(writes))
+                    self.assertIn(b"result=error", writes[0][1])
+                else:
+                    self.assertEqual([], writes)
+
+    @staticmethod
+    def _capture_docker_lines(call):
+        writes = []
+        with patch("lftp.lftp.sys.stderr", MagicMock(fileno=MagicMock(return_value=2))), \
+                patch("lftp.lftp.select.select", return_value=([], [2], [])), \
+                patch("lftp.lftp.os.write",
+                      side_effect=lambda fd, data: writes.append((fd, data)) or len(data)):
+            result = call()
+        return result, [data.decode("ascii") for _fd, data in writes]
 
     @staticmethod
     def _build_lftp():

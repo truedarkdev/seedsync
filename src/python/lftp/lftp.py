@@ -1292,17 +1292,25 @@ def _record_lftp_mirror_terminal_evidence(
             job_correlation = "lftp-job:{}".format(
                 opaque_trace_correlation("lftp.job.v1|{}|mirror".format(jobno)),
             ) if match else None
+            details = {
+                "schema": "lftp.mirror_terminal.v1", "source": source,
+                "jobno": jobno, "job_type": "mirror",
+                **({"job_correlation": job_correlation} if job_correlation is not None else {}),
+                "result": "unknown" if not final_complete else ("error" if errors else "success"),
+                "final_status_complete": final_complete,
+                "directory_count": int(total.group(1)) if final_complete else -1,
+                "file_count": int(total.group(2)) if final_complete else -1,
+                "symlink_count": int(total.group(3)) if final_complete else -1,
+                "error_count": errors,
+            }
+            _write_lftp_terminal_diagnostic_stderr(
+                trace, safe_correlation, source, "mirror_terminal", details["result"],
+                jobno=jobno, error_count=errors, truncated=truncated,
+                complete=final_complete, job_correlation=job_correlation,
+            )
             trace.record(
                 "lftp", "lftp_mirror_terminal",
-                {"schema": "lftp.mirror_terminal.v1", "source": source,
-                 "jobno": jobno, "job_type": "mirror",
-                 **({"job_correlation": job_correlation} if job_correlation is not None else {}),
-                 "result": "unknown" if not final_complete else ("error" if errors else "success"),
-                 "final_status_complete": final_complete,
-                 "directory_count": int(total.group(1)) if final_complete else -1,
-                 "file_count": int(total.group(2)) if final_complete else -1,
-                 "symlink_count": int(total.group(3)) if final_complete else -1,
-                 "error_count": errors, "monotonic_time_ns": time.monotonic_ns()},
+                {**details, "monotonic_time_ns": time.monotonic_ns()},
                 stage="lftp_mirror_terminal", event_type="state_transition",
                 category=LFTP_STATUS_POLL_TRACE_CATEGORY, level="debug",
                 corr_id=safe_correlation, flow_id=safe_correlation, trace_scope="flow",
@@ -1311,6 +1319,10 @@ def _record_lftp_mirror_terminal_evidence(
             if count >= 16:
                 break
         if truncated:
+            _write_lftp_terminal_diagnostic_stderr(
+                trace, safe_correlation, source, "evidence_lost", "unknown",
+                truncated=True, complete=False,
+            )
             trace.record(
                 "lftp", "lftp_mirror_terminal_evidence_lost",
                 {"schema": "lftp.mirror_terminal.v1", "source": source,
@@ -1332,6 +1344,51 @@ def _record_lftp_mirror_terminal_evidence(
         return None
 
 
+def _write_lftp_terminal_diagnostic_stderr(
+        trace: object, correlation: str, source: str, event: str, result: str, *,
+        jobno: int = -1, error_count: int = -1,
+        terminal_seen: str = "unknown", truncated: bool = False,
+        complete: bool = False, job_correlation: object = None,
+        prior_parsed_job_set: str = "unknown",
+) -> None:
+    """Best-effort one-line Docker-log copy of sanitized terminal structure."""
+    if source not in {"pre_send_drain", "post_command"} or event not in {
+            "mirror_terminal", "evidence_lost", "empty_observation"} or result not in {
+            "success", "error", "unknown"}:
+        return
+    safe_correlation = _safe_lftp_status_poll_correlation(correlation)
+    if safe_correlation is None:
+        return
+    jobno = jobno if type(jobno) is int and 0 <= jobno <= 999999999 else -1
+    error_count = error_count if type(error_count) is int and 0 <= error_count <= 999999999 else -1
+    if terminal_seen not in {"yes", "no", "unknown"}:
+        terminal_seen = "unknown"
+    if not isinstance(job_correlation, str) or not re.fullmatch(
+            r"lftp-job:[0-9a-f]{16}", job_correlation):
+        job_correlation = "unknown"
+    if prior_parsed_job_set not in {"nonempty", "empty", "unknown"}:
+        prior_parsed_job_set = "unknown"
+    line = (
+        "seedsync_lftp_terminal corr={} source={} event={} result={} jobno={} job_corr={} "
+        "errors={} terminal_seen={} prior_jobs={} truncated={} complete={}\n"
+    ).format(
+        safe_correlation, source, event, result, jobno, job_correlation,
+        error_count, terminal_seen, prior_parsed_job_set,
+        int(truncated is True), int(complete is True),
+    ).encode("ascii")
+    if len(line) > 320 or not _breadcrumb_effectively_enabled(
+            trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug"):
+        return
+    try:
+        stderr_fd = sys.stderr.fileno()
+        if stderr_fd not in select.select([], [stderr_fd], [], 0)[1]:
+            return
+        os.write(stderr_fd, line)
+    except Exception:
+        # Docker-log diagnostics must never stall or fail a status poll.
+        return
+
+
 def _record_lftp_empty_status_terminal_observation(
         trace: object, correlation: object, scan: object, *,
         healthy: bool, prompt_complete: bool, prior_parse_outcome: object,
@@ -1351,6 +1408,15 @@ def _record_lftp_empty_status_terminal_observation(
         terminal_seen = (
             "yes" if type(mirror_count) is int and mirror_count > 0 else
             "no" if scan_complete else "unknown"
+        )
+        _write_lftp_terminal_diagnostic_stderr(
+            trace, safe_correlation, "post_command", "empty_observation", "unknown",
+            terminal_seen=terminal_seen,
+            truncated=scan.get("scan_truncated") is True, complete=scan_complete,
+            prior_parsed_job_set=(
+                "nonempty" if prior_parse_outcome == "complete_success" else
+                "empty" if prior_parse_outcome == "blank_empty" else "unknown"
+            ),
         )
         recorder = getattr(trace, "record", None)
         if not callable(recorder):
