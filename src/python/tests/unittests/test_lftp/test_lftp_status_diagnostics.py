@@ -197,6 +197,91 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         self.assertEqual(expected.job_correlation, detail["job_correlation"])
         self.assertNotIn("private", repr(events[0]))
 
+    def test_empty_status_observation_joins_prior_job_and_reports_bounded_no_match(self):
+        lftp = self._build_lftp()
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+        running = LftpJobStatus(
+            job_id=7, job_type=LftpJobStatus.Type.MIRROR,
+            state=LftpJobStatus.State.RUNNING, name="private-name", flags="-c",
+        )
+        lftp._Lftp__job_status_parser.parse.side_effect = [[running], [], []]
+        lftp._Lftp__run_command = MagicMock(side_effect=[
+            "[7] mirror -c /private/remote /private/local\n",
+            "[0] Done (queue (private))\n",
+            "x" * (lftp_mod._LFTP_MIRROR_TERMINAL_MAX_BYTES + 1)
+            + "[9] Done (mirror -c /private/remote /private/local)\n",
+        ])
+
+        self.assertEqual([running], lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
+        self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:1123456789abcdef"))
+        self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:2123456789abcdef"))
+
+        observations = [event for event in trace.snapshot()["entries"]
+                        if event["stage"] == "lftp_empty_status_terminal_observation"]
+        self.assertEqual(2, len(observations))
+        ordinary = observations[0]["details"]
+        self.assertEqual("complete_success", ordinary["prior_parse_outcome"])
+        self.assertEqual("nonempty", ordinary["prior_parsed_job_set"])
+        self.assertEqual("no", ordinary["terminal_mirror_seen"])
+        self.assertTrue(ordinary["scan_complete"])
+        self.assertTrue(ordinary["status_healthy"])
+        truncated = observations[1]["details"]
+        self.assertEqual("unknown", truncated["terminal_mirror_seen"])
+        self.assertTrue(truncated["scan_truncated"])
+        self.assertFalse(truncated["scan_complete"])
+        self.assertNotIn("private", repr(observations))
+
+    def test_idle_empty_status_without_prior_job_or_candidate_is_silent(self):
+        lftp = self._build_lftp()
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+        lftp._Lftp__job_status_parser.parse.return_value = []
+        lftp._Lftp__run_command = MagicMock(return_value="")
+        recorder = lambda *_args, **_kwargs: None
+
+        self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
+
+        self.assertFalse(any(
+            event["stage"] == "lftp_empty_status_terminal_observation"
+            for event in trace.snapshot()["entries"]
+        ))
+
+    def test_post_command_error_terminal_and_default_off_gate(self):
+        lftp = self._build_lftp()
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+        lftp._Lftp__job_status_parser.parse.return_value = []
+        lftp._Lftp__run_command = MagicMock(return_value=(
+            "[12] Done (mirror -c /private/remote /private/local)\n"
+            "Total: 1 directory, 0 files, 0 symlinks\n1 error detected\n"
+        ))
+        recorder = lambda *_args, **_kwargs: None
+
+        self.assertEqual([], lftp.status("lftp-poll:0123456789abcdef", recorder))
+
+        events = trace.snapshot()["entries"]
+        terminal = next(event for event in events
+                        if event["stage"] == "lftp_mirror_terminal")
+        observation = next(event for event in events
+                           if event["stage"] == "lftp_empty_status_terminal_observation")
+        self.assertEqual("error", terminal["details"]["result"])
+        self.assertEqual("yes", observation["details"]["terminal_mirror_seen"])
+        self.assertNotIn("private", repr((terminal, observation)))
+
+        disabled = self._build_lftp()
+        disabled_trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8, policy={"default": "off"},
+        )
+        disabled.set_breadcrumb_trace(disabled_trace)
+        disabled._Lftp__last_incoming_recovery_status_observation = {
+            "status_result_shape": "job_present",
+        }
+        disabled._Lftp__job_status_parser.parse.return_value = []
+        disabled._Lftp__run_command = MagicMock(return_value="")
+        self.assertEqual([], disabled.status("lftp-poll:1123456789abcdef", recorder))
+        self.assertEqual([], disabled_trace.snapshot()["entries"])
+
     @staticmethod
     def _build_lftp():
         lftp = Lftp.__new__(Lftp)

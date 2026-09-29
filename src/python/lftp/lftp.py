@@ -1256,19 +1256,22 @@ def _record_lftp_status_poll_breadcrumb(
 def _record_lftp_mirror_terminal_evidence(
         trace: object, correlation: object, output: object, *, source: str,
         complete: bool, truncated_input: bool = False,
-) -> None:
+) -> Optional[dict[str, object]]:
     """Emit bounded per-mirror terminal facts without retaining status text."""
     safe_correlation = _safe_lftp_status_poll_correlation(correlation)
     if safe_correlation is None or source not in {"pre_send_drain", "post_command"} or \
             not _breadcrumb_effectively_enabled(trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug"):
-        return
+        return None
     try:
         text = output.decode("utf-8", "replace") if isinstance(output, bytes) else str(output or "")
         truncated = truncated_input or \
             len(text.encode("utf-8", "replace")) > _LFTP_MIRROR_TERMINAL_MAX_BYTES
         lines = text[:_LFTP_MIRROR_TERMINAL_MAX_BYTES].splitlines()
         count = 0
+        candidate_count = 0
         for index, line in enumerate(lines):
+            if re.match(r"\s*\[\d{1,9}\]\s+Done\s+\(", line):
+                candidate_count = min(16, candidate_count + 1)
             match = re.fullmatch(r"\s*\[(\d{1,9})\]\s+Done\s+\(mirror(?:\s[^\r\n]*)?\)\s*", line)
             partial = re.match(r"\s*\[(\d{1,9})\]\s+Done\s+\(mirror(?:\s|\))", line)
             if not match and not partial:
@@ -1319,6 +1322,56 @@ def _record_lftp_mirror_terminal_evidence(
                 category=LFTP_STATUS_POLL_TRACE_CATEGORY, level="debug",
                 corr_id=safe_correlation, flow_id=safe_correlation, trace_scope="flow",
             )
+        return {
+            "mirror_done_count": min(16, count),
+            "terminal_candidate_count": candidate_count,
+            "scan_truncated": truncated,
+            "scan_complete": complete and not truncated,
+        }
+    except Exception:
+        return None
+
+
+def _record_lftp_empty_status_terminal_observation(
+        trace: object, correlation: object, scan: object, *,
+        healthy: bool, prompt_complete: bool, prior_parse_outcome: object,
+) -> None:
+    """Record only bounded terminal-like evidence accompanying an empty snapshot."""
+    safe_correlation = _safe_lftp_status_poll_correlation(correlation)
+    if safe_correlation is None or not isinstance(scan, dict):
+        return
+    prior_parse_outcome = prior_parse_outcome if prior_parse_outcome in LFTP_STATUS_PARSE_OUTCOMES else "unknown"
+    if (prior_parse_outcome != "complete_success" and scan.get("terminal_candidate_count", 0) <= 0 and
+            scan.get("scan_truncated") is not True) or \
+            not _breadcrumb_effectively_enabled(trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug"):
+        return
+    try:
+        mirror_count = scan.get("mirror_done_count")
+        scan_complete = scan.get("scan_complete") is True and prompt_complete is True and healthy is True
+        terminal_seen = (
+            "yes" if type(mirror_count) is int and mirror_count > 0 else
+            "no" if scan_complete else "unknown"
+        )
+        recorder = getattr(trace, "record", None)
+        if not callable(recorder):
+            return
+        recorder(
+            "lftp", "lftp_empty_status_terminal_observation",
+            {"schema": "lftp.mirror_terminal.v1", "source": "post_command",
+             "terminal_mirror_seen": terminal_seen,
+             "mirror_done_count": mirror_count if type(mirror_count) is int else -1,
+             "terminal_candidate_count": min(16, scan.get("terminal_candidate_count", 0)),
+             "prior_parse_outcome": prior_parse_outcome,
+             "prior_parsed_job_set": "nonempty" if prior_parse_outcome == "complete_success" else
+             "empty" if prior_parse_outcome == "blank_empty" else "unknown",
+             "observation_scope": "bounded_post_command_output",
+             "scan_truncated": scan.get("scan_truncated") is True,
+             "scan_complete": scan_complete, "prompt_complete": prompt_complete is True,
+             "status_healthy": healthy is True, "monotonic_time_ns": time.monotonic_ns()},
+            stage="lftp_empty_status_terminal_observation", event_type="state_transition",
+            category=LFTP_STATUS_POLL_TRACE_CATEGORY, level="debug",
+            corr_id=safe_correlation, flow_id=safe_correlation, trace_scope="flow",
+        )
     except Exception:
         return
 
@@ -3041,9 +3094,12 @@ class Lftp:
         :return:
         """
         self.__last_status_poll_failure_reason = None
+        # Retain only the prior parsed shape for bounded diagnostics; reset
+        # the current outcome before this poll begins.
+        prior_parse_outcome = getattr(self, "_Lftp__last_status_parse_outcome", "unknown")
+        if prior_parse_outcome not in LFTP_STATUS_PARSE_OUTCOMES:
+            prior_parse_outcome = "unknown"
         self.__last_status_parse_outcome = "not_attempted"
-        # A prior poll must never be associated with this poll, or
-        # survive after the gate is disabled.
         self.__last_incoming_recovery_status_observation = None
         safe_trace_poll_correlation = _safe_lftp_status_poll_correlation(trace_poll_correlation)
 
@@ -3157,6 +3213,7 @@ class Lftp:
         preceded_timeout = timed_out is True
         used_connection_grace = False
         statuses: Optional[List[LftpJobStatus]] = None
+        terminal_scan: Optional[dict[str, object]] = None
         try:
             try:
                 preparse_process_alive = self.__process.isalive()
@@ -3166,7 +3223,7 @@ class Lftp:
                 safe_trace_poll_correlation, out, preparse_process_alive,
                 getattr(self, "_Lftp__breadcrumb_trace", None),
             )
-            _record_lftp_mirror_terminal_evidence(
+            terminal_scan = _record_lftp_mirror_terminal_evidence(
                 getattr(self, "_Lftp__breadcrumb_trace", None), safe_trace_poll_correlation,
                 out, source="post_command", complete=not self.__last_command_timed_out,
             )
@@ -3220,7 +3277,7 @@ class Lftp:
                     safe_trace_poll_correlation, out, preparse_process_alive,
                     getattr(self, "_Lftp__breadcrumb_trace", None),
                 )
-                _record_lftp_mirror_terminal_evidence(
+                terminal_scan = _record_lftp_mirror_terminal_evidence(
                     getattr(self, "_Lftp__breadcrumb_trace", None), safe_trace_poll_correlation,
                     out, source="post_command", complete=not self.__last_command_timed_out,
                 )
@@ -3249,6 +3306,13 @@ class Lftp:
                 raise
             if statuses is not None:
                 self.__annotate_status_path_pairs(statuses)
+        if isinstance(statuses, list) and not statuses and self.__last_status_poll_healthy is True and \
+                self.__last_status_poll_failure_reason is None:
+            _record_lftp_empty_status_terminal_observation(
+                getattr(self, "_Lftp__breadcrumb_trace", None), safe_trace_poll_correlation,
+                terminal_scan, healthy=True, prompt_complete=not self.__last_command_timed_out,
+                prior_parse_outcome=prior_parse_outcome,
+            )
         if not self.__last_status_poll_healthy and self.__last_status_poll_failure_reason is None:
             self.__last_status_poll_failure_reason = "unhealthy_snapshot"
         self.__record_incoming_recovery_status_observation(
