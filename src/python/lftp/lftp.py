@@ -86,6 +86,7 @@ LFTP_STATUS_POLL_DRAIN_TERMINATIONS = frozenset({
 LFTP_STATUS_POLL_BUFFER_PROGRESS = frozenset({"progress", "no_progress", "unknown"})
 _LFTP_STATUS_POLL_METRIC_MAX = 2_147_483_647
 _LFTP_TRACE_LINE_SCAN_MAX_BYTES = 64 * 1024
+_LFTP_MIRROR_TERMINAL_MAX_BYTES = 16 * 1024
 redact_credentials = redact_sensitive_text
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -1252,6 +1253,72 @@ def _record_lftp_status_poll_breadcrumb(
         return
 
 
+def _record_lftp_mirror_terminal_evidence(
+        trace: object, correlation: object, output: object, *, source: str,
+        complete: bool, truncated_input: bool = False,
+) -> None:
+    """Emit bounded per-mirror terminal facts without retaining status text."""
+    safe_correlation = _safe_lftp_status_poll_correlation(correlation)
+    if safe_correlation is None or source not in {"pre_send_drain", "post_command"} or \
+            not _breadcrumb_effectively_enabled(trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug"):
+        return
+    try:
+        text = output.decode("utf-8", "replace") if isinstance(output, bytes) else str(output or "")
+        truncated = truncated_input or \
+            len(text.encode("utf-8", "replace")) > _LFTP_MIRROR_TERMINAL_MAX_BYTES
+        lines = text[:_LFTP_MIRROR_TERMINAL_MAX_BYTES].splitlines()
+        count = 0
+        for index, line in enumerate(lines):
+            match = re.fullmatch(r"\s*\[(\d{1,9})\]\s+Done\s+\(mirror(?:\s[^\r\n]*)?\)\s*", line)
+            partial = re.match(r"\s*\[(\d{1,9})\]\s+Done\s+\(mirror(?:\s|\))", line)
+            if not match and not partial:
+                continue
+            jobno = int((match or partial).group(1))
+            final = []
+            for item in lines[index + 1:]:
+                if re.match(r"\s*\[\d+\]\s+", item):
+                    break
+                final.append(item.strip())
+            total = next((re.fullmatch(
+                r"Total:\s*(\d+)\s+director(?:y|ies),\s*(\d+)\s+files?,\s*(\d+)\s+symlinks?", item,
+            ) for item in final if item.startswith("Total:")), None)
+            error_match = next((re.fullmatch(r"(\d+) errors? detected", item) for item in final
+                                if re.fullmatch(r"\d+ errors? detected", item)), None)
+            final_complete = bool(match) and complete and not truncated and total is not None
+            errors = int(error_match.group(1)) if error_match else (0 if final_complete else -1)
+            trace.record(
+                "lftp", "lftp_mirror_terminal",
+                {"schema": "lftp.mirror_terminal.v1", "source": source,
+                 "jobno": jobno, "job_type": "mirror",
+                 "result": "unknown" if not final_complete else ("error" if errors else "success"),
+                 "final_status_complete": final_complete,
+                 "directory_count": int(total.group(1)) if final_complete else -1,
+                 "file_count": int(total.group(2)) if final_complete else -1,
+                 "symlink_count": int(total.group(3)) if final_complete else -1,
+                 "error_count": errors, "monotonic_time_ns": time.monotonic_ns()},
+                stage="lftp_mirror_terminal", event_type="state_transition",
+                category=LFTP_STATUS_POLL_TRACE_CATEGORY, level="debug",
+                corr_id=safe_correlation, flow_id=safe_correlation, trace_scope="flow",
+            )
+            count += 1
+            if count >= 16:
+                break
+        if truncated:
+            trace.record(
+                "lftp", "lftp_mirror_terminal_evidence_lost",
+                {"schema": "lftp.mirror_terminal.v1", "source": source,
+                 "job_id_known": False, "job_type": "unknown", "result": "unknown",
+                 "final_status_complete": False, "evidence_lost": True,
+                 "scan_cap_bytes": _LFTP_MIRROR_TERMINAL_MAX_BYTES,
+                 "monotonic_time_ns": time.monotonic_ns()},
+                stage="lftp_mirror_terminal", event_type="failure",
+                category=LFTP_STATUS_POLL_TRACE_CATEGORY, level="debug",
+                corr_id=safe_correlation, flow_id=safe_correlation, trace_scope="flow",
+            )
+    except Exception:
+        return
+
+
 class _PathPair(Protocol):
     @property
     def id(self) -> str: ...
@@ -1707,7 +1774,8 @@ class Lftp:
             self.logger.error("Lftp process died unexpectedly (EOF) before {}".format(context))
             raise LftpError("Lftp process terminated before {}: {}".format(context, out))
 
-    def __drain_status_poll_terminal(self, diagnostic_enabled: bool = False) -> Optional[str]:
+    def __drain_status_poll_terminal(self, diagnostic_enabled: bool = False,
+                                     correlation: object = None) -> Optional[str]:
         """Discard stale PTY output before one authoritative status command.
 
         The single LFTP executor is the only reader.  A background mirror can
@@ -1741,9 +1809,16 @@ class Lftp:
         fresh_saw_prompt_match = False
         fresh_saw_prompt_or_echo = False
         fresh_saw_error = False
+        mirror_evidence = ""
+        mirror_evidence_truncated = False
+        mirror_evidence_enabled = _safe_lftp_status_poll_correlation(correlation) is not None and \
+            _breadcrumb_effectively_enabled(
+                getattr(self, "_Lftp__breadcrumb_trace", None),
+                LFTP_STATUS_POLL_TRACE_CATEGORY, "debug",
+            )
 
         def observe(value: object, *, fresh: bool = False) -> None:
-            nonlocal evidence_tail, fresh_evidence_tail, saw_backend_error, saw_host_key_prompt, saw_queue_done, \
+            nonlocal evidence_tail, fresh_evidence_tail, mirror_evidence, mirror_evidence_truncated, saw_backend_error, saw_host_key_prompt, saw_queue_done, \
                 saw_job_or_progress, saw_prompt_or_echo, drained_byte_count, drained_line_count, \
                 retained_byte_count, retained_line_count, fresh_byte_count, fresh_line_count, \
                 fresh_saw_queue_done, fresh_saw_job_or_progress, fresh_saw_command_echo, \
@@ -1751,6 +1826,12 @@ class Lftp:
             if not isinstance(value, (str, bytes)):
                 return
             text = self.__decode_spawn_output(value)
+            if mirror_evidence_enabled and len(mirror_evidence) < _LFTP_MIRROR_TERMINAL_MAX_BYTES:
+                remaining_evidence = _LFTP_MIRROR_TERMINAL_MAX_BYTES - len(mirror_evidence)
+                mirror_evidence += text[:remaining_evidence]
+                mirror_evidence_truncated = mirror_evidence_truncated or len(text) > remaining_evidence
+            elif mirror_evidence_enabled and text:
+                mirror_evidence_truncated = True
             # Detect first so a known marker at the head of a large chunk is
             # not hidden by the bounded cross-chunk tail retained below.
             combined = evidence_tail + text
@@ -1828,6 +1909,13 @@ class Lftp:
                 fresh_evidence_tail = fresh_combined[-1024:]
 
         def finish(failure: Optional[str], termination: Optional[str] = None) -> Optional[str]:
+            if mirror_evidence_enabled:
+                _record_lftp_mirror_terminal_evidence(
+                    getattr(self, "_Lftp__breadcrumb_trace", None), correlation, mirror_evidence,
+                    source="pre_send_drain",
+                    complete=False,
+                    truncated_input=mirror_evidence_truncated,
+                )
             if diagnostic_enabled:
                 observation = getattr(self, "_Lftp__last_incoming_recovery_status_observation", None)
                 observation = dict(observation) if isinstance(observation, dict) else {}
@@ -2133,6 +2221,7 @@ class Lftp:
             if status_poll:
                 terminal_failure = self.__drain_status_poll_terminal(
                     callable(diagnostic_recorder) or status_trace_enabled,
+                    safe_status_poll_correlation,
                 )
                 if status_trace_enabled:
                     status_boundary["pre_send_drain_class"] = (
@@ -3073,6 +3162,10 @@ class Lftp:
                 safe_trace_poll_correlation, out, preparse_process_alive,
                 getattr(self, "_Lftp__breadcrumb_trace", None),
             )
+            _record_lftp_mirror_terminal_evidence(
+                getattr(self, "_Lftp__breadcrumb_trace", None), safe_trace_poll_correlation,
+                out, source="post_command", complete=not self.__last_command_timed_out,
+            )
             record_status_result("parse_started", out)
             statuses = self.__job_status_parser.parse(out)
             self.__set_status_parse_outcome(statuses)
@@ -3122,6 +3215,10 @@ class Lftp:
                 _record_lftp_preparse_stderr(
                     safe_trace_poll_correlation, out, preparse_process_alive,
                     getattr(self, "_Lftp__breadcrumb_trace", None),
+                )
+                _record_lftp_mirror_terminal_evidence(
+                    getattr(self, "_Lftp__breadcrumb_trace", None), safe_trace_poll_correlation,
+                    out, source="post_command", complete=not self.__last_command_timed_out,
                 )
                 record_status_result("parse_started", out)
                 statuses = self.__job_status_parser.parse(out)

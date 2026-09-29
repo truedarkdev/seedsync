@@ -56,6 +56,128 @@ class _RealisticStatusPty:
 
 
 class TestLftpStatusDiagnostics(unittest.TestCase):
+    def test_mirror_terminal_breadcrumb_requires_complete_mirror_and_final_counts(self):
+        trace = self._trace()
+        poll = "lftp-poll:0123456789abcdef"
+        complete = (
+            "[7] Done (mirror -c /private/remote /private/local)\n"
+            "Total: 1 directory, 2 files, 0 symlinks\n"
+        )
+        lftp_mod._record_lftp_mirror_terminal_evidence(
+            trace, poll, complete, source="post_command", complete=True,
+        )
+        detail = trace.snapshot()["entries"][-1]["details"]
+        self.assertEqual((7, "mirror", "success", 0),
+                         (detail["jobno"], detail["job_type"], detail["result"], detail["error_count"]))
+        self.assertNotIn("/private", repr(detail))
+
+        lftp_mod._record_lftp_mirror_terminal_evidence(
+            trace, poll, "[0] Done (queue (private))\n", source="post_command", complete=True,
+        )
+        self.assertEqual(1, len(trace.snapshot()["entries"]))
+        lftp_mod._record_lftp_mirror_terminal_evidence(
+            trace, poll, "[8] Done (mirror -c private", source="pre_send_drain", complete=False,
+        )
+        partial = trace.snapshot()["entries"][-1]["details"]
+        self.assertEqual("unknown", partial["result"])
+        self.assertFalse(partial["final_status_complete"])
+
+        lftp_mod._record_lftp_mirror_terminal_evidence(
+            trace, poll,
+            "[10] Done (mirror -c private)\nTotal: 1 directory, 2 files, 0 symlinks\n" + "x" * 17000,
+            source="post_command", complete=True,
+        )
+        truncated = trace.snapshot()["entries"][-1]["details"]
+        self.assertEqual("unknown", truncated["result"])
+        self.assertFalse(truncated["final_status_complete"])
+
+        lftp_mod._record_lftp_mirror_terminal_evidence(
+            trace, poll, "x" * lftp_mod._LFTP_MIRROR_TERMINAL_MAX_BYTES +
+            "\n[11] Done (mirror -c private)\nTotal: 1 directory, 2 files, 0 symlinks\n",
+            source="post_command", complete=True,
+        )
+        lost = trace.snapshot()["entries"][-1]["details"]
+        self.assertTrue(lost["evidence_lost"])
+        self.assertEqual("unknown", lost["result"])
+        self.assertFalse(lost["job_id_known"])
+
+        lftp_mod._record_lftp_mirror_terminal_evidence(
+            trace, poll,
+            "[9] Done (mirror -c private)\nTotal: 1 directory, 2 files, 0 symlinks\n"
+            "1 error detected\n",
+            source="post_command", complete=True,
+        )
+        error = trace.snapshot()["entries"][-1]["details"]
+        self.assertEqual(("error", 1), (error["result"], error["error_count"]))
+
+    def test_pre_send_drain_callsite_emits_mirror_only_terminal_event(self):
+        lftp = self._build_lftp()
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+        lftp._Lftp__process._buffer = io.StringIO(
+            "[0] Done (queue (private))\n"
+            "[4] Done (mirror -c /private/remote /private/local)\n"
+            "Total: 1 directory, 2 files, 0 symlinks\n"
+        )
+        poll = "lftp-poll:0123456789abcdef"
+
+        self.assertIsNone(lftp._Lftp__drain_status_poll_terminal(True, poll))
+
+        events = trace.snapshot()["entries"]
+        self.assertEqual(1, len(events))
+        detail = events[0]["details"]
+        self.assertEqual(("pre_send_drain", 4, "unknown"),
+                         (detail["source"], detail["jobno"], detail["result"]))
+        self.assertFalse(detail["final_status_complete"])
+        self.assertNotIn("private", repr(events[0]))
+
+    def test_pre_send_drain_without_debug_skips_new_evidence_buffer_copy(self):
+        class TrackedText(str):
+            prefix_slices = 0
+
+            def __getitem__(self, key):
+                if isinstance(key, slice) and key.start in (None, 0) and key.stop is not None:
+                    type(self).prefix_slices += 1
+                return super().__getitem__(key)
+
+        lftp = self._build_lftp()
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8, policy={"default": "off"})
+        lftp.set_breadcrumb_trace(trace)
+        lftp._Lftp__process._buffer = io.StringIO(
+            "[4] Done (mirror -c private)\nTotal: 1 directory, 2 files, 0 symlinks\n"
+        )
+        lftp._Lftp__decode_spawn_output = lambda value: TrackedText(value)
+        TrackedText.prefix_slices = 0
+
+        with patch("lftp.lftp._record_lftp_mirror_terminal_evidence") as record:
+            lftp._Lftp__drain_status_poll_terminal(True, "lftp-poll:0123456789abcdef")
+
+        record.assert_not_called()
+        self.assertEqual(0, TrackedText.prefix_slices)
+        self.assertGreater(lftp._Lftp__last_incoming_recovery_status_observation[
+            "_pre_send_drain_bytes"
+        ], 0)
+
+    def test_post_command_callsite_emits_mirror_only_terminal_event(self):
+        lftp = self._build_lftp()
+        trace = self._trace()
+        lftp.set_breadcrumb_trace(trace)
+        lftp._Lftp__run_command = MagicMock(return_value=(
+            "[0] Done (queue (private))\n"
+            "[5] Done (mirror -c /private/remote /private/local)\n"
+            "Total: 1 directory, 2 files, 0 symlinks\n"
+        ))
+
+        lftp.status("lftp-poll:0123456789abcdef")
+
+        events = [event for event in trace.snapshot()["entries"]
+                  if event["stage"] == "lftp_mirror_terminal"]
+        self.assertEqual(1, len(events))
+        detail = events[0]["details"]
+        self.assertEqual(("post_command", 5, "success"),
+                         (detail["source"], detail["jobno"], detail["result"]))
+        self.assertNotIn("private", repr(events[0]))
+
     @staticmethod
     def _build_lftp():
         lftp = Lftp.__new__(Lftp)
