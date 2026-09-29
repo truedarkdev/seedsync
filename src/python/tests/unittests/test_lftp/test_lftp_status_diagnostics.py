@@ -9,7 +9,7 @@ import pexpect
 
 import lftp.lftp as lftp_mod
 from common.breadcrumb_trace import BreadcrumbTraceCollector
-from lftp import Lftp, LftpJobStatusParser, LftpJobStatusParserError
+from lftp import Lftp, LftpJobStatus, LftpJobStatusParser, LftpJobStatusParserError
 
 
 class _RealisticStatusPty:
@@ -67,12 +67,21 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
             trace, poll, complete, source="post_command", complete=True,
         )
         detail = trace.snapshot()["entries"][-1]["details"]
+        mirror_status = LftpJobStatus(
+            job_id=7, job_type=LftpJobStatus.Type.MIRROR,
+            state=LftpJobStatus.State.RUNNING, name="private-name", flags="-c",
+        )
         self.assertEqual((7, "mirror", "success", 0),
                          (detail["jobno"], detail["job_type"], detail["result"], detail["error_count"]))
+        self.assertEqual(mirror_status.job_correlation, detail["job_correlation"])
         self.assertNotIn("/private", repr(detail))
 
         lftp_mod._record_lftp_mirror_terminal_evidence(
             trace, poll, "[0] Done (queue (private))\n", source="post_command", complete=True,
+        )
+        lftp_mod._record_lftp_mirror_terminal_evidence(
+            trace, poll, "[6] Done (get /private/remote /private/local)\n",
+            source="post_command", complete=True,
         )
         self.assertEqual(1, len(trace.snapshot()["entries"]))
         lftp_mod._record_lftp_mirror_terminal_evidence(
@@ -128,6 +137,11 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         detail = events[0]["details"]
         self.assertEqual(("pre_send_drain", 4, "unknown"),
                          (detail["source"], detail["jobno"], detail["result"]))
+        expected = LftpJobStatus(
+            job_id=4, job_type=LftpJobStatus.Type.MIRROR,
+            state=LftpJobStatus.State.RUNNING, name="private-name", flags="-c",
+        )
+        self.assertEqual(expected.job_correlation, detail["job_correlation"])
         self.assertFalse(detail["final_status_complete"])
         self.assertNotIn("private", repr(events[0]))
 
@@ -176,6 +190,11 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         detail = events[0]["details"]
         self.assertEqual(("post_command", 5, "success"),
                          (detail["source"], detail["jobno"], detail["result"]))
+        expected = LftpJobStatus(
+            job_id=5, job_type=LftpJobStatus.Type.MIRROR,
+            state=LftpJobStatus.State.RUNNING, name="private-name", flags="-c",
+        )
+        self.assertEqual(expected.job_correlation, detail["job_correlation"])
         self.assertNotIn("private", repr(events[0]))
 
     @staticmethod

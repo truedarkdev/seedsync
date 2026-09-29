@@ -1286,10 +1286,14 @@ def _record_lftp_mirror_terminal_evidence(
                                 if re.fullmatch(r"\d+ errors? detected", item)), None)
             final_complete = bool(match) and complete and not truncated and total is not None
             errors = int(error_match.group(1)) if error_match else (0 if final_complete else -1)
+            job_correlation = "lftp-job:{}".format(
+                opaque_trace_correlation("lftp.job.v1|{}|mirror".format(jobno)),
+            ) if match else None
             trace.record(
                 "lftp", "lftp_mirror_terminal",
                 {"schema": "lftp.mirror_terminal.v1", "source": source,
                  "jobno": jobno, "job_type": "mirror",
+                 **({"job_correlation": job_correlation} if job_correlation is not None else {}),
                  "result": "unknown" if not final_complete else ("error" if errors else "success"),
                  "final_status_complete": final_complete,
                  "directory_count": int(total.group(1)) if final_complete else -1,
