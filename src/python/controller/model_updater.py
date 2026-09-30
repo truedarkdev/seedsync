@@ -4072,8 +4072,58 @@ class ModelUpdater(_ControllerCoreAccess):
         retired_job_identity: Optional[tuple[int, str]],
         overlays: Mapping[str, ActiveProgressOverlay],
         overlay_identities: Mapping[str, tuple[int, str]],
+        *,
+        poll_correlation: Optional[str] = None,
+        poll_source: str = "unknown",
+        retired_identity_resolution: str = "caller_provided",
     ) -> tuple[Optional[tuple[Optional[int], Optional[int]]], bool, Optional[tuple[int, str]]]:
         """Capture accepted live counters before retirement evicts their source."""
+        retired_identity_valid = (
+            isinstance(retired_job_identity, tuple) and len(retired_job_identity) == 2 and
+            type(retired_job_identity[0]) is int and retired_job_identity[0] >= 0 and
+            isinstance(retired_job_identity[1], str) and bool(retired_job_identity[1])
+        )
+        retired_identity_state = (
+            "available" if retired_identity_valid else
+            "absent" if retired_job_identity is None else "invalid"
+        )
+        if retired_identity_state == "absent" and \
+                retired_identity_resolution == "snapshot_lookup_failed":
+            retired_identity_state = "unknown_after_lookup_failure"
+        overlay_state = "absent"
+        overlay_progress_present = False
+        overlay_transferred_size_present = False
+        published_lookup = "not_attempted"
+        published_candidate = "not_evaluated"
+        capture_source = "none"
+
+        def record_capture(outcome: str) -> None:
+            self._record_completion_gate_breadcrumb(
+                file_id,
+                "completion_progress_floor_capture",
+                {
+                    "schema": "completion_progress_floor_capture.v1",
+                    "poll_source": poll_source
+                    if isinstance(poll_source, str) and
+                    poll_source in _COMPLETION_GATE_LFTP_SOURCES else "unknown",
+                    "retired_identity_resolution": retired_identity_resolution
+                    if isinstance(retired_identity_resolution, str) and
+                    retired_identity_resolution in {
+                        "caller_provided", "snapshot_reader_unavailable",
+                        "snapshot_lookup_succeeded", "snapshot_lookup_failed",
+                    } else "unknown",
+                    "retired_identity_state": retired_identity_state,
+                    "overlay_state": overlay_state,
+                    "overlay_progress_present": overlay_progress_present,
+                    "overlay_transferred_size_present": overlay_transferred_size_present,
+                    "published_lookup": published_lookup,
+                    "published_candidate": published_candidate,
+                    "capture_source": capture_source,
+                    "outcome": outcome,
+                },
+                poll_correlation=poll_correlation,
+            )
+
         overlay = overlays.get(file_id)
         overlay_identity = overlay_identities.get(file_id)
         if isinstance(overlay, ActiveProgressOverlay):
@@ -4082,15 +4132,25 @@ class ModelUpdater(_ControllerCoreAccess):
                     type(overlay_identity[0]) is int and overlay_identity[0] >= 0 and
                     isinstance(overlay_identity[1], str) and overlay_identity[1]
             ):
+                overlay_state = "identity_invalid"
+                record_capture("overlay_identity_invalid")
                 return None, False, None
             if retired_job_identity is not None and overlay_identity != retired_job_identity:
+                overlay_state = "identity_mismatch"
+                record_capture("overlay_identity_mismatch")
                 return None, False, None
-            if type(overlay.download_progress) is int or type(overlay.transferred_size) is int:
+            overlay_progress_present = type(overlay.download_progress) is int
+            overlay_transferred_size_present = type(overlay.transferred_size) is int
+            if overlay_progress_present or overlay_transferred_size_present:
+                overlay_state = "accepted"
+                capture_source = "overlay"
+                record_capture("overlay_accepted")
                 return (
                     (overlay.download_progress, overlay.transferred_size),
                     True,
                     overlay_identity or retired_job_identity,
                 )
+            overlay_state = "counters_missing"
 
         # LFTP retirement can be observed after the active overlay was
         # deliberately retired by a local-only publication.  That published
@@ -4102,9 +4162,7 @@ class ModelUpdater(_ControllerCoreAccess):
         # Keep this deliberately narrow: a real retired identity, a local-only
         # effective record, and a terminal local-only progress value are all
         # required.  Ordinary DEFAULT base files remain diagnostic input only.
-        if isinstance(retired_job_identity, tuple) and len(retired_job_identity) == 2 and \
-                type(retired_job_identity[0]) is int and retired_job_identity[0] >= 0 and \
-                isinstance(retired_job_identity[1], str) and retired_job_identity[1]:
+        if retired_identity_valid:
             model = getattr(self._controller, "_Controller__model", None)
             published_reader = getattr(model, "published_file_with_job_identity", None)
             if callable(published_reader):
@@ -4117,21 +4175,62 @@ class ModelUpdater(_ControllerCoreAccess):
                         published_result = published_reader(file_id)
                     if isinstance(published_result, tuple) and len(published_result) == 2:
                         published, published_identity = published_result
+                        published_lookup = "returned_valid_shape"
                     else:
                         published = None
                         published_identity = None
+                        published_lookup = "returned_invalid_shape"
                 except (AttributeError, TypeError, ValueError):
                     published = None
                     published_identity = None
-                if published_identity == retired_job_identity and \
-                        isinstance(published, ModelFile) and not published.explicitly_stopped and \
-                        published.local_present and not published.remote_has_transferable_content and \
-                        published.download_progress == 100:
+                    published_lookup = "error"
+                if published_lookup == "returned_valid_shape":
+                    if published is None and published_identity is None:
+                        published_candidate = "absent"
+                    elif published_identity != retired_job_identity:
+                        published_candidate = "identity_mismatch"
+                    elif not isinstance(published, ModelFile):
+                        published_candidate = "invalid_model_file"
+                    elif published.explicitly_stopped:
+                        published_candidate = "explicitly_stopped"
+                    elif not published.local_present:
+                        published_candidate = "not_local_present"
+                    elif published.remote_has_transferable_content:
+                        published_candidate = "transferable_remote_content"
+                    elif published.download_progress != 100:
+                        published_candidate = "nonterminal_progress"
+                    else:
+                        published_candidate = "eligible"
+                if published_candidate == "eligible":
+                    capture_source = "published_snapshot"
+                    record_capture("published_snapshot_accepted")
                     return (
                         (published.download_progress, published.transferred_size),
                         True,
                         retired_job_identity,
                     )
+            else:
+                published_lookup = "unavailable"
+        if retired_identity_state in {"absent", "unknown_after_lookup_failure"}:
+            outcome = (
+                "no_retired_identity" if retired_identity_state == "absent" else
+                "retired_identity_lookup_failed"
+            )
+        elif retired_identity_state == "invalid":
+            outcome = "retired_identity_invalid"
+        elif published_lookup == "unavailable":
+            outcome = "published_reader_unavailable"
+        elif published_lookup == "error":
+            outcome = "published_lookup_error"
+        elif published_lookup == "returned_invalid_shape":
+            outcome = "published_result_invalid_shape"
+        elif published_candidate == "absent":
+            outcome = "published_snapshot_absent"
+        elif published_candidate == "identity_mismatch":
+            outcome = "published_identity_mismatch"
+        else:
+            outcome = "published_snapshot_ineligible"
+        record_capture(outcome)
 
         # Never synthesize a completion projection from an arbitrary base
         # ModelFile: it may now be Local Only/DEFAULT after the accepted
@@ -4381,6 +4480,7 @@ class ModelUpdater(_ControllerCoreAccess):
         *,
         defer_snapshot_eviction: bool = False,
         retired_job_identities: Optional[Mapping[str, tuple[int, str]]] = None,
+        retired_identity_resolution: str = "caller_provided",
         lftp_status_poll_authoritative: Optional[bool] = None,
         lftp_status_snapshot_fresh: Optional[bool] = None,
         lftp_status_poll_healthy: Optional[bool] = None,
@@ -4626,6 +4726,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     retired_identity,
                     live_overlay_snapshot,
                     live_overlay_identity_snapshot,
+                    poll_correlation=poll_correlation,
+                    poll_source=poll_source,
+                    retired_identity_resolution=retired_identity_resolution,
                 )
                 if current_floor is None:
                     continue
@@ -5995,18 +6098,21 @@ class ModelUpdater(_ControllerCoreAccess):
         snapshot_identity_reader = getattr(
             type(model_builder), "recent_live_transfer_snapshot_identities", None,
         )
+        retired_identity_resolution = "snapshot_reader_unavailable"
         if callable(snapshot_identity_reader):
             try:
                 for file_id, identity in model_builder.recent_live_transfer_snapshot_identities(
                         completion_candidate_ids,
                 ).items():
                     retired_job_identities.setdefault(file_id, identity)
+                retired_identity_resolution = "snapshot_lookup_succeeded"
             except Exception:
+                retired_identity_resolution = "snapshot_lookup_failed"
                 # A failed snapshot lookup is not evidence that a name-only
                 # retirement is safe. Drop even partial lookup results and
                     # pass the meaningful empty map so the builder retains floors
                     # conservatively until a later boundary supplies identity.
-                    retired_job_identities = {}
+                retired_job_identities = {}
         self._revoke_stale_model_published_provenance(
             replacement_statuses_by_file_id(),
         )
@@ -6016,6 +6122,7 @@ class ModelUpdater(_ControllerCoreAccess):
             retired_queue_dispatches,
             defer_snapshot_eviction=True,
             retired_job_identities=retired_job_identities,
+            retired_identity_resolution=retired_identity_resolution,
             lftp_status_poll_authoritative=lftp_status_poll_healthy or bool(lftp_statuses),
             lftp_status_snapshot_fresh=lftp_status_snapshot_fresh,
             lftp_status_poll_healthy=lftp_status_poll_healthy,

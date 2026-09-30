@@ -14092,6 +14092,27 @@ class TestModelUpdater(unittest.TestCase):
         )
         return controller
 
+    def _run_completion_floor_capture(self, model, retired_identity, trace, *, resolution="snapshot_lookup_succeeded"):
+        file_name = "private-capture.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        controller = self._make_lftp_completion_controller({(file_name, None, None)})
+        controller._Controller__model = model
+        controller._Controller__model_lock = RLock()
+        controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+        retired_identities = {} if retired_identity is None else {file_id: retired_identity}
+        ModelUpdater(controller)._handle_lftp_completion_detection(
+            [],
+            True,
+            retired_job_identities=retired_identities,
+            retired_identity_resolution=resolution,
+            lftp_status_poll_authoritative=True,
+            lftp_status_snapshot_fresh=True,
+            lftp_status_poll_healthy=True,
+            lftp_status_source="fresh_healthy",
+            lftp_status_poll_correlation="lftp-poll:0123456789abcdef",
+        )
+        return controller
+
     def test_sync_persist_to_all_builders_forwards_persisted_categories(self):
         downloaded_file_names = {"downloaded-a", "downloaded-b"}
         extracted_file_names = {"extracted-a"}
@@ -15847,19 +15868,36 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__pending_completion_progress_floor_identities = {}
         controller._Controller__pending_completion_progress_floor_overlay_ids = set()
         controller._Controller__pending_completion_publications = {}
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
         updater = ModelUpdater(controller)
 
         updater._handle_lftp_completion_detection(
             [],
             True,
             retired_job_identities={file_id: (7, LftpJobStatus.Type.PGET.value)},
+            retired_identity_resolution="snapshot_lookup_succeeded",
             lftp_status_poll_authoritative=True,
             lftp_status_snapshot_fresh=True,
             lftp_status_poll_healthy=True,
             lftp_status_source="fresh_healthy",
+            lftp_status_poll_correlation="lftp-poll:0123456789abcdef",
         )
 
+        event = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("message") == "completion_progress_floor_capture"
+        )
+        self.assertEqual("completion_progress_floor_capture.v1", event["details"]["schema"])
+        self.assertEqual("overlay_accepted", event["details"]["outcome"])
+        self.assertEqual("overlay", event["details"]["capture_source"])
+        self.assertEqual("snapshot_lookup_succeeded", event["details"]["retired_identity_resolution"])
+        self.assertEqual("fresh_healthy", event["details"]["poll_source"])
+        self.assertEqual("lftp-poll:0123456789abcdef", event["flow_id"])
+        self.assertNotIn("release", json.dumps(event))
+        self.assertNotIn(LftpJobStatus.Type.PGET.value, json.dumps(event))
         self.assertEqual((93, 930), controller._Controller__pending_completion_progress_floors[file_id])
+        trace.close()
         self.assertIn(file_id, controller._Controller__pending_completion_progress_floor_overlay_ids)
         self.assertEqual(
             (7, LftpJobStatus.Type.PGET.value),
@@ -15942,12 +15980,28 @@ class TestModelUpdater(unittest.TestCase):
         controller = self._make_lftp_completion_controller({("release", None, None)})
         controller._Controller__model = model
         controller._Controller__model_lock = RLock()
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
 
         ModelUpdater(controller)._handle_lftp_completion_detection(
             [], True, retired_job_identities={file_id: identity},
             lftp_status_poll_authoritative=True, lftp_status_snapshot_fresh=True,
             lftp_status_poll_healthy=True, lftp_status_source="fresh_healthy",
+            lftp_status_poll_correlation="lftp-poll:fedcba9876543210",
         )
+
+        event = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("message") == "completion_progress_floor_capture"
+        )
+        self.assertEqual("published_snapshot_accepted", event["details"]["outcome"])
+        self.assertEqual("published_snapshot", event["details"]["capture_source"])
+        self.assertEqual("returned_valid_shape", event["details"]["published_lookup"])
+        self.assertEqual("eligible", event["details"]["published_candidate"])
+        self.assertEqual("lftp-poll:fedcba9876543210", event["flow_id"])
+        self.assertNotIn("release", json.dumps(event))
+        self.assertNotIn(LftpJobStatus.Type.PGET.value, json.dumps(event))
+        trace.close()
 
         self.assertEqual(
             _PendingCompletionPublication(ActiveProgressOverlay(100, 1000, None, None), identity),
@@ -15994,6 +16048,230 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotEqual("stopped", Controller._model_record_visible_state(later_incomplete))
         self.assertIn(file_id, controller._Controller__pending_completion_publications)
         self.assertEqual(identity, model.published_file_job_identity(file_id))
+
+    def test_completion_floor_capture_diagnostics_distinguish_rejections_and_isolate_sink(self):
+        file_name = "private-capture.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        identity = (7, LftpJobStatus.Type.PGET.value)
+
+        def model_with_overlay(overlay_identity):
+            model = Model()
+            active = ModelFile(file_name, False)
+            active.state = ModelFile.State.DOWNLOADING
+            active.is_stoppable = True
+            model.add_file(active)
+            self.assertEqual(
+                ({file_id}, "accepted"),
+                model.publish_active_lftp_root_counters(
+                    {file_id: ActiveProgressOverlay(90, 900, 1, 2)},
+                    {file_id: overlay_identity},
+                    lambda _file_id: True,
+                ),
+            )
+            return model
+
+        def event_for(trace):
+            return next(
+                entry for entry in trace.snapshot()["entries"]
+                if entry.get("message") == "completion_progress_floor_capture"
+            )
+
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        empty_model = Model()
+        empty_reader = MagicMock(wraps=empty_model.published_file_with_job_identity)
+        empty_model.published_file_with_job_identity = empty_reader
+        empty_controller = self._run_completion_floor_capture(empty_model, None, trace)
+        empty_event = event_for(trace)
+        self.assertEqual("no_retired_identity", empty_event["details"]["outcome"])
+        self.assertEqual("absent", empty_event["details"]["retired_identity_state"])
+        self.assertEqual("not_attempted", empty_event["details"]["published_lookup"])
+        empty_reader.assert_not_called()
+        self.assertNotIn(file_id, getattr(empty_controller, "_Controller__pending_completion_progress_floors", {}))
+        trace.close()
+
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        mismatch_model = model_with_overlay((6, LftpJobStatus.Type.PGET.value))
+        mismatch_reader = MagicMock(wraps=mismatch_model.published_file_with_job_identity)
+        mismatch_model.published_file_with_job_identity = mismatch_reader
+        mismatch_controller = self._run_completion_floor_capture(
+            mismatch_model, identity, trace,
+        )
+        mismatch_event = event_for(trace)
+        self.assertEqual("overlay_identity_mismatch", mismatch_event["details"]["outcome"])
+        self.assertEqual("identity_mismatch", mismatch_event["details"]["overlay_state"])
+        self.assertEqual("not_attempted", mismatch_event["details"]["published_lookup"])
+        mismatch_reader.assert_not_called()
+        self.assertNotIn(file_id, getattr(mismatch_controller, "_Controller__pending_completion_progress_floors", {}))
+        trace.close()
+
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        stopped_model = model_with_overlay(identity)
+        stopped = ModelFile(file_name, False)
+        stopped.local_present = True
+        stopped.remote_has_transferable_content = False
+        stopped.local_size = 900
+        stopped.transferred_size = 900
+        stopped.download_progress = 100
+        stopped.explicitly_stopped = True
+        stopped.state = ModelFile.State.DEFAULT
+        stopped_model.apply_with_active_progress_retained(
+            lambda: stopped_model.update_file(stopped), retire_file_ids={file_id},
+        )
+        self.assertEqual(identity, stopped_model.published_file_job_identity(file_id))
+        stopped_controller = self._run_completion_floor_capture(stopped_model, identity, trace)
+        stopped_event = event_for(trace)
+        self.assertEqual("published_snapshot_ineligible", stopped_event["details"]["outcome"])
+        self.assertEqual("explicitly_stopped", stopped_event["details"]["published_candidate"])
+        self.assertNotIn(file_id, getattr(stopped_controller, "_Controller__pending_completion_progress_floors", {}))
+        trace.close()
+
+        def configure_unavailable_reader(model):
+            model.published_file_with_job_identity = None
+
+        def configure_invalid_shape(model):
+            model.published_file_with_job_identity = MagicMock(return_value=(None,))
+
+        def configure_reader_error(error_type):
+            def configure(model):
+                model.published_file_with_job_identity = MagicMock(
+                    side_effect=error_type("private lookup sentinel"),
+                )
+            return configure
+
+        cases = (
+            ("normal_absence", lambda _model: None, "returned_valid_shape", "published_snapshot_absent"),
+            ("reader_unavailable", configure_unavailable_reader, "unavailable", "published_reader_unavailable"),
+            ("invalid_shape", configure_invalid_shape, "returned_invalid_shape", "published_result_invalid_shape"),
+            ("attribute_error", configure_reader_error(AttributeError), "error", "published_lookup_error"),
+            ("type_error", configure_reader_error(TypeError), "error", "published_lookup_error"),
+            ("value_error", configure_reader_error(ValueError), "error", "published_lookup_error"),
+        )
+        for label, configure, expected_lookup, expected_outcome in cases:
+            with self.subTest(case=label):
+                trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+                model = Model()
+                configure(model)
+                controller = self._run_completion_floor_capture(model, identity, trace)
+                event = event_for(trace)
+                self.assertEqual(expected_lookup, event["details"]["published_lookup"])
+                self.assertEqual(expected_outcome, event["details"]["outcome"])
+                self.assertNotIn("private lookup sentinel", json.dumps(event))
+                self.assertNotIn(file_name, json.dumps(event))
+                self.assertNotIn(file_id, getattr(controller, "_Controller__pending_completion_progress_floors", {}))
+                trace.close()
+
+        class FailingTrace:
+            def is_effectively_enabled(self, _category, _level="info"):
+                return True
+
+            def record(self, *_args, **_kwargs):
+                raise RuntimeError("private sink sentinel")
+
+        failing_controller = self._run_completion_floor_capture(
+            model_with_overlay(identity), identity, FailingTrace(),
+        )
+        self.assertEqual((90, 900), failing_controller._Controller__pending_completion_progress_floors[file_id])
+        self.assertIn((file_name, None, None), failing_controller._Controller__pending_completion_file_names)
+
+        disabled_trace = BreadcrumbTraceCollector(lambda: False, max_entries=8)
+        disabled_controller = self._run_completion_floor_capture(
+            model_with_overlay(identity), identity, disabled_trace,
+        )
+        self.assertEqual([], disabled_trace.snapshot()["entries"])
+        self.assertEqual((90, 900), disabled_controller._Controller__pending_completion_progress_floors[file_id])
+        disabled_trace.close()
+
+    def test_completion_floor_capture_diagnostic_persists_finalized_envelope(self):
+        file_name = "private-capture.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        identity = (7, LftpJobStatus.Type.PGET.value)
+        model = Model()
+        active = ModelFile(file_name, False)
+        active.state = ModelFile.State.DOWNLOADING
+        active.is_stoppable = True
+        model.add_file(active)
+        self.assertEqual(
+            ({file_id}, "accepted"),
+            model.publish_active_lftp_root_counters(
+                {file_id: ActiveProgressOverlay(90, 900, 1, 2)},
+                {file_id: identity}, lambda _file_id: True,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as spool_path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                max_entries=8,
+                durable_enabled=True,
+                durable_path=spool_path,
+                policy={"default": "off", "rules": {"completion.gate": "info"}},
+            )
+            self._run_completion_floor_capture(model, identity, trace)
+            health = trace.close()
+            with open(os.path.join(spool_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+        event = next(
+            record for record in records
+            if record.get("message") == "completion_progress_floor_capture"
+        )
+        self.assertGreaterEqual(health.get("written", 0), 1)
+        self.assertEqual("completion.gate", event["category"])
+        self.assertEqual("info", event["level"])
+        self.assertEqual("overlay_accepted", event["details"]["outcome"])
+        self.assertEqual("lftp-poll:0123456789abcdef", event["flow_id"])
+        self.assertTrue(event["corr_id"].startswith("completion:"))
+        self.assertEqual(
+            {
+                "schema", "poll_source", "retired_identity_resolution",
+                "retired_identity_state", "overlay_state", "overlay_progress_present",
+                "overlay_transferred_size_present", "published_lookup",
+                "published_candidate", "capture_source", "outcome", "poll_correlation",
+            },
+            set(event["details"]),
+        )
+        self.assertNotIn(file_name, json.dumps(event))
+        self.assertNotIn(file_id, json.dumps(event))
+        self.assertNotIn(LftpJobStatus.Type.PGET.value, json.dumps(event))
+
+    def test_model_update_reports_completion_identity_lookup_failure_without_changing_later_floor(self):
+        file_name = "private-resolution.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile(file_name, 100, False)])
+        builder.set_local_files([SystemFile(file_name, 25, False, is_staging=True)])
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 2)
+        builder.set_lftp_statuses([running])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=builder.build_model(),
+        )
+        controller._Controller__prev_downloading_file_names = {(file_name, None, None)}
+        controller._Controller__last_lftp_statuses = [running]
+        controller._Controller__lftp.status.return_value = []
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        controller._Controller__context.breadcrumb_trace = trace
+
+        with patch.object(
+                ModelBuilder,
+                "recent_live_transfer_snapshot_identities",
+                side_effect=ValueError("private identity lookup sentinel")):
+            ModelUpdater(controller).update()
+
+        event = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("message") == "completion_progress_floor_capture"
+        )
+        self.assertEqual("snapshot_lookup_failed", event["details"]["retired_identity_resolution"])
+        self.assertEqual("unknown_after_lookup_failure", event["details"]["retired_identity_state"])
+        self.assertEqual("retired_identity_lookup_failed", event["details"]["outcome"])
+        # The later candidate pass still remembers the existing live overlay;
+        # the failed identity-aware capture does not erase that established path.
+        self.assertEqual((25, 25), controller._Controller__pending_completion_progress_floors[file_id])
+        self.assertIn((file_name, None, None), controller._Controller__pending_completion_file_names)
+        self.assertNotIn("private identity lookup sentinel", json.dumps(event))
+        self.assertNotIn(file_name, json.dumps(event))
+        trace.close()
 
     def test_no_diff_terminal_completion_clears_provenance_before_late_same_identity_retirement(self):
         """A no-diff terminal handoff cannot be reused by a late retirement."""
