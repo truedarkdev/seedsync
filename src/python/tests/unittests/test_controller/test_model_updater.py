@@ -9187,7 +9187,10 @@ class TestModelUpdater(unittest.TestCase):
 
         linked = trace.snapshot(flow_id=poll_correlation)["entries"]
         self.assertEqual(
-            {"lftp_status_poll", "completion_pending_registered"},
+            {
+                "lftp_status_poll", "completion_pending_registered",
+                "completion_progress_floor_capture", "completion_live_snapshot_eviction",
+            },
             {entry["message"] for entry in linked},
         )
         self.assertTrue(all(entry["flow_id"] == poll_correlation for entry in linked))
@@ -14092,11 +14095,16 @@ class TestModelUpdater(unittest.TestCase):
         )
         return controller
 
-    def _run_completion_floor_capture(self, model, retired_identity, trace, *, resolution="snapshot_lookup_succeeded"):
+    def _run_completion_floor_capture(
+            self, model, retired_identity, trace, *, resolution="snapshot_lookup_succeeded",
+            model_builder=None,
+    ):
         file_name = "private-capture.bin"
         file_id = ModelFile.build_file_id(file_name, None)
         controller = self._make_lftp_completion_controller({(file_name, None, None)})
         controller._Controller__model = model
+        if model_builder is not None:
+            controller._Controller__model_builder = model_builder
         controller._Controller__model_lock = RLock()
         controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
         retired_identities = {} if retired_identity is None else {file_id: retired_identity}
@@ -14112,6 +14120,28 @@ class TestModelUpdater(unittest.TestCase):
             lftp_status_poll_correlation="lftp-poll:0123456789abcdef",
         )
         return controller
+
+    @staticmethod
+    def _completion_mirror_eviction_fixture(job_id=7):
+        file_name = "private-capture.bin"
+        remote = SystemFile(file_name, 100, True)
+        remote.add_child(SystemFile("remote.bin", 100, False))
+        local = SystemFile(file_name, 40, True)
+        local.add_child(SystemFile("remote.bin", 40, False))
+        status = LftpJobStatus(
+            job_id, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING,
+            file_name, "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(40, 100, 40, 10, 2)
+        status.add_active_file_transfer_state(
+            "remote.bin", LftpJobStatus.TransferState(40, 100, 40, 10, 2),
+        )
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        builder.set_lftp_statuses([status])
+        model = builder.build_model()
+        return builder, model, status.file_id, (job_id, LftpJobStatus.Type.MIRROR.value)
 
     def test_sync_persist_to_all_builders_forwards_persisted_categories(self):
         downloaded_file_names = {"downloaded-a", "downloaded-b"}
@@ -14873,13 +14903,16 @@ class TestModelUpdater(unittest.TestCase):
             [
                 "completion_pending_registered",
                 "completion_progress_floor_capture",
+                "completion_live_snapshot_eviction",
                 "completion_retirement_not_detected",
             ],
             [entry["message"] for entry in entries],
         )
-        pending, capture, active = entries
+        pending, capture, eviction, active = entries
         self.assertEqual("absent", capture["details"]["retired_identity_state"])
         self.assertEqual("no_retired_identity", capture["details"]["outcome"])
+        self.assertEqual("unknown", eviction["details"]["outcome"])
+        self.assertEqual(capture["corr_id"], eviction["corr_id"])
         self.assertEqual(
             {
                 "poll_eligible": True,
@@ -15092,7 +15125,10 @@ class TestModelUpdater(unittest.TestCase):
 
             trace_entries = trace.snapshot()["entries"]
             self.assertEqual(
-                {"completion_retirement_excluded", "completion_pending_registered"},
+                {
+                    "completion_retirement_excluded", "completion_pending_registered",
+                    "completion_progress_floor_capture", "completion_live_snapshot_eviction",
+                },
                 {entry["message"] for entry in trace_entries},
             )
             self.assertEqual(
@@ -15117,11 +15153,21 @@ class TestModelUpdater(unittest.TestCase):
             )
 
             trace_entries = trace.snapshot()["entries"]
-            self.assertEqual(2, len(trace_entries))
-            self.assertTrue(all(
-                entry["message"] == "completion_pending_registered"
-                for entry in trace_entries
-            ))
+            self.assertEqual(6, len(trace_entries))
+            self.assertEqual(
+                {
+                    "completion_pending_registered": 2,
+                    "completion_progress_floor_capture": 2,
+                    "completion_live_snapshot_eviction": 2,
+                },
+                {
+                    message: sum(entry["message"] == message for entry in trace_entries)
+                    for message in {
+                        "completion_pending_registered", "completion_progress_floor_capture",
+                        "completion_live_snapshot_eviction",
+                    }
+                },
+            )
             self.assertEqual(entries, controller._Controller__pending_completion_file_names)
             self.assertEqual(
                 [call()],
@@ -16188,6 +16234,110 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual((90, 900), disabled_controller._Controller__pending_completion_progress_floors[file_id])
         disabled_trace.close()
 
+    def test_completion_snapshot_eviction_diagnostics_report_mirror_identity_and_isolate_failures(self):
+        file_name = "private-capture.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        mirror_type = LftpJobStatus.Type.MIRROR.value
+
+        for retired_id, expected_relation, expected_after_relation, expected_outcome in (
+                (7, "matching", "not_reported", "matching_snapshot_removed"),
+                (8, "different", "different", "different_job_retained"),
+        ):
+            with self.subTest(retired_id=retired_id):
+                builder, model, fixture_file_id, snapshot_identity = \
+                    self._completion_mirror_eviction_fixture()
+                self.assertEqual(file_id, fixture_file_id)
+                self.assertEqual({file_id: snapshot_identity},
+                                 builder.recent_live_transfer_snapshot_identities({file_id}))
+                reader = MagicMock(wraps=builder.recent_live_transfer_snapshot_identities)
+                builder.recent_live_transfer_snapshot_identities = reader
+                trace = BreadcrumbTraceCollector(lambda: True, max_entries=12)
+                controller = self._run_completion_floor_capture(
+                    model, (retired_id, mirror_type), trace, model_builder=builder,
+                )
+
+                events = trace.snapshot()["entries"]
+                event = next(
+                    entry for entry in events
+                    if entry.get("message") == "completion_live_snapshot_eviction"
+                )
+                capture = next(
+                    entry for entry in events
+                    if entry.get("message") == "completion_progress_floor_capture"
+                )
+                self.assertEqual(2, reader.call_count)
+                self.assertEqual("present", event["details"]["snapshot_before"])
+                self.assertEqual(expected_relation,
+                                 event["details"]["retired_job_relation_before"])
+                self.assertEqual(expected_after_relation,
+                                 event["details"]["retired_job_relation_after"])
+                self.assertEqual(expected_outcome, event["details"]["outcome"])
+                self.assertEqual("lftp-poll:0123456789abcdef", event["flow_id"])
+                self.assertEqual(capture["corr_id"], event["corr_id"])
+                self.assertNotIn(file_name, json.dumps(event))
+                self.assertNotIn(file_id, json.dumps(event))
+                self.assertNotIn(mirror_type, json.dumps(event))
+                remaining = builder.recent_live_transfer_snapshot_identities({file_id})
+                self.assertEqual(
+                    {} if retired_id == 7 else {file_id: snapshot_identity},
+                    remaining,
+                )
+                trace.close()
+
+        builder, model, _, snapshot_identity = self._completion_mirror_eviction_fixture()
+        reader = MagicMock(wraps=builder.recent_live_transfer_snapshot_identities)
+        builder.recent_live_transfer_snapshot_identities = reader
+        disabled_trace = BreadcrumbTraceCollector(lambda: False, max_entries=8)
+        self._run_completion_floor_capture(
+            model, snapshot_identity, disabled_trace, model_builder=builder,
+        )
+        reader.assert_not_called()
+        self.assertEqual({}, builder.recent_live_transfer_snapshot_identities({file_id}))
+        disabled_trace.close()
+
+        class FailingTrace:
+            @staticmethod
+            def is_effectively_enabled(_category, _level="info"):
+                return True
+
+            @staticmethod
+            def record(*_args, **_kwargs):
+                raise RuntimeError("private sink failure")
+
+        builder, model, _, snapshot_identity = self._completion_mirror_eviction_fixture()
+        failing_controller = self._run_completion_floor_capture(
+            model, snapshot_identity, FailingTrace(), model_builder=builder,
+        )
+        self.assertEqual({}, builder.recent_live_transfer_snapshot_identities({file_id}))
+        self.assertIn((file_name, None, None), failing_controller._Controller__pending_completion_file_names)
+
+        builder, _, _, snapshot_identity = self._completion_mirror_eviction_fixture()
+        failing_controller = SimpleNamespace(
+            _Controller__model_builder=builder,
+            _Controller__context=SimpleNamespace(
+                breadcrumb_trace=BreadcrumbTraceCollector(lambda: True, max_entries=8),
+            ),
+            logger=MagicMock(),
+        )
+        expected_error = RuntimeError("private eviction failure")
+        evict = MagicMock(side_effect=expected_error)
+        with self.assertRaises(RuntimeError) as caught:
+            ModelUpdater(failing_controller)._evict_recent_completion_snapshots(
+                evict,
+                {file_id},
+                reason="retirement_immediate",
+                retired_job_identities={file_id: snapshot_identity},
+            )
+        self.assertIs(expected_error, caught.exception)
+        evict.assert_called_once()
+        failure_event = next(
+            entry for entry in failing_controller._Controller__context.breadcrumb_trace.snapshot()["entries"]
+            if entry.get("message") == "completion_live_snapshot_eviction"
+        )
+        self.assertEqual("failed", failure_event["details"]["eviction_result"])
+        self.assertNotIn("private eviction failure", json.dumps(failure_event))
+        failing_controller._Controller__context.breadcrumb_trace.close()
+
     def test_completion_floor_capture_diagnostic_persists_finalized_envelope(self):
         file_name = "private-capture.bin"
         file_id = ModelFile.build_file_id(file_name, None)
@@ -16232,11 +16382,35 @@ class TestModelUpdater(unittest.TestCase):
                 "retired_identity_state", "overlay_state", "overlay_progress_present",
                 "overlay_transferred_size_present", "published_lookup",
                 "published_candidate", "published_identity_relation",
+                "published_file_shape", "published_eligibility",
+                "published_display_union", "published_coverage",
                 "retired_job_correlation", "published_job_correlation",
                 "capture_source", "outcome", "poll_correlation",
             },
             set(event["details"]),
         )
+
+        eviction = next(
+            record for record in records
+            if record.get("message") == "completion_live_snapshot_eviction"
+        )
+        self.assertEqual("completion.gate", eviction["category"])
+        self.assertEqual("info", eviction["level"])
+        self.assertEqual("lftp-poll:0123456789abcdef", eviction["flow_id"])
+        self.assertEqual(event["corr_id"], eviction["corr_id"])
+        self.assertEqual(
+            {
+                "schema", "reason", "snapshot_read_before", "snapshot_before",
+                "retired_job_relation_before", "snapshot_read_after", "snapshot_after",
+                "retired_job_relation_after", "eviction_result", "outcome",
+                "preserve_requested", "release_requested", "retired_job_correlation",
+                "poll_correlation",
+            },
+            set(eviction["details"]),
+        )
+        self.assertNotIn(file_name, json.dumps(eviction))
+        self.assertNotIn(file_id, json.dumps(eviction))
+        self.assertNotIn(LftpJobStatus.Type.PGET.value, json.dumps(eviction))
         self.assertNotIn(file_name, json.dumps(event))
         self.assertNotIn(file_id, json.dumps(event))
         self.assertNotIn(LftpJobStatus.Type.PGET.value, json.dumps(event))
@@ -16356,8 +16530,59 @@ class TestModelUpdater(unittest.TestCase):
             if entry.get("message") == "completion_progress_floor_capture"
         )
         self.assertEqual("missing", event["details"]["published_identity_relation"])
+        self.assertEqual("model_file", event["details"]["published_file_shape"])
+        self.assertEqual("eligible", event["details"]["published_eligibility"])
+        self.assertEqual("absent", event["details"]["published_display_union"])
+        self.assertEqual("incomplete", event["details"]["published_coverage"])
         self.assertIsNone(event["details"]["published_job_correlation"])
         self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
+        trace.close()
+
+    def test_completion_floor_capture_metadata_failure_is_unknown_and_does_not_change_capture(self):
+        file_name = "private-capture.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        identity = (7, LftpJobStatus.Type.PGET.value)
+        model = Model()
+        active = ModelFile(file_name, False)
+        active.state = ModelFile.State.DOWNLOADING
+        active.is_stoppable = True
+        model.add_file(active)
+        self.assertEqual(
+            ({file_id}, "accepted"),
+            model.publish_active_lftp_root_counters(
+                {file_id: ActiveProgressOverlay(90, 900, 1, 2)},
+                {file_id: identity}, lambda _file_id: True,
+            ),
+        )
+        published = ModelFile(file_name, False)
+        published.local_present = True
+        published.remote_has_transferable_content = False
+        published.local_size = 1000
+        published.transferred_size = 1000
+        published.download_progress = 100
+        model.apply_with_active_progress_retained(
+            lambda: model.update_file(published), retire_file_ids={file_id},
+        )
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=12)
+
+        def fail_diagnostic_metadata(_file):
+            raise RuntimeError("private metadata failure")
+
+        with patch.object(
+                ModelFile, "display_size_total", new=property(fail_diagnostic_metadata),
+        ):
+            controller = self._run_completion_floor_capture(model, identity, trace)
+
+        event = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("message") == "completion_progress_floor_capture"
+        )
+        self.assertEqual("published_snapshot_accepted", event["details"]["outcome"])
+        self.assertEqual("eligible", event["details"]["published_candidate"])
+        self.assertEqual("unknown", event["details"]["published_display_union"])
+        self.assertEqual("unknown", event["details"]["published_coverage"])
+        self.assertEqual((100, 1000), controller._Controller__pending_completion_progress_floors[file_id])
+        self.assertNotIn("private metadata failure", json.dumps(event))
         trace.close()
 
     def test_completion_retirement_rejects_stale_local_only_publication_for_newer_identity(self):

@@ -3701,6 +3701,125 @@ class ModelUpdater(_ControllerCoreAccess):
             if logger is not None:
                 logger.debug("Ignoring completion-gate breadcrumb failure", exc_info=True)
 
+    def _evict_recent_completion_snapshots(
+            self, evict_snapshots: Callable[..., object], completed_file_ids: set[str], *,
+            reason: str, poll_correlation: Optional[str] = None,
+            **eviction_kwargs: object,
+    ) -> None:
+        """Run the existing completion eviction and report its bounded evidence."""
+        trace_enabled = False
+        try:
+            trace_enabled = self._completion_gate_trace_enabled()
+        except Exception:
+            pass
+
+        def read_snapshot_identities() -> tuple[str, Optional[dict[str, object]]]:
+            if not trace_enabled:
+                return "disabled", None
+            try:
+                model_builder = getattr(self._controller, "_Controller__model_builder", None)
+                reader = getattr(model_builder, "recent_live_transfer_snapshot_identities", None)
+                if not callable(reader):
+                    return "unavailable", None
+                result = reader(completed_file_ids)
+            except Exception:
+                return "read_error", None
+            if not isinstance(result, dict):
+                return "invalid_result", None
+            return "succeeded", result
+
+        before_status, before = read_snapshot_identities()
+        eviction_failed = False
+        try:
+            evict_snapshots(completed_file_ids, **eviction_kwargs)
+        except Exception:
+            eviction_failed = True
+            raise
+        finally:
+            if trace_enabled:
+                try:
+                    after_status, after = read_snapshot_identities()
+                    retired_identities = eviction_kwargs.get("retired_job_identities")
+                    preserve_file_ids = eviction_kwargs.get("preserve_file_ids")
+                    release_file_ids = eviction_kwargs.get("release_resumable_checkpoint_file_ids")
+
+                    def identity_state(
+                            status: str, identities: Optional[dict[str, object]], file_id: str,
+                    ) -> str:
+                        if status != "succeeded" or identities is None:
+                            return "unknown"
+                        return "present" if file_id in identities else "not_reported"
+
+                    def identity_relation(
+                            status: str, identities: Optional[dict[str, object]], file_id: str,
+                            expected: object,
+                    ) -> str:
+                        if status != "succeeded" or identities is None:
+                            return "unknown"
+                        observed = identities.get(file_id)
+                        if observed is None:
+                            return "not_reported"
+                        if not (
+                                isinstance(expected, tuple) and len(expected) == 2 and
+                                type(expected[0]) is int and expected[0] >= 0 and
+                                isinstance(expected[1], str) and bool(expected[1])):
+                            return "retired_identity_unavailable"
+                        return "matching" if observed == expected else "different"
+
+                    def job_correlation(identity: object) -> Optional[str]:
+                        if isinstance(identity, tuple) and len(identity) == 2 and \
+                                type(identity[0]) is int and identity[0] >= 0 and \
+                                isinstance(identity[1], str) and identity[1]:
+                            return opaque_trace_correlation("{}:{}".format(identity[0], identity[1]))
+                        return None
+
+                    for file_id in sorted(completed_file_ids):
+                        expected = retired_identities.get(file_id) \
+                            if isinstance(retired_identities, dict) else None
+                        before_presence = identity_state(before_status, before, file_id)
+                        after_presence = identity_state(after_status, after, file_id)
+                        before_relation = identity_relation(before_status, before, file_id, expected)
+                        after_relation = identity_relation(after_status, after, file_id, expected)
+                        if eviction_failed:
+                            outcome = "failed"
+                        elif before_status != "succeeded" or after_status != "succeeded":
+                            outcome = "unknown"
+                        elif before_relation == "matching" and after_presence == "not_reported":
+                            outcome = "matching_snapshot_removed"
+                        elif before_relation == "matching" and after_relation == "matching":
+                            outcome = "matching_snapshot_retained"
+                        elif before_relation == "different" and after_relation == "different":
+                            outcome = "different_job_retained"
+                        elif before_presence == "not_reported":
+                            outcome = "no_snapshot_identity_reported"
+                        else:
+                            outcome = "state_observed"
+
+                        self._record_completion_gate_breadcrumb(
+                            file_id,
+                            "completion_live_snapshot_eviction",
+                            {
+                                "schema": "completion_live_snapshot_eviction.v1",
+                                "reason": reason,
+                                "snapshot_read_before": before_status,
+                                "snapshot_before": before_presence,
+                                "retired_job_relation_before": before_relation,
+                                "snapshot_read_after": after_status,
+                                "snapshot_after": after_presence,
+                                "retired_job_relation_after": after_relation,
+                                "eviction_result": "failed" if eviction_failed else "completed",
+                                "outcome": outcome,
+                                "preserve_requested": isinstance(preserve_file_ids, set) and
+                                file_id in preserve_file_ids,
+                                "release_requested": isinstance(release_file_ids, set) and
+                                file_id in release_file_ids,
+                                "retired_job_correlation": job_correlation(expected),
+                            },
+                            poll_correlation=poll_correlation,
+                        )
+                except Exception:
+                    pass
+
     def _record_completion_gate_presentation_transition(
             self, old_file: ModelFile, new_file: ModelFile,
             details: dict[str, object],
@@ -4097,7 +4216,15 @@ class ModelUpdater(_ControllerCoreAccess):
         published_candidate = "not_evaluated"
         published_identity = None
         published_identity_relation = "unknown"
+        published_file_shape = "not_attempted"
+        published_eligibility = "unknown"
+        published_display_union = "unknown"
+        published_coverage = "unknown"
         capture_source = "none"
+        try:
+            capture_diagnostic_metadata_enabled = self._completion_gate_trace_enabled()
+        except Exception:
+            capture_diagnostic_metadata_enabled = False
 
         def record_capture(outcome: str) -> None:
             if not self._completion_gate_trace_enabled():
@@ -4130,6 +4257,10 @@ class ModelUpdater(_ControllerCoreAccess):
                     "published_lookup": published_lookup,
                     "published_candidate": published_candidate,
                     "published_identity_relation": published_identity_relation,
+                    "published_file_shape": published_file_shape,
+                    "published_eligibility": published_eligibility,
+                    "published_display_union": published_display_union,
+                    "published_coverage": published_coverage,
                     "retired_job_correlation": job_correlation(retired_job_identity),
                     "published_job_correlation": job_correlation(published_identity),
                     "capture_source": capture_source,
@@ -4198,6 +4329,41 @@ class ModelUpdater(_ControllerCoreAccess):
                     published = None
                     published_identity = None
                     published_lookup = "error"
+                if capture_diagnostic_metadata_enabled:
+                    try:
+                        if published_lookup != "returned_valid_shape":
+                            published_file_shape = "unknown"
+                        elif published is None:
+                            published_file_shape = "absent"
+                        elif not isinstance(published, ModelFile):
+                            published_file_shape = "invalid"
+                        else:
+                            published_file_shape = "model_file"
+                            display_size = published.display_size_total
+                            display_transferred = published.display_transferred_size
+                            published_display_union = (
+                                "present" if display_size is not None and display_transferred is not None else
+                                "partial" if display_size is not None or display_transferred is not None else
+                                "absent"
+                            )
+                            coverage_value = published.complete_local_coverage
+                            published_coverage = (
+                                "complete" if coverage_value is True else
+                                "incomplete" if coverage_value is False else
+                                "unknown"
+                            )
+                            published_eligibility = (
+                                "eligible"
+                                if not published.explicitly_stopped and published.local_present and
+                                not published.remote_has_transferable_content and
+                                published.download_progress == 100
+                                else "ineligible"
+                            )
+                    except Exception:
+                        published_file_shape = "unknown"
+                        published_eligibility = "unknown"
+                        published_display_union = "unknown"
+                        published_coverage = "unknown"
                 if published_lookup == "returned_valid_shape":
                     published_identity_relation = (
                         "missing" if published_identity is None else
@@ -4781,7 +4947,13 @@ class ModelUpdater(_ControllerCoreAccess):
                 # eviction. Omit this keyword only for compatibility callers
                 # that do not participate in identity-aware handoff.
                 eviction_kwargs["retired_job_identities"] = dict(retired_job_identities or {})
-                evict_snapshots(completed_file_ids, **eviction_kwargs)
+                self._evict_recent_completion_snapshots(
+                    evict_snapshots,
+                    completed_file_ids,
+                    reason="retirement_immediate",
+                    poll_correlation=poll_correlation,
+                    **eviction_kwargs,
+                )
             if None in completed_path_pair_ids:
                 controller._Controller__local_scan_process.force_scan()
             else:
@@ -6559,7 +6731,13 @@ class ModelUpdater(_ControllerCoreAccess):
                 # {} means the retired identity could not be proven and must
                 # therefore retain the snapshot conservatively.
                 eviction_kwargs["retired_job_identities"] = retired_snapshot_identities
-                evict_snapshots(completed_snapshot_ids, **eviction_kwargs)
+                self._evict_recent_completion_snapshots(
+                    evict_snapshots,
+                    completed_snapshot_ids,
+                    reason="retirement_deferred",
+                    poll_correlation=lftp_status_poll_correlation,
+                    **eviction_kwargs,
+                )
         if lftp_status_snapshot_fresh and not lftp_status_poll_healthy and not lftp_statuses:
             model_builder.evict_recent_live_transfer_snapshots_missing_roots(
                 {status.file_id for status in lftp_statuses}
@@ -8477,8 +8655,11 @@ class ModelUpdater(_ControllerCoreAccess):
                         None,
                     )
                     if callable(evict_snapshots):
-                        evict_snapshots(
+                        self._evict_recent_completion_snapshots(
+                            evict_snapshots,
                             {pending_file_id},
+                            reason="lifecycle_release",
+                            poll_correlation=lftp_status_poll_correlation,
                             retired_job_identities={pending_file_id: release_identity},
                             release_resumable_checkpoint_file_ids={pending_file_id},
                         )
