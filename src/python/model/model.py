@@ -111,6 +111,51 @@ class Model:
         # identity from a later base/root rebuild.
         self.__published_file_job_identities: Dict[str, tuple[int, str]] = {}
         self.__retiring_progress_overlay_job_identities: Dict[str, tuple[int, str]] = {}
+        self.__completion_provenance_trace_enabled: Optional[Callable[[str], bool]] = None
+        self.__completion_provenance_trace_recorder: Optional[
+            Callable[[str, str, Optional[tuple[int, str]], Optional[tuple[int, str]], str], None]
+        ] = None
+
+    def set_completion_provenance_diagnostics(
+            self,
+            enabled: Optional[Callable[[str], bool]],
+            recorder: Optional[
+                Callable[[str, str, Optional[tuple[int, str]], Optional[tuple[int, str]], str], None]
+            ],
+    ) -> None:
+        """Install transient, fail-isolated completion provenance diagnostics."""
+        self.__completion_provenance_trace_enabled = enabled if callable(enabled) else None
+        self.__completion_provenance_trace_recorder = recorder if callable(recorder) else None
+
+    def __completion_provenance_trace_is_enabled(self, level: str) -> bool:
+        enabled = self.__completion_provenance_trace_enabled
+        if not callable(enabled):
+            return False
+        try:
+            return enabled(level) is True
+        except Exception:
+            return False
+
+    def __record_completion_provenance_transition(
+            self,
+            file_id: str,
+            reason: str,
+            previous_identity: Optional[tuple[int, str]],
+            identity: Optional[tuple[int, str]],
+            level: str,
+    ) -> None:
+        if not self.__completion_provenance_trace_is_enabled(level):
+            return
+        recorder = self.__completion_provenance_trace_recorder
+        if not callable(recorder):
+            return
+        try:
+            recorder(file_id, reason, previous_identity, identity, level)
+        except Exception:
+            try:
+                self.logger.debug("Ignoring completion provenance diagnostic failure", exc_info=True)
+            except Exception:
+                pass
 
     def __refresh_published_file(self, file: ModelFile) -> ModelFile:
         """Materialize one immutable-effective root for asynchronous readers."""
@@ -120,6 +165,15 @@ class Model:
         # events, never for per-pulse overlay publication.
         previous_published = self.__published_files_by_id.get(file.file_id)
         previous_identity = self.__published_file_job_identities.get(file.file_id)
+        identity = self.__active_progress_overlay_job_identities.get(file.file_id)
+        identity_source = "active"
+        if identity is None:
+            identity = self.__retiring_progress_overlay_job_identities.get(file.file_id)
+            identity_source = "retiring"
+        debug_preserve_enabled = (
+            self.__completion_provenance_trace_is_enabled("debug")
+            if previous_identity is not None and identity is None else False
+        )
         published = ModelFile(file.name, file.is_dir)
         published.state = file.state
         published.remote_size = file.remote_size
@@ -159,13 +213,18 @@ class Model:
             published.transferred_size = overlay.transferred_size
             published.downloading_speed = overlay.downloading_speed
             published.eta = overlay.eta
-        identity = self.__active_progress_overlay_job_identities.get(file.file_id)
-        if identity is None:
-            identity = self.__retiring_progress_overlay_job_identities.get(file.file_id)
         if isinstance(identity, tuple) and len(identity) == 2 and \
                 type(identity[0]) is int and identity[0] >= 0 and \
                 isinstance(identity[1], str) and identity[1]:
             self.__published_file_job_identities[file.file_id] = identity
+            if identity_source == "retiring":
+                self.__record_completion_provenance_transition(
+                    file.file_id, "retiring_identity_published", previous_identity, identity, "info",
+                )
+            elif previous_identity != identity:
+                self.__record_completion_provenance_transition(
+                    file.file_id, "identity_bound", previous_identity, identity, "info",
+                )
         elif previous_published == published and previous_identity is not None:
             # An equal effective snapshot is the same committed publication,
             # even when a routine model rebuild no longer has the transient
@@ -175,8 +234,17 @@ class Model:
             # still drops it below, so stale identity can never authorize a
             # different rendered root.
             self.__published_file_job_identities[file.file_id] = previous_identity
+            if debug_preserve_enabled:
+                self.__record_completion_provenance_transition(
+                    file.file_id, "equal_publication_preserved", previous_identity,
+                    previous_identity, "debug",
+                )
         else:
             self.__published_file_job_identities.pop(file.file_id, None)
+            if previous_identity is not None:
+                self.__record_completion_provenance_transition(
+                    file.file_id, "changed_unbound_publication", previous_identity, None, "info",
+                )
         self.__published_files_by_id[file.file_id] = published
         return published
 
@@ -224,6 +292,9 @@ class Model:
         if self.__published_file_job_identities.get(file_id) != expected_job_identity:
             return False
         self.__published_file_job_identities.pop(file_id, None)
+        self.__record_completion_provenance_transition(
+            file_id, "identity_consumed", expected_job_identity, None, "info",
+        )
         return True
 
     def clear_published_file_job_identity_if_replaced(
@@ -245,6 +316,9 @@ class Model:
                 replacement_job_identity[0] < current_identity[0]:
             return False
         self.__published_file_job_identities.pop(file_id, None)
+        self.__record_completion_provenance_transition(
+            file_id, "identity_replaced", current_identity, None, "info",
+        )
         return True
 
     def __full_effective_file(self, file: ModelFile) -> ModelFile:
@@ -423,6 +497,7 @@ class Model:
     ) -> None:
         """Set one transient, best-effort callback before listener dispatch."""
         self.__version_publication_callback = callback if callable(callback) else None
+
 
     def active_progress_overlay(self, file_id: str) -> Optional[ActiveProgressOverlay]:
         return self.__active_progress_overlays.get(file_id)
@@ -994,7 +1069,11 @@ class Model:
         if not self.__file_ids_by_name[file.name]:
             del self.__file_ids_by_name[file.name]
         self.__published_files_by_id.pop(file_id, None)
-        self.__published_file_job_identities.pop(file_id, None)
+        removed_identity = self.__published_file_job_identities.pop(file_id, None)
+        if removed_identity is not None:
+            self.__record_completion_provenance_transition(
+                file_id, "published_root_removed", removed_identity, None, "info",
+            )
         # A suppressed replacement can remove the root before its retained
         # overlay reaches a clear path.  It must never attach to a later root
         # that reuses the same canonical identity.

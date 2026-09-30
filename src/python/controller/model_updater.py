@@ -4095,9 +4095,20 @@ class ModelUpdater(_ControllerCoreAccess):
         overlay_transferred_size_present = False
         published_lookup = "not_attempted"
         published_candidate = "not_evaluated"
+        published_identity = None
+        published_identity_relation = "unknown"
         capture_source = "none"
 
         def record_capture(outcome: str) -> None:
+            if not self._completion_gate_trace_enabled():
+                return
+            def job_correlation(identity: object) -> Optional[str]:
+                if isinstance(identity, tuple) and len(identity) == 2 and \
+                        type(identity[0]) is int and identity[0] >= 0 and \
+                        isinstance(identity[1], str) and identity[1]:
+                    return opaque_trace_correlation("{}:{}".format(identity[0], identity[1]))
+                return None
+
             self._record_completion_gate_breadcrumb(
                 file_id,
                 "completion_progress_floor_capture",
@@ -4118,6 +4129,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     "overlay_transferred_size_present": overlay_transferred_size_present,
                     "published_lookup": published_lookup,
                     "published_candidate": published_candidate,
+                    "published_identity_relation": published_identity_relation,
+                    "retired_job_correlation": job_correlation(retired_job_identity),
+                    "published_job_correlation": job_correlation(published_identity),
                     "capture_source": capture_source,
                     "outcome": outcome,
                 },
@@ -4185,6 +4199,11 @@ class ModelUpdater(_ControllerCoreAccess):
                     published_identity = None
                     published_lookup = "error"
                 if published_lookup == "returned_valid_shape":
+                    published_identity_relation = (
+                        "missing" if published_identity is None else
+                        "matching" if published_identity == retired_job_identity else
+                        "different"
+                    )
                     if published is None and published_identity is None:
                         published_candidate = "absent"
                     elif published_identity != retired_job_identity:

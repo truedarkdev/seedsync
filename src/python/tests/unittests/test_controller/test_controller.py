@@ -2279,6 +2279,109 @@ class TestController(unittest.TestCase):
             ),
         )
 
+    def test_model_completion_provenance_uses_durable_private_controller_envelope(self):
+        root_name = "private-root-sentinel.bin"
+        identity = (987654, "pget")
+        file_id = ModelFile.build_file_id(root_name, None)
+        job_correlation = opaque_trace_correlation("{}:{}".format(*identity))
+        with tempfile.TemporaryDirectory() as spool_path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True, durable_enabled=True, durable_path=spool_path,
+                policy={"default": "off", "rules": {"completion.gate": "info"}},
+            )
+            self.addCleanup(trace.close)
+            context = self._make_startup_context(local_path="/local")
+            context.breadcrumb_trace = trace
+            with patch("controller.controller.create_transfer_backend", return_value=MagicMock()):
+                controller = Controller(context, ControllerPersist())
+            model = controller._Controller__model
+            active = ModelFile(root_name, False)
+            active.state = ModelFile.State.DOWNLOADING
+            active.is_stoppable = True
+            model.add_file(active)
+            model.publish_active_lftp_root_counters(
+                {file_id: ActiveProgressOverlay(100, 1000, None, None)},
+                {file_id: identity}, lambda _file_id: True,
+            )
+            local_only = ModelFile(root_name, False)
+            local_only.local_present = True
+            local_only.remote_has_transferable_content = False
+            local_only.local_size = 1000
+            local_only.transferred_size = 1000
+            local_only.download_progress = 100
+            model.apply_with_active_progress_retained(
+                lambda: model.update_file(local_only), retire_file_ids={file_id},
+            )
+            _captured, accepted, captured_identity = ModelUpdater(controller)._capture_pending_completion_progress_floor(
+                file_id, identity, {}, {}, poll_correlation="lftp-poll:0123456789abcdef",
+                poll_source="fresh_healthy",
+            )
+            self.assertTrue(accepted)
+            self.assertEqual(identity, captured_identity)
+            if os.name != "nt":
+                self.assertTrue(trace.flush_durable(2.0))
+            trace.close()
+            with open(os.path.join(spool_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle if line.strip()]
+
+        model_event = next(row for row in rows if row.get("message") == "model_completion_provenance"
+                           and row["details"]["reason"] == "retiring_identity_published")
+        floor_event = next(row for row in rows if row.get("message") == "completion_progress_floor_capture")
+        root_correlation = "completion:" + opaque_trace_correlation(file_id)
+        self.assertEqual(("controller", "completion_gate", "state_transition", "completion.gate", "info"),
+                         tuple(model_event[key] for key in ("source", "stage", "event_type", "category", "level")))
+        self.assertEqual(root_correlation, model_event["corr_id"])
+        self.assertEqual(root_correlation, floor_event["corr_id"])
+        self.assertEqual(job_correlation, model_event["details"]["job_correlation"])
+        self.assertEqual(job_correlation, floor_event["details"]["retired_job_correlation"])
+        self.assertEqual("matching", floor_event["details"]["published_identity_relation"])
+        serialized = json.dumps([model_event, floor_event])
+        self.assertNotIn(root_name, serialized)
+        self.assertNotIn(str(identity[0]), serialized)
+        self.assertNotIn(identity[1], serialized)
+
+    def test_completion_provenance_policy_off_prevents_correlation_work(self):
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "off"})
+        context = self._make_startup_context(local_path="/local")
+        context.breadcrumb_trace = trace
+        with patch("controller.controller.create_transfer_backend", return_value=MagicMock()):
+            controller = Controller(context, ControllerPersist())
+        model = controller._Controller__model
+        root = ModelFile("policy-off-root", False)
+        root.state = ModelFile.State.DOWNLOADING
+        root.is_stoppable = True
+        model.add_file(root)
+        file_id = root.file_id
+        with patch("controller.controller.opaque_trace_correlation", side_effect=AssertionError("hash while disabled")):
+            result = model.publish_active_lftp_root_counters(
+                {file_id: ActiveProgressOverlay(50, 500, None, None)},
+                {file_id: (5, "pget")}, lambda _file_id: True,
+            )
+        self.assertEqual(({file_id}, "accepted"), result)
+        self.assertEqual((5, "pget"), model.published_file_job_identity(file_id))
+        trace.close()
+
+    def test_completion_provenance_failing_sink_preserves_model_outcome(self):
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"})
+        trace.record = MagicMock(side_effect=RuntimeError("breadcrumb sink failure"))
+        context = self._make_startup_context(local_path="/local")
+        context.breadcrumb_trace = trace
+        with patch("controller.controller.create_transfer_backend", return_value=MagicMock()):
+            controller = Controller(context, ControllerPersist())
+        model = controller._Controller__model
+        root = ModelFile("sink-failure-root", False)
+        root.state = ModelFile.State.DOWNLOADING
+        root.is_stoppable = True
+        model.add_file(root)
+        file_id = root.file_id
+        result = model.publish_active_lftp_root_counters(
+            {file_id: ActiveProgressOverlay(50, 500, None, None)},
+            {file_id: (6, "pget")}, lambda _file_id: True,
+        )
+        self.assertEqual(({file_id}, "accepted"), result)
+        self.assertEqual((6, "pget"), model.published_file_job_identity(file_id))
+        trace.close()
+
     def test_constructor_reports_missing_startup_fields_in_aggregate(self):
         context = self._make_startup_context(local_path=None)
 

@@ -14870,10 +14870,16 @@ class TestModelUpdater(unittest.TestCase):
 
         entries = trace.snapshot()["entries"]
         self.assertEqual(
-            ["completion_pending_registered", "completion_retirement_not_detected"],
+            [
+                "completion_pending_registered",
+                "completion_progress_floor_capture",
+                "completion_retirement_not_detected",
+            ],
             [entry["message"] for entry in entries],
         )
-        pending, active = entries
+        pending, capture, active = entries
+        self.assertEqual("absent", capture["details"]["retired_identity_state"])
+        self.assertEqual("no_retired_identity", capture["details"]["outcome"])
         self.assertEqual(
             {
                 "poll_eligible": True,
@@ -15998,6 +16004,7 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("published_snapshot", event["details"]["capture_source"])
         self.assertEqual("returned_valid_shape", event["details"]["published_lookup"])
         self.assertEqual("eligible", event["details"]["published_candidate"])
+        self.assertEqual("matching", event["details"]["published_identity_relation"])
         self.assertEqual("lftp-poll:fedcba9876543210", event["flow_id"])
         self.assertNotIn("release", json.dumps(event))
         self.assertNotIn(LftpJobStatus.Type.PGET.value, json.dumps(event))
@@ -16224,7 +16231,9 @@ class TestModelUpdater(unittest.TestCase):
                 "schema", "poll_source", "retired_identity_resolution",
                 "retired_identity_state", "overlay_state", "overlay_progress_present",
                 "overlay_transferred_size_present", "published_lookup",
-                "published_candidate", "capture_source", "outcome", "poll_correlation",
+                "published_candidate", "published_identity_relation",
+                "retired_job_correlation", "published_job_correlation",
+                "capture_source", "outcome", "poll_correlation",
             },
             set(event["details"]),
         )
@@ -16325,6 +16334,31 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertNotIn(file_id, controller._Controller__pending_completion_progress_floors)
         self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
+
+    def test_completion_floor_capture_reports_missing_published_identity(self):
+        file_name = "private-capture.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        identity = (7, LftpJobStatus.Type.PGET.value)
+        published = ModelFile(file_name, False)
+        published.local_present = True
+        published.remote_has_transferable_content = False
+        published.local_size = 1000
+        published.transferred_size = 1000
+        published.download_progress = 100
+        model = Model()
+        model.add_file(published)
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+
+        controller = self._run_completion_floor_capture(model, identity, trace)
+
+        event = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("message") == "completion_progress_floor_capture"
+        )
+        self.assertEqual("missing", event["details"]["published_identity_relation"])
+        self.assertIsNone(event["details"]["published_job_correlation"])
+        self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
+        trace.close()
 
     def test_completion_retirement_rejects_stale_local_only_publication_for_newer_identity(self):
         """A Local Only 100% snapshot is not authority for a later LFTP job."""

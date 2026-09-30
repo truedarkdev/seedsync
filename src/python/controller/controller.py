@@ -1446,6 +1446,10 @@ class Controller:
         # The model
         self.__model = Model()
         self.__model.set_base_logger(self.logger)
+        self.__model.set_completion_provenance_diagnostics(
+            self._completion_provenance_trace_enabled,
+            self._record_model_completion_provenance,
+        )
         # Lock for the model. Listeners may re-enter controller model access
         # while the model updater is mutating the model, so this must be reentrant.
         self.__model_lock = RLock()
@@ -6269,6 +6273,70 @@ class Controller:
             logger = getattr(self, "logger", None)
             if logger is not None:
                 logger.debug("Ignoring completion scan-join breadcrumb failure", exc_info=True)
+
+    def _completion_provenance_trace_enabled(self, level: str) -> bool:
+        return _breadcrumb_effectively_enabled(
+            getattr(self.__context, "breadcrumb_trace", None), "completion.gate", level,
+        )
+
+    def _record_model_completion_provenance(
+            self,
+            file_id: str,
+            reason: str,
+            previous_identity: Optional[tuple[int, str]],
+            identity: Optional[tuple[int, str]],
+            level: str,
+    ) -> None:
+        """Record identity-only Model transitions with opaque root/job joins."""
+        reasons = {
+            "identity_bound", "retiring_identity_published", "equal_publication_preserved",
+            "changed_unbound_publication", "identity_consumed", "identity_replaced",
+            "published_root_removed",
+        }
+        if reason not in reasons or level not in {"info", "debug"}:
+            return
+        try:
+            trace = getattr(self.__context, "breadcrumb_trace", None)
+            if not _breadcrumb_effectively_enabled(trace, "completion.gate", level):
+                return
+            root_correlation = opaque_trace_correlation(file_id)
+
+            def job_correlation(value: Optional[tuple[int, str]]) -> Optional[str]:
+                if isinstance(value, tuple) and len(value) == 2 and \
+                        type(value[0]) is int and value[0] >= 0 and \
+                        isinstance(value[1], str) and value[1]:
+                    return opaque_trace_correlation("{}:{}".format(value[0], value[1]))
+                return None
+
+            previous_correlation = job_correlation(previous_identity)
+            identity_correlation = job_correlation(identity)
+            if previous_correlation is None:
+                relation = "bound" if identity_correlation is not None else "unknown"
+            elif identity_correlation is None:
+                relation = "cleared"
+            else:
+                relation = "same" if previous_correlation == identity_correlation else "changed"
+            flow_correlation = identity_correlation or previous_correlation
+            details: dict[str, object] = {
+                "schema": "model_completion_provenance.v1",
+                "reason": reason,
+                "identity_relation": relation,
+                "root_correlation": root_correlation,
+                "previous_job_correlation": previous_correlation,
+                "job_correlation": identity_correlation,
+            }
+            self.__record_breadcrumb(
+                stage="completion_gate", message="model_completion_provenance",
+                event_type="state_transition", corr_id="completion:" + root_correlation,
+                flow_id=("completion-job:" + flow_correlation) if flow_correlation else None,
+                trace_scope="flow", category="completion.gate", level=level,
+                details=details,
+            )
+        except Exception:
+            try:
+                self.logger.debug("Ignoring Model completion provenance breadcrumb failure", exc_info=True)
+            except Exception:
+                pass
 
     def __record_child_completion_hook_breadcrumb(
             self,

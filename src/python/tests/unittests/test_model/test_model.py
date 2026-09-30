@@ -521,6 +521,114 @@ class TestLftpModel(unittest.TestCase):
         self.model = Model()
         self.model.set_base_logger(logger)
 
+    def test_completion_provenance_diagnostics_follow_model_mutations_and_isolate_failures(self):
+        events = []
+        model = Model()
+        model.set_completion_provenance_diagnostics(
+            lambda _level: True,
+            lambda file_id, reason, previous, current, level:
+                events.append((file_id, reason, previous, current, level)),
+        )
+        file_id = ModelFile.build_file_id("completion.bin", None)
+        identity_a = (7, "pget")
+        active = ModelFile("completion.bin", False)
+        active.state = ModelFile.State.DOWNLOADING
+        active.is_stoppable = True
+        model.add_file(active)
+        model.publish_active_lftp_root_counters(
+            {file_id: ActiveProgressOverlay(100, 1000, None, None)},
+            {file_id: identity_a}, lambda _file_id: True,
+        )
+        local_only = ModelFile("completion.bin", False)
+        local_only.local_present = True
+        local_only.remote_has_transferable_content = False
+        local_only.local_size = 1000
+        local_only.transferred_size = 1000
+        local_only.download_progress = 100
+        model.apply_with_active_progress_retained(
+            lambda: model.update_file(local_only), retire_file_ids={file_id},
+        )
+        model.update_file(local_only)
+        changed = ModelFile("completion.bin", False)
+        changed.local_present = True
+        changed.remote_has_transferable_content = False
+        changed.local_size = 1001
+        changed.transferred_size = 1000
+        changed.download_progress = 100
+        model.update_file(changed)
+
+        identity_a_events = [event for event in events if event[0] == file_id]
+        reasons = [event[1] for event in identity_a_events]
+        self.assertIn("identity_bound", reasons)
+        self.assertIn("retiring_identity_published", reasons)
+        self.assertIn("equal_publication_preserved", reasons)
+        self.assertIn("changed_unbound_publication", reasons)
+        self.assertIsNone(model.published_file_job_identity(file_id))
+
+        active_again = ModelFile("completion.bin", False)
+        active_again.state = ModelFile.State.DOWNLOADING
+        active_again.is_stoppable = True
+        active_again.local_present = True
+        active_again.remote_has_transferable_content = True
+        active_again.download_progress = 100
+        active_again.transferred_size = 1000
+        model.update_file(active_again)
+        identity_b = (8, "pget")
+        model.publish_active_lftp_root_counters(
+            {file_id: ActiveProgressOverlay(100, 1000, None, None)},
+            {file_id: identity_b}, lambda _file_id: True,
+        )
+        self.assertTrue(model.clear_published_file_job_identity_if_matches(file_id, identity_b))
+        self.assertIsNone(model.published_file_job_identity(file_id))
+        replaced = Model()
+        replaced.set_completion_provenance_diagnostics(
+            lambda _level: True,
+            lambda *args: events.append(args),
+        )
+        replacement_root = ModelFile("completion.bin", False)
+        replacement_root.state = ModelFile.State.DOWNLOADING
+        replacement_root.is_stoppable = True
+        replacement_root.download_progress = 100
+        replacement_root.transferred_size = 1000
+        replaced.add_file(replacement_root)
+        replaced.publish_active_lftp_root_counters(
+            {file_id: ActiveProgressOverlay(100, 1000, None, None)},
+            {file_id: (9, "pget")}, lambda _file_id: True,
+        )
+        self.assertTrue(replaced.clear_published_file_job_identity_if_replaced(file_id, (10, "pget")))
+        self.assertIsNone(replaced.published_file_job_identity(file_id))
+        removed = Model()
+        removed.set_completion_provenance_diagnostics(lambda _level: True, lambda *args: events.append(args))
+        removed_root = ModelFile("completion.bin", False)
+        removed_root.state = ModelFile.State.DOWNLOADING
+        removed_root.is_stoppable = True
+        removed_root.download_progress = 100
+        removed_root.transferred_size = 1000
+        removed.add_file(removed_root)
+        removed.publish_active_lftp_root_counters(
+            {file_id: ActiveProgressOverlay(100, 1000, None, None)},
+            {file_id: (11, "pget")}, lambda _file_id: True,
+        )
+        removed.remove_file(file_id)
+        self.assertIn("identity_consumed", [event[1] for event in events])
+        self.assertIn("identity_replaced", [event[1] for event in events])
+        self.assertIn("published_root_removed", [event[1] for event in events])
+        replacement_event = next(event for event in events if event[1] == "identity_replaced")
+        self.assertIsNone(replacement_event[3])
+        self.assertEqual((None, None), removed.published_file_with_job_identity(file_id))
+
+        failing = Model()
+        failing.set_completion_provenance_diagnostics(
+            lambda _level: True,
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("diagnostic sink failure")),
+        )
+        failing.add_file(active)
+        failing.publish_active_lftp_root_counters(
+            {file_id: ActiveProgressOverlay(100, 1000, None, None)},
+            {file_id: identity_a}, lambda _file_id: True,
+        )
+        self.assertEqual(identity_a, failing.published_file_job_identity(file_id))
+
     def test_add_file(self):
         file = ModelFile("test", False)
         self.model.add_file(file)
