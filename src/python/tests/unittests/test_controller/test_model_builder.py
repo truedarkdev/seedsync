@@ -36,6 +36,7 @@ from common.performance_diagnostics import (
     DURATION_MODEL_BUILDER_SET_STOPPED_FILES,
     MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
     MODEL_BUILDER_INVALIDATION_CLEAR,
+    MODEL_BUILDER_INVALIDATION_CONFIRMED_LOCAL_DELETIONS,
     MODEL_BUILDER_INVALIDATION_DOWNLOADED_FILES,
     MODEL_BUILDER_INVALIDATION_DOWNLOADED_TIMESTAMPS,
     MODEL_BUILDER_INVALIDATION_EXPLICIT,
@@ -2130,6 +2131,172 @@ class TestModelBuilder(unittest.TestCase):
         self.assertFalse(deleted.local_present)
         self.assertIsNone(deleted.local_size)
         self.assertEqual(ModelFile.State.DEFAULT, deleted.state)
+
+    def test_confirmed_nested_delete_prunes_only_exact_pair_local_and_active_projection(self):
+        mtime_ns = 1_700_000_000_000_000_000
+
+        def add_pair_tree(pair_id, root_name="release"):
+            # Preserve an unrelated aggregate offset: partial scan roots may
+            # legitimately disagree with the currently retained child sum.
+            remote_root = SystemFile(root_name, 350, True)
+            remote_root.path_pair_id = pair_id
+            remote_root.add_child(SystemFile("deleted.bin", 100, False, mtime_ns=mtime_ns))
+            remote_root.add_child(SystemFile("keep.bin", 200, False, mtime_ns=mtime_ns))
+            local_root = SystemFile(root_name, 350, True)
+            local_root.path_pair_id = pair_id
+            local_root.add_child(SystemFile("deleted.bin", 100, False, mtime_ns=mtime_ns))
+            local_root.add_child(SystemFile("keep.bin", 200, False, mtime_ns=mtime_ns))
+            return remote_root, local_root
+
+        remote_a, local_a = add_pair_tree("pair-a")
+        remote_b, local_b = add_pair_tree("pair-b")
+        self.model_builder.set_remote_files([remote_a, remote_b])
+        self.model_builder.set_local_files([local_a, local_b])
+        before = self.model_builder.build_model()
+        root_a_id = before.get_file(ModelFile.build_file_id("release", "pair-a")).file_id
+        deleted_id = next(
+            child.file_id for child in before.get_file(root_a_id).get_children()
+            if child.name == "deleted.bin"
+        )
+        self.assertEqual(
+            ModelFile.build_file_id(os.path.join("release", "deleted.bin"), "pair-a"),
+            deleted_id,
+        )
+        original_local_a = local_a.to_dict()
+        original_remote_a = remote_a.to_dict()
+
+        self.model_builder.confirm_local_deletions({deleted_id})
+
+        after = self.model_builder.build_model()
+        deleted = next(
+            child for child in after.get_file(root_a_id).get_children()
+            if child.name == "deleted.bin"
+        )
+        keep = next(
+            child for child in after.get_file(root_a_id).get_children()
+            if child.name == "keep.bin"
+        )
+        self.assertFalse(deleted.local_present)
+        self.assertEqual(ModelFile.State.DEFAULT, deleted.state)
+        self.assertTrue(keep.local_present)
+        self.assertEqual(250, after.get_file(root_a_id).local_size)
+        self.assertEqual(("keep.bin",), self.model_builder.get_trusted_final_leaf_paths(root_a_id))
+        pair_b_root = after.get_file(ModelFile.build_file_id("release", "pair-b"))
+        pair_b_deleted = next(
+            child for child in pair_b_root.get_children() if child.name == "deleted.bin"
+        )
+        self.assertTrue(pair_b_deleted.local_present)
+        self.assertEqual(original_local_a, local_a.to_dict())
+        self.assertEqual(original_remote_a, remote_a.to_dict())
+
+        # A recovery active tree is another retained local projection. Its
+        # exact target must disappear while the active sibling and source
+        # object survive the copy-on-write update.
+        active_builder = ModelBuilder()
+        remote_active, active_root = add_pair_tree("pair-active")
+        active_builder.set_remote_files([remote_active])
+        active_builder.set_active_files([active_root])
+        active_before = active_builder.build_model()
+        active_root_id = active_before.get_file(ModelFile.build_file_id("release", "pair-active")).file_id
+        active_deleted_id = next(
+            child.file_id for child in active_before.get_file(active_root_id).get_children()
+            if child.name == "deleted.bin"
+        )
+        original_active_tree = active_root.to_dict()
+
+        active_builder.confirm_local_deletions({active_deleted_id})
+
+        active_after = active_builder.build_model()
+        active_deleted = next(
+            child for child in active_after.get_file(active_root_id).get_children()
+            if child.name == "deleted.bin"
+        )
+        active_keep = next(
+            child for child in active_after.get_file(active_root_id).get_children()
+            if child.name == "keep.bin"
+        )
+        self.assertFalse(active_deleted.local_present)
+        self.assertTrue(active_keep.local_present)
+        self.assertEqual(250, active_after.get_file(active_root_id).local_size)
+        self.assertEqual(original_active_tree, active_root.to_dict())
+
+        cached_after = active_builder.build_model()
+        unknown_id = ModelFile.build_file_id(os.path.join("release", "missing.bin"), "pair-active")
+        active_builder.confirm_local_deletions({unknown_id})
+        self.assertIs(cached_after, active_builder.build_model())
+
+    def test_nested_delete_walks_only_exact_segments_and_pair(self):
+        mtime_ns = 1_700_000_000_000_000_000
+
+        def add_tree(pair_id):
+            root = SystemFile("release", 450, True)
+            root.path_pair_id = pair_id
+            branch = SystemFile("branch", 350, True)
+            nested = SystemFile("nested", 300, True)
+            nested.add_child(SystemFile("deleted.bin", 100, False, mtime_ns=mtime_ns))
+            nested.add_child(SystemFile("keep.bin", 200, False, mtime_ns=mtime_ns))
+            branch.add_child(nested)
+            prefix_sibling = SystemFile("branch-copy", 100, True)
+            prefix_sibling.add_child(SystemFile("deleted.bin", 100, False, mtime_ns=mtime_ns))
+            root.add_child(branch)
+            root.add_child(prefix_sibling)
+            return root, branch, prefix_sibling
+
+        remote_a, _, _ = add_tree("pair-a")
+        local_a, selected_branch, unrelated_branch = add_tree("pair-a")
+        remote_b, _, _ = add_tree("pair-b")
+        local_b, _, _ = add_tree("pair-b")
+        self.model_builder.set_remote_files([remote_a, remote_b])
+        self.model_builder.set_local_files([local_a, local_b])
+        before = self.model_builder.build_model()
+        root_a_id = ModelFile.build_file_id("release", "pair-a")
+        root_a = before.get_file(root_a_id)
+        branch_a = next(child for child in root_a.get_children() if child.name == "branch")
+        nested_a = next(child for child in branch_a.get_children() if child.name == "nested")
+        target_id = ModelFile.build_file_id(
+            os.path.join("release", "branch", "nested", "deleted.bin"), "pair-a",
+        )
+        selected_leaf = next(
+            child for child in nested_a.get_children() if child.name == "deleted.bin"
+        )
+        self.assertEqual(target_id, selected_leaf.file_id)
+        original_local = local_a.to_dict()
+        invalidation_diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        self.model_builder.set_performance_diagnostics(invalidation_diagnostics)
+
+        original_iter_children = SystemFile.iter_children
+
+        def reject_unrelated_tree(source):
+            if source is unrelated_branch:
+                raise AssertionError("delete traversal entered sibling-prefix subtree")
+            return original_iter_children(source)
+
+        with patch.object(SystemFile, "iter_children", reject_unrelated_tree):
+            self.model_builder.confirm_local_deletions({target_id})
+
+        after = self.model_builder.build_model()
+        root_a_after = after.get_file(root_a_id)
+        branch = next(child for child in root_a_after.get_children() if child.name == "branch")
+        nested = next(child for child in branch.get_children() if child.name == "nested")
+        children = {child.name: child for child in nested.get_children()}
+        self.assertFalse(children["deleted.bin"].local_present)
+        self.assertTrue(children["keep.bin"].local_present)
+        self.assertEqual(200, nested.local_size)
+        self.assertEqual(250, branch.local_size)
+        self.assertEqual(350, root_a_after.local_size)
+        prefix = next(child for child in root_a_after.get_children() if child.name == "branch-copy")
+        self.assertTrue(prefix.get_children()[0].local_present)
+        pair_b_root = after.get_file(ModelFile.build_file_id("release", "pair-b"))
+        pair_b_branch = next(child for child in pair_b_root.get_children() if child.name == "branch")
+        pair_b_nested = next(child for child in pair_b_branch.get_children() if child.name == "nested")
+        self.assertTrue(pair_b_nested.get_children()[0].local_present)
+        self.assertEqual(original_local, local_a.to_dict())
+        self.assertEqual(
+            1,
+            invalidation_diagnostics.snapshot()["counters"][
+                MODEL_BUILDER_INVALIDATION_CONFIRMED_LOCAL_DELETIONS
+            ],
+        )
 
     def test_active_transfer_delta_accepts_active_scan_only_change_for_known_root(self):
         self.model_builder.set_remote_files([SystemFile("active.bin", 100, False)])

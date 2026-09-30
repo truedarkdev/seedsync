@@ -4313,6 +4313,60 @@ class ModelBuilder:
         for file_id in removed_active_file_ids:
             self.__update_active_only_name_count(file_id)
 
+    @staticmethod
+    def __prune_confirmed_local_descendant(
+            source: SystemFile, path_segments: Tuple[str, ...],
+    ) -> Tuple[Optional[SystemFile], int, bool]:
+        """Copy only ancestors of an exact confirmed nested local deletion."""
+        if not path_segments or not source.is_dir:
+            return source, 0, False
+
+        matches = 0
+        changed = False
+        removed_size = 0
+        children = []
+        target_name = path_segments[0]
+        for child in source.iter_children():
+            if child.name != target_name:
+                children.append(child)
+                continue
+            matches += 1
+            if len(path_segments) == 1:
+                child_changed = True
+                child_removed_size = child.size
+                updated_child = None
+            else:
+                updated_child, child_removed_size, child_changed = \
+                    ModelBuilder.__prune_confirmed_local_descendant(child, path_segments[1:])
+            if child_changed:
+                changed = True
+                removed_size += child_removed_size
+            if updated_child is not None:
+                children.append(updated_child)
+        if matches != 1 or not changed:
+            return source, 0, False
+
+        return ModelBuilder.__clone_system_file(
+            source, children, aggregate_size=max(0, source.size - removed_size),
+        ), removed_size, True
+
+    @staticmethod
+    def __completion_relative_path_segments(
+            file_id: str, root: SystemFile, path_pair_id: Optional[str],
+    ) -> Optional[Tuple[str, ...]]:
+        """Resolve a model ID under one exact root without scanning other branches."""
+        target_path, target_pair_id = ModelBuilder.__completion_file_path(file_id)
+        if not isinstance(target_path, str) or target_pair_id != path_pair_id:
+            return None
+        separator = os.sep
+        prefix = root.name + separator
+        if not target_path.startswith(prefix):
+            return None
+        segments = tuple(target_path[len(prefix):].split(separator))
+        if not segments or any(segment in ("", ".", "..") for segment in segments):
+            return None
+        return segments
+
     def confirm_local_deletions(self, file_ids: Set[str]) -> None:
         """Apply exact local absence after a successful delete process.
 
@@ -4326,12 +4380,51 @@ class ModelBuilder:
         for file_id in file_ids:
             pair_id = self.__file_id_path_pair_id(file_id)
             local_bucket = self.__local_files_by_pair.get(pair_id)
-            if local_bucket is not None and local_bucket.pop(file_id, None) is not None:
+            local_root = local_bucket.pop(file_id, None) if local_bucket is not None else None
+            if local_root is not None:
                 changed_file_ids.add(file_id)
-                if not local_bucket:
-                    self.__local_files_by_pair.pop(pair_id, None)
-            if self.__active_files.pop(file_id, None) is not None:
+            elif local_bucket is not None:
+                for root_file_id, root in tuple(local_bucket.items()):
+                    path_segments = self.__completion_relative_path_segments(
+                        file_id, root, pair_id,
+                    )
+                    if path_segments is None:
+                        continue
+                    updated_root, _, changed = self.__prune_confirmed_local_descendant(
+                        root, path_segments,
+                    )
+                    if changed:
+                        if updated_root is None:
+                            local_bucket.pop(root_file_id, None)
+                        else:
+                            local_bucket[root_file_id] = updated_root
+                        changed_file_ids.add(file_id)
+                        break
+            if local_bucket is not None and not local_bucket:
+                self.__local_files_by_pair.pop(pair_id, None)
+
+            active_root = self.__active_files.pop(file_id, None)
+            if active_root is not None:
                 changed_file_ids.add(file_id)
+            else:
+                for root_file_id, root in tuple(self.__active_files.items()):
+                    if root.path_pair_id != pair_id:
+                        continue
+                    path_segments = self.__completion_relative_path_segments(
+                        file_id, root, pair_id,
+                    )
+                    if path_segments is None:
+                        continue
+                    updated_root, _, changed = self.__prune_confirmed_local_descendant(
+                        root, path_segments,
+                    )
+                    if changed:
+                        if updated_root is None:
+                            self.__active_files.pop(root_file_id, None)
+                        else:
+                            self.__active_files[root_file_id] = updated_root
+                        changed_file_ids.add(file_id)
+                        break
             for snapshots in (
                 self.__recent_live_transfer_snapshots,
                 self.__retained_stopped_transfer_snapshots,
@@ -4375,9 +4468,11 @@ class ModelBuilder:
     @staticmethod
     def __clone_system_file(system_file: SystemFile,
                             children: Optional[List[SystemFile]] = None,
-                            is_staging: Optional[bool] = None) -> SystemFile:
+                            is_staging: Optional[bool] = None,
+                            aggregate_size: Optional[int] = None) -> SystemFile:
         cloned = SystemFile(
             system_file.name,
+            aggregate_size if aggregate_size is not None else
             sum(child.size for child in children) if children is not None else system_file.size,
             system_file.is_dir,
             time_created=system_file.timestamp_created,

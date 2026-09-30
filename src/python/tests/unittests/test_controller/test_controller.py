@@ -10038,6 +10038,140 @@ class TestController(unittest.TestCase):
             self.assertEqual(1, snapshot["durations"][metric]["count"], metric)
         self.assertEqual(1, snapshot["counters"]["controller_cleanup_process_completed"])
 
+    def test_confirmed_nested_delete_callback_updates_real_model_and_queue_exclusions(self):
+        mtime_ns = 1_700_000_000_000_000_000
+        builder = ModelBuilder()
+        remote_a = SystemFile("release", 300, True)
+        remote_a.path_pair_id = "pair-a"
+        remote_a.add_child(SystemFile("deleted.bin", 100, False, mtime_ns=mtime_ns))
+        remote_a.add_child(SystemFile("keep.bin", 200, False, mtime_ns=mtime_ns))
+        local_a = SystemFile("release", 300, True)
+        local_a.path_pair_id = "pair-a"
+        local_a.add_child(SystemFile("deleted.bin", 100, False, mtime_ns=mtime_ns))
+        local_a.add_child(SystemFile("keep.bin", 200, False, mtime_ns=mtime_ns))
+        remote_b = SystemFile("release", 300, True)
+        remote_b.path_pair_id = "pair-b"
+        remote_b.add_child(SystemFile("deleted.bin", 100, False, mtime_ns=mtime_ns))
+        local_b = SystemFile("release", 300, True)
+        local_b.path_pair_id = "pair-b"
+        local_b.add_child(SystemFile("deleted.bin", 100, False, mtime_ns=mtime_ns))
+        builder.set_remote_files([remote_a, remote_b])
+        builder.set_local_files([local_a, local_b])
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__model = builder.build_model()
+        self.controller._Controller__model_lock = threading.RLock()
+
+        root_page = self.controller.get_model_page("pair-a", limit=10)
+        root_id = root_page["records"][0]["file_id"]
+        child_page = self.controller.get_model_page("pair-a", limit=10, parent_file_id=root_id)
+        target_id = next(
+            row["file_id"] for row in child_page["records"] if row["name"] == "deleted.bin"
+        )
+        self.assertEqual(
+            ModelFile.build_file_id(os.path.join("release", "deleted.bin"), "pair-a"),
+            target_id,
+        )
+        target_model_file = next(
+            child for child in self.controller._Controller__model.get_file(root_id).get_children()
+            if child.name == "deleted.bin"
+        )
+
+        def cleanup_worker(propagation_error=None, alive=False):
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, target_id)
+            callback = MagicMock()
+            command.add_callback(callback)
+            process = MagicMock()
+            process.is_alive.return_value = alive
+            if propagation_error is not None:
+                process.propagate_exception.side_effect = propagation_error
+            else:
+                process.propagate_exception.return_value = None
+            self.controller._Controller__active_command_processes = [
+                Controller.CommandProcessWrapper(
+                    command=command,
+                    file_id=target_id,
+                    file_name=target_model_file.name,
+                    process=process,
+                    post_callback=MagicMock(),
+                    await_completion=True,
+                    event_file=target_model_file,
+                )
+            ]
+            self.controller._Controller__cleanup_commands()
+            return callback
+
+        failed_callback = cleanup_worker(FileNotFoundError("incomplete operation"))
+        failed_callback.on_failure.assert_called_once()
+        failed_callback.on_success.assert_not_called()
+        self.assertTrue(builder.build_model().get_file(root_id).get_children()[0].local_present)
+
+        incomplete_callback = cleanup_worker(alive=True)
+        incomplete_callback.on_failure.assert_not_called()
+        incomplete_callback.on_success.assert_not_called()
+        self.assertTrue(builder.build_model().get_file(root_id).get_children()[0].local_present)
+
+        successful_callback = cleanup_worker()
+        successful_callback.on_success.assert_called_once_with()
+        successful_callback.on_failure.assert_not_called()
+
+        self.controller._Controller__model = builder.build_model()
+        published_child_page = self.controller.get_model_page(
+            "pair-a", limit=10, parent_file_id=root_id,
+        )
+        published = {row["name"]: row for row in published_child_page["records"]}
+        self.assertFalse(published["deleted.bin"]["local_present"])
+        self.assertTrue(published["keep.bin"]["local_present"])
+        self.assertEqual(200, self.controller._Controller__model.get_file(root_id).local_size)
+        self.assertEqual(
+            [ExactPathExclusion("keep.bin")],
+            self.controller._Controller__transfer_exclude_patterns(root_id, True),
+        )
+        pair_b_root_id = self.controller.get_model_page("pair-b", limit=10)["records"][0]["file_id"]
+        pair_b_child = self.controller.get_model_page(
+            "pair-b", limit=10, parent_file_id=pair_b_root_id,
+        )["records"][0]
+        self.assertTrue(pair_b_child["local_present"])
+
+    def test_fresh_final_local_scan_adopts_nested_parent_projection(self):
+        pair = PathPair(
+            id="pair-a", name="Local", remote_path="/remote/pair-a", local_path="/local/pair-a",
+            enabled=True, auto_queue=True,
+        )
+        updater, _ = self._configure_real_model_autoqueue_pipeline(pair)
+        builder = self.controller._Controller__model_builder
+        mtime_ns = 1_700_000_000_000_000_000
+        remote_root = SystemFile("release", 300, True)
+        remote_root.path_pair_id = pair.id
+        remote_root.add_child(SystemFile("deleted.bin", 100, False, mtime_ns=mtime_ns))
+        remote_root.add_child(SystemFile("keep.bin", 200, False, mtime_ns=mtime_ns))
+        local_root = SystemFile("release", 300, True)
+        local_root.path_pair_id = pair.id
+        local_root.add_child(SystemFile("deleted.bin", 100, False, mtime_ns=mtime_ns))
+        local_root.add_child(SystemFile("keep.bin", 200, False, mtime_ns=mtime_ns))
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        self.controller._Controller__model = builder.build_model()
+        root_id = ModelFile.build_file_id("release", pair.id)
+
+        fresh_local_root = SystemFile("release", 200, True)
+        fresh_local_root.path_pair_id = pair.id
+        fresh_local_root.add_child(SystemFile("keep.bin", 200, False, mtime_ns=mtime_ns))
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [fresh_local_root], scanned_path_pair_ids={pair.id},
+            completed_path_pair_ids={pair.id},
+        )
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+
+        updater.update()
+
+        root = self.controller._Controller__model.get_file(root_id)
+        children = {child.name: child for child in root.get_children()}
+        self.assertFalse(children["deleted.bin"].local_present)
+        self.assertTrue(children["keep.bin"].local_present)
+        self.assertEqual(200, root.local_size)
+        self.assertEqual(("keep.bin",), builder.get_trusted_final_leaf_paths(root_id))
+
     def test_cleanup_commands_delete_local_surfaces_missing_file_failure(self):
         diagnostics = PerformanceDiagnosticsCollector(lambda: True)
         self.controller._Controller__context.performance_diagnostics = diagnostics
