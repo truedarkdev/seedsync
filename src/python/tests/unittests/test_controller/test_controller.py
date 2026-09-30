@@ -3197,7 +3197,7 @@ class TestController(unittest.TestCase):
         )
 
     @patch("controller.model_updater.datetime")
-    def test_update_model_schedules_healthy_active_status_poll_one_second_out(self, datetime_mock):
+    def test_update_model_schedules_healthy_active_status_poll_about_100ms_out(self, datetime_mock):
         status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
         now = datetime(2026, 4, 4, 12, 0, 0)
         datetime_mock.now.return_value = now
@@ -3206,7 +3206,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__update_model()
 
         self.assertEqual(
-            now + timedelta(seconds=1),
+            now + timedelta(milliseconds=100),
             self.controller._Controller__next_lftp_status_poll_at
         )
         self.assertFalse(self.controller._Controller__lftp_status_poll_retry_active)
