@@ -6252,7 +6252,7 @@ class Controller:
     ) -> None:
         """Emit a privacy-safe root scan/completion join through existing lanes."""
         try:
-            if message == "scan_root_adopted":
+            if message in {"scan_root_adopted", "active_scan_root_adopted"}:
                 category = "scan.authority"
             elif message == "downloaded_marker_added":
                 category = "completion.gate"
@@ -6263,7 +6263,9 @@ class Controller:
                 return
             correlation = opaque_trace_correlation(file_id)
             self.__record_breadcrumb(
-                stage=("scan_authority" if message == "scan_root_adopted" else "completion_gate"),
+                stage=("scan_authority" if message in {
+                    "scan_root_adopted", "active_scan_root_adopted",
+                } else "completion_gate"),
                 message=message, event_type="state_transition",
                 category=category, level="info", trace_scope="flow",
                 corr_id="completion:{}".format(correlation),

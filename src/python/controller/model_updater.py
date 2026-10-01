@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from itertools import islice
 from types import SimpleNamespace
 from threading import Lock, RLock
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional, Sequence, TYPE_CHECKING, cast
 
 from common import Context, PathPair
@@ -191,6 +191,145 @@ def _record_selected_root_scan_join(
         logger = getattr(controller, "logger", None)
         if logger is not None:
             logger.debug("Ignoring selected-root scan join breadcrumb failure", exc_info=True)
+
+
+def _sample_pre_poll_active_scan_targets(
+        controller: "Controller", pre_poll_file_ids: set[str],
+) -> tuple[list[tuple[str, str, Optional[str]]], bool]:
+    """Keep a small identity map for the active roots already selected for scanning."""
+    targets: list[tuple[str, str, Optional[str]]] = []
+    seen: set[str] = set()
+    incomplete = False
+
+    def add_target(name: object, path_pair_id: object) -> None:
+        nonlocal incomplete
+        if not isinstance(name, str) or not name or not (
+                path_pair_id is None or isinstance(path_pair_id, str)):
+            incomplete = True
+            return
+        file_id = ModelFile.build_file_id(name, path_pair_id)
+        if file_id not in pre_poll_file_ids or file_id in seen:
+            return
+        if len(targets) >= _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT:
+            incomplete = True
+            return
+        seen.add(file_id)
+        targets.append((file_id, name, path_pair_id))
+
+    for source in (
+            getattr(controller, "_Controller__active_downloading_file_names", ()) or (),
+            getattr(controller, "_Controller__prev_downloading_file_names", ()) or (),
+    ):
+        for entry in source:
+            if isinstance(entry, tuple) and len(entry) >= 2:
+                add_target(entry[0], entry[1])
+            else:
+                incomplete = True
+    for status in getattr(controller, "_Controller__last_lftp_statuses", ()) or ():
+        if getattr(status, "state", None) in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING):
+            add_target(getattr(status, "name", None), getattr(status, "path_pair_id", None))
+    return targets, incomplete
+
+
+def _record_active_scan_adoption_join(
+        controller: "Controller", scan: object, *, pre_poll_targets: object,
+        pre_poll_targets_incomplete: bool,
+        pending_targets: object, active_files: object,
+        setter_succeeded: bool, poll_correlation: object,
+) -> None:
+    """Record selected inputs and the Builder setter outcome, not model publication."""
+    try:
+        if not _controller_breadcrumb_effectively_enabled(controller, "scan.authority", "info"):
+            return
+
+        selected: dict[str, tuple[str, Optional[str]]] = {}
+        omitted = bool(pre_poll_targets_incomplete)
+
+        def add_target(file_id: str, name: object, path_pair_id: object) -> None:
+            nonlocal omitted
+            if file_id in selected:
+                return
+            if len(selected) >= _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT:
+                omitted = True
+                return
+            selected[file_id] = (name, path_pair_id)
+
+        for file_id, name, path_pair_id in pre_poll_targets:
+            add_target(file_id, name, path_pair_id)
+        for name, path_pair_id, _ in pending_targets:
+            add_target(ModelFile.build_file_id(name, path_pair_id), name, path_pair_id)
+        if not selected:
+            return
+
+        roots = active_files if isinstance(active_files, (list, tuple)) else None
+        root_staging_by_id: dict[str, Optional[bool]] = {}
+        if roots is not None:
+            for root in roots:
+                if not isinstance(root, SystemFile):
+                    continue
+                root_id = ModelFile.build_file_id(root.name, getattr(root, "path_pair_id", None))
+                if root_id in selected:
+                    is_staging = getattr(root, "is_staging", None)
+                    root_staging_by_id[root_id] = is_staging if type(is_staging) is bool else None
+
+        pair_tokens = getattr(scan, "_scan_authority_tokens_by_pair", None)
+        session_token = getattr(scan, "session_token", None)
+        generation = getattr(scan, "generation", None)
+        timestamp = getattr(scan, "timestamp", None)
+        scan_final = getattr(scan, "is_scan_final", None)
+        scan_failed = getattr(scan, "failed", None)
+        scanned_pairs = getattr(scan, "scanned_path_pair_ids", None)
+        completed_pairs = getattr(scan, "completed_path_pair_ids", None)
+        unknown_pairs = getattr(scan, "unknown_path_pair_ids", None)
+        safe_poll = _safe_lftp_status_poll_correlation(poll_correlation)
+        captured_utc = datetime.now(timezone.utc).isoformat()
+        captured_monotonic_ns = time.monotonic_ns()
+        timestamp_value = timestamp.isoformat() if isinstance(timestamp, datetime) else None
+
+        def pair_member(pair_ids: object, path_pair_id: Optional[str]) -> Optional[bool]:
+            if isinstance(pair_ids, (set, frozenset)):
+                return path_pair_id in pair_ids
+            return None
+
+        for file_id, (_, path_pair_id) in selected.items():
+            token = pair_tokens.get(path_pair_id) if isinstance(pair_tokens, dict) else None
+            if isinstance(token, tuple) and len(token) == 2:
+                pair_session, pair_generation = token
+            elif not isinstance(pair_tokens, dict):
+                pair_session, pair_generation = session_token, generation
+            else:
+                pair_session, pair_generation = None, None
+            root_present = file_id in root_staging_by_id if roots is not None else None
+            details = {
+                "scan_side": "active",
+                "active_scan_digest": (
+                    trace_session_digest(pair_session)
+                    if isinstance(pair_session, str) and pair_session else None
+                ),
+                "scan_generation": (
+                    pair_generation if type(pair_generation) is int and pair_generation >= 0 else None
+                ),
+                "scan_final": scan_final if type(scan_final) is bool else None,
+                "scan_failed": scan_failed if type(scan_failed) is bool else None,
+                "scan_result_timestamp": timestamp_value,
+                "captured_utc": captured_utc,
+                "captured_monotonic_ns": captured_monotonic_ns,
+                "poll_correlation": safe_poll,
+                "setter_succeeded": setter_succeeded,
+                "root_in_setter_input": root_present,
+                "root_is_staging": root_staging_by_id.get(file_id) if root_present else None,
+                "scanned_pair": pair_member(scanned_pairs, path_pair_id),
+                "completed_pair": pair_member(completed_pairs, path_pair_id),
+                "unknown_pair": pair_member(unknown_pairs, path_pair_id),
+                "selected_root_omissions": omitted,
+            }
+            controller._record_completion_scan_join_breadcrumb(
+                file_id, "active_scan_root_adopted", details,
+            )
+    except Exception:
+        logger = getattr(controller, "logger", None)
+        if logger is not None:
+            logger.debug("Ignoring active-scan adoption breadcrumb failure", exc_info=True)
 
 
 def _scan_adoption_root_sample(
@@ -5892,6 +6031,21 @@ class ModelUpdater(_ControllerCoreAccess):
             for status in (controller._Controller__last_lftp_statuses or [])
             if status.state in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING)
         })
+        active_scan_trace_enabled = latest_active_scan is not None and \
+            _controller_breadcrumb_effectively_enabled(controller, "scan.authority", "info")
+        pre_poll_active_scan_targets: list[tuple[str, str, Optional[str]]] = []
+        pre_poll_active_scan_targets_incomplete = False
+        if active_scan_trace_enabled:
+            try:
+                (
+                    pre_poll_active_scan_targets,
+                    pre_poll_active_scan_targets_incomplete,
+                ) = _sample_pre_poll_active_scan_targets(
+                    controller, pre_poll_active_lftp_file_ids,
+                )
+            except Exception:
+                # Diagnostics must not change the active scan or polling path.
+                pre_poll_active_scan_targets_incomplete = True
         active_scan_awaiting_lftp_file_ids: set[str] = set()
         if latest_active_scan is not None and not bool(getattr(latest_active_scan, "failed", False)):
             active_scan_file_ids = {
@@ -6700,7 +6854,27 @@ class ModelUpdater(_ControllerCoreAccess):
                         getattr(active_file, "path_pair_id", None),
                     ) not in handoff_file_ids
                 ]
-            model_builder.set_active_files(active_scan_files)
+            if active_scan_trace_enabled:
+                def record_active_scan_setter_outcome(succeeded: bool) -> None:
+                    _record_active_scan_adoption_join(
+                        controller, latest_active_scan,
+                        pre_poll_targets=pre_poll_active_scan_targets,
+                        pre_poll_targets_incomplete=pre_poll_active_scan_targets_incomplete,
+                        pending_targets=controller._Controller__pending_completion_file_names,
+                        active_files=active_scan_files,
+                        setter_succeeded=succeeded,
+                        poll_correlation=lftp_status_poll_correlation,
+                    )
+
+                try:
+                    model_builder.set_active_files(active_scan_files)
+                except Exception:
+                    record_active_scan_setter_outcome(False)
+                    raise
+                else:
+                    record_active_scan_setter_outcome(True)
+            else:
+                model_builder.set_active_files(active_scan_files)
             if _controller_breadcrumb_effectively_enabled(controller, "scan.result", "info"):
                 controller._Controller__record_breadcrumb(
                     stage="scan",

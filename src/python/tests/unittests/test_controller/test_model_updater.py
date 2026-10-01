@@ -30,6 +30,7 @@ from controller.model_updater import (
     _record_active_delta_rejection_summary,
     _record_scan_adoption_breadcrumb,
     _record_selected_root_scan_join,
+    _record_active_scan_adoption_join,
     _record_lftp_status_breadcrumb,
     _record_lftp_status_membership_transition,
     _lftp_status_lineage_trace_enabled,
@@ -194,6 +195,145 @@ class TestModelUpdater(unittest.TestCase):
             _record_selected_root_scan_join(
                 controller, result, side="remote", pending_targets={target},
             )
+
+    def test_active_scan_adoption_join_keeps_incomplete_results_and_bounds_roots(self):
+        controller = SimpleNamespace(
+            logger=MagicMock(),
+            _record_completion_scan_join_breadcrumb=MagicMock(),
+        )
+        timestamp = datetime(2026, 9, 30, 20, 0, 0)
+        roots = []
+        selected = []
+        pre_poll_ids = set()
+        for index in range(20):
+            name = "private-root-{}".format(index)
+            pair_id = "private-pair-{}".format(index)
+            root = SystemFile(name, 1, is_staging=index == 0)
+            root.path_pair_id = pair_id
+            roots.append(root)
+            file_id = ModelFile.build_file_id(name, pair_id)
+            selected.append((file_id, name, pair_id))
+            pre_poll_ids.add(file_id)
+        scan = ScannerResult(
+            timestamp, roots, failed=True, generation=7, is_scan_final=False,
+            session_token="private-session-token",
+            scanned_path_pair_ids={"private-pair-0", "private-pair-1"},
+            completed_path_pair_ids={"private-pair-0"},
+            unknown_path_pair_ids={"private-pair-1"},
+        )
+        scan._scan_authority_tokens_by_pair = {
+            "private-pair-0": ("private-pair-session", 11),
+        }
+
+        with patch("controller.model_updater._controller_breadcrumb_effectively_enabled", return_value=True):
+            _record_active_scan_adoption_join(
+                controller, scan,
+                pre_poll_targets=selected,
+                pre_poll_targets_incomplete=False,
+                pending_targets=set(),
+                active_files=roots,
+                setter_succeeded=True,
+                poll_correlation="lftp-poll:0123456789abcdef",
+            )
+
+        calls = controller._record_completion_scan_join_breadcrumb.call_args_list
+        self.assertEqual(16, len(calls))
+        self.assertTrue(all(call.args[1] == "active_scan_root_adopted" for call in calls))
+        first = calls[0].args[2]
+        self.assertEqual("active", first["scan_side"])
+        self.assertEqual(trace_session_digest("private-pair-session"), first["active_scan_digest"])
+        self.assertEqual(11, first["scan_generation"])
+        self.assertFalse(first["scan_final"])
+        self.assertTrue(first["scan_failed"])
+        self.assertTrue(first["setter_succeeded"])
+        self.assertTrue(first["root_in_setter_input"])
+        self.assertTrue(first["root_is_staging"])
+        self.assertTrue(first["scanned_pair"])
+        self.assertTrue(first["completed_pair"])
+        self.assertFalse(first["unknown_pair"])
+        self.assertTrue(first["selected_root_omissions"])
+        self.assertEqual("lftp-poll:0123456789abcdef", first["poll_correlation"])
+        self.assertEqual(timestamp.isoformat(), first["scan_result_timestamp"])
+        self.assertIsNone(calls[1].args[2]["active_scan_digest"])
+        self.assertIsNone(calls[1].args[2]["scan_generation"])
+        self.assertTrue(calls[1].args[2]["unknown_pair"])
+        serialized_details = json.dumps([call.args[2] for call in calls])
+        self.assertNotIn("private-root-", serialized_details)
+        self.assertNotIn("private-pair-", serialized_details)
+        self.assertNotIn("private-session-token", serialized_details)
+
+        controller._record_completion_scan_join_breadcrumb.reset_mock()
+        pending_root = SystemFile("pending-root", 1)
+        pending_root.path_pair_id = "pending-pair"
+        pending_id = ModelFile.build_file_id(pending_root.name, pending_root.path_pair_id)
+        pending_scan = ScannerResult(
+            timestamp, [pending_root], generation=3, session_token="pending-session",
+        )
+        with patch("controller.model_updater._controller_breadcrumb_effectively_enabled", return_value=True):
+            _record_active_scan_adoption_join(
+                controller, pending_scan,
+                pre_poll_targets=[],
+                pre_poll_targets_incomplete=False,
+                pending_targets={(pending_root.name, pending_root.path_pair_id, "opaque")},
+                active_files=[pending_root], setter_succeeded=True,
+                poll_correlation="lftp-poll:0123456789abcdef",
+            )
+        self.assertEqual(pending_id, controller._record_completion_scan_join_breadcrumb.call_args.args[0])
+        self.assertTrue(
+            controller._record_completion_scan_join_breadcrumb.call_args.args[2]["root_in_setter_input"]
+        )
+
+    def test_active_scan_adoption_join_gates_before_reads_and_isolates_sink_failure(self):
+        class Poison:
+            def __getattribute__(self, name):
+                raise AssertionError("disabled trace read diagnostic input")
+
+        controller = SimpleNamespace(logger=MagicMock())
+        with patch("controller.model_updater._controller_breadcrumb_effectively_enabled", return_value=False):
+            _record_active_scan_adoption_join(
+                controller, Poison(),
+                pre_poll_targets=Poison(),
+                pre_poll_targets_incomplete=False,
+                pending_targets=Poison(),
+                active_files=Poison(), setter_succeeded=True, poll_correlation=Poison(),
+            )
+
+        failing = SimpleNamespace(
+            logger=MagicMock(),
+            _record_completion_scan_join_breadcrumb=MagicMock(side_effect=RuntimeError("sink")),
+        )
+        root = SystemFile("active.bin", 10)
+        scan = ScannerResult(
+            datetime.now(), [root], failed=False, generation=2, session_token="session",
+        )
+        selected = [(ModelFile.build_file_id("active.bin", None), "active.bin", None)]
+        with patch("controller.model_updater._controller_breadcrumb_effectively_enabled", return_value=True):
+            _record_active_scan_adoption_join(
+                failing, scan, pre_poll_targets=selected,
+                pre_poll_targets_incomplete=False,
+                pending_targets=set(), active_files=[root], setter_succeeded=True,
+                poll_correlation="lftp-poll:0123456789abcdef",
+            )
+
+    def test_active_scan_pre_poll_sampling_requires_scan_and_enabled_trace(self):
+        active_scan = ScannerResult(datetime.now(), [SystemFile("active.bin", 10, False)])
+        for scan, trace_policy in ((None, None), (active_scan, {"default": "off"})):
+            builder = ModelBuilder()
+            builder.set_remote_files([SystemFile("active.bin", 10, False)])
+            controller, _ = self._make_progressive_update_controller(
+                None, local_scan=None, model_builder=builder, model=builder.build_model(),
+            )
+            controller._Controller__active_scan_process.pop_latest_result.return_value = scan
+            if trace_policy is not None:
+                trace = BreadcrumbTraceCollector(lambda: True, policy=trace_policy)
+                self.addCleanup(trace.close)
+                controller._Controller__context.breadcrumb_trace = trace
+            with patch(
+                    "controller.model_updater._sample_pre_poll_active_scan_targets",
+                    side_effect=AssertionError("disabled or absent scan must not sample"),
+            ) as sampler:
+                ModelUpdater(controller).update()
+            sampler.assert_not_called()
 
     def test_model_finalization_entry_survives_nonreturning_stage(self):
         trace = BreadcrumbTraceCollector(lambda: True)
@@ -13577,6 +13717,196 @@ class TestModelUpdater(unittest.TestCase):
             "active_scan_lftp_transition",
             status_missing["poll_decision"]["poll_due_reason"],
         )
+
+    def test_active_scan_uses_pre_poll_target_after_explicit_stop(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("active.bin", 100, False)])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=builder.build_model(),
+        )
+        trace = BreadcrumbTraceCollector(
+            lambda: True, policy={"default": "off", "rules": {
+                "scan.authority": "info", "completion.gate": "info",
+            }},
+        )
+        self.addCleanup(trace.close)
+        controller._Controller__context.breadcrumb_trace = trace
+
+        def record_breadcrumb(**kwargs):
+            values = dict(kwargs)
+            message = values.pop("message")
+            details = values.pop("details")
+            trace.record("controller", message, details, **values)
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        controller._record_completion_scan_join_breadcrumb = lambda file_id, message, details: \
+            Controller._record_completion_scan_join_breadcrumb(controller, file_id, message, details)
+        controller._take_lftp_status_poll_correlation = lambda: "lftp-poll:0123456789abcdef"
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        updater = ModelUpdater(controller)
+        controller._Controller__lftp.status.return_value = [status]
+        updater.update()
+
+        self.assertFalse(controller._Controller__pending_completion_file_names)
+        file_id = ModelFile.build_file_id("active.bin", None)
+        self.assertIn(file_id, {item.file_id for item in controller._Controller__last_lftp_statuses})
+        self.assertTrue(any(
+            entry[0] == "active.bin"
+            for entry in controller._Controller__active_downloading_file_names
+        ))
+
+        # Use the production persisted-stop predicate. A normal retirement
+        # creates pending completion, so the no-pending fixture must represent
+        # an explicit stop recorded after the prior active status.
+        controller._Controller__is_explicitly_stopped = lambda name, path_pair_id=None: \
+            Controller._Controller__is_explicitly_stopped(controller, name, path_pair_id)
+        controller._Controller__persist.stopped_file_names.add(file_id)
+        self.assertTrue(controller._Controller__is_explicitly_stopped("active.bin", None))
+        controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+        controller._Controller__lftp.status.return_value = []
+        scan = ScannerResult(
+            datetime.now(), [SystemFile("active.bin", 100, False)],
+            generation=8, session_token="private-retired-scan-session",
+        )
+        controller._Controller__active_scan_process.pop_latest_result.return_value = scan
+        updater.update()
+
+        self.assertFalse(controller._Controller__pending_completion_file_names)
+        self.assertEqual(2, controller._Controller__lftp.status.call_count)
+        self.assertFalse(controller._Controller__last_lftp_statuses)
+        self.assertFalse(any(
+            entry[0] == "active.bin"
+            for entry in controller._Controller__active_downloading_file_names
+        ))
+        self.assertFalse(any(
+            entry[0] == "active.bin"
+            for entry in controller._Controller__prev_downloading_file_names
+        ))
+        retirement = next(
+            event for event in trace.query_events(
+                category="completion.gate", stage="completion_gate", limit=16,
+            )["events"] if event.get("message") == "completion_retirement_excluded"
+        )
+        self.assertEqual("explicit_stop", retirement["details"]["reason"])
+        self.assertTrue(retirement["details"]["explicit_stop"])
+        event = next(
+            event for event in trace.query_events(
+                category="scan.authority", stage="scan_authority", limit=16,
+            )["events"] if event.get("message") == "active_scan_root_adopted"
+        )
+        details = event["details"]
+        self.assertTrue(details["setter_succeeded"])
+        self.assertTrue(details["root_in_setter_input"])
+        self.assertFalse(details["completed_pair"])
+        self.assertEqual("lftp-poll:0123456789abcdef", details["poll_correlation"])
+        self.assertEqual(
+            "completion:{}".format(opaque_trace_correlation(file_id)),
+            event["corr_id"],
+        )
+
+    def test_active_scan_adoption_is_persisted_from_real_updater(self):
+        if os.name == "nt":
+            self.skipTest("Windows durable writer acknowledgement is not verified")
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("private-active-root", 100, False)])
+        live_model = builder.build_model()
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        durable_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(durable_dir.cleanup)
+        trace = BreadcrumbTraceCollector(
+            lambda: True, durable_enabled=True, durable_path=durable_dir.name,
+            policy={"default": "off", "rules": {
+                "scan.authority": "info", "completion.gate": "info",
+            }},
+        )
+        self.addCleanup(trace.close)
+        controller._Controller__context.breadcrumb_trace = trace
+
+        def record_breadcrumb(**kwargs):
+            values = dict(kwargs)
+            message = values.pop("message")
+            details = values.pop("details")
+            trace.record("controller", message, details, **values)
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        controller._record_completion_scan_join_breadcrumb = lambda file_id, message, details: \
+            Controller._record_completion_scan_join_breadcrumb(controller, file_id, message, details)
+        controller._take_lftp_status_poll_correlation = lambda: "lftp-poll:0123456789abcdef"
+
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "private-active-root", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        updater = ModelUpdater(controller)
+        controller._Controller__lftp.status.return_value = [status]
+        updater.update()
+
+        controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+        controller._Controller__lftp.status.return_value = [status]
+        scan_timestamp = datetime.now()
+        scan = ScannerResult(
+            scan_timestamp, [SystemFile("private-active-root", 100, False)],
+            generation=4, session_token="private-active-scan-session",
+        )
+        controller._Controller__active_scan_process.pop_latest_result.return_value = scan
+        updater.update()
+
+        self.assertTrue(trace.flush_durable(2.0))
+        durable_path = os.path.join(durable_dir.name, "breadcrumbs.jsonl")
+        with open(durable_path, encoding="utf-8") as handle:
+            persisted = [json.loads(line) for line in handle if line.strip()]
+        adoption = next(item for item in persisted if item.get("message") == "active_scan_root_adopted")
+        details = adoption["details"]
+        self.assertEqual("scan.authority", adoption["category"])
+        self.assertEqual("scan_authority", adoption["stage"])
+        self.assertEqual("active", details["scan_side"])
+        self.assertEqual(trace_session_digest("private-active-scan-session"), details["active_scan_digest"])
+        self.assertEqual(4, details["scan_generation"])
+        self.assertEqual(scan_timestamp.isoformat(), details["scan_result_timestamp"])
+        self.assertTrue(details["setter_succeeded"])
+        self.assertTrue(details["root_in_setter_input"])
+        self.assertTrue(details["root_is_staging"])
+        self.assertTrue(details["scanned_pair"])
+        self.assertFalse(details["completed_pair"])
+        self.assertFalse(details["unknown_pair"])
+        self.assertEqual("lftp-poll:0123456789abcdef", details["poll_correlation"])
+        self.assertRegex(adoption["corr_id"], r"^completion:[0-9a-f]{16}$")
+        serialized = json.dumps(adoption)
+        self.assertNotIn("private-active-root", serialized)
+        self.assertNotIn("private-active-scan-session", serialized)
+
+        controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+        failed_scan = ScannerResult(
+            datetime.now(), [SystemFile("private-active-root", 100, False)],
+            failed=True, generation=5, is_scan_final=False,
+        )
+        controller._Controller__active_scan_process.pop_latest_result.return_value = failed_scan
+        setter_error = RuntimeError("private setter failure")
+        model_builder.set_active_files = MagicMock(side_effect=setter_error)
+        with self.assertRaises(RuntimeError) as caught:
+            updater.update()
+        self.assertIs(setter_error, caught.exception)
+        model_builder.set_active_files.assert_called_once_with(failed_scan.files)
+        self.assertTrue(trace.flush_durable(2.0))
+        with open(durable_path, encoding="utf-8") as handle:
+            persisted = [json.loads(line) for line in handle if line.strip()]
+        failed_event = [
+            item for item in persisted if item.get("message") == "active_scan_root_adopted"
+        ][-1]
+        failed_details = failed_event["details"]
+        self.assertFalse(failed_details["setter_succeeded"])
+        self.assertTrue(failed_details["root_in_setter_input"])
+        self.assertTrue(failed_details["scan_failed"])
+        self.assertFalse(failed_details["scan_final"])
+        self.assertTrue(failed_details["scanned_pair"])
+        self.assertFalse(failed_details["completed_pair"])
+        self.assertFalse(failed_details["unknown_pair"])
+        self.assertNotIn("private setter failure", json.dumps(failed_event))
 
     def test_cached_idle_tick_without_active_scan_does_not_wake_status_poll(self):
         builder = ModelBuilder()
