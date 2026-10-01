@@ -6852,6 +6852,42 @@ class TestModelUpdater(unittest.TestCase):
             inventory["pair-b"].file_count, inventory["pair-b"].size, inventory["pair-b"].state,
         ))
 
+    def test_local_root_scan_proof_requires_admitted_root_and_current_session_generation(self):
+        root = SystemFile("selected", 1, is_dir=True)
+        root.path_pair_id = "pair-a"
+        root_id = ModelFile.build_file_id("selected", "pair-a")
+        accumulator = _ProgressiveScanAccumulator()
+        accepted_root = ScannerResult(
+            datetime.now(), [root], scanned_path_pair_ids={"pair-a"}, generation=4,
+            is_progress=True, session_token="local-session",
+            root_scan_outcomes_by_pair={"pair-a": {"selected": (True, True)}},
+        )
+
+        accumulator.apply([accepted_root], {"pair-a"})
+        self.assertEqual({root_id: ("local-session", 4)}, accumulator.current_root_scan_proofs())
+        root_sources = accumulator.current_root_scan_sources()
+        self.assertEqual({root_id}, set(root_sources))
+        self.assertIs(root, root_sources[root_id][0])
+        self.assertEqual(("local-session", 4), root_sources[root_id][1:])
+
+        dropped_root = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=5,
+            is_progress=True, failed=True, unknown_path_pair_ids={"pair-a"},
+            recoverable_failure_path_pair_ids={"pair-a"}, session_token="local-session",
+            root_scan_outcomes_by_pair={"pair-a": {"selected": (True, True)}},
+        )
+        accumulator.apply([dropped_root], {"pair-a"})
+        self.assertEqual({}, accumulator.current_root_scan_proofs())
+
+        summary_only = _ProgressiveScanAccumulator()
+        summary_only.apply([dropped_root], {"pair-a"})
+        self.assertEqual({}, summary_only.current_root_scan_proofs())
+
+        restarted = _ProgressiveScanAccumulator()
+        restarted.apply([accepted_root], {"pair-a"})
+        restarted.set_session_token("replacement-session")
+        self.assertEqual({}, restarted.current_root_scan_proofs())
+
     def test_recoverable_pair_does_not_make_ordinary_incomplete_sibling_stale(self):
         """Only a terminal pair may be stale while another pair is simply scanning."""
         def file_for(pair_id, size):

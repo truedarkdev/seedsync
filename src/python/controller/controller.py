@@ -1171,6 +1171,7 @@ class Controller:
 
     def __transfer_exclude_patterns(
             self, file_id: str, is_dir: bool, flow_id: Optional[str] = None,
+            path_pair_id: Optional[str] = None,
     ) -> str | list[str | ExactPathExclusion]:
         configured_patterns = Controller.__get_exclude_patterns(self)
         patterns = parse_exclude_patterns(configured_patterns)
@@ -1188,7 +1189,14 @@ class Controller:
             }, flow_id=flow_id)
             return configured_patterns
         trusted_patterns: list[ExactPathExclusion] = []
-        trusted_paths = self.__model_builder.get_trusted_final_leaf_paths(file_id)
+        local_process = getattr(self, "_Controller__local_scan_process", None)
+        remote_reconciled = getattr(self, "_Controller__reconciled_remote_path_pair_ids", set())
+        trusted_paths = self.__model_builder.get_trusted_final_leaf_paths(
+            file_id,
+            local_scan_session=getattr(local_process, "session_token", None),
+            local_scan_generation=getattr(local_process, "generation", None),
+            remote_path_pair_ready=isinstance(remote_reconciled, set) and path_pair_id in remote_reconciled,
+        )
         serialization_skipped = 0
         for relative_path in trusted_paths:
             try:
@@ -3285,6 +3293,33 @@ class Controller:
             )
             unknown_path_pair_ids = unknown_snapshotter() if callable(unknown_snapshotter) else ()
             return path_pair_id not in unknown_path_pair_ids
+
+    def __has_current_local_root_scan_proof(self, file: ModelFile) -> bool:
+        """Whether this exact directory root has current local and remote evidence."""
+        if not file.is_dir or file.full_path != file.name:
+            return False
+        remote_reconciled = getattr(self, "_Controller__reconciled_remote_path_pair_ids", set())
+        if not isinstance(remote_reconciled, set) or file.path_pair_id not in remote_reconciled:
+            return False
+        builder = getattr(self, "_Controller__model_builder", None)
+        unknown_snapshotter = getattr(builder, "unknown_local_path_pair_ids_snapshot", None)
+        checker = getattr(builder, "has_current_local_root_scan_proof", None)
+        if not callable(unknown_snapshotter) or not callable(checker):
+            return False
+        try:
+            unknown_pairs = unknown_snapshotter()
+            if not isinstance(unknown_pairs, (set, frozenset, list, tuple)) or \
+                    file.path_pair_id not in unknown_pairs:
+                return False
+            process = getattr(self, "_Controller__local_scan_process", None)
+            return checker(
+                file.file_id,
+                getattr(process, "session_token", None),
+                getattr(process, "generation", None),
+            ) is True
+        except Exception:
+            # Queue authority is fail-closed if optional proof inspection fails.
+            return False
 
     def is_remote_delete_eligible(self, file: ModelFile) -> bool:
         """Require final publication proof before deleting staged remote data."""
@@ -11330,6 +11365,7 @@ class Controller:
                     collision_observation = "present" if collision_observed else "absent"
                 except Exception:
                     collision_observation = "unknown"
+                local_root_scan_proof_current = self.__has_current_local_root_scan_proof(file)
                 self.__record_queue_readiness_trace(file.file_id, "queue_model_boundary", {
                     "schema": "queue_readiness.v1",
                     "phase": "model_boundary",
@@ -11343,6 +11379,7 @@ class Controller:
                     "collision_observation": collision_observation,
                     "collision_unresolved": collision_observed,
                     "collision_terminalizable": collision_terminalizable,
+                    "local_root_scan_proof_current": local_root_scan_proof_current,
                     "remote_available": file.remote_size is not None,
                     "transferable_remote_content": file.remote_has_transferable_content,
                 })
@@ -11459,7 +11496,7 @@ class Controller:
                 # command would lose the retained candidate.
                 elif file.is_dir and command.origin != "auto_queue" and not self.is_path_pair_reconciled(
                         file.path_pair_id
-                ):
+                ) and not local_root_scan_proof_current:
                     # Manual directory Queue must wait for a trustworthy
                     # local+remote model boundary. Keep the caller's command
                     # and callbacks in the controller-owned intent map while
@@ -11511,6 +11548,7 @@ class Controller:
                             "dispatch_attempted": False,
                             "local_reconciled": local_reconciled,
                             "remote_reconciled": remote_reconciled,
+                            "local_root_scan_proof_current": local_root_scan_proof_current,
                             "unknown_local_overlay": unknown_local_overlay,
                             "path_pair_scope_configured": file.path_pair_id in getattr(
                                 self, "_Controller__path_pairs_by_id", {},
@@ -11696,6 +11734,7 @@ class Controller:
                             file.file_id,
                             file.is_dir,
                             queue_trace_flow_id,
+                            path_pair_id=file.path_pair_id,
                         )
                         if exclude_patterns:
                             queue_kwargs["exclude_patterns"] = exclude_patterns

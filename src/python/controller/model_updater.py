@@ -2101,6 +2101,9 @@ class _ProgressiveScanAccumulator:
         self.__active_generation: dict[Optional[str], int] = {}
         self.__failed_pairs: set[tuple[int, Optional[str]]] = set()
         self.__authoritative_by_pair: dict[Optional[str], dict[str, Optional[SystemFile]]] = {}
+        self.__root_scan_outcomes_by_pair: dict[
+            Optional[str], tuple[int, dict[str, tuple[bool, bool]]]
+        ] = {}
         self.__incomplete_pairs: set[Optional[str]] = set()
         self.__recoverable_incomplete_pairs: set[Optional[str]] = set()
         self.__completed_pairs: set[Optional[str]] = set()
@@ -2135,6 +2138,7 @@ class _ProgressiveScanAccumulator:
         self.__incomplete_pairs.clear()
         self.__recoverable_incomplete_pairs.clear()
         self.__authoritative_by_pair.clear()
+        self.__root_scan_outcomes_by_pair.clear()
         self.__completed_pairs.clear()
         self.__committed_root_fingerprints.clear()
         self.__session_has_progressive_evidence = False
@@ -2271,6 +2275,7 @@ class _ProgressiveScanAccumulator:
             terminal_failure_path_pair_ids=getattr(
                 event, "terminal_failure_path_pair_ids", None,
             ),
+            root_scan_outcomes_by_pair=getattr(event, "root_scan_outcomes_by_pair", None),
         )
 
     @staticmethod
@@ -2597,11 +2602,32 @@ class _ProgressiveScanAccumulator:
                     self.__manifests.setdefault(generation, {})[pair_id] = None
                     self.__failed_pairs.discard((generation, pair_id))
                     self.__authoritative_by_pair.pop(pair_id, None)
+                    self.__root_scan_outcomes_by_pair.pop(pair_id, None)
                     for root_name in protected_root_names:
                         previous_file = previous.get(root_name)
                         if previous_file is not None:
                             self.__authoritative_by_pair.setdefault(pair_id, {})[root_name] = previous_file
                 touched.add(pair_id)
+                outcome_maps = getattr(event, "root_scan_outcomes_by_pair", {})
+                pair_outcomes = outcome_maps.get(pair_id) if isinstance(outcome_maps, dict) else None
+                if isinstance(pair_outcomes, dict) and pair_outcomes:
+                    current_generation, current_outcomes = self.__root_scan_outcomes_by_pair.get(
+                        pair_id, (generation, {}),
+                    )
+                    if current_generation != generation:
+                        current_outcomes = {}
+                    event_root_names = {
+                        file.name for file in event.files
+                        if file.is_dir and self.__pair_for_file(file, event) == pair_id
+                    }
+                    for root_name, role_outcomes in pair_outcomes.items():
+                        if not isinstance(root_name, str) or root_name not in event_root_names or \
+                                not isinstance(role_outcomes, tuple) or len(role_outcomes) != 2 or \
+                                any(type(value) is not bool for value in role_outcomes):
+                            continue
+                        current_outcomes[root_name] = role_outcomes
+                        self.__last_touched_keys.add((pair_id, root_name))
+                    self.__root_scan_outcomes_by_pair[pair_id] = (generation, current_outcomes)
                 if event.failed:
                     if ids == {None} and not configured_ids:
                         # Legacy pre-manifest transport failures have no
@@ -2622,6 +2648,12 @@ class _ProgressiveScanAccumulator:
                         previous_file = self.__committed_by_pair.get(pair_id, {}).get(root_name)
                         if previous_file is not None:
                             self.__authoritative_by_pair.setdefault(pair_id, {})[root_name] = previous_file
+                    working = self.__working.get(generation, {}).get(pair_id, {})
+                    root_evidence = self.__root_scan_outcomes_by_pair.get(pair_id)
+                    if root_evidence is not None and root_evidence[0] == generation:
+                        for root_name, role_outcomes in root_evidence[1].items():
+                            if role_outcomes == (True, True) and root_name in working:
+                                self.__authoritative_by_pair.setdefault(pair_id, {})[root_name] = working[root_name]
                     failed = True
                     event_recoverable_ids = self.__resolve_failure_path_pair_ids(
                         set(getattr(
@@ -2710,7 +2742,13 @@ class _ProgressiveScanAccumulator:
                         if full_snapshot else working.get(file.name)
                     )
                     working[file.name] = file
-                    self.__authoritative_by_pair.setdefault(pair_id, {})[file.name] = file
+                    root_evidence = self.__root_scan_outcomes_by_pair.get(pair_id)
+                    root_outcomes = root_evidence[1].get(file.name) if root_evidence is not None and \
+                        root_evidence[0] == generation else None
+                    if root_outcomes is None or root_outcomes == (True, True):
+                        self.__authoritative_by_pair.setdefault(pair_id, {})[file.name] = file
+                    else:
+                        self.__authoritative_by_pair.get(pair_id, {}).pop(file.name, None)
                     # A new progressive generation starts from committed
                     # authority.  An unchanged periodic chunk must refresh
                     # that standing source without re-rendering its root.
@@ -2897,6 +2935,31 @@ class _ProgressiveScanAccumulator:
             for pair_id, files in self.__authoritative_by_pair.items()
             if pair_ids is None or pair_id in pair_ids
             for name, file in files.items()
+        }
+
+    def current_root_scan_sources(self) -> dict[str, tuple[SystemFile, str, int]]:
+        """Return current-session FINAL/STAGING roots accepted by this accumulator."""
+        if not isinstance(self.__session_token, str):
+            return {}
+        sources: dict[str, tuple[SystemFile, str, int]] = {}
+        for pair_id, (generation, outcomes) in self.__root_scan_outcomes_by_pair.items():
+            if self.__active_generation.get(pair_id) != generation:
+                continue
+            authoritative_roots = self.__authoritative_by_pair.get(pair_id, {})
+            for root_name, role_outcomes in outcomes.items():
+                current_root = authoritative_roots.get(root_name)
+                if role_outcomes == (True, True) and isinstance(current_root, SystemFile) and \
+                        current_root.is_dir:
+                    sources[ModelFile.build_file_id(root_name, pair_id)] = (
+                        current_root, self.__session_token, generation,
+                    )
+        return sources
+
+    def current_root_scan_proofs(self) -> dict[str, tuple[str, int]]:
+        """Return proof tokens only for roots with accepted current source data."""
+        return {
+            file_id: (session_token, generation)
+            for file_id, (_root, session_token, generation) in self.current_root_scan_sources().items()
         }
 
     def incomplete_pairs(self) -> set[Optional[str]]:
@@ -9918,6 +9981,27 @@ class ModelUpdater(_ControllerCoreAccess):
                 unknown_overlay_changed = overlay != progressive_unknown_before_event
                 progressive_unknown_after_event = set(overlay)
                 setter_unknown_local(overlay)
+
+        # A root is Queue-authoritative only after its exact source has been
+        # adopted into the builder that owns the local bucket. Pair-level
+        # unknown authority remains unchanged; healthy roots can advance while
+        # an unreadable sibling keeps that pair overlaid as unknown.
+        local_root_source_adopter = getattr(model_builder, "adopt_local_root_scan_sources", None)
+        if callable(local_root_source_adopter):
+            local_root_sources: dict[str, tuple[SystemFile, str, int]] = {}
+            local_accumulator = getattr(controller, "_Controller__progressive_local_scan_state", None)
+            if progressive_mode and isinstance(local_accumulator, _ProgressiveScanAccumulator):
+                try:
+                    local_root_sources = local_accumulator.current_root_scan_sources()
+                except Exception:
+                    local_root_sources = {}
+            try:
+                with controller._Controller__model_lock:
+                    local_root_source_adopter(local_root_sources)
+            except Exception:
+                # Failed source adoption must not publish Queue proof or fail
+                # the ordinary model-update cycle.
+                controller.logger.debug("Ignoring local root source adoption failure", exc_info=True)
 
         if remote_reconciliation_established and reconciliation_healthy \
                 and not remote_scan_failed and not controller._Controller__startup_recovery_done:

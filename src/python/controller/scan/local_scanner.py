@@ -266,12 +266,15 @@ class LocalScanner(IScanner):
                 self.__finish_stage(DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION, progress_started)
             for root_name in all_names:
                 result: Optional[SystemFile] = None
+                final_root_complete = True
+                staging_root_complete = self.__staging_path is None or self.__staging_scanner is not None
                 if root_name in root_names:
                     filesystem_started = self.__begin_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL)
                     try:
                         result = self.__scanner.scan_single_if_present(root_name)
                     finally:
                         self.__finish_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, filesystem_started)
+                    final_root_complete = not self.__scanner.scan_root_had_errors(root_name)
                     if result is None:
                         # The manifest established that this root was present;
                         # do not publish a complete snapshot that treats its
@@ -293,6 +296,7 @@ class LocalScanner(IScanner):
                         staging_result = self.__staging_scanner.scan_single_if_present(root_name)
                     finally:
                         self.__finish_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, filesystem_started)
+                    staging_root_complete = not self.__staging_scanner.scan_root_had_errors(root_name)
                     if staging_result is None:
                         # Staging roots share the same manifest authority as
                         # Final roots.  A vanished root must not be published
@@ -324,7 +328,10 @@ class LocalScanner(IScanner):
                         self.__finish_stage(DURATION_LOCAL_SCAN_AGGREGATION, aggregation_started)
                     progress_started = self.__begin_stage(DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION)
                     try:
-                        self.__progress_callback([result], self.__path_pair_id, self.__path_pair_name, None, False)
+                        self.__progress_callback(
+                            [result], self.__path_pair_id, self.__path_pair_name, None, False, None,
+                            {root_name: (final_root_complete, staging_root_complete)},
+                        )
                     finally:
                         self.__finish_stage(DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION, progress_started)
             if self.__scanner.scan_had_errors or (

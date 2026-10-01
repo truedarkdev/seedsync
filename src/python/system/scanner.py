@@ -223,6 +223,8 @@ class SystemScanner:
         self.exclude_suffixes: list[str] = [SystemScanner.__LFTP_STATUS_FILE_SUFFIX]
         self.__lftp_temp_file_suffix: str | None = None
         self.__scan_had_errors = False
+        self.__scan_root_errors: set[str] = set()
+        self.__active_root_name: str | None = None
         self.__breadcrumb_trace: object = None
         self.__scan_role = "system"
 
@@ -265,6 +267,8 @@ class SystemScanner:
         :return:
         """
         self.__scan_had_errors = False
+        self.__scan_root_errors.clear()
+        self.__active_root_name = None
         if not os.path.exists(self.path_to_scan):
             raise SystemScannerError("Path does not exist: {}".format(self.path_to_scan))
         elif not os.path.isdir(self.path_to_scan):
@@ -278,6 +282,11 @@ class SystemScanner:
 
     def reset_scan_errors(self) -> None:
         self.__scan_had_errors = False
+        self.__scan_root_errors.clear()
+
+    def scan_root_had_errors(self, root_name: str) -> bool:
+        """Whether recursive enumeration of one top-level root was incomplete."""
+        return root_name in self.__scan_root_errors
 
     def root_names(self) -> List[str]:
         """Return the filtered top-level manifest without scanning subtrees."""
@@ -311,6 +320,8 @@ class SystemScanner:
         else:
             return None
 
+        previous_root_name = self.__active_root_name
+        self.__active_root_name = name
         try:
             return self.__create_system_file(
                 PseudoDirEntry(
@@ -322,6 +333,8 @@ class SystemScanner:
             )
         except FileNotFoundError:
             return None
+        finally:
+            self.__active_root_name = previous_root_name
 
     def scan_single(self, name: str) -> SystemFile:
         """
@@ -531,6 +544,8 @@ class SystemScanner:
         except PermissionError as error:
             first_error = not self.__scan_had_errors
             self.__scan_had_errors = True
+            if self.__active_root_name is not None:
+                self.__scan_root_errors.add(self.__active_root_name)
             if first_error:
                 try:
                     logging.getLogger("SystemScanner").warning(

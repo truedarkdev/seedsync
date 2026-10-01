@@ -238,6 +238,28 @@ class RecoverableSelectedPairScanner(DummyScanner):
         raise ScannerError("one pair failed", recoverable=True)
 
 
+class RecoverableRootOutcomeScanner(DummyScanner):
+    def __init__(self):
+        self.callback = None
+
+    def set_progress_callback(self, callback):
+        self.callback = callback
+
+    def scanned_path_pair_ids(self):
+        return {"pair-a"}
+
+    def failed_path_pair_ids(self):
+        return {"pair-a"}
+
+    def scan(self):
+        assert self.callback is not None
+        self.callback(
+            [SystemFile("selected", 1, is_dir=True)],
+            "pair-a", "Pair A", None, False, None, {"selected": (True, True)},
+        )
+        raise ScannerError("one sibling failed", recoverable=True)
+
+
 class FatalScanner(DummyScanner):
     def scan(self):
         raise ScannerError("fatal child error", recoverable=False)
@@ -2267,6 +2289,24 @@ class TestScannerProcess(unittest.TestCase):
         warning_message = process.logger.warning.call_args[0][0]
         self.assertIn("recoverable error", warning_message)
         self.assertIn("failed result", warning_message.lower())
+
+    def test_recycled_recoverable_failure_retains_root_outcomes_without_recreating_dropped_roots(self):
+        self.process = ScannerProcess(
+            scanner=RecoverableRootOutcomeScanner(),
+            interval_in_ms=100,
+            verbose=False,
+        )
+
+        self.process.run_loop()
+        events = self.process.pop_results()
+
+        self.assertGreaterEqual(len(events), 2)
+        progress = next(event for event in events if event.is_progress and not event.failed)
+        failure = events[-1]
+        self.assertTrue(failure.failed)
+        self.assertEqual([], failure.files)
+        self.assertEqual({"pair-a": {"selected": (True, True)}}, failure.root_scan_outcomes_by_pair)
+        self.assertEqual({"selected": (True, True)}, progress.root_scan_outcomes_by_pair["pair-a"])
 
     def test_remote_missing_path_error_is_published_as_recoverable_result(self):
         expected_error = "SystemScannerError: Path does not exist: /remote/path/to/scan"

@@ -257,6 +257,7 @@ class ModelBuilder:
         self.__move_failed_files: set[str] = set()
         self.__final_move_succeeded_files: set[str] = set()
         self.__unknown_local_path_pair_ids: set[Optional[str]] = set()
+        self.__local_root_scan_proofs: dict[str, tuple[str, int, SystemFile]] = {}
         self.__local_root_paths: dict[Optional[str], str] = {}
         self.__local_staging_paths: dict[Optional[str], str] = {}
         self.__suppressed_ambiguous_extracted_file_names: set[str] = set()
@@ -2671,7 +2672,51 @@ class ModelBuilder:
             transfer_state.eta,
         )
 
-    def get_trusted_final_leaf_paths(self, file_id: str) -> tuple[str, ...]:
+    def adopt_local_root_scan_sources(self, sources: object) -> None:
+        """Adopt proven roots and bind their tokens to this builder's exact source objects."""
+        # Clear first so a failed bucket update cannot leave proof attached to
+        # a retained source from an earlier scan generation.
+        self.__local_root_scan_proofs = {}
+        accepted: dict[str, tuple[SystemFile, str, int]] = {}
+        if isinstance(sources, dict):
+            for file_id, source in sources.items():
+                if not isinstance(file_id, str) or not isinstance(source, tuple) or len(source) != 3:
+                    continue
+                root, session_token, generation = source
+                if not isinstance(root, SystemFile) or not root.is_dir or \
+                        not isinstance(session_token, str) or type(generation) is not int or generation < 0 or \
+                        ModelFile.build_file_id(root.name, root.path_pair_id) != file_id:
+                    continue
+                accepted[file_id] = (root, session_token, generation)
+
+        roots_by_id = {
+            ModelFile.build_file_id(root.name, root.path_pair_id): root
+            for root in self.local_source_roots_snapshot()
+        }
+        roots_by_id.update({file_id: source[0] for file_id, source in accepted.items()})
+        self.set_local_files(list(roots_by_id.values()))
+
+        bound_proofs: dict[str, tuple[str, int, SystemFile]] = {}
+        for file_id, (scanned_root, session_token, generation) in accepted.items():
+            adopted_root = self.__local_file(file_id)
+            if isinstance(adopted_root, SystemFile) and adopted_root.is_dir and adopted_root == scanned_root:
+                bound_proofs[file_id] = (session_token, generation, adopted_root)
+        self.__local_root_scan_proofs = bound_proofs
+
+    def has_current_local_root_scan_proof(
+            self, file_id: str, session_token: object, generation: object,
+    ) -> bool:
+        """Check scanner token and exact builder-owned source for one root proof."""
+        proof = self.__local_root_scan_proofs.get(file_id)
+        return isinstance(session_token, str) and type(generation) is int and generation >= 0 and \
+            isinstance(proof, tuple) and len(proof) == 3 and \
+            proof[0] == session_token and proof[1] == generation and \
+            self.__local_file(file_id) is proof[2]
+
+    def get_trusted_final_leaf_paths(
+            self, file_id: str, *, local_scan_session: object = None,
+            local_scan_generation: object = None, remote_path_pair_ready: bool = False,
+    ) -> tuple[str, ...]:
         """Return root-relative final leaves safe to omit from Queue.
 
         Only paths present in both the current remote and local scan are
@@ -2681,7 +2726,15 @@ class ModelBuilder:
         """
         trace_enabled = self.__is_stop_resume_trace_enabled("queue.exclusion", "info")
         if not trace_enabled:
-            return self.__get_trusted_final_leaf_paths_without_trace(file_id)
+            pair_id = self.__file_id_path_pair_id(file_id)
+            pair_local_unknown = pair_id in self.__unknown_local_path_pair_ids
+            root_proof_current = pair_local_unknown and remote_path_pair_ready is True and \
+                self.has_current_local_root_scan_proof(
+                    file_id, local_scan_session, local_scan_generation,
+                )
+            return self.__get_trusted_final_leaf_paths_without_trace(
+                file_id, allow_unknown_pair=root_proof_current,
+            )
         remote_root = self.__remote_file(file_id)
         local_root = self.__local_file(file_id)
         counts = self.__queue_exclusion_trace_empty_counts() if trace_enabled else None
@@ -2710,11 +2763,18 @@ class ModelBuilder:
                 counter[key] += 1
 
         pair_id = self.__file_id_path_pair_id(file_id)
-        unknown_local = pair_id in self.__unknown_local_path_pair_ids
+        pair_local_unknown = pair_id in self.__unknown_local_path_pair_ids
+        root_proof_current = pair_local_unknown and remote_path_pair_ready is True and \
+            self.has_current_local_root_scan_proof(
+                file_id, local_scan_session, local_scan_generation,
+            )
+        unknown_local = pair_local_unknown and not root_proof_current
         if remote_root is None:
             readiness_reason = "remote"
         elif local_root is None:
             readiness_reason = "unknown" if unknown_local else "local"
+        elif root_proof_current:
+            readiness_reason = "target_root_proven"
         elif unknown_local:
             readiness_reason = "unknown"
         else:
@@ -2733,6 +2793,8 @@ class ModelBuilder:
                         "local_present": local_root is not None,
                         "remote_present": remote_root is not None,
                         "local_readiness_unknown": unknown_local,
+                        "pair_local_readiness_unknown": pair_local_unknown,
+                        "target_root_proof_current": root_proof_current,
                     },
                     "leaf_observations_present": self.__queue_trace_presence(counts),
                     "mtime_categories_present": self.__queue_trace_presence(mtime_counts),
@@ -2769,6 +2831,8 @@ class ModelBuilder:
                         "local_present": True,
                         "remote_present": True,
                         "local_readiness_unknown": True,
+                        "pair_local_readiness_unknown": True,
+                        "target_root_proof_current": False,
                     },
                     "leaf_observations_present": self.__queue_trace_presence(counts),
                     "mtime_categories_present": self.__queue_trace_presence(mtime_counts),
@@ -2888,6 +2952,8 @@ class ModelBuilder:
                     "local_present": True,
                     "remote_present": True,
                     "local_readiness_unknown": False,
+                    "pair_local_readiness_unknown": pair_local_unknown,
+                    "target_root_proof_current": root_proof_current,
                 },
                 "leaf_observations_present": self.__queue_trace_presence(counts),
                 "mtime_categories_present": self.__queue_trace_presence(mtime_counts),
@@ -2901,13 +2967,16 @@ class ModelBuilder:
             })
         return tuple(paths)
 
-    def __get_trusted_final_leaf_paths_without_trace(self, file_id: str) -> tuple[str, ...]:
+    def __get_trusted_final_leaf_paths_without_trace(
+            self, file_id: str, *, allow_unknown_pair: bool = False,
+    ) -> tuple[str, ...]:
         """Preserve Queue's pre-trace traversal when diagnostics are disabled."""
         remote_root = self.__remote_file(file_id)
         local_root = self.__local_file(file_id)
         if remote_root is None or local_root is None or not remote_root.is_dir or not local_root.is_dir:
             return ()
-        if self.__file_id_path_pair_id(file_id) in self.__unknown_local_path_pair_ids:
+        if self.__file_id_path_pair_id(file_id) in self.__unknown_local_path_pair_ids and \
+                not allow_unknown_pair:
             return ()
 
         paths: list[str] = []
@@ -4768,6 +4837,10 @@ class ModelBuilder:
                 self.__refresh_source_name_counts()
                 self.__refresh_local_root_name_counts()
                 self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LOCAL_FILES)
+                self.__local_root_scan_proofs = {
+                    file_id: proof for file_id, proof in self.__local_root_scan_proofs.items()
+                    if len(proof) == 3 and self.__local_file(file_id) is proof[2]
+                }
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_LOCAL_FILES, started_at)
 

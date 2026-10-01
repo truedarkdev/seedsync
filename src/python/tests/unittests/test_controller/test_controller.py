@@ -24,7 +24,7 @@ from controller.model_updater import (
 )
 from controller.extract import ExtractRequest, ExtractStatus
 from controller.validate import ValidateProcess
-from controller.scan import MultiPathActiveScanner, ScannerProcess, ScannerResult
+from controller.scan import LocalScanner, MultiPathActiveScanner, ScannerProcess, ScannerResult
 from controller.controller import (
     ControllerError, DeferredQueueIntent, DownloadStartLifecycleEntry, PendingQueueDispatch,
     _LftpOperation, _LftpQueueResult, _MoveMutationOutcome, _MoveMutationTracker,
@@ -16026,6 +16026,325 @@ class TestController(unittest.TestCase):
             local_base_dir_path="/local/incomplete",
             exclude_patterns=["*.nfo", ExactPathExclusion("E06.mkv")],
         )
+
+    def test_directory_root_proof_requires_literal_true_from_optional_checker(self):
+        file = ModelFile("selected", True)
+        file.path_pair_id = "pair-a"
+        self.controller._Controller__reconciled_remote_path_pair_ids = {"pair-a"}
+        self.controller._Controller__local_scan_process = SimpleNamespace(
+            session_token="local-session", generation=1,
+        )
+
+        for result in (1, "truthy", object(), MagicMock()):
+            with self.subTest(result_type=type(result).__name__):
+                builder = SimpleNamespace(
+                    unknown_local_path_pair_ids_snapshot=lambda: frozenset({"pair-a"}),
+                    has_current_local_root_scan_proof=lambda *_args: result,
+                )
+                self.controller._Controller__model_builder = builder
+                self.assertFalse(self.controller._Controller__has_current_local_root_scan_proof(file))
+
+        builder = SimpleNamespace(
+            unknown_local_path_pair_ids_snapshot=lambda: frozenset({"pair-a"}),
+            has_current_local_root_scan_proof=lambda *_args: True,
+        )
+        self.controller._Controller__model_builder = builder
+        self.assertTrue(self.controller._Controller__has_current_local_root_scan_proof(file))
+
+    def test_real_local_scan_failure_keeps_manual_directory_queue_pair_blocked(self):
+        pair_id = "pair-a"
+        fixed_mtime_ns = 1_780_000_000_000_000_000
+
+        failure_cases = (
+            ("unreadable-sibling", True, None, None, False),
+            ("unreadable-sibling-changed-retained", True, None, "changed", False),
+            ("unreadable-sibling-removed-retained", True, None, "removed", False),
+            ("unreadable-sibling-adoption-failed", False, None, None, True),
+            ("selected-final", False, None, None, False),
+            ("selected-staging", False, None, None, False),
+            ("stale-generation", False, "generation", None, False),
+            ("restarted-session", False, "session", None, False),
+            ("remote-unreconciled", False, "remote", None, False),
+        )
+        for blocked_root, should_dispatch, invalidate_proof, retained_mutation, fail_adoption in failure_cases:
+            with self.subTest(blocked_root=blocked_root), tempfile.TemporaryDirectory() as temp_dir:
+                fresh_case = TestController()
+                fresh_case.setUp()
+                controller = fresh_case.controller
+                final_path = os.path.join(temp_dir, "final")
+                staging_path = os.path.join(temp_dir, "staging")
+                remote_path = os.path.join(temp_dir, "remote")
+
+                def write_leaf(root, directory, name, contents):
+                    folder = os.path.join(root, directory)
+                    os.makedirs(folder, exist_ok=True)
+                    path = os.path.join(folder, name)
+                    with open(path, "wb") as handle:
+                        handle.write(contents)
+                    os.utime(path, ns=(fixed_mtime_ns, fixed_mtime_ns))
+
+                write_leaf(final_path, "selected", "retained.bin", b"retained")
+                write_leaf(staging_path, "selected", "staging.part", b"partial")
+                write_leaf(final_path, "unreadable-sibling", "sibling.bin", b"sibling")
+                write_leaf(staging_path, "unreadable-sibling", "sibling.part", b"partial")
+                write_leaf(remote_path, "selected", "retained.bin", b"retained")
+                write_leaf(remote_path, "unreadable-sibling", "sibling.bin", b"sibling")
+
+                builder = ModelBuilder()
+                controller._Controller__model_builder = builder
+                controller._Controller__model = builder.build_model()
+                controller._Controller__path_pairs_by_id = {
+                    pair_id: SimpleNamespace(remote_path=remote_path, local_path=final_path),
+                }
+                controller._Controller__path_pair_staging_paths = {pair_id: staging_path}
+                controller._Controller__staging_path = staging_path
+                controller._Controller__explicit_staging_path_configured = True
+                controller._Controller__startup_recovery_done = True
+                controller._Controller__progressive_joint_authoritative = True
+                controller._Controller__context.config.general.exclude_patterns = ""
+                readiness_trace = BreadcrumbTraceCollector(
+                    lambda: True,
+                    policy={"default": "off", "rules": {"queue.readiness": "info"}},
+                    max_entries=32,
+                    durable_enabled=True,
+                    durable_path=os.path.join(temp_dir, "trace"),
+                )
+                self.addCleanup(readiness_trace.close)
+                controller._Controller__context.breadcrumb_trace = readiness_trace
+
+                local_process = ScannerProcess(
+                    LocalScanner(final_path, use_temp_file=False, staging_path=staging_path,
+                                 path_pair_id=pair_id),
+                    interval_in_ms=0,
+                    verbose=False,
+                )
+                remote_process = ScannerProcess(
+                    LocalScanner(remote_path, use_temp_file=False, path_pair_id=pair_id),
+                    interval_in_ms=0,
+                    verbose=False,
+                )
+                self.addCleanup(local_process.close_queues)
+                self.addCleanup(remote_process.close_queues)
+                controller._Controller__local_scan_process = local_process
+                controller._Controller__remote_scan_process = remote_process
+
+                # Establish matching, current final/staging plus remote authority
+                # before the injected read failure, using production scanners.
+                local_process.run_loop()
+                remote_process.run_loop()
+                ModelUpdater(controller).update()
+                target_file_id = ModelFile.build_file_id("selected", pair_id)
+                initial_model = builder.build_model()
+                self.assertIn(target_file_id, initial_model.get_file_ids())
+                self.assertEqual(("retained.bin",), builder.get_trusted_final_leaf_paths(target_file_id))
+                self.assertTrue(Controller.is_path_pair_reconciled(controller, pair_id))
+
+                # The target gains a genuinely remote-only leaf. A successful
+                # Queue must transfer it while excluding the matching retained
+                # final leaf from the current target scan.
+                write_leaf(remote_path, "selected", "remote-only.bin", b"download")
+                remote_process.run_loop()
+                ModelUpdater(controller).update()
+                self.assertIn("remote-only.bin", {
+                    child.name for child in builder.build_model().get_file(target_file_id).get_children()
+                })
+                if retained_mutation == "changed":
+                    write_leaf(final_path, "selected", "retained.bin", b"retained-content-changed")
+                elif retained_mutation == "removed":
+                    os.remove(os.path.join(final_path, "selected", "retained.bin"))
+                write_leaf(final_path, "selected", "fresh-target.bin", b"fresh")
+
+                scan_blocked_root = blocked_root if blocked_root in (
+                    "unreadable-sibling", "selected-final", "selected-staging",
+                ) else "unreadable-sibling"
+                denied_roots = {
+                    "unreadable-sibling": ((final_path, "unreadable-sibling"),
+                                           (staging_path, "unreadable-sibling")),
+                    "selected-final": ((final_path, "selected"),),
+                    "selected-staging": ((staging_path, "selected"),),
+                }[scan_blocked_root]
+                blocked_paths = {
+                    os.path.normcase(os.path.abspath(os.path.join(root, name)))
+                    for root, name in denied_roots
+                }
+                real_scandir = os.scandir
+
+                def scandir_with_one_unreadable_root(path):
+                    normalized = os.path.normcase(os.path.abspath(os.fspath(path)))
+                    if normalized in blocked_paths:
+                        raise PermissionError(13, "permission denied", os.fspath(path))
+                    return real_scandir(path)
+
+                with patch("system.scanner.os.scandir", side_effect=scandir_with_one_unreadable_root):
+                    local_process.run_loop()
+
+                queued_events = list(local_process._ScannerProcess__queue.queue)
+
+                def has_fresh_target(event):
+                    return any(
+                        root.name == "selected" and any(
+                            child.name == "fresh-target.bin" for child in root.iter_children()
+                        )
+                        for root in event.files
+                    )
+
+                if scan_blocked_root == "selected-final":
+                    self.assertFalse(any(has_fresh_target(event) for event in queued_events))
+                else:
+                    self.assertTrue(any(has_fresh_target(event) for event in queued_events))
+
+                if fail_adoption:
+                    with patch.object(builder, "set_local_files", side_effect=RuntimeError("adoption failed")):
+                        ModelUpdater(controller).update()
+                else:
+                    ModelUpdater(controller).update()
+                retained_model = builder.build_model()
+                self.assertFalse(Controller.is_path_pair_reconciled(controller, pair_id))
+                sibling_file_id = ModelFile.build_file_id("unreadable-sibling", pair_id)
+                self.assertIn(sibling_file_id, retained_model.get_file_ids())
+                self.assertIn("sibling.bin", {
+                    child.name for child in retained_model.get_file(sibling_file_id).get_children()
+                })
+                expected_root_proof = scan_blocked_root == "unreadable-sibling" and not fail_adoption
+                if expected_root_proof:
+                    self.assertTrue(builder.has_current_local_root_scan_proof(
+                        target_file_id, local_process.session_token, local_process.generation,
+                    ))
+                else:
+                    self.assertFalse(builder.has_current_local_root_scan_proof(
+                        target_file_id, local_process.session_token, local_process.generation,
+                    ))
+                self.assertEqual(
+                    ("retained.bin",) if expected_root_proof and retained_mutation is None else (),
+                    builder.get_trusted_final_leaf_paths(
+                        target_file_id,
+                        local_scan_session=local_process.session_token,
+                        local_scan_generation=local_process.generation,
+                        remote_path_pair_ready=pair_id in controller._Controller__reconciled_remote_path_pair_ids,
+                    ),
+                )
+                self.assertIn(target_file_id, retained_model.get_file_ids())
+
+                adopted_local_root = next(
+                    root for root in builder.local_source_roots_snapshot()
+                    if root.name == "selected" and root.path_pair_id == pair_id
+                )
+                adopted_children = {child.name: child for child in adopted_local_root.iter_children()}
+                target_root_scan_succeeded = not fail_adoption and scan_blocked_root not in (
+                    "selected-final", "selected-staging",
+                )
+                if target_root_scan_succeeded:
+                    self.assertIn("fresh-target.bin", adopted_children)
+                else:
+                    self.assertNotIn("fresh-target.bin", adopted_children)
+                if retained_mutation == "changed":
+                    self.assertEqual(len(b"retained-content-changed"), adopted_children["retained.bin"].size)
+                elif retained_mutation == "removed":
+                    self.assertNotIn("retained.bin", adopted_children)
+                elif scan_blocked_root == "unreadable-sibling":
+                    self.assertEqual(len(b"retained"), adopted_children["retained.bin"].size)
+
+                controller._Controller__model = retained_model
+                if invalidate_proof == "generation":
+                    # The scanner has entered a newer generation, but its
+                    # result has not yet been adopted by the updater.
+                    local_process.run_loop()
+                elif invalidate_proof == "session":
+                    restarted_process = ScannerProcess(
+                        LocalScanner(final_path, use_temp_file=False, staging_path=staging_path,
+                                     path_pair_id=pair_id),
+                        interval_in_ms=0,
+                        verbose=False,
+                    )
+                    self.addCleanup(restarted_process.close_queues)
+                    controller._Controller__local_scan_process = restarted_process
+                    local_process = restarted_process
+                elif invalidate_proof == "remote":
+                    controller._Controller__reconciled_remote_path_pair_ids.discard(pair_id)
+
+                self.assertEqual(should_dispatch, builder.has_current_local_root_scan_proof(
+                    target_file_id, local_process.session_token, local_process.generation,
+                ) and pair_id in controller._Controller__reconciled_remote_path_pair_ids)
+                if not should_dispatch:
+                    self.assertEqual((), builder.get_trusted_final_leaf_paths(
+                        target_file_id,
+                        local_scan_session=local_process.session_token,
+                        local_scan_generation=local_process.generation,
+                        remote_path_pair_ready=pair_id in controller._Controller__reconciled_remote_path_pair_ids,
+                    ))
+                callback = MagicMock()
+                command = Controller.Command(Controller.Command.Action.QUEUE, target_file_id)
+                command.add_callback(callback)
+                controller.queue_command(command)
+                controller._Controller__process_commands()
+
+                readiness_records = readiness_trace.query_events(
+                    category="queue.readiness", stage="queue_readiness", limit=32,
+                )["events"]
+                model_boundary = [
+                    entry for entry in readiness_records if entry["message"] == "queue_model_boundary"
+                ]
+                self.assertTrue(model_boundary)
+                proof_record = model_boundary[-1]
+                self.assertEqual(
+                    expected_root_proof and invalidate_proof is None,
+                    proof_record["details"]["local_root_scan_proof_current"],
+                )
+                self.assertEqual("queue.readiness", proof_record["category"])
+                self.assertEqual("info", proof_record["level"])
+                self.assertNotIn("pair-a", proof_record["corr_id"])
+                self.assertNotIn("selected", proof_record["corr_id"])
+                self.assertLessEqual(len(readiness_records), 32)
+                self.assertEqual(1, len({entry["corr_id"] for entry in readiness_records}))
+                self.assertNotIn("pair-a", str(readiness_records))
+                self.assertNotIn("selected", str(readiness_records))
+
+                durable_health = readiness_trace.close(3.0)
+                durable_path = os.path.join(temp_dir, "trace", "breadcrumbs.jsonl")
+                with open(durable_path, encoding="utf-8") as handle:
+                    durable_entries = [json.loads(line) for line in handle if line.strip()]
+                durable_boundary = next(
+                    entry for entry in durable_entries
+                    if entry.get("message") == "queue_model_boundary"
+                )
+                self.assertEqual("queue.readiness", durable_boundary["category"])
+                self.assertEqual("info", durable_boundary["level"])
+                self.assertEqual(
+                    proof_record["corr_id"], durable_boundary["corr_id"],
+                )
+                self.assertEqual(
+                    proof_record["details"]["local_root_scan_proof_current"],
+                    durable_boundary["details"]["local_root_scan_proof_current"],
+                )
+                self.assertNotIn("pair-a", json.dumps(durable_boundary))
+                self.assertNotIn("selected", json.dumps(durable_boundary))
+                if os.name == "nt":
+                    self.assertEqual("unsupported", durable_health["offline_retrieval"])
+                else:
+                    self.assertTrue(durable_health["terminal"])
+                    self.assertTrue(durable_health["health_publish_ok"])
+                    self.assertEqual("valid", durable_health["offline_retrieval"])
+
+                if should_dispatch:
+                    expected_exclusions = (
+                        [ExactPathExclusion("retained.bin")]
+                        if retained_mutation is None else []
+                    )
+                    expected_queue_kwargs = {
+                        "remote_base_dir_path": remote_path,
+                        "local_base_dir_path": staging_path,
+                    }
+                    if expected_exclusions:
+                        expected_queue_kwargs["exclude_patterns"] = expected_exclusions
+                    controller._Controller__lftp.queue.assert_called_once_with(
+                        "selected", True, **expected_queue_kwargs,
+                    )
+                    self.assertNotIn(target_file_id, controller._Controller__deferred_queue_intents)
+                else:
+                    controller._Controller__lftp.queue.assert_not_called()
+                    self.assertIn(target_file_id, controller._Controller__deferred_queue_intents)
+                    callback.on_success.assert_not_called()
+                    callback.on_failure.assert_not_called()
 
     def test_process_commands_queue_defers_manual_directory_until_path_pair_reconciles(self):
         file = ModelFile("release", True)

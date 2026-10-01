@@ -50,7 +50,7 @@ class TestLocalScanner(unittest.TestCase):
             handle.write("b")
         scanner = LocalScanner(self.temp_dir, use_temp_file=False, path_pair_id="pair")
         events = []
-        scanner.set_progress_callback(lambda files, pair_id, pair_name, roots, complete:
+        scanner.set_progress_callback(lambda files, pair_id, pair_name, roots, complete, *extra:
                                        events.append((files, roots, complete)))
 
         final_files = scanner.scan()
@@ -72,7 +72,7 @@ class TestLocalScanner(unittest.TestCase):
         scanner.set_breadcrumb_trace(trace)
         events = []
 
-        def publish(files, _pair_id, _pair_name, root_names, complete):
+        def publish(files, _pair_id, _pair_name, root_names, complete, *extra):
             events.append((files, root_names, complete))
             if root_names is not None:
                 os.rename(target, hidden)
@@ -114,7 +114,7 @@ class TestLocalScanner(unittest.TestCase):
         scanner.set_breadcrumb_trace(trace)
         events = []
 
-        def publish(files, _pair_id, _pair_name, root_names, complete):
+        def publish(files, _pair_id, _pair_name, root_names, complete, *extra):
             events.append((files, root_names, complete))
             if root_names is not None:
                 os.rename(target, hidden)
@@ -141,7 +141,7 @@ class TestLocalScanner(unittest.TestCase):
         os.symlink(os.path.join(self.temp_dir, "missing-target"), os.path.join(self.temp_dir, "dangling"))
         scanner = LocalScanner(self.temp_dir, use_temp_file=False, path_pair_id="pair")
         events = []
-        scanner.set_progress_callback(lambda files, _pair_id, _pair_name, roots, complete:
+        scanner.set_progress_callback(lambda files, _pair_id, _pair_name, roots, complete, *extra:
                                       events.append((files, roots, complete)))
 
         with self.assertRaises(ScannerError) as error:
@@ -172,7 +172,7 @@ class TestLocalScanner(unittest.TestCase):
 
         scanner = LocalScanner(self.temp_dir, use_temp_file=False, path_pair_id="pair")
         events = []
-        scanner.set_progress_callback(lambda files, _pair_id, _pair_name, roots, complete:
+        scanner.set_progress_callback(lambda files, _pair_id, _pair_name, roots, complete, *extra:
                                       events.append((files, roots, complete)))
 
         files = scanner.scan()
