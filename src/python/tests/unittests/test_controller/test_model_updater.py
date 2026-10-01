@@ -6205,7 +6205,15 @@ class TestModelUpdater(unittest.TestCase):
             final_remote, local_scan=final_local, model_builder=builder, model=live_model,
         )
         controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
-        controller._refresh_model_file_command_identities_locked = MagicMock()
+        controller._Controller__model = live_model
+        Controller._refresh_model_file_command_identities_locked(controller)
+        identity_refresh_snapshots = []
+
+        def publish_identity_snapshot():
+            Controller._refresh_model_file_command_identities_locked(controller)
+            identity_refresh_snapshots.append(controller._Controller__model_file_command_identities)
+
+        controller._refresh_model_file_command_identities_locked = publish_identity_snapshot
         controller._Controller__context.performance_diagnostics = PerformanceDiagnosticsCollector(lambda: True)
 
         ModelUpdater(controller).update()
@@ -6215,6 +6223,14 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(
             {ModelFile.build_file_id("new.bin", "pair-a"), ModelFile.build_file_id("idle.bin", "pair-b")},
             live_model.get_file_ids(),
+        )
+        self.assertEqual(1, len(identity_refresh_snapshots))
+        self.assertEqual(
+            {
+                (ModelFile.build_file_id("new.bin", "pair-a"), "new.bin", "pair-a"),
+                (ModelFile.build_file_id("idle.bin", "pair-b"), "idle.bin", "pair-b"),
+            },
+            set(identity_refresh_snapshots[-1]),
         )
         self.assertIs(idle_before, live_model.get_file(ModelFile.build_file_id("idle.bin", "pair-b")))
         self.assertEqual(before_overlay_generation, live_model.downloaded_timestamp_overlay_generation)
@@ -8450,17 +8466,33 @@ class TestModelUpdater(unittest.TestCase):
         original_full_builder = builder.build_model
         builder.build_progressive_roots = MagicMock(wraps=original_delta_builder)
         builder.build_model = MagicMock(wraps=original_full_builder)
-        controller._refresh_model_file_command_identities_locked = MagicMock()
+        controller._Controller__model = model
+        Controller._refresh_model_file_command_identities_locked(controller)
+        identity_refresh_snapshots = []
+
+        def publish_identity_snapshot():
+            Controller._refresh_model_file_command_identities_locked(controller)
+            identity_refresh_snapshots.append(controller._Controller__model_file_command_identities)
+
+        controller._refresh_model_file_command_identities_locked = publish_identity_snapshot
         updater = ModelUpdater(controller)
 
         updater.update()
         self.assertEqual({"first.bin"}, model.get_file_names())
         retained_first_root = model.get_file("first.bin")
-        controller._refresh_model_file_command_identities_locked.assert_called_once_with()
+        expected_first_names = {"first.bin", "payload.bin"}.union(
+            f"nested-{depth}" for depth in range(24)
+        )
+        self.assertEqual(1, len(identity_refresh_snapshots))
+        self.assertEqual(expected_first_names, {row[1] for row in identity_refresh_snapshots[-1]})
         updater.update()
         self.assertEqual({"first.bin", "second.bin"}, model.get_file_names())
         self.assertIs(retained_first_root, model.get_file("first.bin"))
-        self.assertEqual(2, controller._refresh_model_file_command_identities_locked.call_count)
+        self.assertEqual(2, len(identity_refresh_snapshots))
+        self.assertEqual(
+            expected_first_names | {"second.bin"},
+            {row[1] for row in identity_refresh_snapshots[-1]},
+        )
         self.assertEqual(2, builder.build_progressive_roots.call_count)
         first_delta_call, second_delta_call = builder.build_progressive_roots.call_args_list
         self.assertEqual({"first.bin"}, {file.name for file in first_delta_call.args[0]})
@@ -8471,7 +8503,11 @@ class TestModelUpdater(unittest.TestCase):
 
         updater.update()
         self.assertEqual({"first.bin", "second.bin"}, model.get_file_names())
-        self.assertEqual(3, controller._refresh_model_file_command_identities_locked.call_count)
+        self.assertEqual(3, len(identity_refresh_snapshots))
+        self.assertEqual(
+            expected_first_names | {"second.bin"},
+            {row[1] for row in identity_refresh_snapshots[-1]},
+        )
         builder.build_model.assert_called_once_with()
 
     def test_progressive_scanner_session_change_reopens_initial_publication_window(self):
@@ -11278,9 +11314,23 @@ class TestModelUpdater(unittest.TestCase):
         builder.build_active_transfer_roots = MagicMock(
             side_effect=AssertionError("active reconciliation must defer to a later tick"),
         )
+        controller._Controller__model = live_model
+        Controller._refresh_model_file_command_identities_locked(controller)
+        identities_before = controller._Controller__model_file_command_identities
+        identity_refreshes = []
+
+        def refresh_command_identities():
+            Controller._refresh_model_file_command_identities_locked(controller)
+            identity_refreshes.append(controller._Controller__model_file_command_identities)
+
+        controller._refresh_model_file_command_identities_locked = refresh_command_identities
+        builder.build_model = MagicMock(wraps=builder.build_model)
 
         ModelUpdater(controller).update()
 
+        self.assertEqual([], identity_refreshes)
+        self.assertEqual(identities_before, controller._Controller__model_file_command_identities)
+        builder.build_model.assert_not_called()
         span = trace.snapshot()["progress_lineage"]["spans"][0]
         direct = next(step for step in span["steps"] if step["phase"] == "direct_root_counter_publish")
         self.assertEqual("accepted", direct["details"]["outcome"])
@@ -11292,6 +11342,7 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("100", direct["details"]["new_counter_bucket"])
         self.assertEqual("same", direct["details"]["monotonic_relation"])
         self.assertEqual(normalized_overlay, live_model.active_progress_overlay("root"))
+        self.assertEqual(77, live_model.published_file("root").download_progress)
         self.assertTrue(builder.has_changes())
 
     def test_same_tick_active_scan_progress_uses_projection_without_tree_build(self):

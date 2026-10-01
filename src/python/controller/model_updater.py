@@ -7900,12 +7900,6 @@ class ModelUpdater(_ControllerCoreAccess):
                     overlay_admission_outcome = direct_outcome
                     if direct_outcome == "accepted":
                         active_progress_overlay_applied = True
-                    if changed:
-                        refresh_identities = getattr(
-                            controller, "_refresh_model_file_command_identities_locked", None,
-                        )
-                        if callable(refresh_identities):
-                            refresh_identities()
             except Exception:
                 # The established reconciliation remains the fail-closed path.
                 active_progress_overlay_applied = False
