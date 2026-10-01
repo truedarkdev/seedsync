@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import errno
+import json
 import os
 import shutil
 import tempfile
@@ -12,6 +13,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from common.lftp_status import parse_lftp_pget_status_bytes
+from common.breadcrumb_trace import BreadcrumbTraceCollector
+from controller.scan import LocalScanner, ScannerError
 from system import SystemScanner, SystemScannerError
 from system.scanner import _record_lftp_sidecar_breadcrumb, lftp_sidecar_target_identity
 
@@ -260,6 +263,171 @@ class TestSystemScanner(unittest.TestCase):
                 scanner.scan_single("c")
 
         self.assertIs(error, ex.exception)
+
+    def test_scandir_permission_error_warns_once_and_keeps_scan_incomplete(self):
+        my_mkdir("denied-one")
+        my_mkdir("denied-two")
+        my_touch(1, "healthy.txt")
+        denied = {
+            os.path.normcase(os.path.abspath(os.path.join(TestSystemScanner.temp_dir, name)))
+            for name in ("denied-one", "denied-two")
+        }
+        real_scandir = os.scandir
+
+        def guarded_scandir(path):
+            if os.path.normcase(os.path.abspath(os.fspath(path))) in denied:
+                raise PermissionError(errno.EACCES, "private denied path", os.fspath(path))
+            return real_scandir(path)
+
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        scanner.set_scan_role("local")
+        scanner.set_breadcrumb_trace(trace)
+        with self.assertLogs("SystemScanner", level="WARNING") as captured, \
+                patch("system.scanner.os.scandir", side_effect=guarded_scandir):
+            files = scanner.scan()
+
+        self.assertIn("healthy.txt", {item.name for item in files})
+        self.assertTrue(scanner.scan_had_errors)
+        self.assertEqual(1, len(captured.records))
+        self.assertEqual(
+            "Permission denied while enumerating a scan directory",
+            captured.records[0].getMessage(),
+        )
+        records = [call for call in trace.record.call_args_list
+                   if call.args[1] == "scan_directory_permission_denied"]
+        self.assertEqual(1, len(records))
+        record = records[0]
+        details = record.args[2]
+        self.assertEqual("local", details["scan_role"])
+        self.assertEqual("PermissionError", details["error_class"])
+        self.assertEqual(errno.EACCES, details["errno"])
+        self.assertEqual("first_scan_error_per_scan", details["basis"])
+        self.assertFalse(details["later_errors_individually_recorded"])
+        self.assertIsInstance(details["captured_utc"], str)
+        self.assertIsInstance(details["captured_monotonic_ns"], int)
+        self.assertEqual("warning", record.kwargs["level"])
+        self.assertEqual("scanner_process", record.kwargs["category"])
+        self.assertNotIn(TestSystemScanner.temp_dir, repr(record))
+        self.assertNotIn("denied-one", repr(record))
+        self.assertNotIn("private denied path", repr(record))
+
+    def test_progressive_local_scan_keeps_permission_error_nonfinal(self):
+        my_mkdir("a-private-denied-root")
+        my_touch(1, "healthy.txt")
+        denied = os.path.normcase(os.path.abspath(
+            os.path.join(TestSystemScanner.temp_dir, "a-private-denied-root")
+        ))
+        real_scandir = os.scandir
+
+        def guarded_scandir(path):
+            if os.path.normcase(os.path.abspath(os.fspath(path))) == denied:
+                raise PermissionError(errno.EACCES, "private denied path", os.fspath(path))
+            return real_scandir(path)
+
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner = LocalScanner(
+            TestSystemScanner.temp_dir, use_temp_file=False,
+            managed_extract_folders_enabled=False,
+            path_pair_id="private-pair-id", path_pair_name="private-pair-name",
+        )
+        scanner.set_breadcrumb_trace(trace)
+        progress = []
+        scanner.set_progress_callback(lambda *args: progress.append(args))
+        with self.assertLogs("SystemScanner", level="WARNING"), \
+                patch("system.scanner.os.scandir", side_effect=guarded_scandir):
+            with self.assertRaises(ScannerError) as error:
+                scanner.scan()
+
+        self.assertTrue(error.exception.recoverable)
+        self.assertTrue(any(
+            any(system_file.name == "healthy.txt" for system_file in call[0])
+            for call in progress
+        ))
+        self.assertFalse(any(call[4] is True for call in progress))
+        records = [call for call in trace.record.call_args_list
+                   if call.args[1] == "scan_directory_permission_denied"]
+        self.assertEqual(1, len(records))
+        self.assertNotIn("private-pair-id", repr(records))
+        self.assertNotIn("private-pair-name", repr(records))
+        self.assertNotIn("a-private-denied-root", repr(records))
+
+    def test_scandir_permission_breadcrumb_is_default_enabled_and_persisted(self):
+        if os.name == "nt":
+            self.skipTest("Windows durable breadcrumb acknowledgement is unverified")
+        my_mkdir("denied-private-name")
+        real_scandir = os.scandir
+        denied = os.path.normcase(os.path.abspath(
+            os.path.join(TestSystemScanner.temp_dir, "denied-private-name")
+        ))
+
+        def guarded_scandir(path):
+            if os.path.normcase(os.path.abspath(os.fspath(path))) == denied:
+                raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+            return real_scandir(path)
+
+        with tempfile.TemporaryDirectory() as durable_path:
+            collector = BreadcrumbTraceCollector(
+                lambda: True, durable_enabled=True, durable_path=durable_path,
+            )
+            try:
+                emitter = collector.create_emitter()
+                self.assertTrue(emitter.is_effectively_enabled("scanner_process", "warning"))
+                scanner = SystemScanner(TestSystemScanner.temp_dir)
+                scanner.set_breadcrumb_trace(emitter)
+                with patch("system.scanner.os.scandir", side_effect=guarded_scandir):
+                    scanner.scan()
+                self.assertTrue(scanner.scan_had_errors)
+                self.assertTrue(collector.flush_durable(2.0))
+            finally:
+                collector.close()
+
+            with open(os.path.join(durable_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                persisted = [json.loads(line) for line in handle if line.strip()]
+        record = next(item for item in persisted
+                      if item.get("message") == "scan_directory_permission_denied")
+        self.assertEqual("scanner_process", record["category"])
+        self.assertEqual("warning", record["level"])
+        self.assertEqual("PermissionError", record["details"]["error_class"])
+        self.assertEqual("first_scan_error_per_scan", record["details"]["basis"])
+        serialized = json.dumps(record, separators=(",", ":"))
+        self.assertNotIn(TestSystemScanner.temp_dir, serialized)
+        self.assertNotIn("denied-private-name", serialized)
+
+    def test_scandir_permission_diagnostics_are_optional_and_file_races_stay_ignored(self):
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = False
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        scanner.set_breadcrumb_trace(trace)
+        with patch("system.scanner.logging.getLogger") as get_logger:
+            self.assertEqual([], scanner.scan())
+        self.assertFalse(scanner.scan_had_errors)
+        get_logger.assert_not_called()
+        trace.record.assert_not_called()
+
+        with self.assertLogs("SystemScanner", level="WARNING"), \
+                patch("system.scanner.os.scandir", side_effect=PermissionError(errno.EACCES, "denied")):
+            files = scanner.scan()
+        self.assertEqual([], files)
+        self.assertTrue(scanner.scan_had_errors)
+        trace.record.assert_not_called()
+
+        throwing_trace = MagicMock()
+        throwing_trace.is_effectively_enabled.return_value = True
+        throwing_trace.record.side_effect = RuntimeError("diagnostic unavailable")
+        scanner.set_breadcrumb_trace(throwing_trace)
+        with self.assertLogs("SystemScanner", level="WARNING"), \
+                patch("system.scanner.os.scandir", side_effect=PermissionError(errno.EACCES, "denied")):
+            self.assertEqual([], scanner.scan())
+        self.assertTrue(scanner.scan_had_errors)
+
+        scanner.set_breadcrumb_trace(None)
+        with patch("system.scanner.os.scandir", side_effect=FileNotFoundError(errno.ENOENT, "gone")):
+            self.assertEqual([], scanner.scan())
+        self.assertFalse(scanner.scan_had_errors)
+        self.assertEqual(1, throwing_trace.record.call_count)
 
     def test_scan_tree_excluded_prefix(self):
         self.setup_default_tree()

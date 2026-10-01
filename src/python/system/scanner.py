@@ -1,8 +1,10 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import logging
 import os
+import time
 from typing import Callable, List, Optional, Protocol
-from datetime import datetime
+from datetime import datetime, timezone
 
 # my libs
 from common.error import AppError
@@ -171,6 +173,37 @@ def _record_lftp_sidecar_breadcrumb(
             _coalesce_key=coalesce_key,
         )
     except Exception:
+        return
+
+
+def _record_scandir_permission_denied(
+        breadcrumb_trace: object, scan_role: str, error: PermissionError,
+) -> None:
+    """Best-effort, path-free evidence for the first incomplete scan error."""
+    if not _breadcrumb_effectively_enabled(breadcrumb_trace, "scanner_process", "warning"):
+        return
+    try:
+        recorder = getattr(breadcrumb_trace, "record", None)
+        if not callable(recorder):
+            return
+        error_number = error.errno
+        details = {
+            "schema": "system_scanner_scan_error.v1",
+            "scan_role": scan_role if scan_role in LFTP_SIDECAR_TRACE_ROLES else "unknown",
+            "error_class": "PermissionError",
+            "errno": error_number if type(error_number) is int and 0 <= error_number <= 65535 else None,
+            "captured_utc": datetime.now(timezone.utc).isoformat(),
+            "captured_monotonic_ns": time.monotonic_ns(),
+            "basis": "first_scan_error_per_scan",
+            "later_errors_individually_recorded": False,
+        }
+        recorder(
+            "system_scanner", "scan_directory_permission_denied", details,
+            stage="directory_enumeration", event_type="failure",
+            category="scanner_process", level="warning",
+        )
+    except Exception:
+        # Breadcrumb collection must never change scan results or exceptions.
         return
 
 
@@ -495,8 +528,19 @@ class SystemScanner:
         # Files may get deleted while scanning, ignore the error
         try:
             entries = os.scandir(path)
-        except PermissionError:
+        except PermissionError as error:
+            first_error = not self.__scan_had_errors
             self.__scan_had_errors = True
+            if first_error:
+                try:
+                    logging.getLogger("SystemScanner").warning(
+                        "Permission denied while enumerating a scan directory"
+                    )
+                except Exception:
+                    pass
+                _record_scandir_permission_denied(
+                    self.__breadcrumb_trace, self.__scan_role, error,
+                )
             return children
         except FileNotFoundError:
             return children
