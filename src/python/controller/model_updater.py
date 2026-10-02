@@ -3754,6 +3754,11 @@ class ModelUpdater(_ControllerCoreAccess):
             authority: Mapping[str, object], *,
             effective_local_reconciled_ids: object = None,
             builder_unknown_local_ids: object = None,
+            remote_scoped_snapshot: object = None,
+            remote_filtered_snapshot: object = None,
+            progressive_delta_keys: object = None,
+            reconciled_remote_roots: object = None,
+            model_builder: object = None,
     ) -> None:
         """Queue bounded pair joins for the settled source-authority outcome."""
         emitter = self.__scan_pair_join_emitter
@@ -3916,6 +3921,176 @@ class ModelUpdater(_ControllerCoreAccess):
                     category="scan.pair_join", level="info",
                     corr_id=pair_token, flow_id=pair_token, trace_scope="flow",
                 )
+
+            # Join a small prefix of the already-computed scoped accumulator
+            # snapshot to its filtered/reconciled inputs and the published
+            # Model.  This is one sibling record at the existing publication
+            # boundary, rather than another per-root event family or retained
+            # signature owner.  Root IDs and names never leave this function.
+            if isinstance(remote_scoped_snapshot, Mapping):
+                root_total = len(remote_scoped_snapshot)
+                pair_indexes = {pair_id: index for index, pair_id in enumerate(selected_pairs)}
+                selected_roots: list[tuple[int, tuple[Optional[str], str], SystemFile]] = []
+                for key, root in islice(remote_scoped_snapshot.items(), 8):
+                    if not isinstance(key, tuple) or len(key) != 2 or not isinstance(root, SystemFile):
+                        continue
+                    pair_id, root_name = key
+                    if (pair_id is not None and not isinstance(pair_id, str)) or \
+                            not isinstance(root_name, str) or not root_name:
+                        continue
+                    if pair_id not in pair_indexes:
+                        continue
+                    selected_roots.append((pair_indexes[pair_id], key, root))
+
+                selected_keys = {key for _index, key, _root in selected_roots}
+                reconciled_keys: set[tuple[Optional[str], str]] = set()
+                if isinstance(reconciled_remote_roots, (list, tuple)) and selected_keys:
+                    for reconciled_root in islice(reconciled_remote_roots, 8):
+                        if not isinstance(reconciled_root, SystemFile):
+                            continue
+                        key = (reconciled_root.path_pair_id, reconciled_root.name)
+                        if key in selected_keys:
+                            reconciled_keys.add(key)
+
+                model_states: dict[tuple[Optional[str], str], str] = {
+                    key: "unknown" for _index, key, _root in selected_roots
+                }
+                model = getattr(controller, "_Controller__model", None)
+                model_lock = getattr(controller, "_Controller__model_lock", None)
+                expected_publication_id = authority.get("publication_id")
+                expected_model_version = authority.get("model_version")
+                scan_authority_snapshot = getattr(
+                    controller, "_Controller__scan_authority_snapshot", None,
+                )
+                publication_matches = isinstance(scan_authority_snapshot, dict) and \
+                    scan_authority_snapshot.get("publication_id") == expected_publication_id
+                if model is not None and model_lock is not None and publication_matches and \
+                        type(expected_model_version) is int:
+                    try:
+                        with model_lock:
+                            published_model = getattr(controller, "_Controller__model", None)
+                            if published_model is model and \
+                                    getattr(published_model, "version", None) == expected_model_version:
+                                for _index, key, root in selected_roots:
+                                    try:
+                                        model_file = published_model.get_file(
+                                            ModelFile.build_file_id(root.name, key[0]),
+                                        )
+                                    except (KeyError, ModelError):
+                                        model_states[key] = "missing"
+                                    except Exception:
+                                        model_states[key] = "unknown"
+                                    else:
+                                        remote_present = getattr(model_file, "remote_present", None)
+                                        model_states[key] = (
+                                            "present_remote" if remote_present else "present_local_only"
+                                        ) if type(remote_present) is bool else "unknown"
+                    except Exception:
+                        pass
+
+                root_pair_indexes: list[int] = []
+                root_correlations: list[str] = []
+                root_filtered_states: list[str] = []
+                root_delta_states: list[str] = []
+                root_reconciled_states: list[str] = []
+                root_builder_states: list[str] = []
+                root_model_states: list[str] = []
+                root_pair_authority: list[object] = []
+                builder_remote_reader = getattr(model_builder, "_ModelBuilder__remote_file", None)
+                remote_reconciled = getattr(
+                    controller, "_Controller__reconciled_remote_path_pair_ids", None,
+                )
+                for pair_index, key, root in selected_roots:
+                    pair_id, root_name = key
+                    file_id = ModelFile.build_file_id(root_name, pair_id)
+                    if isinstance(remote_filtered_snapshot, Mapping):
+                        filtered_state = "present" if key in remote_filtered_snapshot else "absent"
+                    else:
+                        filtered_state = "unknown"
+                    if isinstance(progressive_delta_keys, (set, frozenset, list, tuple)):
+                        delta_state = "present" if key in progressive_delta_keys else "unknown"
+                    else:
+                        delta_state = "unknown"
+                    reconciled_state = (
+                        "present" if key in reconciled_keys else "unknown"
+                    ) if isinstance(reconciled_remote_roots, (list, tuple)) else "unknown"
+                    try:
+                        builder_state = "present" if callable(builder_remote_reader) and \
+                            builder_remote_reader(file_id) is not None else \
+                            "missing" if callable(builder_remote_reader) else "unknown"
+                    except Exception:
+                        builder_state = "unknown"
+                    if isinstance(remote_reconciled, (set, frozenset, list, tuple)):
+                        pair_authority = pair_id in remote_reconciled
+                    else:
+                        pair_authority = "unknown"
+                    root_pair_indexes.append(pair_index)
+                    root_correlations.append(opaque_trace_correlation("scan-root|" + file_id))
+                    root_filtered_states.append(filtered_state)
+                    root_delta_states.append(delta_state)
+                    root_reconciled_states.append(reconciled_state)
+                    root_builder_states.append(builder_state)
+                    root_model_states.append(model_states.get(key, "unknown"))
+                    root_pair_authority.append(pair_authority)
+
+                # A mapping's insertion order defines this bounded prefix.  If
+                # it contains more roots than the cap, omitted_count covers
+                # the whole scoped snapshot; it does not imply absence for any
+                # omitted or out-of-selected-pair root.
+                root_omitted = max(0, root_total - len(selected_roots))
+                if selected_roots:
+                    root_event_id = opaque_trace_correlation(
+                        "scan-root-set|{}".format(expected_publication_id),
+                    )
+                    # The child-ingress record is capped at 8 KiB including
+                    # metadata. Encode fixed-width opaque correlations and
+                    # one-character state codes to fit eight roots while
+                    # preserving the category metadata.
+                    # Schema v1 column order is filtered, delta, reconciled,
+                    # Builder, published Model, remote-pair authority.
+                    state_code = {
+                        "present": "p", "absent": "a", "unknown": "u",
+                        "missing": "m", "present_remote": "r",
+                        "present_local_only": "l", True: "t", False: "f",
+                    }
+                    root_states = "".join(
+                        state_code.get(filtered, "u") +
+                        state_code.get(delta, "u") +
+                        state_code.get(reconciled, "u") +
+                        state_code.get(builder, "u") +
+                        state_code.get(model, "u") +
+                        state_code.get(authority_value, "u")
+                        for filtered, delta, reconciled, builder, model, authority_value in zip(
+                            root_filtered_states, root_delta_states, root_reconciled_states,
+                            root_builder_states, root_model_states, root_pair_authority,
+                        )
+                    )
+                    emitter.record(
+                        "model_updater", "scan_root_membership_join", {
+                            "schema": "scan_remote_root_membership.v1",
+                            "target_correlation": root_event_id,
+                            "publication_id": expected_publication_id,
+                            "model_version": expected_model_version,
+                            "scoped_root_total": root_total,
+                            "selected_root_count": len(selected_roots),
+                            "omitted_root_count": root_omitted,
+                            "omitted_scope": "prefix_or_unselected_pairs",
+                            "selection": "scoped_iteration_prefix_8",
+                            "reconciled_scope": "delta_output",
+                            "pair_correlations": "".join(
+                                opaque_trace_correlation("scan-pair|" + pair_id)
+                                for pair_id in selected_pairs
+                            ),
+                            "root_pair_indexes": "".join(
+                                format(index, "x") for index in root_pair_indexes
+                            ),
+                            "root_correlations": "".join(root_correlations),
+                            "root_state_codes": root_states,
+                        },
+                        stage="scan_authority", event_type="state_transition",
+                        category="scan.pair_join", level="info",
+                        corr_id=root_event_id, flow_id=root_event_id, trace_scope="flow",
+                    )
         except Exception:
             logger = getattr(self._controller, "logger", None)
             if logger is not None:
@@ -5890,6 +6065,9 @@ class ModelUpdater(_ControllerCoreAccess):
         joint_unknown_local_ids: set[Optional[str]] = set()
         joint_remote_excluded_keys: set[tuple[Optional[str], str]] = set()
         progressive_joint_delta_keys: set[tuple[Optional[str], str]] = set()
+        progressive_remote_delta_keys: set[tuple[Optional[str], str]] = set()
+        remote_scoped_snapshot: object = None
+        remote_filtered_snapshot: object = None
         joint_root_shape_trace_enabled = progressive_mode and _controller_breadcrumb_effectively_enabled(
             controller, "scan.root_shape", "info",
         )
@@ -5961,16 +6139,22 @@ class ModelUpdater(_ControllerCoreAccess):
                 remote_snapshot, remote_authority, remote_incomplete, remote_completed = side_state(
                     "remote", latest_remote_scan, scoped_final_pair_ids
                 )
+                # Keep the already-computed accumulator view by reference for
+                # the post-publication diagnostic join; do not recopy or
+                # re-enumerate Builder's retained root buckets.
+                remote_scoped_snapshot = remote_snapshot
                 remote_snapshot, remote_authority, joint_remote_excluded_keys = _filter_progressive_remote_state(
                     remote_snapshot,
                     remote_authority,
                     self._get_exclude_patterns(controller),
                 )
+                remote_filtered_snapshot = remote_snapshot
                 enabled_pair_ids = set(getattr(controller, "_Controller__path_pairs_by_id", {}).keys())
                 if not enabled_pair_ids:
                     enabled_pair_ids = {None}
+                progressive_remote_delta_keys = side_touched_keys("remote", latest_remote_scan)
                 progressive_joint_delta_keys = side_touched_keys("local", latest_local_scan) \
-                    | side_touched_keys("remote", latest_remote_scan)
+                    | progressive_remote_delta_keys
                 record_joint_root_shape_boundary(
                     "reconcile_delta_input", local_snapshot, remote_snapshot,
                 )
@@ -10719,6 +10903,11 @@ class ModelUpdater(_ControllerCoreAccess):
                 latest_local_scan, latest_remote_scan, standing_snapshot,
                 effective_local_reconciled_ids=effective_local_reconciled_after_ids,
                 builder_unknown_local_ids=unknown_overlay_after_ids,
+                remote_scoped_snapshot=remote_scoped_snapshot,
+                remote_filtered_snapshot=remote_filtered_snapshot,
+                progressive_delta_keys=progressive_joint_delta_keys,
+                reconciled_remote_roots=joint_remote_files,
+                model_builder=model_builder,
             )
             authority_publication_recorder = getattr(
                 controller, "_record_authority_handoff_publication", None,

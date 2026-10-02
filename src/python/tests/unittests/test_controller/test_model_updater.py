@@ -10806,33 +10806,48 @@ class TestModelUpdater(unittest.TestCase):
         live_model = builder.build_model()
         file_id = ModelFile.build_file_id("active.bin", "pair-b")
 
-        replacement_local = system_file("new.bin", 30, "pair-a")
-        replacement_remote = system_file("new.bin", 30, "pair-a")
+        selected_pair_ids = ["pair-a"]
+        root_specs = [("new.bin", "pair-a")]
+        replacement_local_files = [system_file(name, 30, pair_id) for name, pair_id in root_specs]
+        replacement_remote_files = [system_file(name, 30, pair_id) for name, pair_id in root_specs]
+        replacement_local, replacement_remote = replacement_local_files[0], replacement_remote_files[0]
         final_local = ScannerResult(
-            datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
-            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
-            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+            datetime.now(), replacement_local_files, scanned_path_pair_ids=set(selected_pair_ids),
+            is_progress=True, completed_path_pair_ids=set(selected_pair_ids), is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids=set(selected_pair_ids),
         )
         final_local.session_token = "local-session-private"
         final_local.generation = 7
         final_remote = ScannerResult(
-            datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
-            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
-            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+            datetime.now(), replacement_remote_files, scanned_path_pair_ids=set(selected_pair_ids),
+            is_progress=True, completed_path_pair_ids=set(selected_pair_ids), is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids=set(selected_pair_ids),
         )
         final_remote.session_token = "remote-session-private"
         final_remote.generation = 11
         controller, _ = self._make_progressive_update_controller(
-            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        def queued_scanner_process(session_token, scan_result):
+            process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+            process._ScannerProcess__session_token = session_token
+            process._ScannerProcess__queue.put(scan_result)
+            return process
+
+        # Exercise the actual ScannerProcess queue and pop_results intake used
+        # by ModelUpdater, while retaining the real Builder and published Model.
+        controller._Controller__remote_scan_process = queued_scanner_process(
+            "remote-session-private", final_remote,
+        )
+        controller._Controller__local_scan_process = queued_scanner_process(
+            "local-session-private", final_local,
         )
         controller._Controller__path_pairs_by_id = {
-            "pair-a": MagicMock(), "pair-b": MagicMock(),
+            pair_id: MagicMock() for pair_id in [*selected_pair_ids, "pair-b"]
         }
         controller._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
         controller._record_path_pair_scan_tokens = lambda local, remote: \
             Controller._record_path_pair_scan_tokens(controller, local, remote)
-        controller._Controller__local_scan_process.session_token = "local-session-private"
-        controller._Controller__remote_scan_process.session_token = "remote-session-private"
         controller._Controller__progress_publication_epoch = 0
         builder.has_only_live_progress_with_active_scan = MagicMock(return_value=True)
         builder.authorize_authoritative_pair_delta = MagicMock(return_value=True)
@@ -10869,23 +10884,21 @@ class TestModelUpdater(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as trace_path:
             trace = BreadcrumbTraceCollector(
-                lambda: True, max_entries=2,
+                lambda: True, max_entries=32,
                 policy={"default": "off", "rules": {"scan.pair_join": "info"}},
                 durable_enabled=True, durable_path=trace_path,
             )
             controller._Controller__context.breadcrumb_trace = trace
+            updater = ModelUpdater(controller)
             try:
-                with patch.object(trace, "create_emitter", wraps=trace.create_emitter) as create_emitter:
-                    ModelUpdater(controller).update()
-                    self.assertEqual(1, create_emitter.call_count)
+                updater.update()
             finally:
                 trace.close(2.0)
-            self.assertEqual(1, len(trace.query_events(category="scan.pair_join")["events"]))
             with open(os.path.join(trace_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
                 persisted = [json.loads(line) for line in handle if line.strip()]
             rows = [row for row in persisted if row.get("message") == "scan_pair_join"]
             self.assertEqual(1, len(rows))
-            row = rows[0]
+            row = next(row for row in rows if row["details"]["pair_index"] == 0)
             expected = opaque_trace_correlation("scan-pair|pair-a")
             self.assertEqual(expected, row["details"]["target_correlation"])
             self.assertEqual(expected, row["corr_id"])
@@ -10910,17 +10923,140 @@ class TestModelUpdater(unittest.TestCase):
             self.assertEqual((7, 11), (standing[1], standing[6]))
             self.assertEqual(trace_session_digest("local-session-private"), standing[2])
             self.assertEqual(trace_session_digest("local-session-private"), standing[3])
-            self.assertEqual(("unknown", "unknown"), (standing[4], standing[5]))
+            self.assertEqual((True, False), (standing[4], standing[5]))
             self.assertEqual((True, True, False), (standing[11], standing[13], standing[14]))
             self.assertLessEqual(len(row["details"]), 24)
             for private_value in ("pair-a", "local-session-private", "remote-session-private"):
                 self.assertNotIn(private_value, json.dumps(row))
+
+            root_rows = [
+                row for row in persisted if row.get("message") == "scan_root_membership_join"
+            ]
+            self.assertEqual(1, len(root_rows))
+            root_event = root_rows[0]
+            root_details = root_event["details"]
+            self.assertEqual("scan_remote_root_membership.v1", root_details["schema"])
+            self.assertEqual("delta_output", root_details["reconciled_scope"])
+            self.assertEqual(
+                controller._Controller__scan_authority_snapshot["publication_id"],
+                root_details["publication_id"],
+            )
+            self.assertEqual(live_model.version, root_details["model_version"])
+            self.assertEqual((1, 1, 0), (
+                root_details["scoped_root_total"],
+                root_details["selected_root_count"],
+                root_details["omitted_root_count"],
+            ))
+            root_correlations = [
+                root_details["root_correlations"][offset:offset + 16]
+                for offset in range(0, len(root_details["root_correlations"]), 16)
+            ]
+            pair_correlations = [
+                root_details["pair_correlations"][offset:offset + 16]
+                for offset in range(0, len(root_details["pair_correlations"]), 16)
+            ]
+            self.assertEqual(1, len(root_correlations))
+            self.assertEqual(1, len(pair_correlations))
+            self.assertEqual(1, len(root_details["root_pair_indexes"]))
+            self.assertEqual(6, len(root_details["root_state_codes"]))
+            expected_root_pairs = {
+                opaque_trace_correlation("scan-root|" + ModelFile.build_file_id(name, pair_id)): pair_id
+                for name, pair_id in root_specs
+            }
+            self.assertTrue(set(root_correlations) <= set(expected_root_pairs))
+            for correlation, pair_index in zip(root_correlations, root_details["root_pair_indexes"]):
+                expected_pair = opaque_trace_correlation(
+                    "scan-pair|" + expected_root_pairs[correlation],
+                )
+                self.assertEqual(expected_pair, pair_correlations[int(pair_index, 16)])
+            # Six compact codes per selected root: filtered, delta,
+            # reconciled, Builder, published Model, remote-pair authority.
+            self.assertEqual("pppprt", root_details["root_state_codes"])
+            self.assertLessEqual(len(root_details), 24)
+            self.assertEqual("scan.pair_join", root_event["category"])
+            self.assertEqual(root_details["target_correlation"], root_event["corr_id"])
+            self.assertNotIn("new.bin", json.dumps(root_event))
+            self.assertNotIn(
+                opaque_trace_correlation(
+                    "scan-root|" + ModelFile.build_file_id("active.bin", "pair-b"),
+                ),
+                root_correlations,
+            )
 
         self.assertIn(ModelFile.build_file_id("new.bin", "pair-a"), live_model.get_file_ids())
         self.assertTrue(observed)
         self.assertEqual([75] * len(observed), observed)
         self.assertEqual(40, live_model.get_file(file_id).transferred_size)
         self.assertEqual(75, live_model.active_progress_overlay(file_id).transferred_size)
+
+    def test_remote_membership_join_persists_capped_columns_and_unknown_inputs(self):
+        pairs = ["fixture-pair-{}".format(index) for index in range(8)]
+        roots = []
+        for index in range(16):
+            root = SystemFile("fixture-{}.bin".format(index), 10, False)
+            root.path_pair_id = pairs[index % 8]
+            roots.append(root)
+        builder = ModelBuilder()
+        builder.set_remote_files(roots)
+        model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, model_builder=builder, model=model,
+        )
+        controller._Controller__reconciled_remote_path_pair_ids = set(pairs)
+        authority = {"publication_id": 7, "model_version": model.version,
+                     "outcome": "no_op", "reason": "joint_not_final"}
+        controller._Controller__scan_authority_snapshot = dict(authority)
+        remote = ScannerResult(datetime.now(), roots, scanned_path_pair_ids=set(pairs))
+        snapshot = {(root.path_pair_id, root.name): root for root in roots}
+        before_ids = set(model.get_file_ids())
+        with tempfile.TemporaryDirectory() as trace_path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True, max_entries=128,
+                policy={"default": "off", "rules": {"scan.pair_join": "info"}},
+                durable_enabled=True, durable_path=trace_path,
+            )
+            controller._Controller__context.breadcrumb_trace = trace
+            updater = ModelUpdater(controller)
+            try:
+                updater._record_scan_pair_joins(
+                    None, remote, authority, remote_scoped_snapshot=snapshot,
+                    remote_filtered_snapshot=snapshot, progressive_delta_keys=set(snapshot),
+                    reconciled_remote_roots=roots, model_builder=builder,
+                )
+                # An untouched delta is not a lossless source replacement.
+                # Missing readers and a different published version stay unknown.
+                updater._record_scan_pair_joins(
+                    None, remote, dict(authority, model_version=model.version + 1),
+                    remote_scoped_snapshot=snapshot,
+                    progressive_delta_keys=set(), reconciled_remote_roots=[],
+                )
+            finally:
+                trace.close(2.0)
+            with open(os.path.join(trace_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle if line.strip()]
+            rows = [row for row in rows if row.get("message") == "scan_root_membership_join"]
+            self.assertEqual(2, len(rows))
+            positive, unknown = [row["details"] for row in rows]
+            for row, details in zip(rows, (positive, unknown)):
+                self.assertEqual((16, 8, 8), tuple(details[key] for key in (
+                    "scoped_root_total", "selected_root_count", "omitted_root_count")))
+                self.assertEqual("delta_output", details["reconciled_scope"])
+                self.assertEqual("scan.pair_join", row["category"])
+                self.assertEqual(details["target_correlation"], row["corr_id"])
+                self.assertEqual(128, len(details["root_correlations"]))
+                self.assertEqual(128, len(details["pair_correlations"]))
+                self.assertEqual("01234567", details["root_pair_indexes"])
+                self.assertLessEqual(len(details), 24)
+                self.assertNotIn("<truncated>", json.dumps(row))
+                for index, root in enumerate(roots[:8]):
+                    self.assertEqual(opaque_trace_correlation("scan-root|" + ModelFile.build_file_id(root.name, root.path_pair_id)),
+                                     details["root_correlations"][index * 16:(index + 1) * 16])
+                self.assertNotIn("fixture-", json.dumps(row))
+            self.assertEqual("pppprt" * 8, positive["root_state_codes"])
+            self.assertEqual("uuuuut" * 8, unknown["root_state_codes"])
+        self.assertEqual(before_ids, set(model.get_file_ids()))
+        self.assertTrue(all(model.get_file(ModelFile.build_file_id(root.name, root.path_pair_id)).remote_present
+                            for root in roots))
 
     def test_scan_pair_join_keeps_standing_source_distinct_from_failed_local_scope(self):
         pair_id = "fixture-pair-a"
