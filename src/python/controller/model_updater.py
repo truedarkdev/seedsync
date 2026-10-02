@@ -3751,7 +3751,9 @@ class ModelUpdater(_ControllerCoreAccess):
 
     def _record_scan_pair_joins(
             self, local_scan: Optional[ScannerResult], remote_scan: Optional[ScannerResult],
-            authority: Mapping[str, object],
+            authority: Mapping[str, object], *,
+            effective_local_reconciled_ids: object = None,
+            builder_unknown_local_ids: object = None,
     ) -> None:
         """Queue bounded pair joins for the settled source-authority outcome."""
         emitter = self.__scan_pair_join_emitter
@@ -3814,8 +3816,53 @@ class ModelUpdater(_ControllerCoreAccess):
             remote_reconciled = membership(getattr(
                 controller, "_Controller__reconciled_remote_path_pair_ids", (),
             ))
+
+            def pair_membership(values: object, pair_id: str) -> object:
+                if not isinstance(values, (set, frozenset, list, tuple)):
+                    return "unknown"
+                try:
+                    return pair_id in values
+                except Exception:
+                    return "unknown"
+
+            def standing_side(side: str, pair_id: str) -> dict[str, object]:
+                result: dict[str, object] = {
+                    "generation": "unknown", "identity_digest": "unknown",
+                    "process_identity_digest": "unknown", "accumulator_completed": "unknown",
+                    "accumulator_incomplete": "unknown",
+                }
+                try:
+                    tokens = getattr(controller, "_Controller__scan_authority_tokens", None)
+                    side_tokens = tokens.get(side) if isinstance(tokens, dict) else None
+                    token = side_tokens.get(pair_id) if isinstance(side_tokens, dict) else None
+                    if isinstance(token, tuple) and len(token) == 2 and \
+                            isinstance(token[0], str) and token[0] and type(token[1]) is int:
+                        result["generation"] = token[1]
+                        result["identity_digest"] = trace_session_digest(token[0])
+                except Exception:
+                    pass
+                try:
+                    process = getattr(controller, "_Controller__{}_scan_process".format(side), None)
+                    session = getattr(process, "session_token", None)
+                    if isinstance(session, str) and session:
+                        result["process_identity_digest"] = trace_session_digest(session)
+                except Exception:
+                    pass
+                try:
+                    accumulator = getattr(
+                        controller, "_Controller__progressive_{}_scan_state".format(side), None,
+                    )
+                    if isinstance(accumulator, _ProgressiveScanAccumulator):
+                        result["accumulator_completed"] = pair_id in accumulator.completed_pairs()
+                        result["accumulator_incomplete"] = pair_id in accumulator.incomplete_pairs()
+                except Exception:
+                    pass
+                return result
+
             for index, pair_id in enumerate(selected_pairs):
                 pair_token = opaque_trace_correlation("scan-pair|" + pair_id)
+                local_standing = standing_side("local", pair_id)
+                remote_standing = standing_side("remote", pair_id)
                 details: dict[str, object] = {
                     "schema": "scan_pair_join.v1",
                     "target_correlation": pair_token,
@@ -3840,6 +3887,28 @@ class ModelUpdater(_ControllerCoreAccess):
                     "pair_total": total,
                     "pair_truncated": total > 8,
                     "captured_monotonic_ns": time.monotonic_ns(),
+                    # Keep primitive fields one collection level below the
+                    # details map so the ingress sanitizer retains them.
+                    # Order: schema, local gen/id/process-id/completed/incomplete,
+                    # remote gen/id/process-id/completed/incomplete, raw local/remote,
+                    # effective local reconciliation, Builder unknown overlay.
+                    "standing_scan": [
+                        "scan_pair_standing_authority.v1",
+                        local_standing["generation"], local_standing["identity_digest"],
+                        local_standing["process_identity_digest"],
+                        local_standing["accumulator_completed"], local_standing["accumulator_incomplete"],
+                        remote_standing["generation"], remote_standing["identity_digest"],
+                        remote_standing["process_identity_digest"],
+                        remote_standing["accumulator_completed"], remote_standing["accumulator_incomplete"],
+                        pair_membership(
+                            getattr(controller, "_Controller__reconciled_local_path_pair_ids", None), pair_id,
+                        ),
+                        pair_membership(
+                            getattr(controller, "_Controller__reconciled_remote_path_pair_ids", None), pair_id,
+                        ),
+                        pair_membership(effective_local_reconciled_ids, pair_id),
+                        pair_membership(builder_unknown_local_ids, pair_id),
+                    ],
                 }
                 emitter.record(
                     "model_updater", "scan_pair_join", details,
@@ -10648,6 +10717,8 @@ class ModelUpdater(_ControllerCoreAccess):
                         controller._Controller__scan_authority_snapshot = dict(standing_snapshot)
             self._record_scan_pair_joins(
                 latest_local_scan, latest_remote_scan, standing_snapshot,
+                effective_local_reconciled_ids=effective_local_reconciled_after_ids,
+                builder_unknown_local_ids=unknown_overlay_after_ids,
             )
             authority_publication_recorder = getattr(
                 controller, "_record_authority_handoff_publication", None,

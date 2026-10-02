@@ -10828,6 +10828,11 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__path_pairs_by_id = {
             "pair-a": MagicMock(), "pair-b": MagicMock(),
         }
+        controller._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
+        controller._record_path_pair_scan_tokens = lambda local, remote: \
+            Controller._record_path_pair_scan_tokens(controller, local, remote)
+        controller._Controller__local_scan_process.session_token = "local-session-private"
+        controller._Controller__remote_scan_process.session_token = "remote-session-private"
         controller._Controller__progress_publication_epoch = 0
         builder.has_only_live_progress_with_active_scan = MagicMock(return_value=True)
         builder.authorize_authoritative_pair_delta = MagicMock(return_value=True)
@@ -10869,11 +10874,13 @@ class TestModelUpdater(unittest.TestCase):
                 durable_enabled=True, durable_path=trace_path,
             )
             controller._Controller__context.breadcrumb_trace = trace
-            with patch.object(trace, "create_emitter", wraps=trace.create_emitter) as create_emitter:
-                ModelUpdater(controller).update()
-                self.assertEqual(1, create_emitter.call_count)
+            try:
+                with patch.object(trace, "create_emitter", wraps=trace.create_emitter) as create_emitter:
+                    ModelUpdater(controller).update()
+                    self.assertEqual(1, create_emitter.call_count)
+            finally:
+                trace.close(2.0)
             self.assertEqual(1, len(trace.query_events(category="scan.pair_join")["events"]))
-            trace.close(2.0)
             with open(os.path.join(trace_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
                 persisted = [json.loads(line) for line in handle if line.strip()]
             rows = [row for row in persisted if row.get("message") == "scan_pair_join"]
@@ -10898,6 +10905,13 @@ class TestModelUpdater(unittest.TestCase):
             self.assertFalse(row["details"]["pair_truncated"])
             self.assertEqual(trace_session_digest("local-session-private"), row["details"]["local_scan_digest"])
             self.assertEqual(trace_session_digest("remote-session-private"), row["details"]["remote_scan_digest"])
+            standing = row["details"]["standing_scan"]
+            self.assertEqual("scan_pair_standing_authority.v1", standing[0])
+            self.assertEqual((7, 11), (standing[1], standing[6]))
+            self.assertEqual(trace_session_digest("local-session-private"), standing[2])
+            self.assertEqual(trace_session_digest("local-session-private"), standing[3])
+            self.assertEqual(("unknown", "unknown"), (standing[4], standing[5]))
+            self.assertEqual((True, True, False), (standing[11], standing[13], standing[14]))
             self.assertLessEqual(len(row["details"]), 24)
             for private_value in ("pair-a", "local-session-private", "remote-session-private"):
                 self.assertNotIn(private_value, json.dumps(row))
@@ -10907,6 +10921,68 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual([75] * len(observed), observed)
         self.assertEqual(40, live_model.get_file(file_id).transferred_size)
         self.assertEqual(75, live_model.active_progress_overlay(file_id).transferred_size)
+
+    def test_scan_pair_join_keeps_standing_source_distinct_from_failed_local_scope(self):
+        pair_id = "fixture-pair-a"
+        local_process_session = "replacement-local-session-private"
+        remote_session = "current-remote-session-private"
+        builder = ModelBuilder()
+        builder.set_unknown_local_path_pair_ids({pair_id})
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder,
+        )
+        controller._Controller__scan_authority_tokens = {
+            "local": {pair_id: ("standing-local-session-private", 8)}, "remote": {},
+        }
+        controller._Controller__local_scan_process.session_token = local_process_session
+        controller._Controller__reconciled_local_path_pair_ids = {pair_id}
+        failed_local = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={pair_id},
+            unknown_path_pair_ids={pair_id}, is_progress=True, failed=True,
+            generation=1, session_token=local_process_session,
+        )
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([failed_local], {pair_id})
+        controller._Controller__progressive_local_scan_state = accumulator
+        remote = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={pair_id},
+            completed_path_pair_ids={pair_id}, is_progress=True, is_scan_final=True,
+            generation=3, session_token=remote_session,
+        )
+
+        class Emitter:
+            def __init__(self):
+                self.events = []
+
+            def is_effectively_enabled(self, _category, _level):
+                return True
+
+            def record(self, _source, _message, details, **_metadata):
+                self.events.append(details)
+                return "enqueued"
+
+        emitter = Emitter()
+        controller._Controller__context.breadcrumb_trace = SimpleNamespace(
+            create_emitter=lambda: emitter,
+        )
+        updater = ModelUpdater(controller)
+        updater._record_scan_pair_joins(
+            None, remote, {"outcome": "adopt", "reason": "pair_delta_adopted"},
+            effective_local_reconciled_ids=set(), builder_unknown_local_ids={pair_id},
+        )
+
+        self.assertEqual(1, len(emitter.events))
+        standing = emitter.events[0]["standing_scan"]
+        self.assertEqual(8, standing[1])
+        self.assertEqual(trace_session_digest("standing-local-session-private"), standing[2])
+        self.assertEqual(trace_session_digest(local_process_session), standing[3])
+        self.assertFalse(standing[4])
+        self.assertTrue(standing[5])
+        self.assertTrue(standing[11])
+        self.assertFalse(standing[13])
+        self.assertTrue(standing[14])
+        self.assertNotIn("standing-local-session-private", json.dumps(emitter.events[0]))
+        self.assertNotIn(local_process_session, json.dumps(emitter.events[0]))
 
     def test_scan_pair_join_disabled_and_busy_ingress_are_fail_isolated(self):
         controller, _ = self._make_progressive_update_controller(None, local_scan=None)
