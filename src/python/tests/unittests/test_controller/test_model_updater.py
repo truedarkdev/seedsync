@@ -6905,6 +6905,71 @@ class TestModelUpdater(unittest.TestCase):
         restarted.set_session_token("replacement-session")
         self.assertEqual({}, restarted.current_root_scan_proofs())
 
+    def test_local_root_scan_sources_include_complete_regular_file_roots_but_proofs_stay_directory_only(self):
+        directory = SystemFile("directory", 1, is_dir=True)
+        regular = SystemFile("regular.bin", 5)
+        staging_only = SystemFile("staging-only.bin", 7, is_staging=True)
+        roots = (directory, regular, staging_only)
+        for root in roots:
+            root.path_pair_id = "pair-a"
+        accumulator = _ProgressiveScanAccumulator()
+        accepted_roots = ScannerResult(
+            datetime.now(), list(roots), scanned_path_pair_ids={"pair-a"}, generation=4,
+            is_progress=True, session_token="local-session",
+            root_scan_outcomes_by_pair={
+                "pair-a": {
+                    "directory": (True, True),
+                    "regular.bin": (True, True),
+                    "staging-only.bin": (True, True),
+                },
+            },
+        )
+
+        accumulator.apply([accepted_roots], {"pair-a"})
+
+        root_sources = accumulator.current_root_scan_sources()
+        expected_source_ids = {
+            ModelFile.build_file_id(root.name, "pair-a") for root in roots
+        }
+        self.assertEqual(expected_source_ids, set(root_sources))
+        self.assertIs(staging_only, root_sources[ModelFile.build_file_id("staging-only.bin", "pair-a")][0])
+        self.assertTrue(root_sources[ModelFile.build_file_id("staging-only.bin", "pair-a")][0].is_staging)
+        self.assertEqual(
+            {("local-session", 4)},
+            {source[1:] for source in root_sources.values()},
+        )
+        self.assertEqual(
+            {ModelFile.build_file_id("directory", "pair-a")},
+            set(accumulator.current_root_scan_proofs()),
+        )
+
+        stale_root = SystemFile("regular.bin", 99)
+        stale_root.path_pair_id = "pair-a"
+        stale = ScannerResult(
+            datetime.now(), [stale_root], scanned_path_pair_ids={"pair-a"}, generation=3,
+            is_progress=True, session_token="local-session",
+            root_scan_outcomes_by_pair={"pair-a": {"regular.bin": (True, True)}},
+        )
+        accumulator.apply([stale], {"pair-a"})
+        self.assertIs(regular, accumulator.current_root_scan_sources()[
+            ModelFile.build_file_id("regular.bin", "pair-a")
+        ][0])
+
+        failed_generation = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=5,
+            is_progress=True, failed=True, unknown_path_pair_ids={"pair-a"},
+            recoverable_failure_path_pair_ids={"pair-a"}, session_token="local-session",
+            root_scan_outcomes_by_pair={"pair-a": {"regular.bin": (True, True)}},
+        )
+        accumulator.apply([failed_generation], {"pair-a"})
+        self.assertEqual({}, accumulator.current_root_scan_sources())
+        self.assertEqual({}, accumulator.current_root_scan_proofs())
+
+        restarted = _ProgressiveScanAccumulator()
+        restarted.apply([accepted_roots], {"pair-a"})
+        restarted.set_session_token("replacement-session")
+        self.assertEqual({}, restarted.current_root_scan_sources())
+
     def test_recoverable_pair_does_not_make_ordinary_incomplete_sibling_stale(self):
         """Only a terminal pair may be stale while another pair is simply scanning."""
         def file_for(pair_id, size):

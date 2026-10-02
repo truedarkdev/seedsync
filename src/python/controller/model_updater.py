@@ -2618,7 +2618,7 @@ class _ProgressiveScanAccumulator:
                         current_outcomes = {}
                     event_root_names = {
                         file.name for file in event.files
-                        if file.is_dir and self.__pair_for_file(file, event) == pair_id
+                        if self.__pair_for_file(file, event) == pair_id
                     }
                     for root_name, role_outcomes in pair_outcomes.items():
                         if not isinstance(root_name, str) or root_name not in event_root_names or \
@@ -2948,8 +2948,7 @@ class _ProgressiveScanAccumulator:
             authoritative_roots = self.__authoritative_by_pair.get(pair_id, {})
             for root_name, role_outcomes in outcomes.items():
                 current_root = authoritative_roots.get(root_name)
-                if role_outcomes == (True, True) and isinstance(current_root, SystemFile) and \
-                        current_root.is_dir:
+                if role_outcomes == (True, True) and isinstance(current_root, SystemFile):
                     sources[ModelFile.build_file_id(root_name, pair_id)] = (
                         current_root, self.__session_token, generation,
                     )
@@ -2959,7 +2958,8 @@ class _ProgressiveScanAccumulator:
         """Return proof tokens only for roots with accepted current source data."""
         return {
             file_id: (session_token, generation)
-            for file_id, (_root, session_token, generation) in self.current_root_scan_sources().items()
+            for file_id, (root, session_token, generation) in self.current_root_scan_sources().items()
+            if root.is_dir
         }
 
     def incomplete_pairs(self) -> set[Optional[str]]:
@@ -8283,9 +8283,9 @@ class ModelUpdater(_ControllerCoreAccess):
 
         candidate_lifecycle_triggered = authoritative_pair_candidate is not None
         defer_nonfresh_active_only_inputs = active_transfer_delta_rejected and \
-            not active_delta_authorization_rejected and callable(active_delta_pending) and \
+            not active_delta_authorization_rejected and callable(active_only_change) and \
             not (joint_reconciliation_final and progressive_final_publication_required) and \
-            (bool(active_delta_pending()) or (
+            (bool(active_only_change()) or (
                 unknown_overlay_only and not (
                     lftp_status_poll_healthy and lftp_status_snapshot_fresh and
                     lftp_status_source == "fresh_healthy"

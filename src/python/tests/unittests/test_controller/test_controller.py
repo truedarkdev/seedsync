@@ -24,7 +24,9 @@ from controller.model_updater import (
 )
 from controller.extract import ExtractRequest, ExtractStatus
 from controller.validate import ValidateProcess
-from controller.scan import LocalScanner, MultiPathActiveScanner, ScannerProcess, ScannerResult
+from controller.scan import (
+    LocalScanner, MultiPathActiveScanner, MultiPathLocalScanner, ScannerProcess, ScannerResult,
+)
 from controller.controller import (
     ControllerError, DeferredQueueIntent, DownloadStartLifecycleEntry, PendingQueueDispatch,
     _LftpOperation, _LftpQueueResult, _MoveMutationOutcome, _MoveMutationTracker,
@@ -54,6 +56,7 @@ from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from lftp.lftp import _incoming_recovery_child_record, _record_lftp_sidecar_breadcrumb
 from model import ActiveProgressOverlay, IModelListener, Model, ModelDiff, ModelError, ModelFile
 from system import SystemFile
+from web.serialize.serialize_model import SerializeModel
 from transfer import RcloneTransferError
 from web.handler.controller import ControllerHandler
 
@@ -16050,6 +16053,236 @@ class TestController(unittest.TestCase):
         )
         self.controller._Controller__model_builder = builder
         self.assertTrue(self.controller._Controller__has_current_local_root_scan_proof(file))
+
+    def test_real_local_scan_publishes_complete_regular_roots_through_normal_updater_cycle(self):
+        pair_id = "pair-readable-inventory"
+        unreadable_pair_id = "pair-unreadable-sibling"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_path = os.path.join(temp_dir, "final")
+            staging_path = os.path.join(temp_dir, "staging")
+            remote_path = os.path.join(temp_dir, "remote")
+            unreadable_final_path = os.path.join(temp_dir, "unreadable-final")
+            unreadable_remote_path = os.path.join(temp_dir, "unreadable-remote")
+
+            def write_file(root, name, contents):
+                path = os.path.join(root, name)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as handle:
+                    handle.write(contents)
+
+            write_file(final_path, "both-side.bin", b"both")
+            write_file(staging_path, "staging-only.bin", b"partial")
+            write_file(remote_path, "both-side.bin", b"both")
+            write_file(remote_path, "staging-only.bin", b"remote-final")
+            write_file(unreadable_final_path, os.path.join("unreadable-root", "sibling.bin"), b"local")
+            write_file(unreadable_remote_path, os.path.join("unreadable-root", "sibling.bin"), b"remote")
+
+            controller = self.controller
+            builder = ModelBuilder()
+            controller._Controller__model_builder = builder
+            controller._Controller__model = Model()
+            controller._Controller__model_lock = threading.RLock()
+            controller._Controller__path_pairs_by_id = {
+                pair_id: SimpleNamespace(remote_path=remote_path, local_path=final_path),
+                unreadable_pair_id: SimpleNamespace(
+                    remote_path=unreadable_remote_path, local_path=unreadable_final_path,
+                ),
+            }
+            controller._Controller__path_pair_staging_paths = {pair_id: staging_path}
+            controller._Controller__staging_path = staging_path
+            controller._Controller__explicit_staging_path_configured = True
+            controller._Controller__context.config.general.exclude_patterns = ""
+
+            local_process = ScannerProcess(
+                MultiPathLocalScanner([
+                    LocalScanner(final_path, use_temp_file=False, staging_path=staging_path,
+                                 path_pair_id=pair_id),
+                    LocalScanner(unreadable_final_path, use_temp_file=False,
+                                 path_pair_id=unreadable_pair_id),
+                ]),
+                interval_in_ms=0,
+                verbose=False,
+            )
+            remote_process = ScannerProcess(
+                MultiPathLocalScanner([
+                    LocalScanner(remote_path, use_temp_file=False, path_pair_id=pair_id),
+                    LocalScanner(unreadable_remote_path, use_temp_file=False,
+                                 path_pair_id=unreadable_pair_id),
+                ]),
+                interval_in_ms=0,
+                verbose=False,
+            )
+            self.addCleanup(local_process.close_queues)
+            self.addCleanup(remote_process.close_queues)
+            controller._Controller__local_scan_process = local_process
+            controller._Controller__remote_scan_process = remote_process
+
+            remote_process.run_loop()
+            local_process.run_loop()
+
+            updater = ModelUpdater(controller)
+            updater.update()
+            updater.update()
+            baseline_both_id = ModelFile.build_file_id("both-side.bin", pair_id)
+            baseline_model = controller._Controller__model
+            self.assertIn(baseline_both_id, baseline_model.get_file_ids())
+            self.assertTrue(baseline_model.get_file(baseline_both_id).remote_present)
+            self.assertTrue(baseline_model.get_file(baseline_both_id).local_present)
+            self.assertTrue(Controller.is_path_pair_reconciled(controller, pair_id))
+            self.assertTrue(Controller.is_path_pair_reconciled(controller, unreadable_pair_id))
+
+            # Add a new local-only file after the healthy publication, then
+            # fail a separate sibling pair during the next local generation.
+            write_file(final_path, "healthy-local.bin", b"local-only")
+            blocked_path = os.path.normcase(os.path.abspath(
+                os.path.join(unreadable_final_path, "unreadable-root"),
+            ))
+            real_scandir = os.scandir
+
+            def deny_one_sibling(path):
+                if os.path.normcase(os.path.abspath(os.fspath(path))) == blocked_path:
+                    raise PermissionError(13, "permission denied", os.fspath(path))
+                return real_scandir(path)
+
+            with patch("system.scanner.os.scandir", side_effect=deny_one_sibling):
+                local_process.run_loop()
+
+            queued_local_events = list(local_process._ScannerProcess__queue.queue)
+            self.assertTrue(any(
+                any(root.name == "healthy-local.bin" and root.path_pair_id == pair_id for root in event.files)
+                for event in queued_local_events
+            ))
+            healthy_event = next(
+                event for event in queued_local_events
+                if any(root.name == "healthy-local.bin" and root.path_pair_id == pair_id for root in event.files)
+            )
+            healthy_source = next(
+                root for root in healthy_event.files
+                if root.name == "healthy-local.bin" and root.path_pair_id == pair_id
+            )
+            self.assertFalse(healthy_source.is_dir)
+            self.assertEqual(local_process.session_token, healthy_event.session_token)
+            self.assertEqual(local_process.generation, healthy_event.generation)
+            self.assertEqual((True, True), healthy_event.root_scan_outcomes_by_pair[pair_id]["healthy-local.bin"])
+            staging_event = next(
+                event for event in queued_local_events
+                if any(root.name == "staging-only.bin" and root.path_pair_id == pair_id for root in event.files)
+            )
+            staging_source = next(
+                root for root in staging_event.files
+                if root.name == "staging-only.bin" and root.path_pair_id == pair_id
+            )
+            self.assertTrue(staging_source.is_staging)
+            self.assertEqual((True, True), staging_event.root_scan_outcomes_by_pair[pair_id]["staging-only.bin"])
+            self.assertTrue(any(
+                event.failed and unreadable_pair_id in event.unknown_path_pair_ids
+                for event in queued_local_events
+            ))
+            # Root sources are adopted after an update's normal build; the
+            # following ordinary cycle is the publication boundary.
+            builder_adoption_inputs = []
+            original_adopter = builder.adopt_local_root_scan_sources
+
+            def record_adoption_input(sources):
+                builder_adoption_inputs.append(dict(sources) if isinstance(sources, dict) else sources)
+                return original_adopter(sources)
+
+            healthy_id = ModelFile.build_file_id("healthy-local.bin", pair_id)
+            cycle_observations = []
+            build_observations = []
+            active_cycle = [0]
+            original_has_changes = builder.has_changes
+            original_build_model = builder.build_model
+            original_record_decision = updater._record_root_progress_decision
+
+            def record_build_model():
+                build_observations.append(active_cycle[0])
+                return original_build_model()
+
+            def record_decision(identity, *, outcome, reason, decision, target_count=0):
+                return original_record_decision(
+                    identity, outcome=outcome, reason=reason, decision=decision, target_count=target_count,
+                )
+
+            def observe_cycle(stage):
+                pending = builder.active_transfer_delta_diagnostics()
+                cycle_observations.append({
+                    "cycle": active_cycle[0],
+                    "stage": stage,
+                    "has_changes": original_has_changes(),
+                    "active_only_change": builder.has_only_pending_active_transfer_delta(),
+                    "pending_reasons": pending["invalidation_reasons"],
+                    "pending_token_reason_counts": pending["token_reason_counts"],
+                    "healthy_in_live_model": healthy_id in controller._Controller__model.get_file_ids(),
+                })
+
+            with patch.object(builder, "adopt_local_root_scan_sources", side_effect=record_adoption_input), \
+                    patch.object(builder, "build_model", side_effect=record_build_model), \
+                    patch.object(updater, "_record_root_progress_decision", side_effect=record_decision):
+                for cycle in range(1, 6):
+                    active_cycle[0] = cycle
+                    observe_cycle("before")
+                    updater.update()
+                    observe_cycle("after")
+
+            first_cycle = next(item for item in cycle_observations if item["cycle"] == 1 and item["stage"] == "before")
+            mixed_cycle = next(item for item in cycle_observations if item["cycle"] == 2 and item["stage"] == "before")
+            self.assertTrue(first_cycle["has_changes"])
+            self.assertTrue(first_cycle["active_only_change"])
+            self.assertEqual([], controller._Controller__last_lftp_statuses)
+            self.assertNotIn(1, build_observations)
+            self.assertTrue(mixed_cycle["has_changes"])
+            self.assertFalse(mixed_cycle["active_only_change"])
+            self.assertIn("model_builder_cache_invalidation_local_files", mixed_cycle["pending_reasons"])
+            self.assertIn("model_builder_cache_invalidation_unknown_local_pairs", mixed_cycle["pending_reasons"])
+            self.assertIn(2, build_observations)
+            self.assertTrue(any(item["cycle"] >= 2 and item["healthy_in_live_model"]
+                                for item in cycle_observations))
+
+            healthy_id = ModelFile.build_file_id("healthy-local.bin", pair_id)
+            both_id = ModelFile.build_file_id("both-side.bin", pair_id)
+            staging_id = ModelFile.build_file_id("staging-only.bin", pair_id)
+            live_model = controller._Controller__model
+            self.assertIn(both_id, live_model.get_file_ids())
+            self.assertTrue(live_model.get_file(both_id).remote_present)
+            self.assertTrue(live_model.get_file(both_id).local_present)
+            self.assertTrue(Controller.is_path_pair_reconciled(controller, pair_id))
+            self.assertFalse(Controller.is_path_pair_reconciled(controller, unreadable_pair_id))
+
+            local_accumulator = controller._Controller__progressive_local_scan_state
+            accepted_sources = local_accumulator.current_root_scan_sources()
+            self.assertEqual(local_process.session_token, local_accumulator.session_token)
+            self.assertEqual(local_process.generation, max(
+                event.generation for event in queued_local_events
+                if any(root.name == "healthy-local.bin" for root in event.files)
+            ))
+            healthy_generation = max(
+                event.generation for event in queued_local_events
+                if pair_id in event.scanned_path_pair_ids
+            )
+            self.assertEqual(local_process.generation, healthy_generation)
+            self.assertIn(healthy_id, accepted_sources)
+            self.assertTrue(builder_adoption_inputs)
+            self.assertIn(healthy_id, builder_adoption_inputs[-1])
+
+            serialized = SerializeModel().model(list(live_model.iter_files()))
+            serialized_data = json.loads(next(
+                line.split(":", 1)[1].strip()
+                for line in serialized.splitlines() if line.startswith("data:")
+            ))
+            serialized_ids = {entry["file_id"] for entry in serialized_data}
+            self.assertIn(both_id, serialized_ids)
+            local_sources = builder.local_source_roots_snapshot()
+            self.assertIn(healthy_id, {ModelFile.build_file_id(root.name, root.path_pair_id)
+                                         for root in local_sources})
+            staging_root = next((root for root in local_sources if root.name == "staging-only.bin"), None)
+            if staging_root is not None:
+                self.assertTrue(staging_root.is_staging)
+            self.assertEqual((), builder.get_trusted_final_leaf_paths(staging_id))
+            self.assertFalse(builder.has_current_local_root_scan_proof(
+                staging_id, local_process.session_token, local_process.generation,
+            ))
+            self.assertIn(healthy_id, serialized_ids)
 
     def test_real_local_scan_failure_keeps_manual_directory_queue_pair_blocked(self):
         pair_id = "pair-a"

@@ -10312,6 +10312,40 @@ class TestModelBuilder(unittest.TestCase):
             self.assertLess(len(json.dumps(entry)), 4096)
             collector.close()
 
+    def test_local_root_scan_source_adopts_regular_data_but_binds_proofs_only_to_directories(self):
+        builder = self.model_builder
+        roots = (
+            SystemFile("directory-root", 4, True),
+            SystemFile("regular-root.bin", 5, False),
+            SystemFile("staging-root.bin", 7, False, is_staging=True),
+        )
+        for root in roots:
+            root.path_pair_id = "pair-a"
+        source_ids = {
+            ModelFile.build_file_id(root.name, root.path_pair_id): (root, "local-session", 4)
+            for root in roots
+        }
+
+        builder.adopt_local_root_scan_sources(source_ids)
+
+        adopted = {
+            ModelFile.build_file_id(root.name, root.path_pair_id): root
+            for root in builder.local_source_roots_snapshot()
+        }
+        self.assertEqual(set(source_ids), set(adopted))
+        self.assertIs(roots[1], adopted[ModelFile.build_file_id("regular-root.bin", "pair-a")])
+        staging_id = ModelFile.build_file_id("staging-root.bin", "pair-a")
+        self.assertTrue(adopted[staging_id].is_staging)
+        self.assertTrue(builder.has_current_local_root_scan_proof(
+            ModelFile.build_file_id("directory-root", "pair-a"), "local-session", 4,
+        ))
+        self.assertFalse(builder.has_current_local_root_scan_proof(
+            ModelFile.build_file_id("regular-root.bin", "pair-a"), "local-session", 4,
+        ))
+        self.assertFalse(builder.has_current_local_root_scan_proof(
+            staging_id, "local-session", 4,
+        ))
+
     def test_local_source_adoption_trace_emits_root_proof_only_after_binding(self):
         builder = ModelBuilder()
         root = SystemFile("private-root", 4, True)

@@ -2679,7 +2679,7 @@ class ModelBuilder:
         )
 
     def adopt_local_root_scan_sources(self, sources: object) -> None:
-        """Adopt proven roots and bind their tokens to this builder's exact source objects."""
+        """Adopt current root data and bind directory proofs to exact source objects."""
         # Clear first so a failed bucket update cannot leave proof attached to
         # a retained source from an earlier scan generation.
         previous_proofs = self.__local_root_scan_proofs
@@ -2690,7 +2690,7 @@ class ModelBuilder:
                 if not isinstance(file_id, str) or not isinstance(source, tuple) or len(source) != 3:
                     continue
                 root, session_token, generation = source
-                if not isinstance(root, SystemFile) or not root.is_dir or \
+                if not isinstance(root, SystemFile) or \
                         not isinstance(session_token, str) or type(generation) is not int or generation < 0 or \
                         ModelFile.build_file_id(root.name, root.path_pair_id) != file_id:
                     continue
@@ -2707,6 +2707,8 @@ class ModelBuilder:
 
         bound_proofs: dict[str, tuple[str, int, SystemFile]] = {}
         for file_id, (scanned_root, session_token, generation) in accepted.items():
+            if not scanned_root.is_dir:
+                continue
             adopted_root = self.__local_file(file_id)
             if isinstance(adopted_root, SystemFile) and adopted_root.is_dir and adopted_root == scanned_root:
                 bound_proofs[file_id] = (session_token, generation, adopted_root)
