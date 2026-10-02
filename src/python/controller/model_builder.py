@@ -539,6 +539,14 @@ class ModelBuilder:
             updated[path_pair_id] = _LocalLibraryInventory(file_count, total_size, "up_to_date")
         self.__replace_local_library_inventory(updated)
 
+    def __record_local_inventory_after_pair_source_commit(
+            self, path_pair_id: Optional[str], local_sources_changed: bool,
+    ) -> None:
+        """Count a committed pair only when its local source or state advanced."""
+        existing = self.__local_library_inventory_by_pair.get(path_pair_id)
+        if local_sources_changed or existing is None or existing.state != "up_to_date":
+            self.record_local_inventory_completion({path_pair_id})
+
     def remote_source_roots_snapshot(self) -> tuple[SystemFile, ...]:
         """Return an on-demand ownership-census snapshot of remote roots."""
         return tuple(
@@ -5333,8 +5341,10 @@ class ModelBuilder:
             applied_invalidation_tokens: Optional[Set[int]] = None,
     ) -> None:
         """Commit staged pair authority only after the live model accepted it."""
-        self.__replace_authoritative_pair_sources(pair_build)
-        self.record_local_inventory_completion({pair_build.path_pair_id})
+        local_sources_changed = self.__replace_authoritative_pair_sources(pair_build)
+        self.__record_local_inventory_after_pair_source_commit(
+            pair_build.path_pair_id, local_sources_changed,
+        )
         selected_pair_ids = {pair_build.path_pair_id}
         selected_root_ids = set(pair_build.previous_local_files).union(pair_build.previous_remote_files)
         selected_root_ids.update(pair_build.local_files)
@@ -5391,38 +5401,46 @@ class ModelBuilder:
             self, pair_build: _AuthoritativePairBuild,
     ) -> None:
         """Keep a final scan authoritative when its live delta is rejected."""
-        self.__replace_authoritative_pair_sources(pair_build)
-        self.record_local_inventory_completion({pair_build.path_pair_id})
+        local_sources_changed = self.__replace_authoritative_pair_sources(pair_build)
+        self.__record_local_inventory_after_pair_source_commit(
+            pair_build.path_pair_id, local_sources_changed,
+        )
         self.__unknown_local_path_pair_ids = set(pair_build.unknown_local_path_pair_ids)
         self.request_rebuild()
 
     def replace_completed_pair_sources_for_full_rebuild(
             self, path_pair_id: Optional[str], local_files: List[SystemFile],
-            remote_files: List[SystemFile], unknown_local_path_pair_ids: Set[Optional[str]],
+            remote_files: Optional[List[SystemFile]],
+            unknown_local_path_pair_ids: Optional[Set[Optional[str]]],
     ) -> None:
         """Commit final pair scan authority when bounded rendering is unsafe.
 
         This intentionally performs no delta-safety classification: the caller
         has already selected the established global-build fallback.  It still
         replaces only this pair's bucket, preserving every unrelated source
-        bucket for that global reconciliation.
+        bucket for that global reconciliation. ``None`` remote sources keeps
+        this pair's existing remote bucket for a local-only full-snapshot
+        completion; ``None`` unknown scope preserves the current overlay.
         """
         next_local = {
             self.__root_file_id(file.name, path_pair_id): file
             for file in local_files if file.path_pair_id == path_pair_id
         }
-        next_remote = {
-            self.__root_file_id(file.name, path_pair_id): file
-            for file in remote_files if file.path_pair_id == path_pair_id
-        }
-        self.__replace_authoritative_pair_sources(_AuthoritativePairBuild(
+        next_remote = dict(self.__remote_files_by_pair.get(path_pair_id, {})) \
+            if remote_files is None else {
+                self.__root_file_id(file.name, path_pair_id): file
+                for file in remote_files if file.path_pair_id == path_pair_id
+            }
+        next_unknown_local_path_pair_ids = set(self.__unknown_local_path_pair_ids) \
+            if unknown_local_path_pair_ids is None else set(unknown_local_path_pair_ids)
+        local_sources_changed = self.__replace_authoritative_pair_sources(_AuthoritativePairBuild(
             path_pair_id,
             dict(self.__local_files_by_pair.get(path_pair_id, {})),
             dict(self.__remote_files_by_pair.get(path_pair_id, {})),
             next_local,
             next_remote,
             None,
-            set(unknown_local_path_pair_ids),
+            next_unknown_local_path_pair_ids,
             set(),
             set(),
             {},
@@ -5431,11 +5449,11 @@ class ModelBuilder:
             frozenset(),
             self.__downloaded_timestamp_overlay_generation,
         ))
-        self.record_local_inventory_completion({path_pair_id})
-        self.__unknown_local_path_pair_ids = set(unknown_local_path_pair_ids)
+        self.__record_local_inventory_after_pair_source_commit(path_pair_id, local_sources_changed)
+        self.__unknown_local_path_pair_ids = next_unknown_local_path_pair_ids
         self.request_rebuild()
 
-    def __replace_authoritative_pair_sources(self, pair_build: _AuthoritativePairBuild) -> None:
+    def __replace_authoritative_pair_sources(self, pair_build: _AuthoritativePairBuild) -> bool:
         """Replace one source bucket and maintain bounded global name counts."""
         pair_id = pair_build.path_pair_id
         previous_local = self.__local_files_by_pair.get(pair_id, {})
@@ -5444,7 +5462,7 @@ class ModelBuilder:
         root_shape_trace_enabled = _breadcrumb_effectively_enabled(
             breadcrumb, "scan.root_shape", "info",
         )
-        local_source_changed_for_trace = False
+        local_source_changed = False
         if root_shape_trace_enabled:
             _record_root_shape_breadcrumb(
                 breadcrumb,
@@ -5489,9 +5507,9 @@ class ModelBuilder:
             self.__remote_files_by_pair.pop(pair_id, None)
         affected_ids = set(old_sources).union(next_sources)
         for file_id in affected_ids:
-            if root_shape_trace_enabled and not local_source_changed_for_trace and \
+            if not local_source_changed and \
                     previous_local.get(file_id) is not pair_build.local_files.get(file_id):
-                local_source_changed_for_trace = True
+                local_source_changed = True
             self.__update_status_only_name_count(file_id)
             self.__update_active_only_name_count(file_id)
         if root_shape_trace_enabled:
@@ -5506,13 +5524,14 @@ class ModelBuilder:
                 phase="model_builder_pair_adoption_committed",
                 flow_id="model-builder:remote-pair",
             )
-        if local_source_changed_for_trace:
+        if local_source_changed:
             self.__record_local_source_adoption(
                 {pair_id: previous_local},
                 {pair_id: pair_build.local_files},
                 {pair_id: self.__local_files_by_pair.get(pair_id, {})},
                 "authoritative_pair_commit",
             )
+        return local_source_changed
 
     def has_pending_active_transfer_delta(self) -> bool:
         """Cheap hot-path gate; does not inspect model roots or source maps."""

@@ -16054,6 +16054,325 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model_builder = builder
         self.assertTrue(self.controller._Controller__has_current_local_root_scan_proof(file))
 
+    def test_cold_start_publishes_healthy_pair_before_unreadable_sibling(self):
+        healthy_pair_id = "pair-cold-healthy"
+        blocked_pair_id = "pair-cold-blocked"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            healthy_final = os.path.join(temp_dir, "healthy-final")
+            healthy_staging = os.path.join(temp_dir, "healthy-staging")
+            healthy_remote = os.path.join(temp_dir, "healthy-remote")
+            blocked_final = os.path.join(temp_dir, "blocked-final")
+            blocked_remote = os.path.join(temp_dir, "blocked-remote")
+
+            def write_file(root, relative_path, contents):
+                path = os.path.join(root, relative_path)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as handle:
+                    handle.write(contents)
+
+            write_file(healthy_final, os.path.join("complete-root", "complete.bin"), b"complete")
+            write_file(healthy_final, os.path.join("removed-root", "removed.bin"), b"removed")
+            write_file(healthy_staging, os.path.join("stage-root", "partial.part"), b"partial")
+            write_file(healthy_remote, os.path.join("complete-root", "complete.bin"), b"complete")
+            write_file(healthy_remote, os.path.join("removed-root", "removed.bin"), b"removed")
+            write_file(healthy_remote, os.path.join("stage-root", "partial.part"), b"remote-final")
+            write_file(blocked_final, os.path.join("unreadable-root", "sibling.bin"), b"local")
+            write_file(blocked_remote, os.path.join("unreadable-root", "sibling.bin"), b"remote")
+
+            controller = self.controller
+            builder = ModelBuilder()
+            controller._Controller__model_builder = builder
+            controller._Controller__model = Model()
+            controller._Controller__model_lock = threading.RLock()
+            controller._Controller__path_pairs_by_id = {
+                healthy_pair_id: SimpleNamespace(
+                    remote_path=healthy_remote, local_path=healthy_final, name="healthy",
+                ),
+                blocked_pair_id: SimpleNamespace(
+                    remote_path=blocked_remote, local_path=blocked_final, name="blocked",
+                ),
+            }
+            controller._Controller__path_pair_staging_paths = {healthy_pair_id: healthy_staging}
+            controller._Controller__staging_path = healthy_staging
+            controller._Controller__explicit_staging_path_configured = True
+            controller._Controller__context.config.general.exclude_patterns = ""
+
+            local_process = ScannerProcess(
+                MultiPathLocalScanner([
+                    LocalScanner(healthy_final, use_temp_file=False, staging_path=healthy_staging,
+                                 path_pair_id=healthy_pair_id),
+                    LocalScanner(blocked_final, use_temp_file=False, path_pair_id=blocked_pair_id),
+                ]),
+                interval_in_ms=0,
+                verbose=False,
+            )
+            remote_process = ScannerProcess(
+                MultiPathLocalScanner([
+                    LocalScanner(healthy_remote, use_temp_file=False, path_pair_id=healthy_pair_id),
+                    LocalScanner(blocked_remote, use_temp_file=False, path_pair_id=blocked_pair_id),
+                ]),
+                interval_in_ms=0,
+                verbose=False,
+            )
+            self.addCleanup(local_process.close_queues)
+            self.addCleanup(remote_process.close_queues)
+            controller._Controller__local_scan_process = local_process
+            controller._Controller__remote_scan_process = remote_process
+
+            healthy_id = ModelFile.build_file_id("complete-root", healthy_pair_id)
+            removed_id = ModelFile.build_file_id("removed-root", healthy_pair_id)
+            staging_id = ModelFile.build_file_id("stage-root", healthy_pair_id)
+            self.assertEqual(set(), controller._Controller__model.get_file_ids())
+            self.assertFalse(Controller.is_path_pair_reconciled(controller, healthy_pair_id))
+            self.assertFalse(Controller.is_path_pair_reconciled(controller, blocked_pair_id))
+            self.assertFalse(hasattr(controller, "_Controller__scan_authority_snapshot"))
+
+            remote_process.run_loop()
+            blocked_root = os.path.normcase(os.path.abspath(os.path.join(blocked_final, "unreadable-root")))
+            blocked_roots = {blocked_root}
+            real_scandir = os.scandir
+
+            def deny_selected_roots(path):
+                normalized = os.path.normcase(os.path.abspath(os.fspath(path)))
+                if normalized in blocked_roots:
+                    raise PermissionError(13, "permission denied", os.fspath(path))
+                return real_scandir(path)
+
+            with patch("system.scanner.os.scandir", side_effect=deny_selected_roots):
+                local_process.run_loop()
+
+            first_wave = list(local_process._ScannerProcess__queue.queue)
+            self.assertTrue(any(
+                event.failed and blocked_pair_id in event.unknown_path_pair_ids
+                for event in first_wave
+            ))
+            healthy_event = next(
+                event for event in first_wave
+                if healthy_pair_id in event.root_scan_outcomes_by_pair
+            )
+            self.assertEqual(local_process.session_token, healthy_event.session_token)
+            self.assertEqual(local_process.generation, healthy_event.generation)
+            self.assertEqual(
+                (True, True),
+                healthy_event.root_scan_outcomes_by_pair[healthy_pair_id]["complete-root"],
+            )
+            staging_event = next(
+                event for event in first_wave
+                if any(root.name == "stage-root" and root.path_pair_id == healthy_pair_id for root in event.files)
+            )
+            self.assertEqual(local_process.session_token, staging_event.session_token)
+            self.assertEqual(local_process.generation, staging_event.generation)
+            self.assertEqual(
+                (True, True),
+                staging_event.root_scan_outcomes_by_pair[healthy_pair_id]["stage-root"],
+            )
+            self.assertTrue(any(
+                root.name == "complete-root" and root.path_pair_id == healthy_pair_id and not root.is_staging
+                for root in healthy_event.files
+            ))
+            self.assertTrue(any(
+                root.name == "stage-root" and root.path_pair_id == healthy_pair_id and root.is_staging
+                for root in staging_event.files
+            ))
+
+            updater = ModelUpdater(controller)
+            observations = []
+            with patch.object(
+                    builder, "_ModelBuilder__local_regular_file_inventory",
+                    wraps=builder._ModelBuilder__local_regular_file_inventory,
+            ) as inventory_count:
+                for _cycle in range(5):
+                    updater.update()
+                    summary = controller.get_model_summary()
+                    summaries_by_pair = {item["path_pair_id"]: item for item in summary["path_pairs"]}
+                    inventory_revision, library_inventory = builder.local_library_inventory_snapshot()
+                    local_accumulator = controller._Controller__progressive_local_scan_state
+                    root_sources = local_accumulator.current_root_scan_sources()
+                    builder_source_ids = {
+                        ModelFile.build_file_id(root.name, root.path_pair_id)
+                        for root in builder.local_source_roots_snapshot()
+                    }
+                    observations.append({
+                        "model_ids": set(controller._Controller__model.get_file_ids()),
+                        "unknown_pairs": set(builder.unknown_local_path_pair_ids_snapshot()),
+                        "summary": summaries_by_pair,
+                        "authority": dict(summary["scan_authority"]),
+                        "inventory_revision": inventory_revision,
+                        "library_inventory": {
+                            path_pair_id: {
+                                "file_count": inventory.file_count,
+                                "size": inventory.size,
+                                "state": inventory.state,
+                            }
+                            for path_pair_id, inventory in library_inventory.items()
+                        },
+                        "completed_pairs": set(local_accumulator.completed_pairs()),
+                        "incomplete_pairs": set(local_accumulator.incomplete_pairs()),
+                        "root_source_ids": set(root_sources),
+                        "builder_source_ids": builder_source_ids,
+                    })
+                self.assertEqual(1, inventory_count.call_count)
+
+            local_accumulator = controller._Controller__progressive_local_scan_state
+            accepted_sources = local_accumulator.current_root_scan_sources()
+            self.assertEqual(local_process.session_token, local_accumulator.session_token)
+            accepted_healthy = accepted_sources[healthy_id]
+            self.assertEqual(local_process.session_token, accepted_healthy[1])
+            self.assertEqual(local_process.generation, accepted_healthy[2])
+            self.assertIn(staging_id, accepted_sources)
+            self.assertIn(removed_id, accepted_sources)
+            self.assertIn(healthy_id, {
+                ModelFile.build_file_id(root.name, root.path_pair_id)
+                for root in builder.local_source_roots_snapshot()
+            })
+            self.assertIn(staging_id, {
+                ModelFile.build_file_id(root.name, root.path_pair_id)
+                for root in builder.local_source_roots_snapshot()
+            })
+            self.assertIn(removed_id, {
+                ModelFile.build_file_id(root.name, root.path_pair_id)
+                for root in builder.local_source_roots_snapshot()
+            })
+            published = [item for item in observations if healthy_id in item["model_ids"]]
+            self.assertTrue(published, observations)
+            self.assertTrue(any(
+                item["summary"].get(healthy_pair_id, {}).get("reconciled_local") is True
+                for item in observations
+            ), observations)
+            self.assertTrue(all(blocked_pair_id in item["unknown_pairs"] for item in observations))
+            self.assertTrue(all(
+                item["summary"].get(blocked_pair_id, {}).get("reconciled_local") is False
+                for item in observations
+            ), observations)
+            first_healthy_authority = next(
+                item for item in observations
+                if item["summary"].get(healthy_pair_id, {}).get("reconciled_local") is True
+            )
+            self.assertEqual(
+                {healthy_id, removed_id, staging_id}, first_healthy_authority["root_source_ids"],
+                first_healthy_authority,
+            )
+            self.assertEqual(
+                {healthy_id, removed_id, staging_id}, first_healthy_authority["builder_source_ids"],
+                first_healthy_authority,
+            )
+            self.assertIn(healthy_pair_id, first_healthy_authority["completed_pairs"], first_healthy_authority)
+            self.assertNotIn(healthy_pair_id, first_healthy_authority["incomplete_pairs"], first_healthy_authority)
+            healthy_inventory = first_healthy_authority["library_inventory"][healthy_pair_id]
+            self.assertEqual({"file_count": 3, "size": 22, "state": "up_to_date"}, healthy_inventory)
+            healthy_summary = first_healthy_authority["summary"][healthy_pair_id]
+            self.assertEqual(3, healthy_summary["root_count"], first_healthy_authority)
+            self.assertEqual(3, healthy_summary["local_library_file_count"], first_healthy_authority)
+            self.assertEqual(22, healthy_summary["local_library_size"], first_healthy_authority)
+            self.assertEqual("up_to_date", healthy_summary["local_library_state"], first_healthy_authority)
+            blocked_inventory = first_healthy_authority["library_inventory"][blocked_pair_id]
+            self.assertEqual({"file_count": None, "size": None, "state": "scanning"}, blocked_inventory)
+            blocked_summary = first_healthy_authority["summary"][blocked_pair_id]
+            self.assertEqual(0, blocked_summary["root_count"], first_healthy_authority)
+            self.assertIsNone(blocked_summary["local_library_file_count"], first_healthy_authority)
+            self.assertIsNone(blocked_summary["local_library_size"], first_healthy_authority)
+            self.assertEqual("scanning", blocked_summary["local_library_state"], first_healthy_authority)
+            self.assertEqual((), builder.get_trusted_final_leaf_paths(staging_id))
+
+            # A later complete local full snapshot removes an absent root from
+            # only the local bucket while preserving the existing remote bucket.
+            remote_ids_before_removal = {
+                ModelFile.build_file_id(root.name, root.path_pair_id)
+                for root in builder.remote_source_roots_snapshot()
+            }
+            shutil.rmtree(os.path.join(healthy_final, "removed-root"))
+            with patch("system.scanner.os.scandir", side_effect=deny_selected_roots):
+                local_process.run_loop()
+            removal_wave = list(local_process._ScannerProcess__queue.queue)
+            self.assertTrue(any(
+                healthy_pair_id in event.completed_path_pair_ids and event.is_full_snapshot
+                for event in removal_wave
+            ))
+            with patch.object(
+                    builder, "_ModelBuilder__local_regular_file_inventory",
+                    wraps=builder._ModelBuilder__local_regular_file_inventory,
+            ) as inventory_count:
+                updater.update()
+                self.assertEqual(1, inventory_count.call_count)
+            current_local_ids = {
+                ModelFile.build_file_id(root.name, root.path_pair_id)
+                for root in builder.local_source_roots_snapshot()
+            }
+            current_remote_ids = {
+                ModelFile.build_file_id(root.name, root.path_pair_id)
+                for root in builder.remote_source_roots_snapshot()
+            }
+            self.assertNotIn(removed_id, current_local_ids)
+            self.assertEqual(remote_ids_before_removal, current_remote_ids)
+            _, current_inventory = builder.local_library_inventory_snapshot()
+            self.assertEqual((2, 15, "up_to_date"), (
+                current_inventory[healthy_pair_id].file_count,
+                current_inventory[healthy_pair_id].size,
+                current_inventory[healthy_pair_id].state,
+            ))
+
+            # Fail the previously selected healthy root after publication. The old data
+            # stays visible, while the new failed scan removes effective local authority.
+            healthy_blocked_root = os.path.normcase(os.path.abspath(
+                os.path.join(healthy_final, "complete-root"),
+            ))
+            blocked_roots.add(healthy_blocked_root)
+            with patch("system.scanner.os.scandir", side_effect=deny_selected_roots):
+                local_process.run_loop()
+            second_wave = list(local_process._ScannerProcess__queue.queue)
+            self.assertTrue(any(
+                event.failed and healthy_pair_id in event.unknown_path_pair_ids
+                for event in second_wave
+            ))
+            for _cycle in range(5):
+                updater.update()
+
+            retained_summary = controller.get_model_summary()
+            retained_pairs = {item["path_pair_id"]: item for item in retained_summary["path_pairs"]}
+            retained_serialized = SerializeModel().model(list(controller._Controller__model.iter_files()))
+            retained_payload = json.loads(next(
+                line.split(":", 1)[1].strip()
+                for line in retained_serialized.splitlines() if line.startswith("data:")
+            ))
+            retained_ids = {entry["file_id"] for entry in retained_payload}
+            self.assertIn(healthy_id, retained_ids)
+            self.assertFalse(retained_pairs[healthy_pair_id]["reconciled_local"])
+            self.assertFalse(retained_pairs[blocked_pair_id]["reconciled_local"])
+            self.assertIn(healthy_pair_id, builder.unknown_local_path_pair_ids_snapshot())
+            self.assertIn(blocked_pair_id, builder.unknown_local_path_pair_ids_snapshot())
+            self.assertFalse(retained_summary["scan_authority"]["full"])
+            self.assertEqual(0, retained_summary["scan_authority"]["effective_local_reconciliation_after_count"])
+            _, retained_inventory = builder.local_library_inventory_snapshot()
+            self.assertEqual((2, 15, "scanning"), (
+                retained_inventory[healthy_pair_id].file_count,
+                retained_inventory[healthy_pair_id].size,
+                retained_inventory[healthy_pair_id].state,
+            ))
+
+            # A later accepted empty full snapshot replaces the retained local
+            # bucket and completes its zero-leaf inventory without clearing
+            # the still-unreadable sibling's unknown scope.
+            blocked_roots.remove(healthy_blocked_root)
+            shutil.rmtree(os.path.join(healthy_final, "complete-root"))
+            shutil.rmtree(healthy_staging)
+            os.makedirs(healthy_staging)
+            with patch("system.scanner.os.scandir", side_effect=deny_selected_roots):
+                local_process.run_loop()
+            empty_wave = list(local_process._ScannerProcess__queue.queue)
+            self.assertTrue(any(
+                healthy_pair_id in event.completed_path_pair_ids and event.is_full_snapshot
+                for event in empty_wave
+            ))
+            for _cycle in range(5):
+                updater.update()
+            _, empty_inventory = builder.local_library_inventory_snapshot()
+            self.assertEqual((0, 0, "up_to_date"), (
+                empty_inventory[healthy_pair_id].file_count,
+                empty_inventory[healthy_pair_id].size,
+                empty_inventory[healthy_pair_id].state,
+            ))
+            self.assertEqual(frozenset({blocked_pair_id}), builder.unknown_local_path_pair_ids_snapshot())
+
     def test_real_local_scan_publishes_complete_regular_roots_through_normal_updater_cycle(self):
         pair_id = "pair-readable-inventory"
         unreadable_pair_id = "pair-unreadable-sibling"

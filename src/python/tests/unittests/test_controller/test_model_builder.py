@@ -10242,6 +10242,59 @@ class TestModelBuilder(unittest.TestCase):
         self.assertNotIn("private-root", str(entries[0]))
         self.assertNotIn("private-pair", str(entries[0]))
 
+    def test_completed_local_pair_replacement_preserves_remote_and_unrelated_unknown_scope(self):
+        local_old = SystemFile("local-old.bin", 5)
+        local_old.path_pair_id = "pair-a"
+        local_other = SystemFile("local-other.bin", 8)
+        local_other.path_pair_id = "pair-b"
+        remote_a = SystemFile("remote-a.bin", 11)
+        remote_a.path_pair_id = "pair-a"
+        remote_b = SystemFile("remote-b.bin", 13)
+        remote_b.path_pair_id = "pair-b"
+        self.model_builder.set_local_files([local_old, local_other])
+        self.model_builder.set_remote_files([remote_a, remote_b])
+        self.model_builder.set_unknown_local_path_pair_ids({"pair-a", "pair-b"})
+
+        local_new = SystemFile("local-new.bin", 3)
+        local_new.path_pair_id = "pair-a"
+        self.model_builder.replace_completed_pair_sources_for_full_rebuild(
+            "pair-a", [local_new], None, {"pair-b"},
+        )
+
+        local_roots = {
+            (root.path_pair_id, root.name): root
+            for root in self.model_builder.local_source_roots_snapshot()
+        }
+        remote_roots = {
+            (root.path_pair_id, root.name): root
+            for root in self.model_builder.remote_source_roots_snapshot()
+        }
+        self.assertEqual({("pair-a", "local-new.bin"), ("pair-b", "local-other.bin")}, set(local_roots))
+        self.assertEqual({("pair-a", "remote-a.bin"), ("pair-b", "remote-b.bin")}, set(remote_roots))
+        self.assertEqual(frozenset({"pair-b"}), self.model_builder.unknown_local_path_pair_ids_snapshot())
+        _, inventory = self.model_builder.local_library_inventory_snapshot()
+        self.assertEqual((1, 3, "up_to_date"), (
+            inventory["pair-a"].file_count, inventory["pair-a"].size, inventory["pair-a"].state,
+        ))
+
+        self.model_builder.replace_completed_pair_sources_for_full_rebuild(
+            "pair-a", [], None, {"pair-b"},
+        )
+        local_roots = {
+            (root.path_pair_id, root.name)
+            for root in self.model_builder.local_source_roots_snapshot()
+        }
+        remote_roots = {
+            (root.path_pair_id, root.name)
+            for root in self.model_builder.remote_source_roots_snapshot()
+        }
+        self.assertEqual({("pair-b", "local-other.bin")}, local_roots)
+        self.assertEqual({("pair-a", "remote-a.bin"), ("pair-b", "remote-b.bin")}, remote_roots)
+        _, inventory = self.model_builder.local_library_inventory_snapshot()
+        self.assertEqual((0, 0, "up_to_date"), (
+            inventory["pair-a"].file_count, inventory["pair-a"].size, inventory["pair-a"].state,
+        ))
+
     def test_local_source_adoption_pair_trace_uses_root_identity_without_deep_equality(self):
         builder = self.model_builder
         original_root = SystemFile("private-root", 4, True)

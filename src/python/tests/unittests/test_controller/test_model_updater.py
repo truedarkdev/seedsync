@@ -6321,7 +6321,7 @@ class TestModelUpdater(unittest.TestCase):
         updater.update()
         updater.update()
         _, before_final = builder.local_library_inventory_snapshot()
-        self.assertIn(before_final["pair-a"].state, {"scanning", "stale"})
+        self.assertEqual("up_to_date", before_final["pair-a"].state)
 
         updater.update()
 
@@ -6371,8 +6371,13 @@ class TestModelUpdater(unittest.TestCase):
             "local-multi", [[local_final], []],
         )
 
-        ModelUpdater(controller).update()
-        ModelUpdater(controller).update()
+        with patch.object(
+                builder, "_ModelBuilder__local_regular_file_inventory",
+                wraps=builder._ModelBuilder__local_regular_file_inventory,
+        ) as inventory_count:
+            ModelUpdater(controller).update()
+            ModelUpdater(controller).update()
+            self.assertEqual(2, inventory_count.call_count)
 
         _, inventory = builder.local_library_inventory_snapshot()
         self.assertEqual((1, 7, "up_to_date"), (
@@ -6437,7 +6442,7 @@ class TestModelUpdater(unittest.TestCase):
 
         updater.update()
         _, first_inventory = builder.local_library_inventory_snapshot()
-        self.assertEqual("scanning", first_inventory[pair_id].state)
+        self.assertEqual("up_to_date", first_inventory[pair_id].state)
         self.assertEqual(frozenset({pair_id}), builder.unknown_local_path_pair_ids_snapshot())
         self.assertEqual({pair_id}, controller._Controller__reconciled_local_path_pair_ids)
         self.assertEqual(set(), controller._Controller__reconciled_remote_path_pair_ids)
@@ -6471,7 +6476,7 @@ class TestModelUpdater(unittest.TestCase):
             self.assertEqual(value, final_authority[key])
 
         self.assertEqual(2, len(summary_snapshots))
-        self.assertEqual("scanning", summary_snapshots[0]["inventory_state"])
+        self.assertEqual("up_to_date", summary_snapshots[0]["inventory_state"])
         self.assertEqual((True, False), summary_snapshots[0]["reconciled"])
         self.assertEqual("up_to_date", summary_snapshots[-1]["inventory_state"])
         self.assertEqual((True, True), summary_snapshots[-1]["reconciled"])

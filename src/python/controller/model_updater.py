@@ -6877,6 +6877,68 @@ class ModelUpdater(_ControllerCoreAccess):
                 setter_unknown_local(unknown_local_ids)
                 unknown_overlay_changed = unknown_before_setter != set(unknown_local_ids)
         if progressive_mode and joint_reconciler is not None:
+            local_pair_sources_committed_for_event: set[Optional[str]] = set()
+            # A lossless local full-pair completion owns its local source
+            # bucket and inventory independently of remote or sibling-pair
+            # finality. The result's completed IDs are per-drain and the
+            # accumulator adds them only for accepted full snapshots; the
+            # per-pair token keeps this adoption bound to the live scanner
+            # session even when another pair in the same drain is unknown.
+            if not joint_reconciliation_final and latest_local_scan is not None and \
+                    not bool(getattr(latest_local_scan, "failed", False)):
+                local_pair_replacer = getattr(
+                    model_builder, "replace_completed_pair_sources_for_full_rebuild", None,
+                )
+                local_pair_replacer_capable = callable(getattr(
+                    type(model_builder), "replace_completed_pair_sources_for_full_rebuild", None,
+                ))
+                unknown_snapshotter = getattr(
+                    model_builder, "unknown_local_path_pair_ids_snapshot", None,
+                )
+                local_authority_tokens = getattr(
+                    latest_local_scan, "_scan_authority_tokens_by_pair", None,
+                )
+                local_process_session = _current_scan_session_token(controller, "local")
+                if local_pair_replacer_capable and callable(local_pair_replacer) and \
+                        callable(unknown_snapshotter) and \
+                        isinstance(local_accumulator, _ProgressiveScanAccumulator) and \
+                        isinstance(local_authority_tokens, dict) and \
+                        isinstance(local_process_session, str) and \
+                        latest_local_scan.session_token == local_process_session and \
+                        local_accumulator.session_token == local_process_session:
+                    accepted_local_pair_ids = set(
+                        getattr(latest_local_scan, "completed_path_pair_ids", set())
+                    ).intersection(local_accumulator.completed_pairs()) \
+                        .difference(local_accumulator.incomplete_pairs()) \
+                        .difference(set(getattr(latest_local_scan, "unknown_path_pair_ids", set())))
+                    accepted_local_pair_ids = {
+                        pair_id for pair_id in accepted_local_pair_ids
+                        if isinstance(local_authority_tokens.get(pair_id), tuple) and
+                        len(local_authority_tokens[pair_id]) == 2 and
+                        local_authority_tokens[pair_id][0] == local_process_session and
+                        type(local_authority_tokens[pair_id][1]) is int and
+                        local_authority_tokens[pair_id][1] >= 0
+                    }
+                    if accepted_local_pair_ids:
+                        local_snapshot = local_accumulator.snapshot_for_pairs(accepted_local_pair_ids)
+                        local_files_by_pair: dict[Optional[str], list[SystemFile]] = {}
+                        for (path_pair_id, _), source in local_snapshot.items():
+                            local_files_by_pair.setdefault(path_pair_id, []).append(source)
+                        locally_resolved_pair_ids = accepted_local_pair_ids.difference(
+                            joint_unknown_local_ids,
+                        )
+                        unknown_after_local_completion = set(unknown_snapshotter()) \
+                            .difference(locally_resolved_pair_ids)
+                        for path_pair_id in accepted_local_pair_ids:
+                            # ``None`` tells the existing Builder owner to
+                            # retain that pair's current remote bucket.
+                            local_pair_replacer(
+                                path_pair_id,
+                                local_files_by_pair.get(path_pair_id, []),
+                                None,
+                                unknown_after_local_completion,
+                            )
+                            local_pair_sources_committed_for_event.add(path_pair_id)
             if progressive_joint_publication_allowed:
                 if joint_reconciliation_final:
                     # A later completed progressive scan can replace exactly
@@ -6951,6 +7013,18 @@ class ModelUpdater(_ControllerCoreAccess):
                                 if isinstance(local_accumulator, _ProgressiveScanAccumulator) else set(
                                     getattr(latest_local_scan, "completed_path_pair_ids", set())
                                 ) if latest_local_scan is not None else set()
+                            inventory_snapshotter = getattr(
+                                model_builder, "local_library_inventory_snapshot", None,
+                            )
+                            if callable(inventory_snapshotter):
+                                inventory_snapshot = inventory_snapshotter()
+                                inventory_by_pair = inventory_snapshot[1] \
+                                    if isinstance(inventory_snapshot, tuple) and len(inventory_snapshot) == 2 and \
+                                    isinstance(inventory_snapshot[1], dict) else {}
+                                completed_inventory_ids = {
+                                    path_pair_id for path_pair_id in completed_inventory_ids
+                                    if getattr(inventory_by_pair.get(path_pair_id), "state", None) != "up_to_date"
+                                }
                             inventory_completion(completed_inventory_ids)
                 if progressive_joint_first_partial_publication:
                     controller._Controller__progressive_joint_first_publication = True
@@ -10280,6 +10354,12 @@ class ModelUpdater(_ControllerCoreAccess):
                 overlay = set(joint_unknown_local_ids) if progressive_source_buckets_adopted else \
                     progressive_unknown_before_event.union(joint_unknown_local_ids)
                 overlay.difference_update(local_noop_inventory_completion_ids)
+                # Clear only scopes whose accepted local full snapshot was
+                # committed in this event. A later remote-only recovery must
+                # keep a prior unknown overlay until local authority refreshes.
+                overlay.difference_update(
+                    local_pair_sources_committed_for_event.difference(joint_unknown_local_ids)
+                )
                 unknown_overlay_changed = overlay != progressive_unknown_before_event
                 progressive_unknown_after_event = set(overlay)
                 setter_unknown_local(overlay)
