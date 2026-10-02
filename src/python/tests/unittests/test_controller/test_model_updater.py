@@ -1,5 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import builtins
 import unittest
 import logging
 import json
@@ -12966,6 +12967,11 @@ class TestModelUpdater(unittest.TestCase):
         for mtime_ns in (1_000_000_001, None):
             with self.subTest(mtime_ns=mtime_ns):
                 controller = self._make_v092_pending_completion_controller()
+                trace = BreadcrumbTraceCollector(
+                    lambda: True, max_entries=32,
+                    policy={"default": "off", "rules": {"completion.gate": "info"}},
+                )
+                controller._Controller__context.breadcrumb_trace = trace
                 controller._Controller__model_builder.set_local_files([
                     SystemFile("pending.bin", 10, False, is_staging=True, mtime_ns=mtime_ns),
                 ])
@@ -12985,6 +12991,18 @@ class TestModelUpdater(unittest.TestCase):
                 )
                 controller._Controller__move_from_staging.assert_not_called()
                 self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+                move_decisions = [
+                    event for event in trace.snapshot()["entries"]
+                    if event["message"] == "pending_completion_move_decision"
+                ]
+                self.assertEqual(1, len(move_decisions))
+                self.assertEqual("authority", move_decisions[0]["details"]["stage"])
+                self.assertEqual(
+                    "staging_identity_unverified", move_decisions[0]["details"]["reason"],
+                )
+                self.assertEqual(
+                    "staging_remote_identity", move_decisions[0]["details"]["proof_source"],
+                )
 
     def test_v092_pending_completion_rejects_full_logical_size_from_pget_sidecar(self):
         controller = self._make_v092_pending_completion_controller()
@@ -13356,7 +13374,7 @@ class TestModelUpdater(unittest.TestCase):
 
     def test_v092_pending_completion_authority_wake_retries_quiet_no_diff(self):
         controller = self._make_v092_pending_completion_controller()
-        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=64)
         controller._Controller__context.breadcrumb_trace = trace
 
         def record_breadcrumb(**kwargs):
@@ -13374,25 +13392,77 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__reconciled_remote_path_pair_ids = set()
         builder = controller._Controller__model_builder
         file_id = ModelFile.build_file_id("pending.bin", None)
+        updater = ModelUpdater(controller)
+
+        def move_decisions():
+            return [event for event in trace.snapshot()["entries"]
+                    if event["message"] == "pending_completion_move_decision"]
 
         with patch.object(builder, "request_rebuild", wraps=builder.request_rebuild) as request_rebuild, \
                 patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
-            ModelUpdater(controller).update()
+            updater.update()
             self.assertEqual(0, request_rebuild.call_count)
             self.assertEqual(0, controller._Controller__move_from_staging.call_count)
             self.assertIn(
                 ("pending.bin", None, None), controller._Controller__pending_completion_file_names,
             )
+            first_wake = [
+                event for event in trace.snapshot()["entries"]
+                if event["message"] == "pending_completion_authority_wake"
+            ]
+            self.assertEqual(1, len(first_wake))
+            self.assertEqual("blocked", first_wake[0]["details"]["decision"])
+            self.assertEqual("local_scope_unreconciled", first_wake[0]["details"]["reason"])
+            self.assertNotIn("pending.bin", json.dumps(first_wake[0]))
+            first_move_decision = move_decisions()
+            self.assertEqual(1, len(first_move_decision))
+            self.assertEqual("pending_completion_move_decision.v1", first_move_decision[0]["details"]["schema"])
+            self.assertEqual("authority", first_move_decision[0]["details"]["stage"])
+            self.assertEqual("local_scope_unreconciled", first_move_decision[0]["details"]["reason"])
+            self.assertEqual("local_scan_scope", first_move_decision[0]["details"]["proof_source"])
+            self.assertEqual("not_attempted", first_move_decision[0]["details"]["move_result"])
+
+            # A quiet unchanged tick is deduplicated even with other gate
+            # events sharing this opaque file correlation in between.
+            updater._record_completion_gate_breadcrumb(
+                file_id,
+                "completion_gate_candidate",
+                {"schema": "completion_gate_candidate.v1", "decision": "observed"},
+                poll_correlation="lftp-poll:abababababababab",
+            )
+            controller._Controller__next_lftp_status_poll_at = None
+            updater.update()
+            unchanged_wakes = [
+                event for event in trace.snapshot()["entries"]
+                if event["message"] == "pending_completion_authority_wake"
+            ]
+            self.assertEqual(1, len(unchanged_wakes))
+            self.assertTrue(any(
+                event["message"] == "completion_gate_build_deferred"
+                for event in trace.snapshot()["entries"]
+            ))
+            self.assertEqual(1, len(move_decisions()))
 
             controller._Controller__reconciled_local_path_pair_ids = {None}
             controller._Controller__reconciled_remote_path_pair_ids = {None}
-            ModelUpdater(controller).update()
+            controller._Controller__next_lftp_status_poll_at = None
+            updater.update()
 
         request_rebuild.assert_called_once_with()
         controller._Controller__move_from_staging.assert_called_once_with("pending.bin", None)
         self.assertEqual(set(), controller._Controller__pending_completion_file_names)
         self.assertEqual({file_id}, controller._Controller__persist.downloaded_file_names)
         self.assertNotIn(file_id, controller._Controller__persist.stopped_file_names)
+        wakes = [
+            event for event in trace.snapshot()["entries"]
+            if event["message"] == "pending_completion_authority_wake"
+        ]
+        self.assertEqual(2, len(wakes))
+        self.assertEqual("wake_allowed", wakes[-1]["details"]["decision"])
+        self.assertEqual("authority_available", wakes[-1]["details"]["reason"])
+        self.assertTrue(all(event["corr_id"] == "completion:{}".format(
+            opaque_trace_correlation(file_id),
+        ) for event in wakes))
         marker = next(
             event for event in trace.snapshot()["entries"]
             if event["message"] == "downloaded_marker_added"
@@ -13401,6 +13471,227 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("completion_gate", marker["stage"])
         self.assertEqual("completion:{}".format(opaque_trace_correlation(file_id)), marker["corr_id"])
         self.assertNotIn("pending.bin", json.dumps(marker))
+        move_events = move_decisions()
+        self.assertEqual(2, len(move_events))
+        self.assertEqual("move", move_events[-1]["details"]["stage"])
+        self.assertEqual("result", move_events[-1]["details"]["decision"])
+        self.assertEqual("move_completed", move_events[-1]["details"]["reason"])
+        self.assertEqual("move_result", move_events[-1]["details"]["proof_source"])
+        self.assertEqual("completed", move_events[-1]["details"]["move_result"])
+        self.assertTrue(all(event["category"] == "completion.gate" and event["level"] == "info"
+                            for event in move_events))
+        self.assertNotIn("pending.bin", json.dumps(move_events))
+
+    def test_actual_quiet_move_result_classification_skips_enum_metadata_when_disabled(self):
+        controller = self._make_v092_pending_completion_controller()
+        trace = BreadcrumbTraceCollector(lambda: False, max_entries=8)
+        controller._Controller__context.breadcrumb_trace = trace
+        updater = ModelUpdater(controller)
+        controller._record_completion_scan_join_breadcrumb = lambda file_id, message, details: \
+            Controller._record_completion_scan_join_breadcrumb(
+                controller, file_id, message, details,
+            )
+        move_result = Controller.MoveFromStagingResult.COMPLETED
+        original_getattr = builtins.getattr
+        name_reads = []
+
+        def reject_move_result_name(obj, name, *args):
+            if obj is move_result and name == "name":
+                name_reads.append(name)
+                raise AssertionError("disabled diagnostics must not inspect move result metadata")
+            return original_getattr(obj, name, *args)
+
+        with patch.object(builtins, "getattr", new=reject_move_result_name), \
+                patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            updater.update()
+
+        self.assertEqual([], name_reads)
+        controller._Controller__move_from_staging.assert_called_once_with("pending.bin", None)
+        controller._release_move_attempt.assert_called_once_with(
+            ModelFile.build_file_id("pending.bin", None),
+        )
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        self.assertEqual(
+            {ModelFile.build_file_id("pending.bin", None)},
+            controller._Controller__persist.downloaded_file_names,
+        )
+        self.assertEqual([], trace.snapshot()["entries"])
+        self.assertEqual({}, updater._ModelUpdater__completion_gate_trace_signatures)
+
+    def test_actual_quiet_move_result_classification_failure_preserves_successful_move(self):
+        controller = self._make_v092_pending_completion_controller()
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=32)
+        controller._Controller__context.breadcrumb_trace = trace
+        updater = ModelUpdater(controller)
+        controller._record_completion_scan_join_breadcrumb = lambda file_id, message, details: \
+            Controller._record_completion_scan_join_breadcrumb(
+                controller, file_id, message, details,
+            )
+        move_result = Controller.MoveFromStagingResult.COMPLETED
+        original_getattr = builtins.getattr
+        name_reads = []
+
+        def fail_move_result_name(obj, name, *args):
+            if obj is move_result and name == "name":
+                name_reads.append(name)
+                raise RuntimeError("optional result projection failed")
+            return original_getattr(obj, name, *args)
+
+        with patch.object(builtins, "getattr", new=fail_move_result_name), \
+                patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            updater.update()
+
+        self.assertEqual(["name"], name_reads)
+        controller._Controller__move_from_staging.assert_called_once_with("pending.bin", None)
+        controller._release_move_attempt.assert_called_once_with(
+            ModelFile.build_file_id("pending.bin", None),
+        )
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        self.assertEqual(
+            {ModelFile.build_file_id("pending.bin", None)},
+            controller._Controller__persist.downloaded_file_names,
+        )
+        move_results = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "pending_completion_move_decision" and
+            entry["details"].get("stage") == "move"
+        ]
+        self.assertEqual([], move_results)
+
+    def test_actual_quiet_move_decision_dedupes_polls_and_records_changed_authority_reason(self):
+        controller = self._make_v092_pending_completion_controller()
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=64)
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__reconciled_local_path_pair_ids = set()
+        controller._Controller__reconciled_remote_path_pair_ids = set()
+        controller._record_completion_scan_join_breadcrumb = lambda file_id, message, details: \
+            Controller._record_completion_scan_join_breadcrumb(
+                controller, file_id, message, details,
+            )
+        polls = iter((
+            "lftp-poll:5151515151515151",
+            "lftp-poll:5252525252525252",
+            "lftp-poll:5353535353535353",
+            "lftp-poll:5454545454545454",
+        ))
+        controller._take_lftp_status_poll_correlation = lambda: next(polls)
+        builder = controller._Controller__model_builder
+        updater = ModelUpdater(controller)
+        file_id = ModelFile.build_file_id("pending.bin", None)
+
+        def move_decisions():
+            return [event for event in trace.snapshot()["entries"]
+                    if event["message"] == "pending_completion_move_decision"]
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            updater.update()
+            first = move_decisions()
+            self.assertEqual(1, len(first))
+            self.assertEqual("local_scope_unreconciled", first[0]["details"]["reason"])
+
+            # Force the real no-diff lifecycle pass again. Poll join metadata
+            # changes, and an unrelated family interleaves, but the semantic
+            # quiet move decision remains the same.
+            updater._record_completion_gate_breadcrumb(
+                file_id,
+                "completion_gate_candidate",
+                {"schema": "completion_gate_candidate.v1", "decision": "observed"},
+                poll_correlation="lftp-poll:abababababababab",
+            )
+            controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+            builder.request_rebuild()
+            updater.update()
+            self.assertEqual(1, len(move_decisions()))
+
+            controller._Controller__reconciled_local_path_pair_ids = {None}
+            controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+            builder.request_rebuild()
+            updater.update()
+            changed = move_decisions()
+            self.assertEqual(2, len(changed))
+            self.assertEqual("remote_scope_unreconciled", changed[-1]["details"]["reason"])
+            self.assertEqual("remote_scan_scope", changed[-1]["details"]["proof_source"])
+
+            controller._Controller__reconciled_remote_path_pair_ids = {None}
+            controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+            builder.request_rebuild()
+            updater.update()
+
+        results = move_decisions()
+        self.assertEqual(3, len(results))
+        self.assertEqual(
+            [
+                "lftp-poll:5151515151515151",
+                "lftp-poll:5353535353535353",
+                "lftp-poll:5454545454545454",
+            ],
+            [event["details"]["poll_correlation"] for event in results],
+        )
+        self.assertEqual("move_completed", results[-1]["details"]["reason"])
+        self.assertEqual("completed", results[-1]["details"]["move_result"])
+        self.assertEqual(1, controller._Controller__move_from_staging.call_count)
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        self.assertNotIn("pending.bin", json.dumps(results))
+
+    def test_v092_pending_completion_authority_wake_is_hot_gated_and_durable(self):
+        controller = self._make_v092_pending_completion_controller()
+        controller._Controller__reconciled_local_path_pair_ids = set()
+        controller._Controller__reconciled_remote_path_pair_ids = set()
+        updater = ModelUpdater(controller)
+        disabled = BreadcrumbTraceCollector(lambda: False, max_entries=8)
+        controller._Controller__context.breadcrumb_trace = disabled
+        with patch.object(updater, "_record_completion_gate_breadcrumb") as record, \
+                patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            updater.update()
+        record.assert_not_called()
+        self.assertEqual({}, updater._ModelUpdater__completion_gate_trace_signatures)
+        self.assertIn(
+            ("pending.bin", None, None), controller._Controller__pending_completion_file_names,
+        )
+
+        with tempfile.TemporaryDirectory() as spool_path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True, max_entries=16, durable_enabled=True, durable_path=spool_path,
+                policy={"default": "off", "rules": {"completion.gate": "info"}},
+            )
+            controller._Controller__context.breadcrumb_trace = trace
+            with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+                updater.update()
+            health = trace.close()
+            with open(os.path.join(spool_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+        event = next(
+            record for record in records
+            if record.get("message") == "pending_completion_authority_wake"
+        )
+        self.assertGreaterEqual(health.get("written", 0), 1)
+        self.assertEqual("completion.gate", event["category"])
+        self.assertEqual("blocked", event["details"]["decision"])
+        self.assertEqual("local_scope_unreconciled", event["details"]["reason"])
+        self.assertNotIn("pending.bin", json.dumps(event))
+
+        failing_trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        controller._Controller__context.breadcrumb_trace = failing_trace
+        original_record = failing_trace.record
+        rejected_messages = []
+
+        def fail_wake_record(component, message, details, **kwargs):
+            if message == "pending_completion_move_decision":
+                rejected_messages.append(message)
+                raise RuntimeError("private recorder failure")
+            if message == "pending_completion_authority_wake":
+                raise RuntimeError("private recorder failure")
+            return original_record(component, message, details, **kwargs)
+
+        failing_trace.record = fail_wake_record
+        controller._Controller__model_builder.request_rebuild()
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+        self.assertEqual(["pending_completion_move_decision"], rejected_messages)
+        self.assertIn(
+            ("pending.bin", None, None), controller._Controller__pending_completion_file_names,
+        )
+        controller._Controller__move_from_staging.assert_not_called()
 
     def test_v092_pending_completion_wake_is_acknowledged_after_candidate_authority(self):
         """A pre-build wake must not consume an authority change mid-build."""
@@ -14399,9 +14690,16 @@ class TestModelUpdater(unittest.TestCase):
         ModelUpdater(controller).update()
 
         entries = trace.snapshot()["entries"]
-        self.assertEqual(["completion_gate_build_deferred"], [entry["message"] for entry in entries])
         self.assertEqual(
-            {"build_ran": False, "reason": "no_model_build"}, entries[0]["details"],
+            ["pending_completion_authority_wake", "completion_gate_build_deferred"],
+            [entry["message"] for entry in entries],
+        )
+        self.assertEqual(
+            {"schema": "pending_completion_authority_wake.v1", "decision": "blocked",
+             "reason": "local_scope_unreconciled"}, entries[0]["details"],
+        )
+        self.assertEqual(
+            {"build_ran": False, "reason": "no_model_build"}, entries[1]["details"],
         )
         self.assertNotIn("private-root", str(entries))
 
@@ -14991,6 +15289,40 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(details, entries[0]["details"])
         self.assertNotIn("private-file-id", str(entries))
 
+        wake = {
+            "schema": "pending_completion_authority_wake.v1",
+            "decision": "blocked",
+            "reason": "local_scope_unreconciled",
+        }
+        updater._record_completion_gate_breadcrumb(
+            "private-file-id", "pending_completion_authority_wake", wake,
+        )
+        updater._record_completion_gate_breadcrumb(
+            "private-file-id", "completion_gate_candidate", details,
+        )
+        updater._record_completion_gate_breadcrumb(
+            "private-file-id", "pending_completion_authority_wake", wake,
+        )
+        changed_wake = dict(wake, reason="remote_scope_unreconciled")
+        updater._record_completion_gate_breadcrumb(
+            "private-file-id", "pending_completion_authority_wake", changed_wake,
+        )
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(
+            2, sum(entry["message"] == "pending_completion_authority_wake" for entry in entries),
+        )
+        self.assertEqual(
+            1, sum(entry["message"] == "completion_gate_candidate" for entry in entries),
+        )
+        for index in range(updater._COMPLETION_GATE_TRACE_SIGNATURE_LIMIT + 1):
+            updater._record_completion_gate_breadcrumb(
+                "private-file-{}".format(index), "completion_gate_candidate", details,
+            )
+        self.assertLessEqual(
+            len(updater._ModelUpdater__completion_gate_trace_signatures),
+            updater._COMPLETION_GATE_TRACE_SIGNATURE_LIMIT,
+        )
+
     def test_completion_gate_presentation_transition_records_frozen_scalar_projection(self):
         cases = (
             ("missing_pending", False, False, False, 25, 100, False),
@@ -15357,6 +15689,16 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("still_active", active["details"]["reason"])
         self.assertTrue(active["details"]["current_active"])
         self.assertFalse(active["details"]["local_scan_forced"])
+        membership = active["details"]["status_membership"]
+        self.assertEqual("completion_status_membership.v1", membership["schema"])
+        self.assertFalse(membership["provenance_available"])
+        self.assertEqual("unknown", membership["raw_status_state"])
+        self.assertEqual("unknown", membership["post_filter_status_state"])
+        self.assertEqual("unknown", membership["displayed_status_state"])
+        self.assertFalse(membership["pending_dispatch_member"])
+        self.assertFalse(membership["raw_duplicate_member"])
+        self.assertFalse(membership["duplicate_retained_running"])
+        self.assertFalse(membership["completion_consumed_running"])
         self.assertNotIn("sample-movie.mkv", str(entries))
         self.assertNotIn("path-pair-a", str(entries))
         self.assertNotIn("Path Pair A", str(entries))
@@ -15364,6 +15706,203 @@ class TestModelUpdater(unittest.TestCase):
             opaque_trace_correlation(ModelFile.build_file_id(*active_entry[:2]))
         )
         self.assertTrue(all(entry["corr_id"] == expected_correlation for entry in entries))
+
+    def test_actual_update_completion_membership_dedupes_poll_churn_and_changes_semantically(self):
+        controller = self._make_v092_pending_completion_controller()
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=64,
+            policy={"default": "off", "rules": {"completion.gate": "info"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__record_breadcrumb = (
+            self._model_finalization_trace_controller(trace)._Controller__record_breadcrumb
+        )
+        updater = ModelUpdater(controller)
+        file_id = ModelFile.build_file_id("pending.bin", None)
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "pending.bin", "",
+        )
+        controller._Controller__lftp.status.return_value = [running]
+        controller._Controller__lftp.last_status_poll_healthy = True
+        correlations = iter((
+            "lftp-poll:1111111111111111",
+            "lftp-poll:2222222222222222",
+            "lftp-poll:3333333333333333",
+            "lftp-poll:4444444444444444",
+        ))
+        controller._take_lftp_status_poll_correlation = lambda: next(correlations)
+
+        def retirement_rows():
+            return [
+                entry for entry in trace.snapshot()["entries"]
+                if entry["message"] == "completion_retirement_not_detected"
+            ]
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            updater.update()
+            first = retirement_rows()
+            self.assertEqual(1, len(first))
+            membership = first[0]["details"]["status_membership"]
+            self.assertEqual("running", membership["raw_status_state"])
+            self.assertEqual("running", membership["post_filter_status_state"])
+            self.assertEqual("running", membership["displayed_status_state"])
+            self.assertTrue(membership["provenance_available"])
+            self.assertTrue(membership["completion_consumed_running"])
+            self.assertFalse(membership["raw_duplicate_member"])
+            self.assertEqual("fresh_healthy", first[0]["details"]["poll_source"])
+            self.assertTrue(first[0]["details"]["poll_fresh"])
+            self.assertTrue(first[0]["details"]["poll_healthy"])
+            self.assertTrue(first[0]["details"]["poll_eligible"])
+
+            # An unrelated completion event for the same opaque file must not
+            # replace the retirement family's last semantic signature.
+            updater._record_completion_gate_breadcrumb(
+                file_id,
+                "completion_gate_candidate",
+                {"schema": "completion_gate_candidate.v1", "decision": "observed"},
+                poll_correlation="lftp-poll:aaaaaaaaaaaaaaaa",
+            )
+            controller._Controller__next_lftp_status_poll_at = None
+            updater.update()
+            self.assertEqual(1, len(retirement_rows()))
+
+            # An actual failed fresh poll reuses the same RUNNING status row.
+            # Membership stays unchanged, but source/freshness/health authority
+            # changes and must produce a new semantic retirement record.
+            controller._Controller__lftp.status.return_value = []
+            controller._Controller__lftp.last_status_poll_healthy = False
+            controller._Controller__next_lftp_status_poll_at = None
+            updater.update()
+            cached = retirement_rows()
+            self.assertEqual(2, len(cached))
+            self.assertEqual("cached_unhealthy", cached[-1]["details"]["poll_source"])
+            self.assertFalse(cached[-1]["details"]["poll_fresh"])
+            self.assertFalse(cached[-1]["details"]["poll_healthy"])
+            self.assertTrue(cached[-1]["details"]["poll_eligible"])
+            self.assertEqual(membership, cached[-1]["details"]["status_membership"])
+
+            queued_duplicate = LftpJobStatus(
+                2, LftpJobStatus.Type.GET, LftpJobStatus.State.QUEUED, "pending.bin", "",
+            )
+            controller._Controller__lftp.status.return_value = [running, queued_duplicate]
+            controller._Controller__lftp.last_status_poll_healthy = True
+            controller._Controller__next_lftp_status_poll_at = None
+            updater.update()
+
+        changed = retirement_rows()
+        self.assertEqual(3, len(changed))
+        self.assertEqual("lftp-poll:1111111111111111", changed[0]["details"]["poll_correlation"])
+        self.assertEqual("lftp-poll:3333333333333333", changed[1]["details"]["poll_correlation"])
+        self.assertEqual("lftp-poll:4444444444444444", changed[2]["details"]["poll_correlation"])
+        self.assertEqual("cached_unhealthy", changed[1]["details"]["poll_source"])
+        membership = changed[2]["details"]["status_membership"]
+        self.assertEqual("mixed", membership["raw_status_state"])
+        self.assertEqual("mixed", membership["post_filter_status_state"])
+        self.assertEqual("mixed", membership["displayed_status_state"])
+        self.assertTrue(membership["raw_duplicate_member"])
+        self.assertTrue(membership["duplicate_retained_running"])
+        self.assertTrue(membership["completion_consumed_running"])
+        self.assertEqual("completion.gate", changed[0]["category"])
+        self.assertEqual("info", changed[0]["level"])
+        serialized = json.dumps(trace.snapshot()["entries"])
+        self.assertNotIn("pending.bin", serialized)
+        self.assertNotIn(file_id, serialized)
+
+    def test_actual_completion_membership_survives_finalized_durable_envelope(self):
+        controller = self._make_v092_pending_completion_controller()
+        with tempfile.TemporaryDirectory() as spool_path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                max_entries=64,
+                durable_enabled=True,
+                durable_path=spool_path,
+                policy={"default": "off", "rules": {"completion.gate": "info"}},
+            )
+            controller._Controller__context.breadcrumb_trace = trace
+            controller._Controller__lftp.status.return_value = [
+                LftpJobStatus(
+                    1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING,
+                    "pending.bin", "",
+                ),
+            ]
+            controller._Controller__lftp.last_status_poll_healthy = True
+            with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+                ModelUpdater(controller).update()
+            health = trace.close()
+            with open(os.path.join(spool_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+
+        event = next(
+            record for record in records
+            if record.get("message") == "completion_retirement_not_detected"
+        )
+        membership = event["details"]["status_membership"]
+        self.assertGreaterEqual(health.get("written", 0), 1)
+        self.assertEqual(
+            {
+                "schema", "provenance_available", "raw_status_state",
+                "post_filter_status_state", "displayed_status_state",
+                "pending_dispatch_member", "raw_duplicate_member",
+                "duplicate_retained_running", "completion_consumed_running",
+            },
+            set(membership),
+        )
+        self.assertEqual("completion_status_membership.v1", membership["schema"])
+        self.assertIs(membership["provenance_available"], True)
+        self.assertEqual(("running", "running", "running"), tuple(
+            membership[key] for key in (
+                "raw_status_state", "post_filter_status_state", "displayed_status_state",
+            )
+        ))
+        self.assertIs(membership["pending_dispatch_member"], False)
+        self.assertIs(membership["raw_duplicate_member"], False)
+        self.assertIs(membership["duplicate_retained_running"], False)
+        self.assertIs(membership["completion_consumed_running"], True)
+        self.assertNotIn("<truncated>", json.dumps(event))
+        self.assertNotIn("pending.bin", json.dumps(event))
+        self.assertEqual("completion.gate", event["category"])
+        self.assertEqual("info", event["level"])
+
+    def test_actual_cached_running_status_keeps_pending_dispatch_membership_separate(self):
+        controller = self._make_v092_pending_completion_controller()
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=64)
+        controller._Controller__context.breadcrumb_trace = trace
+        file_id = ModelFile.build_file_id("pending.bin", None)
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "pending.bin", "",
+        )
+        controller._Controller__last_lftp_statuses = [running]
+        controller._Controller__lftp.status.return_value = []
+        controller._Controller__lftp.last_status_poll_healthy = False
+        controller._Controller__lftp_status_poll_retry_active = True
+        controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(minutes=1)
+        controller._Controller__pending_queue_dispatches = {
+            file_id: PendingQueueDispatch(0.0, "pending.bin", None, False, 7),
+        }
+        controller._Controller__work_state_lock = RLock()
+        controller._Controller__queue_dispatch_pending = (
+            Controller._Controller__queue_dispatch_pending.__get__(controller, Controller)
+        )
+        controller._lftp_statuses_with_pending_dispatches = (
+            Controller._lftp_statuses_with_pending_dispatches.__get__(controller, Controller)
+        )
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+
+        event = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "completion_retirement_not_detected"
+        )
+        membership = event["details"]["status_membership"]
+        self.assertTrue(membership["pending_dispatch_member"])
+        self.assertEqual("running", membership["raw_status_state"])
+        self.assertEqual("running", membership["post_filter_status_state"])
+        self.assertEqual("running", membership["displayed_status_state"])
+        self.assertTrue(membership["completion_consumed_running"])
+        self.assertIn(file_id, controller._Controller__pending_queue_dispatches)
+        self.assertNotIn("pending.bin", json.dumps(event))
 
     def test_lftp_completion_retirement_breadcrumb_records_unhealthy_and_inflight_blocks(self):
         for source, fresh in (("unhealthy_empty", True), ("inflight_empty", False)):

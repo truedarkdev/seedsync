@@ -3883,12 +3883,38 @@ class ModelUpdater(_ControllerCoreAccess):
                 details = dict(details)
                 details["poll_correlation"] = safe_poll_correlation
             corr_id = "completion:{}".format(opaque_trace_correlation(file_id))
-            signature = json.dumps({"message": message, "details": details}, sort_keys=True)
-            previous_signature = self.__completion_gate_trace_signatures.get(corr_id)
+            signature_details = details
+            # These semantic families can be interleaved with other gate
+            # events. Keep their bounded signatures independent of unrelated
+            # messages and poll join metadata; public details remain intact.
+            signature_key = corr_id
+            if message == "completion_retirement_not_detected":
+                signature_key = "{}:{}".format(corr_id, message)
+                signature_details = {
+                    key: details.get(key) for key in (
+                        "decision", "reason", "previous_active", "current_active",
+                        "poll_source", "poll_fresh", "poll_healthy", "poll_eligible",
+                        "status_membership",
+                    )
+                }
+            elif message == "pending_completion_move_decision":
+                signature_key = "{}:{}".format(corr_id, message)
+                signature_details = {
+                    key: details.get(key) for key in (
+                        "schema", "stage", "decision", "reason",
+                        "proof_source", "move_result",
+                    )
+                }
+            elif message == "pending_completion_authority_wake":
+                signature_key = "{}:{}".format(corr_id, message)
+            signature = json.dumps(
+                {"message": message, "details": signature_details}, sort_keys=True,
+            )
+            previous_signature = self.__completion_gate_trace_signatures.get(signature_key)
             if previous_signature == signature:
                 return
-            self.__completion_gate_trace_signatures[corr_id] = signature
-            self.__completion_gate_trace_signatures.move_to_end(corr_id)
+            self.__completion_gate_trace_signatures[signature_key] = signature
+            self.__completion_gate_trace_signatures.move_to_end(signature_key)
             while len(self.__completion_gate_trace_signatures) > self._COMPLETION_GATE_TRACE_SIGNATURE_LIMIT:
                 self.__completion_gate_trace_signatures.popitem(last=False)
             breadcrumb_trace.record(
@@ -4873,6 +4899,7 @@ class ModelUpdater(_ControllerCoreAccess):
         lftp_status_poll_healthy: Optional[bool] = None,
         lftp_status_source: Optional[str] = None,
         lftp_status_poll_correlation: Optional[str] = None,
+        completion_status_membership_by_file_id: Optional[Mapping[str, Mapping[str, object]]] = None,
     ) -> tuple[set[str], set[str], dict[str, tuple[int, str]]]:
         controller = self._controller
         current_downloading_file_names_set = set(current_downloading_file_names)
@@ -4956,6 +4983,23 @@ class ModelUpdater(_ControllerCoreAccess):
                 "scan_health": "requested" if local_scan_forced else "unknown",
                 "scan_freshness": "unknown",
             }
+            if message == "completion_retirement_not_detected":
+                membership = completion_status_membership_by_file_id.get(file_id) \
+                    if isinstance(completion_status_membership_by_file_id, Mapping) else None
+                status_membership = {
+                    "schema": "completion_status_membership.v1",
+                    "provenance_available": isinstance(membership, Mapping),
+                    "raw_status_state": "unknown",
+                    "post_filter_status_state": "unknown",
+                    "displayed_status_state": "unknown",
+                    "pending_dispatch_member": False,
+                    "raw_duplicate_member": False,
+                    "duplicate_retained_running": False,
+                    "completion_consumed_running": False,
+                }
+                if isinstance(membership, Mapping):
+                    status_membership.update(membership)
+                details["status_membership"] = status_membership
             if decision == "pending":
                 details["registration_source"] = "lftp_job_finished"
             self._record_completion_gate_breadcrumb(
@@ -6521,6 +6565,81 @@ class ModelUpdater(_ControllerCoreAccess):
                     # pass the meaningful empty map so the builder retains floors
                     # conservatively until a later boundary supplies identity.
                 retired_job_identities = {}
+
+        completion_status_membership_by_file_id = None
+        try:
+            # This projection is diagnostic-only and stays behind the same
+            # completion trace gate. It joins existing status containers for
+            # identities that the completion detector will actually consume.
+            if self._completion_gate_trace_enabled():
+                consumed_running_entries = set(completion_downloading_file_names)
+                previous_running_entries = getattr(
+                    controller, "_Controller__prev_downloading_file_names", set(),
+                )
+                pending_dispatches = getattr(
+                    controller, "_Controller__pending_queue_dispatches", {},
+                )
+
+                def status_states_by_file_id(statuses) -> dict[str, set[str]]:
+                    result: dict[str, set[str]] = {}
+                    for status in statuses:
+                        file_id = getattr(status, "file_id", None)
+                        if not isinstance(file_id, str):
+                            continue
+                        state = getattr(status, "state", None)
+                        if state == LftpJobStatus.State.RUNNING:
+                            state_name = "running"
+                        elif state == LftpJobStatus.State.QUEUED:
+                            state_name = "queued"
+                        elif isinstance(state, LftpJobStatus.State):
+                            state_name = "other"
+                        else:
+                            state_name = "unknown"
+                        result.setdefault(file_id, set()).add(state_name)
+                    return result
+
+                raw_status_states = status_states_by_file_id(raw_lftp_statuses)
+                post_filter_status_states = status_states_by_file_id(post_filter_lftp_statuses)
+                displayed_status_states = status_states_by_file_id(displayed_lftp_statuses)
+
+                def status_membership_state(states_by_file_id, file_id: str) -> str:
+                    states = states_by_file_id.get(file_id, set())
+                    if not states:
+                        return "absent"
+                    if len(states) > 1:
+                        return "mixed"
+                    return next(iter(states))
+
+                completion_status_membership_by_file_id = {}
+                for entry in previous_running_entries:
+                    if entry not in consumed_running_entries:
+                        continue
+                    name, path_pair_id, _ = entry
+                    file_id = ModelFile.build_file_id(name, path_pair_id)
+                    duplicate_running_retained = any(
+                        getattr(status, "file_id", None) == file_id and
+                        getattr(status, "state", None) == LftpJobStatus.State.RUNNING and
+                        (status.name, status.path_pair_id, status.path_pair_name)
+                        in consumed_running_entries
+                        for status in raw_lftp_statuses
+                    ) if file_id in raw_duplicate_status_file_ids else False
+                    completion_status_membership_by_file_id[file_id] = {
+                        "raw_status_state": status_membership_state(raw_status_states, file_id),
+                        "post_filter_status_state": status_membership_state(
+                            post_filter_status_states, file_id,
+                        ),
+                        "displayed_status_state": status_membership_state(
+                            displayed_status_states, file_id,
+                        ),
+                        "pending_dispatch_member": isinstance(pending_dispatches, dict) and
+                            file_id in pending_dispatches,
+                        "raw_duplicate_member": file_id in raw_duplicate_status_file_ids,
+                        "duplicate_retained_running": duplicate_running_retained,
+                        "completion_consumed_running": True,
+                    }
+        except Exception:
+            # Optional diagnostic projection must never alter update behavior.
+            completion_status_membership_by_file_id = None
         self._revoke_stale_model_published_provenance(
             replacement_statuses_by_file_id(),
         )
@@ -6536,6 +6655,7 @@ class ModelUpdater(_ControllerCoreAccess):
             lftp_status_poll_healthy=lftp_status_poll_healthy,
             lftp_status_source=lftp_status_source,
             lftp_status_poll_correlation=lftp_status_poll_correlation,
+            completion_status_membership_by_file_id=completion_status_membership_by_file_id,
         )
         self._clear_replaced_pending_completion_floors(raw_lftp_statuses)
         controller._Controller__active_downloading_file_names = current_downloading_file_names
@@ -7177,27 +7297,63 @@ class ModelUpdater(_ControllerCoreAccess):
             ) and status.path_pair_id is None and isinstance(status.name, str)
         }
 
+        def record_pending_completion_authority_wake(file_id: str, decision: str, reason: str) -> None:
+            try:
+                if not self._completion_gate_trace_enabled():
+                    return
+            except Exception:
+                return
+            self._record_completion_gate_breadcrumb(
+                file_id,
+                "pending_completion_authority_wake",
+                {
+                    "schema": "pending_completion_authority_wake.v1",
+                    "decision": decision,
+                    "reason": reason,
+                },
+            )
+
         def pending_completion_authority_available(file_id: str) -> bool:
             try:
                 pending_file = model.get_file(file_id)
             except ModelError:
+                record_pending_completion_authority_wake(file_id, "blocked", "model_missing")
                 return False
             path_pair_id = pending_file.path_pair_id
-            if path_pair_id not in reconciled_local_path_pair_ids or \
-                    path_pair_id not in reconciled_remote_path_pair_ids:
+            if path_pair_id not in reconciled_local_path_pair_ids:
+                record_pending_completion_authority_wake(
+                    file_id, "blocked", "local_scope_unreconciled",
+                )
                 return False
-            if not lftp_status_poll_healthy or not bool(getattr(
-                    controller, "_Controller__lftp_idle_status_authoritative", False
-            )):
+            if path_pair_id not in reconciled_remote_path_pair_ids:
+                record_pending_completion_authority_wake(
+                    file_id, "blocked", "remote_scope_unreconciled",
+                )
                 return False
-            if file_id in active_lftp_status_file_ids or (
-                    path_pair_id is not None and
-                    pending_file.name in active_unscoped_lftp_status_names
-            ):
+            if not lftp_status_poll_healthy:
+                record_pending_completion_authority_wake(
+                    file_id, "blocked", "lftp_status_poll_unhealthy",
+                )
+                return False
+            if not bool(getattr(controller, "_Controller__lftp_idle_status_authoritative", False)):
+                record_pending_completion_authority_wake(
+                    file_id, "blocked", "lftp_idle_status_unauthoritative",
+                )
+                return False
+            if file_id in active_lftp_status_file_ids:
+                record_pending_completion_authority_wake(
+                    file_id, "blocked", "exact_active_lftp_owner",
+                )
+                return False
+            if path_pair_id is not None and pending_file.name in active_unscoped_lftp_status_names:
+                record_pending_completion_authority_wake(
+                    file_id, "blocked", "unscoped_active_lftp_owner",
+                )
                 return False
             if controller._Controller__is_explicitly_stopped(
                     pending_file.full_path, path_pair_id
             ):
+                record_pending_completion_authority_wake(file_id, "blocked", "explicit_stop")
                 return False
             # Physical identity, complete coverage, and collision authority
             # remain the final gate in the pending lifecycle pass below.  This
@@ -7209,6 +7365,9 @@ class ModelUpdater(_ControllerCoreAccess):
         for file_id in current_pending_completion_ids:
             if pending_completion_authority_available(file_id):
                 if file_id not in pending_authority_rebuild_ids:
+                    record_pending_completion_authority_wake(
+                        file_id, "wake_allowed", "authority_available",
+                    )
                     authority_wake_ids.add(file_id)
             else:
                 pending_authority_rebuild_ids.discard(file_id)
@@ -8400,15 +8559,68 @@ class ModelUpdater(_ControllerCoreAccess):
                 return authoritative_pair_build is None or \
                     candidate_pair_id(file_id) == authoritative_pair_build.path_pair_id
 
-            def pending_completion_move_authorized(file_id: str) -> bool:
+            def record_pending_completion_move_decision(
+                    file_id: str, stage: str, decision: str, reason: str,
+                    proof_source: str, move_result: str = "not_attempted",
+            ) -> None:
+                try:
+                    if not self._completion_gate_trace_enabled():
+                        return
+                    self._record_completion_gate_breadcrumb(
+                        file_id,
+                        "pending_completion_move_decision",
+                        {
+                            "schema": "pending_completion_move_decision.v1",
+                            "stage": stage,
+                            "decision": decision,
+                            "reason": reason,
+                            "proof_source": proof_source,
+                            "move_result": move_result,
+                        },
+                        poll_correlation=lftp_status_poll_correlation,
+                    )
+                except Exception:
+                    # Diagnostic emission is optional and cannot affect the
+                    # existing completion predicate or move outcome.
+                    return
+
+            def record_pending_completion_move_result(file_id: str, move_result: object) -> None:
+                try:
+                    if not self._completion_gate_trace_enabled():
+                        return
+                    move_result_name = getattr(move_result, "name", "unknown").lower()
+                    move_result_values = {
+                        "completed": ("result", "move_completed", "completed"),
+                        "already_completed": ("result", "move_already_completed", "already_completed"),
+                        "deferred": ("result", "move_deferred", "deferred"),
+                        "failed": ("result", "move_failed", "failed"),
+                        "no_move_applicable": ("result", "move_no_applicable", "no_move_applicable"),
+                        "conflict": ("result", "move_conflict", "conflict"),
+                    }
+                    decision, reason, bounded_result = move_result_values.get(
+                        move_result_name, ("result", "move_deferred", "unknown"),
+                    )
+                    record_pending_completion_move_decision(
+                        file_id, "move", decision, reason, "move_result", bounded_result,
+                    )
+                except Exception:
+                    # Result classification is diagnostic-only; preserve the
+                    # move's actual result if its optional projection fails.
+                    return
+
+            def pending_completion_move_authorized(
+                    file_id: str, trace_pending_decision: bool = False,
+            ) -> bool:
                 with _ModelFinalizationBreadcrumbSpan(
                         controller, "completion_gate", lftp_status_poll_correlation,
                 ), _ModelUpdateDurationSpan(
                         diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_COMPLETION_GATE_PHYSICAL_PROOF,
                 ):
-                    return _pending_completion_move_authorized(file_id)
+                    return _pending_completion_move_authorized(file_id, trace_pending_decision)
 
-            def _pending_completion_move_authorized(file_id: str) -> bool:
+            def _pending_completion_move_authorized(
+                    file_id: str, trace_pending_decision: bool = False,
+            ) -> bool:
                 """Require current end-to-end authority before an automatic move.
 
                 The pending identity survives LFTP retirement specifically so a
@@ -8424,22 +8636,61 @@ class ModelUpdater(_ControllerCoreAccess):
                     pending_file = new_model.get_file(file_id)
                 except ModelError:
                     pending_authority_rebuild_ids.discard(file_id)
+                    if trace_pending_decision:
+                        record_pending_completion_move_decision(
+                            file_id, "authority", "skipped", "model_missing", "model_lookup",
+                        )
                     return False
                 path_pair_id = pending_file.path_pair_id
-                if path_pair_id not in reconciled_local_path_pair_ids or \
-                        path_pair_id not in reconciled_remote_path_pair_ids:
+                if path_pair_id not in reconciled_local_path_pair_ids:
                     pending_authority_rebuild_ids.discard(file_id)
+                    if trace_pending_decision:
+                        record_pending_completion_move_decision(
+                            file_id, "authority", "skipped", "local_scope_unreconciled",
+                            "local_scan_scope",
+                        )
                     return False
-                if not lftp_status_poll_healthy or not bool(getattr(
+                if path_pair_id not in reconciled_remote_path_pair_ids:
+                    pending_authority_rebuild_ids.discard(file_id)
+                    if trace_pending_decision:
+                        record_pending_completion_move_decision(
+                            file_id, "authority", "skipped", "remote_scope_unreconciled",
+                            "remote_scan_scope",
+                        )
+                    return False
+                if not lftp_status_poll_healthy:
+                    pending_authority_rebuild_ids.discard(file_id)
+                    if trace_pending_decision:
+                        record_pending_completion_move_decision(
+                            file_id, "authority", "skipped", "poll_unhealthy", "lftp_status",
+                        )
+                    return False
+                if not bool(getattr(
                         controller, "_Controller__lftp_idle_status_authoritative", False
                 )):
                     pending_authority_rebuild_ids.discard(file_id)
+                    if trace_pending_decision:
+                        record_pending_completion_move_decision(
+                            file_id, "authority", "skipped", "idle_unauthoritative",
+                            "lftp_status",
+                        )
                     return False
-                if file_id in active_lftp_status_file_ids or (
-                        path_pair_id is not None and
-                        pending_file.name in active_unscoped_lftp_status_names
-                ):
+                if file_id in active_lftp_status_file_ids:
                     pending_authority_rebuild_ids.discard(file_id)
+                    if trace_pending_decision:
+                        record_pending_completion_move_decision(
+                            file_id, "authority", "skipped", "active_exact_owner",
+                            "lftp_status",
+                        )
+                    return False
+                if path_pair_id is not None and \
+                        pending_file.name in active_unscoped_lftp_status_names:
+                    pending_authority_rebuild_ids.discard(file_id)
+                    if trace_pending_decision:
+                        record_pending_completion_move_decision(
+                            file_id, "authority", "skipped", "active_unscoped_owner",
+                            "lftp_status",
+                        )
                     return False
                 # This is the sole acknowledgement point for the wake. It
                 # records that this candidate evaluated a stable completion
@@ -8448,9 +8699,21 @@ class ModelUpdater(_ControllerCoreAccess):
                 # but incomplete staging tree would request a rebuild on
                 # every quiet update instead of waiting for fresh scan input.
                 pending_authority_rebuild_ids.add(file_id)
-                authorized = candidate_verified_staging_identity(file_id) and \
-                    candidate_complete_local_coverage(file_id)
-                return authorized
+                if not candidate_verified_staging_identity(file_id):
+                    if trace_pending_decision:
+                        record_pending_completion_move_decision(
+                            file_id, "authority", "skipped", "staging_identity_unverified",
+                            "staging_remote_identity",
+                        )
+                    return False
+                if not candidate_complete_local_coverage(file_id):
+                    if trace_pending_decision:
+                        record_pending_completion_move_decision(
+                            file_id, "authority", "skipped", "local_coverage_incomplete",
+                            "complete_local_coverage",
+                        )
+                    return False
+                return True
 
             def candidate_has_actionable_unrelated_retry(file_id: str) -> bool:
                 """Keep a stale durable marker from invalidating a pair candidate.
@@ -8722,7 +8985,10 @@ class ModelUpdater(_ControllerCoreAccess):
                     ).discard(file.file_id)
                     self._clear_pending_completion_progress_floor(controller, file.file_id)
 
-                def run_reserved_automatic_move(file: ModelFile, trace_completion_gate: bool = False):
+                def run_reserved_automatic_move(
+                        file: ModelFile, trace_completion_gate: bool = False,
+                        trace_pending_decision: bool = False,
+                ):
                     reserve_move = getattr(controller, "_reserve_move_attempt", None)
                     release_move = getattr(controller, "_release_move_attempt", None)
                     move_from_staging = getattr(controller, "_Controller__move_from_staging", None)
@@ -8737,6 +9003,11 @@ class ModelUpdater(_ControllerCoreAccess):
                                 {"reason": "move_boundary_unavailable"},
                                 poll_correlation=lftp_status_poll_correlation,
                             )
+                        if trace_pending_decision:
+                            record_pending_completion_move_decision(
+                                file.file_id, "move", "skipped", "move_boundary_unavailable",
+                                "move_reservation",
+                            )
                         return None
                     if not reserve_move(file.file_id):
                         if trace_completion_gate:
@@ -8744,6 +9015,11 @@ class ModelUpdater(_ControllerCoreAccess):
                                 file.file_id, "completion_gate_move_deferred",
                                 {"reason": "move_reservation_unavailable"},
                                 poll_correlation=lftp_status_poll_correlation,
+                            )
+                        if trace_pending_decision:
+                            record_pending_completion_move_decision(
+                                file.file_id, "move", "skipped", "move_reservation_unavailable",
+                                "move_reservation",
                             )
                         return None
                     try:
@@ -8757,6 +9033,8 @@ class ModelUpdater(_ControllerCoreAccess):
                             file.name,
                             file.path_pair_id,
                         )
+                        if trace_pending_decision:
+                            record_pending_completion_move_result(file.file_id, move_result)
                         if trace_completion_gate:
                             self._record_completion_gate_breadcrumb(
                                 file.file_id, "completion_gate_move_result",
@@ -9373,26 +9651,49 @@ class ModelUpdater(_ControllerCoreAccess):
                         # mutate an unrelated root, but it must request the
                         # ordinary global lifecycle even before a first move
                         # failure has created retry state.
-                        if pending_completion_move_authorized(file_id) or (
+                        authority_available = pending_completion_move_authorized(
+                            file_id, trace_pending_decision=True,
+                        )
+                        if authority_available or (
                                 (failure_count > 0 or
                                  file_id in controller._Controller__deferred_move_file_ids) and
-                                candidate_has_actionable_unrelated_retry(file_id)
+                                 candidate_has_actionable_unrelated_retry(file_id)
                         ):
+                            if authority_available:
+                                record_pending_completion_move_decision(
+                                    file_id, "candidate", "deferred",
+                                    "candidate_pair_unselected", "candidate_scope",
+                                )
                             defer_unrelated_candidate_lifecycle_work(
                                 CANDIDATE_UNRELATED_LIFECYCLE_REASON_PENDING_COMPLETION,
                             )
                         continue
                     if file_id in attempted_move_file_ids:
+                        record_pending_completion_move_decision(
+                            file_id, "candidate", "skipped", "already_attempted",
+                            "candidate_scope",
+                        )
                         continue
                     failure_count = persist.move_failure_counts.get(file_id, 0)
                     if failure_count >= controller._Controller__MAX_MOVE_FAILURES:
+                        record_pending_completion_move_decision(
+                            file_id, "candidate", "skipped", "retry_limit_reached",
+                            "candidate_scope",
+                        )
                         continue
                     retry_due = controller._Controller__move_retry_due.get(file_id)
                     if retry_due is not None and datetime.now() < retry_due:
+                        record_pending_completion_move_decision(
+                            file_id, "candidate", "skipped", "retry_not_due",
+                            "candidate_scope",
+                        )
                         continue
                     try:
                         pending_file = new_model.get_file(file_id)
                     except ModelError:
+                        record_pending_completion_move_decision(
+                            file_id, "candidate", "skipped", "model_missing", "model_lookup",
+                        )
                         continue
                     # A stop is an explicit cancellation boundary, including
                     # for a completion whose first move was deferred until a
@@ -9401,15 +9702,22 @@ class ModelUpdater(_ControllerCoreAccess):
                             pending_file.full_path, pending_file.path_pair_id,
                     ):
                         discard_pending_completion_file(file_id)
+                        record_pending_completion_move_decision(
+                            file_id, "candidate", "cancelled", "explicit_stop", "explicit_stop",
+                        )
                         continue
                     # Durable retry state alone must not re-authorize a move:
                     # the current effective local tree can have gained an
                     # active-only branch or collision since the last attempt.
                     # Leave pending/retry state intact until coverage is
                     # proven again.
-                    if not pending_completion_move_authorized(file_id):
+                    if not pending_completion_move_authorized(
+                            file_id, trace_pending_decision=True,
+                    ):
                         continue
-                    move_result = run_reserved_automatic_move(pending_file)
+                    move_result = run_reserved_automatic_move(
+                        pending_file, trace_pending_decision=True,
+                    )
                     if move_result is None:
                         continue
                     if move_result in (
