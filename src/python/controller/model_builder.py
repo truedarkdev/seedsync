@@ -211,6 +211,7 @@ class ModelBuilder:
     __MIXED_ROOT_TRACE_CATEGORY = "model.mixed_root"
     __MIXED_ROOT_TRACE_SCHEMA = "model_builder.mixed_root.v1"
     __MIXED_ROOT_TRACE_COUNT_MAX = 4096
+    __LOCAL_SOURCE_ADOPTION_TRACE_SCHEMA = "model_builder.local_source_adoption.v1"
 
     def __init__(self):
         self.logger = logging.getLogger("ModelBuilder")
@@ -689,6 +690,11 @@ class ModelBuilder:
             for signature_key in [
                     key for key in self.__stop_resume_trace_last_signatures
                     if key[1] == "remote_publication"
+            ]:
+                self.__stop_resume_trace_last_signatures.pop(signature_key, None)
+            for signature_key in [
+                    key for key in self.__stop_resume_trace_last_signatures
+                    if key[0].startswith("local-source-adoption:")
             ]:
                 self.__stop_resume_trace_last_signatures.pop(signature_key, None)
         self.__stop_resume_trace_breadcrumb = emitter
@@ -2676,6 +2682,7 @@ class ModelBuilder:
         """Adopt proven roots and bind their tokens to this builder's exact source objects."""
         # Clear first so a failed bucket update cannot leave proof attached to
         # a retained source from an earlier scan generation.
+        previous_proofs = self.__local_root_scan_proofs
         self.__local_root_scan_proofs = {}
         accepted: dict[str, tuple[SystemFile, str, int]] = {}
         if isinstance(sources, dict):
@@ -2694,7 +2701,9 @@ class ModelBuilder:
             for root in self.local_source_roots_snapshot()
         }
         roots_by_id.update({file_id: source[0] for file_id, source in accepted.items()})
+        previous_local = self.__local_files_by_pair
         self.set_local_files(list(roots_by_id.values()))
+        committed_local = self.__local_files_by_pair
 
         bound_proofs: dict[str, tuple[str, int, SystemFile]] = {}
         for file_id, (scanned_root, session_token, generation) in accepted.items():
@@ -2702,6 +2711,40 @@ class ModelBuilder:
             if isinstance(adopted_root, SystemFile) and adopted_root.is_dir and adopted_root == scanned_root:
                 bound_proofs[file_id] = (session_token, generation, adopted_root)
         self.__local_root_scan_proofs = bound_proofs
+        try:
+            trace_enabled = bool(bound_proofs) and _breadcrumb_effectively_enabled(
+                self.__stop_resume_trace_breadcrumb, "scan.root_shape", "info",
+            )
+        except Exception:
+            trace_enabled = False
+        changed_proof_ids = set()
+        if trace_enabled:
+            for file_id in set(previous_proofs).union(bound_proofs):
+                previous_proof = previous_proofs.get(file_id)
+                bound_proof = bound_proofs.get(file_id)
+                if previous_proof is None or bound_proof is None:
+                    changed = previous_proof is not bound_proof
+                else:
+                    changed = previous_proof[0] != bound_proof[0] or \
+                        previous_proof[1] != bound_proof[1] or previous_proof[2] is not bound_proof[2]
+                if changed:
+                    changed_proof_ids.add(file_id)
+        if changed_proof_ids:
+            changed_pair_ids = set()
+            for file_id in changed_proof_ids:
+                for proof in (previous_proofs.get(file_id), bound_proofs.get(file_id)):
+                    if isinstance(proof, tuple) and len(proof) == 3 and isinstance(proof[2], SystemFile):
+                        changed_pair_ids.add(proof[2].path_pair_id)
+            incoming_proof_roots: dict[Optional[str], dict[str, SystemFile]] = {}
+            for file_id, (root, _, _) in accepted.items():
+                if root.path_pair_id in changed_pair_ids:
+                    incoming_proof_roots.setdefault(root.path_pair_id, {})[file_id] = root
+            self.__record_local_source_adoption(
+                {pair_id: previous_local.get(pair_id, {}) for pair_id in changed_pair_ids},
+                {pair_id: incoming_proof_roots.get(pair_id, {}) for pair_id in changed_pair_ids},
+                {pair_id: committed_local.get(pair_id, {}) for pair_id in changed_pair_ids},
+                "root_scan_proof_adoption",
+            )
 
     def has_current_local_root_scan_proof(
             self, file_id: str, session_token: object, generation: object,
@@ -4830,9 +4873,14 @@ class ModelBuilder:
     def set_local_files(self, local_files: List[SystemFile]) -> None:
         started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_LOCAL_FILES)
         try:
+            trace_enabled = _breadcrumb_effectively_enabled(
+                self.__stop_resume_trace_breadcrumb, "scan.root_shape", "info",
+            )
+            previous_local_files = self.__local_files_by_pair
             next_local_files = self.__bucket_files(local_files)
             # Invalidate the cache
-            if next_local_files != self.__local_files_by_pair:
+            changed = next_local_files != previous_local_files
+            if changed:
                 self.__local_files_by_pair = next_local_files
                 self.__refresh_source_name_counts()
                 self.__refresh_local_root_name_counts()
@@ -4841,8 +4889,106 @@ class ModelBuilder:
                     file_id: proof for file_id, proof in self.__local_root_scan_proofs.items()
                     if len(proof) == 3 and self.__local_file(file_id) is proof[2]
                 }
+            if changed and trace_enabled:
+                self.__record_local_source_adoption(
+                    previous_local_files,
+                    next_local_files,
+                    self.__local_files_by_pair,
+                    "local_files_set",
+                )
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_LOCAL_FILES, started_at)
+
+    @staticmethod
+    def __local_source_root_counts(
+            files_by_id: dict[str, SystemFile],
+    ) -> dict[str, int]:
+        """Count only direct source-map roots, without walking their children."""
+        directory_root_count = sum(1 for source in files_by_id.values() if source.is_dir)
+        return {
+            "root_count": len(files_by_id),
+            "file_root_count": len(files_by_id) - directory_root_count,
+            "directory_root_count": directory_root_count,
+        }
+
+    def __local_source_generation_known(
+            self, files_by_id: dict[str, SystemFile],
+    ) -> bool:
+        """Report whether a committed direct root still has an exact scan proof."""
+        for file_id, source in files_by_id.items():
+            proof = self.__local_root_scan_proofs.get(file_id)
+            if isinstance(proof, tuple) and len(proof) == 3 and \
+                    isinstance(proof[0], str) and type(proof[1]) is int and proof[1] >= 0 and \
+                    proof[2] is source:
+                return True
+        return False
+
+    def __record_local_source_adoption(
+            self,
+            current_by_pair: dict[Optional[str], dict[str, SystemFile]],
+            incoming_by_pair: dict[Optional[str], dict[str, SystemFile]],
+            committed_by_pair: dict[Optional[str], dict[str, SystemFile]],
+            stage: str,
+    ) -> None:
+        """Emit one opaque, finite top-level source join per changed pair."""
+        breadcrumb = self.__stop_resume_trace_breadcrumb
+        try:
+            if not _breadcrumb_effectively_enabled(breadcrumb, "scan.root_shape", "info"):
+                return
+            path_pair_ids = set(current_by_pair).union(incoming_by_pair).union(committed_by_pair)
+            for path_pair_id in sorted(
+                    path_pair_ids,
+                    key=lambda value: opaque_trace_correlation(value if isinstance(value, str) else ""),
+            ):
+                current_roots = current_by_pair.get(path_pair_id, {})
+                incoming_roots = incoming_by_pair.get(path_pair_id, {})
+                committed_roots = committed_by_pair.get(path_pair_id, {})
+                source_generation_known = self.__local_source_generation_known(committed_roots)
+                if stage == "root_scan_proof_adoption" and not source_generation_known:
+                    continue
+                pair_correlation = opaque_trace_correlation(path_pair_id)
+                details: dict[str, object] = {
+                    "schema": self.__LOCAL_SOURCE_ADOPTION_TRACE_SCHEMA,
+                    "phase": stage,
+                    "path_pair_known": isinstance(path_pair_id, str),
+                    "path_pair_correlation": pair_correlation,
+                    "source_generation_known": source_generation_known,
+                }
+                for prefix, roots in (
+                        ("current", current_roots),
+                        ("incoming", incoming_roots),
+                        ("committed", committed_roots),
+                ):
+                    details.update({
+                        prefix + "_" + name: count
+                        for name, count in self.__local_source_root_counts(roots).items()
+                    })
+                signature = json.dumps(details, sort_keys=True, separators=(",", ":"))
+                signature_key = ("local-source-adoption:" + pair_correlation, stage)
+                if self.__stop_resume_trace_last_signatures.get(signature_key) == "retained:" + signature:
+                    self.__stop_resume_trace_last_signatures.move_to_end(signature_key)
+                    continue
+                if breadcrumb is None:
+                    continue
+                recorder = getattr(breadcrumb, "record", None)
+                if not callable(recorder):
+                    continue
+                outcome = recorder(
+                    "model_builder",
+                    "local_source_adoption",
+                    details,
+                    stage="model_builder_local_source_" + stage,
+                    event_type="diagnostic",
+                    category="scan.root_shape",
+                    level="info",
+                    corr_id=pair_correlation,
+                    trace_scope="aggregate",
+                    _coalesce_key=opaque_trace_correlation(signature),
+                )
+                self.__remember_trace_signature(signature_key, signature, outcome == "retained")
+        except Exception:
+            # Source-adoption diagnostics cannot change committed source state.
+            return
 
     def set_remote_files(self, remote_files: List[SystemFile]) -> None:
         started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_REMOTE_FILES)
@@ -5296,6 +5442,7 @@ class ModelBuilder:
         root_shape_trace_enabled = _breadcrumb_effectively_enabled(
             breadcrumb, "scan.root_shape", "info",
         )
+        local_source_changed_for_trace = False
         if root_shape_trace_enabled:
             _record_root_shape_breadcrumb(
                 breadcrumb,
@@ -5340,6 +5487,9 @@ class ModelBuilder:
             self.__remote_files_by_pair.pop(pair_id, None)
         affected_ids = set(old_sources).union(next_sources)
         for file_id in affected_ids:
+            if root_shape_trace_enabled and not local_source_changed_for_trace and \
+                    previous_local.get(file_id) is not pair_build.local_files.get(file_id):
+                local_source_changed_for_trace = True
             self.__update_status_only_name_count(file_id)
             self.__update_active_only_name_count(file_id)
         if root_shape_trace_enabled:
@@ -5353,6 +5503,13 @@ class ModelBuilder:
                 progressive=True,
                 phase="model_builder_pair_adoption_committed",
                 flow_id="model-builder:remote-pair",
+            )
+        if local_source_changed_for_trace:
+            self.__record_local_source_adoption(
+                {pair_id: previous_local},
+                {pair_id: pair_build.local_files},
+                {pair_id: self.__local_files_by_pair.get(pair_id, {})},
+                "authoritative_pair_commit",
             )
 
     def has_pending_active_transfer_delta(self) -> bool:

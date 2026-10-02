@@ -349,6 +349,16 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
         return collector
 
+    def __enable_local_source_adoption_trace(self, max_entries: int = 16) -> BreadcrumbTraceCollector:
+        self.__trace_enabled = [True]
+        collector = BreadcrumbTraceCollector(
+            lambda: self.__trace_enabled[0],
+            max_entries=max_entries,
+            policy={"default": "off", "rules": {"scan.root_shape": "info"}},
+        )
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        return collector
+
     def test_remote_publication_breadcrumb_is_gated_opaque_and_deduplicated(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=2, policy={"default": "off", "rules": {"model.publication": "info"}})
         self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
@@ -10141,6 +10151,331 @@ class TestModelBuilder(unittest.TestCase):
                 baseline = build_case(local_root, stopped, False)
                 traced = build_case(local_root, stopped, True)
                 self.assertEqual(baseline[:2], traced[:2])
+
+    def test_local_source_adoption_trace_reports_top_level_join_and_is_finite(self):
+        directory_root = SystemFile("private-directory-root", 20, True)
+        directory_root.path_pair_id = "private-pair"
+        nested_directory = SystemFile("nested-directory", 10, True)
+        nested_directory.add_child(SystemFile("nested-file.bin", 10, False))
+        directory_root.add_child(nested_directory)
+        file_root = SystemFile("private-file-root.bin", 7, False)
+        file_root.path_pair_id = "private-pair"
+        collector = self.__enable_local_source_adoption_trace(max_entries=4)
+
+        self.model_builder.set_local_files([directory_root, file_root])
+
+        entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "local_source_adoption"
+        ]
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        details = entry["details"]
+        self.assertEqual("model_builder.local_source_adoption.v1", details["schema"])
+        self.assertEqual("local_files_set", details["phase"])
+        self.assertTrue(details["path_pair_known"])
+        self.assertNotEqual("private-pair", details["path_pair_correlation"])
+        self.assertFalse(details["source_generation_known"])
+        self.assertEqual(
+            (0, 0, 0),
+            (
+                details["current_root_count"],
+                details["current_file_root_count"],
+                details["current_directory_root_count"],
+            ),
+        )
+        expected = (2, 1, 1)
+        self.assertEqual(
+            expected,
+            (
+                details["incoming_root_count"],
+                details["incoming_file_root_count"],
+                details["incoming_directory_root_count"],
+            ),
+        )
+        self.assertEqual(
+            expected,
+            (
+                details["committed_root_count"],
+                details["committed_file_root_count"],
+                details["committed_directory_root_count"],
+            ),
+        )
+        self.assertNotIn("private-directory-root", str(entry))
+        self.assertNotIn("private-file-root", str(entry))
+        self.assertNotIn("nested-file.bin", str(entry))
+        self.assertLess(len(json.dumps(entry)), 4096)
+
+        # An identical setter call is not another semantic source adoption.
+        with patch.object(
+                self.model_builder,
+                "_ModelBuilder__local_source_root_counts",
+                side_effect=AssertionError("unchanged adoption performed count work"),
+        ):
+            self.model_builder.set_local_files([directory_root, file_root])
+        entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "local_source_adoption"
+        ]
+        self.assertEqual(1, len(entries))
+
+    def test_local_source_adoption_trace_joins_authoritative_pair_commit(self):
+        root = SystemFile("private-root", 4, True)
+        root.path_pair_id = "private-pair"
+        collector = self.__enable_local_source_adoption_trace()
+
+        self.model_builder.replace_completed_pair_sources_for_full_rebuild(
+            "private-pair", [root], [], set(),
+        )
+
+        entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "local_source_adoption"
+        ]
+        self.assertEqual(1, len(entries))
+        details = entries[0]["details"]
+        self.assertEqual("authoritative_pair_commit", details["phase"])
+        self.assertEqual(0, details["current_root_count"])
+        self.assertEqual(1, details["incoming_directory_root_count"])
+        self.assertEqual(1, details["committed_directory_root_count"])
+        self.assertFalse(details["source_generation_known"])
+        self.assertNotIn("private-root", str(entries[0]))
+        self.assertNotIn("private-pair", str(entries[0]))
+
+    def test_local_source_adoption_pair_trace_uses_root_identity_without_deep_equality(self):
+        builder = self.model_builder
+        original_root = SystemFile("private-root", 4, True)
+        original_root.path_pair_id = "private-pair"
+        original_root.add_child(SystemFile("private-child.bin", 4, False))
+        builder.replace_completed_pair_sources_for_full_rebuild(
+            "private-pair", [original_root], [], set(),
+        )
+        collector = self.__enable_local_source_adoption_trace()
+
+        replacement_root = SystemFile("private-root", 4, True)
+        replacement_root.path_pair_id = "private-pair"
+        replacement_root.add_child(SystemFile("private-child.bin", 4, False))
+        with patch.object(
+                SystemFile, "__eq__",
+                side_effect=AssertionError("source adoption diagnostics compared SystemFile trees"),
+        ):
+            builder.replace_completed_pair_sources_for_full_rebuild(
+                "private-pair", [replacement_root], [], set(),
+            )
+
+        entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "local_source_adoption"
+        ]
+        self.assertEqual(1, len(entries))
+        details = entries[0]["details"]
+        self.assertEqual("authoritative_pair_commit", details["phase"])
+        self.assertEqual(1, details["current_root_count"])
+        self.assertEqual(1, details["incoming_directory_root_count"])
+        self.assertEqual(1, details["committed_directory_root_count"])
+
+        with patch.object(
+                builder,
+                "_ModelBuilder__local_source_root_counts",
+                side_effect=AssertionError("unchanged pair adoption performed count work"),
+        ):
+            builder.replace_completed_pair_sources_for_full_rebuild(
+                "private-pair", [replacement_root], [], set(),
+            )
+
+    @unittest.skipIf(os.name == "nt", "Windows durable file acknowledgement is buffered/unverified")
+    def test_local_source_adoption_trace_is_durable_and_finite(self):
+        with tempfile.TemporaryDirectory() as path:
+            collector = BreadcrumbTraceCollector(
+                lambda: True,
+                max_entries=1,
+                policy={"default": "off", "rules": {"scan.root_shape": "info"}},
+                durable_enabled=True,
+                durable_path=path,
+            )
+            builder = ModelBuilder()
+            builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+            directory_root = SystemFile("private-directory", 4, True)
+            directory_root.path_pair_id = "private-pair"
+            directory_root.add_child(SystemFile("private-child.bin", 4, False))
+            builder.set_local_files([directory_root])
+
+            self.assertTrue(collector.flush_durable(2.0))
+            with open(os.path.join(path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+            entry = next(record for record in records if record.get("message") == "local_source_adoption")
+            self.assertEqual(1, entry["details"]["committed_root_count"])
+            self.assertEqual(1, entry["details"]["committed_directory_root_count"])
+            self.assertNotIn("private-directory", json.dumps(entry))
+            self.assertNotIn("private-child.bin", json.dumps(entry))
+            self.assertNotIn("private-pair", json.dumps(entry))
+            self.assertLess(len(json.dumps(entry)), 4096)
+            collector.close()
+
+    def test_local_source_adoption_trace_emits_root_proof_only_after_binding(self):
+        builder = ModelBuilder()
+        root = SystemFile("private-root", 4, True)
+        root.path_pair_id = "private-pair"
+        file_id = ModelFile.build_file_id(root.name, root.path_pair_id)
+        session_token = "private-session-token"
+        generation = 7
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=4,
+            policy={"default": "off", "rules": {"scan.root_shape": "info"}},
+        )
+        delegate = collector.create_emitter()
+
+        class ProofCheckingEmitter:
+            @staticmethod
+            def is_effectively_enabled(category, level="info"):
+                return delegate.is_effectively_enabled(category, level)
+
+            @staticmethod
+            def record(*args, **kwargs):
+                if len(args) >= 3 and args[1] == "local_source_adoption":
+                    if args[2].get("phase") == "root_scan_proof_adoption":
+                        self.assertTrue(builder.has_current_local_root_scan_proof(
+                            file_id, session_token, generation,
+                        ))
+                    else:
+                        self.assertFalse(builder.has_current_local_root_scan_proof(
+                            file_id, session_token, generation,
+                        ))
+                return delegate.record(*args, **kwargs)
+
+        builder.set_stop_resume_trace_breadcrumb(ProofCheckingEmitter())
+        builder.adopt_local_root_scan_sources({
+            file_id: (root, session_token, generation),
+        })
+
+        entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "local_source_adoption"
+        ]
+        self.assertEqual(2, len(entries))
+        details_by_phase = {entry["details"]["phase"]: entry["details"] for entry in entries}
+        self.assertFalse(details_by_phase["local_files_set"]["source_generation_known"])
+        proof_details = details_by_phase["root_scan_proof_adoption"]
+        self.assertTrue(proof_details["source_generation_known"])
+        proof_entry = next(entry for entry in entries if entry["details"]["phase"] == "root_scan_proof_adoption")
+        self.assertNotIn(session_token, str(proof_entry))
+        self.assertNotIn("private-root", str(proof_entry))
+
+    def test_local_source_adoption_trace_preserves_proof_for_fresh_equal_root(self):
+        builder = self.model_builder
+        root = SystemFile("private-root", 4, True)
+        root.path_pair_id = "private-pair"
+        root.add_child(SystemFile("private-child.bin", 4, False))
+        file_id = ModelFile.build_file_id(root.name, root.path_pair_id)
+        session_token = "private-session-token"
+        generation = 7
+        collector = self.__enable_local_source_adoption_trace()
+
+        builder.adopt_local_root_scan_sources({
+            file_id: (root, session_token, generation),
+        })
+        self.assertTrue(builder.has_current_local_root_scan_proof(
+            file_id, session_token, generation,
+        ))
+        original_entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "local_source_adoption"
+        ]
+        self.assertEqual(2, len(original_entries))
+
+        equal_replacement = SystemFile("private-root", 4, True)
+        equal_replacement.path_pair_id = "private-pair"
+        equal_replacement.add_child(SystemFile("private-child.bin", 4, False))
+        equality_calls = {"root": 0, "descendant": 0}
+        original_equality = SystemFile.__eq__
+
+        def count_behavioral_equality(left, right):
+            if left is root or left is equal_replacement:
+                equality_calls["root"] += 1
+            else:
+                equality_calls["descendant"] += 1
+            return original_equality(left, right)
+
+        with patch.object(SystemFile, "__eq__", new=count_behavioral_equality), \
+                patch.object(
+                    builder,
+                    "_ModelBuilder__local_source_root_counts",
+                    side_effect=AssertionError("unchanged proof performed diagnostic root counting"),
+                ), \
+                patch.object(
+                    builder,
+                    "_ModelBuilder__record_local_source_adoption",
+                    side_effect=AssertionError("unchanged proof re-emitted its adoption diagnostic"),
+                ):
+            builder.adopt_local_root_scan_sources({
+                file_id: (equal_replacement, session_token, generation),
+            })
+
+        # The two root/descendant equality calls belong to the existing source
+        # replacement and proof-binding predicates; the diagnostic comparison
+        # must add no further recursive equality call.
+        self.assertEqual({"root": 2, "descendant": 2}, equality_calls)
+        self.assertTrue(builder.has_current_local_root_scan_proof(
+            file_id, session_token, generation,
+        ))
+        self.assertIs(builder.local_source_roots_snapshot()[0], root)
+        final_entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "local_source_adoption"
+        ]
+        self.assertEqual(2, len(final_entries))
+
+    def test_local_source_adoption_trace_disabled_gate_skips_count_work(self):
+        class DisabledEmitter:
+            @staticmethod
+            def is_effectively_enabled(category, level="info"):
+                return False
+
+            @staticmethod
+            def record(*args, **kwargs):
+                raise AssertionError("disabled local source adoption trace was emitted")
+
+        self.model_builder.set_stop_resume_trace_breadcrumb(DisabledEmitter())
+        root = SystemFile("root", 4, True)
+        with patch.object(
+                self.model_builder,
+                "_ModelBuilder__local_source_root_counts",
+                side_effect=AssertionError("disabled source count work ran"),
+        ):
+            self.model_builder.set_local_files([root])
+
+        self.assertEqual(1, len(self.model_builder.local_source_roots_snapshot()))
+
+    def test_local_source_adoption_trace_failure_is_isolated_and_precommit_is_silent(self):
+        class FailingEmitter:
+            @staticmethod
+            def is_effectively_enabled(category, level="info"):
+                return category == "scan.root_shape"
+
+            @staticmethod
+            def record(*args, **kwargs):
+                raise RuntimeError("breadcrumb output exploded")
+
+        root = SystemFile("root", 4, True)
+        self.model_builder.set_stop_resume_trace_breadcrumb(FailingEmitter())
+        self.model_builder.set_local_files([root])
+        self.assertEqual(1, len(self.model_builder.local_source_roots_snapshot()))
+
+        builder = ModelBuilder()
+        collector = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"scan.root_shape": "info"}},
+        )
+        builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        with patch.object(
+                builder,
+                "_ModelBuilder__bucket_files",
+                side_effect=RuntimeError("source replacement failed"),
+        ), self.assertRaises(RuntimeError):
+            builder.set_local_files([root])
+        self.assertEqual([], self.__trace_entries(collector, include_root_decisions=True))
+        self.assertEqual((), builder.local_source_roots_snapshot())
 
     def test_mixed_root_trace_reason_change_emits_and_identical_result_dedupes(self):
         remote_root = SystemFile("sample-directory", 20, True)
