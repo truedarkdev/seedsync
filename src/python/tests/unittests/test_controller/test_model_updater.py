@@ -3020,6 +3020,165 @@ class TestModelUpdater(unittest.TestCase):
             full_snapshot_path_pair_ids={pair_id},
         )
 
+    def test_confirmed_local_delete_fence_releases_on_later_exact_root_chunk_while_pair_unknown(self):
+        pair_id = "pair"
+        session = "local-session"
+        initial_root = SystemFile("root", 15, True)
+        deleted_directory = SystemFile("folder", 10, True)
+        deleted_directory.add_child(SystemFile("deleted-a.bin", 5))
+        deleted_directory.add_child(SystemFile("deleted-b.bin", 5))
+        initial_root.add_child(deleted_directory)
+        initial_root.add_child(SystemFile("keep.bin", 5))
+        initial_root.path_pair_id = pair_id
+        initial = self._local_full_snapshot([initial_root], 10, pair_id)
+        initial.session_token = session
+        initial.root_scan_outcomes_by_pair = {pair_id: {"root": (True, True)}}
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([initial])
+
+        self.assertTrue(accumulator.confirm_local_deletion(
+            pair_id, "root", ("folder", "deleted-a.bin"), 10, session,
+        ))
+        self.assertTrue(accumulator.confirm_local_deletion(
+            pair_id, "root", ("folder", "deleted-b.bin"), 10, session,
+        ))
+        self.assertTrue(accumulator.confirm_local_deletion(
+            pair_id, "root", ("folder",), 10, session,
+        ))
+        self.assertEqual(
+            1,
+            len(accumulator._ProgressiveScanAccumulator__move_invalidations_by_root[
+                (pair_id, "root")
+            ]),
+        )
+        root_id = ModelFile.build_file_id("root", pair_id)
+        def assert_pruned(root_file):
+            self.assertEqual({"keep.bin"}, {child.name for child in root_file.iter_children()})
+
+        assert_pruned(accumulator.snapshot()[(pair_id, "root")])
+        assert_pruned(accumulator.authority()[(pair_id, "root")])
+        committed_root = accumulator._ProgressiveScanAccumulator__committed_by_pair[pair_id]["root"]
+        assert_pruned(committed_root)
+        for generation_files in accumulator._ProgressiveScanAccumulator__working.values():
+            pair_files = generation_files.get(pair_id, {})
+            if "root" in pair_files:
+                assert_pruned(pair_files["root"])
+        self.assertNotIn(root_id, accumulator.current_root_scan_sources())
+
+        old_root = SystemFile("root", 15, True)
+        old_deleted_directory = SystemFile("folder", 10, True)
+        old_deleted_directory.add_child(SystemFile("deleted-a.bin", 5))
+        old_deleted_directory.add_child(SystemFile("deleted-b.bin", 5))
+        old_root.add_child(old_deleted_directory)
+        old_root.add_child(SystemFile("keep.bin", 5))
+        old_root.path_pair_id = pair_id
+        stale = ScannerResult(
+            datetime.now(), [old_root], scanned_path_pair_ids={pair_id}, generation=9,
+            is_progress=True, session_token=session,
+            root_scan_outcomes_by_pair={pair_id: {"root": (True, True)}},
+        )
+        same_generation = ScannerResult(
+            datetime.now(), [old_root], scanned_path_pair_ids={pair_id}, generation=10,
+            is_progress=True, session_token=session,
+            root_scan_outcomes_by_pair={pair_id: {"root": (True, True)}},
+        )
+        accumulator.apply([stale, same_generation])
+        assert_pruned(accumulator.snapshot()[(pair_id, "root")])
+        assert_pruned(accumulator.authority()[(pair_id, "root")])
+        self.assertNotIn(root_id, accumulator.current_root_scan_sources())
+
+        sibling = SystemFile("sibling-root", 1)
+        sibling.path_pair_id = pair_id
+        first_chunk = ScannerResult(
+            datetime.now(), [sibling], scanned_path_pair_ids={pair_id}, generation=11,
+            is_progress=True, session_token=session,
+            root_scan_outcomes_by_pair={pair_id: {"sibling-root": (True, True)}},
+        )
+        fresh_root = SystemFile("root", 5, True)
+        fresh_root.add_child(SystemFile("keep.bin", 5))
+        fresh_root.path_pair_id = pair_id
+        same_generation_root = ScannerResult(
+            datetime.now(), [fresh_root], scanned_path_pair_ids={pair_id}, generation=11,
+            is_progress=True, session_token=session,
+            root_scan_outcomes_by_pair={pair_id: {"root": (True, True)}},
+        )
+        accumulator.apply([first_chunk, same_generation_root])
+
+        failed_sibling = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={pair_id}, generation=11,
+            failed=True, unknown_path_pair_ids={pair_id}, is_progress=True,
+            session_token=session,
+        )
+        accumulator.apply([failed_sibling])
+        self.assertIn(pair_id, accumulator.incomplete_pairs())
+        self.assertEqual(
+            {"keep.bin"},
+            {child.name for child in accumulator.snapshot()[(pair_id, "root")].iter_children()},
+        )
+        self.assertIn(root_id, accumulator.current_root_scan_sources())
+        self.assertNotIn((pair_id, "root"), accumulator._ProgressiveScanAccumulator__move_invalidations_by_root)
+
+    def test_confirmed_root_delete_coalesces_and_only_full_snapshot_proves_absence(self):
+        pair_id = "pair"
+        session = "local-session"
+        root = SystemFile("root", 1, True)
+        root.add_child(SystemFile("child.bin", 1))
+        root.path_pair_id = pair_id
+        initial = self._local_full_snapshot([root], 20, pair_id)
+        initial.session_token = session
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([initial])
+
+        self.assertTrue(accumulator.confirm_local_deletion(pair_id, "root", (), 20, session))
+        self.assertTrue(accumulator.confirm_local_deletion(pair_id, "root", (), 21, session))
+        invalidations = accumulator._ProgressiveScanAccumulator__move_invalidations_by_root
+        self.assertEqual(1, len(invalidations[(pair_id, "root")]))
+        self.assertEqual(21, next(iter(invalidations[(pair_id, "root")].values()))[0])
+        self.assertNotIn((pair_id, "root"), accumulator.snapshot())
+
+        incomplete_empty = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={pair_id}, generation=22,
+            is_progress=True, session_token=session,
+        )
+        accumulator.apply([incomplete_empty])
+        self.assertIn((pair_id, "root"), accumulator._ProgressiveScanAccumulator__move_invalidations_by_root)
+
+        full_empty = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={pair_id}, completed_path_pair_ids={pair_id},
+            generation=23, is_progress=True, is_full_snapshot=True,
+            full_snapshot_path_pair_ids={pair_id}, session_token=session,
+        )
+        accumulator.apply([full_empty])
+        self.assertNotIn((pair_id, "root"), accumulator._ProgressiveScanAccumulator__move_invalidations_by_root)
+        self.assertNotIn((pair_id, "root"), accumulator.snapshot())
+
+        self.assertTrue(accumulator.confirm_local_deletion(pair_id, "root", (), 23, session))
+        fresh_root = SystemFile("root", 1, True)
+        fresh_root.add_child(SystemFile("new.bin", 1))
+        fresh_root.path_pair_id = pair_id
+        later_root = ScannerResult(
+            datetime.now(), [fresh_root], scanned_path_pair_ids={pair_id}, generation=24,
+            is_progress=True, session_token=session,
+            root_scan_outcomes_by_pair={pair_id: {"root": (True, True)}},
+        )
+        accumulator.apply([later_root])
+        self.assertIn(pair_id, accumulator.incomplete_pairs())
+        self.assertIn((pair_id, "root"), accumulator.snapshot())
+        self.assertIn(ModelFile.build_file_id("root", pair_id), accumulator.current_root_scan_sources())
+        self.assertNotIn((pair_id, "root"), accumulator._ProgressiveScanAccumulator__move_invalidations_by_root)
+
+        self.assertTrue(accumulator.confirm_local_deletion(pair_id, "root", (), 24, session))
+        accumulator.set_session_token("replacement-session")
+        self.assertNotIn((pair_id, "root"), accumulator._ProgressiveScanAccumulator__move_invalidations_by_root)
+        stale_session_root = SystemFile("root", 1, True)
+        stale_session_root.path_pair_id = pair_id
+        stale_session = ScannerResult(
+            datetime.now(), [stale_session_root], scanned_path_pair_ids={pair_id}, generation=24,
+            is_progress=True, session_token=session,
+        )
+        accumulator.apply([stale_session])
+        self.assertNotIn((pair_id, "root"), accumulator.snapshot())
+
     def test_progressive_accumulator_root_shape_trace_is_empty_when_disabled(self):
         accumulator = _ProgressiveScanAccumulator()
         self.assertEqual({}, accumulator.root_shape_trace())

@@ -2227,6 +2227,63 @@ class _ProgressiveScanAccumulator:
             if not entries:
                 self.__move_invalidations_by_root.pop(key, None)
 
+    def confirm_local_deletion(
+            self, path_pair_id: Optional[str], root_name: str,
+            relative_path_segments: tuple[str, ...], generation: int, session_token: str,
+    ) -> bool:
+        """Prune accepted local roots and fence their pre-delete scan source."""
+        if not isinstance(root_name, str) or not root_name or type(generation) is not int or \
+                generation < 0 or not isinstance(session_token, str) or not session_token or \
+                any(not isinstance(segment, str) or not segment or segment in (".", "..")
+                    for segment in relative_path_segments):
+            return False
+        self.set_session_token(session_token)
+        key = (path_pair_id, root_name)
+        entries = self.__move_invalidations_by_root.setdefault(key, {})
+        for token, (captured_generation, status) in entries.items():
+            if status == "confirmed_delete":
+                entries[token] = (max(captured_generation, generation), status)
+                break
+        else:
+            self.__next_move_invalidation_token += 1
+            entries[self.__next_move_invalidation_token] = (generation, "confirmed_delete")
+
+        def prune_root(files: dict[str, SystemFile]) -> None:
+            root = files.get(root_name)
+            if root is None:
+                return
+            updated = ModelBuilder.prune_confirmed_local_deletion(
+                root, relative_path_segments,
+            )
+            if updated is None:
+                files.pop(root_name, None)
+            else:
+                files[root_name] = updated
+
+        prune_root(self.__committed_by_pair.setdefault(path_pair_id, {}))
+        for generation_files in self.__working.values():
+            pair_files = generation_files.get(path_pair_id)
+            if pair_files is not None:
+                prune_root(pair_files)
+        authoritative = self.__authoritative_by_pair.get(path_pair_id)
+        if authoritative is not None:
+            root = authoritative.get(root_name)
+            if isinstance(root, SystemFile):
+                updated = ModelBuilder.prune_confirmed_local_deletion(
+                    root, relative_path_segments,
+                )
+                if updated is None:
+                    authoritative.pop(root_name, None)
+                else:
+                    authoritative[root_name] = updated
+        fingerprints = self.__committed_root_fingerprints.get(path_pair_id)
+        if fingerprints is not None:
+            fingerprints.pop(root_name, None)
+            if not fingerprints:
+                self.__committed_root_fingerprints.pop(path_pair_id, None)
+        self.__last_touched_keys.add((path_pair_id, root_name))
+        return True
+
     @staticmethod
     def __pair_for_file(file: SystemFile, result: ScannerResult) -> Optional[str]:
         if isinstance(file.path_pair_id, str) or file.path_pair_id is None:
@@ -2567,19 +2624,42 @@ class _ProgressiveScanAccumulator:
                 full_snapshot = bool(getattr(event, "is_full_snapshot", False)) \
                     and pair_id in full_snapshot_ids
                 healthy_post_move_snapshot = self.__is_authoritative_completion(event, pair_id)
+                previous_generation = self.__active_generation.get(pair_id, -1)
+                event_outcomes = getattr(event, "root_scan_outcomes_by_pair", {})
+                pair_outcomes = event_outcomes.get(pair_id) if isinstance(event_outcomes, dict) else None
+                event_root_names = {
+                    file.name for file in event.files
+                    if self.__pair_for_file(file, event) == pair_id
+                }
+                entries_for_pair = [
+                    (key, entries) for key, entries in self.__move_invalidations_by_root.items()
+                    if key[0] == pair_id
+                ]
+                for key, entries in entries_for_pair:
+                    root_name = key[1]
+                    for token, (captured_generation, status) in list(entries.items()):
+                        if status != "confirmed_delete" or generation <= captured_generation or \
+                                generation < previous_generation:
+                            continue
+                        has_current_root = isinstance(pair_outcomes, dict) and \
+                            pair_outcomes.get(root_name) == (True, True) and \
+                            root_name in event_root_names
+                        if has_current_root or healthy_post_move_snapshot:
+                            entries.pop(token, None)
+                    if not entries:
+                        self.__move_invalidations_by_root.pop(key, None)
                 protected_root_names = set()
                 for (invalid_pair_id, root_name), entries in self.__move_invalidations_by_root.items():
                     if invalid_pair_id != pair_id:
                         continue
                     if any(
-                            status == "pending" or generation <= captured_generation or
-                            not healthy_post_move_snapshot
+                            status == "confirmed_delete" or status == "pending" or
+                            generation <= captured_generation or not healthy_post_move_snapshot
                             for captured_generation, status in entries.values()
                     ):
                         protected_root_names.add(root_name)
                 if root_shape_trace is not None:
                     root_shape_trace["protected_root_count"] += len(protected_root_names)
-                previous_generation = self.__active_generation.get(pair_id, -1)
                 if generation < previous_generation:
                     event_stale_rejected = True
                     continue
@@ -2948,6 +3028,9 @@ class _ProgressiveScanAccumulator:
                 continue
             authoritative_roots = self.__authoritative_by_pair.get(pair_id, {})
             for root_name, role_outcomes in outcomes.items():
+                invalidations = self.__move_invalidations_by_root.get((pair_id, root_name), {})
+                if any(status == "confirmed_delete" for _, status in invalidations.values()):
+                    continue
                 current_root = authoritative_roots.get(root_name)
                 if role_outcomes == (True, True) and isinstance(current_root, SystemFile):
                     sources[ModelFile.build_file_id(root_name, pair_id)] = (
@@ -4650,6 +4733,31 @@ class ModelUpdater(_ControllerCoreAccess):
         """Commit or cancel exactly one local-root physical move attempt."""
         accumulator = _ensure_progressive_scan_state(self._controller, "local")
         accumulator.finish_root_invalidation(path_pair_id, root_name, token, mutated)
+
+    def confirm_local_delete(self, file_id: str, path_pair_id: Optional[str]) -> bool:
+        """Fence one confirmed delete against the scanner's current session/work."""
+        process = getattr(self._controller, "_Controller__local_scan_process", None)
+        session_token = getattr(process, "session_token", None)
+        generation = getattr(process, "generation", None)
+        if not isinstance(session_token, str) or not session_token or \
+                type(generation) is not int or generation < 0:
+            return False
+        try:
+            identity = json.loads(file_id)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(identity, list) or len(identity) != 2 or \
+                identity[0] != path_pair_id or not isinstance(identity[1], str) or \
+                ModelFile.build_file_id(identity[1], identity[0]) != file_id:
+            return False
+        relative_path = identity[1].replace("\\", "/")
+        path_segments = tuple(relative_path.split("/"))
+        if not path_segments or any(segment in ("", ".", "..") for segment in path_segments):
+            return False
+        accumulator = _ensure_progressive_scan_state(self._controller, "local", eager=True)
+        return accumulator.confirm_local_deletion(
+            path_pair_id, path_segments[0], path_segments[1:], generation, session_token,
+        )
 
     @staticmethod
     def _preserve_pending_completion_progress_floor(

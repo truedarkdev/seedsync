@@ -4626,6 +4626,18 @@ class ModelBuilder:
         ), removed_size, True
 
     @staticmethod
+    def prune_confirmed_local_deletion(
+            source: SystemFile, path_segments: Tuple[str, ...],
+    ) -> Optional[SystemFile]:
+        """Return the exact-root snapshot after a confirmed nested deletion."""
+        if not path_segments:
+            return None
+        updated, _, changed = ModelBuilder.__prune_confirmed_local_descendant(
+            source, path_segments,
+        )
+        return updated if changed else source
+
+    @staticmethod
     def __completion_relative_path_segments(
             file_id: str, root: SystemFile, path_pair_id: Optional[str],
     ) -> Optional[Tuple[str, ...]]:

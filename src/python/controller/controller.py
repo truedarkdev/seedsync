@@ -9492,6 +9492,11 @@ class Controller:
     ) -> int:
         """Apply the shared metadata transition after a confirmed local delete."""
         self.__advance_transfer_lifecycle(file_id)
+        confirm_local_delete = getattr(
+            getattr(self, "_Controller__updater", None), "confirm_local_delete", None,
+        )
+        if callable(confirm_local_delete):
+            confirm_local_delete(file_id, path_pair_id)
         confirm_local_deletions = getattr(
             self.__model_builder, "confirm_local_deletions", None,
         )

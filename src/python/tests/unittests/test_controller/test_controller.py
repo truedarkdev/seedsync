@@ -16569,6 +16569,108 @@ class TestController(unittest.TestCase):
                 },
             )
 
+    def test_confirmed_nested_delete_does_not_re_adopt_a_queued_predelete_scan(self):
+        pair_id = "delete-target-pair"
+        other_pair_id = "delete-sibling-pair"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_path = os.path.join(temp_dir, "local")
+            remote_path = os.path.join(temp_dir, "remote")
+            other_local_path = os.path.join(temp_dir, "other-local")
+            other_remote_path = os.path.join(temp_dir, "other-remote")
+            deleted_path = os.path.join(local_path, "release", "deleted.bin")
+            os.makedirs(os.path.dirname(deleted_path))
+            Path(deleted_path).write_bytes(b"old")
+            Path(os.path.join(local_path, "release", "keep.bin")).write_bytes(b"keep")
+            os.makedirs(os.path.join(remote_path, "release"))
+            Path(os.path.join(remote_path, "release", "deleted.bin")).write_bytes(b"old")
+            Path(os.path.join(remote_path, "release", "keep.bin")).write_bytes(b"keep")
+            os.makedirs(other_local_path)
+            os.makedirs(other_remote_path)
+            Path(os.path.join(other_local_path, "other.bin")).write_bytes(b"other")
+            Path(os.path.join(other_remote_path, "other.bin")).write_bytes(b"other")
+
+            controller = self.controller
+            builder = ModelBuilder()
+            controller._Controller__model_builder = builder
+            controller._Controller__model = Model()
+            controller._Controller__model_lock = threading.RLock()
+            controller._Controller__path_pairs_by_id = {
+                pair_id: SimpleNamespace(remote_path=remote_path, local_path=local_path),
+                other_pair_id: SimpleNamespace(
+                    remote_path=other_remote_path, local_path=other_local_path,
+                ),
+            }
+            controller._Controller__path_pair_staging_paths = {}
+            controller._Controller__context.config.general.exclude_patterns = ""
+            local_process = ScannerProcess(MultiPathLocalScanner([
+                LocalScanner(local_path, use_temp_file=False, path_pair_id=pair_id),
+                LocalScanner(other_local_path, use_temp_file=False, path_pair_id=other_pair_id),
+            ]), interval_in_ms=0, verbose=False)
+            remote_process = ScannerProcess(MultiPathLocalScanner([
+                LocalScanner(remote_path, use_temp_file=False, path_pair_id=pair_id),
+                LocalScanner(other_remote_path, use_temp_file=False, path_pair_id=other_pair_id),
+            ]), interval_in_ms=0, verbose=False)
+            self.addCleanup(local_process.close_queues)
+            self.addCleanup(remote_process.close_queues)
+            controller._Controller__local_scan_process = local_process
+            controller._Controller__remote_scan_process = remote_process
+            updater = ModelUpdater(controller)
+            controller._Controller__updater = updater
+
+            remote_process.run_loop()
+            local_process.run_loop()
+            updater.update()
+            updater.update()
+            root_id = ModelFile.build_file_id("release", pair_id)
+            deleted_id = ModelFile.build_file_id(os.path.join("release", "deleted.bin"), pair_id)
+            kept_id = ModelFile.build_file_id(os.path.join("release", "keep.bin"), pair_id)
+            other_id = ModelFile.build_file_id("other.bin", other_pair_id)
+            self.assertIn(root_id, controller._Controller__model.get_file_ids())
+            initial_children = {
+                child.name: child for child in controller._Controller__model.get_file(root_id).get_children()
+            }
+            self.assertIn("deleted.bin", initial_children)
+            self.assertTrue(initial_children["deleted.bin"].local_present)
+            self.assertTrue(initial_children["keep.bin"].local_present)
+            self.assertIn(other_id, controller._Controller__model.get_file_ids())
+
+            # Leave a genuine production ScannerProcess result queued from before
+            # the confirmed delete, then complete the physical operation.
+            local_process.run_loop()
+            stale_results = list(local_process._ScannerProcess__queue.queue)
+            self.assertTrue(any(
+                any(file.name == "release" and file.path_pair_id == pair_id for file in event.files)
+                for event in stale_results
+            ))
+            os.unlink(deleted_path)
+            controller._Controller__complete_delete_local_lifecycle(
+                deleted_id, pair_id, "deleted.bin", os.path.join("release", "deleted.bin"),
+            )
+            pruned_root = next(
+                root for root in builder.local_source_roots_snapshot()
+                if root.name == "release" and root.path_pair_id == pair_id
+            )
+            self.assertEqual({"keep.bin"}, {child.name for child in pruned_root.iter_children()})
+
+            updater.update()
+
+            model = controller._Controller__model
+            self.assertIn(root_id, model.get_file_ids())
+            updated_children = {
+                child.name: child for child in model.get_file(root_id).get_children()
+            }
+            self.assertIn("deleted.bin", updated_children)
+            self.assertFalse(updated_children["deleted.bin"].local_present)
+            self.assertTrue(updated_children["deleted.bin"].remote_present)
+            self.assertTrue(updated_children["keep.bin"].local_present)
+            self.assertIn(other_id, model.get_file_ids())
+            retained_root = builder.local_source_roots_snapshot()
+            pair_a_root = next(
+                root for root in retained_root
+                if root.name == "release" and root.path_pair_id == pair_id
+            )
+            self.assertEqual({"keep.bin"}, {child.name for child in pair_a_root.iter_children()})
+
     def test_real_local_scan_publishes_complete_regular_roots_through_normal_updater_cycle(self):
         pair_id = "pair-readable-inventory"
         unreadable_pair_id = "pair-unreadable-sibling"
