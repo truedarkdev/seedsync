@@ -3364,8 +3364,12 @@ class ModelBuilder:
                 ), False
             remote_children = {child.name: child for child in remote_file.iter_children()}
             effective_children = {child.name: child for child in effective_file.iter_children()}
-            if set(remote_children) != set(effective_children):
-                return False, False
+            for name, local_child in effective_children.items():
+                if name in remote_children:
+                    continue
+                if local_child.has_staging_origin is not False or \
+                        ModelBuilder.__has_staging_ambiguity_descendant(local_child):
+                    return False, False
             saw_leaf = False
             for name, remote_child in remote_children.items():
                 verified, child_saw_leaf = visit(remote_child, effective_children.get(name))
@@ -3376,6 +3380,17 @@ class ModelBuilder:
 
         verified, saw_leaf = visit(remote_root, effective_root)
         return verified and saw_leaf
+
+    @staticmethod
+    def __has_staging_ambiguity_descendant(system_file: SystemFile) -> bool:
+        """Reject staged, sidecar-backed, or colliding content under a final-only node."""
+        if system_file.is_staging or system_file.has_staging_origin is True or \
+                system_file.has_staging_collision or system_file.status_sidecar_ready:
+            return True
+        return any(
+            ModelBuilder.__has_staging_ambiguity_descendant(child)
+            for child in system_file.iter_children()
+        )
 
     def has_unresolved_staging_collision(self, file_id: str) -> bool:
         """Whether the effective root still has an unproven staging collision."""
@@ -4739,6 +4754,7 @@ class ModelBuilder:
             time_modified=system_file.timestamp_modified,
             is_staging=system_file.is_staging if is_staging is None else is_staging,
             mtime_ns=system_file.mtime_ns,
+            has_staging_origin=system_file.has_staging_origin,
         )
         cloned.path_pair_id = system_file.path_pair_id
         cloned.path_pair_name = system_file.path_pair_name
@@ -4834,6 +4850,8 @@ class ModelBuilder:
                 merged_children,
                 is_staging=existing_file.is_staging and active_file.is_staging,
             )
+            if active_file.is_staging or active_file.has_staging_origin is True:
+                merged.has_staging_origin = True
             merged.has_staging_collision = \
                 existing_file.has_staging_collision or active_file.has_staging_collision
             return merged
@@ -4849,6 +4867,8 @@ class ModelBuilder:
             merged.has_staging_collision = not ModelBuilder.__leaf_matches_remote_identity(
                 remote_file, active_file
             )
+            if active_file.is_staging or active_file.has_staging_origin is True:
+                merged.has_staging_origin = True
             return merged
 
         merged = ModelBuilder.__clone_system_file(active_file)

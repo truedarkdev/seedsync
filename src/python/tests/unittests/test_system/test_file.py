@@ -96,6 +96,21 @@ class TestSystemFile(unittest.TestCase):
         self.assertTrue(restored.has_staging_collision)
         self.assertFalse(restored.is_staging)
 
+    def test_staging_origin_is_tristate_and_round_trips(self):
+        final_only = SystemFile("final", 0, True, has_staging_origin=False)
+        merged_staging = SystemFile("merged", 0, True, has_staging_origin=True)
+
+        restored_final = SystemFile.from_dict(final_only.to_dict())
+        restored_merged = SystemFile.from_dict(merged_staging.to_dict())
+        legacy = SystemFile.from_dict({"name": "legacy", "size": 0, "is_dir": True})
+
+        self.assertIs(False, restored_final.has_staging_origin)
+        self.assertIs(True, restored_merged.has_staging_origin)
+        self.assertIsNone(legacy.has_staging_origin)
+        self.assertEqual(final_only, restored_final)
+        self.assertEqual(merged_staging, restored_merged)
+        self.assertIsNone(SystemFile("unknown", 0).has_staging_origin)
+
     def test_fail_add_child_to_file(self):
         sf = SystemFile("", 0, False)
         with self.assertRaises(TypeError) as context:
@@ -133,6 +148,7 @@ class TestSystemFile(unittest.TestCase):
 
     def test_compact_storage_preserves_recursive_copy_pickle_and_diagnostics(self):
         root = SystemFile("root", 10, is_dir=True)
+        root.has_staging_origin = False
         root.path_pair_id = "pair"
         root.path_pair_name = "Pair"
         root.status_sidecar_ready = True
@@ -145,4 +161,5 @@ class TestSystemFile(unittest.TestCase):
         self.assertEqual(root, restored)
         self.assertEqual("child", restored.children[0].name)
         self.assertIn("_SystemFile__status_sidecar_ready", repr(root))
+        self.assertIn("_SystemFile__has_staging_origin", repr(root))
         self.assertFalse(hasattr(root, "__dict__"))

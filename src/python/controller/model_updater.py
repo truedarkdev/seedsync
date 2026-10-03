@@ -8011,6 +8011,25 @@ class ModelUpdater(_ControllerCoreAccess):
             ) and status.path_pair_id is None and isinstance(status.name, str)
         }
 
+        def pending_root_local_scope_available(file_id: str, pending_file: ModelFile) -> bool:
+            # The existing root proof covers local scan scope only. Remote,
+            # ownership and physical payload checks still run independently.
+            if pending_file.path_pair_id not in reconciled_remote_path_pair_ids:
+                return False
+            try:
+                if pending_file.is_dir is not True or pending_file.full_path != pending_file.name or \
+                        ModelFile.build_file_id(pending_file.full_path, pending_file.path_pair_id) != file_id:
+                    return False
+                process = getattr(controller, "_Controller__local_scan_process", None)
+                session = getattr(process, "session_token", None)
+                generation = getattr(process, "generation", None)
+                if type(session) is not str or not session or type(generation) is not int or generation < 0:
+                    return False
+                checker = getattr(model_builder, "has_current_local_root_scan_proof", None)
+                return callable(checker) and checker(file_id, session, generation) is True
+            except Exception:
+                return False
+
         def pending_local_root_proof_details(file_id: str, pending_file: ModelFile) -> dict[str, object]:
             details: dict[str, object] = {
                 "local_root_proof_shape": "unknown",
@@ -8072,7 +8091,14 @@ class ModelUpdater(_ControllerCoreAccess):
                 "decision": decision,
                 "reason": reason,
             }
-            if reason == "local_scope_unreconciled" and pending_file is not None:
+            if reason == "authority_available" and pending_file is None:
+                try:
+                    selected = model.get_file(file_id)
+                    if selected.path_pair_id not in reconciled_local_path_pair_ids:
+                        pending_file = selected
+                except ModelError:
+                    pass
+            if reason in ("local_scope_unreconciled", "authority_available") and pending_file is not None:
                 details.update(pending_local_root_proof_details(file_id, pending_file))
             self._record_completion_gate_breadcrumb(
                 file_id,
@@ -8087,7 +8113,8 @@ class ModelUpdater(_ControllerCoreAccess):
                 record_pending_completion_authority_wake(file_id, "blocked", "model_missing")
                 return False
             path_pair_id = pending_file.path_pair_id
-            if path_pair_id not in reconciled_local_path_pair_ids:
+            if path_pair_id not in reconciled_local_path_pair_ids and \
+                    not pending_root_local_scope_available(file_id, pending_file):
                 record_pending_completion_authority_wake(
                     file_id, "blocked", "local_scope_unreconciled", pending_file,
                 )
@@ -9409,7 +9436,8 @@ class ModelUpdater(_ControllerCoreAccess):
                         )
                     return False
                 path_pair_id = pending_file.path_pair_id
-                if path_pair_id not in reconciled_local_path_pair_ids:
+                if path_pair_id not in reconciled_local_path_pair_ids and \
+                        not pending_root_local_scope_available(file_id, pending_file):
                     pending_authority_rebuild_ids.discard(file_id)
                     if trace_pending_decision:
                         record_pending_completion_move_decision(

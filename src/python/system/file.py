@@ -15,6 +15,7 @@ class SystemFileData(TypedDict):
     path_pair_id: NotRequired[str]
     path_pair_name: NotRequired[str]
     is_staging: NotRequired[bool]
+    has_staging_origin: NotRequired[bool]
     has_staging_collision: NotRequired[bool]
     children: NotRequired[list["SystemFileData"]]
 
@@ -35,6 +36,7 @@ class SystemFile:
         "__path_pair_name",
     )
     __DIR, __STAGING, __STATUS_READY, __STAGING_COLLISION = 1, 2, 4, 8
+    __STAGING_ORIGIN_KNOWN, __HAS_STAGING_ORIGIN = 16, 32
 
     def __init__(self,
                  name: str,
@@ -43,7 +45,8 @@ class SystemFile:
                  time_created: datetime | None = None,
                  time_modified: datetime | None = None,
                  is_staging: bool = False,
-                 mtime_ns: int | None = None):
+                 mtime_ns: int | None = None,
+                 has_staging_origin: bool | None = None):
         if size < 0:
             raise ValueError("File size must be zero or greater")
         self.__name = name
@@ -59,6 +62,7 @@ class SystemFile:
         self.__path_pair_name: str | None = None
         if is_staging:
             self.__flags |= self.__STAGING
+        self.has_staging_origin = has_staging_origin
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, SystemFile):
@@ -74,6 +78,7 @@ class SystemFile:
             and self.__path_pair_id == other.__path_pair_id
             and self.__path_pair_name == other.__path_pair_name
             and self.is_staging == other.is_staging
+            and self.has_staging_origin == other.has_staging_origin
             and self.has_staging_collision == other.has_staging_collision
             and self.status_sidecar_ready == other.status_sidecar_ready
         )
@@ -94,6 +99,7 @@ class SystemFile:
             "_SystemFile__path_pair_id": self.__path_pair_id,
             "_SystemFile__path_pair_name": self.__path_pair_name,
             "_SystemFile__is_staging": self.is_staging,
+            "_SystemFile__has_staging_origin": self.has_staging_origin,
             "_SystemFile__status_sidecar_ready": self.status_sidecar_ready,
             "_SystemFile__has_staging_collision": self.has_staging_collision,
         }
@@ -153,6 +159,23 @@ class SystemFile:
         self.__flags = self.__flags | self.__STAGING if is_staging else self.__flags & ~self.__STAGING
 
     @property
+    def has_staging_origin(self) -> bool | None:
+        if not self.__flags & self.__STAGING_ORIGIN_KNOWN:
+            return None
+        return bool(self.__flags & self.__HAS_STAGING_ORIGIN)
+
+    @has_staging_origin.setter
+    def has_staging_origin(self, value: bool | None):
+        if value is None:
+            self.__flags &= ~(self.__STAGING_ORIGIN_KNOWN | self.__HAS_STAGING_ORIGIN)
+        elif type(value) is not bool:
+            raise TypeError
+        elif value:
+            self.__flags |= self.__STAGING_ORIGIN_KNOWN | self.__HAS_STAGING_ORIGIN
+        else:
+            self.__flags = (self.__flags | self.__STAGING_ORIGIN_KNOWN) & ~self.__HAS_STAGING_ORIGIN
+
+    @property
     def has_staging_collision(self) -> bool: return bool(self.__flags & self.__STAGING_COLLISION)
 
     @has_staging_collision.setter
@@ -196,6 +219,8 @@ class SystemFile:
             d["path_pair_name"] = self.__path_pair_name
         if self.is_staging:
             d["is_staging"] = True
+        if self.has_staging_origin is not None:
+            d["has_staging_origin"] = self.has_staging_origin
         if self.has_staging_collision:
             d["has_staging_collision"] = True
         if self.__children:
@@ -221,6 +246,8 @@ class SystemFile:
         )
         system_file.path_pair_id = data.get("path_pair_id")
         system_file.path_pair_name = data.get("path_pair_name")
+        staging_origin = data.get("has_staging_origin")
+        system_file.has_staging_origin = staging_origin if type(staging_origin) is bool else None
         system_file.has_staging_collision = data.get("has_staging_collision", False)
         for child_data in data.get("children", []):
             system_file.add_child(cls.from_dict(child_data))

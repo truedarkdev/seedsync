@@ -14144,6 +14144,75 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(set(), controller._Controller__pending_completion_file_names)
         self.assertNotIn("pending.bin", json.dumps(results))
 
+    def test_pending_mixed_root_move_uses_current_root_scope_and_keeps_other_guards(self):
+        for case in ("current", "stale", "missing", "failed", "sidecar", "collision", "unknown_origin", "active", "stop"):
+            with self.subTest(case=case):
+                controller = self._make_v092_pending_completion_controller(directory_root=True)
+                builder = controller._Controller__model_builder
+                root_id = ModelFile.build_file_id("pending.bin", None)
+                remote = SystemFile("pending.bin", 10, True)
+                remote.add_child(SystemFile("payload.bin", 10, False, mtime_ns=1))
+                local = SystemFile("pending.bin", 14, True, has_staging_origin=True)
+                payload = SystemFile("payload.bin", 10, False, is_staging=True, mtime_ns=1,
+                                     has_staging_origin=True)
+                payload.status_sidecar_ready = case == "sidecar"
+                payload.has_staging_collision = case == "collision"
+                local.add_child(payload)
+                local.add_child(SystemFile("final-only.bin", 4, False,
+                                          has_staging_origin=None if case == "unknown_origin" else False))
+                self.assertEqual({"payload.bin"}, {child.name for child in remote.iter_children()})
+                self.assertEqual({"final-only.bin"},
+                                 {child.name for child in local.iter_children()} -
+                                 {child.name for child in remote.iter_children()})
+                accumulator = _ProgressiveScanAccumulator()
+                accepted = ScannerResult(
+                    datetime.now(), [local], scanned_path_pair_ids={None}, generation=4,
+                    is_progress=True, session_token="pending-local-session",
+                    root_scan_outcomes_by_pair={None: {"pending.bin": (True, True)}},
+                )
+                accumulator.apply([accepted], {None})
+                self.assertEqual({root_id}, set(accumulator.current_root_scan_sources()))
+                if case == "failed":
+                    accumulator.apply([ScannerResult(
+                        datetime.now(), [], scanned_path_pair_ids={None}, generation=5,
+                        is_progress=True, failed=True, unknown_path_pair_ids={None},
+                        session_token="pending-local-session",
+                    )], {None})
+                    self.assertEqual({}, accumulator.current_root_scan_sources())
+                builder.set_remote_files([remote])
+                builder.set_local_files([local])
+                builder.adopt_local_root_scan_sources(
+                    {} if case == "missing" else accumulator.current_root_scan_sources(),
+                )
+                builder.set_unknown_local_path_pair_ids({None})
+                controller._Controller__model = builder.build_model()
+                controller._Controller__reconciled_local_path_pair_ids = set()
+                controller._Controller__reconciled_remote_path_pair_ids = {None}
+                controller._Controller__local_scan_process.generation = 5 if case == "stale" else 4
+                controller._Controller__prev_downloading_file_names = set()
+                controller._Controller__pending_completion_file_names = {("pending.bin", None, None)}
+                controller._Controller__is_explicitly_stopped = \
+                    Controller._Controller__is_explicitly_stopped.__get__(controller, Controller)
+                controller._record_completion_scan_join_breadcrumb = \
+                    Controller._record_completion_scan_join_breadcrumb.__get__(controller, Controller)
+                controller._Controller__collision_compare_claim = None
+                controller._has_active_collision_comparison = \
+                    Controller._has_active_collision_comparison.__get__(controller, Controller)
+                if case == "stop":
+                    controller._Controller__persist.stopped_file_names = {root_id}
+                if case == "active":
+                    active = LftpJobStatus(2, LftpJobStatus.Type.MIRROR,
+                                           LftpJobStatus.State.RUNNING, "pending.bin", "")
+                    active.total_transfer_state = LftpJobStatus.TransferState(1, 10, 10, 1, 9)
+                    controller._Controller__lftp.status.return_value = [active]
+                with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+                    ModelUpdater(controller).update()
+                if case == "current":
+                    controller._Controller__move_from_staging.assert_called_once_with("pending.bin", None)
+                    self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+                else:
+                    controller._Controller__move_from_staging.assert_not_called()
+
     def test_v092_pending_completion_authority_wake_is_hot_gated_and_durable(self):
         controller = self._make_v092_pending_completion_controller(directory_root=True)
         controller._Controller__reconciled_local_path_pair_ids = set()

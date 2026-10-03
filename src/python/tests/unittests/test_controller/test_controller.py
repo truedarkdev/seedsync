@@ -12260,6 +12260,35 @@ class TestController(unittest.TestCase):
             )
             self.assertEqual(b"stale", Path(os.path.join(source_tree, "E06.mkv")).read_bytes())
 
+    def test_move_from_staging_preserves_final_only_sibling_content_and_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release")
+            destination_tree = os.path.join(final_root, "release")
+            os.makedirs(source_tree)
+            os.makedirs(os.path.join(destination_tree, "final-empty"))
+            final_sibling = os.path.join(destination_tree, "final-only.txt")
+            Path(final_sibling).write_bytes(b"keep final bytes")
+            expected_mtime_ns = 1_700_000_100_500_000_000
+            os.utime(final_sibling, ns=(expected_mtime_ns, expected_mtime_ns))
+            before = os.stat(final_sibling)
+            Path(os.path.join(source_tree, "payload.dat")).write_bytes(b"staged payload")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            result = self.controller._Controller__move_from_staging("release")
+
+            after = os.stat(final_sibling)
+            self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
+            self.assertFalse(os.path.exists(source_tree))
+            self.assertEqual(b"staged payload", Path(os.path.join(destination_tree, "payload.dat")).read_bytes())
+            self.assertEqual(b"keep final bytes", Path(final_sibling).read_bytes())
+            self.assertEqual(before.st_size, after.st_size)
+            self.assertEqual(before.st_mtime_ns, after.st_mtime_ns)
+            self.assertEqual(before.st_mode, after.st_mode)
+            self.assertTrue(os.path.isdir(os.path.join(destination_tree, "final-empty")))
+
     def test_move_from_staging_reconciles_verified_equivalent_nested_collision_without_overwrite(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")

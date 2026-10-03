@@ -374,6 +374,7 @@ class LocalScanner(IScanner):
     @staticmethod
     def __mark_staging_file_tree(system_file: SystemFile) -> None:
         system_file.is_staging = True
+        system_file.has_staging_origin = True
         for child in system_file.iter_children():
             LocalScanner.__mark_staging_file_tree(child)
 
@@ -433,7 +434,8 @@ class LocalScanner(IScanner):
             time_created=system_file.timestamp_created,
             time_modified=system_file.timestamp_modified,
             mtime_ns=system_file.mtime_ns,
-            is_staging=system_file.is_staging
+            is_staging=system_file.is_staging,
+            has_staging_origin=system_file.has_staging_origin,
         )
         cloned.path_pair_id = system_file.path_pair_id
         cloned.path_pair_name = system_file.path_pair_name
@@ -453,6 +455,9 @@ class LocalScanner(IScanner):
         for existing_child in existing_file.iter_children():
             staging_child = staging_children_by_name.get(existing_child.name)
             if staging_child is None:
+                # A current staging scan omitted this child at this merge
+                # node, so its whole subtree is final-only.
+                existing_child.has_staging_origin = False
                 merged_children.append(existing_child)
                 continue
             consumed_staging_names.add(existing_child.name)
@@ -473,7 +478,8 @@ class LocalScanner(IScanner):
             time_created=existing_file.timestamp_created,
             time_modified=existing_file.timestamp_modified,
             mtime_ns=existing_file.mtime_ns,
-            is_staging=False
+            is_staging=False,
+            has_staging_origin=True,
         )
         merged_file.path_pair_id = existing_file.path_pair_id
         merged_file.path_pair_name = existing_file.path_pair_name
@@ -492,6 +498,7 @@ class LocalScanner(IScanner):
             # even though publication must retain a type collision.
             merged_file = LocalScanner.__clone_system_file(existing_file)
             merged_file.has_staging_collision = True
+            merged_file.has_staging_origin = True
             return merged_file
         # The final root is authoritative by location.  A split-root recovery
         # can contain a completed final leaf beside an older or sparse staging
@@ -500,4 +507,5 @@ class LocalScanner(IScanner):
         # the model.  Keep the final leaf regardless of its byte count.
         merged_file = LocalScanner.__clone_system_file(existing_file)
         merged_file.has_staging_collision = True
+        merged_file.has_staging_origin = True
         return merged_file

@@ -19,7 +19,7 @@ from system import SystemFile
 from lftp import Lftp, LftpJobStatus, LftpJobStatusParser
 from model import ActiveProgressOverlay, ModelError, ModelFile, Model
 from controller import Controller, ModelBuilder
-from controller.scan import LocalScanner
+from controller.scan import LocalScanner, MultiPathLocalScanner
 from controller.model_builder import _RecentLiveTransferSnapshot, _TransferState
 from controller.model_updater import ModelUpdater
 from controller.extract import ExtractStatus
@@ -5905,6 +5905,119 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_local_files([local_root])
 
         self.assertTrue(self.model_builder.has_verified_complete_staging_remote_identity("release"))
+
+    def test_verified_staging_identity_is_root_scoped_and_rejects_local_only_siblings(self):
+        remote_root = SystemFile("Software", 10, True)
+        remote_root.path_pair_id = "software-pair"
+        remote_root.add_child(SystemFile("payload.dat", 10, False, mtime_ns=1_700_000_100_000_000_000))
+        unknown_remote_sibling = SystemFile("Unrelated", 5, False)
+        unknown_remote_sibling.path_pair_id = "software-pair"
+        local_root = SystemFile("Software", 10, True)
+        local_root.path_pair_id = "software-pair"
+        local_root.add_child(SystemFile(
+            "payload.dat", 10, False, is_staging=True, mtime_ns=1_700_000_100_500_000_000,
+        ))
+        self.model_builder.set_remote_files([remote_root, unknown_remote_sibling])
+        self.model_builder.set_local_files([local_root])
+        target_id = ModelFile.build_file_id("Software", "software-pair")
+
+        self.assertTrue(self.model_builder.has_verified_complete_staging_remote_identity(target_id))
+
+        mixed_local_root = SystemFile("Software", 30, True)
+        mixed_local_root.path_pair_id = "software-pair"
+        mixed_local_root.add_child(SystemFile("Installer.exe", 10, False, mtime_ns=1_700_000_000_000_000_000))
+        mixed_local_root.add_child(SystemFile("README.txt", 10, False, mtime_ns=1_700_000_050_000_000_000))
+        mixed_local_root.add_child(SystemFile(
+            "payload.dat", 10, False, is_staging=True, mtime_ns=1_700_000_100_500_000_000,
+        ))
+        self.model_builder.set_local_files([mixed_local_root])
+        self.assertFalse(self.model_builder.has_verified_complete_staging_remote_identity(target_id))
+
+        stale_root = SystemFile("Software", 10, True)
+        stale_root.path_pair_id = "software-pair"
+        stale_root.add_child(SystemFile(
+            "payload.dat", 10, False, is_staging=True, mtime_ns=1_700_000_101_000_000_000,
+        ))
+        self.model_builder.set_local_files([stale_root])
+        self.assertFalse(self.model_builder.has_verified_complete_staging_remote_identity(target_id))
+
+        self.model_builder.set_local_files([])
+        self.assertFalse(self.model_builder.has_verified_complete_staging_remote_identity(target_id))
+
+    def test_verified_staging_identity_accepts_scanned_final_only_siblings_and_rejects_staged_empty_dir(self):
+        with tempfile.TemporaryDirectory() as local_path, tempfile.TemporaryDirectory() as staging_path:
+            local_root_path = os.path.join(local_path, "Software")
+            staging_root_path = os.path.join(staging_path, "Software")
+            os.makedirs(os.path.join(local_root_path, "final-empty"))
+            os.makedirs(os.path.join(local_root_path, "final-nested"))
+            Path(os.path.join(local_root_path, "final-nested", "readme.txt")).write_bytes(b"final")
+            os.makedirs(staging_root_path)
+            payload_path = os.path.join(staging_root_path, "payload.dat")
+            Path(payload_path).write_bytes(b"payload")
+            payload_mtime_ns = 1_700_000_100_500_000_000
+            os.utime(payload_path, ns=(payload_mtime_ns, payload_mtime_ns))
+
+            remote_root = SystemFile("Software", 7, True)
+            remote_root.path_pair_id = "software-pair"
+            remote_root.add_child(SystemFile(
+                "payload.dat", 7, False, mtime_ns=1_700_000_100_000_000_000,
+            ))
+            unknown_remote_sibling = SystemFile("Other", 1, False)
+            unknown_remote_sibling.path_pair_id = "software-pair"
+            target_id = ModelFile.build_file_id("Software", "software-pair")
+            self.model_builder.set_remote_files([remote_root, unknown_remote_sibling])
+            self.assertEqual({"payload.dat"}, {child.name for child in remote_root.iter_children()})
+            self.assertEqual({"final-empty", "final-nested"}, set(os.listdir(local_root_path)))
+            self.assertEqual({"payload.dat"}, set(os.listdir(staging_root_path)))
+
+            def scanned_root():
+                roots = MultiPathLocalScanner([LocalScanner(
+                    local_path,
+                    use_temp_file=False,
+                    staging_path=staging_path,
+                    path_pair_id="software-pair",
+                    path_pair_name="Software",
+                )]).scan()
+                self.assertEqual(["Software"], [root.name for root in roots])
+                return roots[0]
+
+            merged_root = scanned_root()
+            children = {child.name: child for child in merged_root.iter_children()}
+            self.assertIs(False, children["final-empty"].has_staging_origin)
+            self.assertIs(False, children["final-nested"].has_staging_origin)
+            self.assertTrue(children["payload.dat"].is_staging)
+            self.assertIs(True, children["payload.dat"].has_staging_origin)
+            serialized_root = SystemFile.from_dict(merged_root.to_dict())
+            serialized_children = {child.name: child for child in serialized_root.iter_children()}
+            self.assertIs(False, serialized_children["final-empty"].has_staging_origin)
+            self.model_builder.set_local_files([serialized_root])
+            self.assertTrue(self.model_builder.has_verified_complete_staging_remote_identity(target_id))
+
+            os.makedirs(os.path.join(staging_root_path, "final-nested"))
+            extra_payload = os.path.join(staging_root_path, "final-nested", "extra.dat")
+            Path(extra_payload).write_bytes(b"unexpected staging")
+            self.model_builder.set_local_files([scanned_root()])
+            self.assertFalse(self.model_builder.has_verified_complete_staging_remote_identity(target_id))
+            os.unlink(extra_payload)
+            os.rmdir(os.path.join(staging_root_path, "final-nested"))
+
+            # A same-name empty staging directory is physically indistinguishable
+            # after reduction unless its merge origin survives in the source tree.
+            os.makedirs(os.path.join(staging_root_path, "final-empty"))
+            staged_empty_root = scanned_root()
+            staged_empty = next(child for child in staged_empty_root.iter_children()
+                                if child.name == "final-empty")
+            self.assertIs(True, staged_empty.has_staging_origin)
+            self.model_builder.set_local_files([staged_empty_root])
+            self.assertFalse(self.model_builder.has_verified_complete_staging_remote_identity(target_id))
+
+            # A legacy/unsupported source has no final-only proof and stays unknown.
+            legacy_root = scanned_root()
+            legacy_empty = next(child for child in legacy_root.iter_children()
+                                if child.name == "final-empty")
+            legacy_empty.has_staging_origin = None
+            self.model_builder.set_local_files([legacy_root])
+            self.assertFalse(self.model_builder.has_verified_complete_staging_remote_identity(target_id))
 
     def test_build_recent_live_snapshot_promotes_full_size_staging_copy_after_live_status_disappears(self):
         self.model_builder.clear()
