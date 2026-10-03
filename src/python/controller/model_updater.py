@@ -4102,9 +4102,8 @@ class ModelUpdater(_ControllerCoreAccess):
                         corr_id=root_event_id, flow_id=root_event_id, trace_scope="flow",
                     )
 
-            # Use the original raw prefix only.  This is a sibling of the
-            # existing scan publication join, so it shares that event gate
-            # and cadence instead of adding a status-poll breadcrumb stream.
+            # Sample bounded raw and consumed prefixes as one sibling of the
+            # scan publication join, sharing its event gate and cadence.
             if raw_statuses is not None or filtered_statuses is not None or consumed_statuses is not None:
                 try:
                     self._record_status_publication_join(
@@ -4139,24 +4138,34 @@ class ModelUpdater(_ControllerCoreAccess):
             active_status_file_ids: object, malformed_status_file_ids: object,
             status_source: object, status_fresh: object, status_healthy: object,
     ) -> None:
-        """Join a fixed raw status prefix to same-publication roots."""
+        """Join bounded raw and consumed status prefixes to published roots."""
         def count(value: object) -> Optional[int]:
             return len(value) if isinstance(value, (list, tuple)) else None
 
         raw_count, filtered_count, consumed_count = map(
             count, (raw_statuses, filtered_statuses, consumed_statuses),
         )
-        sample = list(islice(raw_statuses, _SCAN_STATUS_PUBLICATION_JOIN_LIMIT)) \
+        raw_limit = _SCAN_STATUS_PUBLICATION_JOIN_LIMIT // 2
+        consumed_limit = _SCAN_STATUS_PUBLICATION_JOIN_LIMIT - raw_limit
+        raw_sample = list(islice(raw_statuses, raw_limit)) \
             if isinstance(raw_statuses, (list, tuple)) else []
-        omitted = max(0, raw_count - len(sample)) if raw_count is not None else None
+        consumed_sample = list(islice(consumed_statuses, consumed_limit)) \
+            if isinstance(consumed_statuses, (list, tuple)) else []
+        omitted = (
+            max(0, raw_count - raw_limit) + max(0, consumed_count - consumed_limit)
+            if raw_count is not None and consumed_count is not None else None
+        )
         no_id = "u" * 16
         rows: list[dict[str, object]] = []
         consumed_map = getattr(builder, "_ModelBuilder__lftp_statuses", None)
-        for status in sample:
+        sampled_statuses = [(status, "r") for status in raw_sample]
+        sampled_statuses.extend((status, "c") for status in consumed_sample)
+        for status, origin in sampled_statuses:
             row: dict[str, object] = {
                 "id": None, "name": None, "pair": None, "job": "u" * 25,
                 "membership": "uuu", "source": "uu", "model_id": no_id,
                 "name_relation": "u", "model_presence": "uu", "relation": "u", "join": "u",
+                "origin": origin, "size": "uuu",
             }
             try:
                 name, pair_id, file_id = (getattr(status, key, None)
@@ -4209,6 +4218,12 @@ class ModelUpdater(_ControllerCoreAccess):
         local_reader = getattr(builder, "_ModelBuilder__local_file", None)
         remote_reader = getattr(builder, "_ModelBuilder__remote_file", None)
         model_reader = getattr(model, "published_file", None)
+
+        def size_code(value: object) -> str:
+            if type(value) is not int or value < 0:
+                return "u"
+            return "z" if value == 0 else "p"
+
         if model is not None and lock is not None and callable(model_reader) and \
                 type(publication_id) is int and publication_id >= 0 and \
                 isinstance(snapshot, dict) and type(snapshot.get("publication_id")) is int and \
@@ -4242,6 +4257,9 @@ class ModelUpdater(_ControllerCoreAccess):
                                 model_name = getattr(model_file, "name", None)
                                 if not isinstance(model_id, str) or not isinstance(model_name, str):
                                     continue
+                                row["size"] = "".join(size_code(getattr(model_file, key, None)) for key in (
+                                    "remote_size", "local_size", "display_size_total",
+                                ))
                                 row["model_id"] = opaque_trace_correlation("published-root|" + model_id)
                                 row["name_relation"] = "s" if name == model_name else "d"
                                 local_present = getattr(model_file, "local_present", None)
@@ -4268,16 +4286,17 @@ class ModelUpdater(_ControllerCoreAccess):
         )
         emitter.record(
             "model_updater", "scan_status_publication_join", {
-                "schema": "scan_status_publication_join.v1",
-                "cid": correlation,
+                "schema": "scan_status_publication_join.v2",
                 "pub": publication_id if type(publication_id) is int else None,
                 "ver": expected_version if type(expected_version) is int else None,
                 "raw": raw_count, "flt": filtered_count,
                 "con": consumed_count, "rows": len(rows),
-                "omitted": omitted, "sel": "raw_prefix_4",
+                "omitted": omitted, "sel": "raw_prefix_2_consumed_prefix_2",
                 "poll": safe_source,
                 "fresh": status_fresh if type(status_fresh) is bool else None,
                 "health": status_healthy if type(status_healthy) is bool else None,
+                "origin": "".join(cast(str, row["origin"]) for row in rows),
+                "sz": "".join(cast(str, row["size"]) for row in rows),
                 "job": "".join(cast(str, row["job"]) for row in rows),
                 "rid": "".join(cast(str, row.get("status_id", no_id)) for row in rows),
                 "pair": "".join(cast(str, row.get("status_pair", no_id)) for row in rows),
