@@ -3,9 +3,138 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
+const vm = require("node:vm");
 const { test } = require("node:test");
 
 const observer = require("../browser_ancestor_observer.cjs");
+
+test("browser_probe page-init callback joins selected SSE records, removals, DOM, and bounded loss", () => {
+  const sourcePath = path.join(__dirname, "..", "browser_probe.js");
+  const source = fs.readFileSync(sourcePath, "utf8");
+  const moduleBox = {exports: {}};
+  const context = vm.createContext({
+    module: moduleBox,
+    exports: moduleBox.exports,
+    require,
+    __filename: sourcePath,
+    __dirname: path.dirname(sourcePath),
+    process: {argv: [process.execPath, sourcePath, "--self-test"], stdout: {write() {}}, stderr: {write() {}}, exitCode: 0},
+  });
+  // Export the actual lexical installer only in this in-memory test evaluation.
+  vm.runInContext(`${source}\nmodule.exports.__installPageDiagnostics = installPageDiagnostics;`, context, {
+    filename: sourcePath,
+  });
+  const install = moduleBox.exports.__installPageDiagnostics;
+  assert.equal(typeof install, "function");
+
+  const evidence = {errors: [], expected_request_aborts: []};
+  let initCallback;
+  const page = {on() {}, addInitScript(callback) { initCallback = callback; }};
+  install(page, evidence);
+
+  class FakeEventSource {
+    constructor(url) { this.url = url; this.listeners = new Map(); }
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) || [];
+      listeners.push(listener);
+      this.listeners.set(type, listeners);
+    }
+    dispatchEvent(event) {
+      for (const listener of this.listeners.get(event.type) || []) listener.call(this, event);
+      return true;
+    }
+  }
+  const rows = [];
+  const fileList = {};
+  const document = {
+    body: {},
+    querySelector(selector) { return selector === "#file-list" ? fileList : null; },
+    querySelectorAll(selector) { return selector === "#file-list .file" ? rows.slice() : []; },
+  };
+  const mutationObservers = [];
+  Object.assign(context, {
+    window: {EventSource: FakeEventSource}, document,
+    location: {href: "http://localhost/"}, URL,
+    performance: {now: (() => { let n = 0; return () => ++n; })()},
+    MutationObserver: class { constructor(callback) { this.callback = callback; mutationObservers.push(this); } observe() {} },
+    setInterval: () => 1, clearInterval() {},
+  });
+  initCallback();
+  const timeline = context.window.__seedSyncPerfTimeline;
+  assert.ok(timeline);
+  timeline.beginMeasurement();
+  timeline.markMeasuredQueue();
+  timeline.attachTarget("target-id", "selected.bin", "/server/model/v1/pair-1", []);
+  const sourceObject = new context.window.EventSource("/server/model/v1/pair-1/events");
+  sourceObject.addEventListener("model-updated", () => {});
+  sourceObject.addEventListener("model-invalidate", () => {});
+  const publish = (type, payload) => sourceObject.dispatchEvent({type, data: JSON.stringify(payload)});
+  const record = state => ({file_id: "target-id", name: "selected.bin", state, size_bytes: 7});
+  publish("model-updated", {model_version: 10, records: [record("downloaded")]});
+  publish("model-updated", {model_version: 11, records: [record("deleted")]});
+  publish("model-updated", {model_version: 12, records: [record("downloaded")]});
+  publish("model-updated", {model_version: 13, new_file: record("downloaded"), old_file: null});
+  publish("model-invalidate", {model_version: 14, records: [], removed_file_ids: ["target-id"]});
+  publish("model-invalidate", {model_version: 15, file_ids: ["target-id"], records: []});
+  const raw = timeline.snapshot().targetRawProgress;
+  assert.deepEqual(JSON.parse(JSON.stringify(raw.slice(0, 3).map(item => [item.raw_record.record_present, item.raw_record.state]))), [
+    [true, "downloaded"], [true, "deleted"], [true, "downloaded"],
+  ]);
+  assert.equal(raw[0].raw_record.event_payload_branch, "records");
+  assert.equal(raw[0].raw_record.record_source, "records");
+  assert.equal(raw[0].raw_record.model_version, 10);
+  assert.equal(raw[0].pathname, "/server/model/v1/pair-1/events");
+  assert.equal(raw[3].raw_record.event_payload_branch, "legacy_old_new");
+  assert.equal(raw[3].raw_record.record_source, "new_file");
+  assert.equal(raw[3].raw_record.model_version, 13);
+  assert.equal(raw[4].raw_record.record_present, false);
+  assert.equal(raw[4].raw_record.record_source, "removed_file_ids");
+  assert.equal(raw[5].raw_record.record_present, null);
+  assert.equal(raw[5].raw_record.target_file_id_invalidated, true);
+  assert.equal(raw[5].raw_record.target_file_id_removed, null);
+
+  const makeRow = () => ({
+    getAttribute: name => name === "data-file-id" ? "target-id" : null,
+    querySelector(selector) {
+      if (selector === ".name .title") return {textContent: "selected.bin"};
+      if (selector === ".status .text") return {textContent: "Downloaded"};
+      if (selector === ".status img[id]") return null;
+      if (selector === ".progress-bar") return {getAttribute: () => "100"};
+      if (selector === ".size_info") return {textContent: "7 B"};
+      if (selector === '.name img[src*="directory"]') return null;
+      return null;
+    },
+  });
+  rows.push(makeRow());
+  mutationObservers[0].callback();
+  rows.splice(0, rows.length);
+  mutationObservers[0].callback();
+  rows.push(makeRow());
+  mutationObservers[0].callback();
+  const dom = timeline.snapshot().targetDomMutations.filter(item => item.sample_kind === "target_presence");
+  assert.deepEqual(JSON.parse(JSON.stringify(dom.map(item => [item.row_present, item.presence_known]))),
+    [[true, true], [false, true], [true, true]]);
+  document.querySelector = () => null;
+  mutationObservers[0].callback();
+  assert.equal(timeline.snapshot().targetDomMutations.some(item => item.presence_known === false), false,
+    "missing file-list must remain unknown rather than emit absence");
+  document.querySelector = selector => selector === "#file-list" ? fileList : null;
+  for (let index = 0; index < 260; index++) {
+    if (index % 2 === 0) rows.push(makeRow());
+    else rows.splice(0, rows.length);
+    mutationObservers[0].callback();
+  }
+
+  for (let index = 0; index < 260; index++) {
+    publish("model-updated", {model_version: 100 + index, records: [record("downloading")]});
+  }
+  const bounded = timeline.snapshot();
+  assert.equal(bounded.targetRawProgress.length, 256);
+  assert.equal(bounded.targetCaptureLoss.target_raw_progress_dropped, 10);
+  assert.equal(bounded.targetDomMutations.length, 256);
+  assert.ok(bounded.targetCaptureLoss.target_dom_mutations_dropped > 0);
+});
+
 
 function tempRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "seedsync-browser-observer-"));

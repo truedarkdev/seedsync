@@ -975,6 +975,7 @@ async function main() {
     evidence.samples.event_source_apply = sanitizeTimelinePaths(timeline.eventSourceApply);
     evidence.samples.target_raw_progress = Array.isArray(timeline.targetRawProgress) ? timeline.targetRawProgress : [];
     evidence.samples.target_dom_mutations = Array.isArray(timeline.targetDomMutations) ? timeline.targetDomMutations : [];
+    evidence.samples.target_capture_loss = timeline.targetCaptureLoss || {target_raw_progress_dropped: null, target_dom_mutations_dropped: null};
     evidence.samples.main_thread_responsiveness = Array.isArray(timeline.mainThreadResponsiveness)
       ? timeline.mainThreadResponsiveness : [];
     evidence.measurement.epoch_t_ms = timeline.measurementEpochMs ?? evidence.measurement.epoch_t_ms;
@@ -1008,6 +1009,7 @@ async function main() {
         evidence.samples.event_source_apply = sanitizeTimelinePaths(timeline.eventSourceApply);
         evidence.samples.target_raw_progress = Array.isArray(timeline.targetRawProgress) ? timeline.targetRawProgress : [];
         evidence.samples.target_dom_mutations = Array.isArray(timeline.targetDomMutations) ? timeline.targetDomMutations : [];
+        evidence.samples.target_capture_loss = timeline.targetCaptureLoss || {target_raw_progress_dropped: null, target_dom_mutations_dropped: null};
         evidence.samples.main_thread_responsiveness = Array.isArray(timeline.mainThreadResponsiveness)
           ? timeline.mainThreadResponsiveness : [];
         evidence.measurement.epoch_t_ms = timeline.measurementEpochMs ?? evidence.measurement.epoch_t_ms;
@@ -1074,7 +1076,8 @@ function baseEvidence(label, runManifest, target, initialError) {
     },
     samples: {
       event_source_receive: [], event_source_apply: [], target_raw_progress: [],
-      target_dom_mutations: [], target_dom_cadence: null, progress: [],
+      target_dom_mutations: [], target_capture_loss: {target_raw_progress_dropped: null, target_dom_mutations_dropped: null},
+      target_dom_cadence: null, progress: [],
       visible_progress: [], visible_size_info: [], main_thread_responsiveness: [],
     },
     measurement: {
@@ -1220,6 +1223,7 @@ function installPageDiagnostics(page, evidence) {
     const eventSourcePaths = [];
     const targetRawProgress = [];
     const targetDomMutations = [];
+    const targetCaptureLoss = {target_raw_progress_dropped: 0, target_dom_mutations_dropped: 0};
     const mainThreadResponsiveness = [];
     const heartbeatIntervalMs = 100;
     const started = performance.now();
@@ -1229,7 +1233,12 @@ function installPageDiagnostics(page, evidence) {
     let targetSelector = null;
     let heartbeatLastMs = null;
     let heartbeatTimer = null;
+    let lastTargetPresence = null;
     const add = (array, value) => { if (array.length < limit) array.push(value); };
+    const addTarget = (array, value, lossKey) => {
+      if (array.length < limit) array.push(value);
+      else targetCaptureLoss[lossKey] = Math.min(Number.MAX_SAFE_INTEGER, targetCaptureLoss[lossKey] + 1);
+    };
     const relative = () => Number((performance.now() - started).toFixed(3));
     const paths = new WeakMap();
     let seenEvents = new WeakSet();
@@ -1252,12 +1261,29 @@ function installPageDiagnostics(page, evidence) {
       if (!['model-page', 'model-invalidate', 'model-patch', 'model-added', 'model-updated'].includes(eventType)) return;
       let parsed;
       try { parsed = JSON.parse(String(event.data)); } catch (_) { return; }
-      const records = Array.isArray(parsed) ? parsed
-        : Array.isArray(parsed.records) ? parsed.records
-        : [parsed.new_file, parsed.old_file].filter(Boolean);
+      const recordBranch = Array.isArray(parsed) ? 'array'
+        : Array.isArray(parsed?.records) ? 'records'
+        : parsed && typeof parsed === 'object' && ('new_file' in parsed || 'old_file' in parsed)
+          ? 'legacy_old_new' : 'unknown';
+      const records = Array.isArray(parsed) ? parsed.map(record => ({record, source: 'array'}))
+        : recordBranch === 'records' ? parsed.records.map(record => ({record, source: 'records'}))
+        : recordBranch === 'legacy_old_new'
+          ? [parsed.new_file && {record: parsed.new_file, source: 'new_file'},
+             parsed.old_file && {record: parsed.old_file, source: 'old_file'}].filter(Boolean)
+          : [];
+      const modelVersion = Number.isSafeInteger(parsed?.model_version) && parsed.model_version >= 0
+        && parsed.model_version <= 2147483647 ? parsed.model_version : null;
+      const fileIdsKnown = Array.isArray(parsed?.file_ids);
+      const removedIdsKnown = Array.isArray(parsed?.removed_file_ids);
+      const targetFileIdInvalidated = fileIdsKnown ? parsed.file_ids.includes(targetSelector.id) : null;
+      const targetFileIdRemoved = removedIdsKnown ? parsed.removed_file_ids.includes(targetSelector.id) : null;
       const targetSamples = [];
-      for (const record of records) {
+      let selectedRecordFound = false;
+      for (const item of records) {
+        const record = item.record;
+        if (!record || typeof record !== 'object' || Array.isArray(record)) continue;
         if (!targetRecordMatches(record)) continue;
+        if (targetSelector.id && String(record.file_id || '') === targetSelector.id) selectedRecordFound = true;
         const transferred = record.transferred_size == null ? null : Number(record.transferred_size);
         const progress = record.download_progress == null ? null : Number(record.download_progress);
         const targetSample = {
@@ -1277,8 +1303,46 @@ function installPageDiagnostics(page, evidence) {
             ? Number(record.downloading_speed)
             : record.speed != null && Number.isFinite(Number(record.speed)) ? Number(record.speed) : null,
           eta: record.eta == null ? null : record.eta,
+          raw_record: {
+            record_present: true,
+            event_payload_branch: recordBranch,
+            record_source: item.source,
+            model_version: modelVersion,
+            target_file_id_invalidated: targetFileIdInvalidated,
+            target_file_id_removed: targetFileIdRemoved,
+            state: record.state == null ? null : String(record.state),
+            remote_size: record.remote_size != null && Number.isFinite(Number(record.remote_size)) ? Number(record.remote_size) : null,
+            local_size: record.local_size != null && Number.isFinite(Number(record.local_size)) ? Number(record.local_size) : null,
+            remote_present: typeof record.remote_present === 'boolean' ? record.remote_present : null,
+            local_present: typeof record.local_present === 'boolean' ? record.local_present : null,
+            display_size_total: record.display_size_total != null && Number.isFinite(Number(record.display_size_total))
+              ? Number(record.display_size_total) : null,
+            complete_local_coverage: typeof record.complete_local_coverage === 'boolean'
+              ? record.complete_local_coverage : null,
+            final_move_succeeded: typeof record.final_move_succeeded === 'boolean' ? record.final_move_succeeded : null,
+          },
         };
-        add(targetRawProgress, targetSample);
+        addTarget(targetRawProgress, targetSample, 'target_raw_progress_dropped');
+        targetSamples.push(targetSample);
+      }
+      if (!selectedRecordFound && (targetFileIdInvalidated === true || targetFileIdRemoved === true)) {
+        const removalProvesMissing = targetFileIdRemoved === true;
+        const targetSample = {
+          t_ms: relative(), event_type: eventType, pathname: eventPath(source),
+          receive_t_ms: received?.t_ms ?? null, apply_t_ms: null, receive_to_apply_ms: null,
+          is_dir: false, id: targetSelector.id || null, name: targetSelector.name, role: 'parent', status: null,
+          transferred_size: null, download_progress: null, downloading_speed: null, eta: null,
+          raw_record: {
+            record_present: removalProvesMissing ? false : null,
+            event_payload_branch: recordBranch,
+            record_source: removalProvesMissing ? 'removed_file_ids' : 'target_not_in_records',
+            model_version: modelVersion,
+            target_file_id_invalidated: targetFileIdInvalidated,
+            target_file_id_removed: targetFileIdRemoved,
+            state: null,
+          },
+        };
+        addTarget(targetRawProgress, targetSample, 'target_raw_progress_dropped');
         targetSamples.push(targetSample);
       }
       if (event && typeof event === 'object' && targetSamples.length) eventTargetRecords.set(event, targetSamples);
@@ -1391,6 +1455,9 @@ function installPageDiagnostics(page, evidence) {
         targetRawProgress.length = 0;
         targetDomMutations.length = 0;
         mainThreadResponsiveness.length = 0;
+        lastTargetPresence = null;
+        targetCaptureLoss.target_raw_progress_dropped = 0;
+        targetCaptureLoss.target_dom_mutations_dropped = 0;
         seenEvents = new WeakSet();
         eventRecords = new WeakMap();
         eventTargetRecords = new WeakMap();
@@ -1419,7 +1486,16 @@ function installPageDiagnostics(page, evidence) {
         });
         let lastSignature = null;
         const capture = () => {
+          if (!document.querySelector('#file-list')) return;
           const row = find();
+          const selectedRowPresent = Boolean(row);
+          if (selectedRowPresent !== lastTargetPresence) {
+            addTarget(targetDomMutations, {
+              sample_kind: 'target_presence', t_ms: relative(), id: targetSelector.id || null,
+              row_present: selectedRowPresent, presence_known: true,
+            }, 'target_dom_mutations_dropped');
+            lastTargetPresence = selectedRowPresent;
+          }
           if (!row) return;
           const statusText = row.querySelector('.status .text')?.textContent?.trim();
           const icon = row.querySelector('.status img[id]')?.id || null;
@@ -1434,8 +1510,8 @@ function installPageDiagnostics(page, evidence) {
           lastSignature = signature;
           const tMs = relative();
           const apply = latestScopedApply(eventSourceApply, tMs, scopedPath);
-          add(targetDomMutations, {
-            t_ms: tMs, status: status || null,
+          addTarget(targetDomMutations, {
+            sample_kind: 'row', t_ms: tMs, status: status || null, row_present: true, presence_known: true,
             progress: Number.isFinite(progressValue) ? progressValue : null,
             aria_progress: progressAttribute || null,
             size_info: sizeInfo,
@@ -1445,7 +1521,7 @@ function installPageDiagnostics(page, evidence) {
             receive_to_apply_ms: apply && apply.receive_t_ms != null ? Number((apply.t_ms - apply.receive_t_ms).toFixed(3)) : null,
             apply_to_dom_ms: apply ? Number((tMs - apply.t_ms).toFixed(3)) : null,
             receive_to_dom_ms: apply && apply.receive_t_ms != null ? Number((tMs - apply.receive_t_ms).toFixed(3)) : null,
-          });
+          }, 'target_dom_mutations_dropped');
         };
         const observer = new MutationObserver(capture);
         observer.observe(root, {subtree: true, childList: true, attributes: true, characterData: true,
@@ -1453,13 +1529,15 @@ function installPageDiagnostics(page, evidence) {
         window.__seedSyncPerfTimeline.snapshot = () => ({
           eventSourceReceive: eventSourceReceive.slice(), eventSourceApply: eventSourceApply.slice(),
           eventSourcePaths: eventSourcePaths.slice(), targetRawProgress: targetRawProgress.slice(),
-          targetDomMutations: targetDomMutations.slice(), mainThreadResponsiveness: mainThreadResponsiveness.slice(),
+          targetDomMutations: targetDomMutations.slice(), targetCaptureLoss: {...targetCaptureLoss},
+          mainThreadResponsiveness: mainThreadResponsiveness.slice(),
           measurementEpochMs, measuredQueueMs,
         });
       },
       snapshot() { return {eventSourceReceive: eventSourceReceive.slice(), eventSourceApply: eventSourceApply.slice(),
         eventSourcePaths: eventSourcePaths.slice(), targetRawProgress: targetRawProgress.slice(),
-        targetDomMutations: targetDomMutations.slice(), mainThreadResponsiveness: mainThreadResponsiveness.slice(),
+        targetDomMutations: targetDomMutations.slice(), targetCaptureLoss: {...targetCaptureLoss},
+        mainThreadResponsiveness: mainThreadResponsiveness.slice(),
         measurementEpochMs, measuredQueueMs}; },
     };
   });
