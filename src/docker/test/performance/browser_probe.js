@@ -350,6 +350,12 @@ function cleanupPass(record) {
   }
   const actionAccepted = record.queue_accepted === true || record.mutation_accepted === true;
   if (record.profile === 'completion') {
+    if (!actionAccepted) {
+      return record.attempted === true
+        && Array.isArray(record.errors) && record.errors.length === 0
+        && record.residual_remote_only_queueable === true
+        && record.transfer_quiescent === true;
+    }
     return record.attempted === true
       && Array.isArray(record.errors) && record.errors.length === 0
       && ['downloaded', 'complete', 'completed', 'stopped'].includes(record.residual_state)
@@ -479,6 +485,16 @@ function runSelfTest() {
     ], completionExpected)
     && !completionCoverageIsExact(completionParent, [...completionChildren, completionChildren[0]], completionExpected),
   'inexact byte coverage, duplicate child, or nonterminal child was accepted');
+  const exactRootFile = {status: 'downloaded', transferred_size: 2_097_152, download_progress: 100,
+    remote_size: 2_097_152, local_size: 2_097_152, remote_present: true, local_present: true,
+    complete_local_coverage: true};
+  assert(completionRootFileIsExact(exactRootFile, 2_097_152)
+    && !completionRootFileIsExact({...exactRootFile, local_present: false}, 2_097_152)
+    && !completionRootFileIsExact({...exactRootFile, local_size: null}, 2_097_152)
+    && !completionRootFileIsExact({...exactRootFile, complete_local_coverage: false}, 2_097_152)
+    && !completionRootFileIsExact({...exactRootFile, transferred_size: 2_097_151}, 2_097_152)
+    && !completionRootFileIsExact({...exactRootFile, status: 'downloading'}, 2_097_152),
+  'root-file completion accepted absent, partial, or nonterminal evidence');
   assert(completionSampleWindowMs(150_000) === 5_000
     && completionSampleWindowMs(900) === 900
     && completionSampleWindowMs(0) === 1, 'completion API iteration did not honor its shared time cap');
@@ -713,6 +729,23 @@ function runSelfTest() {
   try { discoverTarget(fileManifestForPairId('   ')); } catch (_) { blankPairIdRejected = true; }
   assert(missingPairIdRejected && blankPairIdRejected,
     'missing or blank target pair ids were accepted');
+  const completionFileManifest = {
+    synthetic_only: true,
+    profile: 'completion',
+    path_pairs: [{id: 'pair-file-completion', name: 'Performance Pair File', directory: 'path-pair-01', role: 'ordinary-active',
+      remote_only_targets: [{kind: 'file', relative_path: 'path-pair-01/remote-only/target.bin', size_bytes: 2_097_152}],
+      local_only_targets: [{kind: 'directory', relative_path: 'path-pair-01/local-only-sentinel'}]}],
+  };
+  const completionFileTarget = discoverTarget(completionFileManifest);
+  let completionFileWithoutSizeRejected = false;
+  try {
+    discoverTarget({...completionFileManifest, path_pairs: [{...completionFileManifest.path_pairs[0],
+      remote_only_targets: [{kind: 'file', relative_path: 'path-pair-01/remote-only/target.bin'}]}]});
+  } catch (_) { completionFileWithoutSizeRejected = true; }
+  assert(completionFileTarget.kind === 'file' && completionFileTarget.profile === 'completion'
+    && completionFileTarget.expected_bytes === 2_097_152
+    && completionFileTarget.local_only_targets.length === 1 && completionFileWithoutSizeRejected,
+  'declared file completion profile was not preserved with its bounded descriptor checks');
   const unreconciledSummary = {path_pairs: [{path_pair_id: 'pair-01', reconciled_local: false, reconciled_remote: true}]};
   assert(!pathPairReconciled(unreconciledSummary, target.pair_id)
     && !summaryPathPairReconciliation(unreconciledSummary, 'other-pair').path_pair_id_match,
@@ -735,7 +768,8 @@ function runSelfTest() {
     path_pairs: [{id: 'pair-file', name: 'Performance Pair File', directory: 'path-pair-01', role: 'ordinary-active',
       remote_only_targets: [{relative_path: 'path-pair-01/remote-only/target.bin'}]}],
   });
-  assert(legacyTarget.kind === 'file' && !Object.prototype.hasOwnProperty.call(legacyTarget, 'file_count'),
+  assert(legacyTarget.kind === 'file' && !Object.prototype.hasOwnProperty.call(legacyTarget, 'file_count')
+    && legacyTarget.profile !== 'completion',
     'committed file target descriptor was not retained as a legacy file');
   assert(!JSON.stringify(target).includes('"pair_id"'), 'target pair identity leaked into serialized evidence');
   assert(normalizeAppPath('/server/model/v1/pairs/private-scope/stream') ===
@@ -762,6 +796,16 @@ function runSelfTest() {
   assert(cleanupPass({required: true, profile: 'cadence-directory', attempted: true,
     queue_accepted: true, mutation_accepted: true, errors: [], residual_state: 'stopped',
     transfer_quiescent: true}), 'accepted Queue cleanup did not retain Stop completion requirements');
+  assert(cleanupPass({required: true, profile: 'completion', attempted: true,
+    queue_accepted: true, mutation_accepted: true, errors: [], residual_state: 'downloaded',
+    transfer_quiescent: true}), 'completed-profile cleanup rejected a quiescent downloaded target');
+  assert(cleanupPass({required: true, profile: 'completion', attempted: true,
+    queue_accepted: false, mutation_accepted: false, errors: [],
+    residual_remote_only_queueable: true, transfer_quiescent: true})
+    && !cleanupPass({required: true, profile: 'completion', attempted: true,
+      queue_accepted: false, mutation_accepted: false, errors: [],
+      residual_remote_only_queueable: false, transfer_quiescent: false}),
+  'completed-profile rejected-Queue cleanup did not preserve remote-only quiescence');
   assert(readinessIsQueueable({status: 'default-remote', controls: {
     Queue: {enabled: true}, Stop: {enabled: false},
   }}), 'remote-only default target was not recognized as queueable');
@@ -842,6 +886,7 @@ function runSelfTest() {
       raw_progress_wait_byte_values: true, raw_progress_activity_above_percent_zero: true,
       target_apply_causal_attribution: true,
       completion_exact_coverage: true,
+      completion_root_file_exact_coverage: true,
       completion_shared_iteration_deadline: true,
       main_thread_responsiveness: true,
       measurement_boundary: true,
@@ -1184,6 +1229,13 @@ function discoverTarget(manifest) {
       target.profile = 'completion';
       target.local_only_targets = Array.isArray(pair.local_only_targets) ? pair.local_only_targets : [];
     }
+  } else if (completionProfile) {
+    if (!Number.isInteger(remoteTarget.size_bytes) || remoteTarget.size_bytes <= 0) {
+      throw new Error('completion target file must have a positive exact size');
+    }
+    target.profile = 'completion';
+    target.expected_bytes = remoteTarget.size_bytes;
+    target.local_only_targets = Array.isArray(pair.local_only_targets) ? pair.local_only_targets : [];
   }
   Object.defineProperty(target, 'pair_id', {value: pair.id, enumerable: false});
   return target;
@@ -2331,7 +2383,8 @@ async function cleanupDirectoryTarget(page, target, targetId, timeoutMs, evidenc
   record.observed_identity = observedState?.identity || null;
   const actionAccepted = record.queue_accepted === true || record.mutation_accepted === true;
   if (!actionAccepted) {
-    const quiescent = Boolean(observedState && directoryReadinessIsFresh(observedState));
+    const quiescent = Boolean(observedState && (target.kind === 'directory'
+      ? directoryReadinessIsFresh(observedState) : readinessIsQueueable(observedState)));
     record.residual_state = observedState?.status || null;
     record.residual_identity = observedState?.identity || null;
     record.residual_remote_only_queueable = quiescent;
@@ -2446,13 +2499,15 @@ async function cleanupLegacyTarget(page, target, targetId, timeoutMs, evidence, 
 }
 
 async function cleanupTarget(page, target, targetId, timeoutMs, evidence, record) {
-  if (target.kind === 'directory') return cleanupDirectoryTarget(page, target, targetId, timeoutMs, evidence, record);
+  if (target.kind === 'directory' || target.profile === 'completion') {
+    return cleanupDirectoryTarget(page, target, targetId, timeoutMs, evidence, record);
+  }
   return cleanupLegacyTarget(page, target, targetId, timeoutMs, evidence, record);
 }
 
 async function exerciseActions(page, target, targetId, timeoutMs, evidence, scopedPath, captureBeforeCleanup, runtime = {}) {
   const actions = evidence.actions;
-  const legacy = target.kind !== 'directory';
+  const legacy = target.kind !== 'directory' && target.profile !== 'completion';
   const cleanupRecord = {name: 'cleanup', measured: false, required: false, attempted: false,
     profile: target.profile === 'completion' ? 'completion' : legacy ? 'legacy-file' : 'cadence-directory',
     steps: [], errors: [], observed_state: null, restored_state: null, residual_state: null,
@@ -2567,6 +2622,15 @@ function completionCoverageIsExact(parent, children, expected) {
   });
 }
 
+function completionRootFileIsExact(parent, expectedBytes) {
+  return Boolean(parent && Number.isInteger(expectedBytes) && expectedBytes > 0
+    && ['downloaded', 'complete', 'completed'].includes(String(parent.status || '').toLowerCase())
+    && parent.transferred_size === expectedBytes && parent.download_progress === 100
+    && parent.remote_present === true && parent.remote_size === expectedBytes
+    && parent.local_present === true && parent.local_size === expectedBytes
+    && parent.complete_local_coverage === true);
+}
+
 async function fetchModelRecords(baseUrl, apiToken, endpoint, signal) {
   const records = [];
   let cursor = null;
@@ -2596,12 +2660,13 @@ async function waitForNaturalCompletion(baseUrl, apiToken, target, parentId, tim
   const startedMono = process.hrtime.bigint();
   const result = {
     required: true, source: 'scoped-model-roots-and-children-api',
-    parent_id: String(parentId), expected_child_count: target.children.length,
-    expected_bytes: target.children.reduce((sum, child) => sum + child.size_bytes, 0),
+    parent_id: String(parentId), expected_child_count: target.kind === 'file' ? 0 : target.children.length,
+    expected_bytes: target.kind === 'file' ? target.expected_bytes
+      : target.children.reduce((sum, child) => sum + child.size_bytes, 0),
     local_sentinel_name: String(target.local_only_targets?.[0]?.relative_path || '').split('/').filter(Boolean).pop() || null,
     samples: [], pass: false, elapsed_ms: null,
   };
-  const expected = new Map(target.children.map(child => [child.name, child.size_bytes]));
+  const expected = new Map((target.children || []).map(child => [child.name, child.size_bytes]));
   const basePath = `/server/model/v1/pairs/${encodeURIComponent(target.pair_id)}`;
   const deadline = startedWall + timeoutMs;
   while (Date.now() < deadline) {
@@ -2652,6 +2717,12 @@ async function waitForNaturalCompletion(baseUrl, apiToken, target, parentId, tim
       downloading_speed: parent.downloading_speed != null && Number.isFinite(Number(parent.downloading_speed)) ? Number(parent.downloading_speed)
         : parent.speed != null && Number.isFinite(Number(parent.speed)) ? Number(parent.speed) : null,
       eta: parent.eta == null ? null : parent.eta,
+      remote_size: parent.remote_size != null && Number.isFinite(Number(parent.remote_size)) ? Number(parent.remote_size) : null,
+      local_size: parent.local_size != null && Number.isFinite(Number(parent.local_size)) ? Number(parent.local_size) : null,
+      remote_present: typeof parent.remote_present === 'boolean' ? parent.remote_present : null,
+      local_present: typeof parent.local_present === 'boolean' ? parent.local_present : null,
+      complete_local_coverage: typeof parent.complete_local_coverage === 'boolean' ? parent.complete_local_coverage : null,
+      final_move_succeeded: typeof parent.final_move_succeeded === 'boolean' ? parent.final_move_succeeded : null,
     };
     const sample = {
       utc: new Date().toISOString(),
@@ -2661,13 +2732,17 @@ async function waitForNaturalCompletion(baseUrl, apiToken, target, parentId, tim
       children_api_names_exact: children.length === expected.size && byName.size === expected.size
         && [...expected.keys()].every(name => byName.has(name)),
       parent: parentRow, children: childRows,
+      root_file_exact: target.kind === 'file' ? completionRootFileIsExact(parentRow, target.expected_bytes) : null,
       local_sentinel: sentinelRecord ? {
         id: sentinelRecord.file_id == null ? null : String(sentinelRecord.file_id),
         status: String(sentinelRecord.state || '').toLowerCase() || null,
       } : null,
     };
     boundedPush(result.samples, sample, 600);
-    if (sample.children_api_names_exact && completionCoverageIsExact(parentRow, childRows, expected)) {
+    const exactCompletion = target.kind === 'file'
+      ? sample.root_file_exact === true
+      : completionCoverageIsExact(parentRow, childRows, expected);
+    if (sample.children_api_names_exact && exactCompletion) {
       result.pass = true;
       result.terminal = sample;
       break;
