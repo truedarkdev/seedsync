@@ -4595,18 +4595,19 @@ class TestModelUpdater(unittest.TestCase):
         return controller, model_builder
 
     def _make_v092_pending_completion_controller(
-            self, *, complete=True, path_pair_id=None, sidecar_ready=False,
+            self, *, complete=True, path_pair_id=None, sidecar_ready=False, directory_root=False,
     ):
         """Create a retired-LFTP pending root without relying on a model diff."""
-        remote = SystemFile("pending.bin", 10, False, mtime_ns=1)
+        remote = SystemFile("pending.bin", 10, directory_root, mtime_ns=1)
         local = SystemFile(
-            "pending.bin", 10 if complete else 9, False, is_staging=True, mtime_ns=1,
+            "pending.bin", 10 if complete else 9, directory_root, is_staging=True, mtime_ns=1,
         )
         local.status_sidecar_ready = sidecar_ready
         remote.path_pair_id = path_pair_id
         local.path_pair_id = path_pair_id
         running = LftpJobStatus(
-            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "pending.bin", "",
+            1, LftpJobStatus.Type.MIRROR if directory_root else LftpJobStatus.Type.PGET,
+            LftpJobStatus.State.RUNNING, "pending.bin", "",
         )
         running.total_transfer_state = LftpJobStatus.TransferState(
             local.size, 10, local.size * 10, 100, 0,
@@ -4614,7 +4615,14 @@ class TestModelUpdater(unittest.TestCase):
         running.path_pair_id = path_pair_id
         builder = ModelBuilder()
         builder.set_remote_files([remote])
-        builder.set_local_files([local])
+        if directory_root:
+            builder.adopt_local_root_scan_sources({
+                ModelFile.build_file_id("pending.bin", path_pair_id): (
+                    local, "pending-local-session", 4,
+                ),
+            })
+        else:
+            builder.set_local_files([local])
         builder.set_lftp_statuses([running])
         live_model = builder.build_model()
         controller, _ = self._make_progressive_update_controller(
@@ -4628,6 +4636,9 @@ class TestModelUpdater(unittest.TestCase):
         # regressions below exercise missing and failed coverage directly.
         controller._Controller__reconciled_local_path_pair_ids = {path_pair_id}
         controller._Controller__reconciled_remote_path_pair_ids = {path_pair_id}
+        if directory_root:
+            controller._Controller__local_scan_process.session_token = "pending-local-session"
+            controller._Controller__local_scan_process.generation = 4
         controller._Controller__prev_downloading_file_names = {("pending.bin", path_pair_id, None)}
         controller._Controller__lftp.status.return_value = []
         controller._reserve_move_attempt = MagicMock(return_value=True)
@@ -13909,6 +13920,10 @@ class TestModelUpdater(unittest.TestCase):
             self.assertEqual(1, len(first_wake))
             self.assertEqual("blocked", first_wake[0]["details"]["decision"])
             self.assertEqual("local_scope_unreconciled", first_wake[0]["details"]["reason"])
+            self.assertEqual("non_directory", first_wake[0]["details"]["local_root_proof_shape"])
+            self.assertEqual("unknown", first_wake[0]["details"]["local_root_proof_inputs_known"])
+            self.assertTrue(first_wake[0]["details"]["local_root_proof_checker_available"])
+            self.assertEqual("unknown", first_wake[0]["details"]["local_root_proof_result"])
             self.assertNotIn("pending.bin", json.dumps(first_wake[0]))
             first_move_decision = move_decisions()
             self.assertEqual(1, len(first_move_decision))
@@ -14130,16 +14145,20 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotIn("pending.bin", json.dumps(results))
 
     def test_v092_pending_completion_authority_wake_is_hot_gated_and_durable(self):
-        controller = self._make_v092_pending_completion_controller()
+        controller = self._make_v092_pending_completion_controller(directory_root=True)
         controller._Controller__reconciled_local_path_pair_ids = set()
         controller._Controller__reconciled_remote_path_pair_ids = set()
         updater = ModelUpdater(controller)
+        builder = controller._Controller__model_builder
         disabled = BreadcrumbTraceCollector(lambda: False, max_entries=8)
         controller._Controller__context.breadcrumb_trace = disabled
-        with patch.object(updater, "_record_completion_gate_breadcrumb") as record, \
+        with patch.object(builder, "has_current_local_root_scan_proof",
+                          wraps=builder.has_current_local_root_scan_proof) as proof_check, \
+                patch.object(updater, "_record_completion_gate_breadcrumb") as record, \
                 patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
             updater.update()
         record.assert_not_called()
+        proof_check.assert_not_called()
         self.assertEqual({}, updater._ModelUpdater__completion_gate_trace_signatures)
         self.assertIn(
             ("pending.bin", None, None), controller._Controller__pending_completion_file_names,
@@ -14151,6 +14170,12 @@ class TestModelUpdater(unittest.TestCase):
                 policy={"default": "off", "rules": {"completion.gate": "info"}},
             )
             controller._Controller__context.breadcrumb_trace = trace
+            builder.adopt_local_root_scan_sources({
+                ModelFile.build_file_id("pending.bin", None): (
+                    SystemFile("pending.bin", 10, True, is_staging=True, mtime_ns=1),
+                    "pending-local-session", 4,
+                ),
+            })
             with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
                 updater.update()
             health = trace.close()
@@ -14162,8 +14187,22 @@ class TestModelUpdater(unittest.TestCase):
         )
         self.assertGreaterEqual(health.get("written", 0), 1)
         self.assertEqual("completion.gate", event["category"])
+        self.assertEqual("completion_gate", event["stage"])
         self.assertEqual("blocked", event["details"]["decision"])
         self.assertEqual("local_scope_unreconciled", event["details"]["reason"])
+        self.assertEqual({
+            "schema", "decision", "reason", "local_root_proof_shape",
+            "local_root_proof_inputs_known", "local_root_proof_checker_available",
+            "local_root_proof_result",
+        }, set(event["details"]))
+        self.assertEqual("directory_root", event["details"]["local_root_proof_shape"])
+        self.assertTrue(event["details"]["local_root_proof_inputs_known"])
+        self.assertTrue(event["details"]["local_root_proof_checker_available"])
+        self.assertTrue(event["details"]["local_root_proof_result"])
+        self.assertEqual("completion:{}".format(opaque_trace_correlation(
+            ModelFile.build_file_id("pending.bin", None),
+        )), event["corr_id"])
+        self.assertIsNone(event["flow_id"])
         self.assertNotIn("pending.bin", json.dumps(event))
 
         failing_trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
@@ -14188,6 +14227,101 @@ class TestModelUpdater(unittest.TestCase):
             ("pending.bin", None, None), controller._Controller__pending_completion_file_names,
         )
         controller._Controller__move_from_staging.assert_not_called()
+
+    def test_pending_completion_root_proof_diagnostics_keep_stale_and_unavailable_unknown(self):
+        controller = self._make_v092_pending_completion_controller(directory_root=True)
+        controller._Controller__reconciled_local_path_pair_ids = set()
+        controller._Controller__reconciled_remote_path_pair_ids = set()
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        controller._Controller__context.breadcrumb_trace = trace
+        updater = ModelUpdater(controller)
+        builder = controller._Controller__model_builder
+        process = controller._Controller__local_scan_process
+
+        def wakes():
+            return [entry for entry in trace.snapshot()["entries"]
+                    if entry["message"] == "pending_completion_authority_wake"]
+
+        def adopt_proof(generation=4):
+            builder.adopt_local_root_scan_sources({
+                ModelFile.build_file_id("pending.bin", None): (
+                    SystemFile("pending.bin", 10, True, is_staging=True, mtime_ns=1),
+                    "pending-local-session", generation,
+                ),
+            })
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            adopt_proof()
+            updater.update()
+            self.assertTrue(wakes()[-1]["details"]["local_root_proof_result"])
+
+            process.generation = 5
+            adopt_proof()
+            controller._Controller__next_lftp_status_poll_at = None
+            updater.update()
+            stale = wakes()[-1]["details"]
+            self.assertTrue(stale["local_root_proof_inputs_known"])
+            self.assertTrue(stale["local_root_proof_checker_available"])
+            self.assertFalse(stale["local_root_proof_result"])
+
+            class RaisingProofMap(dict):
+                def get(self, key, default=None):
+                    raise RuntimeError("proof lookup unavailable")
+
+            process.generation = 4
+            adopt_proof()
+            saved_proofs = builder._ModelBuilder__local_root_scan_proofs
+            builder._ModelBuilder__local_root_scan_proofs = RaisingProofMap(saved_proofs)
+            controller._Controller__next_lftp_status_poll_at = None
+            updater.update()
+            failed = wakes()[-1]["details"]
+            self.assertTrue(failed["local_root_proof_checker_available"])
+            self.assertEqual("unknown", failed["local_root_proof_result"])
+            builder._ModelBuilder__local_root_scan_proofs = saved_proofs
+
+            original_record = trace.record
+            rejected_wakes = []
+
+            def fail_wake_record(component, message, details, **kwargs):
+                if message == "pending_completion_authority_wake":
+                    rejected_wakes.append(message)
+                    raise RuntimeError("wake sink unavailable")
+                return original_record(component, message, details, **kwargs)
+
+            trace.record = fail_wake_record
+            adopt_proof()
+            controller._Controller__next_lftp_status_poll_at = None
+            updater.update()
+            self.assertEqual(["pending_completion_authority_wake"], rejected_wakes)
+            self.assertIn(
+                ("pending.bin", None, None), controller._Controller__pending_completion_file_names,
+            )
+            controller._Controller__move_from_staging.assert_not_called()
+            trace.record = original_record
+
+            class BuilderWithoutProofReader:
+                def __init__(self, delegate):
+                    self.delegate = delegate
+
+                def __getattr__(self, name):
+                    if name == "has_current_local_root_scan_proof":
+                        raise AttributeError(name)
+                    return getattr(self.delegate, name)
+
+            adopt_proof()
+            controller._Controller__model_builder = BuilderWithoutProofReader(builder)
+            controller._Controller__next_lftp_status_poll_at = None
+            updater.update()
+            missing = wakes()[-1]["details"]
+            self.assertEqual("unknown", missing["local_root_proof_checker_available"])
+            self.assertEqual("unknown", missing["local_root_proof_result"])
+            controller._Controller__model_builder = builder
+
+        self.assertTrue(all(entry["category"] == "completion.gate" for entry in wakes()))
+        self.assertNotIn("pending.bin", json.dumps(wakes()))
+        self.assertIn(
+            ("pending.bin", None, None), controller._Controller__pending_completion_file_names,
+        )
 
     def test_v092_pending_completion_wake_is_acknowledged_after_candidate_authority(self):
         """A pre-build wake must not consume an authority change mid-build."""

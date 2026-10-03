@@ -8011,20 +8011,73 @@ class ModelUpdater(_ControllerCoreAccess):
             ) and status.path_pair_id is None and isinstance(status.name, str)
         }
 
-        def record_pending_completion_authority_wake(file_id: str, decision: str, reason: str) -> None:
+        def pending_local_root_proof_details(file_id: str, pending_file: ModelFile) -> dict[str, object]:
+            details: dict[str, object] = {
+                "local_root_proof_shape": "unknown",
+                "local_root_proof_inputs_known": "unknown",
+                "local_root_proof_checker_available": "unknown",
+                "local_root_proof_result": "unknown",
+            }
+            try:
+                name = pending_file.name
+                full_path = pending_file.full_path
+                path_pair_id = pending_file.path_pair_id
+                is_dir = pending_file.is_dir
+                canonical = type(name) is str and bool(name) and type(full_path) is str and bool(full_path) and \
+                    (path_pair_id is None or type(path_pair_id) is str and bool(path_pair_id)) and \
+                    ModelFile.build_file_id(full_path, path_pair_id) == file_id
+                if canonical and is_dir is False:
+                    details["local_root_proof_shape"] = "non_directory"
+                elif canonical and is_dir is True and full_path == name:
+                    details["local_root_proof_shape"] = "directory_root"
+                else:
+                    return details
+
+                process = getattr(controller, "_Controller__local_scan_process", None)
+                session_token = getattr(process, "session_token", None)
+                generation = getattr(process, "generation", None)
+                inputs_known = type(session_token) is str and bool(session_token) and \
+                    type(generation) is int and generation >= 0
+                if inputs_known:
+                    details["local_root_proof_inputs_known"] = True
+
+                builder = getattr(controller, "_Controller__model_builder", None)
+                missing = object()
+                checker = getattr(builder, "has_current_local_root_scan_proof", missing)
+                if checker is missing:
+                    return details
+                if not callable(checker):
+                    details["local_root_proof_checker_available"] = False
+                    return details
+                details["local_root_proof_checker_available"] = True
+                if details["local_root_proof_shape"] == "directory_root" and inputs_known:
+                    result = checker(file_id, session_token, generation)
+                    if type(result) is bool:
+                        details["local_root_proof_result"] = result
+            except Exception:
+                # Diagnostic inspection must not change the existing wake path.
+                pass
+            return details
+
+        def record_pending_completion_authority_wake(
+                file_id: str, decision: str, reason: str, pending_file: Optional[ModelFile] = None,
+        ) -> None:
             try:
                 if not self._completion_gate_trace_enabled():
                     return
             except Exception:
                 return
+            details = {
+                "schema": "pending_completion_authority_wake.v1",
+                "decision": decision,
+                "reason": reason,
+            }
+            if reason == "local_scope_unreconciled" and pending_file is not None:
+                details.update(pending_local_root_proof_details(file_id, pending_file))
             self._record_completion_gate_breadcrumb(
                 file_id,
                 "pending_completion_authority_wake",
-                {
-                    "schema": "pending_completion_authority_wake.v1",
-                    "decision": decision,
-                    "reason": reason,
-                },
+                details,
             )
 
         def pending_completion_authority_available(file_id: str) -> bool:
@@ -8036,7 +8089,7 @@ class ModelUpdater(_ControllerCoreAccess):
             path_pair_id = pending_file.path_pair_id
             if path_pair_id not in reconciled_local_path_pair_ids:
                 record_pending_completion_authority_wake(
-                    file_id, "blocked", "local_scope_unreconciled",
+                    file_id, "blocked", "local_scope_unreconciled", pending_file,
                 )
                 return False
             if path_pair_id not in reconciled_remote_path_pair_ids:
