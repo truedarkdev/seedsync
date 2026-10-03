@@ -13303,6 +13303,11 @@ class TestModelUpdater(unittest.TestCase):
             scanned_path_pair_ids={None}, is_scan_final=True,
         )
         controller._Controller__move_from_staging = MagicMock()
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=16,
+            policy={"default": "off", "rules": {"completion.gate": "info"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
 
         ModelUpdater(controller).update()
 
@@ -13313,6 +13318,17 @@ class TestModelUpdater(unittest.TestCase):
         self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
         controller._Controller__move_from_staging.assert_not_called()
         self.assertNotIn("pending.bin", controller._Controller__persist.downloaded_file_names)
+        captures = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("message") == "completion_progress_floor_capture"
+        ]
+        self.assertTrue(captures)
+        self.assertTrue(all(
+            entry["details"]["root_checkpoint_state"] == "sidecar_ready" and
+            entry["details"]["root_checkpoint_freshness"] == "stale"
+            for entry in captures
+        ))
+        trace.close()
 
     def test_v092_pending_completion_fresh_active_sidecar_releases_and_evicts_snapshot(self):
         """Fresh physical sidecar proof releases the retired job exactly once."""
@@ -13354,6 +13370,11 @@ class TestModelUpdater(unittest.TestCase):
             datetime.now(), [staged], scanned_path_pair_ids={None}, is_scan_final=True,
         )
         controller._Controller__move_from_staging = MagicMock()
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=16,
+            policy={"default": "off", "rules": {"completion.gate": "info"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
 
         ModelUpdater(controller).update()
 
@@ -13364,6 +13385,18 @@ class TestModelUpdater(unittest.TestCase):
             builder._ModelBuilder__recent_live_transfer_snapshots,
         )
         controller._Controller__move_from_staging.assert_not_called()
+        eviction = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("message") == "completion_live_snapshot_eviction" and
+            entry["details"].get("reason") == "lifecycle_release"
+        )
+        self.assertEqual("pget", eviction["details"]["retired_job_type"])
+        self.assertIn(eviction["details"]["retired_identity_source"], {
+            "pre_poll_status", "builder_snapshot",
+        })
+        self.assertEqual("sidecar_ready", eviction["details"]["root_checkpoint_state"])
+        self.assertEqual("fresh", eviction["details"]["root_checkpoint_freshness"])
+        trace.close()
 
     def test_v092_pending_completion_defers_when_local_scan_is_unknown(self):
         controller = self._make_v092_pending_completion_controller()
@@ -15275,7 +15308,7 @@ class TestModelUpdater(unittest.TestCase):
 
     def _run_completion_floor_capture(
             self, model, retired_identity, trace, *, resolution="snapshot_lookup_succeeded",
-            model_builder=None,
+            model_builder=None, identity_source="caller_provided", latest_active_scan=None,
     ):
         file_name = "private-capture.bin"
         file_id = ModelFile.build_file_id(file_name, None)
@@ -15291,6 +15324,8 @@ class TestModelUpdater(unittest.TestCase):
             True,
             retired_job_identities=retired_identities,
             retired_identity_resolution=resolution,
+            retired_identity_sources={file_id: identity_source} if identity_source else {},
+            latest_active_scan=latest_active_scan,
             lftp_status_poll_authoritative=True,
             lftp_status_snapshot_fresh=True,
             lftp_status_poll_healthy=True,
@@ -17691,11 +17726,14 @@ class TestModelUpdater(unittest.TestCase):
                 self.assertEqual(expected_after_relation,
                                  event["details"]["retired_job_relation_after"])
                 self.assertEqual(expected_outcome, event["details"]["outcome"])
+                self.assertEqual("mirror", event["details"]["retired_job_type"])
+                self.assertEqual("caller_provided", event["details"]["retired_identity_source"])
+                self.assertEqual("unknown", event["details"]["root_checkpoint_state"])
+                self.assertEqual("unknown", event["details"]["root_checkpoint_freshness"])
                 self.assertEqual("lftp-poll:0123456789abcdef", event["flow_id"])
                 self.assertEqual(capture["corr_id"], event["corr_id"])
                 self.assertNotIn(file_name, json.dumps(event))
                 self.assertNotIn(file_id, json.dumps(event))
-                self.assertNotIn(mirror_type, json.dumps(event))
                 remaining = builder.recent_live_transfer_snapshot_identities({file_id})
                 self.assertEqual(
                     {} if retired_id == 7 else {file_id: snapshot_identity},
@@ -17757,6 +17795,59 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotIn("private eviction failure", json.dumps(failure_event))
         failing_controller._Controller__context.breadcrumb_trace.close()
 
+    def test_completion_checkpoint_bound_and_release_freshness_require_observed_proof(self):
+        file_id = ModelFile.build_file_id("checkpoint-root", None)
+        scanned_at = datetime.now()
+        root = SystemFile("checkpoint-root", 10, False)
+        root.status_sidecar_ready = True
+        rows = [root] + [
+            SystemFile("other-{}".format(index), 10, False) for index in range(3)
+        ] + [SystemFile("checkpoint-root", 10, False)]
+        rows[-1].status_sidecar_ready = False
+        scan = ScannerResult(scanned_at, rows)
+        self.assertEqual(
+            ("unknown", "fresh"),
+            ModelUpdater._completion_root_checkpoint(
+                file_id, scan, scanned_at - timedelta(seconds=1),
+            ),
+        )
+        self.assertEqual(
+            ("unknown", "failed"),
+            ModelUpdater._completion_root_checkpoint(
+                file_id, ScannerResult(scanned_at, [root], failed=True), scanned_at,
+            ),
+        )
+        self.assertEqual(
+            ("unknown", "unknown"),
+            ModelUpdater._completion_root_checkpoint(
+                file_id, SimpleNamespace(timestamp=scanned_at, files=[root]), scanned_at,
+            ),
+        )
+
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+        controller = SimpleNamespace(
+            _Controller__model_builder=SimpleNamespace(
+                recent_live_transfer_snapshot_identities=lambda _file_ids: {},
+            ),
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            logger=MagicMock(),
+        )
+        ModelUpdater(controller)._evict_recent_completion_snapshots(
+            MagicMock(), {file_id},
+            reason="lifecycle_release",
+            retired_job_identities={file_id: (7, LftpJobStatus.Type.PGET.value)},
+            release_resumable_checkpoint_file_ids={file_id},
+            checkpoint_scan=ScannerResult(scanned_at, [root]),
+            checkpoint_retired_at=None,
+        )
+        event = next(
+            item for item in trace.snapshot()["entries"]
+            if item.get("message") == "completion_live_snapshot_eviction"
+        )
+        self.assertEqual("sidecar_ready", event["details"]["root_checkpoint_state"])
+        self.assertEqual("unknown", event["details"]["root_checkpoint_freshness"])
+        trace.close()
+
     def test_completion_floor_capture_diagnostic_persists_finalized_envelope(self):
         file_name = "private-capture.bin"
         file_id = ModelFile.build_file_id(file_name, None)
@@ -17793,6 +17884,10 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("completion.gate", event["category"])
         self.assertEqual("info", event["level"])
         self.assertEqual("overlay_accepted", event["details"]["outcome"])
+        self.assertEqual("pget", event["details"]["retired_job_type"])
+        self.assertEqual("caller_provided", event["details"]["retired_identity_source"])
+        self.assertEqual("unknown", event["details"]["root_checkpoint_state"])
+        self.assertEqual("unknown", event["details"]["root_checkpoint_freshness"])
         self.assertEqual("lftp-poll:0123456789abcdef", event["flow_id"])
         self.assertTrue(event["corr_id"].startswith("completion:"))
         self.assertEqual(
@@ -17800,6 +17895,8 @@ class TestModelUpdater(unittest.TestCase):
                 "schema", "poll_source", "retired_identity_resolution",
                 "retired_identity_state", "overlay_state", "overlay_progress_present",
                 "overlay_transferred_size_present", "published_lookup",
+                "retired_job_type", "retired_identity_source", "root_checkpoint_state",
+                "root_checkpoint_freshness",
                 "published_candidate", "published_identity_relation",
                 "published_file_shape", "published_eligibility",
                 "published_display_union", "published_coverage",
@@ -17823,16 +17920,16 @@ class TestModelUpdater(unittest.TestCase):
                 "retired_job_relation_before", "snapshot_read_after", "snapshot_after",
                 "retired_job_relation_after", "eviction_result", "outcome",
                 "preserve_requested", "release_requested", "retired_job_correlation",
+                "retired_job_type", "retired_identity_source", "root_checkpoint_state",
+                "root_checkpoint_freshness",
                 "poll_correlation",
             },
             set(eviction["details"]),
         )
         self.assertNotIn(file_name, json.dumps(eviction))
         self.assertNotIn(file_id, json.dumps(eviction))
-        self.assertNotIn(LftpJobStatus.Type.PGET.value, json.dumps(eviction))
         self.assertNotIn(file_name, json.dumps(event))
         self.assertNotIn(file_id, json.dumps(event))
-        self.assertNotIn(LftpJobStatus.Type.PGET.value, json.dumps(event))
 
     def test_model_update_reports_completion_identity_lookup_failure_without_changing_later_floor(self):
         file_name = "private-resolution.bin"
@@ -17872,6 +17969,41 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual((25, 25), controller._Controller__pending_completion_progress_floors[file_id])
         self.assertIn((file_name, None, None), controller._Controller__pending_completion_file_names)
         self.assertNotIn("private identity lookup sentinel", json.dumps(event))
+        self.assertNotIn(file_name, json.dumps(event))
+        trace.close()
+
+    def test_model_update_uses_builder_identity_source_for_nonrunning_prefilter_status(self):
+        file_name = "private-resolution.bin"
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile(file_name, 100, False)])
+        builder.set_local_files([SystemFile(file_name, 25, False, is_staging=True)])
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file_name, "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 2)
+        builder.set_lftp_statuses([running])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=builder.build_model(),
+        )
+        controller._Controller__prev_downloading_file_names = {(file_name, None, None)}
+        queued = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.QUEUED, file_name, "",
+        )
+        controller._Controller__last_lftp_statuses = [queued]
+        controller._Controller__lftp.status.return_value = []
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        controller._Controller__context.breadcrumb_trace = trace
+
+        ModelUpdater(controller).update()
+
+        event = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("message") == "completion_progress_floor_capture"
+        )
+        self.assertEqual("snapshot_lookup_succeeded", event["details"]["retired_identity_resolution"])
+        self.assertEqual("available", event["details"]["retired_identity_state"])
+        self.assertEqual("builder_snapshot", event["details"]["retired_identity_source"])
+        self.assertEqual("get", event["details"]["retired_job_type"])
         self.assertNotIn(file_name, json.dumps(event))
         trace.close()
 

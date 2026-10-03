@@ -4389,6 +4389,9 @@ class ModelUpdater(_ControllerCoreAccess):
     def _evict_recent_completion_snapshots(
             self, evict_snapshots: Callable[..., object], completed_file_ids: set[str], *,
             reason: str, poll_correlation: Optional[str] = None,
+            retired_identity_sources: Optional[Mapping[str, str]] = None,
+            checkpoint_scan: object = None,
+            checkpoint_retired_at: Optional[datetime] = None,
             **eviction_kwargs: object,
     ) -> None:
         """Run the existing completion eviction and report its bounded evidence."""
@@ -4461,6 +4464,21 @@ class ModelUpdater(_ControllerCoreAccess):
                     for file_id in sorted(completed_file_ids):
                         expected = retired_identities.get(file_id) \
                             if isinstance(retired_identities, dict) else None
+                        identity_source = retired_identity_sources.get(file_id) \
+                            if isinstance(retired_identity_sources, Mapping) else None
+                        if identity_source not in {
+                                "pre_poll_status", "builder_snapshot", "caller_provided",
+                        }:
+                            identity_source = "unknown"
+                        checkpoint_state, checkpoint_freshness = self._completion_root_checkpoint(
+                            file_id, checkpoint_scan, checkpoint_retired_at,
+                        )
+                        if reason == "lifecycle_release" and isinstance(release_file_ids, set) and \
+                                file_id in release_file_ids:
+                            # This path is reached only after the existing
+                            # fresh active-scan predicate accepted the exact
+                            # pending root's sidecar.
+                            checkpoint_state = "sidecar_ready"
                         before_presence = identity_state(before_status, before, file_id)
                         after_presence = identity_state(after_status, after, file_id)
                         before_relation = identity_relation(before_status, before, file_id, expected)
@@ -4498,12 +4516,71 @@ class ModelUpdater(_ControllerCoreAccess):
                                 file_id in preserve_file_ids,
                                 "release_requested": isinstance(release_file_ids, set) and
                                 file_id in release_file_ids,
+                                "retired_job_type": self._completion_retired_job_type(expected),
+                                "retired_identity_source": identity_source,
+                                "root_checkpoint_state": checkpoint_state,
+                                "root_checkpoint_freshness": checkpoint_freshness,
                                 "retired_job_correlation": job_correlation(expected),
                             },
                             poll_correlation=poll_correlation,
                         )
                 except Exception:
                     pass
+
+    @staticmethod
+    def _completion_retired_job_type(identity: object) -> str:
+        if not isinstance(identity, tuple) or len(identity) != 2 or \
+                type(identity[0]) is not int or identity[0] < 0 or \
+                not isinstance(identity[1], str) or not identity[1]:
+            return "unknown"
+        known_types = {
+            LftpJobStatus.Type.PGET.value: "pget",
+            LftpJobStatus.Type.GET.value: "get",
+            LftpJobStatus.Type.MIRROR.value: "mirror",
+        }
+        return known_types.get(identity[1], "other")
+
+    @staticmethod
+    def _completion_root_checkpoint(
+            file_id: str, scan: object, retired_at: Optional[datetime] = None,
+    ) -> tuple[str, str]:
+        """Summarize only an exact root row from the already-consumed scan."""
+        if scan is None:
+            return "unknown", "unknown"
+        failed = getattr(scan, "failed", None)
+        if type(failed) is not bool:
+            return "unknown", "unknown"
+        if failed:
+            return "unknown", "failed"
+        scan_time = getattr(scan, "timestamp", None)
+        if not isinstance(scan_time, datetime):
+            return "unknown", "unknown"
+        if not isinstance(retired_at, datetime):
+            freshness = "unknown"
+        else:
+            freshness = "stale" if scan_time <= retired_at else "fresh"
+        rows = getattr(scan, "files", None)
+        if not isinstance(rows, (list, tuple)):
+            return "unknown", freshness
+        if len(rows) > 4:
+            return "unknown", freshness
+        matches = []
+        for index, row in enumerate(rows):
+            if index >= 4:
+                break
+            name = getattr(row, "name", None)
+            pair_id = getattr(row, "path_pair_id", None)
+            if isinstance(name, str) and (pair_id is None or isinstance(pair_id, str)) and \
+                    ModelFile.build_file_id(name, pair_id) == file_id:
+                matches.append(row)
+                if len(matches) > 1:
+                    return "unknown", freshness
+        if len(matches) != 1:
+            return "unknown", freshness
+        sidecar = getattr(matches[0], "status_sidecar_ready", None)
+        if type(sidecar) is not bool:
+            return "unknown", freshness
+        return ("sidecar_ready" if sidecar else "no_sidecar"), freshness
 
     def _record_completion_gate_presentation_transition(
             self, old_file: ModelFile, new_file: ModelFile,
@@ -4880,6 +4957,8 @@ class ModelUpdater(_ControllerCoreAccess):
         poll_correlation: Optional[str] = None,
         poll_source: str = "unknown",
         retired_identity_resolution: str = "caller_provided",
+        retired_identity_source: Optional[str] = None,
+        latest_active_scan: object = None,
     ) -> tuple[Optional[tuple[Optional[int], Optional[int]]], bool, Optional[tuple[int, str]]]:
         """Capture accepted live counters before retirement evicts their source."""
         retired_identity_valid = (
@@ -4914,6 +4993,21 @@ class ModelUpdater(_ControllerCoreAccess):
         def record_capture(outcome: str) -> None:
             if not self._completion_gate_trace_enabled():
                 return
+            identity_source = retired_identity_source
+            if identity_source not in {
+                    "pre_poll_status", "builder_snapshot", "caller_provided",
+            }:
+                identity_source = "unknown"
+            publications = getattr(
+                self._controller, "_Controller__pending_completion_publications", None,
+            )
+            publication = publications.get(file_id) \
+                if isinstance(publications, dict) else None
+            retired_at = publication.retired_at \
+                if isinstance(publication, _PendingCompletionPublication) else None
+            checkpoint_state, checkpoint_freshness = self._completion_root_checkpoint(
+                file_id, latest_active_scan, retired_at,
+            )
             def job_correlation(identity: object) -> Optional[str]:
                 if isinstance(identity, tuple) and len(identity) == 2 and \
                         type(identity[0]) is int and identity[0] >= 0 and \
@@ -4936,6 +5030,10 @@ class ModelUpdater(_ControllerCoreAccess):
                         "snapshot_lookup_succeeded", "snapshot_lookup_failed",
                     } else "unknown",
                     "retired_identity_state": retired_identity_state,
+                    "retired_job_type": self._completion_retired_job_type(retired_job_identity),
+                    "retired_identity_source": identity_source,
+                    "root_checkpoint_state": checkpoint_state,
+                    "root_checkpoint_freshness": checkpoint_freshness,
                     "overlay_state": overlay_state,
                     "overlay_progress_present": overlay_progress_present,
                     "overlay_transferred_size_present": overlay_transferred_size_present,
@@ -5357,6 +5455,8 @@ class ModelUpdater(_ControllerCoreAccess):
         lftp_status_source: Optional[str] = None,
         lftp_status_poll_correlation: Optional[str] = None,
         completion_status_membership_by_file_id: Optional[Mapping[str, Mapping[str, object]]] = None,
+        retired_identity_sources: Optional[Mapping[str, str]] = None,
+        latest_active_scan: object = None,
     ) -> tuple[set[str], set[str], dict[str, tuple[int, str]]]:
         controller = self._controller
         current_downloading_file_names_set = set(current_downloading_file_names)
@@ -5609,6 +5709,8 @@ class ModelUpdater(_ControllerCoreAccess):
             for name, path_pair_id, _ in just_completed_file_names:
                 file_id = ModelFile.build_file_id(name, path_pair_id)
                 retired_identity = (retired_job_identities or {}).get(file_id)
+                retired_identity_source = retired_identity_sources.get(file_id) \
+                    if completion_trace_enabled and isinstance(retired_identity_sources, Mapping) else None
                 current_floor, overlay_sourced, floor_identity = self._capture_pending_completion_progress_floor(
                     file_id,
                     retired_identity,
@@ -5617,6 +5719,8 @@ class ModelUpdater(_ControllerCoreAccess):
                     poll_correlation=poll_correlation,
                     poll_source=poll_source,
                     retired_identity_resolution=retired_identity_resolution,
+                    retired_identity_source=retired_identity_source,
+                    latest_active_scan=latest_active_scan if completion_trace_enabled else None,
                 )
                 if current_floor is None:
                     continue
@@ -5655,6 +5759,8 @@ class ModelUpdater(_ControllerCoreAccess):
                     completed_file_ids,
                     reason="retirement_immediate",
                     poll_correlation=poll_correlation,
+                    retired_identity_sources=retired_identity_sources,
+                    checkpoint_scan=latest_active_scan if completion_trace_enabled else None,
                     **eviction_kwargs,
                 )
             if None in completed_path_pair_ids:
@@ -7041,11 +7147,25 @@ class ModelUpdater(_ControllerCoreAccess):
                 retired_job_identities = {}
 
         completion_status_membership_by_file_id = None
+        retired_identity_sources = None
         try:
             # This projection is diagnostic-only and stays behind the same
             # completion trace gate. It joins existing status containers for
             # identities that the completion detector will actually consume.
             if self._completion_gate_trace_enabled():
+                retired_identity_sources = {}
+                for status in pre_poll_lftp_statuses:
+                    identity = retired_job_identities.get(getattr(status, "file_id", None))
+                    status_identity = (getattr(status, "id", None),
+                                       getattr(getattr(status, "type", None), "value", None))
+                    if getattr(status, "state", None) == LftpJobStatus.State.RUNNING and \
+                            identity == status_identity and type(status_identity[0]) is int and \
+                            status_identity[0] >= 0 and isinstance(status_identity[1], str) and \
+                            status_identity[1]:
+                        retired_identity_sources[status.file_id] = "pre_poll_status"
+                if retired_identity_resolution == "snapshot_lookup_succeeded":
+                    for file_id in retired_job_identities:
+                        retired_identity_sources.setdefault(file_id, "builder_snapshot")
                 consumed_running_entries = set(completion_downloading_file_names)
                 previous_running_entries = getattr(
                     controller, "_Controller__prev_downloading_file_names", set(),
@@ -7114,6 +7234,7 @@ class ModelUpdater(_ControllerCoreAccess):
         except Exception:
             # Optional diagnostic projection must never alter update behavior.
             completion_status_membership_by_file_id = None
+            retired_identity_sources = None
         self._revoke_stale_model_published_provenance(
             replacement_statuses_by_file_id(),
         )
@@ -7130,6 +7251,8 @@ class ModelUpdater(_ControllerCoreAccess):
             lftp_status_source=lftp_status_source,
             lftp_status_poll_correlation=lftp_status_poll_correlation,
             completion_status_membership_by_file_id=completion_status_membership_by_file_id,
+            retired_identity_sources=retired_identity_sources,
+            latest_active_scan=latest_active_scan,
         )
         self._clear_replaced_pending_completion_floors(raw_lftp_statuses)
         controller._Controller__active_downloading_file_names = current_downloading_file_names
@@ -7682,6 +7805,8 @@ class ModelUpdater(_ControllerCoreAccess):
                     completed_snapshot_ids,
                     reason="retirement_deferred",
                     poll_correlation=lftp_status_poll_correlation,
+                    retired_identity_sources=retired_identity_sources,
+                    checkpoint_scan=latest_active_scan if self._completion_gate_trace_enabled() else None,
                     **eviction_kwargs,
                 )
         if lftp_status_snapshot_fresh and not lftp_status_poll_healthy and not lftp_statuses:
@@ -9744,6 +9869,18 @@ class ModelUpdater(_ControllerCoreAccess):
                     # This is a lifecycle release, not a normal completed
                     # handoff: block the old 100% record from being copied
                     # back during the candidate diff below.
+                    checkpoint_retired_at = None
+                    if self._completion_gate_trace_enabled():
+                        try:
+                            publications = getattr(
+                                controller, "_Controller__pending_completion_publications", None,
+                            )
+                            publication = publications.get(pending_file_id) \
+                                if isinstance(publications, dict) else None
+                            checkpoint_retired_at = publication.retired_at \
+                                if isinstance(publication, _PendingCompletionPublication) else None
+                        except Exception:
+                            checkpoint_retired_at = None
                     self._invalidate_pending_completion_progress_floor(
                         controller, pending_file_id,
                     )
@@ -9758,6 +9895,9 @@ class ModelUpdater(_ControllerCoreAccess):
                             {pending_file_id},
                             reason="lifecycle_release",
                             poll_correlation=lftp_status_poll_correlation,
+                            retired_identity_sources=retired_identity_sources,
+                            checkpoint_scan=latest_active_scan if self._completion_gate_trace_enabled() else None,
+                            checkpoint_retired_at=checkpoint_retired_at,
                             retired_job_identities={pending_file_id: release_identity},
                             release_resumable_checkpoint_file_ids={pending_file_id},
                         )
