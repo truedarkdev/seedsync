@@ -10999,6 +10999,21 @@ class TestModelUpdater(unittest.TestCase):
             roots.append(root)
         builder = ModelBuilder()
         builder.set_remote_files(roots)
+        status_only_name = "private-status-only.bin"
+        statuses = []
+        for index, (name, pair_id) in enumerate((
+                (roots[0].name, roots[0].path_pair_id),
+                (status_only_name, pairs[7]),
+                (roots[2].name, roots[2].path_pair_id),
+                (roots[3].name, roots[3].path_pair_id),
+                (roots[4].name, roots[4].path_pair_id))):
+            status = LftpJobStatus(
+                index + 100, LftpJobStatus.Type.GET, LftpJobStatus.State.QUEUED,
+                name, "",
+            )
+            status.path_pair_id = pair_id
+            statuses.append(status)
+        builder.set_lftp_statuses(statuses)
         model = builder.build_model()
         controller, _ = self._make_progressive_update_controller(
             None, model_builder=builder, model=model,
@@ -11010,6 +11025,9 @@ class TestModelUpdater(unittest.TestCase):
         remote = ScannerResult(datetime.now(), roots, scanned_path_pair_ids=set(pairs))
         snapshot = {(root.path_pair_id, root.name): root for root in roots}
         before_ids = set(model.get_file_ids())
+        diagnostic_errors = []
+        controller.logger.debug.side_effect = lambda *_args, **_kwargs: diagnostic_errors.append(
+            repr(__import__("sys").exc_info()[1]))
         with tempfile.TemporaryDirectory() as trace_path:
             trace = BreadcrumbTraceCollector(
                 lambda: True, max_entries=128,
@@ -11018,11 +11036,33 @@ class TestModelUpdater(unittest.TestCase):
             )
             controller._Controller__context.breadcrumb_trace = trace
             updater = ModelUpdater(controller)
+            status_admission_results = []
+            bounded_status_metadata = []
+            join_emitter = updater._ModelUpdater__scan_pair_join_emitter
+            original_record = join_emitter.record
+            def record_with_receipt(*args, **kwargs):
+                result = original_record(*args, **kwargs)
+                if args[1] == "scan_status_publication_join":
+                    status_admission_results.append(result)
+                    from common.breadcrumb_trace import _bounded_ingress_record
+                    bounded = _bounded_ingress_record(
+                        args[0], args[1], args[2], kwargs, 0,
+                        SimpleNamespace(value=0), SimpleNamespace(value=0),
+                    )
+                    bounded_status_metadata.append(bounded["metadata"])
+                return result
+            join_emitter.record = record_with_receipt
             try:
                 updater._record_scan_pair_joins(
                     None, remote, authority, remote_scoped_snapshot=snapshot,
                     remote_filtered_snapshot=snapshot, progressive_delta_keys=set(snapshot),
                     reconciled_remote_roots=roots, model_builder=builder,
+                    raw_statuses=statuses, filtered_statuses=statuses[:4],
+                    consumed_statuses=statuses[:3],
+                    raw_status_id_counts={status.file_id: 1 for status in statuses},
+                    active_status_file_ids={status.file_id for status in statuses},
+                    malformed_status_file_ids={statuses[2].file_id},
+                    status_source="cached_unhealthy", status_fresh=True, status_healthy=True,
                 )
                 # An untouched delta is not a lossless source replacement.
                 # Missing readers and a different published version stay unknown.
@@ -11030,12 +11070,28 @@ class TestModelUpdater(unittest.TestCase):
                     None, remote, dict(authority, model_version=model.version + 1),
                     remote_scoped_snapshot=snapshot,
                     progressive_delta_keys=set(), reconciled_remote_roots=[],
+                    model_builder=object(), raw_statuses=statuses,
+                    filtered_statuses=statuses[:4], consumed_statuses=statuses[:3],
+                    raw_status_id_counts={status.file_id: 1 for status in statuses},
+                    active_status_file_ids={status.file_id for status in statuses},
+                    malformed_status_file_ids={statuses[2].file_id},
+                )
+                unknown_job = SimpleNamespace(
+                    name=statuses[0].name, path_pair_id=statuses[0].path_pair_id,
+                    file_id=statuses[0].file_id, job_correlation=None,
+                )
+                updater._record_scan_pair_joins(
+                    None, remote, dict(authority, publication_id=None),
+                    model_builder=builder, raw_statuses=[unknown_job],
+                    filtered_statuses=[], consumed_statuses=statuses,
+                    raw_status_id_counts={unknown_job.file_id: 1},
+                    active_status_file_ids=set(), malformed_status_file_ids=set(),
                 )
             finally:
                 trace.close(2.0)
             with open(os.path.join(trace_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
-                rows = [json.loads(line) for line in handle if line.strip()]
-            rows = [row for row in rows if row.get("message") == "scan_root_membership_join"]
+                persisted = [json.loads(line) for line in handle if line.strip()]
+            rows = [row for row in persisted if row.get("message") == "scan_root_membership_join"]
             self.assertEqual(2, len(rows))
             positive, unknown = [row["details"] for row in rows]
             for row, details in zip(rows, (positive, unknown)):
@@ -11055,6 +11111,55 @@ class TestModelUpdater(unittest.TestCase):
                 self.assertNotIn("fixture-", json.dumps(row))
             self.assertEqual("pppprt" * 8, positive["root_state_codes"])
             self.assertEqual("uuuuut" * 8, unknown["root_state_codes"])
+            status_rows = [row for row in persisted if row.get("message") == "scan_status_publication_join"]
+            self.assertEqual([], diagnostic_errors)
+            self.assertEqual(["enqueued", "enqueued", "enqueued"], status_admission_results)
+            self.assertEqual(3, len(status_rows), bounded_status_metadata)
+            joined = status_rows[0]
+            details = joined["details"]
+            self.assertEqual("scan.pair_join", joined["category"])
+            self.assertEqual(details["cid"], joined["corr_id"])
+            self.assertEqual(details["cid"], joined["flow_id"])
+            self.assertEqual("scan_authority", joined["stage"])
+            self.assertEqual((5, 4, 3, 4, 1), tuple(details[key] for key in (
+                "raw", "flt", "con",
+                "rows", "omitted",
+            )))
+            self.assertEqual(4 * 25, len(details["job"]))
+            self.assertTrue(all(
+                token.startswith("lftp-job:") and len(token) == 25 and
+                all(character in "0123456789abcdef" for character in token[9:])
+                for token in (details["job"][offset:offset + 25]
+                              for offset in range(0, 4 * 25, 25))
+            ))
+            for key in ("rid", "pair", "mid"):
+                self.assertEqual(4 * 16, len(details[key]))
+            self.assertEqual(4 * 3, len(details["mem"]))
+            self.assertEqual(4 * 2, len(details["src"]))
+            self.assertEqual(4 * 2, len(details["msrc"]))
+            self.assertEqual(("ap", "aa"), tuple(
+                details["src"][offset:offset + 2] for offset in (0, 2)
+            ))
+            self.assertEqual("sdss", details["name_rel"])
+            self.assertEqual("s", details["rel"][0])
+            self.assertEqual("f", details["rel"][1])
+            self.assertNotEqual(details["cid"], status_rows[1]["details"]["cid"])
+            unknown_status = status_rows[1]["details"]
+            self.assertEqual("u" * 4, unknown_status["name_rel"])
+            self.assertEqual("u" * 8, unknown_status["src"])
+            self.assertEqual("u" * 8, unknown_status["msrc"])
+            self.assertEqual("u" * (4 * 16), unknown_status["mid"])
+            missing = status_rows[2]["details"]
+            self.assertEqual("u" * 25, missing["job"])
+            self.assertEqual("u", missing["mem"][1])
+            self.assertEqual("uu", missing["src"])
+            self.assertEqual("u", missing["name_rel"])
+            self.assertIsNone(missing["pub"])
+            for row in status_rows:
+                self.assertLessEqual(len(row["details"]), 24)
+                self.assertNotIn("<truncated>", json.dumps(row))
+                for private_value in ("private-status-only.bin", "fixture-pair-", "fixture-0.bin"):
+                    self.assertNotIn(private_value, json.dumps(row))
         self.assertEqual(before_ids, set(model.get_file_ids()))
         self.assertTrue(all(model.get_file(ModelFile.build_file_id(root.name, root.path_pair_id)).remote_present
                             for root in roots))

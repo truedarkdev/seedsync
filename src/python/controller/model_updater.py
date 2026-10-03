@@ -112,6 +112,7 @@ _ACTIVE_DELTA_REJECTION_CORRELATION_TARGET_LIMIT = 16
 _ACTIVE_DELTA_REJECTION_CORRELATION_COUNT_LIMIT = 128
 _SCAN_ADOPTION_TRACE_CATEGORY = "scan.adoption"
 _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT = 16
+_SCAN_STATUS_PUBLICATION_JOIN_LIMIT = 4
 
 
 def _record_selected_root_scan_join(
@@ -3759,6 +3760,15 @@ class ModelUpdater(_ControllerCoreAccess):
             progressive_delta_keys: object = None,
             reconciled_remote_roots: object = None,
             model_builder: object = None,
+            raw_statuses: object = None,
+            filtered_statuses: object = None,
+            consumed_statuses: object = None,
+            raw_status_id_counts: object = None,
+            active_status_file_ids: object = None,
+            malformed_status_file_ids: object = None,
+            status_source: object = None,
+            status_fresh: object = None,
+            status_healthy: object = None,
     ) -> None:
         """Queue bounded pair joins for the settled source-authority outcome."""
         emitter = self.__scan_pair_join_emitter
@@ -4091,6 +4101,28 @@ class ModelUpdater(_ControllerCoreAccess):
                         category="scan.pair_join", level="info",
                         corr_id=root_event_id, flow_id=root_event_id, trace_scope="flow",
                     )
+
+            # Use the original raw prefix only.  This is a sibling of the
+            # existing scan publication join, so it shares that event gate
+            # and cadence instead of adding a status-poll breadcrumb stream.
+            if raw_statuses is not None or filtered_statuses is not None or consumed_statuses is not None:
+                try:
+                    self._record_status_publication_join(
+                        emitter, controller, authority, model_builder,
+                        raw_statuses=raw_statuses,
+                        filtered_statuses=filtered_statuses,
+                        consumed_statuses=consumed_statuses,
+                        raw_status_id_counts=raw_status_id_counts,
+                        active_status_file_ids=active_status_file_ids,
+                        malformed_status_file_ids=malformed_status_file_ids,
+                        status_source=status_source,
+                        status_fresh=status_fresh,
+                        status_healthy=status_healthy,
+                    )
+                except Exception:
+                    logger = getattr(controller, "logger", None)
+                    if logger is not None:
+                        logger.debug("Ignoring status publication join breadcrumb failure", exc_info=True)
         except Exception:
             logger = getattr(self._controller, "logger", None)
             if logger is not None:
@@ -4098,6 +4130,168 @@ class ModelUpdater(_ControllerCoreAccess):
                     logger.debug("Ignoring scan pair join breadcrumb failure", exc_info=True)
                 except Exception:
                     pass
+
+    @staticmethod
+    def _record_status_publication_join(
+            emitter: object, controller: object, authority: Mapping[str, object],
+            builder: object, *, raw_statuses: object, filtered_statuses: object,
+            consumed_statuses: object, raw_status_id_counts: object,
+            active_status_file_ids: object, malformed_status_file_ids: object,
+            status_source: object, status_fresh: object, status_healthy: object,
+    ) -> None:
+        """Join a fixed raw status prefix to same-publication roots."""
+        def count(value: object) -> Optional[int]:
+            return len(value) if isinstance(value, (list, tuple)) else None
+
+        raw_count, filtered_count, consumed_count = map(
+            count, (raw_statuses, filtered_statuses, consumed_statuses),
+        )
+        sample = list(islice(raw_statuses, _SCAN_STATUS_PUBLICATION_JOIN_LIMIT)) \
+            if isinstance(raw_statuses, (list, tuple)) else []
+        omitted = max(0, raw_count - len(sample)) if raw_count is not None else None
+        no_id = "u" * 16
+        rows: list[dict[str, object]] = []
+        consumed_map = getattr(builder, "_ModelBuilder__lftp_statuses", None)
+        for status in sample:
+            row: dict[str, object] = {
+                "id": None, "name": None, "pair": None, "job": "u" * 25,
+                "membership": "uuu", "source": "uu", "model_id": no_id,
+                "name_relation": "u", "model_presence": "uu", "relation": "u", "join": "u",
+            }
+            try:
+                name, pair_id, file_id = (getattr(status, key, None)
+                                          for key in ("name", "path_pair_id", "file_id"))
+                valid = isinstance(name, str) and bool(name) and (pair_id is None or isinstance(pair_id, str)) \
+                    and type(file_id) is str \
+                    and file_id == ModelFile.build_file_id(name, pair_id)
+                if valid:
+                    row.update({
+                        "id": file_id, "name": name, "pair": pair_id,
+                        "status_id": opaque_trace_correlation("status-root|" + file_id),
+                        "status_pair": opaque_trace_correlation("status-pair|" + (pair_id or "none")),
+                    })
+                job = getattr(status, "job_correlation", None)
+                if type(job) is str and job.startswith("lftp-job:") and len(job) == 25 and \
+                        all(character in "0123456789abcdef" for character in job[9:]):
+                    row["job"] = job
+                duplicate_count = raw_status_id_counts.get(file_id) \
+                    if valid and isinstance(raw_status_id_counts, Mapping) else None
+                duplicate = "d" if type(duplicate_count) is int and duplicate_count > 1 else \
+                    "s" if type(duplicate_count) is int and duplicate_count == 1 else "u"
+                if valid and isinstance(active_status_file_ids, (set, frozenset)) and \
+                        isinstance(malformed_status_file_ids, (set, frozenset)):
+                    filtered = "p" if file_id in active_status_file_ids and file_id not in malformed_status_file_ids \
+                        else "f" if file_id in active_status_file_ids else "a"
+                else:
+                    filtered = "u"
+                if valid and isinstance(consumed_map, Mapping):
+                    consumed_row = consumed_map.get(file_id)
+                    consumed_job = getattr(consumed_row, "job_correlation", None) \
+                        if consumed_row is not None else None
+                    consumed_job_known = type(consumed_job) is str and \
+                        consumed_job.startswith("lftp-job:") and len(consumed_job) == 25 and \
+                        all(character in "0123456789abcdef" for character in consumed_job[9:])
+                    consumed = "a" if consumed_row is None else \
+                        "u" if row["job"] == "u" * 25 or not consumed_job_known else \
+                        "p" if consumed_job == row["job"] else "o"
+                else:
+                    consumed = "u"
+                row["membership"] = filtered + consumed + duplicate
+            except Exception:
+                pass
+            rows.append(row)
+
+        publication_id = authority.get("publication_id")
+        expected_version = authority.get("model_version")
+        model = getattr(controller, "_Controller__model", None)
+        lock = getattr(controller, "_Controller__model_lock", None)
+        snapshot = getattr(controller, "_Controller__scan_authority_snapshot", None)
+        local_reader = getattr(builder, "_ModelBuilder__local_file", None)
+        remote_reader = getattr(builder, "_ModelBuilder__remote_file", None)
+        model_reader = getattr(model, "published_file", None)
+        if model is not None and lock is not None and callable(model_reader) and \
+                type(publication_id) is int and publication_id >= 0 and \
+                isinstance(snapshot, dict) and type(snapshot.get("publication_id")) is int and \
+                snapshot.get("publication_id") == publication_id and \
+                type(expected_version) is int:
+            try:
+                with lock:
+                    if getattr(controller, "_Controller__model", None) is model and \
+                            getattr(model, "version", None) == expected_version:
+                        for row in rows:
+                            file_id, name, pair_id = row["id"], row["name"], row["pair"]
+                            if not isinstance(file_id, str) or not isinstance(name, str) or \
+                                    "/" in name or "\\" in name or not callable(local_reader) or \
+                                    not callable(remote_reader):
+                                continue
+                            try:
+                                local = local_reader(file_id)
+                                remote = remote_reader(file_id)
+                                row["source"] = ("p" if local is not None else "a") + \
+                                    ("p" if remote is not None else "a")
+                                model_file = model_reader(file_id)
+                                source_only = local is None and remote is None
+                                if model_file is None and source_only:
+                                    fallback_id = ModelFile.build_file_id(file_id, pair_id)
+                                    if fallback_id != file_id:
+                                        model_file = model_reader(fallback_id)
+                                if model_file is None:
+                                    row["relation"] = "m"
+                                    continue
+                                model_id = getattr(model_file, "file_id", None)
+                                model_name = getattr(model_file, "name", None)
+                                if not isinstance(model_id, str) or not isinstance(model_name, str):
+                                    continue
+                                row["model_id"] = opaque_trace_correlation("published-root|" + model_id)
+                                row["name_relation"] = "s" if name == model_name else "d"
+                                local_present = getattr(model_file, "local_present", None)
+                                remote_present = getattr(model_file, "remote_present", None)
+                                row["model_presence"] = ("p" if local_present else "a") + \
+                                    ("p" if remote_present else "a") if type(local_present) is bool and \
+                                    type(remote_present) is bool else "uu"
+                                row["relation"] = "s" if model_id == file_id else \
+                                    "f" if source_only and model_id == ModelFile.build_file_id(file_id, pair_id) else "d"
+                                presence = row["source"], row["model_presence"]
+                                row["join"] = "a" if presence[0] == presence[1] and \
+                                    presence[0] in {"pp", "pa", "ap", "aa"} else \
+                                    "d" if presence[0] in {"pp", "pa", "ap", "aa"} and \
+                                    presence[1] in {"pp", "pa", "ap", "aa"} else "u"
+                            except Exception:
+                                continue
+            except Exception:
+                pass
+
+        safe_source = status_source if isinstance(status_source, str) and \
+            status_source in _COMPLETION_GATE_LFTP_SOURCES else "unknown"
+        correlation = opaque_trace_correlation(
+            "scan-status-publication|{}|{}".format(publication_id, expected_version),
+        )
+        emitter.record(
+            "model_updater", "scan_status_publication_join", {
+                "schema": "scan_status_publication_join.v1",
+                "cid": correlation,
+                "pub": publication_id if type(publication_id) is int else None,
+                "ver": expected_version if type(expected_version) is int else None,
+                "raw": raw_count, "flt": filtered_count,
+                "con": consumed_count, "rows": len(rows),
+                "omitted": omitted, "sel": "raw_prefix_4",
+                "poll": safe_source,
+                "fresh": status_fresh if type(status_fresh) is bool else None,
+                "health": status_healthy if type(status_healthy) is bool else None,
+                "job": "".join(cast(str, row["job"]) for row in rows),
+                "rid": "".join(cast(str, row.get("status_id", no_id)) for row in rows),
+                "pair": "".join(cast(str, row.get("status_pair", no_id)) for row in rows),
+                "mem": "".join(cast(str, row["membership"]) for row in rows),
+                "src": "".join(cast(str, row["source"]) for row in rows),
+                "mid": "".join(cast(str, row["model_id"]) for row in rows),
+                "name_rel": "".join(cast(str, row["name_relation"]) for row in rows),
+                "msrc": "".join(cast(str, row["model_presence"]) for row in rows),
+                "rel": "".join(cast(str, row["relation"]) for row in rows),
+                "join": "".join(cast(str, row["join"]) for row in rows),
+            }, stage="scan_authority", event_type="state_transition",
+            category="scan.pair_join", level="info", corr_id=correlation,
+            flow_id=correlation, trace_scope="flow",
+        )
 
     def _completion_gate_trace_enabled(self, level: str = "info") -> bool:
         """Check the global trace gate before diagnostic-only marker reads."""
@@ -10949,6 +11143,15 @@ class ModelUpdater(_ControllerCoreAccess):
                 progressive_delta_keys=progressive_joint_delta_keys,
                 reconciled_remote_roots=joint_remote_files,
                 model_builder=model_builder,
+                raw_statuses=raw_lftp_statuses,
+                filtered_statuses=post_filter_lftp_statuses,
+                consumed_statuses=lftp_statuses,
+                raw_status_id_counts=raw_status_id_counts,
+                active_status_file_ids=active_status_file_ids,
+                malformed_status_file_ids=controller._Controller__malformed_status_only_file_ids,
+                status_source=lftp_status_source,
+                status_fresh=lftp_status_snapshot_fresh,
+                status_healthy=lftp_status_poll_healthy,
             )
             authority_publication_recorder = getattr(
                 controller, "_record_authority_handoff_publication", None,
