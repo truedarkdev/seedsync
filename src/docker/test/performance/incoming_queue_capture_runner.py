@@ -120,6 +120,8 @@ class Config:
         fields = (pair.get("id"), pair.get("name"), root.get("id"), root.get("name"), selector.get("leaf_id"), selector.get("leaf_name"))
         if not all(_text(item) for item in fields):
             raise CaptureError("exact selector identity is required")
+        if root["id"] == selector["leaf_id"] and root["name"] != selector["leaf_name"]:
+            raise CaptureError("root file selector names must match")
         paths: dict[str, Path] = {}
         for name in ("key_path", "spool_path", "artifact_path"):
             raw = value.get(name)
@@ -187,6 +189,10 @@ class Config:
 
 
 def _leaf_path(config: Config) -> str:
+    if config.root_id == config.leaf_id:
+        return "/server/model/v1/pairs/{}/roots?limit=200".format(
+            quote(config.pair_id, safe=""),
+        )
     return "/server/model/v1/pairs/{}/children?parent_file_id={}&limit=200".format(
         quote(config.pair_id, safe=""), quote(config.root_id, safe=""),
     )

@@ -35,6 +35,7 @@ PAIR = "pair-1"
 ROOT = "root-1"
 LEAF = "leaf-1"
 LEAF_PATH = "/server/model/v1/pairs/pair-1/children?parent_file_id=root-1&limit=200"
+ROOTS_PATH = "/server/model/v1/pairs/pair-1/roots?limit=200"
 
 
 def _health(path: Path, session: str = "session-1", *, lost: int = 0) -> None:
@@ -70,6 +71,12 @@ def _payload(version: int = 7) -> dict[str, object]:
     }
 
 
+def _root_payload(version: int = 7, **record_overrides) -> dict[str, object]:
+    payload = _payload(version)
+    payload["records"][0].update({"file_id": ROOT, "name": "Incoming", **record_overrides})
+    return payload
+
+
 class Response:
     def __init__(self, status: int, body: bytes):
         self.status, self.body, self.headers = status, body, {}
@@ -100,20 +107,24 @@ def _trace(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
-def _opener(calls: list[str], *, versions: list[int] | None = None, release: threading.Event | None = None):
+def _opener(
+    calls: list[str], *, versions: list[int] | None = None, release: threading.Event | None = None,
+    expected_path: str = LEAF_PATH, payload_factory=None,
+):
     versions = versions or [7]
     count = [0]
 
     def open_request(request, timeout):
         assert request.method == "GET"
         path = request.full_url.split("8800", 1)[-1]
-        assert path == LEAF_PATH
+        assert path == expected_path
         calls.append(path)
         index = min(count[0], len(versions) - 1)
         count[0] += 1
         if release is not None and count[0] >= 2:
             assert release.wait(1)
-        return Response(200, json.dumps(_payload(versions[index])).encode())
+        payload = payload_factory(versions[index]) if payload_factory else _payload(versions[index])
+        return Response(200, json.dumps(payload).encode())
 
     return open_request
 
@@ -164,6 +175,81 @@ def test_passive_get_is_whitelisted_and_persists_wire_times_without_secrets(monk
     text = config.artifact_path.read_text(encoding="utf-8")
     assert "private-credential" not in text and "pair-1" not in text and "leaf-1" not in text
     assert not any("POST" in item for item in calls)
+
+
+def test_root_file_selector_uses_roots_route_and_accepts_exact_regular_file(monkeypatch, tmp_path):
+    spool = _spool(tmp_path)
+    config = _config(tmp_path, spool, selector={
+        "pair": {"id": PAIR, "name": "Pair"},
+        "root": {"id": ROOT, "name": "Incoming"},
+        "leaf_id": ROOT, "leaf_name": "Incoming",
+    })
+    calls: list[str] = []
+
+    result = runner.Runner(config, opener=_opener(
+        calls, expected_path=ROOTS_PATH, payload_factory=_root_payload,
+    )).run()
+
+    assert calls and all(path == ROOTS_PATH for path in calls)
+    assert result["model_outcome"] == "observed"
+    receipt = next(item for item in _trace(config.artifact_path) if item["event"] == "leaf_receipt")
+    assert receipt["model_version"] == 7
+
+
+@pytest.mark.parametrize("record_overrides", [
+    {"is_dir": True},
+    {"file_id": "unknown-file"},
+    {"name": "unexpected-name"},
+])
+def test_root_file_selector_rejects_directory_unknown_and_mismatched_root(monkeypatch, tmp_path, record_overrides):
+    spool = _spool(tmp_path)
+    config = _config(tmp_path, spool, selector={
+        "pair": {"id": PAIR, "name": "Pair"},
+        "root": {"id": ROOT, "name": "Incoming"},
+        "leaf_id": ROOT, "leaf_name": "Incoming",
+    })
+    calls: list[str] = []
+
+    with pytest.raises(runner.CaptureError):
+        runner.Runner(config, opener=_opener(
+            calls, expected_path=ROOTS_PATH,
+            payload_factory=lambda version: _root_payload(version, **record_overrides),
+        )).run()
+
+    assert calls and all(path == ROOTS_PATH for path in calls)
+
+
+def test_root_file_selector_rejects_mismatched_declared_name(tmp_path):
+    with pytest.raises(runner.CaptureError, match="names must match"):
+        _config(tmp_path, _spool(tmp_path), selector={
+            "pair": {"id": PAIR, "name": "Pair"},
+            "root": {"id": ROOT, "name": "Incoming"},
+            "leaf_id": ROOT, "leaf_name": "renamed.bin",
+        })
+
+
+@pytest.mark.parametrize("payload_factory", [
+    lambda version: {"path_pair_id": PAIR, "model_version": version},
+    lambda version: {"path_pair_id": PAIR, "model_version": version, "records": None},
+    lambda version: {"path_pair_id": PAIR, "model_version": version, "records": [
+        _root_payload(version)["records"][0], _root_payload(version)["records"][0],
+    ]},
+])
+def test_root_file_selector_rejects_missing_null_or_ambiguous_records(tmp_path, payload_factory):
+    spool = _spool(tmp_path)
+    config = _config(tmp_path, spool, selector={
+        "pair": {"id": PAIR, "name": "Pair"},
+        "root": {"id": ROOT, "name": "Incoming"},
+        "leaf_id": ROOT, "leaf_name": "Incoming",
+    })
+    calls: list[str] = []
+
+    with pytest.raises(runner.CaptureError):
+        runner.Runner(config, opener=_opener(
+            calls, expected_path=ROOTS_PATH, payload_factory=payload_factory,
+        )).run()
+
+    assert calls and all(path == ROOTS_PATH for path in calls)
 
 
 def test_identity_hash_excludes_mutable_state_and_wire_model_version_is_projected(monkeypatch, tmp_path):
