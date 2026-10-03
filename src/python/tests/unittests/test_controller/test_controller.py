@@ -16122,6 +16122,7 @@ class TestController(unittest.TestCase):
             healthy_id = ModelFile.build_file_id("complete-root", healthy_pair_id)
             removed_id = ModelFile.build_file_id("removed-root", healthy_pair_id)
             staging_id = ModelFile.build_file_id("stage-root", healthy_pair_id)
+            blocked_remote_id = ModelFile.build_file_id("unreadable-root", blocked_pair_id)
             self.assertEqual(set(), controller._Controller__model.get_file_ids())
             self.assertFalse(Controller.is_path_pair_reconciled(controller, healthy_pair_id))
             self.assertFalse(Controller.is_path_pair_reconciled(controller, blocked_pair_id))
@@ -16256,6 +16257,126 @@ class TestController(unittest.TestCase):
                 {healthy_id, removed_id, staging_id}, first_healthy_authority["builder_source_ids"],
                 first_healthy_authority,
             )
+            remote_source_ids = {
+                ModelFile.build_file_id(root.name, root.path_pair_id)
+                for root in builder.remote_source_roots_snapshot()
+            }
+            self.assertEqual(
+                {healthy_id, removed_id, staging_id, blocked_remote_id}, remote_source_ids,
+            )
+            remote_blocked_root = os.path.normcase(os.path.abspath(
+                os.path.join(blocked_remote, "unreadable-root"),
+            ))
+            blocked_roots.add(remote_blocked_root)
+            remote_added_id = ModelFile.build_file_id("remote-added-root", healthy_pair_id)
+            shutil.rmtree(os.path.join(healthy_remote, "removed-root"))
+            write_file(healthy_remote, os.path.join("remote-added-root", "added.bin"), b"added")
+            with patch("system.scanner.os.scandir", side_effect=deny_selected_roots):
+                remote_process.run_loop()
+            remote_replacement_wave = list(remote_process._ScannerProcess__queue.queue)
+            self.assertTrue(any(
+                healthy_pair_id in event.completed_path_pair_ids and event.is_full_snapshot
+                for event in remote_replacement_wave
+            ))
+            self.assertTrue(any(
+                event.failed and blocked_pair_id in event.unknown_path_pair_ids
+                for event in remote_replacement_wave
+            ))
+            for _cycle in range(5):
+                updater.update()
+            remote_accumulator = controller._Controller__progressive_remote_scan_state
+            self.assertIn(healthy_pair_id, remote_accumulator.completed_pairs())
+            self.assertIn(blocked_pair_id, remote_accumulator.incomplete_pairs())
+            remote_source_ids = {
+                ModelFile.build_file_id(root.name, root.path_pair_id)
+                for root in builder.remote_source_roots_snapshot()
+            }
+            self.assertEqual(
+                {healthy_id, staging_id, remote_added_id, blocked_remote_id}, remote_source_ids,
+            )
+            self.assertEqual(
+                frozenset({blocked_pair_id}), builder.unknown_local_path_pair_ids_snapshot(),
+            )
+            _, remote_only_inventory = builder.local_library_inventory_snapshot()
+            self.assertEqual("scanning", remote_only_inventory[blocked_pair_id].state)
+
+            selected_remote_root = os.path.normcase(os.path.abspath(
+                os.path.join(healthy_remote, "complete-root"),
+            ))
+            blocked_roots.add(selected_remote_root)
+            with patch("system.scanner.os.scandir", side_effect=deny_selected_roots):
+                remote_process.run_loop()
+            selected_failure_wave = list(remote_process._ScannerProcess__queue.queue)
+            self.assertTrue(any(
+                event.failed and healthy_pair_id in event.unknown_path_pair_ids
+                for event in selected_failure_wave
+            ))
+            for _cycle in range(5):
+                updater.update()
+            self.assertEqual(
+                {healthy_id, staging_id, remote_added_id, blocked_remote_id}, {
+                    ModelFile.build_file_id(root.name, root.path_pair_id)
+                    for root in builder.remote_source_roots_snapshot()
+                },
+            )
+
+            stale_remote_root = SystemFile("stale-remote-root", 9, False)
+            stale_remote_root.path_pair_id = healthy_pair_id
+            remote_process._ScannerProcess__publish_result(ScannerResult(
+                datetime.now(), [stale_remote_root], scanned_path_pair_ids={healthy_pair_id},
+                completed_path_pair_ids={healthy_pair_id}, generation=remote_process.generation - 1,
+                is_progress=True, is_scan_final=True, is_full_snapshot=True,
+                full_snapshot_path_pair_ids={healthy_pair_id}, session_token=remote_process.session_token,
+            ))
+            for _cycle in range(5):
+                updater.update()
+            self.assertNotIn(
+                ModelFile.build_file_id("stale-remote-root", healthy_pair_id), {
+                    ModelFile.build_file_id(root.name, root.path_pair_id)
+                    for root in builder.remote_source_roots_snapshot()
+                },
+            )
+
+            blocked_roots.remove(selected_remote_root)
+            for root_name in ("complete-root", "stage-root", "remote-added-root"):
+                shutil.rmtree(os.path.join(healthy_remote, root_name))
+            with patch("system.scanner.os.scandir", side_effect=deny_selected_roots):
+                remote_process.run_loop()
+            remote_empty_wave = list(remote_process._ScannerProcess__queue.queue)
+            self.assertTrue(any(
+                healthy_pair_id in event.completed_path_pair_ids and event.is_full_snapshot
+                for event in remote_empty_wave
+            ))
+            self.assertTrue(any(
+                event.failed and blocked_pair_id in event.unknown_path_pair_ids
+                for event in remote_empty_wave
+            ))
+            for _cycle in range(5):
+                updater.update()
+            self.assertEqual(
+                {blocked_remote_id}, {
+                    ModelFile.build_file_id(root.name, root.path_pair_id)
+                    for root in builder.remote_source_roots_snapshot()
+                },
+            )
+            self.assertEqual(
+                frozenset({blocked_pair_id, healthy_pair_id}),
+                builder.unknown_local_path_pair_ids_snapshot(),
+            )
+            _, empty_remote_inventory = builder.local_library_inventory_snapshot()
+            self.assertEqual("scanning", empty_remote_inventory[blocked_pair_id].state)
+            self.assertEqual({"file_count": 3, "size": 22, "state": "up_to_date"}, {
+                "file_count": empty_remote_inventory[healthy_pair_id].file_count,
+                "size": empty_remote_inventory[healthy_pair_id].size,
+                "state": empty_remote_inventory[healthy_pair_id].state,
+            })
+            self.assertEqual(
+                {healthy_id, removed_id, staging_id}, {
+                    ModelFile.build_file_id(root.name, root.path_pair_id)
+                    for root in builder.local_source_roots_snapshot()
+                },
+            )
+
             self.assertIn(healthy_pair_id, first_healthy_authority["completed_pairs"], first_healthy_authority)
             self.assertNotIn(healthy_pair_id, first_healthy_authority["incomplete_pairs"], first_healthy_authority)
             healthy_inventory = first_healthy_authority["library_inventory"][healthy_pair_id]
@@ -16268,7 +16389,9 @@ class TestController(unittest.TestCase):
             blocked_inventory = first_healthy_authority["library_inventory"][blocked_pair_id]
             self.assertEqual({"file_count": None, "size": None, "state": "scanning"}, blocked_inventory)
             blocked_summary = first_healthy_authority["summary"][blocked_pair_id]
-            self.assertEqual(0, blocked_summary["root_count"], first_healthy_authority)
+            self.assertEqual(1, blocked_summary["root_count"], first_healthy_authority)
+            self.assertEqual(6, blocked_summary["remote_size"], first_healthy_authority)
+            self.assertTrue(blocked_summary["reconciled_remote"], first_healthy_authority)
             self.assertIsNone(blocked_summary["local_library_file_count"], first_healthy_authority)
             self.assertIsNone(blocked_summary["local_library_size"], first_healthy_authority)
             self.assertEqual("scanning", blocked_summary["local_library_state"], first_healthy_authority)
@@ -16372,6 +16495,50 @@ class TestController(unittest.TestCase):
                 empty_inventory[healthy_pair_id].state,
             ))
             self.assertEqual(frozenset({blocked_pair_id}), builder.unknown_local_path_pair_ids_snapshot())
+
+            write_file(healthy_remote, os.path.join("complete-root", "complete.bin"), b"reappeared")
+            with patch("system.scanner.os.scandir", side_effect=deny_selected_roots):
+                remote_process.run_loop()
+            for _cycle in range(5):
+                updater.update()
+            reappeared_remote_ids = {
+                ModelFile.build_file_id(root.name, root.path_pair_id)
+                for root in builder.remote_source_roots_snapshot()
+            }
+            self.assertEqual({healthy_id, blocked_remote_id}, reappeared_remote_ids)
+
+            replacement_remote_process = ScannerProcess(
+                MultiPathLocalScanner([
+                    LocalScanner(healthy_remote, use_temp_file=False, path_pair_id=healthy_pair_id),
+                    LocalScanner(blocked_remote, use_temp_file=False, path_pair_id=blocked_pair_id),
+                ]),
+                interval_in_ms=0,
+                verbose=False,
+            )
+            self.addCleanup(replacement_remote_process.close_queues)
+            controller._Controller__remote_scan_process = replacement_remote_process
+            selected_remote_root = os.path.normcase(os.path.abspath(
+                os.path.join(healthy_remote, "complete-root"),
+            ))
+            blocked_roots.add(selected_remote_root)
+            with patch("system.scanner.os.scandir", side_effect=deny_selected_roots):
+                replacement_remote_process.run_loop()
+            replacement_failure_wave = list(replacement_remote_process._ScannerProcess__queue.queue)
+            self.assertTrue(any(
+                event.failed and healthy_pair_id in event.unknown_path_pair_ids
+                for event in replacement_failure_wave
+            ))
+            for _cycle in range(5):
+                updater.update()
+            replacement_accumulator = controller._Controller__progressive_remote_scan_state
+            self.assertEqual(replacement_remote_process.session_token, replacement_accumulator.session_token)
+            self.assertIn(healthy_pair_id, replacement_accumulator.incomplete_pairs())
+            self.assertEqual(
+                reappeared_remote_ids, {
+                    ModelFile.build_file_id(root.name, root.path_pair_id)
+                    for root in builder.remote_source_roots_snapshot()
+                },
+            )
 
     def test_real_local_scan_publishes_complete_regular_roots_through_normal_updater_cycle(self):
         pair_id = "pair-readable-inventory"

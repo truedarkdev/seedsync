@@ -5409,23 +5409,26 @@ class ModelBuilder:
         self.request_rebuild()
 
     def replace_completed_pair_sources_for_full_rebuild(
-            self, path_pair_id: Optional[str], local_files: List[SystemFile],
+            self, path_pair_id: Optional[str], local_files: Optional[List[SystemFile]],
             remote_files: Optional[List[SystemFile]],
             unknown_local_path_pair_ids: Optional[Set[Optional[str]]],
     ) -> None:
-        """Commit final pair scan authority when bounded rendering is unsafe.
+        """Commit final source authority for either completed side of one pair.
 
         This intentionally performs no delta-safety classification: the caller
         has already selected the established global-build fallback.  It still
         replaces only this pair's bucket, preserving every unrelated source
-        bucket for that global reconciliation. ``None`` remote sources keeps
-        this pair's existing remote bucket for a local-only full-snapshot
-        completion; ``None`` unknown scope preserves the current overlay.
+        bucket for that global reconciliation. ``None`` sources preserve that
+        side's current pair bucket, while an empty list records an authoritative
+        empty full snapshot. Local inventory completion is recorded only when
+        local sources were supplied; a remote-only completion does not certify
+        the local inventory. ``None`` unknown scope preserves the current overlay.
         """
-        next_local = {
-            self.__root_file_id(file.name, path_pair_id): file
-            for file in local_files if file.path_pair_id == path_pair_id
-        }
+        next_local = dict(self.__local_files_by_pair.get(path_pair_id, {})) \
+            if local_files is None else {
+                self.__root_file_id(file.name, path_pair_id): file
+                for file in local_files if file.path_pair_id == path_pair_id
+            }
         next_remote = dict(self.__remote_files_by_pair.get(path_pair_id, {})) \
             if remote_files is None else {
                 self.__root_file_id(file.name, path_pair_id): file
@@ -5449,7 +5452,8 @@ class ModelBuilder:
             frozenset(),
             self.__downloaded_timestamp_overlay_generation,
         ))
-        self.__record_local_inventory_after_pair_source_commit(path_pair_id, local_sources_changed)
+        if local_files is not None:
+            self.__record_local_inventory_after_pair_source_commit(path_pair_id, local_sources_changed)
         self.__unknown_local_path_pair_ids = next_unknown_local_path_pair_ids
         self.request_rebuild()
 

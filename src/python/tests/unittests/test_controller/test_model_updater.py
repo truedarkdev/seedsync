@@ -7485,6 +7485,7 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__move_from_staging = MagicMock(
             return_value=Controller.MoveFromStagingResult.COMPLETED,
         )
+        controller._record_completion_scan_join_breadcrumb = MagicMock()
         controller._record_download_completion = MagicMock()
         controller._complete_download_start_lifecycle = MagicMock()
         controller.clear_extracted_marker = MagicMock()

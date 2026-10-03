@@ -7131,14 +7131,12 @@ class ModelUpdater(_ControllerCoreAccess):
                 unknown_overlay_changed = unknown_before_setter != set(unknown_local_ids)
         if progressive_mode and joint_reconciler is not None:
             local_pair_sources_committed_for_event: set[Optional[str]] = set()
-            # A lossless local full-pair completion owns its local source
-            # bucket and inventory independently of remote or sibling-pair
-            # finality. The result's completed IDs are per-drain and the
-            # accumulator adds them only for accepted full snapshots; the
-            # per-pair token keeps this adoption bound to the live scanner
-            # session even when another pair in the same drain is unknown.
-            if not joint_reconciliation_final and latest_local_scan is not None and \
-                    not bool(getattr(latest_local_scan, "failed", False)):
+            # A lossless full-pair completion owns that side's source bucket
+            # independently of sibling-pair finality. The result's completed
+            # IDs are per-drain; intersecting them with accumulator authority
+            # and the exact process token prevents stale or partial scans from
+            # replacing either side. An absent side is preserved by Builder.
+            if not joint_reconciliation_final:
                 local_pair_replacer = getattr(
                     model_builder, "replace_completed_pair_sources_for_full_rebuild", None,
                 )
@@ -7148,11 +7146,19 @@ class ModelUpdater(_ControllerCoreAccess):
                 unknown_snapshotter = getattr(
                     model_builder, "unknown_local_path_pair_ids_snapshot", None,
                 )
+                accepted_local_pair_ids: set[Optional[str]] = set()
+                accepted_remote_pair_ids: set[Optional[str]] = set()
+                local_files_by_pair: dict[Optional[str], list[SystemFile]] = {}
+                remote_files_by_pair: dict[Optional[str], list[SystemFile]] = {}
+                unknown_after_local_completion: Optional[set[Optional[str]]] = None
+
                 local_authority_tokens = getattr(
                     latest_local_scan, "_scan_authority_tokens_by_pair", None,
-                )
+                ) if latest_local_scan is not None else None
                 local_process_session = _current_scan_session_token(controller, "local")
                 if local_pair_replacer_capable and callable(local_pair_replacer) and \
+                        latest_local_scan is not None and \
+                        not bool(getattr(latest_local_scan, "failed", False)) and \
                         callable(unknown_snapshotter) and \
                         isinstance(local_accumulator, _ProgressiveScanAccumulator) and \
                         isinstance(local_authority_tokens, dict) and \
@@ -7174,7 +7180,6 @@ class ModelUpdater(_ControllerCoreAccess):
                     }
                     if accepted_local_pair_ids:
                         local_snapshot = local_accumulator.snapshot_for_pairs(accepted_local_pair_ids)
-                        local_files_by_pair: dict[Optional[str], list[SystemFile]] = {}
                         for (path_pair_id, _), source in local_snapshot.items():
                             local_files_by_pair.setdefault(path_pair_id, []).append(source)
                         locally_resolved_pair_ids = accepted_local_pair_ids.difference(
@@ -7182,15 +7187,51 @@ class ModelUpdater(_ControllerCoreAccess):
                         )
                         unknown_after_local_completion = set(unknown_snapshotter()) \
                             .difference(locally_resolved_pair_ids)
-                        for path_pair_id in accepted_local_pair_ids:
-                            # ``None`` tells the existing Builder owner to
-                            # retain that pair's current remote bucket.
-                            local_pair_replacer(
-                                path_pair_id,
-                                local_files_by_pair.get(path_pair_id, []),
-                                None,
-                                unknown_after_local_completion,
-                            )
+
+                remote_accumulator = getattr(
+                    controller, "_Controller__progressive_remote_scan_state", None,
+                )
+                remote_authority_tokens = getattr(
+                    latest_remote_scan, "_scan_authority_tokens_by_pair", None,
+                ) if latest_remote_scan is not None else None
+                remote_process_session = _current_scan_session_token(controller, "remote")
+                if local_pair_replacer_capable and callable(local_pair_replacer) and \
+                        latest_remote_scan is not None and \
+                        not bool(getattr(latest_remote_scan, "failed", False)) and \
+                        isinstance(remote_accumulator, _ProgressiveScanAccumulator) and \
+                        isinstance(remote_authority_tokens, dict) and \
+                        isinstance(remote_process_session, str) and \
+                        latest_remote_scan.session_token == remote_process_session and \
+                        remote_accumulator.session_token == remote_process_session:
+                    accepted_remote_pair_ids = set(
+                        getattr(latest_remote_scan, "completed_path_pair_ids", set())
+                    ).intersection(remote_accumulator.completed_pairs()) \
+                        .difference(remote_accumulator.incomplete_pairs()) \
+                        .difference(set(getattr(latest_remote_scan, "unknown_path_pair_ids", set())))
+                    accepted_remote_pair_ids = {
+                        pair_id for pair_id in accepted_remote_pair_ids
+                        if isinstance(remote_authority_tokens.get(pair_id), tuple) and
+                        len(remote_authority_tokens[pair_id]) == 2 and
+                        remote_authority_tokens[pair_id][0] == remote_process_session and
+                        type(remote_authority_tokens[pair_id][1]) is int and
+                        remote_authority_tokens[pair_id][1] >= 0
+                    }
+                    if accepted_remote_pair_ids:
+                        remote_snapshot = remote_accumulator.snapshot_for_pairs(accepted_remote_pair_ids)
+                        for (path_pair_id, _), source in remote_snapshot.items():
+                            remote_files_by_pair.setdefault(path_pair_id, []).append(source)
+
+                if local_pair_replacer_capable and callable(local_pair_replacer):
+                    for path_pair_id in accepted_local_pair_ids.union(accepted_remote_pair_ids):
+                        local_completed = path_pair_id in accepted_local_pair_ids
+                        remote_completed = path_pair_id in accepted_remote_pair_ids
+                        local_pair_replacer(
+                            path_pair_id,
+                            local_files_by_pair.get(path_pair_id, []) if local_completed else None,
+                            remote_files_by_pair.get(path_pair_id, []) if remote_completed else None,
+                            unknown_after_local_completion if local_completed else None,
+                        )
+                        if local_completed:
                             local_pair_sources_committed_for_event.add(path_pair_id)
             if progressive_joint_publication_allowed:
                 if joint_reconciliation_final:

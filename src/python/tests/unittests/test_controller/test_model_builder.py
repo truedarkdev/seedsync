@@ -10295,6 +10295,69 @@ class TestModelBuilder(unittest.TestCase):
             inventory["pair-a"].file_count, inventory["pair-a"].size, inventory["pair-a"].state,
         ))
 
+    def test_completed_remote_pair_replacement_preserves_local_and_unknown_without_local_inventory_completion(self):
+        local_a = SystemFile("local-a.bin", 5)
+        local_a.path_pair_id = "pair-a"
+        local_b = SystemFile("local-b.bin", 8)
+        local_b.path_pair_id = "pair-b"
+        remote_a_old = SystemFile("remote-a-old.bin", 11)
+        remote_a_old.path_pair_id = "pair-a"
+        remote_b = SystemFile("remote-b.bin", 13)
+        remote_b.path_pair_id = "pair-b"
+        self.model_builder.set_local_files([local_a, local_b])
+        self.model_builder.set_remote_files([remote_a_old, remote_b])
+        self.model_builder.set_unknown_local_path_pair_ids({"pair-a", "pair-b"})
+        self.model_builder.observe_local_scan_result(
+            {"pair-a"}, set(), {"pair-a"}, failed=False,
+            enabled_path_pair_ids={"pair-a", "pair-b"},
+        )
+        inventory_revision_before, inventory_before = self.model_builder.local_library_inventory_snapshot()
+        self.assertEqual("scanning", inventory_before["pair-a"].state)
+        active_file = SystemFile("active.bin", 19, False)
+        active_file.path_pair_id = "pair-a"
+        active_status = LftpJobStatus(
+            7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        active_status.path_pair_id = "pair-a"
+        self.model_builder.set_active_files([active_file])
+        self.model_builder.set_lftp_statuses([active_status])
+
+        remote_a_new = SystemFile("remote-a-new.bin", 17)
+        remote_a_new.path_pair_id = "pair-a"
+        with patch.object(
+                self.model_builder,
+                "_ModelBuilder__record_local_inventory_after_pair_source_commit",
+                wraps=self.model_builder._ModelBuilder__record_local_inventory_after_pair_source_commit,
+        ) as local_inventory_completion:
+            self.model_builder.replace_completed_pair_sources_for_full_rebuild(
+                "pair-a", None, [remote_a_new], None,
+            )
+            local_inventory_completion.assert_not_called()
+        inventory_revision_after, inventory_after = self.model_builder.local_library_inventory_snapshot()
+        self.assertEqual(inventory_revision_before, inventory_revision_after)
+        self.assertEqual("scanning", inventory_after["pair-a"].state)
+
+        local_roots = {
+            (root.path_pair_id, root.name)
+            for root in self.model_builder.local_source_roots_snapshot()
+        }
+        remote_roots = {
+            (root.path_pair_id, root.name)
+            for root in self.model_builder.remote_source_roots_snapshot()
+        }
+        self.assertEqual({("pair-a", "local-a.bin"), ("pair-b", "local-b.bin")}, local_roots)
+        self.assertEqual({("pair-a", "remote-a-new.bin"), ("pair-b", "remote-b.bin")}, remote_roots)
+        self.assertEqual(
+            frozenset({"pair-a", "pair-b"}),
+            self.model_builder.unknown_local_path_pair_ids_snapshot(),
+        )
+        self.assertIs(active_file, self.model_builder._ModelBuilder__active_files[
+            ModelFile.build_file_id("active.bin", "pair-a")
+        ])
+        self.assertIs(active_status, self.model_builder._ModelBuilder__lftp_statuses[
+            ModelFile.build_file_id("active.bin", "pair-a")
+        ])
+
     def test_local_source_adoption_pair_trace_uses_root_identity_without_deep_equality(self):
         builder = self.model_builder
         original_root = SystemFile("private-root", 4, True)
