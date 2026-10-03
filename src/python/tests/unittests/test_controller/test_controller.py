@@ -16770,6 +16770,51 @@ class TestController(unittest.TestCase):
             ))
             self.assertIn(healthy_id, serialized_ids)
 
+    def test_real_scan_lifecycle_marker_publication_survives_empty_pending(self):
+        self._exact_local_flow_diagnostic_only = True
+        self.test_real_local_scan_failure_keeps_manual_directory_queue_pair_blocked()
+
+    def test_lifecycle_local_flow_keeps_incomplete_stale_and_nested_basis_unknown(self):
+        builder = ModelBuilder()
+        root = SystemFile("root", 1, False)
+        root.path_pair_id = "pair"
+        file_id = ModelFile.build_file_id("root", "pair")
+        builder.set_local_files([root])
+        fields = dict(local_scan_snapshot={("pair", "root"): root},
+                      local_scan_authority={("pair", "root"): root},
+                      local_pair_authority_tokens={"pair": ("session", 2)},
+                      local_completed_pair_ids={"pair"}, local_incomplete_pair_ids=set(),
+                      local_process_session="session", local_accumulator_session="session",
+                      local_process_generation=2, pre_poll_file_ids=set())
+        read = builder._ModelBuilder__lifecycle_local_flow_details
+        self.assertEqual("accepted_current", read(file_id, **fields)["local_flow_basis"])
+        for changes in ({"local_incomplete_pair_ids": {"pair"}},
+                        {"local_process_generation": 3},
+                        {"local_accumulator_session": "replacement"},
+                        {"local_process_session": None, "local_accumulator_session": None}):
+            with self.subTest(changes=changes):
+                result = read(file_id, **dict(fields, **changes))
+                self.assertEqual("unknown", result["local_flow_basis"])
+                self.assertIsNone(result["local_flow_generation"])
+                self.assertEqual("member", result["local_flow_bucket"])
+        nested = read(ModelFile.build_file_id("root/leaf", "pair"), **fields)
+        self.assertEqual("unknown", nested["local_flow_input"])
+        self.assertEqual("unknown", nested["local_flow_bucket"])
+        self.assertEqual("unknown", nested["local_flow_basis"])
+        for changes in ({"local_scan_snapshot": None},
+                        {"local_scan_authority": None},
+                        {"local_scan_snapshot": {}},
+                        {"local_scan_snapshot": {("pair", "root"): None}}):
+            with self.subTest(changes=changes):
+                result = read(file_id, **dict(fields, **changes))
+                self.assertEqual("unknown", result["local_flow_basis"])
+                self.assertEqual("no_member" if changes.get("local_scan_snapshot") == {} else
+                                 "member" if "local_scan_snapshot" not in changes else "unknown",
+                                 result["local_flow_input"])
+        absent = read(file_id, **dict(fields, local_scan_snapshot={}, local_scan_authority={}))
+        self.assertEqual("no_member", absent["local_flow_input"])
+        self.assertEqual("accepted_current", absent["local_flow_basis"])
+
     def test_real_local_scan_failure_keeps_manual_directory_queue_pair_blocked(self):
         pair_id = "pair-a"
         fixed_mtime_ns = 1_780_000_000_000_000_000
@@ -16785,6 +16830,7 @@ class TestController(unittest.TestCase):
             ("restarted-session", False, "session", None, False),
             ("remote-unreconciled", False, "remote", None, False),
         )
+        diagnostic_only = getattr(self, "_exact_local_flow_diagnostic_only", False)
         for blocked_root, should_dispatch, invalidate_proof, retained_mutation, fail_adoption in failure_cases:
             with self.subTest(blocked_root=blocked_root), tempfile.TemporaryDirectory() as temp_dir:
                 fresh_case = TestController()
@@ -16819,7 +16865,6 @@ class TestController(unittest.TestCase):
                 controller._Controller__staging_path = staging_path
                 controller._Controller__explicit_staging_path_configured = True
                 controller._Controller__startup_recovery_done = True
-                controller._Controller__progressive_joint_authoritative = True
                 controller._Controller__context.config.general.exclude_patterns = ""
                 readiness_trace = BreadcrumbTraceCollector(
                     lambda: True,
@@ -16830,6 +16875,18 @@ class TestController(unittest.TestCase):
                 )
                 self.addCleanup(readiness_trace.close)
                 controller._Controller__context.breadcrumb_trace = readiness_trace
+
+                if diagnostic_only:
+                    readiness_trace.apply_policy({"default": "off", "rules": {
+                        "queue.readiness": "info", "lifecycle.persist": "info",
+                    }})
+                    builder.set_stop_resume_trace_breadcrumb(readiness_trace.create_emitter())
+                    target_file_id = ModelFile.build_file_id("selected", pair_id)
+                    controller._Controller__persist.downloaded_file_names = {target_file_id}
+                    controller._Controller__persist.final_move_succeeded_file_names = {target_file_id}
+                    builder.set_downloaded_files({target_file_id})
+                    builder.set_final_move_succeeded_files({target_file_id})
+                    controller._Controller__pending_completion_file_names.clear()
 
                 local_process = ScannerProcess(
                     LocalScanner(final_path, use_temp_file=False, staging_path=staging_path,
@@ -16853,6 +16910,39 @@ class TestController(unittest.TestCase):
                 remote_process.run_loop()
                 ModelUpdater(controller).update()
                 target_file_id = ModelFile.build_file_id("selected", pair_id)
+                self.assertTrue(controller._Controller__progressive_joint_authoritative)
+                self.assertEqual((local_process.session_token, local_process.generation),
+                                 controller._Controller__scan_authority_tokens["local"][pair_id])
+                self.assertEqual((remote_process.session_token, remote_process.generation),
+                                 controller._Controller__scan_authority_tokens["remote"][pair_id])
+                if diagnostic_only:
+                    self.assertFalse(controller._Controller__pending_completion_file_names)
+                    self.assertTrue(readiness_trace.flush_durable(timeout=5.0))
+                    finalized = []
+                    for spool_name in os.listdir(os.path.join(temp_dir, "trace")):
+                        if spool_name.endswith(".jsonl"):
+                            with open(os.path.join(temp_dir, "trace", spool_name)) as spool:
+                                finalized.extend(json.loads(line) for line in spool)
+                    records = [entry for entry in finalized
+                               if entry.get("category") == "lifecycle.persist" and
+                               entry.get("message") in ("model_candidate", "model_live_publication")]
+                    self.assertEqual({"model_candidate", "model_live_publication"},
+                                     {entry["message"] for entry in records})
+                    self.assertEqual(1, len({entry["corr_id"] for entry in records}))
+                    for entry in records:
+                        details = entry["details"]
+                        self.assertEqual("persist_authority", entry["stage"])
+                        self.assertIn("flow_id", entry)
+                        self.assertEqual("exact_local_flow_join.v1", details["local_flow_schema"])
+                        self.assertEqual("member", details["local_flow_input"])
+                        self.assertEqual("member", details["local_flow_bucket"])
+                        self.assertIn(details["local_flow_basis"], ("accepted_current", "unknown"))
+                        self.assertIsInstance(details["candidate_version"], int)
+                        self.assertIsInstance(details["live_version"], int)
+                        scalar_values = [value for value in details.values() if isinstance(value, str)]
+                        self.assertNotIn("selected", scalar_values)
+                        self.assertNotIn("pair-a", scalar_values)
+                    return
                 initial_model = builder.build_model()
                 self.assertIn(target_file_id, initial_model.get_file_ids())
                 self.assertEqual(("retained.bin",), builder.get_trusted_final_leaf_paths(target_file_id))

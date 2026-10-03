@@ -6281,6 +6281,10 @@ class ModelUpdater(_ControllerCoreAccess):
         progressive_remote_delta_keys: set[tuple[Optional[str], str]] = set()
         remote_scoped_snapshot: object = None
         remote_filtered_snapshot: object = None
+        lifecycle_local_snapshot: object = None
+        lifecycle_local_authority: object = None
+        lifecycle_local_incomplete: object = None
+        lifecycle_local_completed: object = None
         joint_root_shape_trace_enabled = progressive_mode and _controller_breadcrumb_effectively_enabled(
             controller, "scan.root_shape", "info",
         )
@@ -6349,6 +6353,10 @@ class ModelUpdater(_ControllerCoreAccess):
                 local_snapshot, local_authority, local_incomplete, local_completed = side_state(
                     "local", latest_local_scan, scoped_final_pair_ids
                 )
+                lifecycle_local_snapshot = local_snapshot
+                lifecycle_local_authority = local_authority
+                lifecycle_local_incomplete = local_incomplete
+                lifecycle_local_completed = local_completed
                 remote_snapshot, remote_authority, remote_incomplete, remote_completed = side_state(
                     "remote", latest_remote_scan, scoped_final_pair_ids
                 )
@@ -10529,10 +10537,38 @@ class ModelUpdater(_ControllerCoreAccess):
             # Markers can be added while resolving completion, so sample this
             # candidate at the publication boundary rather than at build
             # start; otherwise a final-move subject has no trace identity.
+            lifecycle_join_enabled = _controller_breadcrumb_effectively_enabled(
+                controller, "lifecycle.persist", "info",
+            )
+            lifecycle_join_kwargs: dict[str, object] = {}
+            if lifecycle_join_enabled:
+                try:
+                    local_accumulator = getattr(controller, "_Controller__progressive_local_scan_state", None)
+                    authority_tokens = getattr(controller, "_Controller__scan_authority_tokens", {})
+                    local_pair_authority_tokens = authority_tokens.get("local") \
+                        if isinstance(authority_tokens, dict) else None
+                    local_process = getattr(controller, "_Controller__local_scan_process", None)
+                    lifecycle_join_kwargs = {
+                        "local_scan_snapshot": lifecycle_local_snapshot,
+                        "local_scan_authority": lifecycle_local_authority,
+                        "local_pair_authority_tokens": local_pair_authority_tokens,
+                        "local_completed_pair_ids": lifecycle_local_completed,
+                        "local_incomplete_pair_ids": lifecycle_local_incomplete,
+                        "local_process_session": _current_scan_session_token(controller, "local"),
+                        "local_accumulator_session": getattr(local_accumulator, "session_token", None),
+                        "local_process_generation": getattr(local_process, "generation", None),
+                        "pre_poll_file_ids": pre_poll_active_lftp_file_ids,
+                    }
+                except Exception:
+                    lifecycle_join_kwargs = {}
             candidate_recorder = getattr(model_builder, "record_lifecycle_candidate_publication", None)
             if full_build_triggered and callable(candidate_recorder):
                 try:
-                    recorded_ids = candidate_recorder(new_model, lifecycle_publication_build_kind)
+                    recorded_ids = candidate_recorder(
+                        new_model, lifecycle_publication_build_kind,
+                        live=controller._Controller__model,
+                        **lifecycle_join_kwargs,
+                    )
                     if isinstance(recorded_ids, set) and all(isinstance(file_id, str) for file_id in recorded_ids):
                         lifecycle_publication_subject_ids = recorded_ids
                 except Exception:
@@ -10779,6 +10815,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         "authoritative_pair_adopted" if authoritative_pair_delta_applied else (
                             "full_model_adopted" if global_full_build_triggered else "candidate_not_adopted"
                         ),
+                        **lifecycle_join_kwargs,
                     )
                 except Exception:
                     controller.logger.debug("Ignoring lifecycle live-publication breadcrumb failure", exc_info=True)

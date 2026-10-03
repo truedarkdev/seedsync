@@ -707,7 +707,92 @@ class ModelBuilder:
                 self.__stop_resume_trace_last_signatures.pop(signature_key, None)
         self.__stop_resume_trace_breadcrumb = emitter
 
-    def record_lifecycle_candidate_publication(self, candidate: Model, build_kind: str) -> set[str]:
+    def __lifecycle_local_flow_details(
+            self, file_id: str, *, local_scan_snapshot: object, local_scan_authority: object,
+            local_pair_authority_tokens: object, local_completed_pair_ids: object,
+            local_incomplete_pair_ids: object, local_process_session: object,
+            local_process_generation: object,
+            local_accumulator_session: object, pre_poll_file_ids: object,
+    ) -> dict[str, object]:
+        """Join one lifecycle marker to current local input and bucket facts."""
+        path_pair_id = None
+        root_name = file_id
+        canonical_root_id = False
+        try:
+            decoded_id = json.loads(file_id)
+            if isinstance(decoded_id, list) and len(decoded_id) == 2 and \
+                    isinstance(decoded_id[0], str) and isinstance(decoded_id[1], str):
+                path_pair_id, root_name = decoded_id
+            canonical_root_id = bool(root_name) and "/" not in root_name and "\\" not in root_name and \
+                ModelFile.build_file_id(root_name, path_pair_id) == file_id
+        except (TypeError, ValueError):
+            pass
+        root_key = (path_pair_id, root_name)
+        source = local_scan_snapshot.get(root_key) \
+            if canonical_root_id and isinstance(local_scan_snapshot, dict) else None
+        authority_source = local_scan_authority.get(root_key) \
+            if canonical_root_id and isinstance(local_scan_authority, dict) else None
+        input_state = "unknown"
+        authority_state = "unknown"
+        input_generation = None
+        pair_token = local_pair_authority_tokens.get(path_pair_id) \
+            if isinstance(local_pair_authority_tokens, dict) else None
+        source_member = isinstance(source, SystemFile) and source.name == root_name and \
+            source.path_pair_id == path_pair_id
+        pair_completed = isinstance(local_completed_pair_ids, (set, frozenset)) and \
+            path_pair_id in local_completed_pair_ids and \
+            isinstance(local_incomplete_pair_ids, (set, frozenset)) and \
+            path_pair_id not in local_incomplete_pair_ids
+        if canonical_root_id and source_member:
+            input_state = "member"
+        elif canonical_root_id and pair_completed and isinstance(local_scan_snapshot, dict) and \
+                root_key not in local_scan_snapshot:
+            input_state = "no_member"
+        if canonical_root_id:
+            sessions_current = isinstance(local_process_session, str) and bool(local_process_session) and \
+                isinstance(local_accumulator_session, str) and bool(local_accumulator_session) and \
+                local_process_session == local_accumulator_session and \
+                isinstance(pair_token, tuple) and len(pair_token) == 2 and \
+                pair_token[0] == local_process_session and type(pair_token[1]) is int and pair_token[1] >= 0 and \
+                type(local_process_generation) is int and pair_token[1] == local_process_generation
+            source_authority_current = isinstance(local_scan_snapshot, dict) and \
+                isinstance(local_scan_authority, dict) and (
+                    source_member and authority_source is source or
+                    root_key not in local_scan_snapshot and root_key not in local_scan_authority
+                )
+            if sessions_current and pair_completed and source_authority_current:
+                authority_state = "accepted_current"
+                input_generation = pair_token[1]
+        pre_poll_selected = file_id in pre_poll_file_ids \
+            if isinstance(pre_poll_file_ids, (set, frozenset)) else None
+        bucket_state = "unknown"
+        if canonical_root_id:
+            try:
+                bucket_file = self.__local_file(file_id)
+                bucket_state = "no_member" if bucket_file is None else (
+                    "member" if isinstance(bucket_file, SystemFile) and
+                    bucket_file.name == root_name and bucket_file.path_pair_id == path_pair_id else "unknown"
+                )
+            except Exception:
+                bucket_state = "unknown"
+        return {
+            "local_flow_schema": "exact_local_flow_join.v1",
+            "local_flow_pre_poll_selected": pre_poll_selected,
+            "local_flow_input": input_state,
+            "local_flow_basis": authority_state,
+            "local_flow_generation": input_generation,
+            "local_flow_bucket": bucket_state,
+        }
+
+    def record_lifecycle_candidate_publication(
+            self, candidate: Model, build_kind: str, *, local_scan_snapshot: object = None,
+            local_scan_authority: object = None, local_pair_authority_tokens: object = None,
+            local_completed_pair_ids: object = None, local_incomplete_pair_ids: object = None,
+            local_process_session: object = None, local_accumulator_session: object = None,
+            local_process_generation: object = None,
+            pre_poll_file_ids: object = None,
+            live: Optional[Model] = None,
+    ) -> set[str]:
         """Trace global-marker subjects before a candidate reaches the live model."""
         if not self.__is_stop_resume_trace_enabled("lifecycle.persist", "info"):
             return set()
@@ -720,18 +805,51 @@ class ModelBuilder:
                     "candidate_state": "absent",
                     "build_kind": build_kind,
                     "adoption_kind": "pending",
+                    "candidate_version": candidate.version,
+                    "live_version": getattr(live, "version", None),
+                    **self.__lifecycle_local_flow_details(
+                        file_id,
+                        local_scan_snapshot=local_scan_snapshot,
+                        local_scan_authority=local_scan_authority,
+                        local_pair_authority_tokens=local_pair_authority_tokens,
+                        local_completed_pair_ids=local_completed_pair_ids,
+                        local_incomplete_pair_ids=local_incomplete_pair_ids,
+                        local_process_session=local_process_session,
+                        local_process_generation=local_process_generation,
+                        local_accumulator_session=local_accumulator_session,
+                        pre_poll_file_ids=pre_poll_file_ids,
+                    ),
                 })
                 continue
             self.__record_lifecycle_persist_breadcrumb("model_candidate", candidate_file, {
                 "candidate_state": self.__state_category(candidate_file),
                 "build_kind": build_kind,
                 "adoption_kind": "pending",
+                "candidate_version": candidate.version,
+                "live_version": getattr(live, "version", None),
+                **self.__lifecycle_local_flow_details(
+                    file_id,
+                    local_scan_snapshot=local_scan_snapshot,
+                    local_scan_authority=local_scan_authority,
+                    local_pair_authority_tokens=local_pair_authority_tokens,
+                    local_completed_pair_ids=local_completed_pair_ids,
+                    local_incomplete_pair_ids=local_incomplete_pair_ids,
+                    local_process_session=local_process_session,
+                    local_process_generation=local_process_generation,
+                    local_accumulator_session=local_accumulator_session,
+                    pre_poll_file_ids=pre_poll_file_ids,
+                ),
             })
         return subject_ids
 
     def record_lifecycle_live_publication(
             self, candidate: Model, live: Model, subject_ids: set[str],
-            build_kind: str, adoption_kind: str,
+            build_kind: str, adoption_kind: str, *, local_scan_snapshot: object = None,
+            local_scan_authority: object = None, local_pair_authority_tokens: object = None,
+            local_completed_pair_ids: object = None, local_incomplete_pair_ids: object = None,
+            local_process_session: object = None, local_accumulator_session: object = None,
+            local_process_generation: object = None,
+            pre_poll_file_ids: object = None,
     ) -> None:
         """Trace the resulting live state for the same ephemeral candidate subjects."""
         if not self.__is_stop_resume_trace_enabled("lifecycle.persist", "info"):
@@ -754,6 +872,20 @@ class ModelBuilder:
                 "live_state": live_state,
                 "build_kind": build_kind,
                 "adoption_kind": adoption_kind,
+                "candidate_version": candidate.version,
+                "live_version": live.version,
+                **self.__lifecycle_local_flow_details(
+                    file_id,
+                    local_scan_snapshot=local_scan_snapshot,
+                    local_scan_authority=local_scan_authority,
+                    local_pair_authority_tokens=local_pair_authority_tokens,
+                    local_completed_pair_ids=local_completed_pair_ids,
+                    local_incomplete_pair_ids=local_incomplete_pair_ids,
+                    local_process_session=local_process_session,
+                    local_process_generation=local_process_generation,
+                    local_accumulator_session=local_accumulator_session,
+                    pre_poll_file_ids=pre_poll_file_ids,
+                ),
             })
 
     def record_lifecycle_completion_arbitration(
@@ -1667,7 +1799,13 @@ class ModelBuilder:
         if not self.__is_stop_resume_trace_enabled("lifecycle.persist", "info"):
             return
         try:
-            signature = json.dumps(details, sort_keys=True, default=str)
+            signature_details = details
+            if event in ("model_candidate", "model_live_publication"):
+                signature_details = {
+                    key: value for key, value in details.items()
+                    if key not in ("candidate_version", "live_version")
+                }
+            signature = json.dumps(signature_details, sort_keys=True, default=str)
             signature_key = (file_id, event)
             if self.__stop_resume_trace_last_signatures.get(signature_key) == "retained:" + signature:
                 self.__stop_resume_trace_last_signatures.move_to_end(signature_key)
@@ -1680,7 +1818,7 @@ class ModelBuilder:
                     category="lifecycle.persist", level="info",
                     corr_id=opaque_trace_correlation(file_id), trace_scope="flow",
                     _coalesce_key=self.__lifecycle_trace_coalesce_key(
-                        event, "persist_authority", file_id, details,
+                        event, "persist_authority", file_id, signature_details,
                     ),
                 )
                 # Enqueued signatures are bounded bookkeeping only; they are

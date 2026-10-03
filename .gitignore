@@ -22,6 +22,7 @@ id_rsa
 doc/maintainer-policy.md
 /.backupignore
 /tmp/
+/diagnostics/
 src/python/tmp
 src/angular/.angular
 src/tmp
