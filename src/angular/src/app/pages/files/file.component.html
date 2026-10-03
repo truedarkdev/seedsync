@@ -115,10 +115,12 @@
             <div class="progress-composition">
                 <div class="progress">
                     <div class="progress-bar" role="progressbar"
-                         [class.progress-bar-indeterminate]="file.percentDownloaded == null"
+                         [class.progress-bar-no-known-width]="file.percentDownloaded == null && !hasKnownProgress"
                          [class.progress-bar-animated]="
+                            file.percentDownloaded != null && (
                             file.status === ViewFile.Status.DOWNLOADING ||
                             file.status === ViewFile.Status.EXTRACTING
+                            )
                          "
                          [class.progress-bar-striped]="
                             file.status === ViewFile.Status.DOWNLOADING ||
@@ -126,9 +128,7 @@
                          "
                          [attr.aria-valuenow]="file.percentDownloaded" aria-valuemin="0" aria-valuemax="100"
                          [attr.aria-label]="file.percentDownloaded == null ? 'Download progress unavailable' : null"
-                         [style.width]="
-                            file.percentDownloaded == null ? '100%' : min(file.percentDownloaded,100) + '%'
-                         ">
+                         [style.width]="progressBarPercent + '%'">
                         <ng-container *ngIf="file.percentDownloaded != null">
                             {{file.percentDownloaded}}%
                         </ng-container>

@@ -57,6 +57,11 @@ export class FileComponent implements OnChanges {
     // Indicates an active action on-going
     activeAction: FileAction = null;
 
+    // Keep the last determinate width while this same row's progress is unknown.
+    progressBarPercent = 0;
+    hasKnownProgress = false;
+    private _progressBarFileKey: string = null;
+
     constructor(private modal: Modal,
                 private modalAccessibility: ModalAccessibilityService,
                 private _changeDetector: ChangeDetectorRef) {}
@@ -73,9 +78,19 @@ export class FileComponent implements OnChanges {
 
         const oldFile: ViewFile = changes.file.previousValue;
         const newFile: ViewFile = changes.file.currentValue;
+        const newFileKey = newFile == null ? null : (newFile.fileId || newFile.name);
+        if (newFileKey !== this._progressBarFileKey) {
+            this._progressBarFileKey = newFileKey;
+            this.progressBarPercent = 0;
+            this.hasKnownProgress = false;
+        }
+        if (newFile != null && newFile.percentDownloaded != null) {
+            this.progressBarPercent = Math.min(newFile.percentDownloaded, 100);
+            this.hasKnownProgress = true;
+        }
+
         if (oldFile != null && newFile != null) {
             const oldFileKey = oldFile.fileId || oldFile.name;
-            const newFileKey = newFile.fileId || newFile.name;
 
             if (oldFileKey !== newFileKey && this.pendingAction == null) {
                 this.resetActiveAction();

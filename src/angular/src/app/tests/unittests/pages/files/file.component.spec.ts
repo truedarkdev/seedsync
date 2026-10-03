@@ -452,22 +452,24 @@ describe("Testing file component", () => {
         expect(composition.query(By.css(".size_info")).nativeElement.textContent).toContain("of");
     });
 
-    it("should render unavailable downloading progress as an indeterminate accessible bar", () => {
-        fixture.componentInstance.file = createViewFile({
+    it("should hold the last known width when downloading progress is unavailable", () => {
+        fixture.componentRef.setInput("file", createViewFile({
             status: ViewFile.Status.DOWNLOADING,
             percentDownloaded: null,
             transferredSize: null,
             displaySizeTotal: 1024
-        });
-        fixture.componentInstance.options = of(null) as any;
+        }));
+        fixture.componentRef.setInput("options", of(null) as any);
 
         fixture.detectChanges();
 
         const progress = fixture.debugElement.query(By.css(".progress-bar")).nativeElement as HTMLElement;
-        expect(progress.classList.contains("progress-bar-indeterminate")).toBe(true);
+        expect(progress.classList.contains("progress-bar-indeterminate")).toBe(false);
+        expect(progress.classList.contains("progress-bar-no-known-width")).toBe(true);
         expect(progress.classList.contains("progress-bar-striped")).toBe(true);
-        expect(progress.classList.contains("progress-bar-animated")).toBe(true);
-        expect(progress.style.width).toBe("100%");
+        expect(progress.classList.contains("progress-bar-animated")).toBe(false);
+        expect(progress.style.width).toBe("0%");
+        expect(window.getComputedStyle(progress).minWidth).toBe("0px");
         expect(progress.hasAttribute("aria-valuenow")).toBe(false);
         expect(progress.getAttribute("aria-valuenow")).toBeNull();
         expect(progress.getAttribute("aria-label")).toBe("Download progress unavailable");
@@ -480,6 +482,64 @@ describe("Testing file component", () => {
         expect(fixture.nativeElement.textContent).not.toContain("?");
         expect(fixture.debugElement.query(By.css(".speed-eta span"))).toBeNull();
         expect(fixture.debugElement.query(By.css(".eta span"))).toBeNull();
+    });
+
+    it("should preserve determinate progress through unknown samples and resume updates for the same row", () => {
+        fixture.componentRef.setInput("file", createViewFile({
+            fileId: "stable-row",
+            status: ViewFile.Status.DOWNLOADING,
+            percentDownloaded: 37
+        }));
+        fixture.detectChanges();
+
+        let progress = fixture.debugElement.query(By.css(".progress-bar")).nativeElement as HTMLElement;
+        expect(progress.style.width).toBe("37%");
+
+        fixture.componentRef.setInput("file", createViewFile({
+            fileId: "stable-row",
+            status: ViewFile.Status.DOWNLOADING,
+            percentDownloaded: null
+        }));
+        fixture.detectChanges();
+
+        progress = fixture.debugElement.query(By.css(".progress-bar")).nativeElement as HTMLElement;
+        expect(progress.style.width).toBe("37%");
+        expect(progress.classList.contains("progress-bar-no-known-width")).toBe(false);
+        expect(progress.classList.contains("progress-bar-animated")).toBe(false);
+        expect(progress.getAttribute("aria-valuenow")).toBeNull();
+        expect(fixture.debugElement.query(By.css(".progress-unavailable")).nativeElement.textContent.trim())
+            .toBe("Progress unavailable");
+
+        fixture.componentRef.setInput("file", createViewFile({
+            fileId: "stable-row",
+            status: ViewFile.Status.DOWNLOADING,
+            percentDownloaded: 42
+        }));
+        fixture.detectChanges();
+
+        progress = fixture.debugElement.query(By.css(".progress-bar")).nativeElement as HTMLElement;
+        expect(progress.style.width).toBe("42%");
+        expect(progress.classList.contains("progress-bar-animated")).toBe(true);
+    });
+
+    it("should not carry a held progress width into a different row", () => {
+        fixture.componentRef.setInput("file", createViewFile({
+            fileId: "first-row",
+            status: ViewFile.Status.DOWNLOADING,
+            percentDownloaded: 61
+        }));
+        fixture.detectChanges();
+
+        fixture.componentRef.setInput("file", createViewFile({
+            fileId: "second-row",
+            status: ViewFile.Status.DOWNLOADING,
+            percentDownloaded: null
+        }));
+        fixture.detectChanges();
+
+        const progress = fixture.debugElement.query(By.css(".progress-bar")).nativeElement as HTMLElement;
+        expect(progress.style.width).toBe("0%");
+        expect(progress.classList.contains("progress-bar-animated")).toBe(false);
     });
 
     it("should render recovered and terminal progress as determinate bars", () => {

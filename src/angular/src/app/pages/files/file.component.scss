@@ -152,6 +152,9 @@ $file-layout-desktop-min-width: 900px;
 .content .progress-bar {
     min-width: 2em;
 }
+.content .progress-bar.progress-bar-no-known-width {
+    min-width: 0;
+}
 .content .progress {
     margin-bottom: 5px;
     height: 20px;
