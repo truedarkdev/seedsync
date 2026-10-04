@@ -4731,36 +4731,74 @@ class ModelUpdater(_ControllerCoreAccess):
             return "unknown", freshness
         return ("sidecar_ready" if sidecar else "no_sidecar"), freshness
 
+    @staticmethod
+    def _completion_gate_state_name(file: object) -> str:
+        """Return only the finite state vocabulary used by completion diagnostics."""
+        state = getattr(file, "state", None)
+        if not isinstance(state, ModelFile.State):
+            return "unknown"
+        name = state.name.lower()
+        return name if name in {
+            "default", "queued", "downloading", "downloaded", "extracting",
+            "extracted", "deleted",
+        } else "unknown"
+
     def _record_completion_gate_presentation_transition(
             self, old_file: ModelFile, new_file: ModelFile,
-            details: dict[str, object],
+            published_before: Optional[ModelFile], published_after: Optional[ModelFile],
+            publication_decision: dict[str, object], details: dict[str, object],
             poll_correlation: Optional[str] = None,
     ) -> None:
-        """Record an incomplete root returning to DEFAULT."""
-        if old_file.state != ModelFile.State.DOWNLOADING or \
-                new_file.state != ModelFile.State.DEFAULT or new_file.parent is not None:
+        """Record an incomplete root returning to DEFAULT in the published Model."""
+        if self._completion_gate_state_name(published_before) != "downloading" or \
+                self._completion_gate_state_name(published_after) != "default" or \
+                not isinstance(published_after, ModelFile) or published_after.parent is not None:
             return
-        transferred = new_file.transferred_size
+        transferred = published_after.transferred_size
         transferred_positive = type(transferred) is int and transferred > 0
-        if new_file.complete_local_coverage is not False:
+        if published_after.complete_local_coverage is not False:
             return
-        if new_file.explicitly_stopped is False:
+        if published_after.explicitly_stopped is False:
             level = "warning"
-        elif new_file.explicitly_stopped is True and transferred_positive:
+        elif published_after.explicitly_stopped is True and transferred_positive:
             level = "info"
         else:
             return
+        event_details = dict(details)
+        event_details["publication_decision"] = publication_decision
         self._record_completion_gate_breadcrumb(
-            new_file.file_id,
+            published_after.file_id,
             "completion_gate_presentation_transition",
             {
                 "schema": "completion_gate_presentation_transition.v1",
                 "old_state": "downloading",
                 "new_state": "default",
-                **details,
+                **event_details,
             },
             poll_correlation=poll_correlation,
             level=level,
+        )
+
+    def _record_completion_floor_decision(
+            self, file_id: str, decision: str, reason: str, floor_present: Optional[bool],
+            poll_correlation: Optional[str] = None,
+    ) -> None:
+        """Record one direct floor lifecycle decision without retaining its cause."""
+        if decision not in {"invalidated", "reset", "refused"} or reason not in {
+                "replacement_identity", "lifecycle_release", "explicit_stop", "zero_local",
+                "missing_local",
+        }:
+            return
+        self._record_completion_gate_breadcrumb(
+            file_id,
+            "completion_floor_decision",
+            {
+                "schema": "completion_floor_decision.v1",
+                "decision": decision,
+                "reason": reason,
+                "floor_present": floor_present,
+            },
+            poll_correlation=poll_correlation,
         )
 
     def _record_root_progress_decision(
@@ -5394,6 +5432,7 @@ class ModelUpdater(_ControllerCoreAccess):
 
     def _clear_replaced_pending_completion_floors(
         self, statuses: Iterable[LftpJobStatus],
+        poll_correlation: Optional[str] = None,
     ) -> None:
         """Drop a retired floor when a distinct active LFTP identity returns."""
         controller = self._controller
@@ -5427,6 +5466,10 @@ class ModelUpdater(_ControllerCoreAccess):
                 continue
             current_identity = (status.id, status.type.value)
             if current_identity != retired_identity:
+                self._record_completion_floor_decision(
+                    file_id, "invalidated", "replacement_identity", file_id in floors,
+                    poll_correlation=poll_correlation,
+                )
                 self._invalidate_pending_completion_progress_floor(controller, file_id)
 
     def _revoke_stale_model_published_provenance(
@@ -7450,7 +7493,9 @@ class ModelUpdater(_ControllerCoreAccess):
             retired_identity_sources=retired_identity_sources,
             latest_active_scan=latest_active_scan,
         )
-        self._clear_replaced_pending_completion_floors(raw_lftp_statuses)
+        self._clear_replaced_pending_completion_floors(
+            raw_lftp_statuses, poll_correlation=lftp_status_poll_correlation,
+        )
         controller._Controller__active_downloading_file_names = current_downloading_file_names
         if controller._Controller__malformed_status_only_file_ids != previous_malformed_status_only_file_ids:
             controller._Controller__next_lftp_status_poll_at = None
@@ -10235,9 +10280,22 @@ class ModelUpdater(_ControllerCoreAccess):
                                 if isinstance(publication, _PendingCompletionPublication) else None
                         except Exception:
                             checkpoint_retired_at = None
+                    floor_present_before_release = None
+                    if completion_trace_enabled:
+                        floors_before_release = getattr(
+                            controller, "_Controller__pending_completion_progress_floors", None,
+                        )
+                        if isinstance(floors_before_release, dict):
+                            floor_present_before_release = pending_file_id in floors_before_release
                     self._invalidate_pending_completion_progress_floor(
                         controller, pending_file_id,
                     )
+                    if completion_trace_enabled:
+                        self._record_completion_floor_decision(
+                            pending_file_id, "invalidated", "lifecycle_release",
+                            floor_present_before_release,
+                            poll_correlation=lftp_status_poll_correlation,
+                        )
                     evict_snapshots = getattr(
                         model_builder,
                         "evict_recent_live_transfer_snapshots_for_completed_file_ids",
@@ -10397,6 +10455,39 @@ class ModelUpdater(_ControllerCoreAccess):
                 for diff in timed_model_diff_application():
                     old_file = getattr(diff, "old_file", None)
                     new_file = getattr(diff, "new_file", None)
+                    raw_old_state = "unknown"
+                    raw_candidate_state = "unknown"
+                    floor_disposition = "none"
+                    floor_reset = False
+                    published_before = None
+                    published_before_version = None
+                    publication_read_ready = False
+                    publication_probe_candidate = (
+                        (completion_trace_enabled or completion_transition_warning_enabled)
+                        and diff.change == ModelDiff.Change.UPDATED
+                        and isinstance(new_file, ModelFile)
+                        and new_file.parent is None
+                        and new_file.state == ModelFile.State.DEFAULT
+                        and (
+                            new_file.complete_local_coverage is False
+                            or (new_file.name, new_file.path_pair_id, new_file.path_pair_name)
+                            in getattr(controller, "_Controller__pending_completion_file_names", set())
+                        )
+                    )
+                    if publication_probe_candidate:
+                        raw_old_state = self._completion_gate_state_name(old_file)
+                        raw_candidate_state = self._completion_gate_state_name(new_file)
+                        try:
+                            published_reader = getattr(model, "published_file", None)
+                            model_lock = getattr(controller, "_Controller__model_lock", None)
+                            if callable(published_reader) and model_lock is not None:
+                                with model_lock:
+                                    published_before = published_reader(new_file.file_id)
+                                    published_before_version = getattr(model, "version", None)
+                                publication_read_ready = True
+                        except Exception:
+                            published_before = None
+                            published_before_version = None
 
                     if (
                         diff.change == ModelDiff.Change.UPDATED
@@ -10404,6 +10495,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         and new_file is not None
                     ):
                         if new_file.file_id in terminalized_collision_file_ids:
+                            floor_disposition = "invalidated"
                             self._clear_pending_completion_progress_floor(controller, new_file.file_id)
                         else:
                             remember_pending_completion_floor(old_file)
@@ -10411,20 +10503,43 @@ class ModelUpdater(_ControllerCoreAccess):
                                 new_file.file_id,
                             )
                             if floor is not None:
-                                if self._pending_completion_floor_reset(new_file):
+                                floor_reset = self._pending_completion_floor_reset(new_file)
+                                if floor_reset:
+                                    floor_disposition = (
+                                        "reset_stop" if new_file.explicitly_stopped else "reset_zero"
+                                    )
+                                    self._record_completion_floor_decision(
+                                        new_file.file_id, "reset",
+                                        "explicit_stop" if new_file.explicitly_stopped else "zero_local",
+                                        True, poll_correlation=lftp_status_poll_correlation,
+                                    )
                                     self._clear_pending_completion_progress_floor(controller, new_file.file_id)
                                 else:
+                                    if new_file.state == ModelFile.State.DEFAULT and new_file.local_size is None:
+                                        floor_disposition = "missing_local"
+                                        self._record_completion_floor_decision(
+                                            new_file.file_id, "refused", "missing_local", True,
+                                            poll_correlation=lftp_status_poll_correlation,
+                                        )
+                                    pending_ids = pending_completion_file_ids()
+                                    if floor_disposition == "none":
+                                        floor_disposition = (
+                                            "applied" if new_file.file_id in pending_ids else "unknown"
+                                        )
                                     self._apply_pending_completion_progress_floor(
                                         new_file,
-                                        pending_completion_file_ids(),
+                                        pending_ids,
                                         floor[0],
                                         floor[1],
                                         pending_completion_presentation_file_ids(),
                                         pending_completion_publication_file_ids(),
                                     )
-                            elif not self._pending_completion_progress_floor_invalidated(
+                            elif self._pending_completion_progress_floor_invalidated(
                                     controller, new_file.file_id,
                             ):
+                                floor_disposition = "invalidated"
+                            else:
+                                floor_disposition = "unknown"
                                 self._preserve_pending_completion_progress_floor(
                                     old_file,
                                     new_file,
@@ -10437,8 +10552,26 @@ class ModelUpdater(_ControllerCoreAccess):
                     elif diff.change == ModelDiff.Change.ADDED and new_file is not None:
                         floor = controller._Controller__pending_completion_progress_floors.get(new_file.file_id)
                         if floor is not None and self._pending_completion_floor_reset(new_file):
+                            floor_reset = True
+                            floor_disposition = (
+                                "reset_stop" if new_file.explicitly_stopped else "reset_zero"
+                            )
+                            self._record_completion_floor_decision(
+                                new_file.file_id, "reset",
+                                "explicit_stop" if new_file.explicitly_stopped else "zero_local",
+                                True, poll_correlation=lftp_status_poll_correlation,
+                            )
                             self._clear_pending_completion_progress_floor(controller, new_file.file_id)
                         elif floor is not None:
+                            floor_disposition = (
+                                "missing_local" if new_file.state == ModelFile.State.DEFAULT
+                                and new_file.local_size is None else "applied"
+                            )
+                            if floor_disposition == "missing_local":
+                                self._record_completion_floor_decision(
+                                    new_file.file_id, "refused", "missing_local", True,
+                                    poll_correlation=lftp_status_poll_correlation,
+                                )
                             self._apply_pending_completion_progress_floor(
                                 new_file,
                                 pending_completion_file_ids(),
@@ -10462,14 +10595,20 @@ class ModelUpdater(_ControllerCoreAccess):
                             new_file, structural_job_identity=structural_identity_for(new_file),
                         ))
 
-                    if (completion_trace_enabled or completion_transition_warning_enabled) and \
-                            diff.change == ModelDiff.Change.UPDATED and \
-                            old_file is not None and new_file is not None and \
-                            old_file.state == ModelFile.State.DOWNLOADING and \
-                            new_file.state == ModelFile.State.DEFAULT and \
-                            new_file.parent is None:
+                    if publication_probe_candidate and publication_read_ready and \
+                            isinstance(new_file, ModelFile):
                         try:
+                            published_reader = getattr(model, "published_file", None)
+                            model_lock = getattr(controller, "_Controller__model_lock", None)
+                            published_after = None
+                            published_after_version = None
+                            if callable(published_reader) and model_lock is not None:
+                                with model_lock:
+                                    published_after = published_reader(new_file.file_id)
+                                    published_after_version = getattr(model, "version", None)
                             file_id = new_file.file_id
+                            if not isinstance(published_after, ModelFile):
+                                raise ModelError("Published root is unavailable")
                             pending_entries = getattr(
                                 controller, "_Controller__pending_completion_file_names", set(),
                             )
@@ -10526,9 +10665,30 @@ class ModelUpdater(_ControllerCoreAccess):
                                 if latest_local_scan is not None else None
                             remote_scan_failed = getattr(latest_remote_scan, "failed", None) \
                                 if latest_remote_scan is not None else None
+                            invalidated = self._pending_completion_progress_floor_invalidated(
+                                controller, file_id,
+                            )
+                            publication_decision = {
+                                "schema": "completion_gate_publication_decision.v1",
+                                "raw_old_state": raw_old_state,
+                                "raw_candidate_state": raw_candidate_state,
+                                "published_before_state": self._completion_gate_state_name(published_before),
+                                "published_after_state": self._completion_gate_state_name(published_after),
+                                "published_before_version": published_before_version
+                                if type(published_before_version) is int and published_before_version >= 0 else None,
+                                "published_after_version": published_after_version
+                                if type(published_after_version) is int and published_after_version >= 0 else None,
+                                "floor_disposition": floor_disposition,
+                                "invalidated": invalidated,
+                                "floor_reset": floor_reset,
+                                "local_size_known": type(new_file.local_size) is int and new_file.local_size >= 0,
+                            }
                             self._record_completion_gate_presentation_transition(
                                 old_file,
                                 new_file,
+                                published_before if isinstance(published_before, ModelFile) else None,
+                                published_after,
+                                publication_decision,
                                 {
                                     "pending_member": pending,
                                     "floor_present": floor is not None,
