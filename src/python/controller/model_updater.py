@@ -7359,6 +7359,65 @@ class ModelUpdater(_ControllerCoreAccess):
                 ),
             )
 
+        def publication_route_floor_context(
+                file: ModelFile, route: str, identity: object,
+                floor_disposition: str = "not_called",
+        ) -> Optional[dict[str, object]]:
+            # Keep diagnostic-only dictionary reads behind the existing gate.
+            if not self._completion_gate_trace_enabled("info"):
+                return None
+            try:
+                if route not in {"progressive_root", "active_delta", "full_diff"}:
+                    route = "unknown"
+                pending_entries = getattr(
+                    controller, "_Controller__pending_completion_file_names", None,
+                )
+                floors = getattr(controller, "_Controller__pending_completion_progress_floors", None)
+                floor_identities = getattr(
+                    controller, "_Controller__pending_completion_progress_floor_identities", None,
+                )
+                publications = getattr(controller, "_Controller__pending_completion_publications", None)
+                def matches(candidate: object) -> Optional[bool]:
+                    valid_candidate = isinstance(candidate, tuple) and len(candidate) == 2 and \
+                        type(candidate[0]) is int and candidate[0] >= 0 and \
+                        isinstance(candidate[1], str) and bool(candidate[1])
+                    valid_identity = isinstance(identity, tuple) and len(identity) == 2 and \
+                        type(identity[0]) is int and identity[0] >= 0 and \
+                        isinstance(identity[1], str) and bool(identity[1])
+                    return candidate == identity if valid_candidate and valid_identity else None
+
+                pending = None
+                if isinstance(pending_entries, (set, frozenset)):
+                    pending = (file.name, file.path_pair_id, file.path_pair_name) in pending_entries
+                floor_present = file.file_id in floors if isinstance(floors, dict) else None
+                floor_identity = floor_identities.get(file.file_id) \
+                    if isinstance(floor_identities, dict) else None
+                floor_identity_match = matches(floor_identity)
+                publication_present = file.file_id in publications if isinstance(publications, dict) else None
+                publication = publications.get(file.file_id) if isinstance(publications, dict) else None
+                publication_identity_match = matches(getattr(publication, "job_identity", None)) \
+                    if publication is not None else None
+                allowed_dispositions = {
+                    "applied", "missing_local", "reset_stop", "reset_zero", "invalidated",
+                    "not_called", "unknown",
+                }
+                if floor_disposition == "none":
+                    floor_disposition = "unknown"
+                if floor_disposition not in allowed_dispositions:
+                    floor_disposition = "unknown"
+                return {
+                    "schema": "model_route_floor_context.v1",
+                    "route": route,
+                    "pending": pending,
+                    "floor_present": floor_present,
+                    "floor_identity_match": floor_identity_match,
+                    "publication_present": publication_present,
+                    "publication_identity_match": publication_identity_match,
+                    "floor_disposition": floor_disposition,
+                }
+            except Exception:
+                return None
+
         _record_lftp_status_breadcrumb(
             controller,
             lftp_statuses,
@@ -8761,7 +8820,14 @@ class ModelUpdater(_ControllerCoreAccess):
                         else:
                             old_file = model.get_file(file_id)
                             if old_file != new_file:
-                                model.update_file(new_file, structural_job_identity=structural_identity_for(new_file))
+                                structural_identity = structural_identity_for(new_file)
+                                model.update_file(
+                                    new_file,
+                                    structural_job_identity=structural_identity,
+                                    publication_context=publication_route_floor_context(
+                                        new_file, "progressive_root", structural_identity,
+                                    ),
+                                )
                                 next_tree_count += tree_file_count(new_file) - tree_file_count(old_file)
                                 progressive_delta_applied = True
                 model.apply_authoritative_root_replacement(
@@ -9396,7 +9462,14 @@ class ModelUpdater(_ControllerCoreAccess):
                         nonlocal active_transfer_delta_applied, next_tree_count
                         for old_file, new_file in replacement_roots:
                             if old_file != new_file:
-                                model.update_file(new_file, structural_job_identity=structural_identity_for(new_file))
+                                structural_identity = structural_identity_for(new_file)
+                                model.update_file(
+                                    new_file,
+                                    structural_job_identity=structural_identity,
+                                    publication_context=publication_route_floor_context(
+                                        new_file, "active_delta", structural_identity,
+                                    ),
+                                )
                                 next_tree_count += tree_file_count(new_file) - tree_file_count(old_file)
                                 active_transfer_delta_applied = True
 
@@ -10694,8 +10767,14 @@ class ModelUpdater(_ControllerCoreAccess):
                         apply_model_replacement(lambda: model.remove_file(old_file.file_id))
                     elif diff.change == ModelDiff.Change.UPDATED:
                         assert new_file is not None
+                        structural_identity = structural_identity_for(new_file)
+                        publication_context = publication_route_floor_context(
+                            new_file, "full_diff", structural_identity, floor_disposition,
+                        )
                         apply_model_replacement(lambda: model.update_file(
-                            new_file, structural_job_identity=structural_identity_for(new_file),
+                            new_file,
+                            structural_job_identity=structural_identity,
+                            publication_context=publication_context,
                         ))
 
                     if publication_probe_candidate and publication_read_ready and \

@@ -164,6 +164,7 @@ class Model:
             self, file: ModelFile,
             structural_job_identity: Optional[tuple[int, str]] = None,
             *, caller: str,
+            publication_context: Optional[dict[str, object]] = None,
     ) -> ModelFile:
         """Materialize one immutable-effective root for asynchronous readers."""
         # Progress pulses can be frequent and roots may have very large trees.
@@ -308,6 +309,8 @@ class Model:
                     "explicit_stop": finite_boolean(published.explicitly_stopped),
                     "overlay_present": overlay is not None,
                 }
+                if publication_context is not None:
+                    snapshot["publication_context"] = publication_context
                 self.__record_completion_provenance_transition(
                     file.file_id, "published_state_rollback", previous_identity,
                     identity if identity_is_valid else None, "info",
@@ -790,7 +793,10 @@ class Model:
             self.__active_progress_overlay_job_identities.pop(file.file_id, None)
             self.__active_progress_overlay_lifecycle_epochs.pop(file.file_id, None)
 
-    def clear_active_progress_overlays(self) -> None:
+    def clear_active_progress_overlays(
+            self, *, publication_context: Optional[dict[str, object]] = None,
+            publication_file_id: Optional[str] = None,
+    ) -> None:
         """Discard live-only values and publish each affected root's base state."""
         if self.__suppress_active_progress_clear:
             return
@@ -804,7 +810,10 @@ class Model:
                 self.__notify_legacy_overlay_correction_if_needed(file_id, None)
                 continue
             old_published = self.__published_files_by_id.get(file_id)
-            published = self.__refresh_published_file(file, caller="clear_active_progress_overlays")
+            published = self.__refresh_published_file(
+                file, caller="clear_active_progress_overlays",
+                publication_context=publication_context if file_id == publication_file_id else None,
+            )
             global_version, scope_version = self.__advance_version(file)
             self.__notify_legacy_overlay_correction_if_needed(file_id, file)
             self.__notify_versioned_change(file, global_version, scope_version)
@@ -1175,6 +1184,7 @@ class Model:
     def update_file(
             self, file: ModelFile,
             *, structural_job_identity: Optional[tuple[int, str]] = None,
+            publication_context: Optional[dict[str, object]] = None,
     ) -> None:
         """
         Update an already existing file
@@ -1186,20 +1196,24 @@ class Model:
                 type(file.local_size) is int and file.local_size >= fallback:
             file.transferred_size = fallback
         self.__retire_active_projection_for_candidate(file)
-        self.clear_active_progress_overlays()
+        self.clear_active_progress_overlays(
+            publication_context=publication_context,
+            publication_file_id=file.file_id,
+        )
         self.logger.debug("LftpModel: Updating file '{}'".format(self.__format_file_for_log(file)))
         file_id = file.file_id
         if file_id not in self.__files_by_id:
             raise ModelError("File does not exist in the model")
         old_file = self.__files_by_id[file_id]
         old_published = self.__published_files_by_id.get(file_id) or self.__refresh_published_file(
-            old_file, caller="update_file_previous",
+            old_file, caller="update_file_previous", publication_context=publication_context,
         )
         legacy_old_published = self.__full_effective_file(old_file)
         new_file = file
         self.__files_by_id[file_id] = new_file
         new_published = self.__refresh_published_file(
             new_file, structural_job_identity, caller="update_file_candidate",
+            publication_context=publication_context,
         )
         legacy_new_published = self.__full_effective_file(new_file)
         global_version, scope_version = self.__advance_version(new_file)

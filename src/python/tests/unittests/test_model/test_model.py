@@ -211,6 +211,52 @@ class TestStructuralMirrorPublication(unittest.TestCase):
                 self.assertEqual(ModelFile.State.DEFAULT,
                                  model.published_file(ModelFile.build_file_id("failure-isolation", None)).state)
 
+    def test_update_file_route_context_is_limited_to_target_during_bulk_overlay_clear(self):
+        model = Model()
+        events = []
+        model.set_completion_provenance_diagnostics(lambda _level: True, lambda *args: events.append(args))
+        roots = []
+        for name in ("target-root", "unrelated-root"):
+            root = ModelFile(name, True)
+            root.state = ModelFile.State.DOWNLOADING
+            root.is_stoppable = True
+            root.local_size = 20
+            model.add_file(root)
+            roots.append(root)
+        accepted_ids, admission_reason = model.publish_active_lftp_root_counters(
+            {root.file_id: ActiveProgressOverlay(20, 20, None, None) for root in roots},
+            {root.file_id: (51, "mirror") for root in roots},
+            lambda _file_id: True,
+        )
+        self.assertEqual({root.file_id for root in roots}, accepted_ids)
+        self.assertEqual("accepted", admission_reason)
+        for root in roots:
+            self.assertEqual(ModelFile.State.DOWNLOADING, model.published_file(root.file_id).state)
+        for root in roots:
+            model.get_file(root.file_id).state = ModelFile.State.DEFAULT
+        context = {
+            "schema": "model_route_floor_context.v1",
+            "route": "full_diff",
+            "pending": True,
+            "floor_present": True,
+            "floor_identity_match": True,
+            "publication_present": True,
+            "publication_identity_match": True,
+            "floor_disposition": "applied",
+        }
+        replacement = ModelFile("target-root", True)
+        replacement.state = ModelFile.State.DEFAULT
+        model.update_file(replacement, publication_context=context)
+
+        rollbacks = [event for event in events if event[1] == "published_state_rollback"]
+        target = next(event for event in rollbacks if event[0] == roots[0].file_id)
+        unrelated = next(event for event in rollbacks if event[0] == roots[1].file_id)
+        self.assertEqual(6, len(target))
+        self.assertEqual(context, target[5]["publication_context"])
+        self.assertNotIn("publication_context", unrelated[5])
+        self.assertEqual(ModelFile.State.DEFAULT, model.published_file(roots[0].file_id).state)
+        self.assertEqual(ModelFile.State.DEFAULT, model.published_file(roots[1].file_id).state)
+
     def test_published_state_rollback_witness_is_limited_to_root_publications(self):
         model = Model()
         events = []

@@ -6404,6 +6404,7 @@ class Controller:
                 "after_local_size", "before_coverage", "after_coverage", "explicit_stop",
                 "overlay_present",
             }
+            context_keys = expected_keys | {"publication_context"}
             callers = {
                 "apply_with_active_progress_retained", "apply_authoritative_root_replacement",
                 "clear_active_progress_overlays", "clear_active_progress_overlays_except",
@@ -6415,7 +6416,7 @@ class Controller:
                 "default", "downloading", "queued", "downloaded", "deleted", "extracting",
                 "extracted", "validating", "validated", "corrupt", "move_failed",
             }
-            if set(publication_snapshot) != expected_keys or \
+            if set(publication_snapshot) not in (expected_keys, context_keys) or \
                     publication_snapshot.get("schema") != "model_published_snapshot_transition.v1" or \
                     publication_snapshot.get("caller") not in callers or \
                     publication_snapshot.get("basis") not in {"active", "structural", "retiring", "base"}:
@@ -6441,6 +6442,27 @@ class Controller:
                     return
             if type(publication_snapshot.get("overlay_present")) is not bool:
                 return
+            if "publication_context" in publication_snapshot:
+                context = publication_snapshot.get("publication_context")
+                context_expected = {
+                    "schema", "route", "pending", "floor_present", "floor_identity_match",
+                    "publication_present", "publication_identity_match", "floor_disposition",
+                }
+                if not isinstance(context, dict) or set(context) != context_expected or \
+                        context.get("schema") != "model_route_floor_context.v1" or \
+                        context.get("route") not in {
+                            "progressive_root", "active_delta", "full_diff", "unknown",
+                        } or context.get("floor_disposition") not in {
+                            "applied", "missing_local", "reset_stop", "reset_zero", "invalidated",
+                            "not_called", "unknown",
+                        }:
+                    return
+                for key in (
+                        "pending", "floor_present", "floor_identity_match", "publication_present",
+                        "publication_identity_match"):
+                    value = context.get(key)
+                    if value is not None and type(value) is not bool:
+                        return
         elif publication_snapshot is not None:
             return
         try:
@@ -6474,7 +6496,11 @@ class Controller:
                 "job_correlation": identity_correlation,
             }
             if reason == "published_state_rollback":
-                details["publication_snapshot"] = dict(publication_snapshot)
+                snapshot = dict(publication_snapshot)
+                context = snapshot.get("publication_context")
+                if isinstance(context, dict):
+                    snapshot["publication_context"] = dict(context)
+                details["publication_snapshot"] = snapshot
             self.__record_breadcrumb(
                 stage="completion_gate", message="model_completion_provenance",
                 event_type="state_transition", corr_id="completion:" + root_correlation,

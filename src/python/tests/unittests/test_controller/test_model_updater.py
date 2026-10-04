@@ -15,7 +15,7 @@ from threading import Event, Lock as ThreadLock, RLock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
-from controller import Controller, ModelBuilder
+from controller import Controller, ControllerPersist, ModelBuilder
 from controller.controller import _LftpOperation, PendingQueueDispatch
 from controller.extract import ExtractCompletedResult
 from controller.persist_keys import KEY_SEP
@@ -16921,6 +16921,96 @@ class TestModelUpdater(unittest.TestCase):
                                 "completion_gate_presentation_transition", "completion_floor_decision",
                         }:
                             handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def test_completion_gate_route_floor_context_persists_with_real_controller_binding(self):
+        from tests.unittests.test_controller.test_controller import TestController
+
+        with tempfile.TemporaryDirectory() as path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                durable_enabled=True,
+                durable_path=path,
+                policy={"default": "off", "rules": {"completion.gate": "info"}},
+            )
+            self.assertTrue(trace.is_effectively_enabled("completion.gate", "info"))
+            file_name = "private-label.bin"
+            builder = ModelBuilder()
+            builder.set_remote_files([SystemFile(file_name, 100, False)])
+            builder.set_local_files([SystemFile(file_name, 25, False, is_staging=True)])
+            running = LftpJobStatus(
+                1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file_name, "",
+            )
+            running.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 2)
+            builder.set_lftp_statuses([running])
+            builder_model = builder.build_model()
+
+            real_context = TestController()._make_startup_context(local_path="/local")
+            real_context.breadcrumb_trace = trace
+            with patch("controller.controller.create_transfer_backend", return_value=MagicMock()):
+                real_controller = Controller(real_context, ControllerPersist())
+            self.assertTrue(real_controller._completion_provenance_trace_enabled("info"))
+            live_model = real_controller._Controller__model
+            initial_root = builder_model.get_file(file_name)
+            self.assertIsNotNone(initial_root)
+            self.assertEqual(ModelFile.State.DOWNLOADING, initial_root.state)
+            live_model.add_file(initial_root)
+            self.assertEqual(ModelFile.State.DOWNLOADING, live_model.published_file(file_name).state)
+            live_model.get_file(file_name).state = ModelFile.State.DEFAULT
+            self.assertEqual(ModelFile.State.DEFAULT, live_model.get_file(file_name).state)
+            self.assertEqual(ModelFile.State.DOWNLOADING, live_model.published_file(file_name).state)
+
+            updater_controller, _ = self._make_progressive_update_controller(
+                None, local_scan=None, model_builder=builder, model=live_model,
+            )
+            updater_controller._Controller__prev_downloading_file_names = {(file_name, None, None)}
+            updater_controller._Controller__lftp.status.return_value = []
+            updater_controller._Controller__context.breadcrumb_trace = trace
+            ModelUpdater(updater_controller).update()
+            flushed = trace.flush_durable(2.0) if os.name != "nt" else None
+            trace.close()
+
+            with open(os.path.join(path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+            retained_path = os.environ.get("SEEDSYNC_COMPLETION_FINALIZED_ROWS_PATH")
+            if retained_path:
+                os.makedirs(os.path.dirname(retained_path), exist_ok=True)
+                with open(retained_path, "w", encoding="utf-8") as handle:
+                    for record in records:
+                        if record.get("message") == "model_completion_provenance":
+                            handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+            if os.name != "nt":
+                self.assertTrue(flushed)
+            rollback = next(
+                record for record in records
+                if record.get("message") == "model_completion_provenance" and
+                record.get("details", {}).get("reason") == "published_state_rollback"
+            )
+            self.assertEqual("completion.gate", rollback["category"])
+            self.assertEqual("completion_gate", rollback["stage"])
+            self.assertTrue(rollback["corr_id"].startswith("completion:"))
+            route_context = rollback["details"]["publication_snapshot"]["publication_context"]
+            self.assertEqual("model_route_floor_context.v1", route_context["schema"])
+            self.assertEqual("full_diff", route_context["route"])
+            self.assertEqual({
+                "schema", "route", "pending", "floor_present", "floor_identity_match",
+                "publication_present", "publication_identity_match", "floor_disposition",
+            }, set(route_context))
+            self.assertTrue(all(
+                value is None or type(value) is bool
+                for key, value in route_context.items()
+                if key in {
+                    "pending", "floor_present", "floor_identity_match",
+                    "publication_present", "publication_identity_match",
+                }
+            ))
+            self.assertIn(route_context["floor_disposition"], {
+                "applied", "missing_local", "reset_stop", "reset_zero", "invalidated",
+                "not_called", "unknown",
+            })
+            serialized = json.dumps(rollback, sort_keys=True)
+            self.assertNotIn(file_name, serialized)
+            self.assertNotIn("/local", serialized)
 
     def test_completion_floor_decision_persists_from_replacement_owner(self):
         with tempfile.TemporaryDirectory() as path:
