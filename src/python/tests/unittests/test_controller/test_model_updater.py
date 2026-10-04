@@ -90,6 +90,80 @@ from system.scanner import SystemScanner
 
 
 class TestModelUpdater(unittest.TestCase):
+    def test_confirmed_delete_source_persists_success_and_refusal(self):
+        with tempfile.TemporaryDirectory() as path:
+            trace = BreadcrumbTraceCollector(lambda: True, max_entries=16,
+                durable_enabled=True, durable_path=path)
+            root = SystemFile("example-root", 12, True)
+            root.path_pair_id = "pair"
+            root.add_child(SystemFile("payload.bin", 7))
+            root.add_child(SystemFile("keep.bin", 5))
+            initial = self._local_full_snapshot([root], 7)
+            initial.session_token = "private-session"
+            accumulator = _ProgressiveScanAccumulator()
+            accumulator.apply([initial])
+            controller = SimpleNamespace(
+                _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+                _Controller__local_scan_process=SimpleNamespace(session_token="private-session", generation=7),
+                _Controller__progressive_local_scan_state=accumulator, logger=MagicMock(),
+            )
+            updater = ModelUpdater(controller)
+            file_id = ModelFile.build_file_id("example-root/payload.bin", "pair")
+            self.assertTrue(updater.confirm_local_delete(file_id, "pair"))
+            children = accumulator.snapshot()[("pair", "example-root")].iter_children()
+            self.assertEqual({"keep.bin"}, {child.name for child in children})
+            controller._Controller__local_scan_process.generation = None
+            self.assertFalse(updater.confirm_local_delete(file_id, "pair"))
+            controller._Controller__local_scan_process.generation = 8
+            controller._Controller__local_scan_process.session_token = None
+            self.assertFalse(updater.confirm_local_delete(file_id, "pair"))
+            self.assertTrue(trace.flush_durable(2.0))
+            trace.close()
+            with open(os.path.join(path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle if line.strip()]
+            events = [row for row in rows if row.get("message") == "confirmed_local_delete_source"]
+            self.assertEqual([True, False, False], [row["details"]["fence_result"] for row in events])
+            self.assertEqual([7, None, 8], [row["details"]["local_generation"] for row in events])
+            self.assertEqual([True, True, False], [row["details"]["local_scan_binding_known"] for row in events])
+            self.assertEqual([True, False, True], [row["details"]["local_generation_known"] for row in events])
+            for row in events:
+                self.assertIs(type(row["details"]["local_scan_binding_known"]), bool)
+                self.assertIs(type(row["details"]["local_generation_known"]), bool)
+                self.assertEqual("confirmed_local_delete_source.v1", row["details"]["schema"])
+                self.assertEqual("completion:" + opaque_trace_correlation(
+                    ModelFile.build_file_id("example-root", "pair")), row["corr_id"])
+                self.assertEqual("nested_path", row["details"]["target_scope"])
+                self.assertNotIn("example-root", json.dumps(row))
+                self.assertNotIn("private-session", json.dumps(row))
+            retained = os.environ.get("SEEDSYNC_COMPLETION_FINALIZED_ROWS_PATH")
+            if retained:
+                with open(retained, "a", encoding="utf-8") as handle:
+                    for row in events:
+                        handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+    def test_confirmed_delete_source_disabled_and_failure_preserve_results(self):
+        for mode in ("disabled", "failed_gate", "failed_sink"):
+            with self.subTest(mode=mode):
+                trace = MagicMock()
+                trace.is_effectively_enabled.return_value = mode == "failed_sink"
+                if mode == "failed_gate":
+                    trace.is_effectively_enabled.side_effect = RuntimeError("gate")
+                trace.record.side_effect = RuntimeError("sink")
+                controller = SimpleNamespace(
+                    _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+                    _Controller__local_scan_process=SimpleNamespace(session_token="session", generation=2),
+                    logger=MagicMock(),
+                )
+                updater = ModelUpdater(controller)
+                file_id = ModelFile.build_file_id("root/payload.bin", "pair")
+                with patch("controller.model_updater.opaque_trace_correlation") as correlation:
+                    self.assertTrue(updater.confirm_local_delete(file_id, "pair"))
+                    controller._Controller__local_scan_process.session_token = None
+                    self.assertFalse(updater.confirm_local_delete(file_id, "pair"))
+                    if mode != "failed_sink":
+                        correlation.assert_not_called()
+                        trace.record.assert_not_called()
+
     @staticmethod
     def _model_finalization_trace_controller(trace):
         controller = SimpleNamespace(

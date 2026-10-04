@@ -4843,25 +4843,56 @@ class ModelUpdater(_ControllerCoreAccess):
         process = getattr(self._controller, "_Controller__local_scan_process", None)
         session_token = getattr(process, "session_token", None)
         generation = getattr(process, "generation", None)
+
+        def observed(result: bool) -> bool:
+            try:
+                if not self._completion_gate_trace_enabled():
+                    return result
+                identity = json.loads(file_id)
+                if not isinstance(identity, list) or len(identity) != 2 or \
+                        identity[0] != path_pair_id or not isinstance(identity[1], str) or \
+                        ModelFile.build_file_id(identity[1], identity[0]) != file_id:
+                    return result
+                segments = identity[1].replace("\\", "/").split("/")
+                if any(segment in ("", ".", "..") for segment in segments):
+                    return result
+                known_generation = type(generation) is int and generation >= 0
+                self._record_completion_gate_breadcrumb(
+                    ModelFile.build_file_id(segments[0], path_pair_id),
+                    "confirmed_local_delete_source",
+                    {
+                        "schema": "confirmed_local_delete_source.v1",
+                        "delete_confirmed": True,
+                        "fence_result": result,
+                        "target_scope": "exact_root" if len(segments) == 1 else "nested_path",
+                        "local_scan_binding_known": isinstance(session_token, str) and bool(session_token),
+                        "local_generation_known": known_generation,
+                        "local_generation": generation if known_generation else None,
+                    },
+                )
+            except Exception:
+                pass
+            return result
+
         if not isinstance(session_token, str) or not session_token or \
                 type(generation) is not int or generation < 0:
-            return False
+            return observed(False)
         try:
             identity = json.loads(file_id)
         except (TypeError, ValueError):
-            return False
+            return observed(False)
         if not isinstance(identity, list) or len(identity) != 2 or \
                 identity[0] != path_pair_id or not isinstance(identity[1], str) or \
                 ModelFile.build_file_id(identity[1], identity[0]) != file_id:
-            return False
+            return observed(False)
         relative_path = identity[1].replace("\\", "/")
         path_segments = tuple(relative_path.split("/"))
         if not path_segments or any(segment in ("", ".", "..") for segment in path_segments):
-            return False
+            return observed(False)
         accumulator = _ensure_progressive_scan_state(self._controller, "local", eager=True)
-        return accumulator.confirm_local_deletion(
+        return observed(accumulator.confirm_local_deletion(
             path_pair_id, path_segments[0], path_segments[1:], generation, session_token,
-        )
+        ))
 
     @staticmethod
     def _preserve_pending_completion_progress_floor(
