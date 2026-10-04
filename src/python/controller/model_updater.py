@@ -456,6 +456,26 @@ def _fresh_unique_replacement_statuses(
     }
 
 
+def _accepted_structural_mirror_identity(
+        file: ModelFile, status: object, *, publication_current: bool,
+) -> Optional[tuple[int, str]]:
+    """Bind only the canonical running owner accepted for this root commit."""
+    if publication_current is not True or not isinstance(status, LftpJobStatus):
+        return None
+    transfer = status.total_transfer_state
+    if file.parent is not None or not file.is_dir or \
+            file.state != ModelFile.State.DOWNLOADING or file.explicitly_stopped or \
+            not file.is_stoppable or status.file_id != file.file_id or \
+            status.name != file.full_path or status.path_pair_id != file.path_pair_id or \
+            status.type != LftpJobStatus.Type.MIRROR or \
+            status.state != LftpJobStatus.State.RUNNING or \
+            type(status.id) is not int or status.id < 0 or \
+            type(getattr(transfer, "size_local", None)) is not int or transfer.size_local <= 0 or \
+            type(getattr(transfer, "percent_local", None)) is not int or transfer.percent_local <= 0:
+        return None
+    return status.id, status.type.value
+
+
 def _active_delta_rejection_correlation_identity(file_ids: set[str]) -> str:
     """Bound target-set evidence before deriving the process-local correlation."""
     # A stable ordering would require walking/sorting the entire selected set
@@ -7125,6 +7145,17 @@ class ModelUpdater(_ControllerCoreAccess):
                     statuses.setdefault(file_id, object())
             return statuses
 
+        def structural_identity_for(file: ModelFile) -> Optional[tuple[int, str]]:
+            current_epoch = getattr(controller, "_Controller__progress_publication_epoch", None)
+            return _accepted_structural_mirror_identity(
+                file, replacement_statuses_by_file_id().get(file.file_id),
+                publication_current=(
+                    type(current_epoch) is int and current_epoch >= 0 and
+                    type(lftp_status_publication_epoch) is int and
+                    current_epoch == lftp_status_publication_epoch
+                ),
+            )
+
         _record_lftp_status_breadcrumb(
             controller,
             lftp_statuses,
@@ -8501,14 +8532,14 @@ class ModelUpdater(_ControllerCoreAccess):
                             model_builder.request_rebuild()
                             continue
                         if file_id not in model_file_ids:
-                            model.add_file(new_file)
+                            model.add_file(new_file, structural_job_identity=structural_identity_for(new_file))
                             model_file_ids.add(file_id)
                             next_tree_count += tree_file_count(new_file)
                             progressive_delta_applied = True
                         else:
                             old_file = model.get_file(file_id)
                             if old_file != new_file:
-                                model.update_file(new_file)
+                                model.update_file(new_file, structural_job_identity=structural_identity_for(new_file))
                                 next_tree_count += tree_file_count(new_file) - tree_file_count(old_file)
                                 progressive_delta_applied = True
                 model.apply_authoritative_root_replacement(
@@ -9143,7 +9174,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         nonlocal active_transfer_delta_applied, next_tree_count
                         for old_file, new_file in replacement_roots:
                             if old_file != new_file:
-                                model.update_file(new_file)
+                                model.update_file(new_file, structural_job_identity=structural_identity_for(new_file))
                                 next_tree_count += tree_file_count(new_file) - tree_file_count(old_file)
                                 active_transfer_delta_applied = True
 
@@ -10285,13 +10316,17 @@ class ModelUpdater(_ControllerCoreAccess):
 
                     if diff.change == ModelDiff.Change.ADDED:
                         assert new_file is not None
-                        apply_model_replacement(lambda: model.add_file(new_file))
+                        apply_model_replacement(lambda: model.add_file(
+                            new_file, structural_job_identity=structural_identity_for(new_file),
+                        ))
                     elif diff.change == ModelDiff.Change.REMOVED:
                         assert old_file is not None
                         apply_model_replacement(lambda: model.remove_file(old_file.file_id))
                     elif diff.change == ModelDiff.Change.UPDATED:
                         assert new_file is not None
-                        apply_model_replacement(lambda: model.update_file(new_file))
+                        apply_model_replacement(lambda: model.update_file(
+                            new_file, structural_job_identity=structural_identity_for(new_file),
+                        ))
 
                     if (completion_trace_enabled or completion_transition_warning_enabled) and \
                             diff.change == ModelDiff.Change.UPDATED and \

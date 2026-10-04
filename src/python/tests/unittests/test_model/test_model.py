@@ -8,6 +8,116 @@ from unittest.mock import MagicMock, call, patch
 
 from common import BreadcrumbTraceCollector, overrides
 from model import ActiveProgressOverlay, Model, ModelFile, IModelListener, ModelError
+from controller.model_updater import _accepted_structural_mirror_identity, _fresh_unique_replacement_statuses
+from lftp import LftpJobStatus
+
+
+class TestStructuralMirrorPublication(unittest.TestCase):
+    def fixture(self):
+        file = ModelFile("root", True)
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        file.local_size = 500
+        file.remote_size = 1024
+        file.display_size_total = 1124
+        file.display_transferred_size = 500
+        file.transferred_size = 400
+        file.download_progress = 39
+        status = LftpJobStatus(51, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(400, 1024, 39, 8, 80)
+        return file, status
+
+    def test_binding_precedes_notification_and_preserves_union(self):
+        file, status = self.fixture()
+        model = Model()
+        identity = _accepted_structural_mirror_identity(file, status, publication_current=True)
+        observed = []
+        with patch.object(model, "_Model__notify_versioned_change", side_effect=lambda *args:
+                          observed.append(model.published_file_with_job_identity(file.file_id))):
+            model.add_file(file, structural_job_identity=identity)
+        self.assertEqual((51, "mirror"), observed[0][1])
+        self.assertEqual(1124, observed[0][0].display_size_total)
+        self.assertEqual(500, observed[0][0].display_transferred_size)
+        self.assertFalse(model._Model__active_progress_overlays)
+
+    def test_structural_binding_survives_controller_durable_envelope(self):
+        import json
+        import os
+        import tempfile
+        from common.breadcrumb_trace import opaque_trace_correlation
+        from controller import Controller, ControllerPersist
+        from tests.unittests.test_controller.test_controller import TestController
+        file, status = self.fixture()
+        with tempfile.TemporaryDirectory() as spool_path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True, durable_enabled=True, durable_path=spool_path,
+                policy={"default": "off", "rules": {"completion.gate": "info"}},
+            )
+            context = TestController()._make_startup_context(local_path="/local")
+            context.breadcrumb_trace = trace
+            with patch("controller.controller.create_transfer_backend", return_value=MagicMock()):
+                controller = Controller(context, ControllerPersist())
+            model = controller._Controller__model
+            identity = _accepted_structural_mirror_identity(file, status, publication_current=True)
+            model.add_file(file, structural_job_identity=identity)
+            self.assertTrue(trace.flush_durable(2.0))
+            trace.close()
+            with open(os.path.join(spool_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle if line.strip()]
+        event = next(row for row in rows if row.get("message") == "model_completion_provenance")
+        self.assertEqual("identity_bound", event["details"]["reason"])
+        self.assertEqual("completion.gate", event["category"])
+        self.assertEqual("completion_gate", event["stage"])
+        self.assertEqual("completion:" + opaque_trace_correlation(file.file_id), event["corr_id"])
+        self.assertEqual(opaque_trace_correlation("51:mirror"), event["details"]["job_correlation"])
+        self.assertNotIn(file.file_id, list(event.values()) + list(event["details"].values()))
+        self.assertEqual((51, "mirror"), model.published_file_job_identity(file.file_id))
+
+    def test_fresh_unique_and_lifecycle_opposites_decline_binding(self):
+        for healthy, fresh, source, duplicate in ((False, True, "fresh_healthy", False),
+                                                 (True, False, "cached", False),
+                                                 (True, True, "fresh_healthy", True)):
+            file, status = self.fixture()
+            accepted = _fresh_unique_replacement_statuses(
+                [status, status] if duplicate else [status], [status],
+                poll_healthy=healthy, snapshot_fresh=fresh, source=source,
+            )
+            self.assertIsNone(_accepted_structural_mirror_identity(
+                file, accepted.get(file.file_id), publication_current=True))
+        for mutation in ("epoch", "stop", "queued", "reset", "name", "type"):
+            with self.subTest(mutation=mutation):
+                file, status = self.fixture()
+                if mutation == "stop": file.explicitly_stopped = True
+                if mutation == "reset":
+                    status.total_transfer_state = LftpJobStatus.TransferState(0, 1024, 0, 8, 80)
+                if mutation in ("name", "type", "queued"):
+                    status = LftpJobStatus(
+                        51, LftpJobStatus.Type.PGET if mutation == "type" else LftpJobStatus.Type.MIRROR,
+                        LftpJobStatus.State.QUEUED if mutation == "queued" else LftpJobStatus.State.RUNNING,
+                        "other" if mutation == "name" else "root", "",
+                    )
+                    if mutation != "queued":
+                        status.total_transfer_state = LftpJobStatus.TransferState(400, 1024, 39, 8, 80)
+                self.assertIsNone(_accepted_structural_mirror_identity(
+                    file, status, publication_current=mutation != "epoch"))
+
+    def test_changed_unbound_publication_and_new_owner_replace_identity(self):
+        file, status = self.fixture()
+        model = Model()
+        events = []
+        model.set_completion_provenance_diagnostics(lambda level: True,
+                                                   lambda *args: events.append(args))
+        model.add_file(file, structural_job_identity=(51, "mirror"))
+        changed, _ = self.fixture()
+        changed.transferred_size = 500
+        model.update_file(changed, structural_job_identity=(52, "mirror"))
+        self.assertEqual((52, "mirror"), model.published_file_with_job_identity(file.file_id)[1])
+        changed, _ = self.fixture()
+        changed.explicitly_stopped = True
+        model.update_file(changed)
+        self.assertIsNone(model.published_file_with_job_identity(file.file_id)[1])
+        self.assertIn("identity_bound", [event[1] for event in events])
+        self.assertIn("changed_unbound_publication", [event[1] for event in events])
 
 
 class DummyModelListener(IModelListener):

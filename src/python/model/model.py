@@ -157,7 +157,10 @@ class Model:
             except Exception:
                 pass
 
-    def __refresh_published_file(self, file: ModelFile) -> ModelFile:
+    def __refresh_published_file(
+            self, file: ModelFile,
+            structural_job_identity: Optional[tuple[int, str]] = None,
+    ) -> ModelFile:
         """Materialize one immutable-effective root for asynchronous readers."""
         # Progress pulses can be frequent and roots may have very large trees.
         # Publication is intentionally shallow for the scoped hot path.
@@ -168,8 +171,16 @@ class Model:
         identity = self.__active_progress_overlay_job_identities.get(file.file_id)
         identity_source = "active"
         if identity is None:
-            identity = self.__retiring_progress_overlay_job_identities.get(file.file_id)
-            identity_source = "retiring"
+            if isinstance(structural_job_identity, tuple) and len(structural_job_identity) == 2 and \
+                    type(structural_job_identity[0]) is int and structural_job_identity[0] >= 0 and \
+                    structural_job_identity[1] == "mirror" and file.parent is None and \
+                    file.is_dir and file.state == ModelFile.State.DOWNLOADING and \
+                    file.is_stoppable and not file.explicitly_stopped:
+                identity = structural_job_identity
+                identity_source = "structural"
+            else:
+                identity = self.__retiring_progress_overlay_job_identities.get(file.file_id)
+                identity_source = "retiring"
         debug_preserve_enabled = (
             self.__completion_provenance_trace_is_enabled("debug")
             if previous_identity is not None and identity is None else False
@@ -1015,7 +1026,10 @@ class Model:
             else:
                 self.__listeners.remove(listener)
 
-    def add_file(self, file: ModelFile) -> None:
+    def add_file(
+            self, file: ModelFile,
+            *, structural_job_identity: Optional[tuple[int, str]] = None,
+    ) -> None:
         """
         Add a file to the model
         :param file:
@@ -1031,7 +1045,9 @@ class Model:
         if file.name not in self.__file_ids_by_name:
             self.__file_ids_by_name[file.name] = set()
         self.__file_ids_by_name[file.name].add(file_id)
-        published = self.__refresh_published_file(self.__files_by_id[file_id])
+        published = self.__refresh_published_file(
+            self.__files_by_id[file_id], structural_job_identity,
+        )
         with self.__listeners_lock:
             listeners = list(self.__listeners)
         legacy_published = self.__full_effective_file(self.__files_by_id[file_id]) if listeners else None
@@ -1089,7 +1105,10 @@ class Model:
             listener.file_removed(legacy_published)
         self.__notify_versioned_change(file, global_version, scope_version)
 
-    def update_file(self, file: ModelFile) -> None:
+    def update_file(
+            self, file: ModelFile,
+            *, structural_job_identity: Optional[tuple[int, str]] = None,
+    ) -> None:
         """
         Update an already existing file
         :param file:
@@ -1110,7 +1129,7 @@ class Model:
         legacy_old_published = self.__full_effective_file(old_file)
         new_file = file
         self.__files_by_id[file_id] = new_file
-        new_published = self.__refresh_published_file(new_file)
+        new_published = self.__refresh_published_file(new_file, structural_job_identity)
         legacy_new_published = self.__full_effective_file(new_file)
         global_version, scope_version = self.__advance_version(new_file)
         with self.__listeners_lock:
