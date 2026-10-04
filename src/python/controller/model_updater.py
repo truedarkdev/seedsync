@@ -2137,6 +2137,56 @@ class _ProgressiveScanAccumulator:
             tuple[Optional[str], str], dict[int, tuple[int, str]]
         ] = {}
         self.__next_move_invalidation_token = 0
+        self.__fence_diagnostic_enabled: Optional[Callable[[], bool]] = None
+        self.__fence_diagnostic_recorder: Optional[Callable] = None
+
+    def set_fence_diagnostic_callbacks(self, enabled: Callable[[], bool], recorder: Callable) -> None:
+        """Attach observation only; scanner authority remains in this accumulator."""
+        self.__fence_diagnostic_enabled = enabled
+        self.__fence_diagnostic_recorder = recorder
+
+    def __fence_diagnostics_enabled(self) -> bool:
+        try:
+            return self.__fence_diagnostic_enabled is not None and bool(self.__fence_diagnostic_enabled())
+        except Exception:
+            return False
+
+    def __record_fence_disposition(self, key, captured_generation, basis, event=None) -> None:
+        try:
+            if not self.__fence_diagnostics_enabled() or self.__fence_diagnostic_recorder is None:
+                return
+            pair_id, root_name = key
+            generation = getattr(event, "generation", None)
+            started_at = getattr(event, "scan_started_at", None)
+            root = next((file for file in event.files
+                         if file.name == root_name and self.__pair_for_file(file, event) == pair_id), None) \
+                if event is not None else None
+            outcomes = getattr(event, "root_scan_outcomes_by_pair", {})
+            pair_outcomes = outcomes.get(pair_id) if isinstance(outcomes, dict) else None
+            outcome = pair_outcomes.get(root_name) if isinstance(pair_outcomes, dict) else None
+            generation_known = type(generation) is int and generation >= 0
+            captured_known = type(captured_generation) is int and captured_generation >= 0
+            started_ms = int(started_at.timestamp() * 1000) if isinstance(started_at, datetime) else None
+            started_known = type(started_ms) is int and started_ms >= 0
+            self.__fence_diagnostic_recorder(pair_id, root_name, {
+                "schema": "confirmed_delete_fence_disposition.v1",
+                "decision": "reset" if basis == "session_reset" else "released",
+                "release_basis": basis,
+                "captured_generation": captured_generation if captured_known else None,
+                "captured_generation_known": captured_known,
+                "event_generation": generation if generation_known else None,
+                "event_generation_known": generation_known,
+                "local_scan_binding_known": isinstance(self.__session_token, str) and bool(self.__session_token),
+                "scan_started_at_ms": started_ms if started_known else None,
+                "scan_started_at_known": started_known,
+                "root_present": isinstance(root, SystemFile) if event is not None else None,
+                "root_final_complete": outcome[0] if isinstance(outcome, tuple) and len(outcome) == 2 and type(outcome[0]) is bool else None,
+                "root_staging_complete": outcome[1] if isinstance(outcome, tuple) and len(outcome) == 2 and type(outcome[1]) is bool else None,
+                "root_is_dir": root.is_dir if isinstance(root, SystemFile) else None,
+                "root_size": root.size if isinstance(root, SystemFile) and type(root.size) is int and root.size >= 0 else None,
+            })
+        except Exception:
+            pass
 
     def set_session_token(self, session_token: Optional[str]) -> None:
         """Bind active evidence to the current scanner process identity."""
@@ -2149,6 +2199,13 @@ class _ProgressiveScanAccumulator:
             # event. Bind that first session without discarding its token.
             self.__session_token = session_token
             return
+        reset_fences = ()
+        if self.__fence_diagnostics_enabled():
+            try:
+                reset_fences = [(key, generation) for key, entries in self.__move_invalidations_by_root.items()
+                                for generation, status in entries.values() if status == "confirmed_delete"]
+            except Exception:
+                pass
         self.__session_token = session_token
         self.__working.clear()
         self.__manifests.clear()
@@ -2167,6 +2224,8 @@ class _ProgressiveScanAccumulator:
         self.__last_final_comparison_proven_pairs.clear()
         self.__last_root_shape_trace = None
         self.__move_invalidations_by_root.clear()
+        for key, generation in reset_fences:
+            self.__record_fence_disposition(key, generation, "session_reset")
 
     @property
     def session_token(self) -> Optional[str]:
@@ -2667,6 +2726,10 @@ class _ProgressiveScanAccumulator:
                             root_name in event_root_names
                         if has_current_root or healthy_post_move_snapshot:
                             entries.pop(token, None)
+                            self.__record_fence_disposition(
+                                key, captured_generation,
+                                "current_root" if has_current_root else "healthy_full_snapshot", event,
+                            )
                     if not entries:
                         self.__move_invalidations_by_root.pop(key, None)
                 protected_root_names = set()
@@ -3542,6 +3605,15 @@ def _ensure_progressive_scan_state(
         accumulator = _ProgressiveScanAccumulator()
         setattr(controller, state_name, accumulator)
         setattr(controller, "_Controller__progressive_{}_scan_state_eager".format(side), eager)
+    updater = getattr(controller, "_Controller__updater", None)
+    if side == "local" and isinstance(updater, ModelUpdater):
+        accumulator.set_fence_diagnostic_callbacks(
+            updater._completion_gate_trace_enabled,
+            lambda pair_id, root_name, details: updater._record_completion_gate_breadcrumb(
+                ModelFile.build_file_id(root_name, pair_id),
+                "confirmed_delete_fence_disposition", details,
+            ),
+        )
     if bind_current_session and isinstance(
             getattr(controller, "_Controller__{}_scan_process".format(side), None),
             ScannerProcess,

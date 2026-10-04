@@ -52,6 +52,7 @@ from controller.model_updater import (
     _bounded_child_finalization_epoch,
     _filter_actionable_move_retry_ids,
     _request_model_rebuild,
+    _ensure_progressive_scan_state,
 )
 from common.performance_diagnostics import (
     CANDIDATE_LIFECYCLE_FALLBACK_REASON_EXCEPTION,
@@ -3252,6 +3253,227 @@ class TestModelUpdater(unittest.TestCase):
         )
         accumulator.apply([stale_session])
         self.assertNotIn((pair_id, "root"), accumulator.snapshot())
+
+    def test_confirmed_delete_fence_dispositions_persist_release_and_reset(self):
+        with tempfile.TemporaryDirectory() as path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True, max_entries=16, durable_enabled=True, durable_path=path,
+            )
+            controller = SimpleNamespace(
+                _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+                logger=MagicMock(),
+            )
+            updater = ModelUpdater(controller)
+            controller._Controller__updater = updater
+            accumulator = _ensure_progressive_scan_state(
+                controller, "local", eager=True, bind_current_session=False,
+            )
+            pair_id, root_name, session = "private-pair", "example-private-root", "private-session"
+            root = SystemFile(root_name, 12, True)
+            root.path_pair_id = pair_id
+            root.add_child(SystemFile("payload.bin", 7))
+            root.add_child(SystemFile("keep.bin", 5))
+            initial = self._local_full_snapshot([root], 7, pair_id)
+            initial.session_token = session
+            accumulator.apply([initial])
+
+            self.assertTrue(accumulator.confirm_local_deletion(
+                pair_id, root_name, ("payload.bin",), 7, session,
+            ))
+            fresh_root = SystemFile(root_name, 5, True)
+            fresh_root.path_pair_id = pair_id
+            fresh_root.add_child(SystemFile("keep.bin", 5))
+            fresh_root_scan = ScannerResult(
+                datetime.now(), [fresh_root], scanned_path_pair_ids={pair_id},
+                generation=8, is_progress=True, session_token=session,
+                root_scan_outcomes_by_pair={pair_id: {root_name: (True, True)}},
+                scan_started_at=datetime.now(),
+            )
+            accumulator.apply([fresh_root_scan])
+
+            self.assertTrue(accumulator.confirm_local_deletion(
+                pair_id, root_name, (), 8, session,
+            ))
+            full_empty = self._local_full_snapshot([], 9, pair_id)
+            full_empty.session_token = session
+            full_empty.scan_started_at = datetime.now()
+            accumulator.apply([full_empty])
+
+            self.assertTrue(accumulator.confirm_local_deletion(
+                pair_id, root_name, (), 9, session,
+            ))
+            accumulator.set_session_token("replacement-session")
+
+            flushed = trace.flush_durable(2.0)
+            trace.close()
+            with open(os.path.join(path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle if line.strip()]
+            events = [row for row in rows if row.get("message") == "confirmed_delete_fence_disposition"]
+            retained = os.environ.get("SEEDSYNC_COMPLETION_FINALIZED_ROWS_PATH")
+            if retained:
+                os.makedirs(os.path.dirname(retained), exist_ok=True)
+                with open(retained, "a", encoding="utf-8") as handle:
+                    for row in events:
+                        handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+
+            self.assertTrue(flushed)
+            self.assertEqual(3, len(events))
+            self.assertEqual(
+                ["current_root", "healthy_full_snapshot", "session_reset"],
+                [row["details"]["release_basis"] for row in events],
+            )
+            self.assertEqual(["released", "released", "reset"], [
+                row["details"]["decision"] for row in events
+            ])
+            self.assertEqual("completion.gate", events[0]["category"])
+            self.assertEqual("completion_gate", events[0]["stage"])
+            self.assertEqual(
+                "completion:" + opaque_trace_correlation(ModelFile.build_file_id(root_name, pair_id)),
+                events[0]["corr_id"],
+            )
+            current, absent, reset = (row["details"] for row in events)
+            self.assertEqual((7, True), (current["captured_generation"], current["captured_generation_known"]))
+            self.assertEqual((8, True), (current["event_generation"], current["event_generation_known"]))
+            self.assertTrue(current["local_scan_binding_known"])
+            self.assertTrue(current["scan_started_at_known"])
+            self.assertTrue(current["root_present"])
+            self.assertEqual((True, True, True, 5), (
+                current["root_final_complete"], current["root_staging_complete"],
+                current["root_is_dir"], current["root_size"],
+            ))
+            self.assertEqual((False, None, None, None), (
+                absent["root_present"], absent["root_final_complete"],
+                absent["root_staging_complete"], absent["root_size"],
+            ))
+            self.assertEqual((None, False), (reset["event_generation"], reset["event_generation_known"]))
+            self.assertEqual((None, False), (reset["scan_started_at_ms"], reset["scan_started_at_known"]))
+            self.assertEqual((None, None, None, None), (
+                reset["root_present"], reset["root_final_complete"],
+                reset["root_staging_complete"], reset["root_size"],
+            ))
+            self.assertNotIn(root_name, json.dumps(events))
+            self.assertNotIn(pair_id, json.dumps(events))
+            self.assertNotIn(session, json.dumps(events))
+
+    def test_confirmed_delete_fence_disposition_omits_stale_and_failed_events(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            logger=MagicMock(),
+        )
+        updater = ModelUpdater(controller)
+        controller._Controller__updater = updater
+        accumulator = _ensure_progressive_scan_state(
+            controller, "local", eager=True, bind_current_session=False,
+        )
+        root = SystemFile("root", 2, True)
+        root.path_pair_id = "pair"
+        root.add_child(SystemFile("payload.bin", 2))
+        initial = self._local_full_snapshot([root], 4)
+        initial.session_token = "session"
+        accumulator.apply([initial])
+        self.assertTrue(accumulator.confirm_local_deletion("pair", "root", (), 4, "session"))
+
+        stale_root = SystemFile("root", 2, True)
+        stale_root.path_pair_id = "pair"
+        stale = ScannerResult(
+            datetime.now(), [stale_root], scanned_path_pair_ids={"pair"}, generation=4,
+            is_progress=True, session_token="session",
+            root_scan_outcomes_by_pair={"pair": {"root": (True, True)}},
+            scan_started_at=datetime.now(),
+        )
+        failed = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair"}, unknown_path_pair_ids={"pair"},
+            generation=5, failed=True, is_progress=True, session_token="session",
+            scan_started_at=datetime.now(),
+        )
+        accumulator.apply([stale, failed])
+
+        fences = accumulator._ProgressiveScanAccumulator__move_invalidations_by_root
+        self.assertIn(("pair", "root"), fences)
+        self.assertEqual("confirmed_delete", next(iter(fences[("pair", "root")].values()))[1])
+        self.assertEqual([], [
+            row for row in trace.snapshot()["entries"]
+            if row.get("message") == "confirmed_delete_fence_disposition"
+        ])
+        trace.close()
+
+    def test_confirmed_delete_fence_diagnostics_disabled_and_sink_failure_preserve_release(self):
+        for mode in ("default", "disabled", "failed_gate", "sink_failure"):
+            with self.subTest(mode=mode):
+                if mode == "default":
+                    trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+                elif mode == "disabled":
+                    trace = BreadcrumbTraceCollector(lambda: False, max_entries=8)
+                elif mode == "failed_gate":
+                    class FailingGateTrace:
+                        def __init__(self):
+                            self.records = 0
+
+                        def is_effectively_enabled(self, _category, _level):
+                            raise RuntimeError("diagnostic gate unavailable")
+
+                        def record(self, *_args, **_kwargs):
+                            self.records += 1
+
+                    trace = FailingGateTrace()
+                else:
+                    class FailingTrace:
+                        def __init__(self):
+                            self.records = 0
+
+                        def is_effectively_enabled(self, _category, _level):
+                            return True
+
+                        def record(self, *_args, **_kwargs):
+                            self.records += 1
+                            raise RuntimeError("diagnostic sink unavailable")
+
+                    trace = FailingTrace()
+                controller = SimpleNamespace(
+                    _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+                    logger=MagicMock(),
+                )
+                updater = ModelUpdater(controller)
+                controller._Controller__updater = updater
+                accumulator = (
+                    _ProgressiveScanAccumulator()
+                    if mode == "default" else
+                    _ensure_progressive_scan_state(
+                        controller, "local", eager=True, bind_current_session=False,
+                    )
+                )
+                root = SystemFile("root", 2, True)
+                root.path_pair_id = "pair"
+                root.add_child(SystemFile("payload.bin", 2))
+                initial = self._local_full_snapshot([root], 1)
+                initial.session_token = "session"
+                accumulator.apply([initial])
+                self.assertTrue(accumulator.confirm_local_deletion("pair", "root", (), 1, "session"))
+
+                fresh_root = SystemFile("root", 1, True)
+                fresh_root.path_pair_id = "pair"
+                event = ScannerResult(
+                    datetime.now(), [fresh_root], scanned_path_pair_ids={"pair"}, generation=2,
+                    is_progress=True, session_token="session",
+                    root_scan_outcomes_by_pair={"pair": {"root": (True, True)}},
+                    scan_started_at=datetime.now(),
+                )
+                accumulator.apply([event])
+                self.assertNotIn(("pair", "root"), accumulator._ProgressiveScanAccumulator__move_invalidations_by_root)
+                self.assertEqual(1, len(accumulator.snapshot()))
+                self.assertTrue(accumulator.confirm_local_deletion("pair", "root", (), 2, "session"))
+                accumulator.set_session_token("replacement-session")
+                self.assertEqual({}, accumulator._ProgressiveScanAccumulator__move_invalidations_by_root)
+                self.assertEqual({}, accumulator.snapshot())
+                if mode in ("default", "disabled", "failed_gate"):
+                    if mode == "failed_gate":
+                        self.assertEqual(0, trace.records)
+                    else:
+                        self.assertEqual([], trace.snapshot()["entries"])
+                        trace.close()
+                else:
+                    self.assertEqual(2, trace.records)
 
     def test_progressive_accumulator_root_shape_trace_is_empty_when_disabled(self):
         accumulator = _ProgressiveScanAccumulator()
