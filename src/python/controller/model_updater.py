@@ -3091,6 +3091,19 @@ class _ProgressiveScanAccumulator:
         started_at = outcome_and_start[1]
         return started_at if isinstance(current_root, SystemFile) and isinstance(started_at, datetime) else None
 
+    def current_root_scan_source_with_started_at(
+            self, path_pair_id: Optional[str], root_name: str,
+            expected_session: str, expected_generation: int,
+    ) -> Optional[tuple[SystemFile, datetime]]:
+        """Read one accepted root and its true start without an inventory walk."""
+        started_at = self.current_root_scan_source_started_at(
+            path_pair_id, root_name, expected_session, expected_generation,
+        )
+        if started_at is None:
+            return None
+        root = self.__authoritative_by_pair.get(path_pair_id, {}).get(root_name)
+        return (root, started_at) if isinstance(root, SystemFile) else None
+
     def current_root_scan_proofs(self) -> dict[str, tuple[str, int]]:
         """Return proof tokens only for roots with accepted current source data."""
         return {
@@ -5142,6 +5155,7 @@ class ModelUpdater(_ControllerCoreAccess):
         published_identity = None
         published_identity_relation = "unknown"
         published_file_shape = "not_attempted"
+        published_terminal_mirror = False
         published_eligibility = "unknown"
         published_display_union = "unknown"
         published_coverage = "unknown"
@@ -5273,6 +5287,16 @@ class ModelUpdater(_ControllerCoreAccess):
                     published = None
                     published_identity = None
                     published_lookup = "error"
+                published_terminal_mirror = isinstance(published, ModelFile) and (
+                    retired_job_identity[1] == "mirror" and published.is_dir and
+                    published.full_path == published.name and
+                    ModelFile.build_file_id(published.name, published.path_pair_id) == file_id and
+                    published.state == ModelFile.State.DOWNLOADING and
+                    published.download_progress == 100 and
+                    type(published.transferred_size) is int and
+                    type(published.remote_size) is int and published.remote_size > 0 and
+                    published.transferred_size >= published.remote_size
+                )
                 if capture_diagnostic_metadata_enabled:
                     try:
                         if published_lookup != "returned_valid_shape":
@@ -5299,7 +5323,7 @@ class ModelUpdater(_ControllerCoreAccess):
                             published_eligibility = (
                                 "eligible"
                                 if not published.explicitly_stopped and published.local_present and
-                                not published.remote_has_transferable_content and
+                                (not published.remote_has_transferable_content or published_terminal_mirror) and
                                 published.download_progress == 100
                                 else "ineligible"
                             )
@@ -5324,7 +5348,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         published_candidate = "explicitly_stopped"
                     elif not published.local_present:
                         published_candidate = "not_local_present"
-                    elif published.remote_has_transferable_content:
+                    elif published.remote_has_transferable_content and not published_terminal_mirror:
                         published_candidate = "transferable_remote_content"
                     elif published.download_progress != 100:
                         published_candidate = "nonterminal_progress"
@@ -9506,6 +9530,66 @@ class ModelUpdater(_ControllerCoreAccess):
                 publication = publications.get(file_id) if isinstance(publications, dict) else None
                 retired_at = publication.retired_at \
                     if isinstance(publication, _PendingCompletionPublication) else None
+                # A directory checkpoint belongs to the accepted FINAL/STAGING
+                # source, not the active overlay or its reconstructed counters.
+                try:
+                    pending_file = new_model.get_file(file_id)
+                except ModelError:
+                    return False
+                if pending_file.is_dir:
+                    pending_identity = self._pending_completion_provenance_identity(controller, file_id)
+                    if not isinstance(publication, _PendingCompletionPublication) or \
+                            pending_identity is None or pending_identity[1] != "mirror" or \
+                            not isinstance(retired_at, datetime) or \
+                            pending_file.full_path != pending_file.name or \
+                            pending_file.path_pair_id not in reconciled_remote_path_pair_ids:
+                        return False
+                    process = getattr(controller, "_Controller__local_scan_process", None)
+                    session = getattr(process, "session_token", None)
+                    generation = getattr(process, "generation", None)
+                    accumulator = getattr(controller, "_Controller__progressive_local_scan_state", None)
+                    if not isinstance(accumulator, _ProgressiveScanAccumulator):
+                        return False
+                    source = accumulator.current_root_scan_source_with_started_at(
+                        pending_file.path_pair_id, pending_file.name, session, generation,
+                    )
+                    if source is None:
+                        return False
+                    root, started_at = source
+                    try:
+                        fresh_bound_source = started_at > retired_at and root.is_dir and \
+                            model_builder.has_current_local_root_scan_proof(
+                                file_id, session, generation, expected_source=root,
+                            ) is True
+                    except (AttributeError, TypeError, ValueError):
+                        fresh_bound_source = False
+                    if not fresh_bound_source:
+                        return False
+
+                    def resumable_descendant(
+                            node: SystemFile, remote_view: ModelFile, relative: str,
+                    ) -> bool:
+                        if node.has_staging_collision:
+                            return False
+                        if node.is_dir:
+                            if not remote_view.is_dir:
+                                return False
+                            for child in node.iter_children():
+                                matches = [item for item in remote_view.iter_children()
+                                           if item.name == child.name and item.remote_present]
+                                if len(matches) == 1 and resumable_descendant(
+                                        child, matches[0],
+                                        child.name if not relative else relative + "/" + child.name,
+                                ):
+                                    return True
+                            return False
+                        return not remote_view.is_dir and remote_view.remote_present and \
+                            type(remote_view.remote_size) is int and \
+                            type(node.size) is int and 0 <= node.size < remote_view.remote_size and \
+                            node.is_staging and node.status_sidecar_ready and \
+                            model_builder.is_remote_leaf_path(file_id, relative)
+
+                    return resumable_descendant(root, pending_file, "")
                 scan_started_at = getattr(latest_active_scan, "timestamp", None)
                 if not isinstance(scan_started_at, datetime):
                     return False

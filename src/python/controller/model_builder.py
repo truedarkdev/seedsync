@@ -2856,7 +2856,12 @@ class ModelBuilder:
             if not scanned_root.is_dir:
                 continue
             adopted_root = self.__local_file(file_id)
-            if isinstance(adopted_root, SystemFile) and adopted_root.is_dir and adopted_root == scanned_root:
+            if isinstance(adopted_root, SystemFile) and adopted_root == scanned_root and adopted_root is not scanned_root:
+                # Equal scan contents preserve semantic caches, but the proof
+                # must own this generation's actual accepted source object.
+                self.__local_files_by_pair[scanned_root.path_pair_id][file_id] = scanned_root
+                adopted_root = scanned_root
+            if isinstance(adopted_root, SystemFile) and adopted_root.is_dir and adopted_root is scanned_root:
                 bound_proofs[file_id] = (session_token, generation, adopted_root)
         self.__local_root_scan_proofs = bound_proofs
         try:
@@ -2896,13 +2901,15 @@ class ModelBuilder:
 
     def has_current_local_root_scan_proof(
             self, file_id: str, session_token: object, generation: object,
+            *, expected_source: Optional[SystemFile] = None,
     ) -> bool:
         """Check scanner token and exact builder-owned source for one root proof."""
         proof = self.__local_root_scan_proofs.get(file_id)
         return isinstance(session_token, str) and type(generation) is int and generation >= 0 and \
             isinstance(proof, tuple) and len(proof) == 3 and \
             proof[0] == session_token and proof[1] == generation and \
-            self.__local_file(file_id) is proof[2]
+            self.__local_file(file_id) is proof[2] and \
+            (expected_source is None or proof[2] is expected_source)
 
     def get_trusted_final_leaf_paths(
             self, file_id: str, *, local_scan_session: object = None,

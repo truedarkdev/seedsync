@@ -10568,6 +10568,21 @@ class TestModelBuilder(unittest.TestCase):
         self.assertTrue(builder.has_current_local_root_scan_proof(
             ModelFile.build_file_id("directory-root", "pair-a"), "local-session", 4,
         ))
+        directory_id = ModelFile.build_file_id("directory-root", "pair-a")
+        self.assertTrue(builder.has_current_local_root_scan_proof(
+            directory_id, "local-session", 4, expected_source=roots[0],
+        ))
+        equal_but_unowned = SystemFile("directory-root", 4, True)
+        equal_but_unowned.path_pair_id = "pair-a"
+        self.assertFalse(builder.has_current_local_root_scan_proof(
+            directory_id, "local-session", 4, expected_source=equal_but_unowned,
+        ))
+        self.assertFalse(builder.has_current_local_root_scan_proof(
+            directory_id, "other-session", 4, expected_source=roots[0],
+        ))
+        self.assertFalse(builder.has_current_local_root_scan_proof(
+            directory_id, "local-session", 5, expected_source=roots[0],
+        ))
         self.assertFalse(builder.has_current_local_root_scan_proof(
             ModelFile.build_file_id("regular-root.bin", "pair-a"), "local-session", 4,
         ))
@@ -10646,6 +10661,8 @@ class TestModelBuilder(unittest.TestCase):
             if entry["message"] == "local_source_adoption"
         ]
         self.assertEqual(2, len(original_entries))
+        cached_model = builder.build_model()
+        self.assertFalse(builder.has_changes())
 
         equal_replacement = SystemFile("private-root", 4, True)
         equal_replacement.path_pair_id = "private-pair"
@@ -10660,17 +10677,7 @@ class TestModelBuilder(unittest.TestCase):
                 equality_calls["descendant"] += 1
             return original_equality(left, right)
 
-        with patch.object(SystemFile, "__eq__", new=count_behavioral_equality), \
-                patch.object(
-                    builder,
-                    "_ModelBuilder__local_source_root_counts",
-                    side_effect=AssertionError("unchanged proof performed diagnostic root counting"),
-                ), \
-                patch.object(
-                    builder,
-                    "_ModelBuilder__record_local_source_adoption",
-                    side_effect=AssertionError("unchanged proof re-emitted its adoption diagnostic"),
-                ):
+        with patch.object(SystemFile, "__eq__", new=count_behavioral_equality):
             builder.adopt_local_root_scan_sources({
                 file_id: (equal_replacement, session_token, generation),
             })
@@ -10680,14 +10687,40 @@ class TestModelBuilder(unittest.TestCase):
         # must add no further recursive equality call.
         self.assertEqual({"root": 2, "descendant": 2}, equality_calls)
         self.assertTrue(builder.has_current_local_root_scan_proof(
-            file_id, session_token, generation,
+            file_id, session_token, generation, expected_source=equal_replacement,
         ))
-        self.assertIs(builder.local_source_roots_snapshot()[0], root)
+        self.assertFalse(builder.has_current_local_root_scan_proof(
+            file_id, session_token, generation, expected_source=root,
+        ))
+        self.assertIs(builder.local_source_roots_snapshot()[0], equal_replacement)
+        self.assertIs(builder.build_model(), cached_model)
+        self.assertFalse(builder.has_changes())
         final_entries = [
             entry for entry in self.__trace_entries(collector, include_root_decisions=True)
             if entry["message"] == "local_source_adoption"
         ]
-        self.assertEqual(2, len(final_entries))
+        self.assertGreaterEqual(len(final_entries), len(original_entries))
+        self.assertLessEqual(len(final_entries), 3)
+        for entry in final_entries:
+            self.assertNotIn(session_token, str(entry))
+            self.assertNotIn("private-root", str(entry))
+            self.assertLess(len(json.dumps(entry)), 4096)
+
+        # Re-adopting the exact already-bound object leaves proof and cache
+        # state alone and must not emit another adoption transition.
+        with patch.object(
+                builder,
+                "_ModelBuilder__record_local_source_adoption",
+                side_effect=AssertionError("same source re-emitted its adoption diagnostic"),
+        ):
+            builder.adopt_local_root_scan_sources({
+                file_id: (equal_replacement, session_token, generation),
+            })
+        self.assertTrue(builder.has_current_local_root_scan_proof(
+            file_id, session_token, generation, expected_source=equal_replacement,
+        ))
+        self.assertIs(builder.build_model(), cached_model)
+        self.assertFalse(builder.has_changes())
 
     def test_local_source_adoption_trace_disabled_gate_skips_count_work(self):
         class DisabledEmitter:

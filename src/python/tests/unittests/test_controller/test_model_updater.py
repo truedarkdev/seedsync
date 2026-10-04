@@ -7108,13 +7108,25 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(first_start, accumulator.current_root_scan_source_started_at(
             "pair-a", "first", "local-session", 4,
         ))
+        self.assertEqual((first, first_start), accumulator.current_root_scan_source_with_started_at(
+            "pair-a", "first", "local-session", 4,
+        ))
         self.assertEqual(second_start, accumulator.current_root_scan_source_started_at(
+            "pair-a", "second", "local-session", 4,
+        ))
+        self.assertEqual((second, second_start), accumulator.current_root_scan_source_with_started_at(
             "pair-a", "second", "local-session", 4,
         ))
         self.assertIsNone(accumulator.current_root_scan_source_started_at(
             "pair-a", "first", "old-session", 4,
         ))
+        self.assertIsNone(accumulator.current_root_scan_source_with_started_at(
+            "pair-a", "first", "old-session", 4,
+        ))
         self.assertIsNone(accumulator.current_root_scan_source_started_at(
+            "pair-a", "first", "local-session", 3,
+        ))
+        self.assertIsNone(accumulator.current_root_scan_source_with_started_at(
             "pair-a", "first", "local-session", 3,
         ))
 
@@ -7134,7 +7146,13 @@ class TestModelUpdater(unittest.TestCase):
         self.assertIsNone(accumulator.current_root_scan_source_started_at(
             "pair-a", "missing-time", "local-session", 4,
         ))
+        self.assertIsNone(accumulator.current_root_scan_source_with_started_at(
+            "pair-a", "missing-time", "local-session", 4,
+        ))
         self.assertIsNone(accumulator.current_root_scan_source_started_at(
+            "pair-a", "first", "local-session", 4,
+        ))
+        self.assertIsNone(accumulator.current_root_scan_source_with_started_at(
             "pair-a", "first", "local-session", 4,
         ))
 
@@ -17976,6 +17994,129 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotEqual("stopped", Controller._model_record_visible_state(later_incomplete))
         self.assertIn(file_id, controller._Controller__pending_completion_publications)
         self.assertEqual(identity, model.published_file_job_identity(file_id))
+
+    def test_completion_retirement_promotes_only_committed_terminal_mirror_root(self):
+        file_name = "private-capture.bin"
+        file_id = ModelFile.build_file_id(file_name, None)
+        identity = (17, LftpJobStatus.Type.MIRROR.value)
+
+        def model_with_root(*, published_identity, transferred=100, remote=100,
+                            progress=100, stopped=False, is_dir=True):
+            root = ModelFile(file_name, is_dir)
+            root.state = ModelFile.State.DOWNLOADING
+            root.is_stoppable = True
+            root.local_present = True
+            root.remote_has_transferable_content = True
+            root.local_size = 40
+            root.remote_size = remote
+            root.transferred_size = transferred
+            root.download_progress = progress
+            root.explicitly_stopped = stopped
+            model = Model()
+            model.add_file(root, structural_job_identity=published_identity)
+            return model
+
+        # The accepted case uses Model's ordinary immutable publication API:
+        # the retired MIRROR identity is committed with the terminal root.
+        for enabled in (True, False):
+            with self.subTest(diagnostics_enabled=enabled):
+                model = model_with_root(published_identity=identity)
+                self.assertEqual(identity, model.published_file_job_identity(file_id))
+                with tempfile.TemporaryDirectory() as spool_path:
+                    trace = BreadcrumbTraceCollector(
+                        lambda: enabled, max_entries=8,
+                        durable_enabled=enabled,
+                        durable_path=spool_path if enabled else None,
+                        policy={"default": "off", "rules": {"completion.gate": "info"}},
+                    )
+                    controller = self._run_completion_floor_capture(model, identity, trace)
+                    self.assertEqual((100, 100),
+                                     controller._Controller__pending_completion_progress_floors[file_id])
+                    self.assertEqual(identity,
+                                     controller._Controller__pending_completion_progress_floor_identities[file_id])
+                    self.assertIn(file_id, controller._Controller__pending_completion_publications)
+                    if enabled:
+                        trace.close()
+                        with open(os.path.join(spool_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                            records = [json.loads(line) for line in handle if line.strip()]
+                        event = next(
+                            entry for entry in records
+                            if entry.get("message") == "completion_progress_floor_capture"
+                        )
+                        self.assertEqual("completion.gate", event["category"])
+                        self.assertEqual("completion_gate", event["stage"])
+                        self.assertEqual("published_snapshot_accepted", event["details"]["outcome"])
+                        self.assertEqual("eligible", event["details"]["published_candidate"])
+                        self.assertEqual("matching", event["details"]["published_identity_relation"])
+                        self.assertEqual("lftp-poll:0123456789abcdef", event["flow_id"])
+                        self.assertTrue(event["corr_id"].startswith("completion:"))
+                        self.assertNotIn(file_name, json.dumps(event))
+                    else:
+                        self.assertEqual([], trace.snapshot()["entries"])
+                        trace.close()
+
+        class FailingTrace:
+            @staticmethod
+            def is_effectively_enabled(_category, _level="info"):
+                return True
+
+            @staticmethod
+            def record(*_args, **_kwargs):
+                raise RuntimeError("private diagnostic sink failure")
+
+        failing_model = model_with_root(published_identity=identity)
+        failing_controller = self._run_completion_floor_capture(
+            failing_model, identity, FailingTrace(),
+        )
+        self.assertEqual((100, 100),
+                         failing_controller._Controller__pending_completion_progress_floors[file_id])
+        self.assertEqual(identity, failing_model.published_file_job_identity(file_id))
+
+        # These nearby candidates must not inherit the new terminal-MIRROR
+        # capture exception. The ordinary active-overlay PGET path is covered
+        # separately by the existing capture tests above.
+        negative_cases = (
+            ("partial_mirror", identity, 40, 100, 40, False, True,
+             "published_snapshot_ineligible", "transferable_remote_content"),
+            ("wrong_identity", (18, LftpJobStatus.Type.MIRROR.value), 100, 100, 100,
+             False, True, "published_identity_mismatch", "identity_mismatch"),
+            ("non_directory", identity, 100, 100, 100, False, False,
+             "published_identity_mismatch", "identity_mismatch"),
+            ("non_mirror_identity", (17, LftpJobStatus.Type.PGET.value), 100, 100,
+             100, False, True, "published_identity_mismatch", "identity_mismatch"),
+            ("stopped_mirror", identity, 100, 100, 100, True, True,
+             "published_identity_mismatch", "identity_mismatch"),
+        )
+        for (label, published_identity, transferred, remote, progress, stopped,
+             is_dir, expected_outcome, expected_candidate) in negative_cases:
+            with self.subTest(case=label):
+                model = model_with_root(
+                    published_identity=published_identity,
+                    transferred=transferred,
+                    remote=remote,
+                    progress=progress,
+                    stopped=stopped,
+                    is_dir=is_dir,
+                )
+                # Identity mismatches and non-directory/PGET cases can be
+                # rejected by Model before floor capture. The partial MIRROR
+                # retains its identity but is not terminal; a stopped root
+                # cannot receive structural provenance.
+                if label == "partial_mirror":
+                    self.assertEqual(identity, model.published_file_job_identity(file_id))
+                else:
+                    self.assertNotEqual(identity, model.published_file_job_identity(file_id))
+                trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+                controller = self._run_completion_floor_capture(model, identity, trace)
+                self.assertNotIn(file_id, controller._Controller__pending_completion_progress_floors)
+                self.assertNotIn(file_id, controller._Controller__pending_completion_publications)
+                event = next(
+                    entry for entry in trace.snapshot()["entries"]
+                    if entry.get("message") == "completion_progress_floor_capture"
+                )
+                self.assertEqual(expected_outcome, event["details"]["outcome"])
+                self.assertEqual(expected_candidate, event["details"]["published_candidate"])
+                trace.close()
 
     def test_completion_floor_capture_diagnostics_distinguish_rejections_and_isolate_sink(self):
         file_name = "private-capture.bin"
