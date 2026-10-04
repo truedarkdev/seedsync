@@ -2123,7 +2123,7 @@ class _ProgressiveScanAccumulator:
         self.__failed_pairs: set[tuple[int, Optional[str]]] = set()
         self.__authoritative_by_pair: dict[Optional[str], dict[str, Optional[SystemFile]]] = {}
         self.__root_scan_outcomes_by_pair: dict[
-            Optional[str], tuple[int, dict[str, tuple[bool, bool]]]
+            Optional[str], tuple[int, dict[str, tuple[tuple[bool, bool], Optional[datetime]]]]
         ] = {}
         self.__incomplete_pairs: set[Optional[str]] = set()
         self.__recoverable_incomplete_pairs: set[Optional[str]] = set()
@@ -2354,6 +2354,7 @@ class _ProgressiveScanAccumulator:
                 event, "terminal_failure_path_pair_ids", None,
             ),
             root_scan_outcomes_by_pair=getattr(event, "root_scan_outcomes_by_pair", None),
+            scan_started_at=getattr(event, "scan_started_at", None),
         )
 
     @staticmethod
@@ -2726,7 +2727,10 @@ class _ProgressiveScanAccumulator:
                                 not isinstance(role_outcomes, tuple) or len(role_outcomes) != 2 or \
                                 any(type(value) is not bool for value in role_outcomes):
                             continue
-                        current_outcomes[root_name] = role_outcomes
+                        scan_started_at = getattr(event, "scan_started_at", None)
+                        current_outcomes[root_name] = (
+                            role_outcomes, scan_started_at if isinstance(scan_started_at, datetime) else None,
+                        )
                         self.__last_touched_keys.add((pair_id, root_name))
                     self.__root_scan_outcomes_by_pair[pair_id] = (generation, current_outcomes)
                 if event.failed:
@@ -2752,8 +2756,8 @@ class _ProgressiveScanAccumulator:
                     working = self.__working.get(generation, {}).get(pair_id, {})
                     root_evidence = self.__root_scan_outcomes_by_pair.get(pair_id)
                     if root_evidence is not None and root_evidence[0] == generation:
-                        for root_name, role_outcomes in root_evidence[1].items():
-                            if role_outcomes == (True, True) and root_name in working:
+                        for root_name, outcome_and_start in root_evidence[1].items():
+                            if outcome_and_start[0] == (True, True) and root_name in working:
                                 self.__authoritative_by_pair.setdefault(pair_id, {})[root_name] = working[root_name]
                     failed = True
                     event_recoverable_ids = self.__resolve_failure_path_pair_ids(
@@ -2844,9 +2848,13 @@ class _ProgressiveScanAccumulator:
                     )
                     working[file.name] = file
                     root_evidence = self.__root_scan_outcomes_by_pair.get(pair_id)
-                    root_outcomes = root_evidence[1].get(file.name) if root_evidence is not None and \
+                    root_outcome_and_start = root_evidence[1].get(file.name) if root_evidence is not None and \
                         root_evidence[0] == generation else None
-                    if root_outcomes is None or root_outcomes == (True, True):
+                    if root_outcome_and_start is not None and \
+                            (not isinstance(pair_outcomes, dict) or file.name not in pair_outcomes):
+                        root_evidence[1][file.name] = (root_outcome_and_start[0], None)
+                        root_outcome_and_start = root_evidence[1][file.name]
+                    if root_outcome_and_start is None or root_outcome_and_start[0] == (True, True):
                         self.__authoritative_by_pair.setdefault(pair_id, {})[file.name] = file
                     else:
                         self.__authoritative_by_pair.get(pair_id, {}).pop(file.name, None)
@@ -3047,16 +3055,41 @@ class _ProgressiveScanAccumulator:
             if self.__active_generation.get(pair_id) != generation:
                 continue
             authoritative_roots = self.__authoritative_by_pair.get(pair_id, {})
-            for root_name, role_outcomes in outcomes.items():
+            for root_name, outcome_and_start in outcomes.items():
                 invalidations = self.__move_invalidations_by_root.get((pair_id, root_name), {})
                 if any(status == "confirmed_delete" for _, status in invalidations.values()):
                     continue
                 current_root = authoritative_roots.get(root_name)
-                if role_outcomes == (True, True) and isinstance(current_root, SystemFile):
+                if outcome_and_start[0] == (True, True) and isinstance(current_root, SystemFile):
                     sources[ModelFile.build_file_id(root_name, pair_id)] = (
                         current_root, self.__session_token, generation,
                     )
         return sources
+
+    def current_root_scan_source_started_at(
+            self, path_pair_id: Optional[str], root_name: str,
+            expected_session: str, expected_generation: int,
+    ) -> Optional[datetime]:
+        """Return timing only for the exact current accepted root outcome."""
+        if not isinstance(root_name, str) or not root_name or \
+                not isinstance(expected_session, str) or not expected_session or \
+                type(expected_generation) is not int or expected_generation < 0 or \
+                expected_session != self.__session_token or \
+                self.__active_generation.get(path_pair_id) != expected_generation:
+            return None
+        evidence = self.__root_scan_outcomes_by_pair.get(path_pair_id)
+        if evidence is None or evidence[0] != expected_generation:
+            return None
+        outcome_and_start = evidence[1].get(root_name)
+        if not isinstance(outcome_and_start, tuple) or len(outcome_and_start) != 2 or \
+                outcome_and_start[0] != (True, True):
+            return None
+        if any(status == "confirmed_delete" for _, status in
+               self.__move_invalidations_by_root.get((path_pair_id, root_name), {}).values()):
+            return None
+        current_root = self.__authoritative_by_pair.get(path_pair_id, {}).get(root_name)
+        started_at = outcome_and_start[1]
+        return started_at if isinstance(current_root, SystemFile) and isinstance(started_at, datetime) else None
 
     def current_root_scan_proofs(self) -> dict[str, tuple[str, int]]:
         """Return proof tokens only for roots with accepted current source data."""
@@ -4655,7 +4688,7 @@ class ModelUpdater(_ControllerCoreAccess):
             return "unknown", "unknown"
         if failed:
             return "unknown", "failed"
-        scan_time = getattr(scan, "timestamp", None)
+        scan_time = getattr(scan, "scan_started_at", None)
         if not isinstance(scan_time, datetime):
             return "unknown", "unknown"
         if not isinstance(retired_at, datetime):
@@ -8175,6 +8208,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 "local_root_proof_inputs_known": "unknown",
                 "local_root_proof_checker_available": "unknown",
                 "local_root_proof_result": "unknown",
+                "local_root_scan_start_relation": "unknown",
             }
             try:
                 name = pending_file.name
@@ -8212,6 +8246,22 @@ class ModelUpdater(_ControllerCoreAccess):
                     result = checker(file_id, session_token, generation)
                     if type(result) is bool:
                         details["local_root_proof_result"] = result
+                    accumulator = getattr(
+                        controller, "_Controller__progressive_local_scan_state", None,
+                    )
+                    started_at = accumulator.current_root_scan_source_started_at(
+                        path_pair_id, name, session_token, generation,
+                    ) if isinstance(accumulator, _ProgressiveScanAccumulator) else None
+                    publications = getattr(
+                        controller, "_Controller__pending_completion_publications", None,
+                    )
+                    publication = publications.get(file_id) if isinstance(publications, dict) else None
+                    retired_at = publication.retired_at if isinstance(
+                        publication, _PendingCompletionPublication,
+                    ) else None
+                    if isinstance(started_at, datetime) and isinstance(retired_at, datetime):
+                        details["local_root_scan_start_relation"] = \
+                            "before" if started_at <= retired_at else "after"
             except Exception:
                 # Diagnostic inspection must not change the existing wake path.
                 pass

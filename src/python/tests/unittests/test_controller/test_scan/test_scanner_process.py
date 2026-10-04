@@ -689,6 +689,27 @@ class TestScannerProcess(unittest.TestCase):
         self.assertTrue(entries)
         self.assertEqual("local", entries[-1]["details"]["scanner_side"])
 
+    def test_inline_scan_start_is_carried_by_progress_snapshot_and_final_results(self):
+        class StartedProgressiveScanner(ProgressiveScanner):
+            def scan(self):
+                self.scan_entered_at = datetime.now()
+                return super().scan()
+
+        scanner = StartedProgressiveScanner()
+        self.process = ScannerProcess(scanner=scanner, interval_in_ms=0, verbose=False)
+        self.addCleanup(self.process.close_queues)
+
+        self.process.run_loop()
+        results = self.process.pop_results()
+
+        self.assertEqual(5, len(results))
+        starts = {result.scan_started_at for result in results}
+        self.assertEqual(1, len(starts))
+        self.assertIsInstance(next(iter(starts)), datetime)
+        self.assertLessEqual(next(iter(starts)), scanner.scan_entered_at)
+        self.assertTrue(any(result.is_full_snapshot for result in results))
+        self.assertTrue(any(result.is_scan_final for result in results))
+
     def test_spawned_remote_duration_aggregates_reach_parent_collector(self):
         self._scan_run_patcher.stop()
         collector = PerformanceDiagnosticsCollector(lambda: True, sample_interval_seconds=1)
@@ -974,6 +995,7 @@ class TestScannerProcess(unittest.TestCase):
         self.assertTrue(result.failed)
         self.assertEqual("recoverable child error", result.error_message)
         self.assertEqual(["partial"], [system_file.name for system_file in result.files])
+        self.assertIsInstance(result.scan_started_at, datetime)
 
     def test_spawned_worker_propagates_fatal_scanner_error(self):
         self._scan_run_patcher.stop()

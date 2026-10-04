@@ -7080,6 +7080,64 @@ class TestModelUpdater(unittest.TestCase):
         restarted.set_session_token("replacement-session")
         self.assertEqual({}, restarted.current_root_scan_proofs())
 
+    def test_root_scan_start_is_retained_per_exact_accepted_root(self):
+        accumulator = _ProgressiveScanAccumulator()
+        first_start = datetime.now() - timedelta(seconds=2)
+        second_start = first_start + timedelta(seconds=1)
+        first = SystemFile("first", 1, is_dir=True)
+        first.path_pair_id = "pair-a"
+        second = SystemFile("second", 1, is_dir=True)
+        second.path_pair_id = "pair-a"
+        missing = SystemFile("missing-time", 1, is_dir=True)
+        missing.path_pair_id = "pair-a"
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [first], scanned_path_pair_ids={"pair-a"}, generation=4,
+                is_progress=True, session_token="local-session",
+                root_scan_outcomes_by_pair={"pair-a": {"first": (True, True)}},
+                scan_started_at=first_start,
+            ),
+            ScannerResult(
+                datetime.now(), [second], scanned_path_pair_ids={"pair-a"}, generation=4,
+                is_progress=True, session_token="local-session",
+                root_scan_outcomes_by_pair={"pair-a": {"second": (True, True)}},
+                scan_started_at=second_start,
+            ),
+        ], {"pair-a"})
+
+        self.assertEqual(first_start, accumulator.current_root_scan_source_started_at(
+            "pair-a", "first", "local-session", 4,
+        ))
+        self.assertEqual(second_start, accumulator.current_root_scan_source_started_at(
+            "pair-a", "second", "local-session", 4,
+        ))
+        self.assertIsNone(accumulator.current_root_scan_source_started_at(
+            "pair-a", "first", "old-session", 4,
+        ))
+        self.assertIsNone(accumulator.current_root_scan_source_started_at(
+            "pair-a", "first", "local-session", 3,
+        ))
+
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [missing], scanned_path_pair_ids={"pair-a"}, generation=4,
+                is_progress=True, session_token="local-session",
+                root_scan_outcomes_by_pair={"pair-a": {"missing-time": (True, True)}},
+            ),
+            ScannerResult(
+                datetime.now(), [SystemFile("first", 2, is_dir=True)],
+                scanned_path_pair_ids={"pair-a"}, generation=4, is_progress=True,
+                session_token="local-session",
+            ),
+        ], {"pair-a"})
+
+        self.assertIsNone(accumulator.current_root_scan_source_started_at(
+            "pair-a", "missing-time", "local-session", 4,
+        ))
+        self.assertIsNone(accumulator.current_root_scan_source_started_at(
+            "pair-a", "first", "local-session", 4,
+        ))
+
     def test_local_root_scan_sources_include_complete_regular_file_roots_but_proofs_stay_directory_only(self):
         directory = SystemFile("directory", 1, is_dir=True)
         regular = SystemFile("regular.bin", 5)
@@ -14421,12 +14479,13 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual({
             "schema", "decision", "reason", "local_root_proof_shape",
             "local_root_proof_inputs_known", "local_root_proof_checker_available",
-            "local_root_proof_result",
+            "local_root_proof_result", "local_root_scan_start_relation",
         }, set(event["details"]))
         self.assertEqual("directory_root", event["details"]["local_root_proof_shape"])
         self.assertTrue(event["details"]["local_root_proof_inputs_known"])
         self.assertTrue(event["details"]["local_root_proof_checker_available"])
         self.assertTrue(event["details"]["local_root_proof_result"])
+        self.assertEqual("unknown", event["details"]["local_root_scan_start_relation"])
         self.assertEqual("completion:{}".format(opaque_trace_correlation(
             ModelFile.build_file_id("pending.bin", None),
         )), event["corr_id"])
@@ -18166,7 +18225,7 @@ class TestModelUpdater(unittest.TestCase):
             SystemFile("other-{}".format(index), 10, False) for index in range(3)
         ] + [SystemFile("checkpoint-root", 10, False)]
         rows[-1].status_sidecar_ready = False
-        scan = ScannerResult(scanned_at, rows)
+        scan = ScannerResult(scanned_at, rows, scan_started_at=scanned_at)
         self.assertEqual(
             ("unknown", "fresh"),
             ModelUpdater._completion_root_checkpoint(
@@ -18177,6 +18236,16 @@ class TestModelUpdater(unittest.TestCase):
             ("unknown", "failed"),
             ModelUpdater._completion_root_checkpoint(
                 file_id, ScannerResult(scanned_at, [root], failed=True), scanned_at,
+            ),
+        )
+        self.assertEqual(
+            ("sidecar_ready", "stale"),
+            ModelUpdater._completion_root_checkpoint(
+                file_id,
+                ScannerResult(
+                    scanned_at, [root], scan_started_at=scanned_at - timedelta(seconds=2),
+                ),
+                scanned_at - timedelta(seconds=1),
             ),
         )
         self.assertEqual(

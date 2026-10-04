@@ -259,7 +259,8 @@ class ScannerResult:
                  terminal_failure_path_pair_ids: Optional[set[str | None]] = None,
                  root_scan_outcomes_by_pair: Optional[
                      dict[str | None, dict[str, tuple[bool, bool]]]
-                 ] = None):
+                 ] = None,
+                 scan_started_at: Optional[datetime] = None):
         self.timestamp = timestamp
         self.files = files
         self.malformed_status_only_file_ids = [] if malformed_status_only_file_ids is None else malformed_status_only_file_ids
@@ -290,6 +291,7 @@ class ScannerResult:
         self.terminal_failure_path_pair_ids = terminal_failure_path_pair_ids
         self.root_scan_outcomes_by_pair = {} if root_scan_outcomes_by_pair is None \
             else root_scan_outcomes_by_pair
+        self.scan_started_at = scan_started_at
 
 
 class _ScannerQueueReleaseMarker:
@@ -604,6 +606,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                                                  if unchanged_root_fingerprints else None),
             root_scan_outcomes_by_pair={path_pair_id: dict(root_scan_outcomes)}
             if root_scan_outcomes else None,
+            scan_started_at=scan_started_at,
         )
         if result_via_control:
             send_control_message(("result", progress_result))
@@ -625,6 +628,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                 root_scan_outcomes_by_pair={
                     pair_id: dict(outcomes) for pair_id, outcomes in root_scan_outcomes_by_pair.items()
                 },
+                scan_started_at=scan_started_at,
             )
             if result_via_control:
                 send_control_message(("result", pair_snapshot))
@@ -641,6 +645,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
             setter(scan_target_path_pair_ids)
         timestamp = datetime.now()
         try:
+            scan_started_at = datetime.now()
             files = scanner.scan()
             malformed = scanner.pop_malformed_status_only_file_ids()
             managed = scanner.pop_managed_extract_file_ids()
@@ -662,6 +667,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                 root_scan_outcomes_by_pair={
                     pair_id: dict(outcomes) for pair_id, outcomes in root_scan_outcomes_by_pair.items()
                 },
+                scan_started_at=scan_started_at,
                 duration_aggregates=duration_recorder.snapshot(),
                 duration_aggregate_token=(session_token, generation, performance_diagnostics_generation),
             )
@@ -716,6 +722,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                 root_scan_outcomes_by_pair={
                     pair_id: dict(outcomes) for pair_id, outcomes in root_scan_outcomes_by_pair.items()
                 },
+                scan_started_at=scan_started_at,
             )
             outcome = ("recoverable", str(error))
             _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_failed",
@@ -1005,6 +1012,7 @@ class ScannerProcess:
                 breadcrumb_setter(self.__breadcrumb_trace)
             if callable(setter):
                 setter(scan_target_path_pair_ids)
+        scan_started_at = datetime.now()
         self.__scan_generation += 1
         progress_emitted = False
         progress_files_by_pair: dict[Optional[str], list[SystemFile]] = {}
@@ -1047,6 +1055,7 @@ class ScannerProcess:
                                                      if unchanged_root_fingerprints else None),
                 root_scan_outcomes_by_pair={path_pair_id: dict(root_scan_outcomes)}
                 if root_scan_outcomes else None,
+                scan_started_at=scan_started_at,
             ))
             if complete:
                 self.__publish_result(ScannerResult(
@@ -1063,6 +1072,7 @@ class ScannerProcess:
                     root_scan_outcomes_by_pair={
                         pair_id: dict(outcomes) for pair_id, outcomes in root_scan_outcomes_by_pair.items()
                     },
+                    scan_started_at=scan_started_at,
                 ))
         self.__scanner.set_progress_callback(publish_progress)
         self.__inline_scan_target_path_pair_ids = scan_target_path_pair_ids
@@ -1086,7 +1096,8 @@ class ScannerProcess:
                                     root_scan_outcomes_by_pair={
                                         pair_id: dict(outcomes)
                                         for pair_id, outcomes in root_scan_outcomes_by_pair.items()
-                                    })
+                                    },
+                                    scan_started_at=scan_started_at)
             if _scanner_side(self.__scanner) in ("local", "remote"):
                 _record_root_shape_breadcrumb(
                     self.__breadcrumb_trace, files, True, "unknown", "scanner_process",
@@ -1131,7 +1142,8 @@ class ScannerProcess:
                                    root_scan_outcomes_by_pair={
                                        pair_id: dict(outcomes)
                                        for pair_id, outcomes in root_scan_outcomes_by_pair.items()
-                                   })
+                                   },
+                                   scan_started_at=scan_started_at)
             self.__record_breadcrumb("scan_failed", lambda: {
                 "file_count": len(files), "failed": True,
                 "scanner_side": _scanner_side(self.__scanner),
