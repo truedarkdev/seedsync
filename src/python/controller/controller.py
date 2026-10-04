@@ -6383,14 +6383,65 @@ class Controller:
             previous_identity: Optional[tuple[int, str]],
             identity: Optional[tuple[int, str]],
             level: str,
+            publication_snapshot: Optional[dict[str, object]] = None,
     ) -> None:
         """Record identity-only Model transitions with opaque root/job joins."""
         reasons = {
             "identity_bound", "retiring_identity_published", "equal_publication_preserved",
             "changed_unbound_publication", "identity_consumed", "identity_replaced",
-            "published_root_removed",
+            "published_root_removed", "published_state_rollback",
         }
         if reason not in reasons or level not in {"info", "debug"}:
+            return
+        if reason == "published_state_rollback":
+            if not isinstance(publication_snapshot, dict):
+                return
+            expected_keys = {
+                "schema", "caller", "basis", "raw_state", "before_state", "after_state",
+                "before_download_progress", "after_download_progress",
+                "before_display_transferred_size", "after_display_transferred_size",
+                "before_display_size_total", "after_display_size_total", "before_local_size",
+                "after_local_size", "before_coverage", "after_coverage", "explicit_stop",
+                "overlay_present",
+            }
+            callers = {
+                "apply_with_active_progress_retained", "apply_authoritative_root_replacement",
+                "clear_active_progress_overlays", "clear_active_progress_overlays_except",
+                "restore_active_progress_overlays", "clear_active_progress_overlay_if_job_identity_matches",
+                "replace_active_progress_overlays", "publish_active_lftp_root_counters", "add_file",
+                "remove_file", "update_file_previous", "update_file_candidate",
+            }
+            states = {
+                "default", "downloading", "queued", "downloaded", "deleted", "extracting",
+                "extracted", "validating", "validated", "corrupt", "move_failed",
+            }
+            if set(publication_snapshot) != expected_keys or \
+                    publication_snapshot.get("schema") != "model_published_snapshot_transition.v1" or \
+                    publication_snapshot.get("caller") not in callers or \
+                    publication_snapshot.get("basis") not in {"active", "structural", "retiring", "base"}:
+                return
+            for key in ("raw_state", "before_state", "after_state"):
+                value = publication_snapshot.get(key)
+                if value is not None and value not in states:
+                    return
+            for key in ("before_download_progress", "after_download_progress"):
+                value = publication_snapshot.get(key)
+                if value is not None and (type(value) is not int or value < 0 or value > 100):
+                    return
+            for key in (
+                    "before_display_transferred_size", "after_display_transferred_size",
+                    "before_display_size_total", "after_display_size_total",
+                    "before_local_size", "after_local_size"):
+                value = publication_snapshot.get(key)
+                if value is not None and (type(value) is not int or value < 0 or value > 2**63 - 1):
+                    return
+            for key in ("before_coverage", "after_coverage", "explicit_stop"):
+                value = publication_snapshot.get(key)
+                if value is not None and type(value) is not bool:
+                    return
+            if type(publication_snapshot.get("overlay_present")) is not bool:
+                return
+        elif publication_snapshot is not None:
             return
         try:
             trace = getattr(self.__context, "breadcrumb_trace", None)
@@ -6422,6 +6473,8 @@ class Controller:
                 "previous_job_correlation": previous_correlation,
                 "job_correlation": identity_correlation,
             }
+            if reason == "published_state_rollback":
+                details["publication_snapshot"] = dict(publication_snapshot)
             self.__record_breadcrumb(
                 stage="completion_gate", message="model_completion_provenance",
                 event_type="state_transition", corr_id="completion:" + root_correlation,

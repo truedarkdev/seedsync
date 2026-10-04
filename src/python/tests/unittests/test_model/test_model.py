@@ -73,6 +73,161 @@ class TestStructuralMirrorPublication(unittest.TestCase):
         self.assertNotIn(file.file_id, list(event.values()) + list(event["details"].values()))
         self.assertEqual((51, "mirror"), model.published_file_job_identity(file.file_id))
 
+    def test_published_state_rollback_persists_bounded_snapshot_witness(self):
+        import json
+        import os
+        import tempfile
+        from common.breadcrumb_trace import opaque_trace_correlation
+        from controller import Controller, ControllerPersist
+        from tests.unittests.test_controller.test_controller import TestController
+
+        with tempfile.TemporaryDirectory() as spool_path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True, durable_enabled=True, durable_path=spool_path,
+                policy={"default": "off", "rules": {"completion.gate": "info"}},
+            )
+            context = TestController()._make_startup_context(local_path="/local")
+            context.breadcrumb_trace = trace
+            with patch("controller.controller.create_transfer_backend", return_value=MagicMock()):
+                controller = Controller(context, ControllerPersist())
+            model = controller._Controller__model
+
+            root = ModelFile("witness-root", True)
+            root.state = ModelFile.State.DOWNLOADING
+            root.local_size = 40
+            root.download_progress = 4
+            root.display_transferred_size = 40
+            root.display_size_total = 100
+            model.add_file(root)
+            old_published = model.published_file(root.file_id)
+            self.assertEqual(ModelFile.State.DOWNLOADING, old_published.state)
+
+            model.get_file(root.file_id).state = ModelFile.State.DEFAULT
+            raw_default = ModelFile("witness-root", True)
+            raw_default.state = ModelFile.State.DEFAULT
+            raw_default.local_size = 45
+            raw_default.download_progress = 5
+            raw_default.display_transferred_size = 45
+            raw_default.display_size_total = 100
+            model.update_file(raw_default)
+            self.assertEqual(ModelFile.State.DEFAULT, raw_default.state)
+            self.assertEqual(ModelFile.State.DEFAULT, model.published_file(root.file_id).state)
+            model.update_file(raw_default)
+
+            cleared_root = ModelFile("cleared-root", True)
+            cleared_root.state = ModelFile.State.DOWNLOADING
+            cleared_root.is_stoppable = True
+            model.add_file(cleared_root)
+            model.publish_active_lftp_root_counters(
+                {cleared_root.file_id: ActiveProgressOverlay(20, 20, None, None)},
+                {cleared_root.file_id: (51, "mirror")}, lambda _file_id: True,
+            )
+            model.get_file(cleared_root.file_id).state = ModelFile.State.DEFAULT
+            self.assertEqual(ModelFile.State.DOWNLOADING, model.published_file(cleared_root.file_id).state)
+            self.assertTrue(model.clear_active_progress_overlay_if_job_identity_matches(
+                cleared_root.file_id, (51, "mirror"),
+            ))
+            self.assertEqual(ModelFile.State.DEFAULT, model.published_file(cleared_root.file_id).state)
+
+            complete = ModelFile("complete-root", True)
+            complete.state = ModelFile.State.DOWNLOADING
+            model.add_file(complete)
+            downloaded = ModelFile("complete-root", True)
+            downloaded.state = ModelFile.State.DOWNLOADED
+            model.update_file(downloaded)
+
+            stopped = ModelFile("stopped-root", True)
+            stopped.state = ModelFile.State.DOWNLOADING
+            model.add_file(stopped)
+            stop_transition = ModelFile("stopped-root", True)
+            stop_transition.state = ModelFile.State.DEFAULT
+            stop_transition.explicitly_stopped = True
+            model.update_file(stop_transition)
+
+            flushed = trace.flush_durable(2.0)
+            close_summary = trace.close()
+            with open(os.path.join(spool_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle if line.strip()]
+            retained_path = os.environ.get("SEEDSYNC_MODEL_COMPLETION_FINALIZED_ROWS_PATH")
+            if retained_path:
+                with open(retained_path, "w", encoding="utf-8") as handle:
+                    for row in rows:
+                        handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+            self.assertTrue(flushed, close_summary)
+
+        events = [row for row in rows if row.get("details", {}).get("reason") == "published_state_rollback"]
+        self.assertEqual(3, len(events), rows)
+        event = next(row for row in events if row["details"]["publication_snapshot"]["caller"] ==
+                     "update_file_candidate" and row["details"]["root_correlation"] ==
+                     opaque_trace_correlation(root.file_id))
+        self.assertEqual("completion.gate", event["category"])
+        self.assertEqual("completion_gate", event["stage"])
+        snapshot = event["details"]["publication_snapshot"]
+        self.assertEqual({
+            "schema", "caller", "basis", "raw_state", "before_state", "after_state",
+            "before_download_progress", "after_download_progress",
+            "before_display_transferred_size", "after_display_transferred_size",
+            "before_display_size_total", "after_display_size_total", "before_local_size",
+            "after_local_size", "before_coverage", "after_coverage", "explicit_stop",
+            "overlay_present",
+        }, set(snapshot))
+        self.assertEqual("model_published_snapshot_transition.v1", snapshot["schema"])
+        self.assertEqual("base", snapshot["basis"])
+        self.assertEqual("default", snapshot["raw_state"])
+        self.assertEqual("downloading", snapshot["before_state"])
+        self.assertEqual("default", snapshot["after_state"])
+        self.assertEqual(40, snapshot["before_local_size"])
+        self.assertEqual(45, snapshot["after_local_size"])
+        self.assertFalse(snapshot["overlay_present"])
+        cleared_event = next(row for row in events if row["details"]["root_correlation"] ==
+                             opaque_trace_correlation(cleared_root.file_id))
+        self.assertEqual("clear_active_progress_overlay_if_job_identity_matches",
+                         cleared_event["details"]["publication_snapshot"]["caller"])
+        self.assertEqual("base", cleared_event["details"]["publication_snapshot"]["basis"])
+        self.assertFalse(cleared_event["details"]["publication_snapshot"]["overlay_present"])
+        stopped_event = next(row for row in events if row["details"]["root_correlation"] ==
+                             opaque_trace_correlation(ModelFile.build_file_id("stopped-root", None)))
+        self.assertTrue(stopped_event["details"]["publication_snapshot"]["explicit_stop"])
+        self.assertNotIn("witness-root", json.dumps(event, sort_keys=True))
+
+    def test_published_state_rollback_diagnostics_fail_closed_without_changing_publication(self):
+        def raising_gate(_level):
+            raise RuntimeError("disabled diagnostic gate")
+
+        for gate, recorder in (
+                (lambda _level: False, MagicMock()),
+                (raising_gate, MagicMock()),
+                (lambda _level: True,
+                 lambda *_args: (_ for _ in ()).throw(RuntimeError("diagnostic sink failure")))):
+            with self.subTest(gate=gate):
+                model = Model()
+                model.set_completion_provenance_diagnostics(gate, recorder)
+                active = ModelFile("failure-isolation", False)
+                active.state = ModelFile.State.DOWNLOADING
+                model.add_file(active)
+                default = ModelFile("failure-isolation", False)
+                default.state = ModelFile.State.DEFAULT
+                model.update_file(default)
+                self.assertEqual(ModelFile.State.DEFAULT,
+                                 model.published_file(ModelFile.build_file_id("failure-isolation", None)).state)
+
+    def test_published_state_rollback_witness_is_limited_to_root_publications(self):
+        model = Model()
+        events = []
+        model.set_completion_provenance_diagnostics(lambda _level: True, lambda *args: events.append(args))
+        parent = ModelFile("parent", True)
+        child = ModelFile("child", False)
+        child.state = ModelFile.State.DOWNLOADING
+        parent.add_child(child)
+        model.add_file(child)
+        replacement_parent = ModelFile("parent", True)
+        default = ModelFile("child", False)
+        replacement_parent.add_child(default)
+        default.state = ModelFile.State.DEFAULT
+        model.update_file(default)
+        self.assertEqual(ModelFile.State.DEFAULT, model.published_file(default.file_id).state)
+        self.assertNotIn("published_state_rollback", [event[1] for event in events])
+
     def test_fresh_unique_and_lifecycle_opposites_decline_binding(self):
         for healthy, fresh, source, duplicate in ((False, True, "fresh_healthy", False),
                                                  (True, False, "cached", False),

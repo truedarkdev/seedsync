@@ -113,15 +113,13 @@ class Model:
         self.__retiring_progress_overlay_job_identities: Dict[str, tuple[int, str]] = {}
         self.__completion_provenance_trace_enabled: Optional[Callable[[str], bool]] = None
         self.__completion_provenance_trace_recorder: Optional[
-            Callable[[str, str, Optional[tuple[int, str]], Optional[tuple[int, str]], str], None]
+            Callable[..., None]
         ] = None
 
     def set_completion_provenance_diagnostics(
             self,
             enabled: Optional[Callable[[str], bool]],
-            recorder: Optional[
-                Callable[[str, str, Optional[tuple[int, str]], Optional[tuple[int, str]], str], None]
-            ],
+            recorder: Optional[Callable[..., None]],
     ) -> None:
         """Install transient, fail-isolated completion provenance diagnostics."""
         self.__completion_provenance_trace_enabled = enabled if callable(enabled) else None
@@ -143,14 +141,19 @@ class Model:
             previous_identity: Optional[tuple[int, str]],
             identity: Optional[tuple[int, str]],
             level: str,
+            publication_snapshot: Optional[dict[str, object]] = None,
+            gate_checked: bool = False,
     ) -> None:
-        if not self.__completion_provenance_trace_is_enabled(level):
+        if not gate_checked and not self.__completion_provenance_trace_is_enabled(level):
             return
         recorder = self.__completion_provenance_trace_recorder
         if not callable(recorder):
             return
         try:
-            recorder(file_id, reason, previous_identity, identity, level)
+            if publication_snapshot is None:
+                recorder(file_id, reason, previous_identity, identity, level)
+            else:
+                recorder(file_id, reason, previous_identity, identity, level, publication_snapshot)
         except Exception:
             try:
                 self.logger.debug("Ignoring completion provenance diagnostic failure", exc_info=True)
@@ -160,6 +163,7 @@ class Model:
     def __refresh_published_file(
             self, file: ModelFile,
             structural_job_identity: Optional[tuple[int, str]] = None,
+            *, caller: str,
     ) -> ModelFile:
         """Materialize one immutable-effective root for asynchronous readers."""
         # Progress pulses can be frequent and roots may have very large trees.
@@ -257,6 +261,63 @@ class Model:
                     file.file_id, "changed_unbound_publication", previous_identity, None, "info",
                 )
         self.__published_files_by_id[file.file_id] = published
+        if previous_published is not None and \
+                file.parent is None and \
+                previous_published.state == ModelFile.State.DOWNLOADING and \
+                published.state == ModelFile.State.DEFAULT and \
+                self.__completion_provenance_trace_is_enabled("info") and \
+                callable(self.__completion_provenance_trace_recorder):
+            try:
+                def finite_state(value: object) -> Optional[str]:
+                    name = getattr(value, "name", None)
+                    return name.lower() if isinstance(name, str) and name.lower() in {
+                        "default", "downloading", "queued", "downloaded", "deleted",
+                        "extracting", "extracted", "validating", "validated", "corrupt", "move_failed",
+                    } else None
+
+                def finite_integer(value: object) -> Optional[int]:
+                    return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+
+                def finite_progress(value: object) -> Optional[int]:
+                    return value if type(value) is int and 0 <= value <= 100 else None
+
+                def finite_boolean(value: object) -> Optional[bool]:
+                    return value if type(value) is bool else None
+
+                identity_is_valid = isinstance(identity, tuple) and len(identity) == 2 and \
+                    type(identity[0]) is int and identity[0] >= 0 and \
+                    isinstance(identity[1], str) and bool(identity[1])
+                snapshot = {
+                    "schema": "model_published_snapshot_transition.v1",
+                    "caller": caller,
+                    "basis": identity_source if identity_is_valid and
+                        identity_source in {"active", "structural", "retiring"} else "base",
+                    "raw_state": finite_state(file.state),
+                    "before_state": finite_state(previous_published.state),
+                    "after_state": finite_state(published.state),
+                    "before_download_progress": finite_progress(previous_published.download_progress),
+                    "after_download_progress": finite_progress(published.download_progress),
+                    "before_display_transferred_size": finite_integer(previous_published.display_transferred_size),
+                    "after_display_transferred_size": finite_integer(published.display_transferred_size),
+                    "before_display_size_total": finite_integer(previous_published.display_size_total),
+                    "after_display_size_total": finite_integer(published.display_size_total),
+                    "before_local_size": finite_integer(previous_published.local_size),
+                    "after_local_size": finite_integer(published.local_size),
+                    "before_coverage": finite_boolean(previous_published.complete_local_coverage),
+                    "after_coverage": finite_boolean(published.complete_local_coverage),
+                    "explicit_stop": finite_boolean(published.explicitly_stopped),
+                    "overlay_present": overlay is not None,
+                }
+                self.__record_completion_provenance_transition(
+                    file.file_id, "published_state_rollback", previous_identity,
+                    identity if identity_is_valid else None, "info",
+                    publication_snapshot=snapshot, gate_checked=True,
+                )
+            except Exception:
+                try:
+                    self.logger.debug("Ignoring published snapshot diagnostic failure", exc_info=True)
+                except Exception:
+                    pass
         return published
 
     def published_file(self, file_id: str) -> Optional[ModelFile]:
@@ -565,7 +626,9 @@ class Model:
                 if file is None:
                     continue
                 previous_published = self.__published_files_by_id.get(file_id)
-                new_published = self.__refresh_published_file(file)
+                new_published = self.__refresh_published_file(
+                    file, caller="apply_with_active_progress_retained",
+                )
                 if previous_published is not None and previous_published == new_published:
                     continue
                 global_version, scope_version = self.__advance_version(file)
@@ -678,7 +741,7 @@ class Model:
             if refreshed == overlay:
                 continue
             self.__active_progress_overlays[file_id] = refreshed
-            self.__refresh_published_file(file)
+            self.__refresh_published_file(file, caller="apply_authoritative_root_replacement")
             global_version, scope_version = self.__advance_version(file)
             self.__notify_legacy_overlay_correction_if_needed(file_id, file)
             self.__notify_versioned_change(file, global_version, scope_version)
@@ -741,7 +804,7 @@ class Model:
                 self.__notify_legacy_overlay_correction_if_needed(file_id, None)
                 continue
             old_published = self.__published_files_by_id.get(file_id)
-            published = self.__refresh_published_file(file)
+            published = self.__refresh_published_file(file, caller="clear_active_progress_overlays")
             global_version, scope_version = self.__advance_version(file)
             self.__notify_legacy_overlay_correction_if_needed(file_id, file)
             self.__notify_versioned_change(file, global_version, scope_version)
@@ -768,7 +831,7 @@ class Model:
                 self.__notify_legacy_overlay_correction_if_needed(file_id, None)
                 continue
             old_published = self.__published_files_by_id.get(file_id)
-            published = self.__refresh_published_file(file)
+            published = self.__refresh_published_file(file, caller="clear_active_progress_overlays_except")
             global_version, scope_version = self.__advance_version(file)
             self.__notify_legacy_overlay_correction_if_needed(file_id, file)
             self.__notify_versioned_change(file, global_version, scope_version)
@@ -817,7 +880,7 @@ class Model:
                 self.__notify_legacy_overlay_correction_if_needed(file_id, None)
                 continue
             old_published = self.__published_files_by_id.get(file_id)
-            published = self.__refresh_published_file(file)
+            published = self.__refresh_published_file(file, caller="restore_active_progress_overlays")
             global_version, scope_version = self.__advance_version(file)
             self.__notify_legacy_overlay_correction_if_needed(file_id, file)
             self.__notify_versioned_change(file, global_version, scope_version)
@@ -844,7 +907,9 @@ class Model:
             self.__notify_legacy_overlay_correction_if_needed(file_id, None)
             return True
         old_published = self.__published_files_by_id.get(file_id)
-        published = self.__refresh_published_file(file)
+        published = self.__refresh_published_file(
+            file, caller="clear_active_progress_overlay_if_job_identity_matches",
+        )
         global_version, scope_version = self.__advance_version(file)
         self.__notify_legacy_overlay_correction_if_needed(file_id, file)
         self.__notify_versioned_change(file, global_version, scope_version)
@@ -875,7 +940,7 @@ class Model:
         for file_id in sorted(changed):
             file = self.__files_by_id[file_id]
             old_published = self.__published_files_by_id.get(file_id)
-            published = self.__refresh_published_file(file)
+            published = self.__refresh_published_file(file, caller="replace_active_progress_overlays")
             global_version, scope_version = self.__advance_version(file)
             self.__notify_legacy_overlay_correction_if_needed(file_id, file)
             self.__notify_versioned_change(file, global_version, scope_version)
@@ -986,7 +1051,7 @@ class Model:
                 self.__notify_legacy_overlay_correction_if_needed(file_id, None)
                 continue
             old_published = self.__published_files_by_id.get(file_id)
-            published = self.__refresh_published_file(file)
+            published = self.__refresh_published_file(file, caller="publish_active_lftp_root_counters")
             global_version, scope_version = self.__advance_version(file)
             self.__notify_legacy_overlay_correction_if_needed(file_id, file)
             self.__notify_versioned_change(file, global_version, scope_version)
@@ -1046,7 +1111,7 @@ class Model:
             self.__file_ids_by_name[file.name] = set()
         self.__file_ids_by_name[file.name].add(file_id)
         published = self.__refresh_published_file(
-            self.__files_by_id[file_id], structural_job_identity,
+            self.__files_by_id[file_id], structural_job_identity, caller="add_file",
         )
         with self.__listeners_lock:
             listeners = list(self.__listeners)
@@ -1076,7 +1141,9 @@ class Model:
         self.clear_active_progress_overlays()
         file_id = self.__resolve_file_id(filename)
         file = self.__files_by_id[file_id]
-        published = self.__published_files_by_id.get(file_id) or self.__refresh_published_file(file)
+        published = self.__published_files_by_id.get(file_id) or self.__refresh_published_file(
+            file, caller="remove_file",
+        )
         legacy_published = self.__full_effective_file(file)
         self.logger.debug("LftpModel: Removing file '{}'".format(self.__format_file_for_log(file)))
         del self.__files_by_id[file_id]
@@ -1125,11 +1192,15 @@ class Model:
         if file_id not in self.__files_by_id:
             raise ModelError("File does not exist in the model")
         old_file = self.__files_by_id[file_id]
-        old_published = self.__published_files_by_id.get(file_id) or self.__refresh_published_file(old_file)
+        old_published = self.__published_files_by_id.get(file_id) or self.__refresh_published_file(
+            old_file, caller="update_file_previous",
+        )
         legacy_old_published = self.__full_effective_file(old_file)
         new_file = file
         self.__files_by_id[file_id] = new_file
-        new_published = self.__refresh_published_file(new_file, structural_job_identity)
+        new_published = self.__refresh_published_file(
+            new_file, structural_job_identity, caller="update_file_candidate",
+        )
         legacy_new_published = self.__full_effective_file(new_file)
         global_version, scope_version = self.__advance_version(new_file)
         with self.__listeners_lock:
