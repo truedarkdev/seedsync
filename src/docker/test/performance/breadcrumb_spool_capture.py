@@ -147,6 +147,14 @@ _MODEL_PROGRESS_LINEAGE_DURATION_BUCKETS = frozenset({
 _MODEL_PROGRESS_LINEAGE_MISSING_PHASES = frozenset({
     "none", "status_consume", "model_mutation", "updater_decision", "multiple",
 })
+_MODEL_INPUT_ARBITRATION_SCHEMA = "model_input_arbitration.v1"
+_MODEL_INPUT_ARBITRATION_PHASES = frozenset({"summary", "root_fill", "remote_leaf_fill"})
+_MODEL_INPUT_ARBITRATION_SUBJECTS = frozenset({"summary", "root", "remote_leaf"})
+_MODEL_INPUT_ARBITRATION_SCOPES = frozenset({"root"})
+_MODEL_INPUT_ARBITRATION_SELECTIONS = frozenset({"absent", "local", "active", "split", "unknown"})
+_MODEL_INPUT_ARBITRATION_STATES = frozenset({"queued", "downloading", "default", "downloaded", "move_failed"})
+_OPAQUE_TOKEN = re.compile(r"^[0-9a-f]{16}$")
+_INPUT_ARBITRATION_BUILD_TOKEN = re.compile(r"^input-arbitration:([0-9a-f]{16})$")
 _QUEUE_LIFECYCLE_BOOLS = frozenset({
     "fresh", "healthy", "process_alive_before", "process_alive_after", "process_alive",
     "pre_send_drain_queue_done", "pre_send_drain_job_or_progress", "pre_send_drain_prompt_or_echo",
@@ -426,6 +434,101 @@ def _model_progress_lineage_facts(details: Mapping[str, object]) -> dict[str, ob
     return result
 
 
+def _input_arbitration_facts(row: Mapping[str, object], metadata: Mapping[str, object],
+                             details: Mapping[str, object]) -> dict[str, object] | None:
+    """Project the producer's capped, finalized input-arbitration envelope."""
+    if details.get("schema") != _MODEL_INPUT_ARBITRATION_SCHEMA:
+        return None
+
+    def fixed(key: str, allowed: frozenset[str]) -> str:
+        value = details.get(key)
+        return value if isinstance(value, str) and value in allowed else "unknown"
+
+    def opaque(key: str) -> str:
+        value = details.get(key)
+        return value if isinstance(value, str) and _OPAQUE_TOKEN.fullmatch(value) else "unknown"
+
+    def integer(key: str) -> int | None | str:
+        if key not in details:
+            return "unknown"
+        value = details[key]
+        if value is None:
+            return None
+        return value if type(value) is int and 0 <= value <= 2**63 - 1 else "unknown"
+
+    def boolean(key: str) -> bool | None | str:
+        if key not in details:
+            return "unknown"
+        value = details[key]
+        if value is None:
+            return None
+        return value if type(value) is bool else "unknown"
+
+    corr_id = row.get("corr_id", metadata.get("corr_id"))
+    flow_id = row.get("flow_id", metadata.get("flow_id"))
+    trace_scope = row.get("trace_scope", metadata.get("trace_scope"))
+    match = _INPUT_ARBITRATION_BUILD_TOKEN.fullmatch(corr_id) if isinstance(corr_id, str) else None
+    build_token = match.group(1) if match and flow_id == corr_id and trace_scope == "flow" else "unknown"
+
+    result: dict[str, object] = {
+        "schema": _MODEL_INPUT_ARBITRATION_SCHEMA,
+        "phase": fixed("phase", _MODEL_INPUT_ARBITRATION_PHASES),
+        "subject_kind": fixed("subject_kind", _MODEL_INPUT_ARBITRATION_SUBJECTS),
+        "build_token": build_token,
+        "root_id": opaque("root_id"),
+        "subject_id": opaque("subject_id"),
+        "input_scope": fixed("input_scope", _MODEL_INPUT_ARBITRATION_SCOPES),
+        "selection": fixed("selection", _MODEL_INPUT_ARBITRATION_SELECTIONS),
+    }
+    for key in ("root_rows_sampled", "root_rows_omitted", "remote_leaf_rows_sampled", "remote_leaf_rows_omitted"):
+        value = integer(key)
+        result[key] = value
+    for key in ("local_proof_generation", "local_input_size", "active_input_size", "remote_input_size",
+                "filled_local_size", "filled_remote_size", "filled_transferred_size"):
+        result[key] = integer(key)
+    for key in ("local_proof_generation_known", "active_generation_known", "local_input_present",
+                "local_input_is_staging", "active_input_present", "active_input_is_staging",
+                "remote_input_present", "remote_input_is_dir", "filled_local_present", "filled_remote_present",
+                "filled_remote_transferable"):
+        result[key] = boolean(key)
+    state = details.get("filled_state")
+    result["filled_state"] = state if isinstance(state, str) and state in _MODEL_INPUT_ARBITRATION_STATES else "unknown"
+    return result
+
+
+def select_input_arbitration_rows(records: object, root_id: object) -> dict[str, object]:
+    """Select app-emitted root rows and their same-build leaf/summary rows.
+
+    ``root_id`` must be the opaque token read from a finalized app record.  An
+    empty result is deliberately ``unknown``: it cannot prove the root was
+    absent from an incomplete or lossy capture.
+    """
+    if not isinstance(root_id, str) or not _OPAQUE_TOKEN.fullmatch(root_id) or not isinstance(records, list):
+        return {"state": "unknown", "build_tokens": [], "records": []}
+    token_rows: set[str] = set()
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        facts = record.get("input_arbitration")
+        if not isinstance(facts, Mapping) or facts.get("root_id") != root_id:
+            continue
+        token = facts.get("build_token")
+        if isinstance(token, str) and _OPAQUE_TOKEN.fullmatch(token):
+            token_rows.add(token)
+    if not token_rows:
+        return {"state": "unknown", "build_tokens": [], "records": []}
+    selected = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        facts = record.get("input_arbitration")
+        if not isinstance(facts, Mapping) or facts.get("build_token") not in token_rows:
+            continue
+        if facts.get("root_id") == root_id or facts.get("subject_kind") == "summary":
+            selected.append(record)
+    return {"state": "selected", "build_tokens": sorted(token_rows), "records": selected}
+
+
 def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bool]:
     metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
     details = row.get("details") if isinstance(row.get("details"), Mapping) else {}
@@ -444,11 +547,16 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     readiness = _queue_readiness_facts(row.get("message"), details) if category == "queue.readiness" else None
     model_page_snapshot = _model_page_snapshot_facts(details) if category == "model_page_snapshot" else None
     model_progress_lineage = _model_progress_lineage_facts(details) if category == "model.progress" else None
+    input_arbitration = _input_arbitration_facts(row, metadata, details)
     if category == "queue.readiness" and readiness is None:
         return None, True
     if category == "model_page_snapshot" and model_page_snapshot is None:
         return None, True
     if details.get("schema") == _MODEL_PROGRESS_LINEAGE_SCHEMA and model_progress_lineage is None:
+        return None, True
+    if details.get("schema") == _MODEL_INPUT_ARBITRATION_SCHEMA and (
+        category != "scan.authority" or row.get("message", metadata.get("message")) != "input_arbitration_witness"
+    ):
         return None, True
     lifecycle_event = lifecycle.get("event") if lifecycle else None
     if event_type == "completion" or stage == "terminal" or lifecycle_event in {"queue_retired", "operation_retired"} or details.get("final") is True or details.get("completed") is True:
@@ -480,6 +588,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["model_page_snapshot"] = model_page_snapshot
     if model_progress_lineage is not None:
         result["model_progress_lineage"] = model_progress_lineage
+    if input_arbitration is not None:
+        result["input_arbitration"] = input_arbitration
     return result, False
 
 

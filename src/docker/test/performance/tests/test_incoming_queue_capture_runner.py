@@ -167,11 +167,23 @@ def test_passive_get_is_whitelisted_and_persists_wire_times_without_secrets(monk
     started = next(item for item in records if item["event"] == "capture_started")
     terminal = next(item for item in records if item["event"] == "terminal")
     leaf = next(item for item in records if item["event"] == "leaf_receipt")
-    assert records.index(started) < records.index(leaf)
+    assert records.index(leaf) < records.index(started)
     assert terminal["capture_start_utc_ms"] == started["capture_start_utc_ms"]
     assert terminal["capture_start_monotonic_ms"] == started["capture_start_monotonic_ms"]
     assert terminal["capture_end_utc_ms"] >= terminal["capture_start_utc_ms"]
     assert terminal["capture_end_monotonic_ms"] >= terminal["capture_start_monotonic_ms"]
+    start_mono = terminal["capture_start_monotonic_ms"]
+    end_mono = terminal["capture_end_monotonic_ms"]
+    invocations = [item for item in records if item["event"] == "model_get_invoked"
+                   and start_mono <= item["invocation_monotonic_ms"] <= end_mono]
+    responses = [item for item in records if item["event"] == "model_get_response"
+                 and start_mono <= item["response_monotonic_ms"] <= end_mono]
+    assert any(
+        response["response_monotonic_ms"] >= invoked["invocation_monotonic_ms"]
+        and response["selector_hash"] == invoked["selector_hash"]
+        and response["leaf_hash"] == invoked["leaf_hash"]
+        for invoked in invocations for response in responses
+    ), "no selected-model GET was proven inside the armed capture interval"
     text = config.artifact_path.read_text(encoding="utf-8")
     assert "private-credential" not in text and "pair-1" not in text and "leaf-1" not in text
     assert not any("POST" in item for item in calls)
@@ -403,10 +415,11 @@ def test_failure_after_sink_creation_writes_fixed_terminal_without_raw_error(mon
     assert terminal["phase"] == "finished"
     assert terminal["completion_proven"] is False
     records = _trace(config.artifact_path)
-    started = next(item for item in records if item["event"] == "capture_started")
-    assert terminal["capture_start_utc_ms"] == started["capture_start_utc_ms"]
-    assert terminal["capture_end_utc_ms"] >= terminal["capture_start_utc_ms"]
-    assert terminal["capture_end_monotonic_ms"] >= terminal["capture_start_monotonic_ms"]
+    assert not any(item["event"] == "capture_started" for item in records)
+    assert terminal["capture_start_utc_ms"] is None
+    assert terminal["capture_start_monotonic_ms"] is None
+    assert terminal["capture_end_utc_ms"] > 0
+    assert terminal["capture_end_monotonic_ms"] > 0
 
 
 def test_config_digest_is_immutable_during_passive_window(monkeypatch, tmp_path):

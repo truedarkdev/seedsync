@@ -123,6 +123,53 @@ def test_observer_allowlists_response_and_scan_authority_enums():
     assert "private-value" not in str(evidence)
 
 
+def test_input_arbitration_projection_is_finite_and_preserves_unknowns(tmp_path):
+    projection = {
+        "kind": "event", "source": "model_builder", "category": "scan.authority",
+        "event_type": "info", "stage": "model_build", "level": "info", "numbers": {},
+        "input_arbitration": {
+            "schema": "model_input_arbitration.v1", "phase": "root_fill", "subject_kind": "root",
+            "build_token": "0123456789abcdef", "root_id": "fedcba9876543210",
+            "subject_id": "fedcba9876543210", "input_scope": "root", "selection": "active",
+            "root_rows_sampled": 2, "root_rows_omitted": 0,
+            "remote_leaf_rows_sampled": 1, "remote_leaf_rows_omitted": 0,
+            "local_proof_generation": None, "local_input_size": 0, "active_input_size": 5,
+            "remote_input_size": 8, "filled_local_size": 0, "filled_remote_size": 8,
+            "filled_transferred_size": None, "local_proof_generation_known": False,
+            "active_generation_known": True, "local_input_present": True, "local_input_is_staging": False,
+            "active_input_present": True, "active_input_is_staging": False, "remote_input_present": True,
+            "remote_input_is_dir": True, "filled_local_present": True, "filled_remote_present": True,
+            "filled_remote_transferable": "unknown", "filled_state": "unknown",
+            "private_path": "/private/should-not-survive",
+        },
+    }
+    sink = observer.JsonArtifactSink(tmp_path / "input-arbitration.jsonl")
+    sink.persist({
+        "schema": "incoming-recovery-observer-sample.v1", "event": "capture", "outcome": "success",
+        "capture": {"state": "record", "source": "controller", "projection": projection},
+    })
+    record = json.loads((tmp_path / "input-arbitration.jsonl").read_text(encoding="utf-8"))
+    safe = record["capture"]["projection"]["input_arbitration"]
+    assert safe["build_token"] == "0123456789abcdef"
+    assert safe["root_id"] == safe["subject_id"] == "fedcba9876543210"
+    assert safe["local_input_size"] == 0 and safe["local_proof_generation"] is None
+    assert safe["filled_remote_transferable"] == safe["filled_state"] == "unknown"
+    assert "private_path" not in safe
+
+    malformed = dict(projection)
+    malformed["input_arbitration"] = {
+        **projection["input_arbitration"],
+        "root_id": "/private/path", "build_token": "not-an-app-token",
+        "local_input_size": True, "remote_input_present": 1,
+        "filled_state": {"private": "value"},
+    }
+    bounded = observer._sanitize_capture_projection(malformed)["input_arbitration"]
+    assert bounded["root_id"] == bounded["build_token"] == "unknown"
+    assert bounded["local_input_size"] == bounded["remote_input_present"] == "unknown"
+    assert bounded["filled_state"] == "unknown"
+    assert observer._sanitize_capture_projection({**projection, "input_arbitration": {"schema": "wrong"}}).get("input_arbitration") is None
+
+
 def test_pending_transfer_gate_requires_exact_local_paths_and_safe_lifecycle_before_queue():
     gate = observer.QueueGate(
         PAIR, "Pr0n", ROOT, "Incoming",

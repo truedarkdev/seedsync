@@ -347,13 +347,8 @@ class Runner:
         self._platform_preflight()
         self._assert_config_unchanged()
         self.sink = JsonArtifactSink(self.config.artifact_path)
-        capture_start_utc_ms = time.time_ns() // 1_000_000
-        capture_start_monotonic_ms = time.monotonic_ns() // 1_000_000
-        self._event(
-            "capture_started", phase="capture",
-            capture_start_utc_ms=capture_start_utc_ms,
-            capture_start_monotonic_ms=capture_start_monotonic_ms,
-        )
+        capture_start_utc_ms: int | None = None
+        capture_start_monotonic_ms: int | None = None
         reader: BreadcrumbSpoolCapture | None = None
         physical: dict[str, object] = {"outcome": "not_observed"}
         model_outcome = "not_observed"
@@ -456,6 +451,13 @@ class Runner:
             # H0/H1 are established before the passive window begins. Any
             # bytes already present are intentionally pre-arm history.
             reader.start()
+            capture_start_utc_ms = time.time_ns() // 1_000_000
+            capture_start_monotonic_ms = time.monotonic_ns() // 1_000_000
+            self._event(
+                "capture_started", phase="capture",
+                capture_start_utc_ms=capture_start_utc_ms,
+                capture_start_monotonic_ms=capture_start_monotonic_ms,
+            )
             reader.poll()
             reader_outcome = "healthy"
             deadline = time.monotonic() + PASSIVE_WINDOW_SECONDS

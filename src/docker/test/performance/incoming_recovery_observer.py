@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -522,6 +523,68 @@ _CAPTURE_COMMAND_PHASES = {"submitted", "prompt_ready", "prompt_timeout", "proce
 _CAPTURE_COMMAND_OUTPUTS = {"empty", "connecting", "backend_error", "other"}
 _CAPTURE_COMMAND_COUNT_BUCKETS = {"0", "1", "2-4", "5-16", "17-64", "65-256", "257+", "unknown"}
 _CAPTURE_COMMAND_BYTE_BUCKETS = {"0", "1-127", "128-511", "512-2047", "2048-8191", "8192-32767", "32768+", "unknown"}
+_CAPTURE_INPUT_ARBITRATION_SCHEMA = "model_input_arbitration.v1"
+_CAPTURE_INPUT_ARBITRATION_PHASES = {"summary", "root_fill", "remote_leaf_fill"}
+_CAPTURE_INPUT_ARBITRATION_SUBJECTS = {"summary", "root", "remote_leaf"}
+_CAPTURE_INPUT_ARBITRATION_SCOPES = {"root"}
+_CAPTURE_INPUT_ARBITRATION_SELECTIONS = {"absent", "local", "active", "split", "unknown"}
+_CAPTURE_INPUT_ARBITRATION_STATES = {"queued", "downloading", "default", "downloaded", "move_failed", "unknown"}
+_CAPTURE_INPUT_ARBITRATION_OPAQUE = re.compile(r"^[0-9a-f]{16}$")
+
+
+def _sanitize_input_arbitration(value: Mapping[str, object]) -> Mapping[str, object] | None:
+    if value.get("schema") != _CAPTURE_INPUT_ARBITRATION_SCHEMA:
+        return None
+
+    def fixed(key: str, allowed: set[str]) -> str:
+        item = value.get(key)
+        return item if isinstance(item, str) and item in allowed else "unknown"
+
+    def opaque(key: str) -> str:
+        item = value.get(key)
+        return item if isinstance(item, str) and _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(item) else "unknown"
+
+    def integer(key: str) -> int | None | str:
+        if key not in value:
+            return "unknown"
+        item = value[key]
+        if item is None:
+            return None
+        return item if type(item) is int and 0 <= item <= 2**63 - 1 else "unknown"
+
+    def boolean(key: str) -> bool | None | str:
+        if key not in value:
+            return "unknown"
+        item = value[key]
+        if item is None:
+            return None
+        return item if type(item) is bool else "unknown"
+
+    result: dict[str, object] = {
+        "schema": _CAPTURE_INPUT_ARBITRATION_SCHEMA,
+        "phase": fixed("phase", _CAPTURE_INPUT_ARBITRATION_PHASES),
+        "subject_kind": fixed("subject_kind", _CAPTURE_INPUT_ARBITRATION_SUBJECTS),
+        "build_token": opaque("build_token"),
+        "root_id": opaque("root_id"),
+        "subject_id": opaque("subject_id"),
+        "input_scope": fixed("input_scope", _CAPTURE_INPUT_ARBITRATION_SCOPES),
+        "selection": fixed("selection", _CAPTURE_INPUT_ARBITRATION_SELECTIONS),
+    }
+    for key in (
+        "root_rows_sampled", "root_rows_omitted", "remote_leaf_rows_sampled", "remote_leaf_rows_omitted",
+        "local_proof_generation", "local_input_size", "active_input_size", "remote_input_size",
+        "filled_local_size", "filled_remote_size", "filled_transferred_size",
+    ):
+        result[key] = integer(key)
+    for key in (
+        "local_proof_generation_known", "active_generation_known", "local_input_present", "local_input_is_staging",
+        "active_input_present", "active_input_is_staging", "remote_input_present", "remote_input_is_dir",
+        "filled_local_present", "filled_remote_present", "filled_remote_transferable",
+    ):
+        result[key] = boolean(key)
+    state = value.get("filled_state")
+    result["filled_state"] = state if isinstance(state, str) and state in _CAPTURE_INPUT_ARBITRATION_STATES else "unknown"
+    return result
 
 
 def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
@@ -630,6 +693,11 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
         safe_lineage = _sanitize_progress_lineage(lineage)
         if safe_lineage is not None:
             result["model_progress_lineage"] = safe_lineage
+    input_arbitration = value.get("input_arbitration")
+    if isinstance(input_arbitration, Mapping):
+        safe_input_arbitration = _sanitize_input_arbitration(input_arbitration)
+        if safe_input_arbitration is not None:
+            result["input_arbitration"] = safe_input_arbitration
     return result
 
 

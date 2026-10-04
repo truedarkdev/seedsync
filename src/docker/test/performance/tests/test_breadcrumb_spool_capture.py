@@ -32,8 +32,12 @@ for _common_root in _COMMON_ROOTS:
         break
 try:
     from common.breadcrumb_trace import BreadcrumbTraceCollector
+    from system import SystemFile
+    from controller import ModelBuilder
 except ImportError:
     BreadcrumbTraceCollector = None
+    SystemFile = None
+    ModelBuilder = None
 
 
 def _health(path: Path, *, session: str = "session-1", lost: int = 0, rotation_count: int = 0) -> None:
@@ -577,6 +581,111 @@ def test_collector_durable_flat_envelope_reaches_reader_projection(tmp_path: Pat
     projections = [item["capture"]["projection"] for item in _artifacts(artifact) if item["capture"].get("state") == "record"]
     assert any(item.get("queue_readiness", {}).get("event") == "queue_callback" for item in projections)
     assert any(item.get("model_page_snapshot", {}).get("outcome") == "success" for item in projections)
+
+
+@pytest.mark.skipif(BreadcrumbTraceCollector is None or ModelBuilder is None, reason="production model builder is unavailable")
+def test_finalized_input_arbitration_selects_actual_root_builds_and_summaries(tmp_path: Path) -> None:
+    spool = tmp_path / "input-arbitration-spool"
+    spool.mkdir()
+    artifact = tmp_path / "input-arbitration-capture.jsonl"
+    collector = BreadcrumbTraceCollector(
+        lambda: True, max_entries=128,
+        policy={"default": "off", "rules": {"scan.authority": "info"}},
+        durable_enabled=True, durable_path=str(spool),
+    )
+    reader = _reader(spool, artifact)
+    builder = ModelBuilder()
+    remote = SystemFile("private-root-label", 100, True)
+    remote.add_child(SystemFile("private-leaf-label.bin", 100, False))
+    local = SystemFile("private-root-label", 40, True)
+    local.add_child(SystemFile("private-leaf-label.bin", 40, False))
+    builder.set_remote_files([remote])
+    builder.set_local_files([local])
+    builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+    try:
+        assert collector.record(
+            "controller", "baseline", {"schema": "input_arbitration_test_baseline.v1"},
+            category="scan.authority", level="info",
+        ) in {"retained", "enqueued"}
+        assert collector.flush_durable(2.0)
+        reader.start()
+        first_model = builder.build_model()
+        active = SystemFile("private-root-label", 100, True)
+        active.add_child(SystemFile("private-leaf-label.bin", 100, False))
+        builder.set_active_files([active])
+        second_model = builder.build_model()
+        assert first_model is not second_model
+        assert collector.flush_durable(2.0)
+        assert reader.poll() == 6
+    finally:
+        reader.close()
+        collector.close(timeout=2.0)
+
+    durable = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
+    finalized = [row for row in durable if row.get("message") == "input_arbitration_witness"]
+    assert len(finalized) == 6
+    assert all("metadata" not in row and row.get("trace_scope") == "flow" for row in finalized)
+    assert all(type(row.get("version")) is int for row in finalized)
+    assert len({row["version"] for row in finalized}) == 6
+    assert "private-root-label" not in json.dumps(finalized)
+    assert "private-leaf-label.bin" not in json.dumps(finalized)
+
+    projected = [
+        item["capture"]["projection"] for item in _artifacts(artifact)
+        if item["capture"].get("state") == "record"
+        and item["capture"].get("projection", {}).get("category") == "scan.authority"
+    ]
+    assert len(projected) == 6
+    roots = [item for item in projected if item["input_arbitration"]["phase"] == "root_fill"]
+    assert len(roots) == 2
+    root_token = roots[0]["input_arbitration"]["root_id"]
+    assert root_token != "unknown" and roots[1]["input_arbitration"]["root_id"] == root_token
+    selected = capture.select_input_arbitration_rows(projected, root_token)
+    assert selected["state"] == "selected"
+    assert len(selected["build_tokens"]) == 2
+    assert all(len(token) == 16 for token in selected["build_tokens"])
+    assert len(selected["records"]) == 6
+    for token in selected["build_tokens"]:
+        build_rows = [row for row in selected["records"] if row["input_arbitration"]["build_token"] == token]
+        assert {row["input_arbitration"]["phase"] for row in build_rows} == {
+            "root_fill", "remote_leaf_fill", "summary",
+        }
+        assert len({row["numbers"]["version"] for row in build_rows}) == 3
+        assert {row["input_arbitration"]["subject_kind"] for row in build_rows} == {
+            "root", "remote_leaf", "summary",
+        }
+    assert capture.select_input_arbitration_rows(projected, "0" * 16)["state"] == "unknown"
+
+    # The durable writer flattens metadata today; retain compatibility with a
+    # metadata-wrapped finalized envelope without copying arbitrary headers.
+    actual = finalized[0]
+    metadata_keys = ("source", "category", "event_type", "stage", "level", "corr_id", "flow_id", "trace_scope", "message")
+    wrapped = {
+        "metadata": {key: actual[key] for key in metadata_keys},
+        "details": actual["details"], "created_ms": actual["created_ms"],
+        "created_ns": actual["created_ns"], "version": actual["version"],
+        "private_header": "never-project",
+    }
+    wrapped_projection, irrelevant = capture._projection(wrapped)
+    assert not irrelevant and wrapped_projection is not None
+    facts = wrapped_projection["input_arbitration"]
+    assert facts["root_id"] == root_token
+    assert facts["build_token"] in selected["build_tokens"]
+    assert "private_header" not in json.dumps(wrapped_projection)
+
+    # The actual producer's 24-item detail cap omits these optional tail facts;
+    # missing stays unknown, while explicit null and malformed false-like data
+    # remain distinguishable.
+    capped = dict(actual["details"])
+    capped.pop("filled_state", None)
+    capped.pop("filled_remote_transferable", None)
+    capped["local_input_size"] = None
+    capped["local_input_present"] = 0
+    safe, irrelevant = capture._projection({**actual, "details": capped})
+    assert not irrelevant and safe is not None
+    facts = safe["input_arbitration"]
+    assert facts["filled_state"] == "unknown" and facts["filled_remote_transferable"] == "unknown"
+    assert facts["local_input_size"] is None and facts["local_input_present"] == "unknown"
 
 
 @pytest.mark.skipif(BreadcrumbTraceCollector is None, reason="production breadcrumb collector is unavailable")
