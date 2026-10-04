@@ -559,6 +559,18 @@ class _MoveMutationTracker:
         if self.outcome == _MoveMutationOutcome.NO_MUTATION:
             self.outcome = _MoveMutationOutcome.UNCERTAIN
 
+    def publication_diagnostics_enabled(self) -> bool:
+        """Check the publication gate before optional copy timing work."""
+        breadcrumb_trace = self.breadcrumb_trace
+        if breadcrumb_trace is None or not isinstance(self.file_id, str):
+            return False
+        try:
+            return _breadcrumb_effectively_enabled(
+                breadcrumb_trace, "final_move.publication", "info",
+            ) is True
+        except Exception:
+            return False
+
     def record_publication(
             self,
             phase: str,
@@ -571,6 +583,7 @@ class _MoveMutationTracker:
             destination_path: Optional[str] = None,
             temporary_created: Optional[bool] = None,
             residue_path: Optional[str] = None,
+            copy_metrics: Optional[dict[str, int]] = None,
     ) -> None:
         """Emit fixed-schema, identity-free final publication evidence."""
         breadcrumb_trace = self.breadcrumb_trace
@@ -603,6 +616,11 @@ class _MoveMutationTracker:
                 "destination_exists": probe(destination_path),
             }
             details.update({key: value for key, value in known_bools.items() if type(value) is bool})
+            if phase == "copy_complete" and isinstance(copy_metrics, dict):
+                for key in ("copy_bytes_ns", "temporary_fsync_ns", "metadata_copy_ns"):
+                    value = copy_metrics.get(key)
+                    if type(value) is int and 0 <= value <= 9_223_372_036_854_775_807:
+                        details[key] = value
             breadcrumb_trace.record(
                 "controller",
                 "final_move_publication",
@@ -8615,6 +8633,7 @@ class Controller:
         def record_copy_phase(
                 phase: str, operation: str, temporary_path: Optional[str],
                 residue_path: Optional[str] = None,
+                copy_metrics: Optional[dict[str, int]] = None,
         ) -> None:
             if mutation_tracker is not None:
                 mutation_tracker.record_publication(
@@ -8625,6 +8644,7 @@ class Controller:
                     destination_path=destination_path,
                     temporary_created=True,
                     residue_path=residue_path,
+                    copy_metrics=copy_metrics,
                 )
 
         source_stat = os.lstat(src)
@@ -8657,10 +8677,23 @@ class Controller:
                 os.unlink(temporary_path)
                 os.symlink(os.readlink(src), temporary_path)
             elif stat.S_ISREG(source_stat.st_mode):
-                cls.__copy_regular_file_to_temporary(src, temporary_path)
+                metrics_callback = None
+                if mutation_tracker is not None and mutation_tracker.publication_diagnostics_enabled():
+                    metrics_callback = lambda metrics: record_copy_phase(
+                        "copy_complete", "copy", temporary_path, copy_metrics=metrics,
+                    )
+                cls.__copy_regular_file_to_temporary(
+                    src, temporary_path,
+                    mutation_tracker=mutation_tracker,
+                    destination_path=destination_path,
+                    metrics_callback=metrics_callback,
+                )
+                if metrics_callback is None:
+                    record_copy_phase("copy_complete", "copy", temporary_path)
             else:
                 raise OSError(errno.ENOTSUP, "unsupported staging source type", src)
-            record_copy_phase("copy_complete", "copy", temporary_path)
+            if not stat.S_ISREG(source_stat.st_mode):
+                record_copy_phase("copy_complete", "copy", temporary_path)
         except BaseException:
             try:
                 os.unlink(temporary_path)
@@ -8670,11 +8703,73 @@ class Controller:
         return temporary_path, None
 
     @classmethod
-    def __copy_regular_file_to_temporary(cls, src: str, dst: str) -> str:
+    def __copy_regular_file_to_temporary(
+            cls, src: str, dst: str, *,
+            mutation_tracker: Optional[_MoveMutationTracker] = None,
+            destination_path: Optional[str] = None,
+            metrics_callback: Optional[Callable[[Optional[dict[str, int]]], None]] = None,
+    ) -> str:
         """Copy and flush private content before source permissions are copied."""
-        shutil.copyfile(src, dst, follow_symlinks=False)
-        cls.__sync_publish_temporary(dst)
-        shutil.copystat(src, dst, follow_symlinks=False)
+        if not callable(metrics_callback) or mutation_tracker is None or \
+                not mutation_tracker.publication_diagnostics_enabled():
+            shutil.copyfile(src, dst, follow_symlinks=False)
+            cls.__sync_publish_temporary(dst)
+            shutil.copystat(src, dst, follow_symlinks=False)
+            return dst
+
+        operations = (
+            ("copy", "copy_bytes_ns", lambda: shutil.copyfile(src, dst, follow_symlinks=False)),
+            ("sync", "temporary_fsync_ns", lambda: cls.__sync_publish_temporary(dst)),
+            ("metadata", "metadata_copy_ns", lambda: shutil.copystat(src, dst, follow_symlinks=False)),
+        )
+        metrics: dict[str, int] = {}
+        timing_enabled = True
+
+        def record_failure(operation: str, error: BaseException) -> None:
+            if mutation_tracker is None:
+                return
+            try:
+                mutation_tracker.record_publication(
+                    "copy_failure", operation, "temporary", error,
+                    source_path=src, temporary_path=dst,
+                    destination_parent_path=os.path.dirname(dst),
+                    destination_path=destination_path, temporary_created=True,
+                )
+            except Exception:
+                pass
+
+        for operation, metric_name, action in operations:
+            started_ns = None
+            if timing_enabled:
+                try:
+                    started_ns = time.perf_counter_ns()
+                except Exception:
+                    timing_enabled = False
+                    metrics.clear()
+            try:
+                action()
+            except BaseException as error:
+                record_failure(operation, error)
+                raise
+            if started_ns is None:
+                continue
+            try:
+                elapsed_ns = time.perf_counter_ns() - started_ns
+            except Exception:
+                timing_enabled = False
+                metrics.clear()
+                started_ns = None
+            if started_ns is not None and type(elapsed_ns) is int and \
+                    0 <= elapsed_ns <= 9_223_372_036_854_775_807:
+                metrics[metric_name] = elapsed_ns
+            elif started_ns is not None:
+                timing_enabled = False
+                metrics.clear()
+        if callable(metrics_callback):
+            try:
+                metrics_callback(metrics if timing_enabled and len(metrics) == 3 else None)
+            except Exception:
+                pass
         return dst
 
     @staticmethod

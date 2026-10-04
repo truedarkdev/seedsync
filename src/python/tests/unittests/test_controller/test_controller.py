@@ -20418,6 +20418,229 @@ class TestController(unittest.TestCase):
             self.assertEqual(b"payload", Path(destination).read_bytes())
             self.assertEqual(stat.S_IRUSR, stat.S_IMODE(os.lstat(destination).st_mode) & stat.S_IRUSR)
 
+    def test_regular_file_copy_publication_records_bounded_phase_durations(self):
+        name = "copy-metrics.bin"
+        with tempfile.TemporaryDirectory() as root:
+            spool = os.path.join(root, "breadcrumbs")
+            trace = BreadcrumbTraceCollector(
+                lambda: True, max_entries=16, durable_enabled=True, durable_path=spool,
+            )
+            trace.sync_enabled_state()
+            source = os.path.join(root, "staging", name)
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, name)
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"private-payload")
+            tracker = _MoveMutationTracker(name, trace)
+            with patch.object(
+                    Controller, "_Controller__rename_no_replace",
+                    side_effect=OSError(errno.EINVAL, "unsupported")):
+                Controller._Controller__publish_staging_no_replace(source, destination, tracker)
+
+            entries = trace.query_events(
+                category="final_move.publication", order="asc",
+            )["events"]
+            copies = [entry for entry in entries if entry["details"]["phase"] == "copy_complete"]
+            self.assertEqual(1, len(copies))
+            details = copies[0]["details"]
+            for key in ("copy_bytes_ns", "temporary_fsync_ns", "metadata_copy_ns"):
+                self.assertIs(type(details[key]), int)
+                self.assertGreaterEqual(details[key], 0)
+            self.assertEqual(opaque_trace_correlation(name), copies[0]["corr_id"])
+            self.assertNotIn(name, json.dumps(entries))
+            self.assertNotIn(source, json.dumps(entries))
+            self.assertNotIn(destination, json.dumps(entries))
+            self.assertEqual(b"private-payload", Path(destination).read_bytes())
+            self.assertFalse(os.path.exists(source))
+            self.assertTrue(trace.flush_durable(2.0))
+            trace.close(2.0)
+            with open(os.path.join(spool, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                durable = [json.loads(line) for line in handle if line.strip()]
+            finalized = [entry for entry in durable if entry.get("details", {}).get("phase") == "copy_complete"]
+            self.assertEqual(1, len(finalized))
+            self.assertEqual("final_move.publication", finalized[0]["category"])
+            self.assertEqual("final_move_publication", finalized[0]["stage"])
+            self.assertEqual(copies[0]["corr_id"], finalized[0]["corr_id"])
+            self.assertEqual(details, finalized[0]["details"])
+            artifact_path = os.environ.get("SEEDSYNC_COPY_TIMING_FINALIZED_ROWS_PATH")
+            if artifact_path:
+                with open(artifact_path, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(finalized[0], sort_keys=True) + "\n")
+
+    def test_regular_file_copy_failures_are_classified_and_diagnostics_fail_open(self):
+        for operation, error_number, target in (
+                ("copy", errno.ENOSPC, "controller.controller.shutil.copyfile"),
+                ("sync", errno.EIO, "controller.controller.Controller._Controller__sync_publish_temporary"),
+                ("metadata", errno.EACCES, "controller.controller.shutil.copystat")):
+            with self.subTest(operation=operation):
+                with tempfile.TemporaryDirectory() as root:
+                    spool = os.path.join(root, "breadcrumbs")
+                    trace = BreadcrumbTraceCollector(
+                        lambda: True, max_entries=16, durable_enabled=True, durable_path=spool,
+                    )
+                    source = os.path.join(root, "staging", "sample.bin")
+                    parent = os.path.join(root, "final")
+                    destination = os.path.join(parent, "sample.bin")
+                    os.makedirs(os.path.dirname(source)); os.mkdir(parent)
+                    Path(source).write_bytes(b"payload")
+                    tracker = _MoveMutationTracker("sample.bin", trace)
+                    target_patch = patch(target, side_effect=OSError(error_number, "private detail"))
+                    with patch.object(
+                            Controller, "_Controller__rename_no_replace",
+                            side_effect=OSError(errno.EINVAL, "unsupported")), target_patch:
+                        with self.assertRaises(OSError):
+                            Controller._Controller__publish_staging_no_replace(source, destination, tracker)
+                    failures = [entry for entry in trace.snapshot()["entries"]
+                                if entry["details"]["phase"] == "copy_failure"]
+                    self.assertEqual(1, len(failures))
+                    self.assertEqual(operation, failures[0]["details"]["operation"])
+                    self.assertEqual(b"payload", Path(source).read_bytes())
+                    self.assertNotIn("private detail", json.dumps(failures))
+                    self.assertTrue(trace.flush_durable(2.0))
+                    trace.close(2.0)
+                    with open(os.path.join(spool, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                        durable = [json.loads(line) for line in handle if line.strip()]
+                    finalized_failures = [
+                        entry for entry in durable
+                        if entry.get("details", {}).get("phase") == "copy_failure"
+                    ]
+                    self.assertEqual(1, len(finalized_failures))
+                    finalized = finalized_failures[0]
+                    self.assertEqual("final_move.publication", finalized["category"])
+                    self.assertEqual("final_move_publication", finalized["stage"])
+                    self.assertEqual(failures[0]["corr_id"], finalized["corr_id"])
+                    self.assertEqual(failures[0]["details"], finalized["details"])
+                    self.assertEqual({errno.ENOSPC: "enospc", errno.EIO: "eio",
+                                      errno.EACCES: "permission"}[error_number],
+                                     finalized["details"]["errno_class"])
+                    serialized = json.dumps(finalized)
+                    self.assertNotIn("private detail", serialized)
+                    self.assertNotIn(source, serialized)
+                    self.assertNotIn(destination, serialized)
+                    artifact_path = os.environ.get("SEEDSYNC_COPY_TIMING_FINALIZED_ROWS_PATH")
+                    if artifact_path:
+                        with open(artifact_path, "a", encoding="utf-8") as handle:
+                            handle.write(json.dumps(finalized, sort_keys=True) + "\n")
+
+        disabled = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "info", "rules": {"final_move.publication": "off"}},
+        )
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "sample.bin")
+            parent = os.path.join(root, "final")
+            destination = os.path.join(parent, "sample.bin")
+            os.makedirs(os.path.dirname(source)); os.mkdir(parent)
+            Path(source).write_bytes(b"payload")
+            with patch("controller.controller.time.perf_counter_ns",
+                       side_effect=AssertionError("disabled copy measured")) as clock, \
+                    patch.object(Controller, "_Controller__rename_no_replace",
+                                 side_effect=OSError(errno.EINVAL, "unsupported")):
+                Controller._Controller__publish_staging_no_replace(
+                    source, destination, _MoveMutationTracker("sample.bin", disabled),
+                )
+            clock.assert_not_called()
+            self.assertEqual(b"payload", Path(destination).read_bytes())
+            self.assertEqual([], disabled.snapshot()["entries"])
+        disabled.close()
+
+        gate = SimpleNamespace(is_effectively_enabled=MagicMock(side_effect=RuntimeError("gate")))
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "sample.bin")
+            parent = os.path.join(root, "final")
+            destination = os.path.join(parent, "sample.bin")
+            os.makedirs(os.path.dirname(source)); os.mkdir(parent)
+            Path(source).write_bytes(b"payload")
+            with patch("controller.controller.time.perf_counter_ns",
+                       side_effect=AssertionError("failed gate reached clock")) as clock, \
+                    patch.object(Controller, "_Controller__rename_no_replace",
+                                 side_effect=OSError(errno.EINVAL, "unsupported")):
+                Controller._Controller__publish_staging_no_replace(
+                    source, destination, _MoveMutationTracker("sample.bin", gate),
+                )
+            clock.assert_not_called()
+            self.assertEqual(b"payload", Path(destination).read_bytes())
+
+        clock_failure = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "sample.bin")
+            parent = os.path.join(root, "final")
+            destination = os.path.join(parent, "sample.bin")
+            os.makedirs(os.path.dirname(source)); os.mkdir(parent)
+            Path(source).write_bytes(b"payload")
+            with patch("controller.controller.time.perf_counter_ns",
+                       side_effect=RuntimeError("clock")), \
+                    patch.object(Controller, "_Controller__rename_no_replace",
+                                 side_effect=OSError(errno.EINVAL, "unsupported")):
+                Controller._Controller__publish_staging_no_replace(
+                    source, destination, _MoveMutationTracker("sample.bin", clock_failure),
+                )
+            self.assertEqual(b"payload", Path(destination).read_bytes())
+            clock_events = clock_failure.snapshot()["entries"]
+            copy_complete = next(
+                entry for entry in clock_events if entry["details"]["phase"] == "copy_complete"
+            )
+            self.assertFalse({"copy_bytes_ns", "temporary_fsync_ns", "metadata_copy_ns"} &
+                             set(copy_complete["details"]))
+        clock_failure.close()
+
+        bounded_clock = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "sample.bin")
+            parent = os.path.join(root, "final")
+            destination = os.path.join(parent, "sample.bin")
+            os.makedirs(os.path.dirname(source)); os.mkdir(parent)
+            Path(source).write_bytes(b"payload")
+            with patch("controller.controller.time.perf_counter_ns",
+                       side_effect=[0, 9_223_372_036_854_775_808]), \
+                    patch.object(Controller, "_Controller__rename_no_replace",
+                                 side_effect=OSError(errno.EINVAL, "unsupported")):
+                Controller._Controller__publish_staging_no_replace(
+                    source, destination, _MoveMutationTracker("sample.bin", bounded_clock),
+                )
+            bounded_event = next(
+                entry for entry in bounded_clock.snapshot()["entries"]
+                if entry["details"]["phase"] == "copy_complete"
+            )
+            self.assertFalse({"copy_bytes_ns", "temporary_fsync_ns", "metadata_copy_ns"} &
+                             set(bounded_event["details"]))
+            self.assertEqual(b"payload", Path(destination).read_bytes())
+        bounded_clock.close()
+
+        sink_failure = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "sample.bin")
+            parent = os.path.join(root, "final")
+            destination = os.path.join(parent, "sample.bin")
+            os.makedirs(os.path.dirname(source)); os.mkdir(parent)
+            Path(source).write_bytes(b"payload")
+            with patch.object(sink_failure, "record", side_effect=RuntimeError("sink")), \
+                    patch.object(Controller, "_Controller__rename_no_replace",
+                                 side_effect=OSError(errno.EINVAL, "unsupported")):
+                Controller._Controller__publish_staging_no_replace(
+                    source, destination, _MoveMutationTracker("sample.bin", sink_failure),
+                )
+            self.assertEqual(b"payload", Path(destination).read_bytes())
+        sink_failure.close()
+
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "source.bin")
+            destination = os.path.join(root, "copy.bin")
+            Path(source).write_bytes(b"payload")
+            callback_trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+            callback = MagicMock(side_effect=RuntimeError("diagnostic callback"))
+            self.assertEqual(
+                destination,
+                Controller._Controller__copy_regular_file_to_temporary(
+                    source, destination,
+                    mutation_tracker=_MoveMutationTracker("sample.bin", callback_trace),
+                    metrics_callback=callback,
+                ),
+            )
+            self.assertEqual(b"payload", Path(destination).read_bytes())
+            callback.assert_called_once()
+            callback_trace.close()
+
     def test_portable_publish_preserves_nested_symlink_without_leaving_private_temporary(self):
         with tempfile.TemporaryDirectory() as root:
             source = os.path.join(root, "staging", "release")
