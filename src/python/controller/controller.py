@@ -3339,6 +3339,28 @@ class Controller:
             # Queue authority is fail-closed if optional proof inspection fails.
             return False
 
+    def __has_fresh_local_root_scan_proof(
+            self, file: ModelFile, intent: DeferredQueueIntent,
+    ) -> bool:
+        """Whether the selected directory root was proved after this rescan began."""
+        if not isinstance(file, ModelFile) or file.file_id != intent.file_id or \
+                file.path_pair_id != intent.path_pair_id or not file.is_dir or file.full_path != file.name:
+            return False
+        generations = intent.rescan_generations
+        if not isinstance(generations, tuple) or len(generations) != 2 or \
+                not isinstance(generations[0], tuple) or len(generations[0]) != 2:
+            return False
+        baseline_session, baseline_generation = generations[0]
+        process = getattr(self, "_Controller__local_scan_process", None)
+        session = getattr(process, "session_token", None)
+        generation = getattr(process, "generation", None)
+        if type(baseline_session) is not str or not baseline_session or \
+                type(baseline_generation) is not int or baseline_generation < 0 or \
+                type(session) is not str or session != baseline_session or \
+                type(generation) is not int or generation <= baseline_generation:
+            return False
+        return self.__has_current_local_root_scan_proof(file)
+
     def is_remote_delete_eligible(self, file: ModelFile) -> bool:
         """Require final publication proof before deleting staged remote data."""
         if file.path_pair_id is None:
@@ -3439,6 +3461,27 @@ class Controller:
             if result is None:
                 return
 
+            recoverable_local_reasons = {
+                "initial_local_scan_recoverable_failed",
+                "initial_local_scan_recoverable_unknown",
+            }
+
+            def record_failure(intent: DeferredQueueIntent, reason: str, outcome: str) -> None:
+                previous = intent.rescan_failure_reason
+                if previous is not None and (
+                        previous not in recoverable_local_reasons or reason in recoverable_local_reasons
+                ):
+                    return
+                intent.rescan_failure_reason = reason
+                self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
+                    "schema": "queue_readiness.v1",
+                    "phase": "rescan_unknown",
+                    "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
+                    "outcome": outcome,
+                    "reason": self.__external_initial_rescan_failure_reason(reason),
+                    "ready": False,
+                })
+
             def mark_initial_rescan_failure(
                     affected_pair_ids: set[object], reason: str,
                     require_fresh_token: bool = True,
@@ -3471,17 +3514,16 @@ class Controller:
                         if not has_result_token or result_session != baseline[0] or \
                                 result_generation <= baseline[1]:
                             continue
-                    if intent.rescan_failure_reason is not None:
-                        continue
-                    intent.rescan_failure_reason = reason
-                    self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
-                        "schema": "queue_readiness.v1",
-                        "phase": "rescan_unknown",
-                        "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
-                        "outcome": "unknown",
-                        "reason": reason,
-                        "ready": False,
-                    })
+                    failure_reason = reason
+                    recoverable_ids = getattr(result, "recoverable_failure_path_pair_ids", None)
+                    if side == "local" and reason == "initial_local_scan_unknown":
+                        terminal_ids = getattr(result, "terminal_failure_path_pair_ids", None)
+                        terminal = isinstance(terminal_ids, (set, frozenset, list, tuple)) and \
+                            intent.path_pair_id in terminal_ids
+                        if not terminal and isinstance(recoverable_ids, (set, frozenset, list, tuple)) and \
+                                intent.path_pair_id in recoverable_ids:
+                            failure_reason = "initial_local_scan_recoverable_unknown"
+                    record_failure(intent, failure_reason, "unknown")
 
             if bool(getattr(result, "failed", False)):
                 failure_scope: set[object] = set()
@@ -3507,6 +3549,8 @@ class Controller:
                     result_generation = getattr(result, "generation", None)
                     side_index = 0 if side == "local" else 1
                     failure_reason = "initial_{}_scan_failed".format(side)
+                    recoverable_ids = getattr(result, "recoverable_failure_path_pair_ids", None)
+                    terminal_ids = getattr(result, "terminal_failure_path_pair_ids", None)
                     for intent in self.__deferred_queue_intents_map().values():
                         if intent.phase != "initial_rescan":
                             continue
@@ -3528,16 +3572,14 @@ class Controller:
                                 type(result_session) is not str or result_session != baseline[0] or \
                                 type(result_generation) is not int or result_generation <= baseline[1]:
                             continue
-                        if intent.rescan_failure_reason is None:
-                            intent.rescan_failure_reason = failure_reason
-                            self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
-                                "schema": "queue_readiness.v1",
-                                "phase": "rescan_unknown",
-                                "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
-                                "outcome": "failed",
-                                "reason": failure_reason,
-                                "ready": False,
-                            })
+                        intent_failure_reason = failure_reason
+                        if side == "local":
+                            terminal = isinstance(terminal_ids, (set, frozenset, list, tuple)) and \
+                                intent.path_pair_id in terminal_ids
+                            if not terminal and isinstance(recoverable_ids, (set, frozenset, list, tuple)) and \
+                                    intent.path_pair_id in recoverable_ids:
+                                intent_failure_reason = "initial_local_scan_recoverable_failed"
+                        record_failure(intent, intent_failure_reason, "failed")
                 return
             result_unknown_ids = getattr(result, "unknown_path_pair_ids", set())
             unknown_pair_ids = result_unknown_ids if isinstance(result_unknown_ids, (set, frozenset, list, tuple)) \
@@ -10709,7 +10751,10 @@ class Controller:
         intent.failure_notified = True
         self.__notify_queue_failure_callbacks(intent.command, reason, error_code)
 
-    def __queue_scoped_rescan_ready(self, intent: DeferredQueueIntent) -> bool:
+    def __queue_scoped_rescan_ready(
+            self, intent: DeferredQueueIntent, file: Optional[ModelFile] = None,
+            *, allow_recoverable_local_root_proof: bool = False,
+    ) -> bool:
         if not intent.rescan_requested:
             return False
         generations = intent.rescan_generations
@@ -10723,25 +10768,52 @@ class Controller:
         scan_tokens = getattr(self, "_Controller__scan_authority_tokens", None)
         if not isinstance(scan_tokens, dict):
             return False
+        local_root_proof_fresh = False
+        if allow_recoverable_local_root_proof and \
+                getattr(intent.command, "origin", "manual") == "manual":
+            if file is None:
+                try:
+                    file = self.__model.get_file(intent.command.filename)
+                except Exception:
+                    file = None
+            if isinstance(file, ModelFile):
+                local_root_proof_fresh = self.__has_fresh_local_root_scan_proof(file, intent)
         for side, baseline in zip(("local", "remote"), generations):
             side_tokens = scan_tokens.get(side)
             acknowledged = side_tokens.get(intent.path_pair_id) \
                 if isinstance(side_tokens, dict) else None
-            if not isinstance(acknowledged, tuple) or len(acknowledged) != 2 or \
-                    type(acknowledged[0]) is not str or type(acknowledged[1]) is not int or \
-                    acknowledged[0] != baseline[0] or acknowledged[1] <= baseline[1]:
+            if side == "remote" and local_root_proof_fresh:
+                process = getattr(self, "_Controller__remote_scan_process", None)
+                current_session = getattr(process, "session_token", None)
+                current_generation = getattr(process, "generation", None)
+                if type(current_session) is not str or not current_session or \
+                        current_session != baseline[0] or type(current_generation) is not int or \
+                        current_generation < baseline[1] or not isinstance(acknowledged, tuple) or \
+                        len(acknowledged) != 2 or acknowledged[0] != current_session:
+                    return False
+            token_is_fresh = isinstance(acknowledged, tuple) and len(acknowledged) == 2 and \
+                type(acknowledged[0]) is str and type(acknowledged[1]) is int and \
+                acknowledged[0] == baseline[0] and acknowledged[1] > baseline[1]
+            if not token_is_fresh and not (side == "local" and local_root_proof_fresh):
                 return False
         try:
             ready = self.is_path_pair_reconciled(intent.path_pair_id)
         except Exception:
             ready = False
+        if not ready and local_root_proof_fresh:
+            remote_reconciled = getattr(
+                self, "_Controller__reconciled_remote_path_pair_ids", set(),
+            )
+            ready = isinstance(remote_reconciled, set) and intent.path_pair_id in remote_reconciled
         if ready:
             self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
                 "schema": "queue_readiness.v1",
                 "phase": "rescan_ready",
                 "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
                 "outcome": "ready",
-                "reason": "authoritative_scoped_scan",
+                "reason": "authoritative_local_root" if local_root_proof_fresh
+                    else "authoritative_scoped_scan",
+                "local_scope_basis": "selected_root" if local_root_proof_fresh else "pair",
                 "ready": True,
             })
             self._record_authority_handoff_breadcrumb(
@@ -10786,11 +10858,16 @@ class Controller:
     def __initial_rescan_failure_reason(
             self, intent: DeferredQueueIntent,
     ) -> Optional[str]:
-        if intent.rescan_failure_reason is not None:
-            return intent.rescan_failure_reason
+        failure_reason = intent.rescan_failure_reason
+        recoverable_local_reasons = (
+            "initial_local_scan_recoverable_failed",
+            "initial_local_scan_recoverable_unknown",
+        )
+        if failure_reason is not None and failure_reason not in recoverable_local_reasons:
+            return failure_reason
         generations = intent.rescan_generations
         if not isinstance(generations, tuple) or len(generations) != 2:
-            return None
+            return failure_reason
         for side, process, baseline in zip(
                 ("local", "remote"),
                 (self.__local_scan_process, self.__remote_scan_process),
@@ -10806,7 +10883,15 @@ class Controller:
             if type(session_token) is str and session_token == baseline[0] and \
                     type(generation) is int and generation < baseline[1]:
                 return "initial_{}_scan_generation_reset".format(side)
-        return None
+        return failure_reason
+
+    @staticmethod
+    def __external_initial_rescan_failure_reason(reason: str) -> str:
+        if reason == "initial_local_scan_recoverable_failed":
+            return "initial_local_scan_failed"
+        if reason == "initial_local_scan_recoverable_unknown":
+            return "initial_local_scan_unknown"
+        return reason
 
     def __prepare_deferred_queue_retries(self) -> None:
         """Put only ready intents back into the normal command flow."""
@@ -10848,15 +10933,30 @@ class Controller:
                 continue
             if intent.phase == "initial_rescan":
                 failure_reason = self.__initial_rescan_failure_reason(intent)
+                allow_local_root_proof = False
+                if failure_reason in (
+                        "initial_local_scan_recoverable_failed",
+                        "initial_local_scan_recoverable_unknown",
+                ) and getattr(intent.command, "origin", "manual") == "manual":
+                    allow_local_root_proof = self.__has_fresh_local_root_scan_proof(
+                        deferred_file, intent,
+                    )
+                    if allow_local_root_proof:
+                        failure_reason = None
                 if failure_reason is not None:
-                    if self.__retire_deferred_queue_intent(file_id, failure_reason):
-                        self.__notify_deferred_queue_failure(intent, failure_reason)
+                    external_reason = self.__external_initial_rescan_failure_reason(failure_reason)
+                    if self.__retire_deferred_queue_intent(file_id, external_reason):
+                        self.__notify_deferred_queue_failure(intent, external_reason)
                     continue
                 # A scan result that was published before the boundary is
                 # authoritative even when this controller turn reached the
                 # deadline.  Admit it into the ordinary collision preflight
                 # rather than turning a healthy handoff into a timeout.
-                if self.__queue_scoped_rescan_ready(intent):
+                if self.__queue_scoped_rescan_ready(
+                        intent,
+                        deferred_file,
+                        allow_recoverable_local_root_proof=allow_local_root_proof,
+                ):
                     intents.pop(file_id, None)
                     intent.phase = "collision"
                     intent.rescan_requested = False

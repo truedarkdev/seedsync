@@ -16952,6 +16952,9 @@ class TestController(unittest.TestCase):
 
         failure_cases = (
             ("unreadable-sibling", True, None, None, False),
+            ("unreadable-sibling-deferred", True, None, None, False),
+            ("unreadable-sibling-deferred-local-session", False, "session", None, False),
+            ("unreadable-sibling-deferred-remote-session", False, "remote-session", None, False),
             ("unreadable-sibling-changed-retained", True, None, "changed", False),
             ("unreadable-sibling-removed-retained", True, None, "removed", False),
             ("unreadable-sibling-adoption-failed", False, None, None, True),
@@ -17115,10 +17118,58 @@ class TestController(unittest.TestCase):
                         raise PermissionError(13, "permission denied", os.fspath(path))
                     return real_scandir(path)
 
+                deferred_callback = None
+                deferred_command = None
+                is_deferred_case = blocked_root.startswith("unreadable-sibling-deferred")
+                if is_deferred_case:
+                    # First establish an unknown selected root so the manual
+                    # Queue enters the ordinary initial-rescan path. A later
+                    # scan will prove that root while the sibling stays
+                    # recoverably unreadable.
+                    blocked_paths = {
+                        os.path.normcase(os.path.abspath(os.path.join(final_path, "selected"))),
+                    }
+                    with patch("system.scanner.os.scandir", side_effect=scandir_with_one_unreadable_root):
+                        local_process.run_loop()
+                    ModelUpdater(controller).update()
+                    self.assertIn(pair_id, controller._Controller__reconciled_remote_path_pair_ids)
+                    baseline_remote = controller._Controller__scan_authority_tokens["remote"][pair_id]
+                    self.assertFalse(builder.has_current_local_root_scan_proof(
+                        target_file_id, local_process.session_token, local_process.generation,
+                    ))
+                    deferred_callback = MagicMock()
+                    deferred_command = Controller.Command(Controller.Command.Action.QUEUE, target_file_id)
+                    deferred_command.add_callback(deferred_callback)
+                    controller.queue_command(deferred_command)
+                    controller._Controller__process_commands()
+                    pending_intent = controller._Controller__deferred_queue_intents.get(target_file_id)
+                    self.assertIsNotNone(pending_intent)
+                    self.assertEqual("initial_rescan", pending_intent.phase)
+                    self.assertEqual(baseline_remote, pending_intent.rescan_generations[1])
+                    controller._Controller__lftp.queue.assert_not_called()
+                    blocked_paths = {
+                        os.path.normcase(os.path.abspath(os.path.join(final_path, "unreadable-sibling"))),
+                        os.path.normcase(os.path.abspath(os.path.join(staging_path, "unreadable-sibling"))),
+                    }
+
                 with patch("system.scanner.os.scandir", side_effect=scandir_with_one_unreadable_root):
                     local_process.run_loop()
+                if deferred_command is not None:
+                    remote_process.run_loop()
 
                 queued_events = list(local_process._ScannerProcess__queue.queue)
+                if deferred_command is not None:
+                    recoverable_failures = [
+                        event for event in queued_events
+                        if getattr(event, "failed", False) and pair_id in getattr(
+                            event, "recoverable_failure_path_pair_ids", set(),
+                        )
+                    ]
+                    self.assertTrue(recoverable_failures)
+                    terminal_ids = getattr(
+                        recoverable_failures[-1], "terminal_failure_path_pair_ids", set(),
+                    )
+                    self.assertNotIn(pair_id, terminal_ids or set())
 
                 def has_fresh_target(event):
                     return any(
@@ -17138,6 +17189,10 @@ class TestController(unittest.TestCase):
                         ModelUpdater(controller).update()
                 else:
                     ModelUpdater(controller).update()
+                if deferred_command is not None:
+                    fresh_remote = controller._Controller__scan_authority_tokens["remote"][pair_id]
+                    self.assertEqual(remote_process.session_token, fresh_remote[0])
+                    self.assertGreater(fresh_remote[1], baseline_remote[1])
                 retained_model = builder.build_model()
                 self.assertFalse(Controller.is_path_pair_reconciled(controller, pair_id))
                 sibling_file_id = ModelFile.build_file_id("unreadable-sibling", pair_id)
@@ -17199,28 +17254,62 @@ class TestController(unittest.TestCase):
                     self.addCleanup(restarted_process.close_queues)
                     controller._Controller__local_scan_process = restarted_process
                     local_process = restarted_process
+                elif invalidate_proof == "remote-session":
+                    restarted_remote_process = ScannerProcess(
+                        LocalScanner(remote_path, use_temp_file=False, path_pair_id=pair_id),
+                        interval_in_ms=0,
+                        verbose=False,
+                    )
+                    self.addCleanup(restarted_remote_process.close_queues)
+                    controller._Controller__remote_scan_process = restarted_remote_process
+                    remote_process = restarted_remote_process
                 elif invalidate_proof == "remote":
                     controller._Controller__reconciled_remote_path_pair_ids.discard(pair_id)
 
-                self.assertEqual(should_dispatch, builder.has_current_local_root_scan_proof(
+                local_authority = builder.has_current_local_root_scan_proof(
                     target_file_id, local_process.session_token, local_process.generation,
-                ) and pair_id in controller._Controller__reconciled_remote_path_pair_ids)
-                if not should_dispatch:
+                ) and pair_id in controller._Controller__reconciled_remote_path_pair_ids
+                if deferred_command is not None:
+                    current_remote_token = controller._Controller__scan_authority_tokens["remote"].get(pair_id)
+                    remote_baseline = controller._Controller__deferred_queue_intents[
+                        target_file_id
+                    ].rescan_generations[1]
+                    remote_current = isinstance(current_remote_token, tuple) and len(current_remote_token) == 2 and \
+                        current_remote_token[0] == remote_process.session_token == remote_baseline[0] and \
+                        type(remote_process.generation) is int and remote_process.generation >= remote_baseline[1] and \
+                        type(current_remote_token[1]) is int and current_remote_token[1] > remote_baseline[1]
+                else:
+                    remote_current = True
+                self.assertEqual(should_dispatch, local_authority and remote_current)
+                if not should_dispatch and invalidate_proof != "remote-session":
                     self.assertEqual((), builder.get_trusted_final_leaf_paths(
                         target_file_id,
                         local_scan_session=local_process.session_token,
                         local_scan_generation=local_process.generation,
                         remote_path_pair_ready=pair_id in controller._Controller__reconciled_remote_path_pair_ids,
                     ))
-                callback = MagicMock()
-                command = Controller.Command(Controller.Command.Action.QUEUE, target_file_id)
-                command.add_callback(callback)
-                controller.queue_command(command)
+                callback = deferred_callback or MagicMock()
+                command = deferred_command or Controller.Command(Controller.Command.Action.QUEUE, target_file_id)
+                if deferred_command is None:
+                    command.add_callback(callback)
+                    controller.queue_command(command)
                 controller._Controller__process_commands()
 
                 readiness_records = readiness_trace.query_events(
                     category="queue.readiness", stage="queue_readiness", limit=32,
                 )["events"]
+                if deferred_command is not None:
+                    retry_intent = controller._Controller__deferred_queue_intents.get(target_file_id)
+                    retry_diagnostic = {
+                        "failure_reason": getattr(retry_intent, "rescan_failure_reason", None),
+                        "fresh_root_proof": controller._Controller__has_fresh_local_root_scan_proof(
+                            retained_model.get_file(target_file_id), retry_intent,
+                        ) if retry_intent is not None else False,
+                        "queue_calls": controller._Controller__lftp.queue.call_count,
+                        "callback_success_calls": deferred_callback.on_success.call_count,
+                        "readiness_messages": [entry["message"] for entry in readiness_records],
+                    }
+                    self.assertIsNone(retry_intent, msg=repr(retry_diagnostic))
                 model_boundary = [
                     entry for entry in readiness_records if entry["message"] == "queue_model_boundary"
                 ]
@@ -17229,6 +17318,19 @@ class TestController(unittest.TestCase):
                 self.assertEqual(
                     expected_root_proof and invalidate_proof is None,
                     proof_record["details"]["local_root_scan_proof_current"],
+                    msg=repr({
+                        "queue_calls": controller._Controller__lftp.queue.call_count,
+                        "callback_success_calls": callback.on_success.call_count,
+                        "callback_failure_calls": callback.on_failure.call_count,
+                        "deferred_intent_present": target_file_id in
+                            controller._Controller__deferred_queue_intents,
+                        "readiness": [
+                            (entry["message"], entry["details"].get("phase"),
+                             entry["details"].get("reason"),
+                             entry["details"].get("local_root_scan_proof_current"))
+                            for entry in readiness_records
+                        ],
+                    }) if deferred_command is not None else None,
                 )
                 self.assertEqual("queue.readiness", proof_record["category"])
                 self.assertEqual("info", proof_record["level"])
@@ -17236,17 +17338,27 @@ class TestController(unittest.TestCase):
                 self.assertNotIn("selected", proof_record["corr_id"])
                 self.assertLessEqual(len(readiness_records), 32)
                 self.assertEqual(1, len({entry["corr_id"] for entry in readiness_records}))
-                self.assertNotIn("pair-a", str(readiness_records))
-                self.assertNotIn("selected", str(readiness_records))
+                readiness_json = json.dumps(readiness_records, sort_keys=True)
+                self.assertNotIn('"pair-a"', readiness_json)
+                self.assertNotIn('"selected"', readiness_json)
+                if blocked_root == "unreadable-sibling-deferred":
+                    ready_record = next(
+                        entry for entry in readiness_records
+                        if entry["message"] == "queue_rescan_readiness" and
+                        entry["details"].get("phase") == "rescan_ready"
+                    )
+                    self.assertEqual("selected_root", ready_record["details"]["local_scope_basis"])
 
                 durable_health = readiness_trace.close(3.0)
                 durable_path = os.path.join(temp_dir, "trace", "breadcrumbs.jsonl")
                 with open(durable_path, encoding="utf-8") as handle:
                     durable_entries = [json.loads(line) for line in handle if line.strip()]
-                durable_boundary = next(
+                durable_boundaries = [
                     entry for entry in durable_entries
                     if entry.get("message") == "queue_model_boundary"
-                )
+                ]
+                self.assertTrue(durable_boundaries)
+                durable_boundary = durable_boundaries[-1]
                 self.assertEqual("queue.readiness", durable_boundary["category"])
                 self.assertEqual("info", durable_boundary["level"])
                 self.assertEqual(
@@ -17256,8 +17368,9 @@ class TestController(unittest.TestCase):
                     proof_record["details"]["local_root_scan_proof_current"],
                     durable_boundary["details"]["local_root_scan_proof_current"],
                 )
-                self.assertNotIn("pair-a", json.dumps(durable_boundary))
-                self.assertNotIn("selected", json.dumps(durable_boundary))
+                durable_boundary_json = json.dumps(durable_boundary, sort_keys=True)
+                self.assertNotIn('"pair-a"', durable_boundary_json)
+                self.assertNotIn('"selected"', durable_boundary_json)
                 if os.name == "nt":
                     self.assertEqual("unsupported", durable_health["offline_retrieval"])
                 else:
@@ -17280,11 +17393,73 @@ class TestController(unittest.TestCase):
                         "selected", True, **expected_queue_kwargs,
                     )
                     self.assertNotIn(target_file_id, controller._Controller__deferred_queue_intents)
+                    if deferred_command is not None:
+                        callback.on_success.assert_called_once_with()
+                        callback.on_failure.assert_not_called()
                 else:
                     controller._Controller__lftp.queue.assert_not_called()
-                    self.assertIn(target_file_id, controller._Controller__deferred_queue_intents)
                     callback.on_success.assert_not_called()
-                    callback.on_failure.assert_not_called()
+                    if invalidate_proof in ("session", "remote-session") and deferred_command is not None:
+                        side = "remote" if invalidate_proof == "remote-session" else "local"
+                        callback.on_failure.assert_called_once_with(
+                            "Queue preflight cancelled: initial_{}_scan_session_changed".format(side), 409,
+                        )
+                        self.assertNotIn(target_file_id, controller._Controller__deferred_queue_intents)
+                    else:
+                        self.assertIn(target_file_id, controller._Controller__deferred_queue_intents)
+                        callback.on_failure.assert_not_called()
+
+    def test_terminal_local_scan_failure_supersedes_recoverable_rescan_reason(self):
+        pair_id = "pair-a"
+        file_id = ModelFile.build_file_id("selected", pair_id)
+        command = Controller.Command(Controller.Command.Action.QUEUE, file_id)
+        intent = DeferredQueueIntent(
+            command,
+            file_id,
+            pair_id,
+            phase="initial_rescan",
+            rescan_requested=True,
+            rescan_generations=(("local-session", 0), ("remote-session", 0)),
+        )
+        self.controller._Controller__deferred_queue_intents_map()[file_id] = intent
+        self.controller._record_path_pair_scan_tokens(
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={pair_id}, failed=True,
+                generation=1, session_token="local-session",
+                recoverable_failure_path_pair_ids={pair_id},
+                terminal_failure_path_pair_ids=set(),
+            ),
+            None,
+        )
+        self.assertEqual("initial_local_scan_recoverable_failed", intent.rescan_failure_reason)
+
+        self.controller._record_path_pair_scan_tokens(
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={pair_id}, failed=True,
+                generation=2, session_token="local-session",
+                recoverable_failure_path_pair_ids=set(),
+                terminal_failure_path_pair_ids={pair_id},
+            ),
+            None,
+        )
+        self.assertEqual("initial_local_scan_failed", intent.rescan_failure_reason)
+        self.assertEqual(
+            "initial_local_scan_failed",
+            self.controller._Controller__external_initial_rescan_failure_reason(
+                intent.rescan_failure_reason,
+            ),
+        )
+
+        intent.rescan_failure_reason = None
+        self.controller._record_path_pair_scan_tokens(
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={pair_id},
+                unknown_path_pair_ids={pair_id}, generation=3,
+                session_token="local-session", terminal_failure_path_pair_ids={pair_id},
+            ),
+            None,
+        )
+        self.assertEqual("initial_local_scan_unknown", intent.rescan_failure_reason)
 
     def test_process_commands_queue_defers_manual_directory_until_path_pair_reconciles(self):
         file = ModelFile("release", True)
