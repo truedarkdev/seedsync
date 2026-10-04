@@ -7018,6 +7018,79 @@ class ModelBuilder:
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
 
+    def __input_witness_context(self) -> Optional[dict]:
+        if not self.__is_stop_resume_trace_enabled("scan.authority", "info"):
+            return None
+        try:
+            priority_roots = []
+            for file_id, node in self.__active_files.items():
+                if self.__nested_active_file_root_file_id(node) is None:
+                    priority_roots.append(file_id)
+                    if len(priority_roots) == 4:
+                        break
+            return {"corr": "input-arbitration:" + opaque_trace_correlation(str(time.monotonic_ns())),
+                    "priority_roots": tuple(priority_roots),
+                    "root_rows_sampled": 0, "root_rows_omitted": 0,
+                    "remote_leaf_rows_sampled": 0, "remote_leaf_rows_omitted": 0}
+        except Exception:
+            return None
+
+    def __input_witness_root(self, file_id: str, remote: Optional[SystemFile],
+                             selected: Optional[SystemFile]) -> Optional[dict]:
+        try:
+            local = self.__local_file(file_id)
+            active = self.__active_files.get(file_id)
+            selection = "absent" if selected is None else "local" if selected is local else \
+                "active" if selected is active else "split" if local is not None and active is not None else "unknown"
+            proof = self.__local_root_scan_proofs.get(file_id)
+            generation = proof[1] if isinstance(proof, tuple) and len(proof) == 3 and \
+                proof[2] is local and type(proof[1]) is int and proof[1] >= 0 else None
+            facts = {"root_id": opaque_trace_correlation(file_id), "input_scope": "root",
+                     "selection": selection, "local_proof_generation": generation,
+                     "local_proof_generation_known": generation is not None, "active_generation_known": False}
+            for label, node in (("local", local), ("active", active), ("remote", remote)):
+                facts[label + "_input_present"] = node is not None
+                facts[label + "_input_size"] = node.size if node is not None else None
+                facts[label + ("_input_is_dir" if label == "remote" else "_input_is_staging")] = \
+                    (node.is_dir if label == "remote" else node.is_staging) if node is not None else None
+            return facts
+        except Exception:
+            return None
+
+    def __record_input_witness(self, context: Optional[dict], facts: Optional[dict] = None,
+                               model_file: Optional[ModelFile] = None, *, leaf: bool = False) -> None:
+        if context is None:
+            return
+        try:
+            if model_file is None:
+                details = {"schema": "model_input_arbitration.v1"}
+                details.update({"phase": "summary", "subject_kind": "summary"})
+                details.update({key: context[key] for key in ("root_rows_sampled", "root_rows_omitted",
+                    "remote_leaf_rows_sampled", "remote_leaf_rows_omitted")})
+            else:
+                prefix = "remote_leaf" if leaf else "root"
+                if facts is None or context[prefix + "_rows_sampled"] >= (8 if leaf else 4):
+                    context[prefix + "_rows_omitted"] += 1
+                    return
+                details = {"schema": "model_input_arbitration.v1"}
+                context[prefix + "_rows_sampled"] += 1
+                state = model_file.state.name.lower()
+                details.update(facts)
+                details.update({"phase": "remote_leaf_fill" if leaf else "root_fill",
+                    "subject_kind": "remote_leaf" if leaf else "root",
+                    "subject_id": opaque_trace_correlation(model_file.file_id),
+                    "filled_local_present": model_file.local_present,
+                    "filled_remote_present": model_file.remote_present,
+                    "filled_local_size": model_file.local_size, "filled_remote_size": model_file.remote_size,
+                    "filled_transferred_size": model_file.transferred_size,
+                    "filled_state": state if state in ("queued", "downloading", "default", "downloaded", "move_failed") else "unknown",
+                    "filled_remote_transferable": model_file.remote_has_transferable_content})
+            self.__stop_resume_trace_breadcrumb.record("model_builder", "input_arbitration_witness", details,
+                category="scan.authority", level="info", stage="model_builder_input_arbitration",
+                event_type="diagnostic", corr_id=context["corr"], flow_id=context["corr"], trace_scope="flow")
+        except Exception:
+            pass
+
     def build_model(self) -> Model:
         if self.__cached_model is not None:
             return self.__cached_model
@@ -7035,6 +7108,7 @@ class ModelBuilder:
         # Model publication is a high-volume diagnostic. Snapshot its explicit
         # opt-in once so a disabled build does not enter per-node trace code.
         model_publication_trace_enabled = self.__is_model_publication_trace_enabled()
+        input_witness = self.__input_witness_context()
         effective_local_files = self.__build_effective_local_files()
         self.__cached_unresolved_staging_collision_file_ids = {
             file_id
@@ -7081,6 +7155,9 @@ class ModelBuilder:
         for file_id in all_file_ids:
             remote = remote_files.get(file_id, None)
             local = effective_local_files.get(file_id, None)
+            input_facts = self.__input_witness_root(file_id, remote, local) if input_witness is not None and \
+                input_witness["root_rows_sampled"] < 4 and \
+                (not input_witness["priority_roots"] or file_id in input_witness["priority_roots"]) else None
             status = self.__lftp_statuses.get(file_id, None)
             is_stopped = self.__is_stopped_file(file_id, remote, local)
             name = remote.name if remote else local.name if local else file_id
@@ -7167,6 +7244,8 @@ class ModelBuilder:
                 live_transferred_file_ids,
                 build_local_predicate_cache,
                 root_file_id=file_id,
+                input_witness=input_witness,
+                input_facts=input_facts,
             )
             self.__estimate_eta(model_file)
             incomplete_children, arbitration_source = self.__check_root_downloaded(
@@ -7183,6 +7262,7 @@ class ModelBuilder:
                 model_file, remote, self.__local_file(file_id),
             )
             self.__determine_state(model_file, local, incomplete_children)
+            self.__record_input_witness(input_witness, input_facts, model_file)
             # Trace failed presentation/lifecycle decisions and explicit Stop
             # boundaries; successful, unstopped roots without a marker remain
             # quiet.
@@ -7343,6 +7423,7 @@ class ModelBuilder:
         self.__lftp_regressed_root_file_ids.clear()
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
+        self.__record_input_witness(input_witness)
         return model
 
     def __resolve_root_transfer_state(
@@ -7536,6 +7617,8 @@ class ModelBuilder:
         live_transferred_file_ids: Set[str],
         build_local_predicate_cache: Optional[dict[tuple[object, ...], bool]] = None,
         root_file_id: Optional[str] = None,
+        input_witness: Optional[dict] = None,
+        input_facts: Optional[dict] = None,
     ) -> None:
         # Traverse SystemFile children tree in BFS order
         # Store (remote, local, status, model_file) tuple in traversal frontier where remote and local
@@ -7723,6 +7806,8 @@ class ModelBuilder:
                     _child_current_transfer_state,
                     _child_live_status,
                 )
+                if input_witness is not None and _remote_child is not None and not _remote_child.is_dir:
+                    self.__record_input_witness(input_witness, input_facts, _child_model_file, leaf=True)
                 if self.__is_stop_resume_trace_enabled():
                     self.__trace_target_arbitration(
                         _child_model_file,

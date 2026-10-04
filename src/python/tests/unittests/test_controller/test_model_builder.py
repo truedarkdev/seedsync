@@ -56,6 +56,140 @@ from common.performance_diagnostics import (
 
 
 class TestModelBuilder(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "Requires native durable file acknowledgement")
+    def test_input_arbitration_witness_retains_actual_build_call_and_fill(self):
+        with tempfile.TemporaryDirectory() as path:
+            collector = BreadcrumbTraceCollector(lambda: True, max_entries=128,
+                policy={"default": "off", "rules": {"scan.authority": "info"}},
+                durable_enabled=True, durable_path=path)
+            self.addCleanup(collector.close)
+            builder = self.model_builder
+            remote = SystemFile("input-root", 100, True)
+            remote.add_child(SystemFile("payload.bin", 100, False))
+            local = SystemFile("input-root", 40, True)
+            local.add_child(SystemFile("payload.bin", 40, False))
+            builder.set_remote_files([remote])
+            builder.set_local_files([local])
+            builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+            first = builder.build_model()
+            self.assertIs(first, builder.build_model())  # Cached reads create no invented build.
+            active = SystemFile("input-root", 100, True)
+            active.add_child(SystemFile("payload.bin", 100, False))
+            builder.set_active_files([active])
+            second = builder.build_model()
+            self.assertTrue(collector.flush_durable(2.0))
+            with open(os.path.join(path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle if line.strip()]
+            rows = [row for row in rows if row.get("message") == "input_arbitration_witness"]
+            print("INPUT_WITNESS_FINALIZED=" + json.dumps(rows, sort_keys=True))
+            roots = [row for row in rows if row["details"]["phase"] == "root_fill"]
+            self.assertEqual(2, len(roots))
+            self.assertEqual(["local", "active"], [row["details"]["selection"] for row in roots])
+            self.assertNotEqual(roots[0]["corr_id"], roots[1]["corr_id"])
+            self.assertEqual(roots[0]["details"]["root_id"], roots[1]["details"]["root_id"])
+            for root_row, model in zip(roots, (first, second)):
+                related = [row for row in rows if row["corr_id"] == root_row["corr_id"]]
+                self.assertEqual({"root_fill", "remote_leaf_fill", "summary"},
+                                 {row["details"]["phase"] for row in related})
+                filled = model.get_file("input-root")
+                self.assertEqual(filled.local_size, root_row["details"]["filled_local_size"])
+                leaf = next(row for row in related if row["details"]["phase"] == "remote_leaf_fill")
+                self.assertEqual(filled.get_children()[0].local_size, leaf["details"]["filled_local_size"])
+                self.assertEqual("root", leaf["details"]["input_scope"])
+                self.assertFalse(root_row["details"]["active_generation_known"])
+                self.assertIsNone(root_row["details"]["local_proof_generation"])
+                self.assertFalse(root_row["details"]["local_proof_generation_known"])
+            for row in rows:
+                self.assertNotIn("input-root", json.dumps(row))
+                self.assertNotIn("payload.bin", json.dumps(row))
+                self.assertLess(len(json.dumps(row)), 4096)
+
+    def test_input_arbitration_witness_bounds_root_and_leaf_rows(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=128,
+            policy={"default": "off", "rules": {"scan.authority": "info"}})
+        self.addCleanup(collector.close)
+        roots = []
+        for index in range(6):
+            root = SystemFile("bounded-root-{}".format(index), 12, True)
+            for child in range(12):
+                root.add_child(SystemFile("leaf-{}.bin".format(child), 1, False))
+            roots.append(root)
+        self.model_builder.set_remote_files(roots)
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        self.model_builder.build_model()
+        rows = [row for row in self.__trace_entries(collector, True)
+                if row["message"] == "input_arbitration_witness"]
+        summary = next(row["details"] for row in rows if row["details"]["phase"] == "summary")
+        self.assertEqual(4, summary["root_rows_sampled"])
+        self.assertEqual(2, summary["root_rows_omitted"])
+        self.assertEqual(8, summary["remote_leaf_rows_sampled"])
+        self.assertEqual(64, summary["remote_leaf_rows_omitted"])
+        self.assertEqual(13, len(rows))
+
+    def test_input_arbitration_witness_split_and_active_sampling_priority(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=128,
+            policy={"default": "off", "rules": {"scan.authority": "info"}})
+        self.addCleanup(collector.close)
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        self.test_active_staging_overlay_preserves_verified_split_root_final_leaves_and_completion()
+        rows = [row for row in self.__trace_entries(collector, True)
+                if row["message"] == "input_arbitration_witness"]
+        root_row = next(row for row in rows if row["details"]["phase"] == "root_fill")
+        self.assertEqual("split", root_row["details"]["selection"])
+        self.assertTrue(any(row["details"]["phase"] == "remote_leaf_fill" and
+                            row["corr_id"] == root_row["corr_id"] for row in rows))
+
+        builder = ModelBuilder()
+        roots = [SystemFile("ordinary-{}".format(index), 0, True) for index in range(6)]
+        selected = SystemFile("active-priority", 1, True)
+        selected.add_child(SystemFile("payload.bin", 1, False))
+        roots.append(selected)
+        builder.set_remote_files(roots)
+        active = SystemFile("active-priority", 1, True)
+        active.add_child(SystemFile("payload.bin", 1, False))
+        builder.set_active_files([active])
+        other = BreadcrumbTraceCollector(lambda: True, max_entries=128,
+            policy={"default": "off", "rules": {"scan.authority": "info"}})
+        self.addCleanup(other.close)
+        builder.set_stop_resume_trace_breadcrumb(other.create_emitter())
+        builder.build_model()
+        rows = [row for row in self.__trace_entries(other, True)
+                if row["message"] == "input_arbitration_witness"]
+        root_rows = [row for row in rows if row["details"]["phase"] == "root_fill"]
+        self.assertEqual(1, len(root_rows))
+        self.assertEqual("active", root_rows[0]["details"]["selection"])
+        summary = next(row["details"] for row in rows if row["details"]["phase"] == "summary")
+        self.assertEqual(6, summary["root_rows_omitted"])
+
+    def test_input_arbitration_witness_disabled_and_failing_diagnostics_preserve_build(self):
+        def build(emitter):
+            builder = ModelBuilder()
+            builder.set_base_logger(self.model_builder.logger)
+            remote = SystemFile("neutral-root", 10, True)
+            remote.add_child(SystemFile("payload.bin", 10, False))
+            builder.set_remote_files([remote])
+            builder.set_stop_resume_trace_breadcrumb(emitter)
+            root = builder.build_model().get_file("neutral-root")
+            return (root.state, root.local_present, root.remote_size, root.complete_local_coverage)
+        baseline = build(None)
+        class Disabled:
+            def is_effectively_enabled(self, category, level="info"):
+                return False
+            def record(self, *args, **kwargs):
+                raise AssertionError("disabled emission")
+        with patch("controller.model_builder.ModelBuilder._ModelBuilder__input_witness_root",
+                   side_effect=AssertionError("disabled source facts")), \
+             patch("controller.model_builder.time.monotonic_ns", side_effect=AssertionError("disabled clock")):
+            self.assertEqual(baseline, build(Disabled()))
+        class Failing:
+            def is_effectively_enabled(self, category, level="info"):
+                return category == "scan.authority"
+            def record(self, *args, **kwargs):
+                raise RuntimeError("diagnostic sink failure")
+        self.assertEqual(baseline, build(Failing()))
+        with patch("controller.model_builder.opaque_trace_correlation", side_effect=RuntimeError("correlation failure")):
+            self.assertEqual(baseline, build(Failing()))
+
     def setUp(self):
         logger = logging.getLogger(TestModelBuilder.__name__)
         handler = logging.StreamHandler(sys.stdout)
