@@ -1624,6 +1624,8 @@ def test_browser_harness_is_lazy_configurable_and_manifest_driven():
     assert "require(moduleName)" in source
     assert "PERF_PLAYWRIGHT_MODULE" in source
     assert "NODE_PATH" in lab_source
+    assert 'PERF_BROWSER_PROBE_PATH="${PERF_BROWSER_PROBE_PATH:-$SCRIPT_DIR/browser_probe.js}"' in lab_source
+    assert '"$PERF_BROWSER_PROBE_PATH"' in lab_source
     assert "ordinary-active" in source and "remote_only_targets" in source
     assert "active-queue-target" not in source and "remote-only-target.bin" not in source
     assert "path_segments: parts[0] === pair.directory ? parts.slice(1) : parts" in source
@@ -1840,6 +1842,7 @@ def test_browser_probe_self_test_runs_without_playwright():
         "raw_progress_activity_above_percent_zero": True,
         "target_apply_causal_attribution": True,
         "completion_exact_coverage": True,
+        "completion_root_file_exact_coverage": True,
         "completion_shared_iteration_deadline": True,
         "main_thread_responsiveness": True,
         "measurement_boundary": True,

@@ -38,6 +38,7 @@ else
 fi
 PERF_HOST_PORT="${PERF_HOST_PORT:-18800}"
 PERF_NODE_BINARY="${PERF_NODE_BINARY:-node}"
+PERF_BROWSER_PROBE_PATH="${PERF_BROWSER_PROBE_PATH:-$SCRIPT_DIR/browser_probe.js}"
 PERF_PLAYWRIGHT_MODULE="${PERF_PLAYWRIGHT_MODULE:-${SEEDSYNC_PLAYWRIGHT_MODULE:-playwright}}"
 PERF_NODE_PATH="${PERF_NODE_PATH:-${SEEDSYNC_PLAYWRIGHT_NODE_PATH:-}}"
 PERF_MEASURE_TIMEOUT_SECONDS="${PERF_MEASURE_TIMEOUT_SECONDS:-900}"
@@ -1269,7 +1270,7 @@ PY
   # The browser harness reads PERF_API_TOKEN directly from its environment;
   # credentials are never passed as arguments or written to run metadata.
   set +e
-  "${node_path_args[@]}" "$PERF_NODE_BINARY" "$SCRIPT_DIR/browser_probe.js" \
+  "${node_path_args[@]}" "$PERF_NODE_BINARY" "$PERF_BROWSER_PROBE_PATH" \
     --label "$label" \
     --base-url "http://127.0.0.1:$PERF_HOST_PORT" \
     --manifest "$manifest" \

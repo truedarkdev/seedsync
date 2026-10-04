@@ -135,7 +135,6 @@ test("browser_probe page-init callback joins selected SSE records, removals, DOM
   assert.ok(bounded.targetCaptureLoss.target_dom_mutations_dropped > 0);
 });
 
-
 function tempRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "seedsync-browser-observer-"));
 }
@@ -224,10 +223,36 @@ test("root projection keeps the typed field set and accounts for loss", () => {
   assert.equal(bounded.records_dropped, 1);
   assert.equal(bounded.payload_loss, true);
 
-  const oversizedSse = observer.projectSse("model-page", "x".repeat(32769), 4);
+  const oversizedSse = observer.projectSse("model-page", "x".repeat(32769), 4, null, '["pair","root"]');
   assert.equal(oversizedSse.payload_projection, "oversize");
   assert.equal(oversizedSse.payload_skipped, true);
   assert.equal(oversizedSse.model_version, null);
+  assert.equal(oversizedSse.root_match_status, "unavailable");
+});
+
+test("SSE root projection follows model-page and model-invalidate production records", () => {
+  const rootId = '["pair","root"]';
+  const source = { source_id: 2, route_class: "model_stream", scope_class: "scoped", scope_digest: "1234abcd" };
+  const record = { file_id: rootId, name: "private-name", state: "downloading", download_progress: 40, downloading_speed: 7, eta: 8, explicitly_stopped: false, complete_local_coverage: false };
+  const initial = observer.projectSse("model-page", JSON.stringify({ model_version: 19, records: [record] }), 12, source, rootId);
+  assert.equal(initial.at_ms, 12);
+  assert.equal(initial.model_version, 19);
+  assert.equal(initial.root_match_status, "matched");
+  assert.deepEqual([initial.root.state, initial.root.download_progress, initial.root.downloading_speed, initial.root.eta, initial.root.explicitly_stopped, initial.root.complete_local_coverage], ["downloading", 40, 7, 8, false, false]);
+  assert.ok(!JSON.stringify(initial).includes(rootId));
+  assert.ok(!JSON.stringify(initial).includes("private-name"));
+
+  const unrelated = observer.projectSse("model-invalidate", JSON.stringify({ model_version: 20, records: [{ ...record, file_id: '["pair","other"]', state: "stopped" }], removed_file_ids: [] }), 13, source, rootId);
+  assert.equal(unrelated.root_match_status, "missing");
+  assert.equal(unrelated.root.state, null);
+
+  const completed = observer.projectSse("model-invalidate", JSON.stringify({ model_version: 21, records: [{ ...record, state: "downloaded", download_progress: 100, downloading_speed: 0, eta: 0, explicitly_stopped: false, complete_local_coverage: true }], removed_file_ids: [] }), 14, source, rootId);
+  assert.equal(completed.root_match_status, "matched");
+  assert.deepEqual([completed.model_version, completed.root.state, completed.root.download_progress, completed.root.downloading_speed, completed.root.eta, completed.root.explicitly_stopped, completed.root.complete_local_coverage], [21, "downloaded", 100, 0, 0, false, true]);
+
+  const malformed = observer.projectSse("model-invalidate", JSON.stringify({ model_version: 22, records: "invalid" }), 15, source, rootId);
+  assert.equal(malformed.root_match_status, "malformed");
+  assert.equal(malformed.root.model_version, 22);
 });
 
 test("runtime config requires an explicit safe origin and scoped paths", () => {
@@ -300,13 +325,20 @@ function startFixture(rootId, options = {}) {
       const transferred = rootRequests >= 3 ? 10 : 5;
       response.writeHead(200, { "content-type": "application/json" });
       if (options.hangRootBody === true) { holdResponse(request, response, '{"model_version":1,"records":['); return; }
-      response.end(JSON.stringify({ model_version: 7 + rootRequests, records: [{ file_id: rootId, name: "private-name", state: "downloading", local_size: 10, remote_size: 20, transferred_size: transferred, display_size_total: 20, display_transferred_size: transferred, download_progress: transferred * 5, complete_local_coverage: false, final_move_succeeded: false }] }));
+      response.end(JSON.stringify({ model_version: 7 + rootRequests, records: [{ file_id: rootId, name: "private-name", state: "downloading", local_size: 10, remote_size: 20, transferred_size: transferred, display_size_total: 20, display_transferred_size: transferred, download_progress: transferred * 5, downloading_speed: 3, eta: 4, explicitly_stopped: false, complete_local_coverage: false, final_move_succeeded: false }] }));
       return;
     }
     if (url.pathname === "/server/model/v1/pairs/pair-1/stream") {
       response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-      const ssePayload = options.multibyteOversizeSse === true ? "€".repeat(11000) : options.oversizeSse === true ? "x".repeat(observer.MAX_SSE_PAYLOAD_BYTES + 1) : '{"model_version":8}';
+      const record = { file_id: rootId, name: "private-name", state: "downloading", local_size: 10, remote_size: 20, transferred_size: 5, display_size_total: 20, display_transferred_size: 5, download_progress: 25, downloading_speed: 3, eta: 4, explicitly_stopped: false, complete_local_coverage: false, final_move_succeeded: false };
+      const ssePayload = options.multibyteOversizeSse === true ? "€".repeat(11000) : options.oversizeSse === true ? "x".repeat(observer.MAX_SSE_PAYLOAD_BYTES + 1) : JSON.stringify({ model_version: 8, records: [record] });
       response.write(`event: model-page\ndata: ${ssePayload}\n\n`);
+      const unrelated = { ...record, file_id: '["pair-1","other-root"]', state: "stopped", explicitly_stopped: true };
+      const changed = { ...record, state: "downloaded", transferred_size: 20, download_progress: 100, downloading_speed: 0, eta: 0, complete_local_coverage: true };
+      setTimeout(() => {
+        response.write(`event: model-invalidate\ndata: ${JSON.stringify({ model_version: 9, records: [unrelated], removed_file_ids: [] })}\n\n`);
+        response.write(`event: model-invalidate\ndata: ${JSON.stringify({ model_version: 10, records: [changed], removed_file_ids: [] })}\n\n`);
+      }, 5);
       setTimeout(() => response.end(), 50);
       return;
     }
@@ -358,6 +390,15 @@ test("local Playwright fixture preserves root-response before DOM-observer order
     assert.ok(result.root_api.response_end_ms <= result.observer_capture.armed_at_ms);
     assert.ok(result.observer_capture.armed_at_ms <= result.observer_capture.first_present_root_ms);
     assert.ok(result.sse.events.some(event => event.event_type === "model-page" && event.model_version === 8));
+    const initial = result.sse.events.find(event => event.event_type === "model-page");
+    assert.equal(initial.root_match_status, "matched");
+    assert.deepEqual([initial.root.state, initial.root.complete_local_coverage, initial.root.explicitly_stopped, initial.root.download_progress, initial.root.downloading_speed, initial.root.eta, initial.root.model_version], ["downloading", false, false, 25, 3, 4, 8]);
+    const invalidations = result.sse.events.filter(event => event.event_type === "model-invalidate");
+    assert.equal(invalidations.length, 2);
+    assert.equal(invalidations[0].root_match_status, "missing");
+    assert.equal(invalidations[0].root.state, null);
+    assert.equal(invalidations[1].root_match_status, "matched");
+    assert.deepEqual([invalidations[1].model_version, invalidations[1].root.state, invalidations[1].root.complete_local_coverage, invalidations[1].root.explicitly_stopped, invalidations[1].root.download_progress, invalidations[1].root.downloading_speed, invalidations[1].root.eta], [10, "downloaded", true, false, 100, 0, 0]);
     const written = fs.readFileSync(output, "utf8");
     assert.ok(!written.includes(rootId));
     assert.ok(!written.includes("Pair One"));

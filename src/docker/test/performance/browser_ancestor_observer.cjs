@@ -31,6 +31,7 @@ const SAFE_SIZE = /^[A-Za-z0-9%:/+., _-]{0,96}$/;
 const ROOT_FIELDS = [
   "state", "local_size", "remote_size", "transferred_size",
   "display_size_total", "display_transferred_size", "download_progress",
+  "downloading_speed", "eta", "explicitly_stopped",
   "complete_local_coverage", "final_move_succeeded", "model_version",
 ];
 
@@ -112,6 +113,9 @@ function emptyRootProjection(modelVersion = null) {
     display_size_total: null,
     display_transferred_size: null,
     download_progress: null,
+    downloading_speed: null,
+    eta: null,
+    explicitly_stopped: null,
     complete_local_coverage: null,
     final_move_succeeded: null,
     model_version: projectModelVersion(modelVersion),
@@ -130,6 +134,9 @@ function projectRootRecord(record, modelVersion = null) {
     download_progress: Number.isInteger(source.download_progress) &&
         source.download_progress >= 0 && source.download_progress <= 100
       ? source.download_progress : null,
+    downloading_speed: boundedSafeInt(source.downloading_speed),
+    eta: boundedSafeInt(source.eta),
+    explicitly_stopped: boundedBoolean(source.explicitly_stopped),
     complete_local_coverage: boundedBoolean(source.complete_local_coverage),
     final_move_succeeded: boundedBoolean(source.final_move_succeeded),
     model_version: projectModelVersion(modelVersion),
@@ -291,7 +298,7 @@ function projectRootApiResponse(body, selectedRootId, metadata = {}) {
   return output;
 }
 
-function projectSse(eventType, data, atMs, source = null) {
+function projectSse(eventType, data, atMs, source = null, selectedRootId = null) {
   let payload = null;
   let parse = "unavailable";
   const payloadBytes = typeof data === "string" ? Buffer.byteLength(data, "utf8") : 0;
@@ -306,6 +313,17 @@ function projectSse(eventType, data, atMs, source = null) {
     } catch (_) { /* bounded metadata intentionally retains no raw payload */ }
   }
   const modelVersion = projectModelVersion(payload?.model_version ?? payload?.global_model_version);
+  let rootMatchStatus = "not_applicable";
+  let root = emptyRootProjection(modelVersion);
+  if (selectedRootId && ["model-page", "model-invalidate", "model-patch"].includes(eventType)) {
+    const records = payload?.records;
+    const match = Array.isArray(records) ? records.find(record => record && typeof record === "object" &&
+      !Array.isArray(record) && record.file_id === selectedRootId) : null;
+    rootMatchStatus = !payload ? "unavailable" : !Array.isArray(records) ? "malformed" : match ? "matched" : "missing";
+    if (match) root = projectRootRecord(match, modelVersion);
+  } else if (["model-page", "model-invalidate", "model-patch", "model-reset"].includes(eventType)) {
+    rootMatchStatus = "not_included";
+  }
   const projected = {
     at_ms: Math.max(0, boundedInt(atMs) ?? 0),
     event_type: safeEventType(eventType),
@@ -315,6 +333,8 @@ function projectSse(eventType, data, atMs, source = null) {
     payload_oversize: payloadOversize,
     payload_skipped: payloadOversize || payload === null,
     payload_bytes: Math.min(payloadBytes, MAX_SSE_PAYLOAD_BYTES + 1),
+    root_match_status: rootMatchStatus,
+    root,
   };
   if (source && typeof source === "object") {
     projected.source_id = boundedInt(source.source_id);
@@ -741,7 +761,7 @@ async function liveCapture(rawConfig) {
     }
     const { chromium } = require(config.playwrightModule);
     context = await chromium.launchPersistentContext(config.profile, { headless: true, viewport: { width: 1280, height: 800 }, timeout: startupBudget() });
-    await context.addInitScript(({ originMs, maxSsePayloadBytes }) => {
+    await context.addInitScript(({ originMs, maxSsePayloadBytes, selectedRootId }) => {
       const atMs = () => Math.max(0, Date.now() - originMs);
       const safeTokenInPage = value => typeof value === "string" && /^[A-Za-z0-9_-]{1,48}$/.test(value) ? value : "unknown";
       const state = { opened: 0, errors: 0, events: [], eventsDropped: 0, payloadOversize: 0, payloadSkipped: 0, sources: [], sourcesDropped: 0, navigation: [] };
@@ -789,9 +809,35 @@ async function liveCapture(rawConfig) {
             const candidate = data && typeof data === "object" && !Array.isArray(data) ? (Number.isInteger(data.model_version) ? data.model_version : data.global_model_version) : null;
             const modelVersion = Number.isInteger(candidate) && candidate >= 0 && candidate <= 2147483647 ? candidate : null;
             if (type === "model-page" && source.first_model_page_ms === null) source.first_model_page_ms = eventAtMs;
-            state.events.push({ at_ms: eventAtMs, event_type: safeTokenInPage(type), model_version: modelVersion, model_version_available: modelVersion !== null, payload_projection: payloadOversize ? "oversize" : data ? "projected" : "unavailable", payload_oversize: payloadOversize, payload_skipped: !data, payload_bytes: Math.min(payloadBytes, maxSsePayloadBytes + 1), source_id: source.source_id, route_class: source.route_class, scope_class: source.scope_class, scope_digest: source.scope_digest });
+            let rootMatchStatus = "not_applicable";
+            let root = { state: null, local_size: null, remote_size: null, transferred_size: null, display_size_total: null, display_transferred_size: null, download_progress: null, downloading_speed: null, eta: null, explicitly_stopped: null, complete_local_coverage: null, final_move_succeeded: null, model_version: modelVersion };
+            if (["model-page", "model-invalidate", "model-patch"].includes(type)) {
+              const records = data?.records;
+              const match = selectedRootId && Array.isArray(records) ? records.find(record => record && typeof record === "object" && !Array.isArray(record) && record.file_id === selectedRootId) : null;
+              rootMatchStatus = !selectedRootId ? "not_included" : !data ? "unavailable" : !Array.isArray(records) ? "malformed" : match ? "matched" : "missing";
+              if (match) {
+                root = {
+                  state: typeof match.state === "string" && /^[A-Za-z0-9_-]{1,48}$/.test(match.state) ? match.state : null,
+                  local_size: Number.isSafeInteger(match.local_size) && match.local_size >= 0 ? match.local_size : null,
+                  remote_size: Number.isSafeInteger(match.remote_size) && match.remote_size >= 0 ? match.remote_size : null,
+                  transferred_size: Number.isSafeInteger(match.transferred_size) && match.transferred_size >= 0 ? match.transferred_size : null,
+                  display_size_total: Number.isSafeInteger(match.display_size_total) && match.display_size_total >= 0 ? match.display_size_total : null,
+                  display_transferred_size: Number.isSafeInteger(match.display_transferred_size) && match.display_transferred_size >= 0 ? match.display_transferred_size : null,
+                  download_progress: Number.isInteger(match.download_progress) && match.download_progress >= 0 && match.download_progress <= 100 ? match.download_progress : null,
+                  downloading_speed: Number.isSafeInteger(match.downloading_speed) && match.downloading_speed >= 0 ? match.downloading_speed : null,
+                  eta: Number.isSafeInteger(match.eta) && match.eta >= 0 ? match.eta : null,
+                  explicitly_stopped: typeof match.explicitly_stopped === "boolean" ? match.explicitly_stopped : null,
+                  complete_local_coverage: typeof match.complete_local_coverage === "boolean" ? match.complete_local_coverage : null,
+                  final_move_succeeded: typeof match.final_move_succeeded === "boolean" ? match.final_move_succeeded : null,
+                  model_version: modelVersion,
+                };
+              }
+            } else if (["model-reset"].includes(type)) {
+              rootMatchStatus = "not_included";
+            }
+            state.events.push({ at_ms: eventAtMs, event_type: safeTokenInPage(type), model_version: modelVersion, model_version_available: modelVersion !== null, payload_projection: payloadOversize ? "oversize" : data ? "projected" : "unavailable", payload_oversize: payloadOversize, payload_skipped: !data, payload_bytes: Math.min(payloadBytes, maxSsePayloadBytes + 1), root_match_status: rootMatchStatus, root, source_id: source.source_id, route_class: source.route_class, scope_class: source.scope_class, scope_digest: source.scope_digest });
           };
-          ["open", "error", "status", "model-page", "model-summary", "model-patch", "model-reset"].forEach(type => this.addEventListener(type, capture(type)));
+          ["open", "error", "status", "model-page", "model-summary", "model-invalidate", "model-patch", "model-reset"].forEach(type => this.addEventListener(type, capture(type)));
         }
         close(...args) { const source = sourceByInstance.get(this); if (source && source.close_ms === null) source.close_ms = atMs(); return super.close(...args); }
       }
@@ -804,7 +850,7 @@ async function liveCapture(rawConfig) {
       window.addEventListener("pagehide", () => recordNavigation("pagehide"));
       window.addEventListener("beforeunload", () => recordNavigation("beforeunload"));
       window.__g21Capture = state;
-    }, { originMs: started, maxSsePayloadBytes: MAX_SSE_PAYLOAD_BYTES });
+    }, { originMs: started, maxSsePayloadBytes: MAX_SSE_PAYLOAD_BYTES, selectedRootId: rootId });
     const page = await context.newPage();
     page.on("framenavigated", frame => {
       if (frame !== page.mainFrame() || result.navigation.events.length >= MAX_NAVIGATION_EVENTS) return;
