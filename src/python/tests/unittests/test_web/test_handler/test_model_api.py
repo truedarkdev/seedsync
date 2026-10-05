@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 from webtest import TestApp
 
 from common import BreadcrumbTraceCollector, Config, Status
+from common.breadcrumb_trace import opaque_trace_correlation
 from common.performance_diagnostics import PerformanceDiagnosticsCollector
 from controller import Controller
 from controller.controller import MODEL_LEGACY_SCOPE_ID
@@ -21,6 +22,7 @@ from controller.model_builder import ModelBuilder
 from model import ActiveProgressOverlay, Model, ModelError, ModelFile
 from system import SystemFile
 from web.handler.model_api import ModelApiHandler, ScopedModelListener, SummaryModelListener
+from web.auth_store import ApiKeyStore
 from web.web_app import WebApp
 import bottle
 
@@ -942,6 +944,192 @@ class TestModelApi(unittest.TestCase):
         legacy = self.client.get("/server/model/v1/pairs/{}/roots".format(MODEL_LEGACY_SCOPE_ID)).json
         self.assertEqual(["legacy"], [record["name"] for record in legacy["records"]])
         self.assertEqual("legacy", legacy["records"][0]["file_id"])
+
+    def test_completion_ack_is_admin_scoped_and_matches_model_producer_correlation(self):
+        spool = tempfile.TemporaryDirectory(prefix="test_model_completion_ack_spool_")
+        self.addCleanup(spool.cleanup)
+        trace = BreadcrumbTraceCollector(
+            lambda: True, durable_enabled=True, durable_path=spool.name,
+            policy={"default": "off", "rules": {"completion.gate": "info"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.model.set_completion_provenance_diagnostics(
+            self.controller._completion_provenance_trace_enabled,
+            self.controller._record_model_completion_provenance,
+        )
+        root = self._file("ack-root", "pair-a", directory=True)
+        root.state = ModelFile.State.DOWNLOADING
+        self.model.add_file(root)
+        finished = self._file("ack-root", "pair-a", directory=True)
+        finished.state = ModelFile.State.DEFAULT
+        self.model.update_file(finished)
+        secured, admin_secret, reader_secret = self._completion_ack_client()
+        endpoint = "/server/admin/model/v1/pairs/pair-a/completion-ack"
+        request = {
+            "file_id": root.file_id,
+            "expected_model_version": self.controller.get_model_root_updates(
+                "pair-a", [root.file_id],
+            )["model_version"],
+        }
+        unauthenticated = self.client.post_json(endpoint, request, expect_errors=True)
+        self.assertEqual(401, unauthenticated.status_int)
+        reader = secured.post_json(
+            endpoint, request, expect_errors=True,
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(reader_secret)},
+        )
+        self.assertEqual(403, reader.status_int)
+
+        version_before_ack = self.model.version
+        response = secured.post_json(
+            endpoint, request,
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(admin_secret)},
+        )
+        self.assertTrue(trace.flush_durable(2.0))
+        trace.close()
+        with open(os.path.join(spool.name, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+            finalized_rows = [json.loads(line) for line in handle if line.strip()]
+        finalized_producers = [
+            row for row in finalized_rows
+            if row.get("message") == "model_completion_provenance"
+            and row.get("details", {}).get("reason") == "published_state_rollback"
+        ]
+        artifact_path = os.environ.get("SEEDSYNC_COMPLETION_FINALIZED_ROWS_PATH")
+        if artifact_path:
+            with open(artifact_path, "w", encoding="utf-8") as handle:
+                for row in finalized_producers:
+                    handle.write(json.dumps(row, sort_keys=True) + "\n")
+            ack_path = os.path.splitext(artifact_path)[0] + ".ack.json"
+            with open(ack_path, "w", encoding="utf-8") as handle:
+                json.dump(response.json, handle, sort_keys=True)
+        producer = finalized_producers[0]
+        self.assertEqual(1, len(finalized_producers))
+        self.assertEqual({
+            "schema": "completion_root_ack.v1",
+            "source": "current_model_root",
+            "status": "acknowledged",
+            "completion_correlation": producer["corr_id"],
+            "model_version": request["expected_model_version"],
+            "global_model_version": version_before_ack,
+            "process_session": opaque_trace_correlation("model-api-completion-process"),
+        }, response.json)
+        self.assertNotIn(root.file_id, response.text)
+        self.assertNotIn("file_id", response.json)
+        self.assertEqual(version_before_ack, self.model.version)
+
+    def test_completion_ack_accepts_fresh_progress_and_rejects_supplied_stale_versions(self):
+        root = self._file("progress-root", "pair-a", directory=True)
+        self.model.add_file(root)
+        secured, admin_secret, _ = self._completion_ack_client()
+        endpoint = "/server/admin/model/v1/pairs/pair-a/completion-ack"
+        headers = {"HTTP_AUTHORIZATION": "Bearer {}".format(admin_secret)}
+
+        first = secured.post_json(endpoint, {"file_id": root.file_id}, extra_environ=headers)
+        old_version = first.json["model_version"]
+        self.assertIs(type(old_version), int)
+
+        progressed = self._file("progress-root", "pair-a", directory=True)
+        progressed.local_size = 1
+        self.model.update_file(progressed)
+        current = self.controller.get_model_root_updates("pair-a", [root.file_id])
+        accepted = secured.post_json(endpoint, {"file_id": root.file_id}, extra_environ=headers)
+        self.assertEqual(current["model_version"], accepted.json["model_version"])
+        self.assertGreater(accepted.json["model_version"], old_version)
+
+        stale_version = secured.post_json(
+            endpoint,
+            {"file_id": root.file_id, "expected_model_version": old_version},
+            expect_errors=True, extra_environ=headers,
+        )
+        self.assertEqual(409, stale_version.status_int)
+        stale_process_session = "0" * 16
+        if stale_process_session == first.json["process_session"]:
+            stale_process_session = "1" * 16
+        stale_session = secured.post_json(
+            endpoint,
+            {"file_id": root.file_id, "expected_process_session": stale_process_session},
+            expect_errors=True, extra_environ=headers,
+        )
+        self.assertEqual(409, stale_session.status_int)
+        for malformed_session in ("stale-process", "A" * 16, "0" * 15, True, None):
+            malformed = secured.post_json(
+                endpoint,
+                {"file_id": root.file_id, "expected_process_session": malformed_session},
+                expect_errors=True, extra_environ=headers,
+            )
+            self.assertEqual(400, malformed.status_int)
+        valid_session = secured.post_json(
+            endpoint,
+            {
+                "file_id": root.file_id,
+                "expected_model_version": accepted.json["model_version"],
+                "expected_process_session": first.json["process_session"],
+            },
+            extra_environ=headers,
+        )
+        self.assertEqual(200, valid_session.status_int)
+        with patch("common.breadcrumb_trace._OPAQUE_TRACE_CORRELATION_KEY", b"changed-process-key"):
+            restarted = secured.post_json(endpoint, {"file_id": root.file_id}, extra_environ=headers)
+            old_session = secured.post_json(
+                endpoint,
+                {"file_id": root.file_id, "expected_process_session": first.json["process_session"]},
+                expect_errors=True, extra_environ=headers,
+            )
+        self.assertEqual(200, restarted.status_int)
+        self.assertNotEqual(first.json["process_session"], restarted.json["process_session"])
+        self.assertEqual(409, old_session.status_int)
+
+    def test_completion_ack_requires_exact_current_scoped_root_and_handles_lookup_failure(self):
+        root = self._file("directory", "pair-a", directory=True)
+        child = self._file("child.bin", "pair-a")
+        root.add_child(child)
+        other_pair_root = self._file("other", "pair-b", directory=True)
+        legacy_root = self._file("legacy", None, directory=True)
+        self.model.add_file(root)
+        self.model.add_file(other_pair_root)
+        self.model.add_file(legacy_root)
+        secured, admin_secret, _ = self._completion_ack_client()
+        endpoint = "/server/admin/model/v1/pairs/pair-a/completion-ack"
+        headers = {"HTTP_AUTHORIZATION": "Bearer {}".format(admin_secret)}
+
+        for requested_file_id in (
+            child.file_id,
+            other_pair_root.file_id,
+            ModelFile.build_file_id("missing", "pair-a"),
+        ):
+            with self.subTest(file_id=requested_file_id):
+                response = secured.post_json(
+                    endpoint, {"file_id": requested_file_id},
+                    expect_errors=True, extra_environ=headers,
+                )
+                self.assertEqual(404, response.status_int)
+
+        malformed = secured.post_json(
+            endpoint, {"file_id": root.file_id, "expected_model_version": True},
+            expect_errors=True, extra_environ=headers,
+        )
+        self.assertEqual(400, malformed.status_int)
+        with patch.object(self.controller, "get_model_root_updates", side_effect=RuntimeError("unavailable")):
+            unavailable = secured.post_json(
+                endpoint, {"file_id": root.file_id},
+                expect_errors=True, extra_environ=headers,
+            )
+        self.assertEqual(503, unavailable.status_int)
+        self.assertEqual({"error": "model_snapshot_unavailable"}, unavailable.json)
+        legacy = secured.post_json(
+            "/server/admin/model/v1/pairs/{}/completion-ack".format(MODEL_LEGACY_SCOPE_ID),
+            {"file_id": legacy_root.file_id}, expect_errors=True, extra_environ=headers,
+        )
+        self.assertEqual(400, legacy.status_int)
+
+    def _completion_ack_client(self):
+        directory = tempfile.TemporaryDirectory(prefix="test_model_completion_ack_")
+        self.addCleanup(directory.cleanup)
+        store = ApiKeyStore(file_path=os.path.join(directory.name, "api-keys.json"))
+        admin_secret = store.create_api_key("ack-admin", ["admin"])["secret"]
+        reader_secret = store.create_api_key("ack-reader", ["read"])["secret"]
+        app = WebApp(self.controller._Controller__context, self.controller, auth_store=store)
+        ModelApiHandler(self.controller).add_routes(app)
+        return TestApp(app), admin_secret, reader_secret
 
     def test_child_identity_must_be_canonical_and_in_scope(self):
         other = self._file("other", "pair-b", directory=True)

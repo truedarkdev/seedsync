@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 from collections import OrderedDict
 import json
+import re
 import time
 from threading import Event, Lock
 from typing import Iterator, Optional
@@ -337,6 +338,70 @@ class ModelApiHandler(IHandler):
             "/server/model/v1/pairs/<path_pair_id>/stream",
             required_scope="stream", allow_sessionless_ui=True,
         )(self.__handle_stream)
+        web_app.add_post_handler(
+            "/server/admin/model/v1/pairs/<path_pair_id>/completion-ack",
+            self.__handle_completion_ack, required_scope="admin", always_auth=True,
+        )
+
+    def __handle_completion_ack(self, path_pair_id: str) -> HTTPResponse:
+        scope_id = self.__validate_scope_id(path_pair_id)
+        if scope_id == MODEL_LEGACY_SCOPE_ID:
+            return self.__json_response({"error": "path_pair_id_required"}, 400)
+
+        payload = bottle.request.json
+        if not isinstance(payload, dict):
+            return self.__json_response({"error": "invalid_request"}, 400)
+        file_id = payload.get("file_id")
+        if not isinstance(file_id, str) or not file_id or len(file_id) > 4096:
+            return self.__json_response({"error": "invalid_file_id"}, 400)
+
+        expected_version: Optional[int] = None
+        if "expected_model_version" in payload:
+            expected_version_value = payload.get("expected_model_version")
+            if type(expected_version_value) is not int or expected_version_value < 0:
+                return self.__json_response({"error": "invalid_model_version"}, 400)
+            expected_version = expected_version_value
+
+        expected_process_session: Optional[str] = None
+        if "expected_process_session" in payload:
+            session_value = payload.get("expected_process_session")
+            if not isinstance(session_value, str) or re.fullmatch(r"[0-9a-f]{16}", session_value) is None:
+                return self.__json_response({"error": "invalid_process_session"}, 400)
+            expected_process_session = session_value
+
+        try:
+            snapshot = self.__controller.get_model_root_updates(scope_id, [file_id])
+        except Exception:
+            return self.__json_response({"error": "model_snapshot_unavailable"}, 503)
+
+        records = snapshot.get("records") if isinstance(snapshot, dict) else None
+        if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+            return self.__json_response({"error": "model_root_not_found"}, 404)
+        root = records[0]
+        if root.get("file_id") != file_id or root.get("path_pair_id") != scope_id:
+            return self.__json_response({"error": "model_root_not_found"}, 404)
+
+        model_version = snapshot.get("model_version")
+        if type(model_version) is not int or model_version < 0:
+            return self.__json_response({"error": "model_snapshot_unavailable"}, 503)
+        if expected_version is not None and expected_version != model_version:
+            return self.__json_response({"error": "model_version_stale"}, 409)
+
+        process_session = opaque_trace_correlation("model-api-completion-process")
+        if expected_process_session is not None and expected_process_session != process_session:
+            return self.__json_response({"error": "process_session_stale"}, 409)
+        global_version = snapshot.get("_global_model_version")
+        if type(global_version) is not int or global_version < 0:
+            global_version = None
+        return self.__json_response({
+            "schema": "completion_root_ack.v1",
+            "source": "current_model_root",
+            "status": "acknowledged",
+            "completion_correlation": "completion:" + opaque_trace_correlation(file_id),
+            "model_version": model_version,
+            "global_model_version": global_version,
+            "process_session": process_session,
+        }, scope_id=scope_id)
 
     def __record_duration(self, metric: str, operation) -> object:
         diagnostics = self.__performance_diagnostics
