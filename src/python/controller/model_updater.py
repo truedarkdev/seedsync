@@ -7420,6 +7420,30 @@ class ModelUpdater(_ControllerCoreAccess):
             except Exception:
                 return None
 
+        def pending_completion_file_ids() -> set[str]:
+            return {
+                ModelFile.build_file_id(file_name, path_pair_id)
+                for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
+            }
+
+        def pending_completion_presentation_file_ids() -> set[str]:
+            # Compatibility floors recorded before this ownership record remain
+            # presentation-capable. New pending completions use the record so
+            # global candidate adoption cannot erase their lifecycle projection.
+            pending_ids = pending_completion_file_ids()
+            return set(getattr(
+                controller,
+                "_Controller__pending_completion_progress_floor_overlay_ids",
+                set(),
+            )).intersection(pending_ids).union(
+                self._pending_completion_publication_file_ids(controller, pending_ids)
+            )
+
+        def pending_completion_publication_file_ids() -> set[str]:
+            return self._pending_completion_publication_file_ids(
+                controller, pending_completion_file_ids(),
+            )
+
         _record_lftp_status_breadcrumb(
             controller,
             lftp_statuses,
@@ -8883,6 +8907,41 @@ class ModelUpdater(_ControllerCoreAccess):
                             progressive_delta_applied = True
                         else:
                             old_file = model.get_file(file_id)
+                            floor_disposition = "not_called"
+                            floor = controller._Controller__pending_completion_progress_floors.get(
+                                file_id,
+                            )
+                            if floor is not None:
+                                if self._pending_completion_floor_reset(new_file):
+                                    floor_disposition = (
+                                        "reset_stop" if new_file.explicitly_stopped else "reset_zero"
+                                    )
+                                    self._record_completion_floor_decision(
+                                        file_id, "reset",
+                                        "explicit_stop" if new_file.explicitly_stopped else "zero_local",
+                                        True, poll_correlation=lftp_status_poll_correlation,
+                                    )
+                                    self._clear_pending_completion_progress_floor(controller, file_id)
+                                else:
+                                    if new_file.state == ModelFile.State.DEFAULT and new_file.local_size is None:
+                                        floor_disposition = "missing_local"
+                                        self._record_completion_floor_decision(
+                                            file_id, "refused", "missing_local", True,
+                                            poll_correlation=lftp_status_poll_correlation,
+                                        )
+                                    pending_ids = pending_completion_file_ids()
+                                    if floor_disposition == "not_called":
+                                        floor_disposition = (
+                                            "applied" if file_id in pending_ids else "unknown"
+                                        )
+                                    self._apply_pending_completion_progress_floor(
+                                        new_file,
+                                        pending_ids,
+                                        floor[0],
+                                        floor[1],
+                                        pending_completion_presentation_file_ids(),
+                                        pending_completion_publication_file_ids(),
+                                    )
                             if old_file != new_file:
                                 structural_identity = structural_identity_for(new_file)
                                 model.update_file(
@@ -8890,6 +8949,7 @@ class ModelUpdater(_ControllerCoreAccess):
                                     structural_job_identity=structural_identity,
                                     publication_context=publication_route_floor_context(
                                         new_file, "progressive_root", structural_identity,
+                                        floor_disposition,
                                     ),
                                 )
                                 next_tree_count += tree_file_count(new_file) - tree_file_count(old_file)
@@ -10106,33 +10166,6 @@ class ModelUpdater(_ControllerCoreAccess):
             ), _ModelUpdateDurationSpan(
                     diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF,
             ):
-                def pending_completion_file_ids():
-                    return {
-                        ModelFile.build_file_id(file_name, path_pair_id)
-                        for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
-                    }
-
-                def pending_completion_presentation_file_ids() -> set[str]:
-                    # Compatibility floors recorded before this ownership
-                    # record remain presentation-capable. New pending
-                    # completions use the record so global candidate adoption
-                    # cannot erase their lifecycle projection.
-                    pending_ids = pending_completion_file_ids()
-                    return set(getattr(
-                        controller,
-                        "_Controller__pending_completion_progress_floor_overlay_ids",
-                        set(),
-                    )).intersection(pending_ids).union(
-                        self._pending_completion_publication_file_ids(
-                            controller, pending_ids,
-                        )
-                    )
-
-                def pending_completion_publication_file_ids() -> set[str]:
-                    return self._pending_completion_publication_file_ids(
-                        controller, pending_completion_file_ids(),
-                    )
-
                 def discard_pending_completion_file(file_id: str) -> None:
                     controller._Controller__pending_completion_file_names = {
                         file_name

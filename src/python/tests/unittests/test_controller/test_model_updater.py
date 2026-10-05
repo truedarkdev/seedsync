@@ -19468,6 +19468,21 @@ class TestModelUpdater(unittest.TestCase):
                 self.assertIsNone(file.download_progress)
                 self.assertNotEqual(ModelFile.State.DOWNLOADING, file.state)
 
+        missing_local = ModelFile("release", False)
+        missing_local.remote_size = 1000
+        missing_local.local_size = None
+        missing_local.state = ModelFile.State.DEFAULT
+        ModelUpdater._apply_pending_completion_progress_floor(
+            missing_local,
+            {missing_local.file_id},
+            previous_download_progress=93,
+            previous_transferred_size=930,
+            presentation_floor_file_ids={missing_local.file_id},
+        )
+        self.assertIsNone(missing_local.transferred_size)
+        self.assertIsNone(missing_local.download_progress)
+        self.assertEqual(ModelFile.State.DEFAULT, missing_local.state)
+
     def test_newer_replacement_full_update_does_not_inherit_retired_floor(self):
         """A newer active job clears the floor before candidate diff handling."""
         file_name = "replacement.bin"
@@ -19626,6 +19641,7 @@ class TestModelUpdater(unittest.TestCase):
     def test_mirror_pending_floor_survives_delayed_authoritative_scan_publications(self):
         """Compare the last active MIRROR counter after a real updater overlay exists."""
         scan_time = datetime(2026, 1, 1)
+        scan_session = "progressive-floor-session"
 
         def run(last_transferred):
             remote_root = SystemFile("root", 1010, True, mtime_ns=1)
@@ -19649,12 +19665,6 @@ class TestModelUpdater(unittest.TestCase):
             builder.set_remote_files([remote_root])
             builder.set_local_files([initial_local])
             builder.set_active_files([initial_local])
-            initial = LftpJobStatus(
-                1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "",
-            )
-            initial.total_transfer_state = LftpJobStatus.TransferState(510, 1010, 50, 100, 5)
-            builder.set_lftp_statuses([initial])
-
             def status(transferred):
                 value = LftpJobStatus(
                     1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "",
@@ -19664,12 +19674,28 @@ class TestModelUpdater(unittest.TestCase):
                 )
                 return value
 
+            def scan_result(files, *, final=False):
+                return ScannerResult(
+                    scan_time,
+                    files,
+                    scanned_path_pair_ids={None},
+                    generation=1,
+                    is_progress=True,
+                    completed_path_pair_ids={None} if final else set(),
+                    is_scan_final=final,
+                    unknown_path_pair_ids=set() if final else {None},
+                    is_full_snapshot=final,
+                    full_snapshot_path_pair_ids={None} if final else set(),
+                    session_token=scan_session,
+                )
+
             common_active = status(400)
             final_active = status(last_transferred)
             model = builder.build_model()
             controller, _ = self._make_progressive_update_controller(
-                None, local_scan=None, model_builder=builder, model=model,
+                None, local_scan=None, authoritative=False, model_builder=builder, model=model,
             )
+            controller._Controller__progress_publication_epoch = 0
             controller._Controller__uses_async_lftp_owner = MagicMock(return_value=False)
             controller._get_lftp_status_snapshot = (
                 Controller._get_lftp_status_snapshot.__get__(controller, Controller)
@@ -19680,30 +19706,24 @@ class TestModelUpdater(unittest.TestCase):
             controller._Controller__lftp.status.side_effect = [
                 [common_active], [final_active], [], [], [],
             ]
-            controller._Controller__active_scan_process.pop_latest_result.side_effect = [
-                ScannerResult(
-                    scan_time, [local_tree(1000)], scanned_path_pair_ids=set(),
-                    is_scan_final=False,
-                ), None, None, None, None,
-            ]
-            delayed_scan = ScannerResult(
-                scan_time, [local_tree(1000)], scanned_path_pair_ids=set(),
-                is_scan_final=False,
+            initial_local_scan = scan_result([initial_local])
+            initial_remote_scan = scan_result([remote_root])
+            delayed_scan = scan_result(
+                # The local root is a real partial selected-root publication:
+                # retirement already recorded the last coherent transfer floor,
+                # and this scan has not yet observed the final staged payload.
+                [local_tree(400)],
             )
-            final_local = ScannerResult(
-                scan_time, [local_tree(1000, staging=False)], scanned_path_pair_ids={None},
-                completed_path_pair_ids={None}, is_scan_final=True,
+            final_local = scan_result([local_tree(1000, staging=False)], final=True)
+            final_remote = scan_result([remote_root], final=True)
+            local_scan_inputs = [initial_local_scan, None, None, delayed_scan, final_local]
+            remote_scan_inputs = [initial_remote_scan, None, None, None, final_remote]
+            controller._Controller__local_scan_process = self._progressive_process(
+                scan_session, [[result] if result is not None else [] for result in local_scan_inputs],
             )
-            final_remote = ScannerResult(
-                scan_time, [remote_root], scanned_path_pair_ids={None},
-                completed_path_pair_ids={None}, is_scan_final=True,
+            controller._Controller__remote_scan_process = self._progressive_process(
+                scan_session, [[result] if result is not None else [] for result in remote_scan_inputs],
             )
-            controller._Controller__local_scan_process.pop_latest_result.side_effect = [
-                None, None, None, delayed_scan, final_local,
-            ]
-            controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
-                None, None, None, None, final_remote,
-            ]
             controller.MoveFromStagingResult = Controller.MoveFromStagingResult
             controller._reserve_move_attempt = MagicMock(return_value=True)
             controller._release_move_attempt = MagicMock()
@@ -19726,8 +19746,10 @@ class TestModelUpdater(unittest.TestCase):
                     "visible": Controller._model_record_visible_state(root),
                     "coverage": root.complete_local_coverage,
                     "stopped": root.explicitly_stopped,
-                    "transferred": root.display_transferred_size,
-                    "total": root.display_size_total,
+                    "progress": root.download_progress,
+                    "transferred": root.transferred_size,
+                    "local_size": root.local_size,
+                    "published_identity": model.published_file_job_identity("root"),
                     "pending": set(controller._Controller__pending_completion_file_names),
                     "floors": dict(getattr(
                         controller, "_Controller__pending_completion_progress_floors", {},
@@ -19752,6 +19774,25 @@ class TestModelUpdater(unittest.TestCase):
                 }
 
             callbacks = []
+            progressive_floor_contexts = []
+            original_model_update = model.update_file
+
+            def capture_model_update(file, **kwargs):
+                context = kwargs.get("publication_context")
+                if file.file_id == ModelFile.build_file_id("root", None) and isinstance(context, dict):
+                    progressive_floor_contexts.append({
+                        "context": dict(context),
+                        "raw_state": file.state.name.lower(),
+                        "progress": file.download_progress,
+                        "transferred": file.transferred_size,
+                        "local_size": file.local_size,
+                        "coverage": file.complete_local_coverage,
+                        "stopped": file.explicitly_stopped,
+                        "visible": Controller._model_record_visible_state(file),
+                    })
+                return original_model_update(file, **kwargs)
+
+            model.update_file = capture_model_update
             original_callback_setter = model.set_version_publication_callback
 
             def capture_callback(callback):
@@ -19766,31 +19807,118 @@ class TestModelUpdater(unittest.TestCase):
             model.set_version_publication_callback = capture_callback
             updater = ModelUpdater(controller)
             observations = [publication()]
-            for _ in range(5):
+            for tick in range(5):
                 controller._Controller__next_lftp_status_poll_at = None
                 updater.update()
                 observations.append(publication())
-            return observations, callbacks
+            def input_projection(result):
+                if result is None:
+                    return None
+                return {
+                    "generation": result.generation,
+                    "session": result.session_token,
+                    "scanned": sorted("none" if pair is None else pair
+                                      for pair in result.scanned_path_pair_ids),
+                    "completed": sorted("none" if pair is None else pair
+                                        for pair in result.completed_path_pair_ids),
+                    "unknown": sorted("none" if pair is None else pair
+                                      for pair in result.unknown_path_pair_ids),
+                    "is_progress": result.is_progress,
+                    "is_scan_final": result.is_scan_final,
+                    "is_full_snapshot": result.is_full_snapshot,
+                    "root_sizes": [file.size for file in result.files],
+                }
 
-        half, half_callbacks = run(510)
-        complete, complete_callbacks = run(1010)
-        # The common first updater tick creates the active overlay in both cases;
-        # only the final active counter differs before the healthy empty retirement.
+            scan_inputs = [
+                {
+                    "tick": tick + 1,
+                    "local": input_projection(local_scan_inputs[tick]),
+                    "remote": input_projection(remote_scan_inputs[tick]),
+                }
+                for tick in range(5)
+            ]
+            return observations, callbacks, progressive_floor_contexts, scan_inputs
+
+        half, half_callbacks, half_routes, half_inputs = run(510)
+        complete, complete_callbacks, complete_routes, complete_inputs = run(1010)
+        def retained_snapshot(observation):
+            return {
+                "raw_state": observation["state"],
+                "visible": observation["visible"],
+                "progress": observation["progress"],
+                "transferred": observation["transferred"],
+                "local_size": observation["local_size"],
+                "published_identity": observation["published_identity"],
+                "coverage": observation["coverage"],
+                "stopped": observation["stopped"],
+                "pending": bool(observation["pending"]),
+                "floor": observation["floors"].get("root"),
+            }
+
+        evidence_path = os.environ.get("SEEDSYNC_PROGRESSIVE_PENDING_FLOOR_ROWS_PATH")
+        if evidence_path:
+            with open(evidence_path, "w", encoding="utf-8") as evidence_file:
+                json.dump({
+                    "half": {
+                        "snapshots": [retained_snapshot(value) for value in half],
+                        "model_update_inputs": half_routes,
+                        "scanner_inputs": half_inputs,
+                    },
+                    "complete": {
+                        "snapshots": [retained_snapshot(value) for value in complete],
+                        "model_update_inputs": complete_routes,
+                        "scanner_inputs": complete_inputs,
+                    },
+                }, evidence_file, sort_keys=True)
+
+        for observations in (half, complete):
+            self.assertEqual((1, "mirror"), observations[2]["published_identity"], observations)
+        self.assertIn("root", complete[3]["publication_ids"], complete)
+        self.assertIn("root", complete[3]["presentation_ids"], complete)
+        self.assertIn("root", complete[3]["floor_identity_ids"], complete)
+        self.assertNotIn("root", half[3]["publication_ids"], half)
+        self.assertNotIn("root", half[3]["presentation_ids"], half)
+
+        admitted_routes = [
+            [row for row in routes
+             if row["context"].get("route") == "progressive_root"
+             and row["context"].get("pending") is True
+             and row["context"].get("floor_present") is True]
+            for routes in (half_routes, complete_routes)
+        ]
+        for routes in admitted_routes:
+            self.assertTrue(routes, routes)
+            self.assertTrue(any(
+                row["context"].get("route") == "progressive_root"
+                and row["context"].get("pending") is True
+                and row["context"].get("floor_present") is True
+                and row["context"].get("floor_disposition") == "applied"
+                for row in routes
+            ), routes)
+        # The updater publishes the running owner before natural retirement;
+        # only the final active counter differs before the healthy empty snapshot.
         for observations, callbacks in ((half, half_callbacks), (complete, complete_callbacks)):
             self.assertEqual("downloading", observations[1]["visible"], observations)
-            self.assertTrue(observations[1]["overlay_identity"], observations)
+            self.assertEqual((1, "mirror"), observations[1]["published_identity"], observations)
             self.assertTrue(observations[3]["pending"], observations)
             self.assertTrue(observations[3]["idle_authoritative"], observations)
             self.assertTrue(callbacks)
             self.assertTrue(observations[5]["coverage"], observations)
             self.assertFalse(observations[5]["stopped"], observations)
-        self.assertEqual("downloading", half[3]["visible"], half)
+        self.assertEqual("stopped", half[3]["visible"], half)
         self.assertEqual("downloading", complete[3]["visible"], complete)
-        self.assertEqual(510, half[2]["overlay"].transferred_size, half)
-        self.assertEqual(1010, complete[2]["overlay"].transferred_size, complete)
+        self.assertEqual(510, half[2]["transferred"], half)
+        self.assertEqual(1010, complete[2]["transferred"], complete)
         self.assertEqual((50, 510), half[3]["floors"]["root"], half)
         self.assertEqual((100, 1010), complete[3]["floors"]["root"], complete)
-        self.assertEqual("downloading", half[4]["visible"], half)
+        self.assertEqual("stopped", half[4]["visible"], half)
         self.assertEqual("downloading", complete[4]["visible"], complete)
+        for observations in (half, complete):
+            self.assertFalse(observations[4]["coverage"], observations)
+            self.assertFalse(observations[4]["stopped"], observations)
+            self.assertTrue(observations[4]["pending"], observations)
+        self.assertEqual(510, half[4]["transferred"], half)
+        self.assertEqual(50, half[4]["progress"], half)
+        self.assertEqual(1010, complete[4]["transferred"], complete)
         self.assertEqual("downloaded", half[5]["visible"], half)
         self.assertEqual("downloaded", complete[5]["visible"], complete)
