@@ -285,6 +285,37 @@ def _lftp_command_facts(details: Mapping[str, object]) -> dict[str, object] | No
     return result
 
 
+def _delete_local_command_facts(
+    row: Mapping[str, object], metadata: Mapping[str, object], details: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Project only bounded Delete Local outcome facts from command breadcrumbs."""
+    if _allowed_field(row, metadata, "category", _CATEGORIES) != "controller":
+        return None
+    if _allowed_field(row, metadata, "stage", _STAGES) != "command":
+        return None
+    message = row.get("message", metadata.get("message"))
+    if not isinstance(message, str) or message not in {"command_dispatched", "command_finished", "command_failed"}:
+        return None
+    facts: dict[str, object] = {}
+    for key, minimum in (
+        ("delete_local_planned_location_count", 0),
+        ("delete_local_removed_location_count", 0),
+    ):
+        if key not in details:
+            continue
+        value = details[key]
+        if value is None or (type(value) is int and minimum <= value <= 2):
+            facts[key] = value
+    value = details.get("delete_local_result_known")
+    if type(value) is bool:
+        facts["delete_local_result_known"] = value
+    value = details.get("delete_local_partial_failure")
+    if value is None or type(value) is bool:
+        if "delete_local_partial_failure" in details:
+            facts["delete_local_partial_failure"] = value
+    return facts or None
+
+
 def _queue_readiness_facts(message: object, details: Mapping[str, object]) -> dict[str, object] | None:
     """Project only the finite, source-shaped Queue readiness discriminator."""
     schema = details.get("schema")
@@ -544,6 +575,7 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     lifecycle = _queue_lifecycle_facts(details) if category == "queue.lifecycle" else None
     gate = _completion_gate_facts(details) if category == "completion.gate" else None
     command = _lftp_command_facts(details) if category == "transfer.lftp.command" else None
+    delete_local = _delete_local_command_facts(row, metadata, details)
     readiness = _queue_readiness_facts(row.get("message"), details) if category == "queue.readiness" else None
     model_page_snapshot = _model_page_snapshot_facts(details) if category == "model_page_snapshot" else None
     model_progress_lineage = _model_progress_lineage_facts(details) if category == "model.progress" else None
@@ -582,6 +614,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["completion_gate"] = gate
     if command is not None:
         result["lftp_command"] = command
+    if delete_local is not None:
+        result.update(delete_local)
     if readiness is not None:
         result["queue_readiness"] = readiness
     if model_page_snapshot is not None:

@@ -1,8 +1,10 @@
 import os
 import posixpath
+import shutil
 import tempfile
 import unittest
 import logging
+import multiprocessing
 from unittest.mock import MagicMock, patch
 
 from controller.delete.delete_process import DeleteLocalProcess, DeleteRemoteProcess
@@ -237,6 +239,316 @@ class TestDeleteRemoteProcess(unittest.TestCase):
 
 
 class TestDeleteLocalProcess(unittest.TestCase):
+    def test_dual_root_directory_delete_prevalidates_then_removes_only_selected_trees(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            final_target = os.path.join(final_root, "selected")
+            staging_target = os.path.join(staging_root, "selected")
+            os.makedirs(final_target)
+            os.makedirs(staging_target)
+            with open(os.path.join(final_target, "final.bin"), "wb") as handle:
+                handle.write(b"final")
+            with open(os.path.join(staging_target, "partial.bin"), "wb") as handle:
+                handle.write(b"partial")
+            os.makedirs(os.path.join(final_root, "sibling"))
+            os.makedirs(os.path.join(staging_root, "sibling"))
+            result_queue = multiprocessing.Queue(maxsize=1)
+            process = DeleteLocalProcess(
+                final_root, "selected", allow_recursive=True,
+                additional_targets=((staging_root, "selected", True),),
+                result_queue=result_queue,
+            )
+            process.logger = MagicMock()
+
+            try:
+                process.run_once()
+                self.assertFalse(os.path.lexists(final_target))
+                self.assertFalse(os.path.lexists(staging_target))
+                self.assertTrue(os.path.isdir(os.path.join(final_root, "sibling")))
+                self.assertTrue(os.path.isdir(os.path.join(staging_root, "sibling")))
+                self.assertEqual(
+                    {"planned": 2, "removed": 2, "known": True, "partial": False},
+                    result_queue.get(timeout=1),
+                )
+            finally:
+                result_queue.close()
+                result_queue.join_thread()
+
+    def test_dual_root_preflight_rejects_second_symlink_before_first_delete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            os.makedirs(final_root)
+            os.makedirs(staging_root)
+            final_target = os.path.join(final_root, "selected.bin")
+            staging_target = os.path.join(staging_root, "selected.bin")
+            with open(final_target, "wb") as handle:
+                handle.write(b"must remain")
+            staging_sentinel = os.path.join(staging_root, "sentinel.bin")
+            with open(staging_sentinel, "wb") as handle:
+                handle.write(b"outside")
+            try:
+                os.symlink(staging_sentinel, staging_target)
+            except (NotImplementedError, OSError):
+                self.skipTest("symbolic links are unavailable")
+            result_queue = multiprocessing.Queue(maxsize=1)
+            process = DeleteLocalProcess(
+                final_root, "selected.bin",
+                additional_targets=((staging_root, "selected.bin", False),),
+                result_queue=result_queue,
+            )
+            process.logger = MagicMock()
+
+            try:
+                with self.assertRaises(OSError):
+                    process.run_once()
+                self.assertTrue(os.path.isfile(final_target))
+                self.assertTrue(os.path.islink(staging_target))
+                self.assertEqual(
+                    {"planned": 2, "removed": 0, "known": True, "partial": False},
+                    result_queue.get(timeout=1),
+                )
+            finally:
+                result_queue.close()
+                result_queue.join_thread()
+
+    def test_dual_root_second_unlink_failure_reports_partial_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            os.makedirs(final_root)
+            os.makedirs(staging_root)
+            final_target = os.path.join(final_root, "selected.bin")
+            staging_target = os.path.join(staging_root, "selected.bin")
+            with open(final_target, "wb") as handle:
+                handle.write(b"final")
+            with open(staging_target, "wb") as handle:
+                handle.write(b"staging")
+            result_queue = multiprocessing.Queue(maxsize=1)
+            process = DeleteLocalProcess(
+                final_root, "selected.bin",
+                additional_targets=((staging_root, "selected.bin", False),),
+                result_queue=result_queue,
+            )
+            process.logger = MagicMock()
+            real_unlink = os.unlink
+
+            def fail_second(path):
+                if path == final_target:
+                    real_unlink(path)
+                    return
+                raise PermissionError("blocked second removal")
+
+            try:
+                with patch("controller.delete.delete_process.os.unlink", side_effect=fail_second):
+                    with self.assertRaises(PermissionError):
+                        process.run_once()
+                self.assertFalse(os.path.exists(final_target))
+                self.assertTrue(os.path.exists(staging_target))
+                self.assertEqual(
+                    {"planned": 2, "removed": 1, "known": True, "partial": True},
+                    result_queue.get(timeout=1),
+                )
+            finally:
+                result_queue.close()
+                result_queue.join_thread()
+
+    def test_dual_root_rechecks_second_target_after_first_directory_removal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            final_target = os.path.join(final_root, "selected")
+            staging_target = os.path.join(staging_root, "selected")
+            outside = os.path.join(temp_dir, "outside")
+            os.makedirs(final_target)
+            os.makedirs(staging_target)
+            os.makedirs(outside)
+            probe_link = os.path.join(temp_dir, "symlink-probe")
+            try:
+                os.symlink(outside, probe_link, target_is_directory=True)
+            except (NotImplementedError, OSError):
+                self.skipTest("symbolic links are unavailable")
+            os.unlink(probe_link)
+            result_queue = multiprocessing.Queue(maxsize=1)
+            process = DeleteLocalProcess(
+                final_root, "selected", allow_recursive=True,
+                additional_targets=((staging_root, "selected", True),),
+                result_queue=result_queue,
+            )
+            process.logger = MagicMock()
+            real_rmtree = shutil.rmtree
+
+            def mutate_second_target(path):
+                real_rmtree(path)
+                if path == final_target:
+                    os.rmdir(staging_target)
+                    os.symlink(outside, staging_target, target_is_directory=True)
+
+            try:
+                with patch("controller.delete.delete_process.shutil.rmtree", side_effect=mutate_second_target):
+                    with self.assertRaises((OSError, ValueError)):
+                        process.run_once()
+                self.assertFalse(os.path.exists(final_target))
+                self.assertTrue(os.path.islink(staging_target))
+                self.assertEqual(
+                    {"planned": 2, "removed": 1, "known": True, "partial": True},
+                    result_queue.get(timeout=1),
+                )
+            finally:
+                result_queue.close()
+                result_queue.join_thread()
+
+    def test_dual_root_rejects_in_root_parent_symlink_swap_before_second_delete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            final_parent = os.path.join(final_root, "nested")
+            staging_parent = os.path.join(staging_root, "nested")
+            sibling_parent = os.path.join(staging_root, "sibling")
+            os.makedirs(final_parent)
+            os.makedirs(staging_parent)
+            os.makedirs(sibling_parent)
+            final_target = os.path.join(final_parent, "selected.bin")
+            staging_target = os.path.join(staging_parent, "selected.bin")
+            sibling_target = os.path.join(sibling_parent, "selected.bin")
+            with open(final_target, "wb") as handle:
+                handle.write(b"first selected location")
+            with open(staging_target, "wb") as handle:
+                handle.write(b"second selected location")
+            with open(sibling_target, "wb") as handle:
+                handle.write(b"unrelated in-root sibling")
+            probe_link = os.path.join(temp_dir, "symlink-probe")
+            try:
+                os.symlink(sibling_parent, probe_link, target_is_directory=True)
+            except (NotImplementedError, OSError):
+                self.skipTest("symbolic links are unavailable")
+            os.unlink(probe_link)
+            result_queue = multiprocessing.Queue(maxsize=1)
+            process = DeleteLocalProcess(
+                final_root, os.path.join("nested", "selected.bin"),
+                additional_targets=((staging_root, os.path.join("nested", "selected.bin"), False),),
+                result_queue=result_queue,
+            )
+            process.logger = MagicMock()
+            real_unlink = os.unlink
+
+            def swap_second_parent(path):
+                real_unlink(path)
+                if path == final_target:
+                    real_unlink(staging_target)
+                    os.rmdir(staging_parent)
+                    os.symlink(sibling_parent, staging_parent, target_is_directory=True)
+
+            try:
+                with patch("controller.delete.delete_process.os.unlink", side_effect=swap_second_parent):
+                    with self.assertRaises(OSError):
+                        process.run_once()
+                self.assertFalse(os.path.exists(final_target))
+                self.assertTrue(os.path.islink(staging_parent))
+                self.assertTrue(os.path.isfile(sibling_target))
+                self.assertEqual(
+                    {"planned": 2, "removed": 1, "known": True, "partial": True},
+                    result_queue.get(timeout=1),
+                )
+            finally:
+                result_queue.close()
+                result_queue.join_thread()
+
+    def test_dual_root_first_directory_failure_reports_unknown_partial_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            final_target = os.path.join(final_root, "selected")
+            staging_target = os.path.join(staging_root, "selected")
+            os.makedirs(final_target)
+            os.makedirs(staging_target)
+            partial_path = os.path.join(final_target, "partially-removed.bin")
+            with open(partial_path, "wb") as handle:
+                handle.write(b"may be removed before failure")
+            result_queue = multiprocessing.Queue(maxsize=1)
+            process = DeleteLocalProcess(
+                final_root, "selected", allow_recursive=True,
+                additional_targets=((staging_root, "selected", True),),
+                result_queue=result_queue,
+            )
+            process.logger = MagicMock()
+
+            def partially_remove_then_fail(path):
+                if path == final_target:
+                    os.unlink(partial_path)
+                    raise PermissionError("failed after an uncounted partial mutation")
+                return shutil.rmtree(path)
+
+            try:
+                with patch("controller.delete.delete_process.shutil.rmtree", side_effect=partially_remove_then_fail):
+                    with self.assertRaises(PermissionError):
+                        process.run_once()
+                self.assertFalse(os.path.exists(partial_path))
+                self.assertTrue(os.path.isdir(staging_target))
+                self.assertEqual(
+                    {"planned": 2, "removed": 0, "known": True, "partial": None},
+                    result_queue.get(timeout=1),
+                )
+            finally:
+                result_queue.close()
+                result_queue.join_thread()
+
+    def test_dual_root_revalidates_artifact_before_unlink(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            outside_root = os.path.join(temp_dir, "outside")
+            os.makedirs(final_root)
+            os.makedirs(staging_root)
+            os.makedirs(outside_root)
+            final_target = os.path.join(final_root, "selected.bin")
+            staging_target = os.path.join(staging_root, "selected.bin")
+            artifact_path = os.path.join(staging_root, "selected.bin.lftp-pget-status")
+            outside_target = os.path.join(outside_root, "sentinel.bin")
+            for path, content in (
+                    (final_target, b"final"), (staging_target, b"staging"),
+                    (artifact_path, b"metadata"), (outside_target, b"must remain")):
+                with open(path, "wb") as handle:
+                    handle.write(content)
+            probe_link = os.path.join(temp_dir, "symlink-probe")
+            try:
+                os.symlink(outside_target, probe_link)
+            except (NotImplementedError, OSError):
+                self.skipTest("symbolic links are unavailable")
+            os.unlink(probe_link)
+            result_queue = multiprocessing.Queue(maxsize=1)
+            process = DeleteLocalProcess(
+                final_root, "selected.bin",
+                artifact_paths=(artifact_path,), artifact_root=staging_root,
+                additional_targets=((staging_root, "selected.bin", False),),
+                result_queue=result_queue,
+            )
+            process.logger = MagicMock()
+            real_unlink = os.unlink
+
+            def swap_artifact_after_primary(path):
+                real_unlink(path)
+                if path == final_target:
+                    real_unlink(artifact_path)
+                    os.symlink(outside_target, artifact_path)
+
+            try:
+                with patch("controller.delete.delete_process.os.unlink", side_effect=swap_artifact_after_primary):
+                    with self.assertRaises(OSError):
+                        process.run_once()
+                self.assertFalse(os.path.exists(final_target))
+                self.assertFalse(os.path.exists(staging_target))
+                self.assertTrue(os.path.islink(artifact_path))
+                self.assertTrue(os.path.isfile(outside_target))
+                self.assertEqual(
+                    {"planned": 2, "removed": 2, "known": True, "partial": True},
+                    result_queue.get(timeout=1),
+                )
+            finally:
+                result_queue.close()
+                result_queue.join_thread()
+
     @patch("controller.delete.delete_process.os.unlink", side_effect=FileNotFoundError)
     @patch("controller.delete.delete_process.os.path.isfile", return_value=True)
     @patch("controller.delete.delete_process.os.path.exists", return_value=True)

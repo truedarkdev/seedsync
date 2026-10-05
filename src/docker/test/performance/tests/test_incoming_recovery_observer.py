@@ -170,6 +170,52 @@ def test_input_arbitration_projection_is_finite_and_preserves_unknowns(tmp_path)
     assert observer._sanitize_capture_projection({**projection, "input_arbitration": {"schema": "wrong"}}).get("input_arbitration") is None
 
 
+def test_delete_local_projection_sanitizer_preserves_only_typed_outcome_facts(tmp_path):
+    projection = {
+        "kind": "completion", "source": "controller", "category": "controller",
+        "event_type": "completion", "stage": "command", "level": "info",
+        "delete_local_planned_location_count": 2,
+        "delete_local_removed_location_count": 1,
+        "delete_local_result_known": True,
+        "delete_local_partial_failure": True,
+        "file_name": "private-name.bin", "local_path": "/private/location",
+    }
+    sink = observer.JsonArtifactSink(tmp_path / "delete-local-projection.jsonl")
+    sink.persist({
+        "schema": "incoming-recovery-observer-sample.v1", "event": "capture", "outcome": "success",
+        "capture": {"state": "record", "source": "controller", "projection": projection},
+    })
+    text = (tmp_path / "delete-local-projection.jsonl").read_text(encoding="utf-8")
+    safe = json.loads(text)["capture"]["projection"]
+    assert safe["delete_local_planned_location_count"] == 2
+    assert safe["delete_local_removed_location_count"] == 1
+    assert safe["delete_local_result_known"] is True
+    assert safe["delete_local_partial_failure"] is True
+    assert "file_name" not in safe and "local_path" not in safe
+    assert "private-name.bin" not in text and "/private/location" not in text
+
+    unknown = observer._sanitize_capture_projection({
+        **projection,
+        "delete_local_planned_location_count": None,
+        "delete_local_removed_location_count": None,
+        "delete_local_result_known": False,
+        "delete_local_partial_failure": None,
+    })
+    assert unknown["delete_local_planned_location_count"] is None
+    assert unknown["delete_local_removed_location_count"] is None
+    assert unknown["delete_local_result_known"] is False
+    assert unknown["delete_local_partial_failure"] is None
+
+    malformed = observer._sanitize_capture_projection({
+        **projection,
+        "delete_local_planned_location_count": True,
+        "delete_local_removed_location_count": 3,
+        "delete_local_result_known": 1,
+        "delete_local_partial_failure": "false",
+    })
+    assert not any(key.startswith("delete_local_") for key in malformed)
+
+
 def test_pending_transfer_gate_requires_exact_local_paths_and_safe_lifecycle_before_queue():
     gate = observer.QueueGate(
         PAIR, "Pr0n", ROOT, "Incoming",

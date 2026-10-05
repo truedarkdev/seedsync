@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple, cast
 from threading import Condition, Event, Lock, RLock
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError
-from queue import Queue
+from queue import Empty, Queue
 from enum import Enum
 from datetime import datetime, timedelta, timezone
 import copy
@@ -14,6 +14,7 @@ import hashlib
 import json
 import heapq
 import math
+import multiprocessing
 import os
 import ntpath
 import stat
@@ -1122,6 +1123,8 @@ class Controller:
             self.await_completion = await_completion
             self.started_at_monotonic = time.monotonic() if started_at_monotonic is None else started_at_monotonic
             self.event_file = event_file
+            self.delete_local_result_queue = None
+            self.delete_local_planned_location_count: Optional[int] = None
 
     _MAX_CONCURRENT_COMMAND_PROCESSES = 8
     _MAX_PENDING_DELETE_COMMANDS = _MAX_CONCURRENT_COMMAND_PROCESSES * 2
@@ -9648,25 +9651,62 @@ class Controller:
 
         return final_path, local_name
 
-    def __has_ambiguous_split_local_target(self, file: ModelFile) -> bool:
-        """Whether deleting one root could discard final split-root content."""
+    def __plan_delete_local_targets(
+            self, file: ModelFile,
+    ) -> tuple[tuple[str, str], tuple[tuple[str, str, bool], ...], int]:
+        """Plan exact existing locations for the selected item, never descendants."""
         path_pair = self.__get_path_pair(file.path_pair_id)
         final_root = path_pair.local_path if path_pair is not None else self.__legacy_local_path
         staging_root = self.__get_staging_path(file.path_pair_id if path_pair is not None else None)
-        if not final_root or not staging_root:
-            return False
-        local_name = os.path.join(*self.__canonical_relative_transfer_path(file).split("/"))
-        final_target = Controller.__safe_final_move_candidate(final_root, local_name)
-        staging_target = Controller.__safe_final_move_candidate(staging_root, local_name)
-        if final_target is None or staging_target is None:
-            return True
-        try:
-            return os.path.lexists(final_target) and (
-                os.path.lexists(staging_target) or
-                os.path.lexists(staging_target + Constants.LFTP_TEMP_FILE_SUFFIX)
-            )
-        except OSError:
-            return True
+        relative_name = self.__canonical_relative_transfer_path(file)
+        recursive = bool(file.is_dir)
+        roots = [final_root]
+        if isinstance(staging_root, str) and staging_root:
+            roots.append(staging_root)
+        suffix = Constants.LFTP_TEMP_FILE_SUFFIX
+        targets: list[tuple[str, str, bool]] = []
+        seen: set[str] = set()
+        for root in roots:
+            if not isinstance(root, str) or not root:
+                continue
+            names = [relative_name]
+            if not recursive and root == staging_root:
+                direct = Controller.__safe_final_move_candidate(root, relative_name)
+                if direct is None:
+                    raise LftpError("Delete Local target is unsafe")
+                if not os.path.lexists(direct):
+                    names.append(relative_name + suffix)
+            for name in names:
+                candidate = Controller.__safe_final_move_candidate(root, name)
+                if candidate is None:
+                    raise LftpError("Delete Local target is unsafe")
+                try:
+                    info = os.lstat(candidate)
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise LftpError("Delete Local target could not be verified") from error
+                try:
+                    root_info = os.lstat(root)
+                except OSError as error:
+                    raise LftpError("Delete Local root could not be verified") from error
+                if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode) or \
+                        stat.S_ISLNK(info.st_mode) or bool(stat.S_ISDIR(info.st_mode)) != recursive or \
+                        (not recursive and not stat.S_ISREG(info.st_mode)):
+                    raise LftpError("Delete Local target type or root is unsafe")
+                identity = os.path.normcase(os.path.realpath(candidate))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                targets.append((root, name, recursive))
+                # A staging direct file owns its artifact form. Do not also
+                # select its historical temporary sibling in the same root.
+                if not recursive:
+                    break
+        if targets:
+            primary = (targets[0][0], targets[0][1])
+            return primary, tuple((root, name, kind) for root, name, kind in targets[1:]), len(targets)
+        return self.__get_delete_local_target(file), (), 0
 
     def __absent_move_failure_repair_blocker(self, file: ModelFile) -> Optional[str]:
         """Return why an explicit metadata-only Delete Local repair is unsafe."""
@@ -9983,8 +10023,14 @@ class Controller:
         artifact_paths: tuple[str, ...] = (),
         artifact_root: Optional[str] = None,
         delete_primary: bool = True,
-    ) -> None:
-        delete_local_path, delete_local_name = self.__get_delete_local_target(file)
+        additional_targets: tuple[tuple[str, str, bool], ...] = (),
+        primary_target: Optional[tuple[str, str]] = None,
+    ) -> "Controller.CommandProcessWrapper":
+        delete_local_path, delete_local_name = primary_target or self.__get_delete_local_target(file)
+        # A bounded one-result IPC slot reports physical selected-location
+        # outcomes for the dual-root operation without retaining new state.
+        planned_locations = (1 if delete_primary else 0) + len(additional_targets)
+        result_queue = multiprocessing.Queue(maxsize=1) if planned_locations > 1 else None
         process_kwargs: dict[str, object] = {
             "local_path": delete_local_path,
             "file_name": delete_local_name,
@@ -9997,6 +10043,10 @@ class Controller:
             process_kwargs["artifact_root"] = artifact_root
         if not delete_primary:
             process_kwargs["delete_primary"] = False
+        if additional_targets:
+            process_kwargs["additional_targets"] = additional_targets
+        if result_queue is not None:
+            process_kwargs["result_queue"] = result_queue
         process = DeleteLocalProcess(**process_kwargs)  # type: ignore[arg-type]
         process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
         command_wrapper = Controller.CommandProcessWrapper(
@@ -10008,9 +10058,12 @@ class Controller:
             await_completion=True,
             event_file=copy.deepcopy(file),
         )
+        command_wrapper.delete_local_result_queue = result_queue
+        command_wrapper.delete_local_planned_location_count = planned_locations if result_queue is not None else None
         with self.__command_state_lock():
             self.__active_command_processes.append(command_wrapper)
         command_wrapper.process.start()
+        return command_wrapper
 
     def __delete_local_artifact_plan(self, file: ModelFile) -> tuple[tuple[str, ...], Optional[str]]:
         staging_path = self.__get_staging_path(file.path_pair_id)
@@ -12774,12 +12827,21 @@ class Controller:
                         file
                     )
                     continue
-                if file.is_dir:
-                    try:
-                        self.__canonical_relative_transfer_path(file)
-                    except LftpError as error:
-                        _notify_failure(command, str(error), 409, file)
+                # A collision worker may temporarily own the selected staging
+                # path under a claimed name. Restore only this selected scope
+                # before resolving exact physical delete targets.
+                try:
+                    if self._has_active_collision_comparison(file.full_path, file.path_pair_id) and \
+                            not self.__cancel_and_settle_collision_claim_for_refresh():
+                        _notify_failure(command, "Local file is still being compared; Delete Local was rejected", 409, file)
                         continue
+                    primary_target, additional_targets, physical_target_count = \
+                        self.__plan_delete_local_targets(file)
+                except (LftpError, OSError) as error:
+                    _notify_failure(command, str(error), 409, file)
+                    continue
+
+                if file.is_dir:
                     artifact_paths, artifact_root = (), None
                 else:
                     try:
@@ -12787,9 +12849,23 @@ class Controller:
                     except LftpError as error:
                         _notify_failure(command, str(error), 409, file)
                         continue
+                    planned_physical_paths = {
+                        os.path.normcase(os.path.realpath(os.path.join(root, name)))
+                        for root, name, _recursive in (
+                            (primary_target[0], primary_target[1], False),
+                            *additional_targets,
+                        )
+                    } if physical_target_count else set()
+                    artifact_paths = tuple(
+                        artifact for artifact in artifact_paths
+                        if os.path.normcase(os.path.realpath(artifact)) not in planned_physical_paths
+                    )
 
-                delete_primary = file.local_size is not None
-                if file.local_size is None:
+                # Filesystem presence is authoritative for the destructive
+                # choice. A stale local_size=None must not turn a restored
+                # physical target into a metadata-only repair.
+                delete_primary = physical_target_count > 0 or file.local_size is not None
+                if file.local_size is None and physical_target_count == 0:
                     if file.state != ModelFile.State.MOVE_FAILED and not artifact_paths:
                         _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404, file)
                         continue
@@ -12817,16 +12893,6 @@ class Controller:
                                 file=file,
                             )
                             continue
-                if self.__has_ambiguous_split_local_target(file):
-                    _notify_failure(
-                        command,
-                        "Local file '{}' has both final and staging content; refusing ambiguous delete".format(
-                            command.filename
-                        ),
-                        409,
-                        file,
-                    )
-                    continue
                 if len(self.__active_command_processes) >= Controller._MAX_CONCURRENT_COMMAND_PROCESSES:
                     self.__defer_delete_command(command, deferred_commands)
                     self.logger.debug(
@@ -12840,7 +12906,7 @@ class Controller:
                 # is admitted. A later auto-delete in this same drain cannot
                 # retain authority captured before local deletion.
                 self.__advance_transfer_lifecycle(file.file_id)
-                self.__queue_delete_local_process(
+                delete_wrapper = self.__queue_delete_local_process(
                     file,
                     lambda path_pair_id=file.path_pair_id: (
                         self.__local_scan_process.force_scan()
@@ -12851,17 +12917,27 @@ class Controller:
                     artifact_paths=artifact_paths,
                     artifact_root=artifact_root,
                     delete_primary=delete_primary,
+                    additional_targets=additional_targets,
+                    primary_target=primary_target,
                 )
                 self.__persist.stopped_file_names.add(file.file_id)
                 self.__validate_process.clear(file.file_id)
+                dispatch_details: dict[str, object] = {
+                    "command": "DELETE_LOCAL",
+                    "mode": "delete_local_process",
+                    "await_completion": True,
+                }
+                if delete_wrapper.delete_local_planned_location_count is not None:
+                    dispatch_details.update({
+                        "delete_local_planned_location_count": delete_wrapper.delete_local_planned_location_count,
+                        "delete_local_removed_location_count": None,
+                        "delete_local_result_known": False,
+                        "delete_local_partial_failure": None,
+                    })
                 self.__record_command_breadcrumb(
                     command=command,
                     message="command_dispatched",
-                    details={
-                        "command": "DELETE_LOCAL",
-                        "mode": "delete_local_process",
-                        "await_completion": True,
-                    },
+                    details=dispatch_details,
                     file=file,
                 )
 
@@ -13447,6 +13523,57 @@ class Controller:
                 lambda: invoke_callbacks(command_process, method, *args),
             )
 
+        def delete_local_result_details(command_process) -> dict[str, object]:
+            planned = getattr(command_process, "delete_local_planned_location_count", None)
+            result_queue = getattr(command_process, "delete_local_result_queue", None)
+            if type(planned) is not int or not 0 <= planned <= 2 or result_queue is None:
+                return {}
+            outcome = None
+            try:
+                outcome = result_queue.get(timeout=0.5)
+            except (Empty, OSError, EOFError, ValueError):
+                pass
+            finally:
+                command_process.delete_local_result_queue = None
+                try:
+                    result_queue.close()
+                    result_queue.join_thread()
+                except Exception:
+                    pass
+            removed = outcome.get("removed") if isinstance(outcome, dict) else None
+            known = isinstance(outcome, dict) and outcome.get("known") is True and \
+                type(removed) is int and 0 <= removed <= planned
+            partial = outcome.get("partial") if known else None
+            if type(partial) is not bool:
+                partial = None
+            return {
+                "delete_local_planned_location_count": planned,
+                "delete_local_removed_location_count": removed if known else None,
+                "delete_local_result_known": known,
+                "delete_local_partial_failure": partial,
+            }
+
+        def is_multi_location_delete(command_process) -> bool:
+            planned = getattr(command_process, "delete_local_planned_location_count", None)
+            return command_process.command.action == Controller.Command.Action.DELETE_LOCAL and \
+                type(planned) is int and 1 < planned <= 2
+
+        def rescan_failed_delete(command_process) -> None:
+            if not is_multi_location_delete(command_process):
+                return
+            try:
+                observe_cleanup_stage(
+                    command_process,
+                    "post_callback",
+                    DURATION_CONTROLLER_CLEANUP_POST_CALLBACK,
+                    "controller_cleanup_post_callback_exceptions",
+                    command_process.post_callback,
+                )
+            except Exception:
+                # A failed delete still requests reconciliation, but its
+                # observer/callback failure cannot replace the delete result.
+                self.logger.warning("Delete Local post-failure rescan callback failed", exc_info=True)
+
         def observe_cleanup_stage(command_process, phase, metric, failure_counter, operation):
             """Record sparse Delete Local cleanup timing without owning its outcome."""
             is_delete_local = command_process.command.action == Controller.Command.Action.DELETE_LOCAL
@@ -13516,23 +13643,26 @@ class Controller:
                             exc_info=True
                         )
                     try:
+                        timeout_details: dict[str, object] = {
+                            "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                            "message": "Delete command timed out",
+                            "error_code": 504,
+                            "file_name": command_process.file_name,
+                            "lifecycle_phase": "cleanup",
+                            "completion": "timed_out",
+                            "timeout_seconds": Controller._DELETE_COMMAND_STALE_TIMEOUT_IN_SECS,
+                            "elapsed_seconds": elapsed_seconds,
+                        }
+                        timeout_details.update(delete_local_result_details(command_process))
                         self.__record_command_breadcrumb(
                             command=command_process.command,
                             message="command_failed",
-                            details={
-                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
-                                "message": "Delete command timed out",
-                                "error_code": 504,
-                                "file_name": command_process.file_name,
-                                "lifecycle_phase": "cleanup",
-                                "completion": "timed_out",
-                                "timeout_seconds": Controller._DELETE_COMMAND_STALE_TIMEOUT_IN_SECS,
-                                "elapsed_seconds": elapsed_seconds,
-                            },
+                            details=timeout_details,
                             event_type="failure",
                         )
                         if command_process.await_completion:
                             self.__persist.stopped_file_names.discard(command_process.file_id)
+                            rescan_failed_delete(command_process)
                             observe_cleanup_stage(
                                 command_process,
                                 "callback_signal",
@@ -13572,16 +13702,18 @@ class Controller:
                                 command_process.process.propagate_exception,
                             )
                         except FileNotFoundError as error:
+                            failure_details: dict[str, object] = {
+                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                "message": "Delete Local failed" if is_multi_location_delete(command_process) else str(error),
+                                "error_code": 404,
+                                "file_name": command_process.file_name,
+                                "lifecycle_phase": "cleanup",
+                            }
+                            failure_details.update(delete_local_result_details(command_process))
                             self.__record_command_breadcrumb(
                                 command=command_process.command,
                                 message="command_failed",
-                                details={
-                                    "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
-                                    "message": str(error),
-                                    "error_code": 404,
-                                    "file_name": command_process.file_name,
-                                    "lifecycle_phase": "cleanup",
-                                },
+                                details=failure_details,
                                 event_type="failure",
                             )
                             self.logger.warning(
@@ -13592,6 +13724,7 @@ class Controller:
                                 )
                             )
                             self.__persist.stopped_file_names.discard(command_process.file_id)
+                            rescan_failed_delete(command_process)
                             observe_cleanup_stage(
                                 command_process,
                                 "callback_signal",
@@ -13605,16 +13738,18 @@ class Controller:
                                 ),
                             )
                         except Exception as error:
+                            failure_details = {
+                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                "message": "Delete Local failed" if is_multi_location_delete(command_process) else str(error),
+                                "error_code": 500,
+                                "file_name": command_process.file_name,
+                                "lifecycle_phase": "cleanup",
+                            }
+                            failure_details.update(delete_local_result_details(command_process))
                             self.__record_command_breadcrumb(
                                 command=command_process.command,
                                 message="command_failed",
-                                details={
-                                    "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
-                                    "message": str(error),
-                                    "error_code": 500,
-                                    "file_name": command_process.file_name,
-                                    "lifecycle_phase": "cleanup",
-                                },
+                                details=failure_details,
                                 event_type="failure",
                             )
                             self.logger.warning(
@@ -13625,6 +13760,7 @@ class Controller:
                                 )
                             )
                             self.__persist.stopped_file_names.discard(command_process.file_id)
+                            rescan_failed_delete(command_process)
                             observe_cleanup_stage(
                                 command_process,
                                 "callback_signal",
@@ -13673,6 +13809,7 @@ class Controller:
                             }
                             if command_process.command.action == Controller.Command.Action.DELETE_LOCAL:
                                 completion_details["invalidated_ancestor_count"] = invalidated_ancestor_count
+                                completion_details.update(delete_local_result_details(command_process))
                             self.__record_command_breadcrumb(
                                 command=command_process.command,
                                 message="command_finished",

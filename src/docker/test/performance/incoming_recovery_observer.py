@@ -624,6 +624,19 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
         item = value.get(key)
         if isinstance(item, str) and len(item) == 16 and all(char in "0123456789abcdef" for char in item):
             result[key] = item
+    for key in ("delete_local_planned_location_count", "delete_local_removed_location_count"):
+        if key not in value:
+            continue
+        item = value[key]
+        if item is None or (type(item) is int and 0 <= item <= 2):
+            result[key] = item
+    item = value.get("delete_local_result_known")
+    if type(item) is bool:
+        result["delete_local_result_known"] = item
+    item = value.get("delete_local_partial_failure")
+    if item is None or type(item) is bool:
+        if "delete_local_partial_failure" in value:
+            result["delete_local_partial_failure"] = item
     lifecycle = value.get("lifecycle")
     if isinstance(lifecycle, Mapping):
         safe: dict[str, object] = {"schema": "queue.lifecycle.v1"} if lifecycle.get("schema") == "queue.lifecycle.v1" else {}

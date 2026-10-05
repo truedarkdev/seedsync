@@ -322,6 +322,154 @@ def test_typed_projection_preserves_dotted_fields_and_numeric_values_only(tmp_pa
     assert unsupported and unsupported[-1]["irrelevant"] == 1
 
 
+def test_delete_local_command_projection_is_bounded_typed_and_private(tmp_path: Path) -> None:
+    spool, artifact = _prepare(tmp_path)
+    rows = [
+        _row(
+            category="controller", event_type="completion", stage="command",
+            label="command_finished", identity="delete-success",
+            details={
+                "command": "DELETE_LOCAL", "delete_local_planned_location_count": 2,
+                "delete_local_removed_location_count": 2, "delete_local_result_known": True,
+                "delete_local_partial_failure": False, "file_name": "private-name.bin",
+                "local_path": "/private/location",
+            },
+        ),
+        _row(
+            category="controller", event_type="failure", stage="command",
+            label="command_failed", identity="delete-partial",
+            details={
+                "command": "DELETE_LOCAL", "delete_local_planned_location_count": 2,
+                "delete_local_removed_location_count": 1, "delete_local_result_known": True,
+                "delete_local_partial_failure": True,
+            },
+        ),
+        _row(
+            category="controller", stage="command", label="command_finished", identity="delete-unknown",
+            details={
+                "command": "DELETE_LOCAL", "delete_local_planned_location_count": None,
+                "delete_local_removed_location_count": None, "delete_local_result_known": False,
+                "delete_local_partial_failure": None,
+            },
+        ),
+        _row(
+            category="controller", event_type="failure", stage="command", label="command_failed", identity="delete-ambiguous-partial",
+            details={
+                "command": "DELETE_LOCAL", "delete_local_planned_location_count": 2,
+                "delete_local_removed_location_count": 0, "delete_local_result_known": True,
+                "delete_local_partial_failure": None,
+            },
+        ),
+        _row(
+            category="controller", event_type="failure", stage="command", label="command_failed", identity="delete-malformed",
+            details={
+                "command": "DELETE_LOCAL", "delete_local_planned_location_count": True,
+                "delete_local_removed_location_count": 3, "delete_local_result_known": 1,
+                "delete_local_partial_failure": "false",
+            },
+        ),
+        _row(
+            category="queue.lifecycle", event_type="completion", stage="command", label="command_finished", identity="queue-not-delete",
+            details={
+                "command": "QUEUE", "delete_local_planned_location_count": 2,
+                "delete_local_removed_location_count": 2, "delete_local_result_known": True,
+                "delete_local_partial_failure": False,
+            },
+        ),
+    ]
+    active = spool / "breadcrumbs.jsonl"
+    reader = _reader(spool, artifact)
+    try:
+        reader.start()
+        active.write_bytes(b"".join(rows))
+        assert reader.poll() == len(rows)
+    finally:
+        reader.close()
+
+    records = [item["capture"]["projection"] for item in _artifacts(artifact) if item["capture"].get("state") == "record"]
+    successful = next(item for item in records if item.get("delete_local_removed_location_count") == 2)
+    partial = next(item for item in records if item.get("delete_local_removed_location_count") == 1)
+    unknown = next(item for item in records if item.get("delete_local_result_known") is False)
+    assert successful["delete_local_planned_location_count"] == 2
+    assert successful["delete_local_result_known"] is True
+    assert successful["delete_local_partial_failure"] is False
+    assert partial["delete_local_partial_failure"] is True
+    assert unknown["delete_local_planned_location_count"] is None
+    assert unknown["delete_local_removed_location_count"] is None
+    assert unknown["delete_local_partial_failure"] is None
+    ambiguous_partial = next(item for item in records if item.get("delete_local_removed_location_count") == 0)
+    assert ambiguous_partial["delete_local_result_known"] is True
+    assert ambiguous_partial["delete_local_partial_failure"] is None
+    malformed = next(item for item in records if item["event_type"] == "failure" and "delete_local_partial_failure" not in item)
+    assert not any(key.startswith("delete_local_") for key in malformed)
+    queue = next(item for item in records if item["event_type"] == "completion" and "delete_local_planned_location_count" not in item)
+    assert not any(key.startswith("delete_local_") for key in queue)
+    text = artifact.read_text(encoding="utf-8")
+    assert "private-name.bin" not in text and "/private/location" not in text
+
+
+def _roundtrip_finalized_delete_local_rows(tmp_path: Path, finalized_path: str) -> tuple[list[dict[str, object]], str]:
+    finalized = Path(finalized_path).read_bytes()
+    rows = [json.loads(line) for line in finalized.splitlines() if line]
+    boundary = next(row for row in rows if row.get("session_boundary") is True)
+    spool, artifact = _prepare(tmp_path)
+    _health(spool, session=boundary["session_id"])
+    reader = _reader(spool, artifact)
+    try:
+        reader.start()
+        (spool / "breadcrumbs.jsonl").write_bytes(finalized)
+        reader.poll()
+    finally:
+        reader.close()
+    return _artifacts(artifact), artifact.read_text(encoding="utf-8")
+
+
+def test_actual_finalized_delete_local_rows_survive_projection_and_sink(tmp_path: Path) -> None:
+    finalized_path = os.environ.get("SEEDSYNC_DELETE_LOCAL_FINALIZED_ROWS_PATH")
+    if not finalized_path:
+        pytest.skip("actual finalized Delete Local rows were not supplied")
+    output, text = _roundtrip_finalized_delete_local_rows(tmp_path, finalized_path)
+    projections = [
+        item["capture"]["projection"]
+        for item in output
+        if item.get("capture", {}).get("state") == "record"
+    ]
+    facts = [item for item in projections if "delete_local_planned_location_count" in item]
+    assert len(facts) == 2
+    dispatched = next(item for item in facts if item["delete_local_result_known"] is False)
+    finished = next(item for item in facts if item["delete_local_result_known"] is True)
+    assert dispatched["delete_local_planned_location_count"] == 2
+    assert dispatched["delete_local_removed_location_count"] is None
+    assert dispatched["delete_local_partial_failure"] is None
+    assert finished["delete_local_planned_location_count"] == 2
+    assert finished["delete_local_removed_location_count"] == 2
+    assert finished["delete_local_partial_failure"] is False
+    assert "release.bin" not in text and "<redacted>" not in text
+
+
+def test_actual_finalized_delete_local_failure_rows_survive_projection_and_sink(tmp_path: Path) -> None:
+    finalized_path = os.environ.get("SEEDSYNC_DELETE_LOCAL_FINALIZED_FAILURE_ROWS_PATH")
+    if not finalized_path:
+        pytest.skip("actual finalized Delete Local failure rows were not supplied")
+    output, text = _roundtrip_finalized_delete_local_rows(tmp_path, finalized_path)
+    projections = [
+        item["capture"]["projection"]
+        for item in output
+        if item.get("capture", {}).get("state") == "record"
+    ]
+    facts = [item for item in projections if "delete_local_planned_location_count" in item]
+    assert len(facts) == 2
+    dispatched = next(item for item in facts if item["delete_local_result_known"] is False)
+    failed = next(item for item in facts if item["delete_local_result_known"] is True)
+    assert dispatched["delete_local_planned_location_count"] == 2
+    assert dispatched["delete_local_removed_location_count"] is None
+    assert dispatched["delete_local_partial_failure"] is None
+    assert failed["delete_local_planned_location_count"] == 2
+    assert failed["delete_local_removed_location_count"] == 1
+    assert failed["delete_local_partial_failure"] is True
+    assert "release.bin" not in text and "<redacted>" not in text
+
+
 def test_composed_producer_rows_retain_finite_lifecycle_facts_and_hashes(tmp_path: Path) -> None:
     spool, artifact = _prepare(tmp_path)
     rows = [

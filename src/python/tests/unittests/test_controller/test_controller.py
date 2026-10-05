@@ -3,6 +3,7 @@ import copy
 import errno
 import os
 import json
+import logging
 import shutil
 import stat
 import threading
@@ -33,7 +34,7 @@ from controller.controller import (
     _lftp_executor_exception_family, _lftp_executor_trace_enabled,
 )
 from controller.persist_keys import KEY_SEP, persist_key
-from common import AppError, Config, Constants, PathPairError, PathPairManager
+from common import AppError, Config, Constants, MultiprocessingLogger, PathPairError, PathPairManager
 from common.performance_diagnostics import (
     DURATION_CONTROLLER_AUXILIARY_REAP,
     DURATION_CONTROLLER_CLEANUP_COMMANDS,
@@ -9963,12 +9964,18 @@ class TestController(unittest.TestCase):
             normal_callback.on_success.assert_called_once_with()
             normal_callback.on_failure.assert_not_called()
 
-    def test_process_commands_delete_local_directory_keeps_split_root_rejection(self):
+    def test_process_commands_delete_local_directory_removes_selected_item_from_both_roots(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             final_root = os.path.join(temp_dir, "final")
             staging_root = os.path.join(temp_dir, "staging")
-            os.makedirs(os.path.join(final_root, "sample-directory"))
-            os.makedirs(os.path.join(staging_root, "sample-directory"))
+            final_target = os.path.join(final_root, "sample-directory")
+            staging_target = os.path.join(staging_root, "sample-directory")
+            os.makedirs(os.path.join(final_target, "nested"))
+            os.makedirs(os.path.join(staging_target, "nested"))
+            os.makedirs(os.path.join(final_root, "sibling"))
+            os.makedirs(os.path.join(staging_root, "sibling"))
+            Path(os.path.join(final_target, "nested", "final.bin")).write_bytes(b"final")
+            Path(os.path.join(staging_target, "nested", "partial.bin")).write_bytes(b"partial")
 
             file = ModelFile("sample-directory", True)
             file.path_pair_id = "movies"
@@ -9987,14 +9994,341 @@ class TestController(unittest.TestCase):
 
             with patch.object(Controller, "_Controller__delete_local_artifact_plan") as artifact_plan, \
                     patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+                process = MagicMock()
+                process.is_alive.return_value = False
+                process.propagate_exception.return_value = None
+                delete_local_process.return_value = process
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+                self.controller._Controller__cleanup_commands()
+
+            artifact_plan.assert_not_called()
+            delete_local_process.assert_called_once()
+            kwargs = delete_local_process.call_args.kwargs
+            self.assertEqual(final_root, kwargs["local_path"])
+            self.assertEqual("sample-directory", kwargs["file_name"])
+            self.assertTrue(kwargs["allow_recursive"])
+            self.assertEqual(((staging_root, "sample-directory", True),), kwargs["additional_targets"])
+            self.assertIsNotNone(delete_local_process.call_args.kwargs["result_queue"])
+            callback.on_success.assert_called_once_with()
+            callback.on_failure.assert_not_called()
+
+    def test_process_commands_delete_local_deletes_restored_targets_with_unknown_model_size(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            os.makedirs(final_root)
+            os.makedirs(staging_root)
+            Path(os.path.join(final_root, "release.bin")).write_bytes(b"final")
+            Path(os.path.join(staging_root, "release.bin")).write_bytes(b"staged")
+
+            file = ModelFile("release.bin", False)
+            file.path_pair_id = "movies"
+            file.local_size = None
+            file.state = ModelFile.State.MOVE_FAILED
+            self.controller._Controller__model.get_file.return_value = file
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(local_path=final_root)
+            }
+            self.controller._Controller__path_pair_staging_paths = {"movies": staging_root}
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+
+            with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+                process = MagicMock()
+                process.is_alive.return_value = False
+                process.propagate_exception.return_value = None
+                delete_local_process.return_value = process
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+                self.controller._Controller__cleanup_commands()
+
+            delete_local_process.assert_called_once()
+            kwargs = delete_local_process.call_args.kwargs
+            self.assertEqual(final_root, kwargs["local_path"])
+            self.assertEqual("release.bin", kwargs["file_name"])
+            self.assertEqual(((staging_root, "release.bin", False),), kwargs["additional_targets"])
+            self.assertNotIn("delete_primary", kwargs)
+            self.assertNotIn(file.file_id, self.controller._Controller__persist.downloaded_file_names)
+
+    def test_dual_root_delete_persists_actual_worker_counts(self):
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as spool_path:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            os.makedirs(final_root)
+            os.makedirs(staging_root)
+            Path(os.path.join(final_root, "release.bin")).write_bytes(b"final")
+            Path(os.path.join(staging_root, "release.bin")).write_bytes(b"staging")
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "info"},
+                max_entries=64,
+                durable_enabled=True,
+                durable_path=spool_path,
+            )
+            mp_logger = MultiprocessingLogger(logging.getLogger("dual-root-delete-test"))
+            self.controller._Controller__context.breadcrumb_trace = trace
+            self.controller._Controller__mp_logger = mp_logger
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(local_path=final_root, enabled=True)
+            }
+            self.controller._Controller__path_pair_staging_paths = {"movies": staging_root}
+            file = ModelFile("release.bin", False)
+            file.path_pair_id = "movies"
+            file.local_size = 12
+            file.state = ModelFile.State.DEFAULT
+            self.controller._Controller__model.get_file.return_value = file
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+            callback = MagicMock()
+            command.add_callback(callback)
+            mp_logger.start()
+            child_exitcode = None
+            try:
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+                active = self.controller._Controller__active_command_processes[-1]
+                active.process.join(timeout=5)
+                child_exitcode = active.process.exitcode
+                self.controller._Controller__cleanup_commands()
+            finally:
+                mp_logger.stop()
+                trace.close(timeout=2.0)
+
+            spool_file = Path(spool_path) / "breadcrumbs.jsonl"
+            spool_text = spool_file.read_text(encoding="utf-8")
+            retained_rows_path = os.environ.get("SEEDSYNC_DELETE_LOCAL_FINALIZED_ROWS_PATH")
+            if retained_rows_path:
+                with open(retained_rows_path, "x", encoding="utf-8") as handle:
+                    handle.write(spool_text)
+            records = [
+                json.loads(line) for line in spool_text.splitlines()
+            ]
+            self.assertEqual(0, child_exitcode)
+            self.assertFalse(os.path.exists(os.path.join(final_root, "release.bin")))
+            self.assertFalse(os.path.exists(os.path.join(staging_root, "release.bin")))
+            callback.on_success.assert_called_once_with()
+            callback.on_failure.assert_not_called()
+            dispatch = next(entry for entry in records if entry.get("message") == "command_dispatched")
+            finished = next(entry for entry in records if entry.get("message") == "command_finished")
+            expected_fields = {
+                "delete_local_planned_location_count": 2,
+                "delete_local_removed_location_count": 2,
+                "delete_local_result_known": True,
+                "delete_local_partial_failure": False,
+            }
+            for entry in (dispatch, finished):
+                for key, value in expected_fields.items():
+                    if entry is dispatch and key != "delete_local_planned_location_count":
+                        self.assertIn(key, entry["details"])
+                    else:
+                        self.assertEqual(value, entry["details"][key])
+            self.assertNotIn(final_root, json.dumps(records))
+            self.assertNotIn(staging_root, json.dumps(records))
+
+    def test_dual_root_delete_permission_failure_persists_cleanup_and_rescan(self):
+        if os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() == 0:
+            self.skipTest("requires a non-root POSIX worker with enforceable directory permissions")
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as spool_path:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            os.makedirs(final_root)
+            os.makedirs(staging_root)
+            final_target = os.path.join(final_root, "release.bin")
+            staging_target = os.path.join(staging_root, "release.bin")
+            Path(final_target).write_bytes(b"final")
+            Path(staging_target).write_bytes(b"staging")
+            os.chmod(staging_root, stat.S_IRUSR | stat.S_IXUSR)
+            if os.access(staging_root, os.W_OK):
+                os.chmod(staging_root, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+                self.skipTest("directory write refusal is not enforced for this test process")
+
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "info"},
+                max_entries=64,
+                durable_enabled=True,
+                durable_path=spool_path,
+            )
+            mp_logger = MultiprocessingLogger(logging.getLogger("dual-root-delete-failure-test"))
+            self.controller._Controller__context.breadcrumb_trace = trace
+            self.controller._Controller__mp_logger = mp_logger
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(local_path=final_root, enabled=True)
+            }
+            self.controller._Controller__path_pair_staging_paths = {"movies": staging_root}
+            file = ModelFile("release.bin", False)
+            file.path_pair_id = "movies"
+            file.local_size = 12
+            file.state = ModelFile.State.DEFAULT
+            self.controller._Controller__model.get_file.return_value = file
+            callback = MagicMock()
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+            command.add_callback(callback)
+            mp_logger.start()
+            child_exitcode = None
+            try:
+                with patch.object(self.controller, "_Controller__complete_delete_local_lifecycle") as lifecycle:
+                    self.controller.queue_command(command)
+                    self.controller._Controller__process_commands()
+                    active = self.controller._Controller__active_command_processes[-1]
+                    active.process.join(timeout=10)
+                    child_exitcode = active.process.exitcode
+                    self.assertFalse(active.process.is_alive())
+                    self.controller._Controller__cleanup_commands()
+                    lifecycle.assert_not_called()
+            finally:
+                mp_logger.stop()
+                trace.close(timeout=2.0)
+                os.chmod(staging_root, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+
+            spool_file = Path(spool_path) / "breadcrumbs.jsonl"
+            spool_text = spool_file.read_text(encoding="utf-8")
+            retained_rows_path = os.environ.get("SEEDSYNC_DELETE_LOCAL_FINALIZED_FAILURE_ROWS_PATH")
+            if retained_rows_path:
+                with open(retained_rows_path, "x", encoding="utf-8") as handle:
+                    handle.write(spool_text)
+            records = [json.loads(line) for line in spool_text.splitlines()]
+            failed = next(entry for entry in records if entry.get("message") == "command_failed")
+            details = failed["details"]
+            self.assertEqual(1, child_exitcode)
+            self.assertFalse(os.path.exists(final_target))
+            self.assertTrue(os.path.exists(staging_target))
+            callback.on_success.assert_not_called()
+            callback.on_failure.assert_called_once()
+            self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("movies")
+            self.assertEqual(2, details["delete_local_planned_location_count"])
+            self.assertEqual(1, details["delete_local_removed_location_count"])
+            self.assertIs(details["delete_local_result_known"], True)
+            self.assertIs(details["delete_local_partial_failure"], True)
+            self.assertNotIn(final_root, json.dumps(records))
+            self.assertNotIn(staging_root, json.dumps(records))
+
+    def test_delete_local_settles_selected_claim_before_planning_restored_physical_roots(self):
+        temp_dir, file, staging, original, claimed, sidecar = self._seed_active_deferred_collision_claim()
+        file.local_size = None
+        file.state = ModelFile.State.MOVE_FAILED
+        self.controller._Controller__deferred_queue_intents_map().clear()
+        order = []
+        settle = self.controller._Controller__cancel_and_settle_collision_claim_for_refresh
+        plan = self.controller._Controller__plan_delete_local_targets
+
+        def settle_claim():
+            order.append("settle")
+            settled = settle()
+            self.assertTrue(settled)
+            return settled
+
+        def plan_targets(target_file):
+            order.append("plan")
+            self.assertTrue(os.path.isfile(original))
+            self.assertFalse(os.path.lexists(claimed))
+            self.assertFalse(os.path.lexists(sidecar))
+            return plan(target_file)
+
+        self.controller._Controller__cancel_and_settle_collision_claim_for_refresh = MagicMock(
+            side_effect=settle_claim,
+        )
+        self.controller._Controller__plan_delete_local_targets = MagicMock(
+            side_effect=plan_targets,
+        )
+        self.controller._Controller__queue_delete_local_process = MagicMock(
+            return_value=SimpleNamespace(delete_local_planned_location_count=None),
+        )
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+
+        try:
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+
+            self.assertEqual(["settle", "plan"], order)
+            self.controller._Controller__cancel_and_settle_collision_claim_for_refresh.assert_called_once_with()
+            self.controller._Controller__plan_delete_local_targets.assert_called_once_with(file)
+            self.controller._Controller__queue_delete_local_process.assert_called_once()
+            queue_kwargs = self.controller._Controller__queue_delete_local_process.call_args.kwargs
+            self.assertEqual((os.path.join(temp_dir.name, "final"), "sample-directory"),
+                             queue_kwargs["primary_target"])
+            self.assertEqual(((staging, "sample-directory", True),), queue_kwargs["additional_targets"])
+        finally:
+            temp_dir.cleanup()
+
+    def test_delete_local_refuses_unsettled_selected_claim_before_planning(self):
+        temp_dir, file, _staging, original, claimed, sidecar = self._seed_active_deferred_collision_claim(
+            future_done=False,
+        )
+        file.local_size = None
+        file.state = ModelFile.State.MOVE_FAILED
+        self.controller._Controller__deferred_queue_intents_map().clear()
+        callback = MagicMock()
+        future = self.controller._Controller__collision_compare_future
+        self.controller._Controller__plan_delete_local_targets = MagicMock()
+        self.controller._Controller__queue_delete_local_process = MagicMock()
+        self.controller._Controller__delete_local_artifact_plan = MagicMock()
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        command.add_callback(callback)
+
+        try:
+            with patch.object(future, "result", side_effect=TimeoutError("still comparing")):
                 self.controller.queue_command(command)
                 self.controller._Controller__process_commands()
 
-            artifact_plan.assert_not_called()
-            delete_local_process.assert_not_called()
-            callback.on_success.assert_not_called()
             callback.on_failure.assert_called_once()
             self.assertEqual(409, callback.on_failure.call_args.args[1])
+            callback.on_success.assert_not_called()
+            self.controller._Controller__plan_delete_local_targets.assert_not_called()
+            self.controller._Controller__delete_local_artifact_plan.assert_not_called()
+            self.controller._Controller__queue_delete_local_process.assert_not_called()
+            self.assertTrue(os.path.lexists(claimed))
+            self.assertTrue(os.path.lexists(sidecar))
+            self.assertFalse(os.path.lexists(original))
+            self.assertIsNotNone(self.controller._Controller__collision_compare_claim)
+        finally:
+            future.set_result(("equal", None, None))
+            self.controller._Controller__cancel_and_settle_collision_claim_for_refresh()
+            temp_dir.cleanup()
+
+    def test_delete_local_does_not_settle_unrelated_collision_claim(self):
+        temp_dir, _claimed_file, _staging, original, claimed, sidecar = \
+            self._seed_active_deferred_collision_claim()
+        self.controller._Controller__deferred_queue_intents_map().clear()
+        final_root = os.path.join(temp_dir.name, "other-final")
+        staging_root = os.path.join(temp_dir.name, "other-staging")
+        os.makedirs(final_root)
+        os.makedirs(staging_root)
+        Path(os.path.join(final_root, "other.bin")).write_bytes(b"final")
+        Path(os.path.join(staging_root, "other.bin")).write_bytes(b"staging")
+        pair_a = self.controller._Controller__path_pairs_by_id["pair-a"]
+        pair_b = PathPair(
+            id="pair-b", name="Pair B", remote_path="/other", local_path=final_root, enabled=True,
+        )
+        self.controller._Controller__path_pairs_by_id["pair-b"] = pair_b
+        self.controller._Controller__path_pair_staging_paths["pair-b"] = staging_root
+        file = ModelFile("other.bin", False)
+        file.path_pair_id = pair_b.id
+        file.local_size = 7
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        actual_settle = self.controller._Controller__cancel_and_settle_collision_claim_for_refresh
+        settle = self.controller._Controller__cancel_and_settle_collision_claim_for_refresh = MagicMock()
+        self.controller._Controller__queue_delete_local_process = MagicMock(
+            return_value=SimpleNamespace(delete_local_planned_location_count=None),
+        )
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+
+        try:
+            self.assertEqual("pair-a", pair_a.id)
+            self.assertFalse(self.controller._has_active_collision_comparison(file.full_path, file.path_pair_id))
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+
+            settle.assert_not_called()
+            self.controller._Controller__queue_delete_local_process.assert_called_once()
+            self.assertTrue(os.path.lexists(claimed))
+            self.assertTrue(os.path.lexists(sidecar))
+            self.assertFalse(os.path.lexists(original))
+            self.assertIsNotNone(self.controller._Controller__collision_compare_claim)
+        finally:
+            self.controller._Controller__cancel_and_settle_collision_claim_for_refresh = actual_settle
+            actual_settle()
+            temp_dir.cleanup()
 
     def test_process_commands_delete_local_directory_keeps_active_root_rejection(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -17509,7 +17843,7 @@ class TestController(unittest.TestCase):
         blocked_callback.on_failure.assert_not_called()
         admitted_callback.on_failure.assert_not_called()
 
-    def test_ambiguous_split_local_target_refuses_final_delete(self):
+    def test_delete_local_plan_includes_exact_final_and_staging_file_locations(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             final_root = os.path.join(temp_dir, "final")
             staging_root = os.path.join(temp_dir, "staging")
@@ -17521,7 +17855,10 @@ class TestController(unittest.TestCase):
             self.controller._Controller__staging_path = staging_root
             file = ModelFile("release", False)
 
-            self.assertTrue(self.controller._Controller__has_ambiguous_split_local_target(file))
+            primary, additional, count = self.controller._Controller__plan_delete_local_targets(file)
+            self.assertEqual((final_root, "release"), primary)
+            self.assertEqual(((staging_root, "release", False),), additional)
+            self.assertEqual(2, count)
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_defers_when_lftp_temp_artifact_matches_path_pair_source(self, move):
