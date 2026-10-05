@@ -210,6 +210,12 @@ new one; it never removes or modifies the external network. Also set
 external network can contain other Compose projects; this prevents the generic
 `remote` service alias from resolving another retained fixture.
 
+For an isolated local diagnostic topology, `PERF_COMPOSE_OVERRIDE` may name one
+additional Compose file. The lab applies it after the base and optional external
+network files for every command, including `prepare`, `start`, `status`, and
+`stop`. Keep overrides scoped to a fresh `PERF_PROJECT`; the lab does not
+validate that an override preserves fixture mounts or service ownership.
+
 Run the candidate against the same retained fixture with a different run ID:
 
 ~~~sh

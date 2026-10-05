@@ -152,7 +152,7 @@ def normalize_topology_spec(
                 "nodes_local": 1,
                 "nodes_remote": 1,
                 "enabled": True,
-                "auto_queue": number != 1,
+                "auto_queue": False,
                 "remote_only_targets": [target] if number == 1 else [],
             }
             if number == 1:

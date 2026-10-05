@@ -392,6 +392,27 @@ def test_completion_profile_is_small_remote_directory_with_local_sentinel(tmp_pa
     assert cli.returncode == 0, cli.stderr
 
 
+def test_completion_profile_disables_auto_queue_on_every_isolation_pair():
+    spec = normalize_topology_spec("completion", pairs=2)
+    assert [pair["auto_queue"] for pair in spec["pairs"]] == [False, False]
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected_enabled"),
+    (("completion", False), ("uniform", True), ("mixed", True), ("cadence", True)),
+)
+def test_seeded_autoqueue_global_policy_is_disabled_only_for_completion(profile, expected_enabled, tmp_path):
+    config_dir = tmp_path / profile
+    pairs = 6 if profile == "cadence" else 2
+    seed_config(config_dir, "local-test-token", pairs=pairs, profile=profile)
+
+    config = Config.from_file(str(config_dir / "settings.cfg"))
+    assert config.autoqueue.enabled is expected_enabled
+    if profile == "completion":
+        pairs = json.loads((config_dir / "path_pairs.json").read_text(encoding="utf-8"))["path_pairs"]
+        assert [pair["auto_queue"] for pair in pairs] == [False, False]
+
+
 def test_cadence_fixture_records_asymmetric_counts_staging_mtimes_and_retained_reuse(tmp_path):
     local_root, remote_root = tmp_path / "local", tmp_path / "remote"
     first = generate_fixture(local_root, remote_root, tmp_path / "first.json", profile="cadence")
@@ -1446,6 +1467,103 @@ def test_compose_uses_isolated_default_network_with_optional_external_overlay():
         in external_source
     assert "${PERF_REMOTE_ADDRESS:?PERF_REMOTE_ADDRESS must name the external-network remote alias}" \
         in external_source
+
+
+def test_lab_compose_applies_one_optional_local_override_after_network_overlay():
+    lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    compose = lab_source[lab_source.index("compose() {"):lab_source.index("\n}\n", lab_source.index("compose() {"))]
+
+    assert 'if [[ -n "${PERF_COMPOSE_OVERRIDE:-}" ]]; then' in compose
+    assert 'compose_files+=(--file "$PERF_COMPOSE_OVERRIDE")' in compose
+    assert compose.index('compose_files+=(--file "$SCRIPT_DIR/compose.external-network.yml")') \
+        < compose.index('compose_files+=(--file "$PERF_COMPOSE_OVERRIDE")')
+    assert 'docker compose --project-name "$PROJECT" "${compose_files[@]}" "$@"' in compose
+
+
+def test_lab_start_app_only_checks_existing_dependencies_and_calls_outer_compose_no_deps(tmp_path):
+    if os.name == "nt":
+        bash_candidates = [Path("C:/Program Files/Git/bin/bash.exe"), Path("C:/Program Files/Git/usr/bin/bash.exe")]
+        bash = next((str(path) for path in bash_candidates if path.is_file()), None)
+    else:
+        bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("Git Bash or bash is required for the lab outer-callsite regression")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls_path = tmp_path / "docker-calls.jsonl"
+    docker_stub = bin_dir / "docker"
+    docker_stub.write_text(
+        """#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ['DOCKER_STUB_CALLS'], 'a', encoding='utf-8') as stream:
+    stream.write(json.dumps(args) + '\\n')
+services = {'fixture':'fixture-id', 'config_seed':'config-id', 'complete_seed':'complete-id', 'remote':'remote-id', 'app':'app-id'}
+if args and args[0] == 'compose':
+    if 'ps' in args:
+        print(services.get(args[-1], ''))
+    elif 'up' in args:
+        print('started')
+    else:
+        raise SystemExit('unexpected compose command')
+elif args and args[0] == 'inspect':
+    template, container_id = args[2], args[3]
+    service = next((name for name, value in services.items() if value == container_id), '')
+    project = os.environ['PERF_PROJECT']
+    if 'State.Health.Status' in template:
+        print(f'running|true|healthy|{project}|remote')
+    elif 'State.ExitCode' in template:
+        status = 'exited'
+        code = '1' if os.environ.get('DOCKER_STUB_FAIL_SERVICE') == service else '0'
+        print(f'{status}|{code}|{project}|{service}')
+    else:
+        print('running|true|2026-10-05T00:00:00Z||0|synthetic-image|linux/amd64')
+else:
+    raise SystemExit('unexpected docker command')
+""",
+        encoding="utf-8",
+    )
+    docker_stub.chmod(0o755)
+    override = tmp_path / "override.yml"
+    override.write_text("services:\n  app:\n    environment:\n      LOCAL_TEST: \"1\"\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.update({
+        "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+        "DOCKER_STUB_CALLS": str(calls_path),
+        "PERF_PROJECT": "synthetic-completion-project",
+        "PERF_RUN_ID": "synthetic-app-only-start",
+        "PERF_PROFILE": "completion",
+        "PERF_IMAGE": "synthetic-image",
+        "PERF_COMPOSE_OVERRIDE": str(override),
+        "PERF_ARTIFACT_ROOT": str(tmp_path / "artifacts"),
+    })
+    repo_root = PERF_DIR.parents[3]
+    repo_shell_path = str(repo_root).replace("\\", "/")
+    if os.name == "nt":
+        drive, tail = os.path.splitdrive(repo_shell_path)
+        repo_shell_path = "/" + drive.rstrip(":").lower() + tail
+    command = f"cd {shlex.quote(repo_shell_path)} && exec ./src/docker/test/performance/lab.sh start-app-only"
+
+    success = subprocess.run([bash, "-c", command], capture_output=True, text=True, env=env)
+    assert success.returncode == 0, success.stderr
+    calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
+    compose_calls = [call for call in calls if call and call[0] == "compose"]
+    up_calls = [call for call in compose_calls if "up" in call]
+    assert len(up_calls) == 1
+    assert up_calls[0][-4:] == ["--detach", "--force-recreate", "--no-deps", "app"]
+    assert all("run" not in call and "build" not in call for call in compose_calls)
+    for service in ("fixture", "config_seed", "complete_seed", "remote"):
+        assert any("ps" in call and call[-1] == service for call in compose_calls)
+
+    calls_path.write_text("", encoding="utf-8")
+    env["DOCKER_STUB_FAIL_SERVICE"] = "complete_seed"
+    env["PERF_RUN_ID"] = "synthetic-app-only-refusal"
+    refused = subprocess.run([bash, "-c", command], capture_output=True, text=True, env=env)
+    assert refused.returncode == 2
+    assert "complete_seed prerequisite is not complete" in refused.stderr
+    refused_calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
+    assert not any(call and call[0] == "compose" and "up" in call for call in refused_calls)
 
 
 def test_compose_waits_for_remote_ssh_health_before_starting_app():

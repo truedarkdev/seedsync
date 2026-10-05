@@ -109,6 +109,9 @@ compose() {
     export PERF_EXTERNAL_NETWORK
     compose_files+=(--file "$SCRIPT_DIR/compose.external-network.yml")
   fi
+  if [[ -n "${PERF_COMPOSE_OVERRIDE:-}" ]]; then
+    compose_files+=(--file "$PERF_COMPOSE_OVERRIDE")
+  fi
   docker compose --project-name "$PROJECT" "${compose_files[@]}" "$@"
 }
 
@@ -239,6 +242,49 @@ start() {
   compose up --detach remote app
   write_compose_summary "$ARTIFACT_DIR/compose-state-start.json"
   echo "Started project $PROJECT; artifacts: $ARTIFACT_DIR"
+}
+
+start_app_only() {
+  if [[ "$PERF_PROFILE" != completion ]]; then
+    echo "start-app-only is limited to the completion profile" >&2
+    return 2
+  fi
+  if [[ -z "${PERF_COMPOSE_OVERRIDE:-}" || ! -f "$PERF_COMPOSE_OVERRIDE" ]]; then
+    echo "start-app-only requires an existing PERF_COMPOSE_OVERRIDE" >&2
+    return 2
+  fi
+
+  local service container_id fields
+  for service in fixture config_seed complete_seed; do
+    container_id="$(compose ps --all -q "$service" | head -n 1)"
+    if [[ -z "$container_id" ]]; then
+      echo "Refusing app-only start: successful $service prerequisite is missing" >&2
+      return 2
+    fi
+    fields="$(docker inspect --format '{{.State.Status}}|{{.State.ExitCode}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}' "$container_id")"
+    if [[ "$fields" != "exited|0|$PROJECT|$service" ]]; then
+      echo "Refusing app-only start: $service prerequisite is not complete for this project" >&2
+      return 2
+    fi
+  done
+
+  container_id="$(compose ps --all -q remote | head -n 1)"
+  if [[ -z "$container_id" ]]; then
+    echo "Refusing app-only start: remote prerequisite is missing" >&2
+    return 2
+  fi
+  fields="$(docker inspect --format '{{.State.Status}}|{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}' "$container_id")"
+  if [[ "$fields" != "running|true|healthy|$PROJECT|remote" ]]; then
+    echo "Refusing app-only start: remote prerequisite is not healthy for this project" >&2
+    return 2
+  fi
+
+  ensure_artifacts
+  write_run_metadata start-app-only
+  date -u +%s%3N > "$ARTIFACT_DIR/start-epoch-ms.txt"
+  compose up --detach --force-recreate --no-deps app
+  write_compose_summary "$ARTIFACT_DIR/compose-state-start.json"
+  echo "Started app only for project $PROJECT; artifacts: $ARTIFACT_DIR"
 }
 
 status() {
@@ -1288,6 +1334,7 @@ PY
 case "${1:-}" in
   prepare) prepare ;;
   start) start ;;
+  start-app-only) start_app_only ;;
   status) status ;;
   measure) shift; measure "$@" ;;
   browser) shift; browser "$@" ;;

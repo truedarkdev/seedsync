@@ -93,6 +93,7 @@ def seed_config(config_dir: Path, api_token: str, pairs: int = 6, breadcrumb_mod
     if not remote_address.strip():
         raise ValueError("remote_address must be nonblank")
     breadcrumb_enabled = "True" if breadcrumb_mode == "on" else "False"
+    autoqueue_enabled = "False" if profile == "completion" else "True"
     breadcrumb_policy = (
         '{"rules":{"model.progress":"debug"}}'
         if breadcrumb_mode == "on" else "{}"
@@ -201,7 +202,7 @@ managed_extract_folders_enabled = True
 port = 8800
 
 [AutoQueue]
-enabled = True
+enabled = {autoqueue_enabled}
 patterns_only = False
 auto_extract = True
 auto_delete_remote = False
