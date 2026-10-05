@@ -139,6 +139,12 @@ function tempRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "seedsync-browser-observer-"));
 }
 
+function expectedScopeDigest(value) {
+  let hash = 2166136261;
+  for (const byte of Buffer.from(value, "utf8")) { hash ^= byte; hash = Math.imul(hash, 16777619) >>> 0; }
+  return hash.toString(16).padStart(8, "0");
+}
+
 test("offline self-check covers root response states, privacy, filter, and bounds", () => {
   const root = tempRoot();
   const output = path.join(root, "self-check.json");
@@ -348,6 +354,164 @@ function startFixture(rootId, options = {}) {
   server.__fixtureCleanup = () => { for (const response of heldResponses) response.destroy(); };
   return new Promise(resolve => server.listen(0, "127.0.0.1", () => resolve(server)));
 }
+
+function startRouteSequenceFixture(pairIds, rootIds) {
+  const cursorSecret = "private-cursor-fixture-token";
+  const streamCounts = new Map();
+  const cursorRequests = [];
+  let dashboardRequests = 0;
+  const server = http.createServer((request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    if (url.pathname === "/dashboard") {
+      dashboardRequests += 1;
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end(`<!doctype html><div id="filter-search"><input type="search" value="keep-this-filter"></div>${pairIds.map((id, index) => `<a href="/dashboard/${id}" data-pair="${id}">Pair ${index + 1}</a>`).join("")}<div id="file-list"></div><script>
+        const roots = ${JSON.stringify(Object.fromEntries(pairIds.map((id, index) => [id, rootIds[index]])))};
+        let stream = null;
+        document.addEventListener('click', event => {
+          const link = event.target.closest('a[data-pair]');
+          if (!link) return;
+          event.preventDefault();
+          history.pushState({pair: link.dataset.pair}, '', link.getAttribute('href'));
+          renderPair(link.dataset.pair);
+        });
+        window.addEventListener('popstate', () => renderPair(history.state?.pair));
+        function renderPair(pairId) {
+          if (!pairId || !roots[pairId]) return;
+          if (stream) stream.close();
+          const rootId = roots[pairId];
+          const delay = pairId === 'pair-1' && !window.__firstPairRendered ? 1150 : 180;
+          window.__firstPairRendered = true;
+          const list = document.querySelector('#file-list');
+          list.replaceChildren();
+          stream = new EventSource('/server/model/v1/pairs/'+pairId+'/stream');
+          stream.addEventListener('model-page', event => {
+            const data = JSON.parse(event.data);
+            if (data.next_cursor) fetch('/server/model/v1/pairs/'+pairId+'/roots?limit=1&cursor='+encodeURIComponent(data.next_cursor)).then(() => {});
+          });
+          setTimeout(() => {
+            const row = document.createElement('div'); row.className='file'; row.dataset.fileId=rootId;
+            row.innerHTML='<span class="status"><span class="text">downloading</span></span><span class="size_info">2 / 4 MiB</span><div role="progressbar" aria-valuenow="50"></div>';
+            list.append(row);
+            setTimeout(() => row.querySelector('[role=progressbar]').setAttribute('aria-valuenow', '62'), 100);
+          }, delay);
+        }
+      </script>`);
+      return;
+    }
+    if (url.pathname === "/server/path-pairs") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ data: pairIds.map((id, index) => ({ id, name: `Pair ${index + 1}` })) }));
+      return;
+    }
+    const apiMatch = url.pathname.match(/^\/server\/model\/v1\/pairs\/(pair-[12])\/roots$/);
+    if (apiMatch) {
+      const pairId = apiMatch[1];
+      const pairIndex = pairIds.indexOf(pairId);
+      const cursor = url.searchParams.get("cursor");
+      cursorRequests.push({ pairId, cursorPresent: cursor !== null });
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ model_version: 30 + pairIndex, records: [{ file_id: rootIds[pairIndex], state: "downloading", local_size: 2, remote_size: 4, transferred_size: 2, display_size_total: 4, display_transferred_size: 2, download_progress: 50 }] }));
+      return;
+    }
+    const streamMatch = url.pathname.match(/^\/server\/model\/v1\/pairs\/(pair-[12])\/stream$/);
+    if (streamMatch) {
+      const pairId = streamMatch[1];
+      const pairIndex = pairIds.indexOf(pairId);
+      const eventNumber = (streamCounts.get(pairId) || 0) + 1;
+      streamCounts.set(pairId, eventNumber);
+      response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+      const record = { file_id: rootIds[pairIndex], state: "downloading", local_size: 2, remote_size: 4, transferred_size: 2 + eventNumber, display_size_total: 4, display_transferred_size: 2 + eventNumber, download_progress: 50 + eventNumber };
+      setTimeout(() => {
+        const payload = { model_version: 40 + pairIndex, next_cursor: cursorSecret, records: [record] };
+        if (pairId === "pair-1" && eventNumber === 1) payload.padding = "x".repeat(observer.MAX_SSE_PAYLOAD_BYTES);
+        response.write(`event: model-page\ndata: ${JSON.stringify(payload)}\n\n`);
+        setTimeout(() => response.end(), 80);
+      }, pairId === "pair-1" && eventNumber === 1 ? 1150 : 180);
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  server.__cursorRequests = cursorRequests;
+  Object.defineProperty(server, "__dashboardRequests", { get: () => dashboardRequests });
+  return new Promise(resolve => server.listen(0, "127.0.0.1", () => resolve(server)));
+}
+
+test("headless route sequence retains exact root binding, cursor presence, and per-step timing", async t => {
+  try { require(process.env.PERF_PLAYWRIGHT_MODULE || "playwright"); }
+  catch (_) { return t.skip("Playwright is not installed in this worker environment"); }
+  const root = tempRoot();
+  const profile = path.join(root, "profile");
+  fs.mkdirSync(profile);
+  const pairIds = ["pair-1", "pair-2"];
+  const rootIds = pairIds.map(pairId => JSON.stringify([pairId, `${pairId}-root`]));
+  const selectorPath = path.join(root, "selector.json");
+  const output = path.join(root, "capture.json");
+  fs.writeFileSync(selectorPath, JSON.stringify({ pair_id: pairIds[0], root_id: rootIds[0] }));
+  const server = await startRouteSequenceFixture(pairIds, rootIds);
+  try {
+    const address = server.address();
+    const result = await observer.liveCapture({
+      diagnosticsRoot: root, output, selectorPath, profile,
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      playwrightModule: process.env.PERF_PLAYWRIGHT_MODULE || "playwright", maxSeconds: 5,
+      routeSequence: [
+        { pair_id: pairIds[0], root_id: rootIds[0] },
+        { pair_id: pairIds[1], root_id: rootIds[1] },
+        { pair_id: pairIds[0], root_id: rootIds[0] },
+      ],
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.route_sequence.complete, true);
+    assert.equal(result.route_sequence.steps.length, 3);
+    assert.deepEqual(result.route_sequence.steps.map(step => step.step_index), [0, 1, 2]);
+    assert.ok(result.route_sequence.steps.every(step => step.root_match_status === "matched"));
+    assert.ok(result.route_sequence.steps.every(step => step.root_selector_pair_binding === true));
+    assert.ok(result.route_sequence.steps.every(step => step.root_request_start_ms <= step.root_response_end_ms));
+    assert.ok(result.route_sequence.steps.every(step => step.cursor_requests.includes(true)));
+    assert.ok(result.ancestor_samples.some(sample => sample.route_step_index === 0 && sample.present === true));
+    assert.ok(result.ancestor_samples.some(sample => sample.route_step_index === 1 && sample.present === true));
+    assert.ok(result.ancestor_samples.some(sample => sample.route_step_index === 2 && sample.present === true));
+    assert.ok(result.sse.events.some(event => event.route_step_index === 0 && event.event_type === "model-page" && event.payload_projection === "oversize" && event.root_match_status === "unavailable" && event.root.state === null && event.root.complete_local_coverage === null));
+    assert.ok(result.sse.events.some(event => event.route_step_index === 1 && event.event_type === "model-page" && event.root_match_status === "matched"));
+    assert.ok(result.sse.events.some(event => event.route_step_index === 2 && event.event_type === "model-page" && event.root_match_status === "matched"));
+    const elapsedMs = Date.parse(result.ended_utc) - Date.parse(result.started_utc);
+    for (const [stepIndex, pairId] of [pairIds[0], pairIds[1], pairIds[0]].entries()) {
+      const expectedDigest = expectedScopeDigest(`/server/model/v1/pairs/${encodeURIComponent(pairId)}/stream`);
+      const source = result.sse.sources.find(item => item.route_step_index === stepIndex && item.route_class === "model_stream" && item.scope_digest === expectedDigest);
+      assert.ok(source, `step ${stepIndex} has a source with the expected pair scope`);
+      assert.ok(Number.isSafeInteger(source.request_start_ms) && source.request_start_ms >= 0 && source.request_start_ms <= elapsedMs);
+      assert.ok(Number.isSafeInteger(source.open_ms) && source.open_ms >= source.request_start_ms && source.open_ms <= elapsedMs);
+    assert.ok(Number.isSafeInteger(source.first_model_page_ms) && source.first_model_page_ms >= source.open_ms && source.first_model_page_ms <= elapsedMs);
+    }
+    assert.equal(result.route_sequence.steps[0].root_match_status, "matched", "API root binding remains independent from the oversized SSE projection");
+    assert.ok(Number.isSafeInteger(result.route_sequence.steps[0].first_model_page_ms), "the scoped stream-source arrival proves the first page was seen");
+    assert.equal(result.sse.payload_loss, true);
+    assert.ok(result.sse.payload_oversize_events >= 1);
+    assert.ok(result.route_sequence.steps.every(step => step.cursor_requests.includes(true)));
+    assert.ok(result.route_sequence.steps[0].first_model_page_ms >= 1000, "the first page remains observable past the old fixed 100 ms wait");
+    assert.equal(server.__dashboardRequests, 1, "pair changes stay within the same document");
+    assert.ok(server.__cursorRequests.some(request => request.pairId === "pair-1" && request.cursorPresent));
+    assert.ok(server.__cursorRequests.some(request => request.pairId === "pair-2" && request.cursorPresent));
+    const written = fs.readFileSync(output, "utf8");
+    assert.ok(!written.includes(rootIds[0]));
+    assert.ok(!written.includes(rootIds[1]));
+    assert.ok(!written.includes("Pair 1"));
+    assert.ok(!written.includes("Pair 2"));
+    assert.ok(!written.includes("keep-this-filter"));
+    assert.ok(!written.includes("private-cursor-fixture-token"));
+    const saved = JSON.parse(written);
+    assert.deepEqual(saved.route_sequence.steps.map(step => step.scope_digest), [
+      saved.route_sequence.steps[0].scope_digest,
+      saved.route_sequence.steps[1].scope_digest,
+      saved.route_sequence.steps[0].scope_digest,
+    ]);
+    assert.equal(result.filter_mutation_attempts, 0);
+  } finally {
+    await stopFixture(server);
+  }
+});
 
 async function stopFixture(server) {
   if (typeof server.__fixtureCleanup === "function") server.__fixtureCleanup();

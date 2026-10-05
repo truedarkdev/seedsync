@@ -180,7 +180,7 @@ function emptyRootApiProjection() {
   };
 }
 
-function addRootApiSnapshot(result, snapshot, phase, capturedAtMs) {
+function addRootApiSnapshot(result, snapshot, phase, capturedAtMs, routeStepIndex = null) {
   const boundedPhase = phase === "before_dom_arm" || phase === "armed" || phase === "armed_final"
     ? phase : "unknown";
   const projected = {
@@ -188,6 +188,7 @@ function addRootApiSnapshot(result, snapshot, phase, capturedAtMs) {
     capture_at_ms: boundedInt(capturedAtMs),
     capture_phase: boundedPhase,
   };
+  if (Number.isInteger(routeStepIndex) && routeStepIndex >= 0 && routeStepIndex < 3) projected.route_step_index = routeStepIndex;
   if (result.root_api_snapshots.length < MAX_ROOT_API_SNAPSHOTS) {
     result.root_api_snapshots.push(projected);
   } else {
@@ -346,7 +347,7 @@ function projectSse(eventType, data, atMs, source = null, selectedRootId = null)
 }
 
 function projectSource(source) {
-  return {
+  const projected = {
     source_id: boundedInt(source?.source_id),
     route_class: safeEventType(source?.route_class),
     scope_class: safeEventType(source?.scope_class),
@@ -359,6 +360,8 @@ function projectSource(source) {
     error_count: boundedInt(source?.error_count) ?? 0,
     event_count: boundedInt(source?.event_count) ?? 0,
   };
+  if (Number.isInteger(source?.route_step_index) && source.route_step_index >= 0 && source.route_step_index < 3) projected.route_step_index = source.route_step_index;
+  return projected;
 }
 
 function projectNavigationEvent(event) {
@@ -485,7 +488,20 @@ function validateConfig(config) {
   if (!moduleName || moduleName.length > 256 || /[\x00-\x1F\x7F]/.test(moduleName)) throw new Error("playwright_module");
   const maxSeconds = Number(config.maxSeconds ?? 600);
   if (!Number.isFinite(maxSeconds) || maxSeconds < 1 || maxSeconds > 600) throw new Error("max_seconds");
-  return { diagnosticsRoot, output, selectorPath, profile, g6SnapshotPath, baseUrl: baseUrl.replace(/\/$/, ""), playwrightModule: moduleName, maxSeconds: Math.floor(maxSeconds) };
+  let routeSequence = null;
+  if (config.routeSequence !== undefined) {
+    if (!Array.isArray(config.routeSequence) || config.routeSequence.length < 2 || config.routeSequence.length > 3) throw new Error("route_sequence_shape");
+    routeSequence = config.routeSequence.map(step => {
+      if (!step || typeof step !== "object" || Array.isArray(step) ||
+          Object.keys(step).some(key => !["pair_id", "root_id"].includes(key)) ||
+          !Object.prototype.hasOwnProperty.call(step, "pair_id") || !Object.prototype.hasOwnProperty.call(step, "root_id")) throw new Error("route_sequence_step_shape");
+      const pairId = selectorValue(step.pair_id, "pair");
+      const rootId = selectorValue(step.root_id, "root");
+      if (!selectorPairBinding(rootId, pairId)) throw new Error("route_sequence_binding");
+      return { pairId, rootId };
+    });
+  }
+  return { diagnosticsRoot, output, selectorPath, profile, g6SnapshotPath, baseUrl: baseUrl.replace(/\/$/, ""), playwrightModule: moduleName, maxSeconds: Math.floor(maxSeconds), routeSequence };
 }
 
 function makeAtomicWriter(output, diagnosticsRoot) {
@@ -737,6 +753,7 @@ async function liveCapture(rawConfig) {
   const write = makeAtomicWriter(config.output, config.diagnosticsRoot);
   let pairId = null;
   let rootId = null;
+  let routeStepIndex = null;
   let startupDeadlineMs = started + BROWSER_SESSION_DEADLINE_MS;
   const startupBudget = () => {
     const remaining = Math.max(0, startupDeadlineMs - Date.now());
@@ -751,6 +768,7 @@ async function liveCapture(rawConfig) {
     const selector = JSON.parse(fs.readFileSync(config.selectorPath, "utf8").replace(/^\uFEFF/, ""));
     pairId = selectorValue(selector.pair_id, "pair");
     rootId = selectorValue(selector.root_id, "root");
+    routeStepIndex = config.routeSequence ? 0 : null;
     result.navigation.root_selector_pair_binding = selectorPairBinding(rootId, pairId);
     if (config.g6SnapshotPath) {
       try {
@@ -761,10 +779,31 @@ async function liveCapture(rawConfig) {
     }
     const { chromium } = require(config.playwrightModule);
     context = await chromium.launchPersistentContext(config.profile, { headless: true, viewport: { width: 1280, height: 800 }, timeout: startupBudget() });
-    await context.addInitScript(({ originMs, maxSsePayloadBytes, selectedRootId }) => {
+    if (config.routeSequence && (config.routeSequence[0].pairId !== pairId || config.routeSequence[0].rootId !== rootId)) throw new Error("route_sequence_initial_binding");
+    if (config.routeSequence) {
+      result.route_sequence = {
+        schema: "incoming-recovery-browser-route-sequence.v1",
+        complete: false,
+        steps: config.routeSequence.map((step, stepIndex) => ({
+          step_index: stepIndex,
+          scope_digest: textFingerprint(`/dashboard/${encodeURIComponent(step.pairId)}`),
+          root_selector_pair_binding: selectorPairBinding(step.rootId, step.pairId),
+          selected_at_ms: null,
+          root_response_end_ms: null,
+          root_match_status: null,
+          first_model_page_ms: null,
+          first_visible_progress_ms: null,
+          last_visible_progress_ms: null,
+          cursor_requests: [],
+          observed: false,
+        })),
+      };
+    }
+    await context.addInitScript(({ originMs, maxSsePayloadBytes, selectedRootId, routeSequence }) => {
       const atMs = () => Math.max(0, Date.now() - originMs);
       const safeTokenInPage = value => typeof value === "string" && /^[A-Za-z0-9_-]{1,48}$/.test(value) ? value : "unknown";
       const state = { opened: 0, errors: 0, events: [], eventsDropped: 0, payloadOversize: 0, payloadSkipped: 0, sources: [], sourcesDropped: 0, navigation: [] };
+      if (routeSequence.length) window.__g21RouteSelection = { pairId: routeSequence[0].pairId, rootId: routeSequence[0].rootId, stepIndex: 0, routePath: null, active: false };
       const sourceByInstance = new WeakMap();
       const fingerprint = value => {
         const text = typeof value === "string" ? value : "";
@@ -775,7 +814,8 @@ async function liveCapture(rawConfig) {
       const describeUrl = value => {
         try {
           const pathname = new URL(String(value), window.location.href).pathname;
-          if (/^\/server\/model\/v1\/pairs\/[^/]+\/stream$/.test(pathname)) return { route_class: "model_stream", scope_class: "scoped", scope_digest: fingerprint(pathname) };
+          const streamMatch = pathname.match(/^\/server\/model\/v1\/pairs\/([^/]+)\/stream$/);
+          if (streamMatch) return { route_class: "model_stream", scope_class: "scoped", scope_digest: fingerprint(pathname), pair_id: decodeURIComponent(streamMatch[1]) };
           if (pathname === "/server/model/v1/summary/stream") return { route_class: "model_summary_stream", scope_class: "summary", scope_digest: null };
         } catch (_) { /* no raw URL is retained */ }
         return { route_class: "other", scope_class: "other", scope_digest: null };
@@ -783,7 +823,9 @@ async function liveCapture(rawConfig) {
       const Original = window.EventSource;
       class ObservedEventSource extends Original {
         constructor(...args) {
-          const source = { source_id: state.opened + 1, ...describeUrl(args[0]), request_start_ms: atMs(), open_ms: null, first_model_page_ms: null, close_ms: null, navigation_ms: null, error_count: 0, event_count: 0 };
+          const described = describeUrl(args[0]);
+          const current = window.__g21RouteSelection;
+          const source = { source_id: state.opened + 1, ...described, route_step_index: routeSequence.length && current?.active && current.pairId === described.pair_id ? current.stepIndex : null, request_start_ms: atMs(), open_ms: null, first_model_page_ms: null, close_ms: null, navigation_ms: null, error_count: 0, event_count: 0 };
           super(...args);
           state.opened += 1;
           if (state.sources.length < 64) state.sources.push(source);
@@ -809,12 +851,16 @@ async function liveCapture(rawConfig) {
             const candidate = data && typeof data === "object" && !Array.isArray(data) ? (Number.isInteger(data.model_version) ? data.model_version : data.global_model_version) : null;
             const modelVersion = Number.isInteger(candidate) && candidate >= 0 && candidate <= 2147483647 ? candidate : null;
             if (type === "model-page" && source.first_model_page_ms === null) source.first_model_page_ms = eventAtMs;
+            const current = window.__g21RouteSelection;
+            const selectionMatches = !routeSequence.length || (current?.active === true && current.pairId === source.pair_id && window.location.pathname === current.routePath);
+            const eventRootId = routeSequence.length ? (selectionMatches ? current.rootId : null) : selectedRootId;
+            const eventStepIndex = routeSequence.length && selectionMatches ? current.stepIndex : null;
             let rootMatchStatus = "not_applicable";
             let root = { state: null, local_size: null, remote_size: null, transferred_size: null, display_size_total: null, display_transferred_size: null, download_progress: null, downloading_speed: null, eta: null, explicitly_stopped: null, complete_local_coverage: null, final_move_succeeded: null, model_version: modelVersion };
             if (["model-page", "model-invalidate", "model-patch"].includes(type)) {
               const records = data?.records;
-              const match = selectedRootId && Array.isArray(records) ? records.find(record => record && typeof record === "object" && !Array.isArray(record) && record.file_id === selectedRootId) : null;
-              rootMatchStatus = !selectedRootId ? "not_included" : !data ? "unavailable" : !Array.isArray(records) ? "malformed" : match ? "matched" : "missing";
+              const match = eventRootId && Array.isArray(records) ? records.find(record => record && typeof record === "object" && !Array.isArray(record) && record.file_id === eventRootId) : null;
+              rootMatchStatus = !eventRootId ? "not_included" : !data ? "unavailable" : !Array.isArray(records) ? "malformed" : match ? "matched" : "missing";
               if (match) {
                 root = {
                   state: typeof match.state === "string" && /^[A-Za-z0-9_-]{1,48}$/.test(match.state) ? match.state : null,
@@ -835,7 +881,7 @@ async function liveCapture(rawConfig) {
             } else if (["model-reset"].includes(type)) {
               rootMatchStatus = "not_included";
             }
-            state.events.push({ at_ms: eventAtMs, event_type: safeTokenInPage(type), model_version: modelVersion, model_version_available: modelVersion !== null, payload_projection: payloadOversize ? "oversize" : data ? "projected" : "unavailable", payload_oversize: payloadOversize, payload_skipped: !data, payload_bytes: Math.min(payloadBytes, maxSsePayloadBytes + 1), root_match_status: rootMatchStatus, root, source_id: source.source_id, route_class: source.route_class, scope_class: source.scope_class, scope_digest: source.scope_digest });
+            state.events.push({ at_ms: eventAtMs, route_step_index: eventStepIndex, event_type: safeTokenInPage(type), model_version: modelVersion, model_version_available: modelVersion !== null, payload_projection: payloadOversize ? "oversize" : data ? "projected" : "unavailable", payload_oversize: payloadOversize, payload_skipped: !data, payload_bytes: Math.min(payloadBytes, maxSsePayloadBytes + 1), root_match_status: rootMatchStatus, root, source_id: source.source_id, route_class: source.route_class, scope_class: source.scope_class, scope_digest: source.scope_digest });
           };
           ["open", "error", "status", "model-page", "model-summary", "model-invalidate", "model-patch", "model-reset"].forEach(type => this.addEventListener(type, capture(type)));
         }
@@ -850,7 +896,7 @@ async function liveCapture(rawConfig) {
       window.addEventListener("pagehide", () => recordNavigation("pagehide"));
       window.addEventListener("beforeunload", () => recordNavigation("beforeunload"));
       window.__g21Capture = state;
-    }, { originMs: started, maxSsePayloadBytes: MAX_SSE_PAYLOAD_BYTES, selectedRootId: rootId });
+    }, { originMs: started, maxSsePayloadBytes: MAX_SSE_PAYLOAD_BYTES, selectedRootId: rootId, routeSequence: config.routeSequence || [] });
     const page = await context.newPage();
     page.on("framenavigated", frame => {
       if (frame !== page.mainFrame() || result.navigation.events.length >= MAX_NAVIGATION_EVENTS) return;
@@ -866,8 +912,8 @@ async function liveCapture(rawConfig) {
       try {
         const pathname = new URL(value).pathname;
         if (pathname === "/server/path-pairs") return { route_class: "path_pairs", scope_digest: null };
-        if (/^\/server\/model\/v1\/pairs\/[^/]+\/roots$/.test(pathname)) return { route_class: "model_roots", scope_digest: null };
-        if (/^\/server\/model\/v1\/pairs\/[^/]+\/stream$/.test(pathname)) return { route_class: "model_stream", scope_digest: textFingerprint(pathname) };
+        if (/^\/server\/model\/v1\/pairs\/[^/]+\/roots$/.test(pathname)) return { route_class: "model_roots", scope_digest: null, cursor_present: new URL(value).searchParams.has("cursor") };
+        if (/^\/server\/model\/v1\/pairs\/[^/]+\/stream$/.test(pathname)) return { route_class: "model_stream", scope_digest: textFingerprint(pathname), cursor_present: false };
       } catch (_) { /* no URL retained */ }
       return null;
     };
@@ -875,13 +921,15 @@ async function liveCapture(rawConfig) {
       try {
         if (new URL(request.url()).pathname.startsWith("/server/command/")) result.command_request_count += 1;
         const descriptor = routeDescriptor(request.url());
-        if (descriptor) requestStarted.set(request, { kind: descriptor.route_class, scope_digest: descriptor.scope_digest, at_ms: Math.max(0, Date.now() - started) });
+        if (descriptor) requestStarted.set(request, { kind: descriptor.route_class, scope_digest: descriptor.scope_digest, cursor_present: descriptor.cursor_present, route_step_index: routeStepIndex, at_ms: Math.max(0, Date.now() - started) });
       } catch (_) { /* ignore malformed browser event */ }
     });
     page.on("response", response => {
       const timing = requestStarted.get(response.request());
       if (!timing || result.api_timing.length >= MAX_API_TIMING) return;
-      result.api_timing.push({ route_class: timing.kind, scope_digest: timing.scope_digest, request_start_ms: timing.at_ms, status: Number.isInteger(response.status()) ? response.status() : null, response_end_ms: Math.max(0, Date.now() - started), response_duration_ms: Math.max(0, Date.now() - started - timing.at_ms) });
+      const projected = { route_class: timing.kind, scope_digest: timing.scope_digest, request_start_ms: timing.at_ms, status: Number.isInteger(response.status()) ? response.status() : null, response_end_ms: Math.max(0, Date.now() - started), response_duration_ms: Math.max(0, Date.now() - started - timing.at_ms) };
+      if (config.routeSequence) { projected.route_step_index = timing.route_step_index; projected.cursor_present = timing.cursor_present === true; }
+      result.api_timing.push(projected);
       requestStarted.delete(response.request());
     });
     result.status = "dashboard";
@@ -901,6 +949,14 @@ async function liveCapture(rawConfig) {
     await pairLink.waitFor({ state: "visible", timeout: startupBudget() });
     result.navigation.pair_link_match_count = await pairLink.count();
     if (result.navigation.pair_link_match_count !== 1) throw new Error("pair_link_ambiguous");
+    if (config.routeSequence) {
+      const first = config.routeSequence[0];
+      const href = await pairLink.getAttribute("href");
+      const target = new URL(href || "", config.baseUrl);
+      if (first.pairId !== pairId || first.rootId !== rootId || target.origin !== new URL(config.baseUrl).origin || !target.pathname.startsWith("/dashboard/")) throw new Error("route_sequence_initial_binding");
+      await page.evaluate(selection => { window.__g21RouteSelection = { ...selection, active: true }; }, { pairId, rootId, stepIndex: 0, routePath: target.pathname });
+      result.route_sequence.steps[0].selected_at_ms = Math.max(0, Date.now() - started);
+    }
     await pairLink.click();
     result.navigation.selected_pair_route_clicked = true;
     result.navigation.selected_pair_route_class = /^\/dashboard\/[^/]+$/.test(new URL(page.url()).pathname) ? "dashboard_selected_pair" : "unexpected_route";
@@ -912,16 +968,25 @@ async function liveCapture(rawConfig) {
       const requestStart = Math.max(0, Date.now() - started);
       const sessionRemaining = startupDeadlineMs === null ? null : startupBudget();
       const snapshot = await fetchRootProjection(page, config.baseUrl, pairId, rootId, started, requestStart, sessionRemaining);
-      addRootApiSnapshot(result, snapshot, phase, Math.max(0, Date.now() - started));
+      addRootApiSnapshot(result, snapshot, phase, Math.max(0, Date.now() - started), routeStepIndex);
       return snapshot;
     };
     result.status = "root_api";
     result.root_api = await captureRootApiSnapshot("before_dom_arm");
+    if (config.routeSequence) {
+      const step = result.route_sequence.steps[0];
+      step.root_response_end_ms = result.root_api.response_end_ms;
+      step.root_match_status = result.root_api.match_status;
+      step.root_request_start_ms = result.root_api.request_start_ms;
+    }
     result.status = "ancestor_observer";
     const observerArm = await page.evaluate(({ ancestorId, originMs }) => {
       const normalize = () => {
-        const node = [...document.querySelectorAll(".file[data-file-id]")].find(item => item.getAttribute("data-file-id") === ancestorId);
-        return { present: !!node, status: node?.querySelector(".status img")?.id || node?.querySelector(".status .text")?.textContent?.trim() || "unknown", progress: node?.querySelector("[role=progressbar]")?.getAttribute("aria-valuenow") || null, size: node?.querySelector(".size_info")?.textContent?.trim().replace(/\s+/g, " ") || null };
+        const selection = window.__g21RouteSelection;
+        const selected = selection?.active && window.location.pathname === selection.routePath;
+        const selectedRoot = selected ? selection.rootId : ancestorId;
+        const node = [...document.querySelectorAll(".file[data-file-id]")].find(item => item.getAttribute("data-file-id") === selectedRoot);
+        return { present: !!node, status: node?.querySelector(".status img")?.id || node?.querySelector(".status .text")?.textContent?.trim() || "unknown", progress: node?.querySelector("[role=progressbar]")?.getAttribute("aria-valuenow") || null, size: node?.querySelector(".size_info")?.textContent?.trim().replace(/\s+/g, " ") || null, route_step_index: selected ? selection.stepIndex : null };
       };
       const emit = () => {
         const sample = normalize();
@@ -950,6 +1015,44 @@ async function liveCapture(rawConfig) {
     const end = Date.now() + config.maxSeconds * 1000;
     let nextWrite = Date.now() + 1000;
     let nextRootSnapshot = Date.now() + ROOT_API_SNAPSHOT_INTERVAL_MS;
+    let sequenceIndex = 0;
+    const navigateSequenceStep = async index => {
+      const selected = config.routeSequence[index];
+      pairId = selected.pairId;
+      rootId = selected.rootId;
+      routeStepIndex = index;
+      const lookup = await fetchPairLookup(page, pairId, started, Math.max(1, end - Date.now()));
+      if (!lookup.name) throw new Error("route_sequence_pair_lookup_failed");
+      const link = page.getByRole("link", { name: lookup.name, exact: true });
+      await link.waitFor({ state: "visible", timeout: Math.max(1, end - Date.now()) });
+      if (await link.count() !== 1) throw new Error("route_sequence_pair_link_ambiguous");
+      const href = await link.getAttribute("href");
+      const target = new URL(href || "", config.baseUrl);
+      if (target.origin !== new URL(config.baseUrl).origin || !target.pathname.startsWith("/dashboard/")) throw new Error("route_sequence_route_scope");
+      await page.evaluate(selection => { window.__g21RouteSelection = { ...selection, active: true }; }, { pairId, rootId, stepIndex: index, routePath: target.pathname });
+      const route = result.route_sequence.steps[index];
+      route.selected_at_ms = Math.max(0, Date.now() - started);
+      if (new URL(page.url()).pathname !== target.pathname) {
+        await Promise.all([
+          page.waitForURL(url => url.pathname === target.pathname, { timeout: Math.max(1, end - Date.now()) }),
+          link.click(),
+        ]);
+      } else {
+        await link.click();
+      }
+      await page.waitForSelector("#file-list", { state: "attached", timeout: Math.max(1, end - Date.now()) });
+      const requestStart = Math.max(0, Date.now() - started);
+      const snapshot = await fetchRootProjection(page, config.baseUrl, pairId, rootId, started, requestStart, Math.max(1, end - Date.now()));
+      addRootApiSnapshot(result, snapshot, "armed", Math.max(0, Date.now() - started), index);
+      route.root_request_start_ms = snapshot.request_start_ms;
+      route.root_response_end_ms = snapshot.response_end_ms;
+      route.root_match_status = snapshot.match_status;
+    };
+    const projectSamples = samples => samples.slice(0, MAX_SAMPLES).map(item => {
+      const projected = projectAncestor(item, item.at_ms);
+      if (config.routeSequence && Number.isInteger(item.route_step_index)) projected.route_step_index = item.route_step_index;
+      return projected;
+    });
     while (Date.now() < end) {
       await page.waitForTimeout(250);
       if (Date.now() >= nextRootSnapshot) {
@@ -958,7 +1061,7 @@ async function liveCapture(rawConfig) {
       }
       if (Date.now() >= nextWrite) {
         const state = await page.evaluate(() => ({ samples: window.__g21AncestorSamples || [], samplesDropped: window.__g21AncestorSamplesDropped || 0, sse: window.__g21Capture || { opened: 0, errors: 0, events: [], eventsDropped: 0, sources: [], navigation: [] } }));
-        result.ancestor_samples = state.samples.slice(0, MAX_SAMPLES).map(item => projectAncestor(item, item.at_ms));
+        result.ancestor_samples = projectSamples(state.samples);
         result.ancestor_samples_dropped = Math.min(MAX_COUNTER, (boundedInt(state.samplesDropped) ?? 0) + Math.max(0, state.samples.length - result.ancestor_samples.length));
         const samplesDropped = boundedInt(state.samplesDropped) ?? 0;
         result.observer_capture.samples_observed = Math.min(MAX_COUNTER, state.samples.length + samplesDropped);
@@ -967,6 +1070,24 @@ async function liveCapture(rawConfig) {
         const firstPresent = state.samples.find(item => item.present === true);
         result.observer_capture.first_present_root_ms = firstPresent ? boundedInt(firstPresent.at_ms) : null;
         result.sse = { opened: boundedInt(state.sse.opened) ?? 0, errors: boundedInt(state.sse.errors) ?? 0, events: state.sse.events.slice(0, MAX_SSE_EVENTS), events_dropped: boundedInt(state.sse.eventsDropped) ?? 0, payload_loss: (boundedInt(state.sse.payloadSkipped) ?? 0) > 0 || state.sse.events.some(item => item.payload_projection !== "projected"), payload_oversize_events: boundedInt(state.sse.payloadOversize) ?? 0, payload_skipped_events: boundedInt(state.sse.payloadSkipped) ?? 0, retention_policy: "initial_plus_recent", chronology_complete: (boundedInt(state.sse.eventsDropped) ?? 0) === 0 && (boundedInt(state.sse.sourcesDropped) ?? 0) === 0, sources: state.sse.sources.slice(0, MAX_SSE_SOURCES).map(projectSource), sources_dropped: boundedInt(state.sse.sourcesDropped) ?? 0 };
+        if (config.routeSequence) {
+          const step = result.route_sequence.steps[sequenceIndex];
+          const pageSource = state.sse.sources.find(item => item.route_step_index === sequenceIndex && item.route_class === "model_stream" && boundedInt(item.first_model_page_ms) !== null);
+          const visible = state.samples.find(item => item.route_step_index === sequenceIndex && item.present === true);
+          if (pageSource && step.first_model_page_ms === null) step.first_model_page_ms = boundedInt(pageSource.first_model_page_ms);
+          if (visible) {
+            if (step.first_visible_progress_ms === null) step.first_visible_progress_ms = boundedInt(visible.at_ms);
+            step.last_visible_progress_ms = boundedInt(state.samples.filter(item => item.route_step_index === sequenceIndex && item.present === true).slice(-1)[0]?.at_ms);
+          }
+          step.cursor_requests = result.api_timing.filter(item => item.route_step_index === sequenceIndex && item.route_class === "model_roots").map(item => item.cursor_present === true);
+          step.observed = pageSource !== undefined && step.root_match_status === "matched" && visible !== undefined;
+          if (step.observed && sequenceIndex + 1 < config.routeSequence.length) {
+            sequenceIndex += 1;
+            await navigateSequenceStep(sequenceIndex);
+          } else if (step.observed && sequenceIndex === config.routeSequence.length - 1) {
+            result.route_sequence.complete = result.route_sequence.steps.every(item => item.observed);
+          }
+        }
         result.navigation.events = result.navigation.events.concat(state.sse.navigation.slice(0, MAX_NAVIGATION_EVENTS).map(projectNavigationEvent)).slice(0, MAX_NAVIGATION_EVENTS);
         write(result);
         nextWrite = Date.now() + 1000;
@@ -974,7 +1095,7 @@ async function liveCapture(rawConfig) {
     }
     await captureRootApiSnapshot("armed_final");
     const state = await page.evaluate(() => ({ samples: window.__g21AncestorSamples || [], samplesDropped: window.__g21AncestorSamplesDropped || 0, sse: window.__g21Capture || { opened: 0, errors: 0, events: [], eventsDropped: 0, sources: [], navigation: [] } }));
-    result.ancestor_samples = state.samples.slice(0, MAX_SAMPLES).map(item => projectAncestor(item, item.at_ms));
+    result.ancestor_samples = projectSamples(state.samples);
     result.ancestor_samples_dropped = Math.min(MAX_COUNTER, (boundedInt(state.samplesDropped) ?? 0) + Math.max(0, state.samples.length - result.ancestor_samples.length));
     const samplesDropped = boundedInt(state.samplesDropped) ?? 0;
     result.observer_capture.samples_observed = Math.min(MAX_COUNTER, state.samples.length + samplesDropped);
@@ -983,6 +1104,16 @@ async function liveCapture(rawConfig) {
     const firstPresent = state.samples.find(item => item.present === true);
     result.observer_capture.first_present_root_ms = firstPresent ? boundedInt(firstPresent.at_ms) : null;
     result.sse = { opened: boundedInt(state.sse.opened) ?? 0, errors: boundedInt(state.sse.errors) ?? 0, events: state.sse.events.slice(0, MAX_SSE_EVENTS), events_dropped: boundedInt(state.sse.eventsDropped) ?? 0, payload_loss: (boundedInt(state.sse.payloadSkipped) ?? 0) > 0 || state.sse.events.some(item => item.payload_projection !== "projected"), payload_oversize_events: boundedInt(state.sse.payloadOversize) ?? 0, payload_skipped_events: boundedInt(state.sse.payloadSkipped) ?? 0, retention_policy: "initial_plus_recent", chronology_complete: (boundedInt(state.sse.eventsDropped) ?? 0) === 0 && (boundedInt(state.sse.sourcesDropped) ?? 0) === 0, sources: state.sse.sources.slice(0, MAX_SSE_SOURCES).map(projectSource), sources_dropped: boundedInt(state.sse.sourcesDropped) ?? 0 };
+    if (config.routeSequence) {
+      const step = result.route_sequence.steps[sequenceIndex];
+      const pageSource = state.sse.sources.find(item => item.route_step_index === sequenceIndex && item.route_class === "model_stream" && boundedInt(item.first_model_page_ms) !== null);
+      const visible = state.samples.find(item => item.route_step_index === sequenceIndex && item.present === true);
+      if (pageSource && step.first_model_page_ms === null) step.first_model_page_ms = boundedInt(pageSource.first_model_page_ms);
+      if (visible && step.first_visible_progress_ms === null) step.first_visible_progress_ms = boundedInt(visible.at_ms);
+      if (visible) step.last_visible_progress_ms = boundedInt(state.samples.filter(item => item.route_step_index === sequenceIndex && item.present === true).slice(-1)[0]?.at_ms);
+      step.observed = pageSource !== undefined && step.root_match_status === "matched" && visible !== undefined;
+      result.route_sequence.complete = result.route_sequence.steps.every(item => item.observed);
+    }
     result.navigation.events = result.navigation.events.concat(state.sse.navigation.slice(0, MAX_NAVIGATION_EVENTS).map(projectNavigationEvent)).slice(0, MAX_NAVIGATION_EVENTS);
     result.resource_timing = await page.evaluate(({ baseUrl, originMs }) => {
       const classify = value => {
