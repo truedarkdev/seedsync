@@ -390,6 +390,11 @@ _ARTIFACT_PRIVATE_KEYS = frozenset({
     "password", "secret", "message", "detail", "file_id", "pair_id", "root_id",
 })
 _ARTIFACT_ROOT_STATES = frozenset({"default", "active", "queued", "stopped", "complete", "unknown"})
+_ARTIFACT_MODEL_STATES = _ARTIFACT_ROOT_STATES | frozenset({
+    "downloading", "downloaded", "deleted", "extracting", "extracted",
+    "validating", "validated", "corrupt", "move_failed", "move_succeeded",
+    "local_only",
+})
 _ARTIFACT_ALLOWED_KEYS = frozenset({
     "schema", "event", "phase", "outcome", "success", "kind", "error_type",
     "status_code", "body_reason", "request_index", "response_kind", "root_state",
@@ -401,7 +406,9 @@ _ARTIFACT_ALLOWED_KEYS = frozenset({
     "capture_start_utc_ms", "capture_start_monotonic_ms", "capture_end_utc_ms", "capture_end_monotonic_ms",
     "model_outcome", "reader_outcome", "timed_out", "config_hash", "runtime_hash", "workload_hash",
     "selector_hash", "leaf_hash", "model_version",
-    "model_snapshot",
+    "model_snapshot", "target_outcome", "target_visible_state", "target_explicitly_stopped", "target_gap_count",
+    "target_max_observed_gap_ms", "target_expected_interval_ms", "target_max_gap_ms",
+    "target_first_sample_monotonic_ms", "target_last_sample_monotonic_ms",
     "runtime_version",
 })
 _ARTIFACT_SAFE_REASONS = _QUEUE_PREFLIGHT_REASONS | frozenset({
@@ -411,7 +418,10 @@ _ARTIFACT_SAFE_REASONS = _QUEUE_PREFLIGHT_REASONS | frozenset({
     "preflight_cancelled_unrecognized", "first_failure", "get_failed", "get_succeeded",
 })
 _ARTIFACT_ERROR_TYPES = frozenset({
-    "auth_error", "http_error", "timeout", "transport_error", "observer_error",
+    "auth_error", "http_error", "timeout", "transport_error", "observer_error", "selector_error",
+})
+_ARTIFACT_TARGET_OUTCOMES = frozenset({
+    "completed", "stopped", "rollback", "deadline", "read_failure", "selector_unknown", "unknown",
 })
 _ARTIFACT_RESPONSE_KINDS = frozenset({"none", "mapping", "bytes", "text", "number", "object"})
 
@@ -878,7 +888,7 @@ def _sanitize_artifact(value: object) -> Mapping[str, object]:
                 if type(item) in (int, float) and math.isfinite(float(item))
                 and 0 <= float(item) <= _MAX_REQUEST_LATENCY_MS else None
             )
-        elif key in {"utc_ms", "monotonic_ms", "invocation_utc_ms", "invocation_monotonic_ms", "response_utc_ms", "response_monotonic_ms", "timeout_utc_ms", "timeout_monotonic_ms", "capture_start_utc_ms", "capture_start_monotonic_ms", "capture_end_utc_ms", "capture_end_monotonic_ms"}:
+        elif key in {"utc_ms", "monotonic_ms", "invocation_utc_ms", "invocation_monotonic_ms", "response_utc_ms", "response_monotonic_ms", "timeout_utc_ms", "timeout_monotonic_ms", "capture_start_utc_ms", "capture_start_monotonic_ms", "capture_end_utc_ms", "capture_end_monotonic_ms", "target_first_sample_monotonic_ms", "target_last_sample_monotonic_ms", "target_expected_interval_ms", "target_max_gap_ms", "target_max_observed_gap_ms", "target_gap_count"}:
             sanitized[key] = item if type(item) is int and 0 <= item <= 2**63 - 1 else None
         elif key in {"timeout_seconds", "timeout"}:
             sanitized[key] = item if type(item) in (int, float) and math.isfinite(float(item)) and 0 <= float(item) <= _MAX_REQUEST_LATENCY_MS / 1000 else None
@@ -896,6 +906,12 @@ def _sanitize_artifact(value: object) -> Mapping[str, object]:
             sanitized[key] = item if isinstance(item, str) and len(item) <= 64 and item.replace("_", "").isalnum() else "unknown"
         elif key == "endpoint_class":
             sanitized[key] = item if isinstance(item, str) and item in _ENDPOINT_CLASSES else "unknown"
+        elif key == "target_outcome":
+            sanitized[key] = item if isinstance(item, str) and item in _ARTIFACT_TARGET_OUTCOMES else "unknown"
+        elif key == "target_visible_state":
+            sanitized[key] = item if isinstance(item, str) and item in _ARTIFACT_MODEL_STATES else "unknown"
+        elif key == "target_explicitly_stopped":
+            sanitized[key] = item if type(item) is bool else None
         elif key in {"classification", "reason"}:
             allowed = _DISCRIMINATOR_LABELS if key == "classification" else _DISCRIMINATOR_REASONS
             sanitized[key] = item if isinstance(item, str) and item in allowed else "inconclusive"
@@ -918,7 +934,9 @@ def _sanitize_artifact(value: object) -> Mapping[str, object]:
                     else "unknown"
                 )
                 state = item.get("state")
-                safe_snapshot["state"] = state if isinstance(state, str) and state in _ARTIFACT_ROOT_STATES else "unknown"
+                safe_snapshot["state"] = state if isinstance(state, str) and state in _ARTIFACT_MODEL_STATES else "unknown"
+                visible_state = item.get("visible_state")
+                safe_snapshot["visible_state"] = visible_state if isinstance(visible_state, str) and visible_state in _ARTIFACT_MODEL_STATES else "unknown"
                 for field in (
                     "size", "local_size", "remote_size", "transferred_size",
                     "display_size_total", "display_transferred_size", "downloading_speed", "eta",
@@ -932,7 +950,7 @@ def _sanitize_artifact(value: object) -> Mapping[str, object]:
                 model_version = item.get("model_version")
                 if type(model_version) is int and 0 <= model_version <= 2**31 - 1:
                     safe_snapshot["model_version"] = model_version
-                for field in ("remote_present", "local_present", "complete_local_coverage", "final_move_succeeded", "explicitly_stopped"):
+                for field in ("remote_present", "remote_has_transferable_content", "local_present", "complete_local_coverage", "final_move_succeeded", "explicitly_stopped"):
                     boolean = item.get(field)
                     if type(boolean) is bool:
                         safe_snapshot[field] = boolean

@@ -216,8 +216,14 @@ def _leaf_receipt(config: Config, payload: object) -> tuple[Mapping[str, object]
     if len(matches) != 1:
         raise CaptureError("selected leaf receipt is invalid")
     record = matches[0]
-    if record.get("path_pair_id") != config.pair_id or record.get("is_dir") is not False or record.get("has_children") is not False or record.get("children") not in ([], None):
-        raise CaptureError("selected leaf shape is invalid")
+    if record.get("path_pair_id") != config.pair_id:
+        raise CaptureError("selected target scope is invalid")
+    if config.root_id == config.leaf_id and record.get("is_dir") is True:
+        child_count = record.get("child_count")
+        if type(child_count) is not int or child_count < 0 or record.get("has_children") is not (child_count > 0) or record.get("children") not in ([], None):
+            raise CaptureError("selected root shape is invalid")
+    elif record.get("is_dir") is not False or record.get("has_children") is not False or record.get("children") not in ([], None):
+        raise CaptureError("selected target shape is invalid")
     return {"selector_hash": config.selector_hash, "leaf_hash": config.leaf_hash}, _wire_model_version(payload), record
 
 
@@ -252,11 +258,53 @@ def _model_snapshot(identity: Mapping[str, object], model_version: int | None, r
         value = record.get(key)
         if type(value) is int and 0 <= value <= 2**63 - 1 and (key != "download_progress" or value <= 100):
             snapshot[key] = value
-    for key in ("remote_present", "local_present", "complete_local_coverage", "final_move_succeeded", "explicitly_stopped"):
+    for key in ("remote_present", "remote_has_transferable_content", "local_present", "complete_local_coverage", "final_move_succeeded", "explicitly_stopped"):
         value = record.get(key)
         if type(value) is bool:
             snapshot[key] = value
     return snapshot
+
+
+def _visible_state(snapshot: Mapping[str, object]) -> str:
+    """Mirror the Controller's bounded visible-state predicate for one record."""
+    state = snapshot.get("state")
+    if not isinstance(state, str):
+        return "unknown"
+    if snapshot.get("local_present") is True and snapshot.get("remote_has_transferable_content") is False:
+        return "local_only"
+    final_move = snapshot.get("final_move_succeeded") is True
+    explicitly_stopped = snapshot.get("explicitly_stopped") is True
+    if state in {"default", "downloaded"} and explicitly_stopped and not final_move:
+        return "stopped"
+    if state == "default":
+        display_total = snapshot.get("display_size_total")
+        display_transferred = snapshot.get("display_transferred_size")
+        has_display_union = type(display_total) is int and type(display_transferred) is int
+        complete_display = (
+            has_display_union and display_total > 0 and display_transferred >= display_total
+        )
+        total = display_total if has_display_union else snapshot.get("remote_size")
+        transferred = display_transferred if has_display_union else snapshot.get("transferred_size")
+        complete_progress = (
+            snapshot.get("complete_local_coverage") is True
+            and (not has_display_union or complete_display)
+            and snapshot.get("explicitly_stopped") is False
+        )
+        retained_progress = (
+            snapshot.get("remote_has_transferable_content") is True
+            and (total if type(total) is int else 0) > 0
+            and (
+                (transferred if type(transferred) is int else 0) > 0
+                or (snapshot.get("download_progress") if type(snapshot.get("download_progress")) is int else 0) > 0
+            )
+        )
+        if complete_progress:
+            return "downloaded"
+        if retained_progress:
+            return "stopped"
+    if state == "downloaded" and final_move:
+        return "move_succeeded"
+    return state
 
 
 class Runner:
@@ -292,7 +340,7 @@ class Runner:
         if digest != self.config.config_digest:
             raise CaptureError("protected config changed")
 
-    def _get(self, path: str) -> tuple[Mapping[str, object], int | None]:
+    def _get(self, path: str) -> tuple[Mapping[str, object], int | None, int]:
         if path != _leaf_path(self.config):
             raise CaptureError("GET route is not allowlisted")
         selector_hash, leaf_hash = self.config.selector_hash, self.config.leaf_hash
@@ -330,7 +378,7 @@ class Runner:
                 selector_hash=selector_hash, leaf_hash=leaf_hash,
                 model_version=_wire_model_version(payload),
             )
-            return payload, _wire_model_version(payload)
+            return payload, _wire_model_version(payload), response_mono
         except BaseException as exc:
             if response_utc is None:
                 response_utc = time.time_ns() // 1_000_000
@@ -355,8 +403,37 @@ class Runner:
         reader_outcome = "not_armed"
         terminal_written = False
         model_thread: threading.Thread | None = None
-        model_result: list[tuple[Mapping[str, object], int | None, Mapping[str, object]]] = []
-        model_errors: list[BaseException] = []
+        model_result: list[tuple[Mapping[str, object], int | None, Mapping[str, object], int]] = []
+        model_errors: list[str] = []
+        target_observation: dict[str, object] = {
+            "outcome": "unknown", "visible_state": "unknown",
+            "explicitly_stopped": None,
+            "first_sample_monotonic_ms": None, "last_sample_monotonic_ms": None,
+            "expected_interval_ms": max(1, int(POLL_CADENCE_SECONDS * 1000)),
+            "max_gap_ms": max(1, int((POLL_CADENCE_SECONDS + LEAF_GET_TIMEOUT_SECONDS) * 1000)),
+            "max_observed_gap_ms": 0, "gap_count": 0,
+            "last_error_type": None, "_last_terminal_state": None,
+            "_completed_seen": False,
+            "_previous_bytes": None,
+        }
+
+        def target_summary(*, final: bool = False) -> dict[str, object]:
+            outcome = target_observation["outcome"]
+            if outcome == "unknown" and target_observation["first_sample_monotonic_ms"] is None and target_observation["last_error_type"]:
+                outcome = "selector_unknown" if target_observation["last_error_type"] == "selector_error" else "read_failure"
+            elif final and outcome == "unknown":
+                outcome = "deadline"
+            return {
+                "target_outcome": outcome,
+                "target_visible_state": target_observation["visible_state"],
+                "target_explicitly_stopped": target_observation["explicitly_stopped"],
+                "target_first_sample_monotonic_ms": target_observation["first_sample_monotonic_ms"],
+                "target_last_sample_monotonic_ms": target_observation["last_sample_monotonic_ms"],
+                "target_expected_interval_ms": target_observation["expected_interval_ms"],
+                "target_max_gap_ms": target_observation["max_gap_ms"],
+                "target_max_observed_gap_ms": target_observation["max_observed_gap_ms"],
+                "target_gap_count": target_observation["gap_count"],
+            }
 
         def capture_summary() -> dict[str, object]:
             if reader is None:
@@ -391,7 +468,7 @@ class Runner:
                 capture_end_monotonic_ms=time.monotonic_ns() // 1_000_000,
                 physical_outcome=physical.get("outcome", "not_observed"),
                 model_outcome=model_outcome, reader_outcome=reader_outcome,
-                completion_proven=False, capture=capture_summary(),
+                completion_proven=False, **target_summary(final=True), capture=capture_summary(),
             )
             terminal_written = True
 
@@ -401,25 +478,68 @@ class Runner:
                 return
             model_thread.join()
             if model_result:
-                identity, model_version, record = model_result.pop(0)
+                identity, model_version, record, response_monotonic_ms = model_result.pop(0)
                 model_outcome = "observed"
+                snapshot = _model_snapshot(identity, model_version, record)
+                visible = _visible_state(snapshot)
+                snapshot["visible_state"] = visible
+                prior = target_observation["last_sample_monotonic_ms"]
+                if type(prior) is int:
+                    gap = max(0, response_monotonic_ms - prior)
+                    target_observation["max_observed_gap_ms"] = max(target_observation["max_observed_gap_ms"], gap)
+                    if gap > target_observation["max_gap_ms"]:
+                        target_observation["gap_count"] += 1
+                else:
+                    target_observation["first_sample_monotonic_ms"] = response_monotonic_ms
+                target_observation["last_sample_monotonic_ms"] = response_monotonic_ms
+                target_observation["visible_state"] = visible
+                target_observation["explicitly_stopped"] = snapshot.get("explicitly_stopped")
+                bytes_now = snapshot.get("transferred_size")
+                bytes_before = target_observation["_previous_bytes"]
+                if visible in {"downloaded", "move_succeeded", "extracted"}:
+                    target_observation["_completed_seen"] = True
+                    target_observation["outcome"] = "completed"
+                elif target_observation["_completed_seen"] and visible in {"default", "stopped", "deleted", "move_failed", "corrupt"}:
+                    target_observation["outcome"] = "rollback"
+                elif visible == "stopped" and snapshot.get("explicitly_stopped") is False and type(bytes_now) is int and type(bytes_before) is int and bytes_now < bytes_before:
+                    target_observation["outcome"] = "rollback"
+                elif visible == "stopped":
+                    target_observation["outcome"] = "stopped"
+                elif target_observation["outcome"] in {"stopped", "rollback"}:
+                    target_observation["outcome"] = "unknown"
+                target_observation["_previous_bytes"] = bytes_now if type(bytes_now) is int else bytes_before
                 self._event(
                     "model_snapshot", phase="model_poll", selector_hash=identity["selector_hash"],
                     leaf_hash=identity["leaf_hash"], model_version=model_version,
-                    model_snapshot=_model_snapshot(identity, model_version, record),
+                    response_monotonic_ms=response_monotonic_ms, model_snapshot=snapshot,
                 )
+                terminal_state = target_observation["outcome"]
+                if terminal_state in {"completed", "stopped", "rollback"} and target_observation["_last_terminal_state"] != terminal_state:
+                    self._event(
+                        "target_terminal", phase="target_watch",
+                        outcome="success" if terminal_state == "completed" else "failure",
+                        **target_summary(),
+                    )
+                    target_observation["_last_terminal_state"] = terminal_state
             elif model_errors:
                 model_outcome = "observed_with_loss" if model_outcome == "observed" else "loss"
+                target_observation["last_error_type"] = model_errors[-1]
+                target_observation["outcome"] = "selector_unknown" if model_errors[-1] == "selector_error" else "read_failure"
                 model_errors.clear()
             model_thread = None
 
         def model_poll() -> None:
             try:
-                payload, _model_version = self._get(_leaf_path(self.config))
-                identity, version, record = _leaf_receipt(self.config, payload)
-                model_result.append((identity, version, record))
+                payload, _model_version, response_monotonic_ms = self._get(_leaf_path(self.config))
             except BaseException as exc:
-                model_errors.append(exc)
+                model_errors.append("timeout" if isinstance(exc, TimeoutError) else "transport_error")
+                return
+            try:
+                identity, version, record = _leaf_receipt(self.config, payload)
+            except BaseException:
+                model_errors.append("selector_error")
+                return
+            model_result.append((identity, version, record, response_monotonic_ms))
 
         def start_model() -> None:
             nonlocal model_thread
@@ -438,8 +558,13 @@ class Runner:
                 max_millis=self.config.poll_millis, max_records=self.config.max_records,
                 max_output_bytes=self.config.max_output_bytes,
             )
-            payload, model_version = self._get(_leaf_path(self.config))
-            identity, _model_version, selected = _leaf_receipt(self.config, payload)
+            payload, model_version, _initial_response_monotonic_ms = self._get(_leaf_path(self.config))
+            try:
+                identity, _model_version, selected = _leaf_receipt(self.config, payload)
+            except CaptureError:
+                target_observation["last_error_type"] = "selector_error"
+                target_observation["outcome"] = "selector_unknown"
+                raise
             physical = _physical_receipt(self.config, selected)
             model_outcome = "observed"
             self._event(
@@ -477,6 +602,7 @@ class Runner:
                 model_thread.join(timeout=LEAF_GET_TIMEOUT_SECONDS)
                 if model_thread.is_alive():
                     model_outcome = "observed_with_loss" if model_outcome == "observed" else "loss"
+                    target_observation["last_error_type"] = "timeout"
                 else:
                     consume_model()
             try:
@@ -493,8 +619,14 @@ class Runner:
                 "schema": SCHEMA, "outcome": terminal_outcome,
                 "completion_proven": False, "physical_outcome": physical["outcome"],
                 "model_outcome": model_outcome, "reader_outcome": reader_outcome,
+                **target_summary(final=True),
             }
-        except BaseException:
+        except BaseException as exc:
+            if target_observation["first_sample_monotonic_ms"] is None:
+                if target_observation["outcome"] == "unknown":
+                    target_observation["outcome"] = "read_failure"
+                if target_observation["last_error_type"] is None:
+                    target_observation["last_error_type"] = "timeout" if isinstance(exc, TimeoutError) else "observer_error"
             try:
                 if model_thread is not None:
                     model_thread.join(timeout=LEAF_GET_TIMEOUT_SECONDS)

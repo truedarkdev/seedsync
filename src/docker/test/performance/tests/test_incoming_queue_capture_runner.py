@@ -66,7 +66,7 @@ def _payload(version: int = 7) -> dict[str, object]:
             "display_transferred_size": 5, "download_progress": 41, "downloading_speed": 7, "eta": 3,
             "progress": 99, "bytes_done": 1, "bytes_total": 12, "private_detail": "private-response-body",
             "complete_local_coverage": False,
-            "remote_present": True, "local_present": True,
+            "remote_present": True, "remote_has_transferable_content": True, "local_present": True,
         }],
     }
 
@@ -206,6 +206,34 @@ def test_root_file_selector_uses_roots_route_and_accepts_exact_regular_file(monk
     assert result["model_outcome"] == "observed"
     receipt = next(item for item in _trace(config.artifact_path) if item["event"] == "leaf_receipt")
     assert receipt["model_version"] == 7
+
+
+def test_exact_root_directory_can_be_watched_without_substituting_a_child(monkeypatch, tmp_path):
+    spool = _spool(tmp_path)
+    config = _config(tmp_path, spool, selector={
+        "pair": {"id": PAIR, "name": "Pair"},
+        "root": {"id": ROOT, "name": "Incoming"},
+        "leaf_id": ROOT, "leaf_name": "Incoming",
+    })
+    calls: list[str] = []
+
+    def root_directory(version):
+        payload = _root_payload(version, is_dir=True, has_children=True, child_count=3)
+        payload["records"][0].update({
+            "state": "default", "local_size": 12, "remote_size": 12,
+            "transferred_size": 12, "display_size_total": 12,
+            "display_transferred_size": 12, "download_progress": 100,
+            "remote_has_transferable_content": True, "complete_local_coverage": True,
+            "explicitly_stopped": False,
+        })
+        return payload
+
+    result = runner.Runner(config, opener=_opener(
+        calls, versions=[7, 8], expected_path=ROOTS_PATH, payload_factory=root_directory,
+    )).run()
+    assert calls and all(path == ROOTS_PATH for path in calls)
+    assert result["target_outcome"] == "completed"
+    assert next(item for item in _trace(config.artifact_path) if item["event"] == "leaf_receipt")["leaf_hash"] == config.leaf_hash
 
 
 @pytest.mark.parametrize("record_overrides", [
@@ -420,6 +448,7 @@ def test_failure_after_sink_creation_writes_fixed_terminal_without_raw_error(mon
     assert terminal["capture_start_monotonic_ms"] is None
     assert terminal["capture_end_utc_ms"] > 0
     assert terminal["capture_end_monotonic_ms"] > 0
+    assert terminal["target_outcome"] == "read_failure"
 
 
 def test_config_digest_is_immutable_during_passive_window(monkeypatch, tmp_path):
@@ -445,6 +474,215 @@ def test_config_digest_is_immutable_during_passive_window(monkeypatch, tmp_path)
     with pytest.raises(runner.CaptureError, match="protected config changed"):
         runner.Runner(config, opener=opener).run()
     assert _trace(config.artifact_path)[-1]["event"] == "terminal"
+
+
+def _target_payload(version: int, *, state: str, coverage: bool = False, progress: int = 0,
+                    transferred: int = 0, display_transferred: int | None = None,
+                    explicitly_stopped: bool = False) -> dict[str, object]:
+    payload = _payload(version)
+    record = payload["records"][0]
+    record.update({
+        "file_id": ROOT, "name": "Incoming", "path_pair_id": PAIR,
+        "state": state, "complete_local_coverage": coverage,
+        "download_progress": progress, "transferred_size": transferred,
+        "display_size_total": 12,
+        "display_transferred_size": display_transferred,
+        "explicitly_stopped": explicitly_stopped,
+        "remote_has_transferable_content": True,
+    })
+    return payload
+
+
+def test_visible_local_only_matches_immutable_controller_predicate():
+    app_python = Path("/app-python")
+    if not (app_python / "controller" / "controller.py").is_file():
+        pytest.skip("immutable app source is not mounted")
+    sys.path.insert(0, str(app_python))
+    from controller.controller import Controller
+    from model import ModelFile
+
+    file = ModelFile("root", False)
+    file.local_present = True
+    file.remote_has_transferable_content = False
+    file.complete_local_coverage = True
+    snapshot = {
+        "state": "default", "local_present": True,
+        "remote_has_transferable_content": False,
+        "complete_local_coverage": True, "explicitly_stopped": False,
+    }
+    assert runner._visible_state(snapshot) == Controller._model_record_visible_state(file) == "local_only"
+
+
+def test_watched_root_reports_controller_visible_completion_separately_from_capture(monkeypatch, tmp_path):
+    spool = _spool(tmp_path)
+    config = _config(tmp_path, spool, selector={
+        "pair": {"id": PAIR, "name": "Pair"},
+        "root": {"id": ROOT, "name": "Incoming"},
+        "leaf_id": ROOT, "leaf_name": "Incoming",
+    })
+    calls: list[str] = []
+
+    def payload(version):
+        # The selected root remains raw DEFAULT, but Controller renders it as
+        # downloaded only because complete coverage is established.
+        return _target_payload(version, state="default", coverage=True, progress=100,
+                               transferred=12, display_transferred=12)
+
+    result = runner.Runner(config, opener=_opener(
+        calls, versions=[7, 8], expected_path=ROOTS_PATH, payload_factory=payload,
+    )).run()
+
+    assert result["outcome"] == "success"
+    assert result["completion_proven"] is False
+    assert result["target_outcome"] == "completed"
+    assert result["target_visible_state"] == "downloaded"
+    assert result["target_first_sample_monotonic_ms"] > 0
+    records = _trace(config.artifact_path)
+    started = next(index for index, item in enumerate(records) if item["event"] == "capture_started")
+    target_terminal = next(index for index, item in enumerate(records) if item["event"] == "target_terminal")
+    finished = next(index for index, item in enumerate(records) if item["event"] == "terminal")
+    assert started < target_terminal < finished
+    snapshot = next(item["model_snapshot"] for item in records if item["event"] == "model_snapshot")
+    assert snapshot["state"] == "default" and snapshot["visible_state"] == "downloaded"
+
+
+def test_stopped_is_reported_then_polling_continues_to_downloaded(monkeypatch, tmp_path):
+    spool = _spool(tmp_path)
+    config = _config(tmp_path, spool, selector={
+        "pair": {"id": PAIR, "name": "Pair"},
+        "root": {"id": ROOT, "name": "Incoming"},
+        "leaf_id": ROOT, "leaf_name": "Incoming",
+    })
+    calls: list[str] = []
+
+    def payload(version):
+        if version == 8:
+            return _target_payload(version, state="default", progress=100, transferred=12,
+                                   display_transferred=12, coverage=False)
+        return _target_payload(version, state="default", progress=100, transferred=12,
+                               display_transferred=12, coverage=True)
+
+    result = runner.Runner(config, opener=_opener(
+        calls, versions=[7, 8, 9], expected_path=ROOTS_PATH, payload_factory=payload,
+    )).run()
+    assert result["target_outcome"] == "completed"
+    terminals = [item for item in _trace(config.artifact_path) if item["event"] == "target_terminal"]
+    assert [item["target_outcome"] for item in terminals[:2]] == ["stopped", "completed"]
+    assert len(calls) >= 4  # initial receipt, stopped sample, recovered sample, continued bounded capture
+
+
+def test_target_deadline_and_stopped_rollback_are_not_capture_success(monkeypatch, tmp_path):
+    spool = _spool(tmp_path)
+    config = _config(tmp_path, spool, selector={
+        "pair": {"id": PAIR, "name": "Pair"},
+        "root": {"id": ROOT, "name": "Incoming"},
+        "leaf_id": ROOT, "leaf_name": "Incoming",
+    })
+    calls: list[str] = []
+    result = runner.Runner(config, opener=_opener(
+        calls, expected_path=ROOTS_PATH,
+        payload_factory=lambda version: _target_payload(version, state="downloading", progress=10, transferred=1),
+    )).run()
+    assert result["outcome"] == "success"
+    assert result["target_outcome"] == "deadline"
+    assert result["completion_proven"] is False
+    terminal = _trace(config.artifact_path)[-1]
+    assert terminal["outcome"] == "success" and terminal["target_outcome"] == "deadline"
+    downloading = next(item["model_snapshot"] for item in _trace(config.artifact_path) if item["event"] == "model_snapshot")
+    assert downloading["state"] == "downloading"
+
+
+def test_explicit_stop_and_post_completion_rollback_remain_distinct(monkeypatch, tmp_path):
+    spool = _spool(tmp_path)
+    config = _config(tmp_path, spool, selector={
+        "pair": {"id": PAIR, "name": "Pair"},
+        "root": {"id": ROOT, "name": "Incoming"},
+        "leaf_id": ROOT, "leaf_name": "Incoming",
+    })
+    calls: list[str] = []
+    stopped = runner.Runner(config, opener=_opener(
+        calls, expected_path=ROOTS_PATH,
+        payload_factory=lambda version: _target_payload(version, state="default", coverage=True,
+                                                         progress=100, transferred=12,
+                                                         display_transferred=12, explicitly_stopped=True),
+    )).run()
+    assert stopped["target_outcome"] == "stopped"
+    assert stopped["target_explicitly_stopped"] is True
+
+    rollback_config = _config(tmp_path / "rollback", _spool(tmp_path / "rollback"), selector={
+        "pair": {"id": PAIR, "name": "Pair"},
+        "root": {"id": ROOT, "name": "Incoming"},
+        "leaf_id": ROOT, "leaf_name": "Incoming",
+    })
+    calls.clear()
+    def rollback_payload(version):
+        return _target_payload(version, state="default", coverage=version == 8,
+                               progress=100 if version == 8 else 0,
+                               transferred=12 if version == 8 else 0,
+                               display_transferred=12 if version == 8 else 0)
+    rollback = runner.Runner(rollback_config, opener=_opener(
+        calls, versions=[7, 8, 9], expected_path=ROOTS_PATH, payload_factory=rollback_payload,
+    )).run()
+    assert rollback["target_outcome"] == "rollback"
+
+    byte_drop_config = _config(tmp_path / "byte-drop", _spool(tmp_path / "byte-drop"), selector={
+        "pair": {"id": PAIR, "name": "Pair"},
+        "root": {"id": ROOT, "name": "Incoming"},
+        "leaf_id": ROOT, "leaf_name": "Incoming",
+    })
+    calls.clear()
+    def byte_drop_payload(version):
+        if version == 8:
+            return _target_payload(version, state="downloading", progress=50, transferred=10)
+        return _target_payload(version, state="default", progress=20, transferred=4,
+                               explicitly_stopped=False)
+    runner.Runner(byte_drop_config, opener=_opener(
+        calls, versions=[7, 8, 9], expected_path=ROOTS_PATH, payload_factory=byte_drop_payload,
+    )).run()
+    terminal_outcomes = [item["target_outcome"] for item in _trace(byte_drop_config.artifact_path)
+                         if item["event"] == "target_terminal"]
+    assert "stopped" in terminal_outcomes and "rollback" in terminal_outcomes
+
+
+def test_poll_failure_reports_selector_unknown_and_sample_gap(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner, "POLL_CADENCE_SECONDS", 0.01, raising=False)
+    monkeypatch.setattr(runner, "LEAF_GET_TIMEOUT_SECONDS", 0.01, raising=False)
+    monkeypatch.setattr(runner, "PASSIVE_WINDOW_SECONDS", 0.12, raising=False)
+    spool = _spool(tmp_path)
+    config = _config(tmp_path, spool, selector={
+        "pair": {"id": PAIR, "name": "Pair"},
+        "root": {"id": ROOT, "name": "Incoming"},
+        "leaf_id": ROOT, "leaf_name": "Incoming",
+    })
+    calls = [0]
+
+    def opener(request, timeout):
+        calls[0] += 1
+        if calls[0] == 3:
+            time.sleep(0.04)
+        return Response(200, json.dumps(_target_payload(calls[0], state="downloading", progress=5, transferred=1)).encode())
+
+    result = runner.Runner(config, opener=opener).run()
+    assert result["target_outcome"] == "deadline"
+    assert result["target_gap_count"] >= 1
+    assert result["target_max_observed_gap_ms"] > result["target_max_gap_ms"]
+
+    bad_spool = _spool(tmp_path / "bad")
+    bad_config = _config(tmp_path / "bad", bad_spool, selector={
+        "pair": {"id": PAIR, "name": "Pair"},
+        "root": {"id": ROOT, "name": "Incoming"},
+        "leaf_id": ROOT, "leaf_name": "Incoming",
+    })
+    calls[0] = 0
+
+    def selector_failure(request, timeout):
+        calls[0] += 1
+        payload = _root_payload(calls[0]) if calls[0] == 1 else _payload(calls[0])
+        return Response(200, json.dumps(payload).encode())
+
+    failed = runner.Runner(bad_config, opener=selector_failure).run()
+    assert failed["target_outcome"] == "selector_unknown"
+    assert failed["target_first_sample_monotonic_ms"] is None
 
 
 def test_missing_physical_is_observed_distinct_from_not_configured(monkeypatch, tmp_path):
