@@ -8286,7 +8286,7 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__local_scan_process.force_scan.assert_called_once_with("pair-a")
         builder.build_model.assert_not_called()
 
-    def test_unrelated_terminalizable_collision_uses_global_lifecycle_before_candidate(self):
+    def test_unrelated_terminalizable_collision_uses_global_lifecycle_before_candidate(self, collision_mode="normal"):
         old = SystemFile("old.bin", 10, False)
         old.path_pair_id = "pair-a"
         idle_remote = SystemFile("idle", 20, True)
@@ -8343,7 +8343,53 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__move_from_staging = MagicMock()
         controller._Controller__context.performance_diagnostics = PerformanceDiagnosticsCollector(lambda: True)
 
+        collision_trace_path = tempfile.TemporaryDirectory()
+        self.addCleanup(collision_trace_path.cleanup)
+        collision_trace = BreadcrumbTraceCollector(lambda: True, max_entries=64,
+            durable_enabled=True, durable_path=collision_trace_path.name,
+            policy={"default": "info"})
+        self.addCleanup(collision_trace.close)
+        if collision_mode in ("disabled", "failed_gate"):
+            original_gate = collision_trace.is_effectively_enabled
+            def collision_gate(category, level="info"):
+                if category == "completion.gate":
+                    if collision_mode == "failed_gate":
+                        raise RuntimeError("diagnostic gate")
+                    return False
+                return original_gate(category, level)
+            collision_trace.is_effectively_enabled = collision_gate
+        elif collision_mode == "failed_sink":
+            original_record = collision_trace.record
+            def collision_record(source, message, details, *args, **kwargs):
+                if message == "staging_collision_admission":
+                    raise RuntimeError("diagnostic sink")
+                return original_record(source, message, details, *args, **kwargs)
+            collision_trace.record = collision_record
+        controller._Controller__context.breadcrumb_trace = collision_trace
+
         ModelUpdater(controller).update()
+
+        self.assertTrue(collision_trace.flush_durable(2.0))
+        with open(os.path.join(collision_trace_path.name, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+            collision_rows = [json.loads(line) for line in handle if line.strip()]
+        collision_rows = [row for row in collision_rows
+                          if row.get("message") == "staging_collision_admission"]
+        if collision_mode == "normal":
+            self.assertTrue(collision_rows)
+            self.assertIn("rebuild_requested", {row["details"]["disposition"] for row in collision_rows})
+        else:
+            self.assertFalse(collision_rows)
+        self.assertLessEqual(len(collision_rows), 16)
+        for row in collision_rows:
+            self.assertEqual("staging_collision_admission.v1", row["details"]["schema"])
+            self.assertEqual("completion:" + opaque_trace_correlation(idle_id), row["corr_id"])
+            self.assertIs(type(row["details"]["status_fresh"]), bool)
+            self.assertNotIn("entry.bin", json.dumps(row))
+        retained = os.environ.get("SEEDSYNC_COMPLETION_FINALIZED_ROWS_PATH")
+        if retained:
+            with open(retained, "a", encoding="utf-8") as handle:
+                for row in collision_rows:
+                    handle.write(json.dumps(row, separators=(",", ":")) + "\n")
 
         self.assertIn(ModelFile.build_file_id("new.bin", "pair-a"), live_model.get_file_ids())
         builder.build_authoritative_pair_roots.assert_called_once()
@@ -8377,6 +8423,11 @@ class TestModelUpdater(unittest.TestCase):
             authority_calls[0].kwargs["details"]["reason"],
         )
         self.assertTrue(authority_calls[0].kwargs["details"]["pair_delta_fallback"])
+
+    def test_collision_admission_diagnostics_disabled_and_failure_preserve_lifecycle(self):
+        for mode in ("disabled", "failed_gate", "failed_sink"):
+            with self.subTest(mode=mode):
+                self.test_unrelated_terminalizable_collision_uses_global_lifecycle_before_candidate(mode)
 
     def test_pair_candidate_ignores_unrelated_stale_move_failure_marker(self):
         old = SystemFile("old.bin", 10, False)

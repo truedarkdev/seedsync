@@ -4585,6 +4585,8 @@ class ModelUpdater(_ControllerCoreAccess):
                 }
             elif message == "pending_completion_authority_wake":
                 signature_key = "{}:{}".format(corr_id, message)
+            elif message == "staging_collision_admission":
+                signature_key = "{}:{}:{}".format(corr_id, message, details.get("site"))
             signature = json.dumps(
                 {"message": message, "details": signature_details}, sort_keys=True,
             )
@@ -8612,6 +8614,59 @@ class ModelUpdater(_ControllerCoreAccess):
                     diagnostics,
                     MODEL_REBUILD_REASON_DEFERRED_MOVE_PENDING,
                 )
+        collision_trace_remaining = 16
+
+        def collision_trace_enabled():
+            try:
+                return self._completion_gate_trace_enabled()
+            except Exception:
+                return False
+
+        def record_collision_decision(file_id, site, disposition, candidate=None,
+                                      lifecycle=None, terminalizable=True, live=None,
+                                      stopped=None, maximum=None, comparison=None):
+            nonlocal collision_trace_remaining
+            try:
+                if collision_trace_remaining <= 0 or not collision_trace_enabled():
+                    return
+                collision_trace_remaining -= 1
+                def known_bool(value):
+                    return value if type(value) is bool else None
+                self._record_completion_gate_breadcrumb(file_id, "staging_collision_admission", {
+                    "schema": "staging_collision_admission.v1",
+                    "site": site,
+                    "status_source": lftp_status_source if lftp_status_source in
+                    _COMPLETION_GATE_LFTP_SOURCES else "unknown",
+                    "status_healthy": known_bool(lftp_status_poll_healthy),
+                    "status_fresh": known_bool(lftp_status_snapshot_fresh),
+                    "local_reconciled": known_bool(getattr(controller,
+                        "_Controller__last_local_reconciliation_healthy", None)),
+                    "remote_reconciled": known_bool(getattr(controller,
+                        "_Controller__last_remote_reconciliation_healthy", None)),
+                    "candidate_member": candidate,
+                    "lifecycle_allowed": lifecycle,
+                    "terminalizable_member": terminalizable,
+                    "live_owner": live,
+                    "explicit_stop": stopped,
+                    "max_failures": maximum,
+                    "comparison_active": comparison,
+                    "disposition": disposition,
+                })
+            except Exception:
+                pass
+
+        if collision_trace_enabled() and not (
+                lftp_status_poll_healthy and lftp_status_snapshot_fresh and
+                lftp_status_source == "fresh_healthy"):
+            try:
+                for collision_file_id in model_builder.get_terminalizable_staging_collision_file_ids():
+                    record_collision_decision(collision_file_id, "cached_rebuild_gate",
+                        "skip_status_unhealthy" if not lftp_status_poll_healthy else
+                        "skip_status_not_fresh")
+                    if collision_trace_remaining <= 0:
+                        break
+            except Exception:
+                pass
         if lftp_status_poll_healthy and lftp_status_snapshot_fresh and \
                 lftp_status_source == "fresh_healthy":
             live_lftp_file_ids = {status.file_id for status in (lftp_statuses or [])}
@@ -8619,23 +8674,32 @@ class ModelUpdater(_ControllerCoreAccess):
                 if collision_file_id in live_lftp_file_ids or \
                         persist.move_failure_counts.get(collision_file_id, 0) >= \
                         controller._Controller__MAX_MOVE_FAILURES:
+                    record_collision_decision(collision_file_id, "cached_rebuild_gate",
+                        "skip_live_owner" if collision_file_id in live_lftp_file_ids else
+                        "skip_max_failures", live=collision_file_id in live_lftp_file_ids)
                     continue
                 try:
                     with controller._Controller__model_lock:
                         collision_file = model.get_file(collision_file_id)
                 except ModelError:
+                    record_collision_decision(collision_file_id, "cached_rebuild_gate", "skip_model_missing")
                     continue
                 if collision_file.state == ModelFile.State.MOVE_FAILED or \
                         controller._Controller__is_explicitly_stopped(
                             collision_file.full_path,
                             collision_file.path_pair_id,
                         ):
+                    record_collision_decision(collision_file_id, "cached_rebuild_gate",
+                        "skip_terminal_state" if collision_file.state == ModelFile.State.MOVE_FAILED
+                        else "skip_explicit_stop")
                     continue
                 _request_model_rebuild(
                     model_builder,
                     diagnostics,
                     MODEL_REBUILD_REASON_TERMINALIZABLE_COLLISION,
                 )
+                record_collision_decision(collision_file_id, "cached_rebuild_gate", "rebuild_requested",
+                    live=False, stopped=False, maximum=False)
                 break
 
         due_retry_ids = controller._Controller__move_retry_rebuild_gate.due_ids(
@@ -10384,6 +10448,20 @@ class ModelUpdater(_ControllerCoreAccess):
                         terminalizable_collision_file_ids
                     ) if candidate_lifecycle_allows(file_id)
                 }
+                if collision_trace_enabled():
+                    for collision_file_id in pending_file_ids.union(terminalizable_collision_file_ids):
+                        if collision_file_id not in terminal_collision_candidate_ids:
+                            record_collision_decision(collision_file_id, "candidate_park_gate",
+                                "skip_not_lifecycle_candidate", candidate=True, lifecycle=False,
+                                terminalizable=collision_file_id in terminalizable_collision_file_ids)
+                        elif not (lftp_status_poll_healthy and lftp_status_snapshot_fresh and
+                                  lftp_status_source == "fresh_healthy"):
+                            record_collision_decision(collision_file_id, "candidate_park_gate",
+                                "skip_status_unhealthy" if not lftp_status_poll_healthy else
+                                "skip_status_not_fresh", candidate=True, lifecycle=True,
+                                terminalizable=collision_file_id in terminalizable_collision_file_ids)
+                        if collision_trace_remaining <= 0:
+                            break
                 if lftp_status_poll_healthy and lftp_status_snapshot_fresh and \
                         lftp_status_source == "fresh_healthy":
                     live_lftp_file_ids = {
@@ -10393,20 +10471,41 @@ class ModelUpdater(_ControllerCoreAccess):
                         if pending_file_id not in terminalizable_collision_file_ids or \
                                 persist.move_failure_counts.get(pending_file_id, 0) >= \
                                 controller._Controller__MAX_MOVE_FAILURES:
+                            record_collision_decision(pending_file_id, "candidate_park_gate",
+                                "skip_not_terminalizable" if pending_file_id not in
+                                terminalizable_collision_file_ids else "skip_max_failures",
+                                candidate=True, lifecycle=True,
+                                terminalizable=pending_file_id in terminalizable_collision_file_ids)
                             continue
                         try:
                             pending_file = new_model.get_file(pending_file_id)
                         except ModelError:
+                            record_collision_decision(pending_file_id, "candidate_park_gate",
+                                "skip_model_missing", candidate=True, lifecycle=True)
                             continue
-                        if controller._Controller__is_explicitly_stopped(
+                        collision_stopped = controller._Controller__is_explicitly_stopped(
                                 pending_file.full_path,
                                 pending_file.path_pair_id,
-                        ) or pending_file_id in live_lftp_file_ids or \
-                                controller._has_active_collision_comparison(
+                        )
+                        if collision_stopped:
+                            record_collision_decision(pending_file_id, "candidate_park_gate",
+                                "skip_explicit_stop", candidate=True, lifecycle=True, stopped=True)
+                            continue
+                        if pending_file_id in live_lftp_file_ids:
+                            record_collision_decision(pending_file_id, "candidate_park_gate",
+                                "skip_live_owner", candidate=True, lifecycle=True, stopped=False, live=True)
+                            continue
+                        if controller._has_active_collision_comparison(
                                     pending_file.name, pending_file.path_pair_id,
                                 ):
+                            record_collision_decision(pending_file_id, "candidate_park_gate",
+                                "skip_collision_comparison", candidate=True, lifecycle=True,
+                                stopped=False, live=False, comparison=True)
                             continue
                         terminalize_unresolved_staging_collision(pending_file)
+                        record_collision_decision(pending_file_id, "candidate_park_gate", "parked",
+                            candidate=True, lifecycle=True, live=False, stopped=False,
+                            maximum=False, comparison=False)
 
                 # A status sidecar is physical evidence of a resumable partial
                 # transfer.  Release only that exact pending transaction
