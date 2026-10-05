@@ -4802,11 +4802,16 @@ class ModelBuilder:
     @staticmethod
     def __final_split_root_structure(existing_file: SystemFile,
                                      remote_file: Optional[SystemFile]) -> Optional[SystemFile]:
-        """Keep only final evidence absent from a fresh active staging scan."""
+        """Retain final-only leaves matching portable Queue identity.
+
+        This identity can contribute to existing local coverage when the
+        remaining payload is complete. It does not establish strict raw-mtime
+        identity or resolve an outstanding staging collision.
+        """
         if remote_file is None or existing_file.is_dir != remote_file.is_dir:
             return None
         if not existing_file.is_dir:
-            if existing_file.is_staging or not ModelBuilder.__is_verified_final_leaf(
+            if not ModelBuilder.__leaf_matches_remote_queue_exclusion_identity(
                     remote_file, existing_file):
                 return None
             return existing_file

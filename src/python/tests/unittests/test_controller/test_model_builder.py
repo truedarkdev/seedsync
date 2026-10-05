@@ -4352,6 +4352,80 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.build_model()
         self.assertTrue(self.model_builder.has_complete_local_coverage("release"))
 
+    def test_active_staging_overlay_keeps_coarse_matching_final_sibling_for_coverage(self):
+        epoch = 1_786_400_003_000_000_000
+        remote_fractional_mtime = epoch + 400_000_000
+
+        def build(final_size=10, final_mtime=epoch, final_staging=False, collision=False,
+                  progress_size=4):
+            builder = ModelBuilder()
+            remote_root = SystemFile("release", 30, True)
+            remote_root.add_child(SystemFile("anchor.bin", 10, False, mtime_ns=epoch))
+            remote_root.add_child(SystemFile(
+                "final-sibling.bin", 10, False, mtime_ns=remote_fractional_mtime,
+            ))
+            remote_root.add_child(SystemFile("progress.bin", 10, False, mtime_ns=epoch + 1_000_000_000))
+
+            local_root = SystemFile("release", 20 + progress_size, True)
+            local_root.add_child(SystemFile("anchor.bin", 10, False, mtime_ns=epoch))
+            final_sibling = SystemFile(
+                "final-sibling.bin", final_size, False,
+                is_staging=final_staging, mtime_ns=final_mtime,
+            )
+            final_sibling.has_staging_collision = collision
+            local_root.add_child(final_sibling)
+            local_root.add_child(SystemFile(
+                "progress.bin", progress_size, False, is_staging=True,
+            ))
+
+            active_root = SystemFile("release", progress_size, True, is_staging=True)
+            active_root.add_child(SystemFile("progress.bin", progress_size, False))
+            status = LftpJobStatus(
+                17, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "",
+            )
+            status.total_transfer_state = LftpJobStatus.TransferState(
+                progress_size, 10, progress_size * 10, 100, 2,
+            )
+            builder.set_remote_files([remote_root])
+            builder.set_local_files([local_root])
+            builder.set_active_files([active_root])
+            builder.set_lftp_statuses([status])
+            effective_root = builder._ModelBuilder__build_effective_local_files()["release"]
+            effective_children = {child.name: child for child in effective_root.iter_children()}
+            return builder, effective_children
+
+        builder, effective_children = build()
+        final_sibling = effective_children["final-sibling.bin"]
+        self.assertFalse(final_sibling.is_staging)
+        self.assertFalse(final_sibling.has_staging_collision)
+        self.assertFalse(ModelBuilder._ModelBuilder__leaf_matches_remote_identity(
+            SystemFile("final-sibling.bin", 10, False, mtime_ns=remote_fractional_mtime),
+            final_sibling,
+        ))
+        release = builder.build_model().get_file("release")
+        self.assertEqual(ModelFile.State.DOWNLOADING, release.state)
+        self.assertFalse(release.complete_local_coverage)
+        self.assertNotEqual(ModelFile.State.DOWNLOADED, release.state)
+
+        complete_builder, complete_children = build(progress_size=10)
+        self.assertIn("final-sibling.bin", complete_children)
+        complete_builder.build_model()
+        self.assertTrue(complete_builder.has_complete_local_coverage("release"))
+
+        rejected = (
+            ("different-second", 10, epoch + 1_000_000_000, False, False),
+            ("size-mismatch", 9, epoch, False, False),
+            ("missing-mtime", 10, None, False, False),
+            ("malformed-mtime", 10, "unknown", False, False),
+            ("distinct-fractional", 10, epoch + 700_000_000, False, False),
+            ("staging-source", 10, epoch, True, False),
+            ("collision-source", 10, epoch, False, True),
+        )
+        for name, size, mtime, is_staging, has_collision in rejected:
+            with self.subTest(name=name):
+                _, children = build(size, mtime, is_staging, has_collision)
+                self.assertNotIn("final-sibling.bin", children)
+
     def test_active_split_root_projects_final_only_bytes_omitted_by_staging_overlay(self):
         remote_root = SystemFile("sample-directory", 40, True)
         remote_root.add_child(SystemFile("anchor.zero", 0, False))
