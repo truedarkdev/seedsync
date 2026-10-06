@@ -166,6 +166,20 @@ _COMPLETION_GATE_REASONS = frozenset({
     "completion_authority_missing", "complete_local_coverage", "unknown",
 })
 _COMPLETION_GATE_OUTCOMES = frozenset({"stopped", "deferred", "downloaded", "unknown"})
+_AUTOMATIC_MOVE_BOUNDARY_SCHEMA = "automatic_move_copy_boundary.v1"
+_AUTOMATIC_MOVE_BOUNDARY_PHASE_DECISIONS = {
+    "prepublish_gate": frozenset({"deferred", "failed", "published"}),
+    "copy_yield": frozenset({"started"}),
+    "copy_reacquired": frozenset({"ready", "failed"}),
+}
+_AUTOMATIC_MOVE_BOUNDARY_REASONS = frozenset({
+    "stale_authority", "stop_or_delete_pending", "copy_failed", "published", "publication_failed",
+})
+_AUTOMATIC_MOVE_CHANGED_DIMENSIONS = frozenset({
+    "progress_epoch", "refresh", "active_paths", "scan_publication",
+    "scanner_authority", "pending_job", "published_snapshot", "candidate_file",
+})
+_AUTOMATIC_MOVE_CHANGED_DIMENSIONS_MAX = 8
 _COMPLETION_GATE_BOOLS = frozenset({
     "poll_eligible", "poll_fresh", "poll_healthy", "previous_active", "current_active", "marker_observed", "local_scan_forced",
     "explicit_stop", "build_ran", "candidate_present", "live_present", "local_size_present", "remote_size_present",
@@ -269,6 +283,40 @@ def _completion_gate_facts(details: Mapping[str, object]) -> dict[str, object] |
         value = details.get(key)
         if type(value) is bool:
             result[key] = value
+    return result
+
+
+def _automatic_move_copy_boundary_facts(
+    message: object, details: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Project the finalized, finite automatic-move copy boundary envelope."""
+    if message != "automatic_move_copy_boundary" or details.get("schema") != _AUTOMATIC_MOVE_BOUNDARY_SCHEMA:
+        return None
+    phase = details.get("phase")
+    decision = details.get("decision")
+    allowed_decisions = _AUTOMATIC_MOVE_BOUNDARY_PHASE_DECISIONS.get(phase) if isinstance(phase, str) else None
+    if allowed_decisions is None or not isinstance(decision, str) or decision not in allowed_decisions:
+        return None
+    result: dict[str, object] = {
+        "schema": _AUTOMATIC_MOVE_BOUNDARY_SCHEMA,
+        "phase": phase,
+        "decision": decision,
+    }
+    reason = details.get("reason")
+    if isinstance(reason, str) and reason in _AUTOMATIC_MOVE_BOUNDARY_REASONS:
+        result["reason"] = reason
+    duration = details.get("duration_ms")
+    if phase == "copy_reacquired" and type(duration) is int and 0 <= duration <= 600_000:
+        result["duration_ms"] = duration
+    dimensions = details.get("changed_dimensions")
+    if reason == "stale_authority" and isinstance(dimensions, list):
+        bounded: list[str] = []
+        for item in dimensions:
+            if isinstance(item, str) and item in _AUTOMATIC_MOVE_CHANGED_DIMENSIONS and item not in bounded:
+                bounded.append(item)
+                if len(bounded) >= _AUTOMATIC_MOVE_CHANGED_DIMENSIONS_MAX:
+                    break
+        result["changed_dimensions"] = bounded
     return result
 
 
@@ -574,6 +622,10 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     numbers = _numeric_values(row, metadata, details)
     lifecycle = _queue_lifecycle_facts(details) if category == "queue.lifecycle" else None
     gate = _completion_gate_facts(details) if category == "completion.gate" else None
+    automatic_move_boundary = (
+        _automatic_move_copy_boundary_facts(row.get("message", metadata.get("message")), details)
+        if category == "completion.gate" else None
+    )
     command = _lftp_command_facts(details) if category == "transfer.lftp.command" else None
     delete_local = _delete_local_command_facts(row, metadata, details)
     readiness = _queue_readiness_facts(row.get("message"), details) if category == "queue.readiness" else None
@@ -612,6 +664,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["lifecycle"] = lifecycle
     if gate is not None:
         result["completion_gate"] = gate
+    if automatic_move_boundary is not None:
+        result["automatic_move_copy_boundary"] = automatic_move_boundary
     if command is not None:
         result["lftp_command"] = command
     if delete_local is not None:

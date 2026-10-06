@@ -544,6 +544,10 @@ class _MoveMutationOutcome(Enum):
     UNCERTAIN = "uncertain"
 
 
+class _MovePublicationDeferred(Exception):
+    """A fresh lifecycle or command gate rejected publication before commit."""
+
+
 class _MoveMutationTracker:
     """Fail closed: only an observed no-mutation path may cancel a fence."""
 
@@ -7349,6 +7353,7 @@ class Controller:
             path_pair_id: Optional[str] = None,
             require_collision_proof: bool = False,
             anchored_paths: Optional[Tuple[str, str, str, str]] = None,
+            automatic_move_boundary: Optional[object] = None,
     ) -> MoveFromStagingResult:
         if anchored_paths is None:
             resolved = self.__resolve_safe_final_move_paths(name, path_pair_id)
@@ -7478,7 +7483,9 @@ class Controller:
                     return Controller.MoveFromStagingResult.DEFERRED
                 return Controller.MoveFromStagingResult.FAILED
             else:
-                self.__publish_staging_no_replace(src, dst, mutation_tracker)
+                self.__publish_staging_no_replace(
+                    src, dst, mutation_tracker, automatic_move_boundary,
+                )
                 # The production primitive marks at each physical mutation;
                 # retaining this successful-return mark keeps lightweight
                 # adapters/mocks equally conservative.
@@ -7513,6 +7520,14 @@ class Controller:
             else:
                 self.__local_scan_process.force_scan(path_pair_id)
             return Controller.MoveFromStagingResult.COMPLETED
+        except _MovePublicationDeferred:
+            if should_trace:
+                self.__trace_target_archive_event("move_from_staging_result", {
+                    "file_id": trace_file_id,
+                    "file_name": name,
+                    "result": "deferred_before_publication",
+                })
+            return Controller.MoveFromStagingResult.DEFERRED
         except FileExistsError as error:
             self.logger.warning(
                 "Refusing to overwrite existing final target for '%s': %s",
@@ -8913,13 +8928,25 @@ class Controller:
     def __publish_regular_file_exclusively(
             cls, temporary_path: str, dst: str,
             mutation_tracker: Optional[_MoveMutationTracker] = None,
+            automatic_move_boundary: Optional[object] = None,
     ) -> None:
         """Copy a temporary regular file with O_EXCL and verify its identity."""
         expected_manifest = cls.__publication_tree_manifest(temporary_path)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_BINARY"):
             flags |= os.O_BINARY
-        fd = os.open(dst, flags, 0o600)
+        fd: Optional[int] = None
+
+        def reserve_destination() -> None:
+            nonlocal fd
+            fd = os.open(dst, flags, 0o600)
+
+        if automatic_move_boundary is None:
+            reserve_destination()
+        elif automatic_move_boundary.publish_no_replace(reserve_destination) is not True:
+            raise _MovePublicationDeferred()
+        if fd is None:
+            raise OSError(errno.EIO, "exclusive destination reservation did not return a descriptor", dst)
         if mutation_tracker is not None:
             mutation_tracker.mutated()
         published_stat = os.fstat(fd)
@@ -8947,6 +8974,7 @@ class Controller:
     def __publish_temporary_directory(
             cls, temporary_path: str, dst: str,
             mutation_tracker: Optional[_MoveMutationTracker] = None,
+            automatic_move_boundary: Optional[object] = None,
     ) -> None:
         """Materialize a private directory through exclusive entries.
 
@@ -8958,7 +8986,11 @@ class Controller:
         """
         expected_manifest = cls.__publication_tree_manifest(temporary_path)
         temporary_stat = os.lstat(temporary_path)
-        os.mkdir(dst, 0o700)
+        reserve_directory = lambda: os.mkdir(dst, 0o700)
+        if automatic_move_boundary is None:
+            reserve_directory()
+        elif automatic_move_boundary.publish_no_replace(reserve_directory) is not True:
+            raise _MovePublicationDeferred()
         if mutation_tracker is not None:
             mutation_tracker.mutated()
         published_stat = os.lstat(dst)
@@ -8973,13 +9005,20 @@ class Controller:
                 for entry in entries:
                     destination_child = os.path.join(dst, entry.name)
                     try:
-                        cls.__rename_no_replace(entry.path, destination_child)
+                        rename_child = lambda: cls.__rename_no_replace(entry.path, destination_child)
+                        if automatic_move_boundary is None:
+                            rename_child()
+                        elif automatic_move_boundary.publish_no_replace(rename_child) is not True:
+                            raise _MovePublicationDeferred()
                         if mutation_tracker is not None:
                             mutation_tracker.mutated()
                     except OSError as error:
                         if not cls.__is_no_replace_capability_error(error):
                             raise
-                        cls.__publish_temporary_no_replace(entry.path, destination_child, mutation_tracker)
+                        cls.__publish_temporary_no_replace(
+                            entry.path, destination_child, mutation_tracker,
+                            automatic_move_boundary,
+                        )
                     if not cls.__same_path_identity(dst, published_stat):
                         raise OSError(errno.EAGAIN, "final directory changed during publication", dst)
             if directory_fd is not None:
@@ -9003,16 +9042,23 @@ class Controller:
     def __publish_temporary_no_replace(
             cls, temporary_path: str, dst: str,
             mutation_tracker: Optional[_MoveMutationTracker] = None,
+            automatic_move_boundary: Optional[object] = None,
     ) -> None:
         """Publish a destination-side temporary object without clobbering dst."""
         temporary_stat = os.lstat(temporary_path)
         expected_manifest = cls.__publication_tree_manifest(temporary_path)
         if stat.S_ISDIR(temporary_stat.st_mode):
-            cls.__publish_temporary_directory(temporary_path, dst, mutation_tracker)
+            cls.__publish_temporary_directory(
+                temporary_path, dst, mutation_tracker, automatic_move_boundary,
+            )
             return
         if stat.S_ISLNK(temporary_stat.st_mode):
             link_target = os.readlink(temporary_path)
-            os.symlink(link_target, dst)
+            publish_link = lambda: os.symlink(link_target, dst)
+            if automatic_move_boundary is None:
+                publish_link()
+            elif automatic_move_boundary.publish_no_replace(publish_link) is not True:
+                raise _MovePublicationDeferred()
             if mutation_tracker is not None:
                 mutation_tracker.mutated()
             published_stat = os.lstat(dst)
@@ -9033,7 +9079,11 @@ class Controller:
         if not stat.S_ISREG(temporary_stat.st_mode):
             raise OSError(errno.ENOTSUP, "unsupported temporary publication type", temporary_path)
         try:
-            os.link(temporary_path, dst, follow_symlinks=False)
+            publish_link = lambda: os.link(temporary_path, dst, follow_symlinks=False)
+            if automatic_move_boundary is None:
+                publish_link()
+            elif automatic_move_boundary.publish_no_replace(publish_link) is not True:
+                raise _MovePublicationDeferred()
             if mutation_tracker is not None:
                 mutation_tracker.mutated()
             if not cls.__same_path_identity(dst, temporary_stat):
@@ -9046,13 +9096,16 @@ class Controller:
         except OSError as error:
             if not cls.__can_copy_instead_of_link(error):
                 raise
-            cls.__publish_regular_file_exclusively(temporary_path, dst, mutation_tracker)
+            cls.__publish_regular_file_exclusively(
+                temporary_path, dst, mutation_tracker, automatic_move_boundary,
+            )
         os.unlink(temporary_path)
 
     @classmethod
     def __publish_staging_no_replace(
             cls, src: str, dst: str,
             mutation_tracker: Optional[_MoveMutationTracker] = None,
+            automatic_move_boundary: Optional[object] = None,
     ) -> None:
         """Publish staging content once; preserve src on collision or failure.
 
@@ -9064,7 +9117,11 @@ class Controller:
         """
         source_manifest = cls.__publication_tree_manifest(src)
         try:
-            cls.__rename_no_replace(src, dst)
+            rename_source = lambda: cls.__rename_no_replace(src, dst)
+            if automatic_move_boundary is None:
+                rename_source()
+            elif automatic_move_boundary.publish_no_replace(rename_source) is not True:
+                raise _MovePublicationDeferred()
             if mutation_tracker is not None:
                 mutation_tracker.mutated()
             if mutation_tracker is not None:
@@ -9149,14 +9206,17 @@ class Controller:
         try:
             try:
                 if mutation_tracker is None:
-                    temporary_path, temporary_root = cls.__copy_to_publish_temporary(src, destination_parent)
+                    copy_operation = lambda: cls.__copy_to_publish_temporary(src, destination_parent)
                 else:
-                    temporary_path, temporary_root = cls.__copy_to_publish_temporary(
-                        src,
-                        destination_parent,
+                    copy_operation = lambda: cls.__copy_to_publish_temporary(
+                        src, destination_parent,
                         mutation_tracker=mutation_tracker,
                         destination_path=dst,
                     )
+                if automatic_move_boundary is None:
+                    temporary_path, temporary_root = copy_operation()
+                else:
+                    temporary_path, temporary_root = automatic_move_boundary.copy_private(copy_operation)
             except BaseException as error:
                 if mutation_tracker is not None:
                     mutation_tracker.record_publication(
@@ -9188,7 +9248,11 @@ class Controller:
             temporary_manifest = cls.__publication_tree_manifest(temporary_path)
             temporary_rename_completed = False
             try:
-                cls.__rename_no_replace(temporary_path, dst)
+                rename_temporary = lambda: cls.__rename_no_replace(temporary_path, dst)
+                if automatic_move_boundary is None:
+                    rename_temporary()
+                elif automatic_move_boundary.publish_no_replace(rename_temporary) is not True:
+                    raise _MovePublicationDeferred()
                 temporary_rename_completed = True
                 if mutation_tracker is not None:
                     mutation_tracker.mutated()
@@ -9232,7 +9296,9 @@ class Controller:
                         )
                     raise
                 try:
-                    cls.__publish_temporary_no_replace(temporary_path, dst, mutation_tracker)
+                    cls.__publish_temporary_no_replace(
+                        temporary_path, dst, mutation_tracker, automatic_move_boundary,
+                    )
                 except BaseException as fallback_error:
                     if mutation_tracker is not None:
                         mutation_tracker.record_publication(

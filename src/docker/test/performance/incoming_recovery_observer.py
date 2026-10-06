@@ -467,6 +467,19 @@ _CAPTURE_NUMBER_KEYS = frozenset({
     "percent", "processed", "progress", "queue_depth", "retries", "scanned", "size", "status_code", "total",
     "transferred", "unknown", "unresolved", "version", "written",
 })
+_CAPTURE_AUTOMATIC_MOVE_PHASE_DECISIONS = {
+    "prepublish_gate": frozenset({"deferred", "failed", "published"}),
+    "copy_yield": frozenset({"started"}),
+    "copy_reacquired": frozenset({"ready", "failed"}),
+}
+_CAPTURE_AUTOMATIC_MOVE_REASONS = frozenset({
+    "stale_authority", "stop_or_delete_pending", "copy_failed", "published", "publication_failed",
+})
+_CAPTURE_AUTOMATIC_MOVE_DIMENSIONS = frozenset({
+    "progress_epoch", "refresh", "active_paths", "scan_publication",
+    "scanner_authority", "pending_job", "published_snapshot", "candidate_file",
+})
+_CAPTURE_AUTOMATIC_MOVE_DIMENSIONS_MAX = 8
 _CAPTURE_LIFECYCLE_EVENTS = frozenset({
     "queue_admitted", "executor_start", "executor_return", "executor_error", "lftp_child", "status_membership",
     "root_default", "queue_retired", "controller_force_close", "operation_scheduled", "operation_retired", "unknown",
@@ -637,6 +650,28 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
     if item is None or type(item) is bool:
         if "delete_local_partial_failure" in value:
             result["delete_local_partial_failure"] = item
+    boundary = value.get("automatic_move_copy_boundary")
+    if isinstance(boundary, Mapping):
+        phase = boundary.get("phase")
+        decision = boundary.get("decision")
+        allowed_decisions = _CAPTURE_AUTOMATIC_MOVE_PHASE_DECISIONS.get(phase) if isinstance(phase, str) else None
+        if boundary.get("schema") == "automatic_move_copy_boundary.v1" and allowed_decisions is not None and isinstance(decision, str) and decision in allowed_decisions:
+            safe_boundary: dict[str, object] = {
+                "schema": "automatic_move_copy_boundary.v1", "phase": phase, "decision": decision,
+            }
+            reason = boundary.get("reason")
+            if isinstance(reason, str) and reason in _CAPTURE_AUTOMATIC_MOVE_REASONS:
+                safe_boundary["reason"] = reason
+            dimensions = boundary.get("changed_dimensions")
+            if reason == "stale_authority" and isinstance(dimensions, list):
+                bounded: list[str] = []
+                for dimension in dimensions:
+                    if isinstance(dimension, str) and dimension in _CAPTURE_AUTOMATIC_MOVE_DIMENSIONS and dimension not in bounded:
+                        bounded.append(dimension)
+                        if len(bounded) >= _CAPTURE_AUTOMATIC_MOVE_DIMENSIONS_MAX:
+                            break
+                safe_boundary["changed_dimensions"] = bounded
+            result["automatic_move_copy_boundary"] = safe_boundary
     lifecycle = value.get("lifecycle")
     if isinstance(lifecycle, Mapping):
         safe: dict[str, object] = {"schema": "queue.lifecycle.v1"} if lifecycle.get("schema") == "queue.lifecycle.v1" else {}

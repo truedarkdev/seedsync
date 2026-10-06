@@ -13,7 +13,7 @@ import unittest
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from pathlib import Path
 from queue import Queue
-from threading import Lock
+from threading import Lock, RLock
 from unittest.mock import ANY, MagicMock, mock_open, patch
 from types import SimpleNamespace
 
@@ -21,7 +21,8 @@ import pexpect
 
 from controller import AutoQueue, AutoQueuePersist, Controller, ControllerPersist, ModelBuilder
 from controller.model_updater import (
-    ModelUpdater, _PendingCompletionPublication, _ProgressiveScanAccumulator, _pop_scan_updates,
+    ModelUpdater, _AutomaticMoveBoundary, _ModelUpdateTimedModelLock,
+    _PendingCompletionPublication, _ProgressiveScanAccumulator, _pop_scan_updates,
 )
 from controller.extract import ExtractRequest, ExtractStatus
 from controller.validate import ValidateProcess
@@ -12015,6 +12016,345 @@ class TestController(unittest.TestCase):
                     Controller._Controller__publish_staging_no_replace(source, destination, tracker)
 
             self.assertEqual(_MoveMutationOutcome.UNCERTAIN, tracker.outcome)
+
+    def test_automatic_move_boundary_defers_regular_and_directory_fallback_before_publish(self):
+        class Boundary:
+            def __init__(self):
+                self.copy_calls = 0
+                self.publish_calls = 0
+
+            def copy_private(self, operation):
+                self.copy_calls += 1
+                return operation()
+
+            def publish_no_replace(self, operation):
+                self.publish_calls += 1
+                if self.publish_calls == 1:
+                    operation()
+                    return True
+                return False
+
+        for directory_source in (False, True):
+            with self.subTest(directory_source=directory_source), tempfile.TemporaryDirectory() as temp_dir:
+                staging_root = os.path.join(temp_dir, "staging")
+                final_root = os.path.join(temp_dir, "final")
+                os.mkdir(staging_root)
+                os.mkdir(final_root)
+                source = os.path.join(staging_root, "sample")
+                if directory_source:
+                    os.mkdir(source)
+                    Path(os.path.join(source, "payload.bin")).write_bytes(b"payload")
+                else:
+                    Path(source).write_bytes(b"payload")
+                self.controller._Controller__staging_path = staging_root
+                self.controller._Controller__legacy_local_path = final_root
+                boundary = Boundary()
+
+                with patch.object(
+                        Controller, "_Controller__rename_no_replace",
+                        side_effect=OSError(errno.EXDEV, "copy fallback required"),
+                ) as rename:
+                    result = self.controller._Controller__move_from_staging(
+                        "sample", automatic_move_boundary=boundary,
+                    )
+
+                self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result)
+                self.assertEqual(1, boundary.copy_calls)
+                self.assertEqual(2, boundary.publish_calls)
+                self.assertEqual(1, rename.call_count)
+                self.assertTrue(os.path.lexists(source))
+                if directory_source:
+                    self.assertEqual(b"payload", Path(source, "payload.bin").read_bytes())
+                else:
+                    self.assertEqual(b"payload", Path(source).read_bytes())
+                self.assertFalse(os.path.lexists(os.path.join(final_root, "sample")))
+                self.assertFalse(any(
+                    entry.startswith(".seedsync-publish-") for entry in os.listdir(final_root)
+                ))
+
+    def test_automatic_move_boundary_revalidates_committed_authority_not_worker_generation(self):
+        race_cases = (
+            "stop", "delete", "epoch", "config", "worker_generation",
+            "scanner_session", "pair_token", "publication",
+        )
+        for race_case in race_cases:
+            with self.subTest(race_case=race_case), tempfile.TemporaryDirectory() as temp_dir:
+                staging_root = os.path.join(temp_dir, "staging")
+                final_root = os.path.join(temp_dir, "final")
+                os.mkdir(staging_root)
+                os.mkdir(final_root)
+                source = os.path.join(staging_root, "sample")
+                Path(source).write_bytes(b"payload")
+                self.controller._Controller__staging_path = staging_root
+                self.controller._Controller__legacy_local_path = final_root
+                self.controller._Controller__model_lock = RLock()
+                self.controller._Controller__command_queue = Queue()
+                self.controller._Controller__command_flow_lock = Lock()
+                self.controller._Controller__active_command_processes = []
+                self.controller._Controller__progress_publication_epoch = 0
+                self.controller._Controller__path_pair_refresh_requested = False
+                self.controller._Controller__path_pair_refresh_generation = 0
+                self.controller._Controller__scan_authority_publication_id = 1
+                self.controller._Controller__scan_authority_tokens = {
+                    "local": {None: ("local-session", 0)},
+                    "remote": {None: ("remote-session", 0)},
+                }
+                for side, session in (
+                        ("active", "active-session"),
+                        ("local", "local-session"),
+                        ("remote", "remote-session")):
+                    process = getattr(self.controller, "_Controller__{}_scan_process".format(side))
+                    process.session_token = session
+                    process.generation = 0
+                self.controller._Controller__model = Model()
+                self.controller._Controller__pending_completion_publications = {
+                    ModelFile.build_file_id("sample", None): SimpleNamespace(job_identity=(1, "job")),
+                }
+                self.controller._Controller__updater._record_completion_gate_breadcrumb.reset_mock()
+                file_id = ModelFile.build_file_id("sample", None)
+                file = SimpleNamespace(
+                    file_id=file_id, name="sample", full_path="sample", path_pair_id=None,
+                    state=ModelFile.State.DOWNLOADED, local_size=7, remote_size=7, modified=None,
+                )
+                timed_lock = _ModelUpdateTimedModelLock(
+                    self.controller._Controller__model_lock, None,
+                )
+                boundary = _AutomaticMoveBoundary(
+                    self.controller._Controller__updater, self.controller, timed_lock, file, None,
+                )
+                original_copy = Controller._Controller__copy_to_publish_temporary
+
+                def inject_race(*args, **kwargs):
+                    copied = original_copy(*args, **kwargs)
+                    if race_case in ("stop", "delete"):
+                        action = Controller.Command.Action.STOP if race_case == "stop" else \
+                            Controller.Command.Action.DELETE_LOCAL
+                        self.controller._Controller__command_queue.put(Controller.Command(action, "sample"))
+                    elif race_case == "epoch":
+                        self.controller._Controller__progress_publication_epoch += 1
+                    elif race_case == "config":
+                        with self.controller._Controller__path_pair_refresh_lock:
+                            self.controller._Controller__path_pair_refresh_requested = True
+                            self.controller._Controller__path_pair_refresh_generation += 1
+                    elif race_case == "worker_generation":
+                        self.controller._Controller__local_scan_process.generation = 999
+                    elif race_case == "scanner_session":
+                        self.controller._Controller__local_scan_process.session_token = "replacement-session"
+                    elif race_case == "pair_token":
+                        self.controller._Controller__scan_authority_tokens["local"][None] = (
+                            "local-session", 1,
+                        )
+                    elif race_case == "publication":
+                        self.controller._Controller__pending_completion_publications[file_id] = \
+                            SimpleNamespace(job_identity=(2, "replacement"))
+                    return copied
+
+                with patch.object(
+                        Controller, "_Controller__rename_no_replace",
+                        side_effect=OSError(errno.EXDEV, "copy fallback required"),
+                ) as rename, patch.object(
+                        Controller, "_Controller__copy_to_publish_temporary",
+                        side_effect=inject_race,
+                ) as copy_temporary, timed_lock:
+                    result = self.controller._Controller__move_from_staging(
+                        "sample", automatic_move_boundary=boundary,
+                    )
+
+                generation_only = race_case == "worker_generation"
+                self.assertEqual(
+                    Controller.MoveFromStagingResult.COMPLETED if generation_only else
+                    Controller.MoveFromStagingResult.DEFERRED,
+                    result,
+                )
+                self.assertEqual(1, copy_temporary.call_count)
+                self.assertEqual(2 if generation_only else 1, rename.call_count)
+                destination = os.path.join(final_root, "sample")
+                if generation_only:
+                    self.assertFalse(os.path.exists(source))
+                    self.assertEqual(b"payload", Path(destination).read_bytes())
+                else:
+                    self.assertTrue(os.path.exists(source))
+                    self.assertEqual(b"payload", Path(source).read_bytes())
+                    self.assertFalse(os.path.exists(destination))
+                self.assertFalse(any(
+                    entry.startswith(".seedsync-publish-") for entry in os.listdir(final_root)
+                ))
+                phases = [
+                    call_args.args[2]["phase"]
+                    for call_args in self.controller._Controller__updater._record_completion_gate_breadcrumb.call_args_list
+                ]
+                self.assertIn("copy_yield", phases)
+                self.assertIn("copy_reacquired", phases)
+                self.assertEqual("prepublish_gate", phases[-1])
+                gate_details = next(
+                    call_args.args[2]
+                    for call_args in reversed(
+                        self.controller._Controller__updater._record_completion_gate_breadcrumb.call_args_list
+                    )
+                    if call_args.args[2].get("phase") == "prepublish_gate"
+                )
+                if generation_only:
+                    self.assertEqual("published", gate_details["decision"])
+                elif race_case in ("epoch", "config", "scanner_session", "pair_token", "publication"):
+                    expected_dimension = {
+                        "epoch": "progress_epoch",
+                        "config": "refresh",
+                        "scanner_session": "scanner_authority",
+                        "pair_token": "scanner_authority",
+                        "publication": "pending_job",
+                    }[race_case]
+                    self.assertEqual([expected_dimension], gate_details["changed_dimensions"])
+
+    def test_automatic_move_publication_holds_queue_admission_through_no_replace(self):
+        command_queue = Queue()
+        controller = SimpleNamespace(
+            _Controller__path_pair_refresh_lock=Lock(),
+            _Controller__path_pair_refresh_requested=False,
+            _Controller__path_pair_refresh_generation=0,
+            _Controller__path_pairs_by_id={},
+            _Controller__path_pair_staging_paths={},
+            _Controller__legacy_local_path="local",
+            _Controller__legacy_remote_path="remote",
+            _Controller__staging_path="staging",
+            _Controller__progress_publication_epoch=1,
+            _Controller__scan_authority_publication_id=2,
+            _Controller__pending_completion_publications={},
+            _Controller__model=Model(),
+            _Controller__command_flow_lock=Lock(),
+            _Controller__command_queue=command_queue,
+            _Controller__active_command_processes=[],
+            _Controller__deferred_delete_command_refs=[],
+        )
+        updater = SimpleNamespace(_record_completion_gate_breadcrumb=MagicMock())
+        file = SimpleNamespace(
+            file_id=ModelFile.build_file_id("sample", None), name="sample",
+            full_path="sample", path_pair_id=None, state=ModelFile.State.DOWNLOADED,
+            local_size=7, remote_size=7, modified=None,
+        )
+        timed_lock = _ModelUpdateTimedModelLock(RLock(), None)
+        publish_started = threading.Event()
+        finish_publish = threading.Event()
+        stop_queued = threading.Event()
+        result = []
+
+        def publish():
+            publish_started.set()
+            self.assertTrue(finish_publish.wait(1))
+
+        def run_publication():
+            with timed_lock:
+                boundary = _AutomaticMoveBoundary(updater, controller, timed_lock, file, None)
+                result.append(boundary.publish_no_replace(publish))
+
+        def enqueue_stop():
+            command_queue.put(Controller.Command(Controller.Command.Action.STOP, "sample"))
+            stop_queued.set()
+
+        publisher = threading.Thread(target=run_publication)
+        publisher.start()
+        self.assertTrue(publish_started.wait(1))
+        enqueue = threading.Thread(target=enqueue_stop)
+        enqueue.start()
+        self.assertFalse(stop_queued.wait(0.05))
+        finish_publish.set()
+        publisher.join(1)
+        enqueue.join(1)
+
+        self.assertFalse(publisher.is_alive())
+        self.assertFalse(enqueue.is_alive())
+        self.assertEqual([True], result)
+        self.assertTrue(stop_queued.is_set())
+        self.assertEqual(1, command_queue.qsize())
+
+    def test_automatic_move_boundary_requires_known_published_reader_snapshot(self):
+        class FreshReaderFailure:
+            def __init__(self):
+                self.calls = 0
+
+            def published_file_with_job_identity(self, _file_id):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("reader unavailable after private copy")
+                return None, None
+
+        for reader_case in ("missing", "throws", "invalid", "fresh_throws", "known_absent"):
+            with self.subTest(reader_case=reader_case), tempfile.TemporaryDirectory() as temp_dir:
+                staging_root = os.path.join(temp_dir, "staging")
+                final_root = os.path.join(temp_dir, "final")
+                os.mkdir(staging_root)
+                os.mkdir(final_root)
+                source = os.path.join(staging_root, "sample")
+                destination = os.path.join(final_root, "sample")
+                Path(source).write_bytes(b"payload")
+
+                if reader_case == "missing":
+                    model = SimpleNamespace()
+                elif reader_case == "throws":
+                    model = SimpleNamespace(
+                        published_file_with_job_identity=MagicMock(
+                            side_effect=RuntimeError("reader unavailable at capture"),
+                        ),
+                    )
+                elif reader_case == "invalid":
+                    model = SimpleNamespace(
+                        published_file_with_job_identity=MagicMock(return_value=(None,)),
+                    )
+                elif reader_case == "fresh_throws":
+                    model = FreshReaderFailure()
+                else:
+                    # The production Model returns exactly (None, None) for a
+                    # valid, known-absent publication snapshot.
+                    model = Model()
+
+                queue = Queue()
+                model_lock = RLock()
+                controller = SimpleNamespace(
+                    _Controller__path_pair_refresh_lock=Lock(),
+                    _Controller__path_pair_refresh_requested=False,
+                    _Controller__path_pair_refresh_generation=0,
+                    _Controller__path_pairs_by_id={},
+                    _Controller__path_pair_staging_paths={},
+                    _Controller__legacy_local_path=final_root,
+                    _Controller__legacy_remote_path="remote",
+                    _Controller__staging_path=staging_root,
+                    _Controller__progress_publication_epoch=1,
+                    _Controller__scan_authority_publication_id=2,
+                    _Controller__pending_completion_publications={},
+                    _Controller__model=model,
+                    _Controller__model_lock=model_lock,
+                    _Controller__command_flow_lock=Lock(),
+                    _Controller__command_queue=queue,
+                    _Controller__active_command_processes=[],
+                    _Controller__deferred_delete_command_refs=[],
+                )
+                updater = SimpleNamespace(_record_completion_gate_breadcrumb=MagicMock())
+                file = SimpleNamespace(
+                    file_id=ModelFile.build_file_id("sample", None), name="sample",
+                    full_path="sample", path_pair_id=None, state=ModelFile.State.DOWNLOADED,
+                    local_size=7, remote_size=7, modified=None,
+                )
+                timed_lock = _ModelUpdateTimedModelLock(model_lock, None)
+                mutation_calls = []
+
+                with timed_lock:
+                    boundary = _AutomaticMoveBoundary(updater, controller, timed_lock, file, None)
+
+                    def publish():
+                        mutation_calls.append(True)
+                        os.rename(source, destination)
+
+                    accepted = boundary.publish_no_replace(publish)
+
+                if reader_case == "known_absent":
+                    self.assertTrue(accepted)
+                    self.assertEqual([True], mutation_calls)
+                    self.assertFalse(os.path.exists(source))
+                    self.assertEqual(b"payload", Path(destination).read_bytes())
+                else:
+                    self.assertFalse(accepted)
+                    self.assertEqual([], mutation_calls)
+                    self.assertEqual(b"payload", Path(source).read_bytes())
+                    self.assertFalse(os.path.exists(destination))
 
     def test_regular_fallback_missing_destination_parent_after_temporary_creation_is_private_and_source_safe(self):
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=32)

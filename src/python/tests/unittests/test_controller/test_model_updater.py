@@ -49,6 +49,7 @@ from controller.model_updater import (
     _ModelUpdateStageTimer,
     _ModelUpdateTimedModelLock,
     _MoveRetryRebuildGate,
+    _AutomaticMoveBoundary,
     _bounded_child_finalization_epoch,
     _filter_actionable_move_retry_ids,
     _request_model_rebuild,
@@ -855,6 +856,84 @@ class TestModelUpdater(unittest.TestCase):
         self.assertTrue(lock.acquire(blocking=False))
         lock.release()
         recorder.assert_not_called()
+
+    def test_timed_model_lock_private_copy_yield_releases_only_measured_hold_segment(self):
+        lock = ThreadLock()
+        hold_durations = []
+
+        class Diagnostics:
+            def begin_duration(self, metric):
+                return metric, time.monotonic_ns()
+
+            def finish_duration(self, metric, token):
+                if metric == DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD:
+                    hold_durations.append((time.monotonic_ns() - token[1]) / 1_000_000)
+
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=SimpleNamespace(
+                is_effectively_enabled=lambda category, level: False,
+            )),
+            logger=MagicMock(),
+        )
+        contender_acquired = Event()
+        timed_lock = _ModelUpdateTimedModelLock(lock, Diagnostics(), controller)
+        with timed_lock:
+            def contend_for_model_lock():
+                if lock.acquire(timeout=1):
+                    contender_acquired.set()
+                    lock.release()
+
+            contender = Thread(target=contend_for_model_lock)
+
+            def private_copy():
+                contender.start()
+                self.assertTrue(contender_acquired.wait(1))
+                time.sleep(0.12)
+                return "copied"
+
+            self.assertEqual("copied", timed_lock.run_unlocked(private_copy))
+            contender.join(1)
+
+        self.assertFalse(contender.is_alive())
+        self.assertTrue(contender_acquired.is_set())
+        self.assertEqual(2, len(hold_durations))
+        self.assertLess(sum(hold_durations), 100)
+
+    def test_timed_model_lock_reacquires_before_diagnostic_failure_and_copy_error(self):
+        class DiagnosticFailure(BaseException):
+            pass
+
+        lock = ThreadLock()
+
+        class Diagnostics:
+            def __init__(self):
+                self.hold_entries = 0
+                self.lock_owned_during_hold_setup = []
+
+            def begin_duration(self, metric):
+                if metric == DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD:
+                    self.hold_entries += 1
+                    acquired = lock.acquire(blocking=False)
+                    if acquired:
+                        lock.release()
+                    self.lock_owned_during_hold_setup.append(not acquired)
+                    if self.hold_entries == 2:
+                        raise DiagnosticFailure("reacquire diagnostic failed")
+                return metric, time.monotonic_ns()
+
+            def finish_duration(self, _metric, _token):
+                pass
+
+        diagnostics = Diagnostics()
+        timed_lock = _ModelUpdateTimedModelLock(lock, diagnostics)
+        with timed_lock:
+            with self.assertRaisesRegex(RuntimeError, "copy failed"):
+                timed_lock.run_unlocked(lambda: (_ for _ in ()).throw(RuntimeError("copy failed")))
+            self.assertFalse(lock.acquire(blocking=False))
+            self.assertEqual([True, True], diagnostics.lock_owned_during_hold_setup)
+
+        self.assertTrue(lock.acquire(blocking=False))
+        lock.release()
 
     def test_timed_model_lock_emits_bounded_correlated_span_pairs(self):
         trace = BreadcrumbTraceCollector(lambda: True)
@@ -16606,6 +16685,53 @@ class TestModelUpdater(unittest.TestCase):
             len(updater._ModelUpdater__completion_gate_trace_signatures),
             updater._COMPLETION_GATE_TRACE_SIGNATURE_LIMIT,
         )
+
+    def test_automatic_move_stale_authority_event_reaches_breadcrumb_consumer(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        model = Model()
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__path_pair_refresh_lock=ThreadLock(),
+            _Controller__path_pair_refresh_requested=False,
+            _Controller__path_pair_refresh_generation=0,
+            _Controller__path_pairs_by_id={},
+            _Controller__path_pair_staging_paths={},
+            _Controller__legacy_local_path="local-root",
+            _Controller__legacy_remote_path="remote-root",
+            _Controller__staging_path="staging-root",
+            _Controller__progress_publication_epoch=1,
+            _Controller__scan_authority_publication_id=2,
+            _Controller__scan_authority_tokens={"local": {}, "remote": {}},
+            _Controller__pending_completion_publications={},
+            _Controller__model=model,
+            _Controller__local_scan_process=SimpleNamespace(session_token="local-session"),
+            _Controller__model_lock=RLock(),
+        )
+        file = ModelFile("private-label.bin", False)
+        updater = ModelUpdater(controller)
+        timed_lock = _ModelUpdateTimedModelLock(controller._Controller__model_lock, None, controller)
+
+        with timed_lock:
+            boundary = _AutomaticMoveBoundary(updater, controller, timed_lock, file, None)
+            controller._Controller__local_scan_process.session_token = "replacement-session"
+            self.assertFalse(boundary.publish_no_replace(lambda: self.fail("stale gate published")))
+
+        entries = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry["message"] == "automatic_move_copy_boundary"
+        ]
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertEqual("completion_gate", entry["stage"])
+        self.assertEqual("info", entry["level"])
+        self.assertEqual({
+            "schema": "automatic_move_copy_boundary.v1",
+            "phase": "prepublish_gate",
+            "decision": "deferred",
+            "reason": "stale_authority",
+            "changed_dimensions": ["scanner_authority"],
+        }, entry["details"])
+        self.assertNotIn("private-label.bin", str(trace.snapshot()))
 
     def test_completion_gate_presentation_transition_records_frozen_scalar_projection(self):
         cases = (

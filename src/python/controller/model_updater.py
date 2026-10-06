@@ -2003,6 +2003,8 @@ class _ModelUpdateTimedModelLock:
     ) -> None:
         self.__model_lock = model_lock
         self.__diagnostics = diagnostics
+        self.__controller = controller
+        self.__correlation = correlation
         self.__wait_breadcrumb = _ModelFinalizationBreadcrumbSpan(
             controller, "model_lock_wait", correlation,
             defer_recording=True, eager_entry=True,
@@ -2019,6 +2021,8 @@ class _ModelUpdateTimedModelLock:
         self.__hold_span = _ModelUpdateDurationSpan(
             diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_MODEL_LOCK_HOLD,
         )
+        self.__owns_lock = False
+        self.__deferred_breadcrumbs: list[_ModelFinalizationBreadcrumbSpan] = []
 
     def __enter__(self) -> object:
         for span in (
@@ -2031,6 +2035,7 @@ class _ModelUpdateTimedModelLock:
         self.__wait_span.__enter__()
         try:
             entered = self.__model_lock.__enter__()
+            self.__owns_lock = True
         except BaseException as exc:
             self.__wait_span.__exit__(type(exc), exc, exc.__traceback__)
             if self.__wait_breadcrumb is not None:
@@ -2041,6 +2046,8 @@ class _ModelUpdateTimedModelLock:
             self.__wait_span.__exit__(None, None, None)
             if self.__wait_breadcrumb is not None:
                 self.__wait_breadcrumb.__exit__(None, None, None)
+                self.__deferred_breadcrumbs.append(self.__wait_breadcrumb)
+                self.__wait_breadcrumb = None
             self.__hold_span.__enter__()
             if self.__hold_breadcrumb is not None:
                 self.__hold_breadcrumb.__enter__()
@@ -2057,6 +2064,107 @@ class _ModelUpdateTimedModelLock:
                 self.__hold_breadcrumb.flush()
             raise
         return entered
+
+    def __new_hold_breadcrumb(self) -> Optional[_ModelFinalizationBreadcrumbSpan]:
+        if self.__controller is None:
+            return None
+        span = _ModelFinalizationBreadcrumbSpan(
+            self.__controller, "model_lock_hold", self.__correlation,
+            defer_recording=True,
+        )
+        span.prepare()
+        return span
+
+    def run_unlocked(self, operation: Callable[[], object]) -> object:
+        """Run only private work outside the model lock, then reacquire it.
+
+        The outer context remains responsible for the final release.  Hold and
+        wait measurements are segmented so the yielded interval is never
+        attributed to model-lock occupancy.
+        """
+        if not self.__owns_lock:
+            raise RuntimeError("model lock is not currently owned")
+
+        hold_breadcrumb = self.__hold_breadcrumb
+        try:
+            self.__hold_span.__exit__(None, None, None)
+        except BaseException:
+            pass
+        if hold_breadcrumb is not None:
+            try:
+                hold_breadcrumb.__exit__(None, None, None)
+            except BaseException:
+                pass
+            self.__deferred_breadcrumbs.append(hold_breadcrumb)
+            self.__hold_breadcrumb = None
+        try:
+            self.__model_lock.__exit__(None, None, None)
+            self.__owns_lock = False
+        except BaseException:
+            raise
+
+        operation_error: Optional[BaseException] = None
+        result: object = None
+        try:
+            result = operation()
+        except BaseException as error:
+            operation_error = error
+
+        wait_started_ns: Optional[int] = None
+        wait_started_cpu_ns: Optional[int] = None
+        try:
+            wait_started_ns = time.monotonic_ns()
+            cpu_clock = getattr(time, "thread_time_ns", None)
+            wait_started_cpu_ns = cpu_clock() if callable(cpu_clock) else None
+        except BaseException:
+            pass
+        try:
+            self.__model_lock.__enter__()
+            self.__owns_lock = True
+        except BaseException:
+            raise
+
+        # Restore raw lock ownership before diagnostic callbacks or caller
+        # cleanup can run, even when the private copy raised.
+        wait_ended_ns: Optional[int] = None
+        wait_ended_cpu_ns: Optional[int] = None
+        try:
+            wait_ended_ns = time.monotonic_ns()
+            cpu_clock = getattr(time, "thread_time_ns", None)
+            wait_ended_cpu_ns = cpu_clock() if callable(cpu_clock) else None
+        except BaseException:
+            pass
+        if self.__controller is not None:
+            try:
+                wait_breadcrumb = _ModelFinalizationBreadcrumbSpan(
+                    self.__controller, "model_lock_wait", self.__correlation,
+                    defer_recording=True,
+                )
+                wait_breadcrumb.prepare()
+                wait_breadcrumb.__enter__(
+                    boundary_ns=wait_started_ns, boundary_cpu_ns=wait_started_cpu_ns,
+                )
+                wait_breadcrumb.__exit__(
+                    None, None, None,
+                    boundary_ns=wait_ended_ns, boundary_cpu_ns=wait_ended_cpu_ns,
+                )
+                self.__deferred_breadcrumbs.append(wait_breadcrumb)
+            except BaseException:
+                pass
+        try:
+            self.__hold_span.__enter__()
+        except BaseException:
+            pass
+        try:
+            self.__hold_breadcrumb = self.__new_hold_breadcrumb()
+            if self.__hold_breadcrumb is not None:
+                self.__hold_breadcrumb.__enter__()
+        except BaseException:
+            self.__hold_breadcrumb = None
+
+        if operation_error is not None:
+            raise operation_error
+        return result
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
         # Capture boundaries while the original lock remains held, then emit
@@ -2079,7 +2187,9 @@ class _ModelUpdateTimedModelLock:
                     # Breadcrumb setup must never block the raw lock release.
                     pass
             try:
-                suppressed = bool(self.__model_lock.__exit__(exc_type, exc_value, traceback))
+                suppressed = bool(self.__model_lock.__exit__(exc_type, exc_value, traceback)) \
+                    if self.__owns_lock else False
+                self.__owns_lock = False
             except BaseException as error:
                 if release_breadcrumb_started:
                     try:
@@ -2093,14 +2203,314 @@ class _ModelUpdateTimedModelLock:
                         self.__release_breadcrumb.__exit__(None, None, None)
                     except BaseException:
                         pass
-        for span in (
-                self.__wait_breadcrumb, self.__hold_breadcrumb,
-                self.__release_breadcrumb):
-            if span is not None:
+        for span in self.__deferred_breadcrumbs:
+            try:
                 span.flush()
+            except BaseException:
+                pass
+        for span in (self.__hold_breadcrumb, self.__release_breadcrumb):
+            if span is not None:
+                try:
+                    span.flush()
+                except BaseException:
+                    pass
         if diagnostic_error is not None:
             raise diagnostic_error
         return suppressed
+
+
+class _AutomaticMoveBoundary:
+    """Yield only private copy work, then gate the existing publisher."""
+
+    def __init__(
+            self, updater: "ModelUpdater", controller: object,
+            timed_model_lock: _ModelUpdateTimedModelLock, file: ModelFile,
+            poll_correlation: Optional[str],
+    ) -> None:
+        self.__updater = updater
+        self.__controller = controller
+        self.__timed_model_lock = timed_model_lock
+        self.__file = file
+        self.__poll_correlation = poll_correlation
+        self.__snapshot = self.__capture_authority()
+
+    @staticmethod
+    def __file_snapshot(file: object) -> tuple[object, ...]:
+        state = getattr(file, "state", None)
+        state_name = getattr(state, "name", None)
+        return (
+            getattr(file, "file_id", None),
+            getattr(file, "name", None),
+            getattr(file, "full_path", None),
+            getattr(file, "path_pair_id", None),
+            state_name,
+            getattr(file, "local_size", None),
+            getattr(file, "remote_size", None),
+            getattr(file, "modified", None),
+        )
+
+    def __capture_authority(self, refresh_locked: bool = False) -> tuple[object, ...]:
+        controller = self.__controller
+        file_id = self.__file.file_id
+        path_pair_id = self.__file.path_pair_id
+        refresh_lock = getattr(controller, "_Controller__path_pair_refresh_lock", None)
+        if refresh_lock is not None and refresh_locked:
+            refresh = (
+                getattr(controller, "_Controller__path_pair_refresh_requested", None),
+                getattr(controller, "_Controller__path_pair_refresh_generation", None),
+            )
+        elif refresh_lock is not None:
+            with refresh_lock:
+                refresh = (
+                    getattr(controller, "_Controller__path_pair_refresh_requested", None),
+                    getattr(controller, "_Controller__path_pair_refresh_generation", None),
+                )
+        else:
+            refresh = (None, None)
+
+        pairs = getattr(controller, "_Controller__path_pairs_by_id", {})
+        pair = pairs.get(path_pair_id) if path_pair_id is not None and isinstance(pairs, dict) else None
+        staging_paths = getattr(controller, "_Controller__path_pair_staging_paths", {})
+        selected_staging = staging_paths.get(path_pair_id) \
+            if path_pair_id is not None and isinstance(staging_paths, dict) else None
+        active_paths = (
+            path_pair_id,
+            getattr(pair, "local_path", None) if pair is not None else
+            getattr(controller, "_Controller__legacy_local_path", None),
+            getattr(pair, "remote_path", None) if pair is not None else
+            getattr(controller, "_Controller__legacy_remote_path", None),
+            selected_staging if path_pair_id is not None else
+            getattr(controller, "_Controller__staging_path", None),
+            pair is not None if path_pair_id is not None else True,
+        )
+
+        scanner_authority = []
+        scan_tokens = getattr(controller, "_Controller__scan_authority_tokens", {})
+        for side in ("active", "local", "remote"):
+            process = getattr(controller, "_Controller__{}_scan_process".format(side), None)
+            # A scanner worker's generation advances when scan work starts,
+            # before its result is adopted as authority by this updater.  It
+            # is not a committed lifecycle fence; retain the stable process
+            # session and selected-pair result tokens below.
+            scanner_authority.append((
+                side,
+                getattr(process, "session_token", None),
+            ))
+            if side in ("local", "remote"):
+                tokens = scan_tokens.get(side, {}) if isinstance(scan_tokens, dict) else {}
+                scanner_authority.append((side, tokens.get(path_pair_id) if isinstance(tokens, dict) else None))
+
+        publications = getattr(controller, "_Controller__pending_completion_publications", {})
+        publication = publications.get(file_id) if isinstance(publications, dict) else None
+        pending_job_identity = getattr(publication, "job_identity", None)
+        model = getattr(controller, "_Controller__model", None)
+        published_reader = getattr(model, "published_file_with_job_identity", None)
+        published_snapshot: tuple[object, ...] = (False, None, None)
+        if callable(published_reader):
+            try:
+                published = published_reader(file_id)
+                if isinstance(published, tuple) and len(published) == 2:
+                    published_file, published_identity = published
+                    valid_file = published_file is None or isinstance(published_file, ModelFile)
+                    valid_identity = published_identity is None or (
+                        isinstance(published_identity, tuple) and len(published_identity) == 2 and
+                        type(published_identity[0]) is int and isinstance(published_identity[1], str)
+                    )
+                    if valid_file and valid_identity:
+                        published_snapshot = (
+                            True, published_identity,
+                            self.__file_snapshot(published_file) if published_file is not None else None,
+                        )
+            except Exception:
+                published_snapshot = (False, None, None)
+
+        return (
+            getattr(controller, "_Controller__progress_publication_epoch", None),
+            refresh,
+            active_paths,
+            getattr(controller, "_Controller__scan_authority_publication_id", None),
+            tuple(scanner_authority),
+            pending_job_identity,
+            published_snapshot,
+            self.__file_snapshot(self.__file),
+        )
+
+    def __changed_authority_dimensions(self, current: tuple[object, ...]) -> tuple[str, ...]:
+        names = (
+            "progress_epoch", "refresh", "active_paths", "scan_publication",
+            "scanner_authority", "pending_job", "published_snapshot", "candidate_file",
+        )
+        try:
+            if len(self.__snapshot) != len(names) or len(current) != len(names):
+                return ()
+            changed = [name for name, before, after in zip(names, self.__snapshot, current)
+                       if before != after]
+            published = current[6]
+            if (not isinstance(published, tuple) or not published or published[0] is not True) and \
+                    "published_snapshot" not in changed:
+                changed.append("published_snapshot")
+            return tuple(changed[:8])
+        except Exception:
+            return ()
+
+    def __record(self, phase: str, decision: str, reason: Optional[str] = None,
+                 duration_ms: Optional[int] = None,
+                 changed_dimensions: Optional[tuple[str, ...]] = None) -> None:
+        details: dict[str, object] = {
+            "schema": "automatic_move_copy_boundary.v1",
+            "phase": phase,
+            "decision": decision,
+        }
+        if reason in {
+                "stale_authority", "stop_or_delete_pending", "copy_failed",
+                "published", "publication_failed",
+        }:
+            details["reason"] = reason
+        if reason == "stale_authority":
+            allowed_dimensions = {
+                "progress_epoch", "refresh", "active_paths", "scan_publication",
+                "scanner_authority", "pending_job", "published_snapshot", "candidate_file",
+            }
+            details["changed_dimensions"] = [
+                name for name in (changed_dimensions or ()) if name in allowed_dimensions
+            ][:8]
+        if type(duration_ms) is int and duration_ms >= 0:
+            details["duration_ms"] = min(duration_ms, 600_000)
+        try:
+            self.__updater._record_completion_gate_breadcrumb(
+                self.__file.file_id, "automatic_move_copy_boundary", details,
+                poll_correlation=self.__poll_correlation,
+            )
+        except Exception:
+            pass
+
+    def copy_private(self, operation: Callable[[], object]) -> object:
+        started_ns = time.monotonic_ns()
+        self.__record("copy_yield", "started")
+        succeeded = False
+        try:
+            result = self.__timed_model_lock.run_unlocked(operation)
+            succeeded = True
+            return result
+        finally:
+            elapsed_ms = max(0, (time.monotonic_ns() - started_ns) // 1_000_000)
+            self.__record(
+                "copy_reacquired", "ready" if succeeded else "failed",
+                None if succeeded else "copy_failed", int(elapsed_ms),
+            )
+
+    def __pending_control_intent_unlocked(self, queued_commands: object) -> bool:
+        file = self.__file
+        target_paths = tuple(
+            value for value in (file.name, file.full_path) if isinstance(value, str) and value
+        )
+        target_ids = {file.file_id}
+        for path in target_paths:
+            try:
+                target_ids.add(ModelFile.build_file_id(path, file.path_pair_id))
+            except (TypeError, ValueError):
+                pass
+
+        def matches(command: object) -> bool:
+            action = getattr(getattr(command, "action", None), "name", None)
+            if action not in {"STOP", "DELETE_LOCAL", "DELETE_REMOTE"}:
+                return False
+            values = {
+                getattr(command, "filename", None),
+                getattr(command, "delete_identity", None),
+            }
+            if values.intersection(target_ids) or values.intersection(target_paths):
+                return True
+            # A Stop/Delete of a selected parent or descendant overlaps this
+            # root transaction even when its command uses a relative path.
+            for value in values:
+                if not isinstance(value, str):
+                    continue
+                try:
+                    decoded = json.loads(value)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    decoded = None
+                relative = decoded[1] if isinstance(decoded, list) and len(decoded) == 2 and \
+                    decoded[0] == file.path_pair_id and isinstance(decoded[1], str) else value
+                if any(
+                        relative == path or relative.startswith(path.rstrip("/") + "/") or
+                        path.startswith(relative.rstrip("/") + "/")
+                        for path in target_paths
+                ):
+                    return True
+            return False
+
+        active = getattr(self.__controller, "_Controller__active_command_processes", ())
+        if any(matches(getattr(wrapper, "command", None)) for wrapper in active):
+            return True
+        if any(matches(command) for command in queued_commands):
+            return True
+        deferred = getattr(self.__controller, "_Controller__deferred_delete_command_refs", ())
+        return isinstance(deferred, list) and any(matches(command) for command in deferred)
+
+    def publish_no_replace(self, operation: Callable[[], object]) -> bool:
+        controller = self.__controller
+        if self.__snapshot[-2][0] is not True:
+            self.__record(
+                "prepublish_gate", "deferred", "stale_authority",
+                changed_dimensions=("published_snapshot",),
+            )
+            return False
+        current_authority = self.__capture_authority()
+        if current_authority[-2][0] is not True or current_authority != self.__snapshot:
+            self.__record(
+                "prepublish_gate", "deferred", "stale_authority",
+                changed_dimensions=self.__changed_authority_dimensions(current_authority),
+            )
+            return False
+
+        stopped = getattr(controller, "_Controller__is_explicitly_stopped", None)
+        if callable(stopped) and stopped(self.__file.name, self.__file.path_pair_id):
+            self.__record("prepublish_gate", "deferred", "stop_or_delete_pending")
+            return False
+
+        flow_lock = getattr(controller, "_Controller__command_flow_lock", None)
+        queue = getattr(controller, "_Controller__command_queue", None)
+        refresh_lock = getattr(controller, "_Controller__path_pair_refresh_lock", None)
+        if flow_lock is None or queue is None or refresh_lock is None:
+            self.__record("prepublish_gate", "deferred", "stale_authority")
+            return False
+
+        # Lock order matches command admission (flow -> Queue.mutex). The path
+        # request lock is outermost; refresh requests never take these command
+        # locks, and the model lock remains owned by this updater thread.
+        defer_reason: Optional[str] = None
+        stale_dimensions: tuple[str, ...] = ()
+        operation_error: Optional[BaseException] = None
+        with refresh_lock:
+            authority_under_lock = self.__capture_authority(refresh_locked=True)
+            if authority_under_lock != self.__snapshot:
+                defer_reason = "stale_authority"
+                stale_dimensions = self.__changed_authority_dimensions(authority_under_lock)
+            else:
+                with flow_lock:
+                    # Hold Queue.mutex through the no-replace mutation too:
+                    # Stop uses Queue.put without the flow lock, so inspecting
+                    # the queue and then dropping its mutex would leave a gap.
+                    with queue.mutex:
+                        if self.__pending_control_intent_unlocked(queue.queue):
+                            defer_reason = "stop_or_delete_pending"
+                        else:
+                            try:
+                                operation()
+                            except BaseException as error:
+                                operation_error = error
+        if defer_reason is not None:
+            self.__record(
+                "prepublish_gate", "deferred", defer_reason,
+                changed_dimensions=stale_dimensions if defer_reason == "stale_authority" else None,
+            )
+            return False
+        if operation_error is not None:
+            self.__record("prepublish_gate", "failed", "publication_failed")
+            raise operation_error
+        self.__record("prepublish_gate", "published", "published")
+        return True
 
 
 class _ProgressiveScanAccumulator:
@@ -10157,13 +10567,14 @@ class ModelUpdater(_ControllerCoreAccess):
                 unrelated_candidate_lifecycle_work_deferred = True
                 unrelated_candidate_lifecycle_deferred_reasons.add(reason)
 
+            timed_model_lock = _ModelUpdateTimedModelLock(
+                controller._Controller__model_lock, diagnostics,
+                controller, lftp_status_poll_correlation,
+            )
             with _CandidateLifecycleFallback(
                     model_builder, authoritative_pair_build, pair_fallback_committer,
                     record_candidate_lifecycle_fallback,
-            ), _ModelUpdateTimedModelLock(
-                    controller._Controller__model_lock, diagnostics,
-                    controller, lftp_status_poll_correlation,
-            ), _ModelUpdateDurationSpan(
+            ), timed_model_lock, _ModelUpdateDurationSpan(
                     diagnostics, DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF,
             ):
                 def discard_pending_completion_file(file_id: str) -> None:
@@ -10415,10 +10826,23 @@ class ModelUpdater(_ControllerCoreAccess):
                                 {"attempted": True},
                                 poll_correlation=lftp_status_poll_correlation,
                             )
-                        move_result = move_from_staging(
-                            file.name,
-                            file.path_pair_id,
-                        )
+                        move_callable = getattr(move_from_staging, "__func__", move_from_staging)
+                        if getattr(move_callable, "__qualname__", "").endswith(
+                                "Controller.__move_from_staging"):
+                            boundary = _AutomaticMoveBoundary(
+                                self, controller, timed_model_lock, file,
+                                lftp_status_poll_correlation,
+                            )
+                            move_result = move_from_staging(
+                                file.name,
+                                file.path_pair_id,
+                                automatic_move_boundary=boundary,
+                            )
+                        else:
+                            move_result = move_from_staging(
+                                file.name,
+                                file.path_pair_id,
+                            )
                         if trace_pending_decision:
                             record_pending_completion_move_result(file.file_id, move_result)
                         if trace_completion_gate:

@@ -322,6 +322,73 @@ def test_typed_projection_preserves_dotted_fields_and_numeric_values_only(tmp_pa
     assert unsupported and unsupported[-1]["irrelevant"] == 1
 
 
+def test_automatic_move_boundary_finalized_rows_preserve_finite_facts_and_order(tmp_path: Path) -> None:
+    spool, artifact = _prepare(tmp_path)
+    dimensions = [
+        "scanner_authority", "pending_job", "private/path", "scanner_authority",
+        "candidate_file", "unexpected_private_value", {"sensitive": "nested-private-value"},
+    ]
+    rows = [
+        _row(category="completion.gate", label="automatic_move_copy_boundary", created=41,
+             identity="repeat", details={"schema": "automatic_move_copy_boundary.v1", "phase": "prepublish_gate",
+             "reason": "stale_authority", "decision": "deferred", "changed_dimensions": dimensions,
+             "path": "/private/secret", "file_name": "private.bin"}),
+        _row(category="completion.gate", label="automatic_move_copy_boundary", created=42,
+             identity="repeat", details={"schema": "automatic_move_copy_boundary.v1", "phase": "copy_yield",
+             "decision": "started", "duration_ms": 999, "source": "private/path"}),
+        _row(category="completion.gate", label="automatic_move_copy_boundary", created=43,
+             identity="repeat", details={"schema": "automatic_move_copy_boundary.v1", "phase": "copy_reacquired",
+             "reason": "published", "decision": "ready", "duration_ms": 9187,
+             "changed_dimensions": ["scanner_authority"]}),
+    ]
+    reader = _reader(spool, artifact)
+    try:
+        reader.start()
+        with (spool / "breadcrumbs.jsonl").open("ab") as handle:
+            handle.write(b"".join(rows))
+        assert reader.poll() == 3
+    finally:
+        reader.close()
+    captured = [item["capture"] for item in _artifacts(artifact) if item["capture"].get("state") == "record"]
+    records = [item["projection"] for item in captured]
+    assert all("automatic_move_copy_boundary" in item for item in records)
+    facts = [item["automatic_move_copy_boundary"] for item in records]
+    assert [item["phase"] for item in facts] == ["prepublish_gate", "copy_yield", "copy_reacquired"]
+    assert facts[0] == {
+        "schema": "automatic_move_copy_boundary.v1", "phase": "prepublish_gate",
+        "decision": "deferred", "reason": "stale_authority",
+        "changed_dimensions": ["scanner_authority", "pending_job", "candidate_file"],
+    }
+    assert facts[1] == {"schema": "automatic_move_copy_boundary.v1", "phase": "copy_yield", "decision": "started"}
+    assert facts[2] == {
+        "schema": "automatic_move_copy_boundary.v1", "phase": "copy_reacquired",
+        "decision": "ready", "reason": "published",
+    }
+    assert records[2]["numbers"] == {"duration_ms": 9187}
+    assert [item["created_ms"] for item in captured] == [41, 42, 43]
+    assert len({item["corr_hash"] for item in records}) == 1
+    serialized = json.dumps(records, sort_keys=True)
+    for secret in ("/private/secret", "private.bin", "private/path", "unexpected_private_value", "nested-private-value"):
+        assert secret not in serialized
+
+
+@pytest.mark.parametrize("details_and_expected", [
+    ({"schema": "automatic_move_copy_boundary.v2", "phase": "copy_yield", "decision": "started"}, None),
+    ({"schema": "automatic_move_copy_boundary.v1", "phase": "copy_yield", "decision": "published"}, None),
+    ({"schema": "automatic_move_copy_boundary.v1", "phase": "copy_reacquired", "decision": "ready", "reason": "secret", "duration_ms": -1}, {
+        "schema": "automatic_move_copy_boundary.v1", "phase": "copy_reacquired", "decision": "ready",
+    }),
+])
+def test_automatic_move_boundary_rejects_unknown_or_malformed_envelope(
+    tmp_path: Path, details_and_expected: tuple[dict[str, object], dict[str, object] | None],
+) -> None:
+    details, expected = details_and_expected
+    row = json.loads(_row(category="completion.gate", label="automatic_move_copy_boundary", details=details))
+    projection, irrelevant = capture._projection(row)
+    assert not irrelevant and projection is not None
+    assert projection.get("automatic_move_copy_boundary") == expected
+
+
 def test_delete_local_command_projection_is_bounded_typed_and_private(tmp_path: Path) -> None:
     spool, artifact = _prepare(tmp_path)
     rows = [
