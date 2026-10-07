@@ -2546,6 +2546,7 @@ class TestModelUpdater(unittest.TestCase):
             lambda: True, max_entries=128,
             policy={"default": "off", "rules": {
                 "scan.authority": "info", "scan.adoption": "info", "scan.lifecycle": "info",
+                "scan.root_shape": "info",
             }},
             durable_enabled=True, durable_path=durable_dir.name,
         )
@@ -2563,7 +2564,20 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__local_scan_process = local_process
         controller._Controller__remote_scan_process = remote_process
         local_accumulator = _ProgressiveScanAccumulator()
-        local_accumulator.set_session_token("prior-local-session")
+        local_accumulator.set_session_token(local_process.session_token)
+        source_only_root = SystemFile("source-only-root", 13, True)
+        source_only_root.path_pair_id = "retained-pair"
+        source_only_result = ScannerResult(
+            datetime.now(), [source_only_root],
+            scanned_path_pair_ids={"retained-pair"}, completed_path_pair_ids={"retained-pair"},
+            generation=1, is_progress=True, is_scan_final=True,
+            session_token=local_process.session_token, is_full_snapshot=True,
+            full_snapshot_path_pair_ids={"retained-pair"}, root_names={source_only_root.name},
+            root_scan_outcomes_by_pair={"retained-pair": {source_only_root.name: (True, True)}},
+        )
+        local_accumulator.apply([source_only_result], {"retained-pair"})
+        source_only_id = ModelFile.build_file_id(source_only_root.name, "retained-pair")
+        self.assertIn(source_only_id, local_accumulator.current_root_scan_sources())
         controller._Controller__progressive_local_scan_state = local_accumulator
 
         def record_breadcrumb(**kwargs):
@@ -2597,6 +2611,10 @@ class TestModelUpdater(unittest.TestCase):
                 "scoped-pair": {root.name: (True, True) for root in roots}
             },
         )
+        self.assertNotIn("retained-pair", result.scanned_path_pair_ids)
+        self.assertNotIn(source_only_id, {
+            ModelFile.build_file_id(root.name, root.path_pair_id) for root in result.files
+        })
         local_process._ScannerProcess__publish_result(result)
         ModelUpdater(controller).update()
 
@@ -2677,6 +2695,19 @@ class TestModelUpdater(unittest.TestCase):
             self.assertIsNone(row["details"]["p"]["ao"])
         self.assertTrue(expected_ids.issubset(source_rows))
         self.assertLessEqual(len(source_rows), 8)
+        source_only_corr = opaque_trace_correlation(source_only_id)
+        source_only_transitions = [
+            row for row in event_rows
+            if row.get("message") == "local_root_proof_transition" and
+            row.get("details", {}).get("root_corr") == "completion:" + source_only_corr
+        ]
+        self.assertEqual(1, len(source_only_transitions))
+        source_only_transition = source_only_transitions[0]["details"]
+        self.assertEqual("adopt_local_root_scan_sources", source_only_transition["writer"])
+        self.assertEqual("progressive_root_sources", source_only_transition["route"])
+        self.assertEqual("present", source_only_transition["input_presence"])
+        self.assertEqual("bound", source_only_transition["transition"])
+        self.assertEqual("match", source_only_transition["after_expected"])
         last_target_id = opaque_trace_correlation(
             ModelFile.build_file_id(roots[-1].name, "scoped-pair")
         )

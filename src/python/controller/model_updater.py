@@ -12867,7 +12867,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     return _run_local_root_proof_writer(
                         controller, model_builder, "adopt_local_root_scan_sources", local_root_source_route,
                         lambda: local_root_source_adopter(local_root_sources),
-                        target_ids=lambda: diagnostic_target_root_ids(local_root_sources, root_proof=True),
+                        target_ids=lambda: diagnostic_target_root_ids(
+                            local_root_sources.keys(), root_proof=True,
+                        ),
                         input_sources=local_root_sources if local_root_source_input_known else None,
                         input_presence="unknown" if not local_root_source_input_known else "absent",
                     )
