@@ -4785,16 +4785,25 @@ class ModelBuilder:
 
     @staticmethod
     def __has_verified_split_root_final_leaf(existing_file: SystemFile,
-                                             remote_file: Optional[SystemFile]) -> bool:
+                                             remote_file: Optional[SystemFile],
+                                             leaf_observer: Optional[Callable[
+                                                 [SystemFile, SystemFile, bool], None
+                                             ]] = None) -> bool:
         if remote_file is None or existing_file.is_dir != remote_file.is_dir:
             return False
         if not existing_file.is_dir:
-            return not existing_file.has_staging_collision and \
+            verified = not existing_file.has_staging_collision and \
                 ModelBuilder.__is_verified_final_leaf(remote_file, existing_file)
+            if leaf_observer is not None:
+                try:
+                    leaf_observer(remote_file, existing_file, verified)
+                except Exception:
+                    pass
+            return verified
         remote_children = {child.name: child for child in remote_file.iter_children()}
         return any(
             ModelBuilder.__has_verified_split_root_final_leaf(
-                child, remote_children.get(child.name)
+                child, remote_children.get(child.name), leaf_observer,
             )
             for child in existing_file.iter_children()
         )
@@ -5029,36 +5038,150 @@ class ModelBuilder:
             for remote_child in remote_children.values()
         )
 
-    def __build_effective_local_files(self) -> Dict[str, SystemFile]:
+    def __build_effective_local_files(self, input_witness: Optional[dict] = None) -> Dict[str, SystemFile]:
         if not self.__active_files:
             return self.__local_files()
 
         effective_local_files = self.__local_files()
+
+        def record_selection(file_id: str, reason: str, **guards: Optional[bool]) -> None:
+            if input_witness is None or file_id not in input_witness.get("priority_roots", ()):
+                return
+            selected = input_witness.setdefault("selection_by_root", {})
+            if len(selected) >= 4 and file_id not in selected:
+                return
+            selected[file_id] = {
+                "selection_reason": reason,
+                "selection_guards": {
+                    "sd": guards.get("local_staging_descendant"),
+                    "cd": guards.get("local_staging_collision_descendant"),
+                    "sv": guards.get("split_has_verified_leaf"),
+                    "lce": guards.get("local_candidate_eligible"),
+                    "sga": guards.get("local_size_ge_active"),
+                    "rn": guards.get("remote_indicates_newer"),
+                },
+            }
+
         for file_id, active_file in self.__active_files.items():
             # A recovery-produced active PGET leaf has a canonical descendant
             # identity. It is inserted while building that remote root below,
             # rather than being published as a separate local-only root.
             if self.__nested_active_file_root_file_id(active_file) is not None:
+                record_selection(file_id, "nested_active_omitted")
                 continue
             existing_file = effective_local_files.get(file_id)
             remote_file = self.__remote_file(file_id)
-            if existing_file is not None and remote_file is not None and \
-                    (self.__has_staging_descendant(existing_file) or
-                     self.__has_staging_collision_descendant(existing_file)) and \
-                    (self.__has_verified_split_root_final_leaf(existing_file, remote_file) or
-                     self.__has_staging_collision_descendant(existing_file)):
-                effective_local_files[file_id] = self.__merge_active_split_root(
-                    existing_file, active_file, remote_file
+            staging_descendant: Optional[bool] = None
+            collision_descendant: Optional[bool] = None
+            verified_split_leaf: Optional[bool] = None
+            if existing_file is not None and remote_file is not None:
+                staging_descendant = self.__has_staging_descendant(existing_file)
+                if not staging_descendant:
+                    collision_descendant = self.__has_staging_collision_descendant(existing_file)
+                if staging_descendant or collision_descendant:
+                    leaf_observer = None
+                    if input_witness is not None and file_id in input_witness.get("priority_roots", ()):
+                        def capture_split_leaf(
+                                remote_leaf: SystemFile, local_leaf: SystemFile, strict_verified: bool,
+                        ) -> None:
+                            try:
+                                split_leaf_facts = input_witness.setdefault("split_leaf_facts", {})
+                                remote_key = id(remote_leaf)
+                                if local_leaf.is_staging or remote_key in split_leaf_facts or \
+                                        len(split_leaf_facts) >= 8:
+                                    return
+                                local_mtime_ns = local_leaf.mtime_ns
+                                remote_mtime_ns = remote_leaf.mtime_ns
+                                split_leaf_facts[remote_key] = {
+                                    "local_present": True,
+                                    "local_size": local_leaf.size
+                                        if type(local_leaf.size) is int else None,
+                                    "local_mtime_ns": str(local_mtime_ns)
+                                        if type(local_mtime_ns) is int else None,
+                                    "local_mtime_known": type(local_mtime_ns) is int,
+                                    "remote_size": remote_leaf.size
+                                        if type(remote_leaf.size) is int else None,
+                                    "remote_mtime_ns": str(remote_mtime_ns)
+                                        if type(remote_mtime_ns) is int else None,
+                                    "remote_mtime_known": type(remote_mtime_ns) is int,
+                                    "strict_verified": strict_verified,
+                                    "portable_queue_exclusion_match":
+                                        ModelBuilder.__leaf_matches_remote_queue_exclusion_identity(
+                                            remote_leaf, local_leaf,
+                                        ),
+                                    "provenance": "split_candidate_local",
+                                }
+                            except Exception:
+                                pass
+
+                        leaf_observer = capture_split_leaf
+                    verified_split_leaf = self.__has_verified_split_root_final_leaf(
+                        existing_file, remote_file, leaf_observer,
+                    )
+                    if verified_split_leaf:
+                        record_selection(
+                            file_id, "split_merge",
+                            local_staging_descendant=staging_descendant,
+                            local_staging_collision_descendant=collision_descendant,
+                            split_has_verified_leaf=verified_split_leaf,
+                        )
+                        effective_local_files[file_id] = self.__merge_active_split_root(
+                            existing_file, active_file, remote_file
+                        )
+                        continue
+                    split_collision_descendant = self.__has_staging_collision_descendant(existing_file)
+                    if collision_descendant is None:
+                        collision_descendant = split_collision_descendant
+                    if split_collision_descendant:
+                        record_selection(
+                            file_id, "split_merge",
+                            local_staging_descendant=staging_descendant,
+                            local_staging_collision_descendant=collision_descendant,
+                            split_has_verified_leaf=verified_split_leaf,
+                        )
+                        effective_local_files[file_id] = self.__merge_active_split_root(
+                            existing_file, active_file, remote_file
+                        )
+                        continue
+            if existing_file is not None and getattr(existing_file, "is_staging", False):
+                record_selection(
+                    file_id, "local_staging_retained",
+                    local_staging_descendant=staging_descendant,
+                    local_staging_collision_descendant=collision_descendant,
+                    split_has_verified_leaf=verified_split_leaf,
                 )
                 continue
-            if existing_file is not None and getattr(existing_file, "is_staging", False):
-                continue
-            if existing_file is not None and \
-                    self.__is_authoritative_local_file(existing_file) and \
-                    getattr(active_file, "is_staging", False) and \
-                    existing_file.size >= active_file.size and \
-                    not self.__remote_indicates_newer_content(existing_file, remote_file):
-                continue
+            local_authoritative: Optional[bool] = None
+            local_size_ge_active: Optional[bool] = None
+            remote_indicates_newer: Optional[bool] = None
+            if existing_file is not None:
+                local_authoritative = self.__is_authoritative_local_file(existing_file)
+                if local_authoritative and getattr(active_file, "is_staging", False):
+                    local_size_ge_active = existing_file.size >= active_file.size
+                    if local_size_ge_active:
+                        remote_indicates_newer = self.__remote_indicates_newer_content(
+                            existing_file, remote_file,
+                        )
+                        if not remote_indicates_newer:
+                            record_selection(
+                                file_id, "local_retained_over_active_staging",
+                                local_staging_descendant=staging_descendant,
+                                local_staging_collision_descendant=collision_descendant,
+                                split_has_verified_leaf=verified_split_leaf,
+                                local_candidate_eligible=local_authoritative,
+                                local_size_ge_active=local_size_ge_active,
+                                remote_indicates_newer=remote_indicates_newer,
+                            )
+                            continue
+            record_selection(
+                file_id, "active_selected",
+                local_staging_descendant=staging_descendant,
+                local_staging_collision_descendant=collision_descendant,
+                split_has_verified_leaf=verified_split_leaf,
+                local_candidate_eligible=local_authoritative,
+                local_size_ge_active=local_size_ge_active,
+                remote_indicates_newer=remote_indicates_newer,
+            )
             effective_local_files[file_id] = active_file
         return effective_local_files
 
@@ -7035,12 +7158,15 @@ class ModelBuilder:
                         break
             return {"corr": "input-arbitration:" + opaque_trace_correlation(str(time.monotonic_ns())),
                     "priority_roots": tuple(priority_roots),
+                    "selection_by_root": {},
+                    "split_leaf_facts": {},
                     "root_rows_sampled": 0, "root_rows_omitted": 0,
                     "remote_leaf_rows_sampled": 0, "remote_leaf_rows_omitted": 0}
         except Exception:
             return None
 
-    def __input_witness_root(self, file_id: str, remote: Optional[SystemFile],
+    def __input_witness_root(self, context: dict, file_id: str,
+                             remote: Optional[SystemFile],
                              selected: Optional[SystemFile]) -> Optional[dict]:
         try:
             local = self.__local_file(file_id)
@@ -7053,17 +7179,37 @@ class ModelBuilder:
             facts = {"root_id": opaque_trace_correlation(file_id), "input_scope": "root",
                      "selection": selection, "local_proof_generation": generation,
                      "local_proof_generation_known": generation is not None, "active_generation_known": False}
-            for label, node in (("local", local), ("active", active), ("remote", remote)):
-                facts[label + "_input_present"] = node is not None
-                facts[label + "_input_size"] = node.size if node is not None else None
-                facts[label + ("_input_is_dir" if label == "remote" else "_input_is_staging")] = \
-                    (node.is_dir if label == "remote" else node.is_staging) if node is not None else None
+            selection_facts = context.get("selection_by_root", {}).get(file_id, {})
+            facts["selection_reason"] = selection_facts.get(
+                "selection_reason",
+                "local_selected" if local is not None else "active_selected" if active is not None else "absent",
+            )
+            guard_names = (
+                "sd", "cd", "sv", "lce", "sga", "rn",
+            )
+            selection_guards = selection_facts.get("selection_guards", {})
+            facts["selection_guards"] = {
+                name: selection_guards.get(name) for name in guard_names
+            }
+            source_inputs = {
+                "lp": local is not None,
+                "lb": local.size if local is not None else None,
+                "ls": local.is_staging if local is not None else None,
+                "ap": active is not None,
+                "ab": active.size if active is not None else None,
+                "as": active.is_staging if active is not None else None,
+                "rp": remote is not None,
+                "rb": remote.size if remote is not None else None,
+                "rd": remote.is_dir if remote is not None else None,
+            }
+            facts["source_inputs"] = source_inputs
             return facts
         except Exception:
             return None
 
     def __record_input_witness(self, context: Optional[dict], facts: Optional[dict] = None,
-                               model_file: Optional[ModelFile] = None, *, leaf: bool = False) -> None:
+                               model_file: Optional[ModelFile] = None, *, leaf: bool = False,
+                               leaf_facts: Optional[dict] = None) -> None:
         if context is None:
             return
         try:
@@ -7080,19 +7226,40 @@ class ModelBuilder:
                 details = {"schema": "model_input_arbitration.v1"}
                 context[prefix + "_rows_sampled"] += 1
                 state = model_file.state.name.lower()
-                details.update(facts)
+                if leaf:
+                    leaf_context_fields = ("root_id",) if leaf_facts is not None else (
+                        "root_id", "input_scope", "selection", "local_proof_generation",
+                        "local_proof_generation_known", "active_generation_known",
+                    )
+                    details.update({
+                        key: facts[key] for key in leaf_context_fields if key in facts
+                    })
+                else:
+                    details.update(facts)
                 details.update({"phase": "remote_leaf_fill" if leaf else "root_fill",
                     "subject_kind": "remote_leaf" if leaf else "root",
                     "subject_id": opaque_trace_correlation(model_file.file_id),
                     "filled_local_present": model_file.local_present,
                     "filled_remote_present": model_file.remote_present,
                     "filled_local_size": model_file.local_size, "filled_remote_size": model_file.remote_size,
-                    "filled_transferred_size": model_file.transferred_size,
-                    "filled_state": state if state in ("queued", "downloading", "default", "downloaded", "move_failed") else "unknown",
-                    "filled_remote_transferable": model_file.remote_has_transferable_content})
+                })
+                extended_root = not leaf and facts is not None and \
+                    "source_inputs" in facts and "selection_guards" in facts
+                extended_split_leaf = leaf and leaf_facts is not None
+                if not (extended_root or extended_split_leaf):
+                    details.update({
+                        "filled_transferred_size": model_file.transferred_size,
+                        "filled_state": state if state in (
+                            "queued", "downloading", "default", "downloaded", "move_failed",
+                        ) else "unknown",
+                        "filled_remote_transferable": model_file.remote_has_transferable_content,
+                    })
+                if leaf and leaf_facts is not None:
+                    details["split_candidate"] = leaf_facts
             self.__stop_resume_trace_breadcrumb.record("model_builder", "input_arbitration_witness", details,
-                category="scan.authority", level="info", stage="model_builder_input_arbitration",
-                event_type="diagnostic", corr_id=context["corr"], flow_id=context["corr"], trace_scope="flow")
+                category="scan.authority", corr_id=context["corr"], flow_id=context["corr"],
+                level="info", stage="model_builder_input_arbitration",
+                event_type="diagnostic", trace_scope="flow")
         except Exception:
             pass
 
@@ -7114,7 +7281,7 @@ class ModelBuilder:
         # opt-in once so a disabled build does not enter per-node trace code.
         model_publication_trace_enabled = self.__is_model_publication_trace_enabled()
         input_witness = self.__input_witness_context()
-        effective_local_files = self.__build_effective_local_files()
+        effective_local_files = self.__build_effective_local_files(input_witness)
         self.__cached_unresolved_staging_collision_file_ids = {
             file_id
             for file_id, local_file in effective_local_files.items()
@@ -7160,7 +7327,7 @@ class ModelBuilder:
         for file_id in all_file_ids:
             remote = remote_files.get(file_id, None)
             local = effective_local_files.get(file_id, None)
-            input_facts = self.__input_witness_root(file_id, remote, local) if input_witness is not None and \
+            input_facts = self.__input_witness_root(input_witness, file_id, remote, local) if input_witness is not None and \
                 input_witness["root_rows_sampled"] < 4 and \
                 (not input_witness["priority_roots"] or file_id in input_witness["priority_roots"]) else None
             status = self.__lftp_statuses.get(file_id, None)
@@ -7812,7 +7979,13 @@ class ModelBuilder:
                     _child_live_status,
                 )
                 if input_witness is not None and _remote_child is not None and not _remote_child.is_dir:
-                    self.__record_input_witness(input_witness, input_facts, _child_model_file, leaf=True)
+                    split_leaf_facts = input_witness.get("split_leaf_facts", {}).pop(
+                        id(_remote_child), None,
+                    )
+                    self.__record_input_witness(
+                        input_witness, input_facts, _child_model_file,
+                        leaf=True, leaf_facts=split_leaf_facts,
+                    )
                 if self.__is_stop_resume_trace_enabled():
                     self.__trace_target_arbitration(
                         _child_model_file,

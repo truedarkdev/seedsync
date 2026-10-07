@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import sys
 
 import pytest
@@ -873,7 +874,7 @@ def test_finalized_input_arbitration_selects_actual_root_builds_and_summaries(tm
 
     # The durable writer flattens metadata today; retain compatibility with a
     # metadata-wrapped finalized envelope without copying arbitrary headers.
-    actual = finalized[0]
+    actual = next(row for row in finalized if row.get("details", {}).get("phase") == "root_fill")
     metadata_keys = ("source", "category", "event_type", "stage", "level", "corr_id", "flow_id", "trace_scope", "message")
     wrapped = {
         "metadata": {key: actual[key] for key in metadata_keys},
@@ -888,19 +889,134 @@ def test_finalized_input_arbitration_selects_actual_root_builds_and_summaries(tm
     assert facts["build_token"] in selected["build_tokens"]
     assert "private_header" not in json.dumps(wrapped_projection)
 
-    # The actual producer's 24-item detail cap omits these optional tail facts;
-    # missing stays unknown, while explicit null and malformed false-like data
-    # remain distinguishable.
+    # Missing optional facts remain unknown, while explicit null and malformed
+    # compact source values remain distinguishable.
     capped = dict(actual["details"])
     capped.pop("filled_state", None)
     capped.pop("filled_remote_transferable", None)
-    capped["local_input_size"] = None
-    capped["local_input_present"] = 0
+    source_inputs = dict(capped["source_inputs"])
+    source_inputs["lb"] = None
+    source_inputs["lp"] = 0
+    capped["source_inputs"] = source_inputs
     safe, irrelevant = capture._projection({**actual, "details": capped})
     assert not irrelevant and safe is not None
     facts = safe["input_arbitration"]
     assert facts["filled_state"] == "unknown" and facts["filled_remote_transferable"] == "unknown"
     assert facts["local_input_size"] is None and facts["local_input_present"] == "unknown"
+
+
+@pytest.mark.skipif(BreadcrumbTraceCollector is None or ModelBuilder is None, reason="production model builder is unavailable")
+def test_finalized_split_arbitration_preserves_selection_guards_and_wide_mtimes(tmp_path: Path) -> None:
+    spool = tmp_path / "split-arbitration-spool"
+    spool.mkdir()
+    artifact = tmp_path / "split-arbitration-capture.jsonl"
+    collector = BreadcrumbTraceCollector(
+        lambda: True, max_entries=128,
+        policy={"default": "off", "rules": {"scan.authority": "info"}},
+        durable_enabled=True, durable_path=str(spool),
+    )
+    reader = _reader(spool, artifact)
+    baseline_builder = ModelBuilder()
+    baseline_remote = SystemFile("baseline-root", 32, True)
+    baseline_remote.add_child(SystemFile("baseline-leaf", 32, False))
+    baseline_local = SystemFile("baseline-root", 16, True)
+    baseline_local.add_child(SystemFile("baseline-leaf", 16, False))
+    baseline_builder.set_remote_files([baseline_remote])
+    baseline_builder.set_local_files([baseline_local])
+    baseline_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+    builder = ModelBuilder()
+    epoch_ns = 1_790_873_610_000_000_000
+    remote_root = SystemFile("mixed-root", 2_981_866_544, True, mtime_ns=epoch_ns + 24_000_000_000)
+    remote_root.add_child(SystemFile("payload.iso", 2_981_865_472, False, mtime_ns=epoch_ns + 24_000_000_000))
+    remote_checksum = SystemFile("checksums.txt", 1_072, False, mtime_ns=epoch_ns + 500_000_000)
+    remote_root.add_child(remote_checksum)
+    local_root = SystemFile("mixed-root", 35_759_708_487, True, mtime_ns=epoch_ns)
+    local_root.add_child(SystemFile("payload.iso", 2_981_865_472, False, is_staging=True,
+                                    mtime_ns=epoch_ns + 24_000_000_000))
+    local_checksum = SystemFile("checksums.txt", 1_072, False, mtime_ns=epoch_ns)
+    local_root.add_child(local_checksum)
+    active_root = SystemFile("mixed-root", 2_981_865_472, True)
+    active_root.add_child(SystemFile("payload.iso", 2_981_865_472, False,
+                                     mtime_ns=epoch_ns + 24_000_000_000))
+    builder.set_remote_files([remote_root])
+    builder.set_local_files([local_root])
+    builder.set_active_files([active_root])
+    builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+    try:
+        assert baseline_builder.build_model().get_file("baseline-root") is not None
+        assert collector.flush_durable(2.0)
+        initial = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert any(row.get("message") == "input_arbitration_witness" for row in initial)
+        reader.start()
+        model = builder.build_model()
+        assert model.get_file("mixed-root") is not None
+        assert collector.flush_durable(2.0)
+        assert reader.poll() == 4
+    finally:
+        reader.close()
+        collector.close(timeout=2.0)
+
+    durable = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
+    finalized = [row for row in durable if row.get("message") == "input_arbitration_witness"]
+    assert len(finalized) == 7
+    assert all(row.get("category") == "scan.authority"
+               and row.get("stage") == "model_builder_input_arbitration"
+               and row.get("event_type") == "diagnostic"
+               and row.get("trace_scope") == "flow" and row.get("corr_id") == row.get("flow_id")
+               and re.fullmatch(r"input-arbitration:[0-9a-f]{16}", row["corr_id"]) for row in finalized)
+    projections = [item["capture"]["projection"] for item in _artifacts(artifact)
+                   if item["capture"].get("state") == "record"]
+    assert len(projections) == 4
+    assert all(item["category"] == "scan.authority" and item["event_type"] == "diagnostic"
+               and item["stage"] == "model_builder_input_arbitration" for item in projections)
+    phases = [item["input_arbitration"]["phase"] for item in projections]
+    assert phases.count("root_fill") == 1 and phases.count("remote_leaf_fill") == 2
+    assert phases.count("summary") == 1
+    build_tokens = {item["input_arbitration"]["build_token"] for item in projections}
+    assert len(build_tokens) == 1 and "unknown" not in build_tokens
+    root_ids = {item["input_arbitration"]["root_id"] for item in projections
+                if item["input_arbitration"]["phase"] != "summary"}
+    assert len(root_ids) == 1 and all(re.fullmatch(r"[0-9a-f]{16}", token) for token in root_ids)
+    leaf_facts = [item["input_arbitration"] for item in projections
+                  if item["input_arbitration"]["phase"] == "remote_leaf_fill"]
+    root_facts = next(item["input_arbitration"] for item in projections
+                      if item["input_arbitration"]["phase"] == "root_fill")
+    split_leaf = next(leaf for leaf in leaf_facts
+                      if leaf["split_candidate_provenance"] == "split_candidate_local")
+    for leaf in leaf_facts:
+        if leaf is split_leaf:
+            continue
+        for key in ("input_scope", "selection", "local_proof_generation",
+                    "local_proof_generation_known", "active_generation_known"):
+            assert leaf[key] == root_facts[key]
+    if split_leaf is not None:
+        leaf = split_leaf
+        assert leaf["input_scope"] == leaf["selection"] == "unknown"
+        assert leaf["local_proof_generation"] == "unknown"
+        assert leaf["local_proof_generation_known"] == leaf["active_generation_known"] == "unknown"
+    root = next(item["input_arbitration"] for item in projections
+                if item.get("input_arbitration", {}).get("phase") == "root_fill")
+    assert root["selection"] == "active" and root["selection_reason"] == "active_selected"
+    assert root["local_staging_descendant"] is True
+    assert root["local_staging_collision_descendant"] is False
+    assert root["split_has_verified_leaf"] is False
+    assert root["local_candidate_eligible"] is True and root["local_size_ge_active"] is True
+    assert root["remote_indicates_newer"] is True
+    checksum = next(item["input_arbitration"] for item in projections
+                    if item.get("input_arbitration", {}).get("split_candidate_remote_size") == 1_072)
+    assert checksum["split_candidate_local_present"] is True
+    assert checksum["split_candidate_local_size"] == checksum["split_candidate_remote_size"] == 1_072
+    assert checksum["split_candidate_local_mtime_ns"] == str(epoch_ns)
+    assert checksum["split_candidate_remote_mtime_ns"] == str(epoch_ns + 500_000_000)
+    assert int(checksum["split_candidate_local_mtime_ns"]) > 2**53
+    assert checksum["split_candidate_local_mtime_known"] is True
+    assert checksum["split_candidate_remote_mtime_known"] is True
+    assert checksum["split_candidate_strict_verified"] is False
+    assert checksum["split_candidate_portable_queue_exclusion_match"] is True
+    assert checksum["split_candidate_provenance"] == "split_candidate_local"
+    assert len({item["version"] for item in finalized}) == 7
+    versions = [item["numbers"]["version"] for item in projections]
+    assert versions == sorted(versions) and len(set(versions)) == 4
 
 
 @pytest.mark.skipif(BreadcrumbTraceCollector is None, reason="production breadcrumb collector is unavailable")

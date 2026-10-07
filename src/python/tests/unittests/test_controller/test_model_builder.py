@@ -83,17 +83,20 @@ class TestModelBuilder(unittest.TestCase):
             rows = [row for row in rows if row.get("message") == "input_arbitration_witness"]
             print("INPUT_WITNESS_FINALIZED=" + json.dumps(rows, sort_keys=True))
             roots = [row for row in rows if row["details"]["phase"] == "root_fill"]
+            self.assertEqual(6, len(rows))
             self.assertEqual(2, len(roots))
             self.assertEqual(["local", "active"], [row["details"]["selection"] for row in roots])
             self.assertNotEqual(roots[0]["corr_id"], roots[1]["corr_id"])
             self.assertEqual(roots[0]["details"]["root_id"], roots[1]["details"]["root_id"])
             for root_row, model in zip(roots, (first, second)):
                 related = [row for row in rows if row["corr_id"] == root_row["corr_id"]]
-                self.assertEqual({"root_fill", "remote_leaf_fill", "summary"},
-                                 {row["details"]["phase"] for row in related})
+                self.assertEqual(["remote_leaf_fill", "root_fill", "summary"],
+                                 [row["details"]["phase"] for row in related])
                 filled = model.get_file("input-root")
+                self.assertEqual(root_row["details"]["root_id"], root_row["details"]["subject_id"])
                 self.assertEqual(filled.local_size, root_row["details"]["filled_local_size"])
                 leaf = next(row for row in related if row["details"]["phase"] == "remote_leaf_fill")
+                self.assertEqual(leaf["details"]["root_id"], root_row["details"]["root_id"])
                 self.assertEqual(filled.get_children()[0].local_size, leaf["details"]["filled_local_size"])
                 self.assertEqual("root", leaf["details"]["input_scope"])
                 self.assertFalse(root_row["details"]["active_generation_known"])
@@ -124,7 +127,31 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(2, summary["root_rows_omitted"])
         self.assertEqual(8, summary["remote_leaf_rows_sampled"])
         self.assertEqual(64, summary["remote_leaf_rows_omitted"])
+        for key in ("filled_transferred_size", "filled_state", "filled_remote_transferable"):
+            self.assertNotIn(key, summary)
         self.assertEqual(13, len(rows))
+        root_rows = [row for row in rows if row["details"]["phase"] == "root_fill"]
+        leaf_rows = [row for row in rows if row["details"]["phase"] == "remote_leaf_fill"]
+        self.assertEqual(4, len(root_rows))
+        self.assertEqual(4, len({row["details"]["subject_id"] for row in root_rows}))
+        self.assertEqual(8, len(leaf_rows))
+        self.assertEqual(8, len({row["details"]["subject_id"] for row in leaf_rows}))
+        self.assertEqual(1, len({row["corr_id"] for row in rows}))
+        self.assertEqual({"scan.authority"}, {row.get("category") for row in rows})
+        self.assertTrue(all(row.get("corr_id") == row.get("flow_id") for row in rows))
+        self.assertEqual("summary", rows[-1]["details"]["phase"])
+        for row in root_rows:
+            for key in ("filled_transferred_size", "filled_state", "filled_remote_transferable"):
+                self.assertNotIn(key, row["details"])
+        for row in leaf_rows:
+            self.assertNotIn("split_candidate", row["details"])
+            for key in ("filled_transferred_size", "filled_state", "filled_remote_transferable"):
+                self.assertIn(key, row["details"])
+            for key in (
+                    "input_scope", "selection", "local_proof_generation",
+                    "local_proof_generation_known", "active_generation_known"):
+                self.assertIn(key, row["details"])
+        self.assertEqual(0, collector.snapshot()["drops"]["policy"])
 
     def test_input_arbitration_witness_split_and_active_sampling_priority(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=128,
@@ -160,6 +187,146 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual("active", root_rows[0]["details"]["selection"])
         summary = next(row["details"] for row in rows if row["details"]["phase"] == "summary")
         self.assertEqual(6, summary["root_rows_omitted"])
+
+    def test_input_arbitration_witness_records_selection_guard_results_and_short_circuits(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=32,
+            policy={"default": "off", "rules": {"scan.authority": "info"}})
+        self.addCleanup(collector.close)
+        builder = ModelBuilder()
+        builder.set_base_logger(self.model_builder.logger)
+        remote = SystemFile("private-root", 35_750_000_000, True, mtime_ns=20_000_000_000)
+        remote.add_child(SystemFile("candidate.bin", 35_750_000_000, False,
+                                    mtime_ns=20_000_000_000))
+        local = SystemFile("private-root", 35_750_000_000, True, mtime_ns=10_000_000_000)
+        local.add_child(SystemFile("candidate.bin", 35_750_000_000, False,
+                                   mtime_ns=10_000_000_000))
+        active = SystemFile("private-root", 2_980_000_000, True, is_staging=True)
+        active.add_child(SystemFile("candidate.bin", 2_980_000_000, False, is_staging=True))
+        builder.set_remote_files([remote])
+        builder.set_local_files([local])
+        builder.set_active_files([active])
+        builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+
+        built = builder.build_model()
+        self.assertEqual(2_980_000_000, built.get_file("private-root").local_size)
+        rows = [row for row in self.__trace_entries(collector, True)
+                if row["message"] == "input_arbitration_witness" and
+                row["details"]["phase"] == "root_fill"]
+        self.assertEqual(1, len(rows))
+        details = rows[0]["details"]
+        self.assertEqual("active_selected", details["selection_reason"])
+        for key in (
+                "input_scope", "selection", "local_proof_generation",
+                "local_proof_generation_known", "active_generation_known"):
+            self.assertIn(key, details)
+        for key in ("filled_transferred_size", "filled_state", "filled_remote_transferable"):
+            self.assertNotIn(key, details)
+        for key in ("filled_local_present", "filled_remote_present", "filled_local_size", "filled_remote_size"):
+            self.assertIn(key, details)
+        guards = details["selection_guards"]
+        self.assertFalse(guards["sd"])
+        self.assertFalse(guards["cd"])
+        self.assertIsNone(guards["sv"])
+        self.assertTrue(guards["lce"])
+        self.assertTrue(guards["sga"])
+        self.assertTrue(guards["rn"])
+        self.assertEqual({
+            "lp": True, "lb": 35_750_000_000, "ls": False,
+            "ap": True, "ab": 2_980_000_000, "as": True,
+            "rp": True, "rb": 35_750_000_000, "rd": True,
+        }, details["source_inputs"])
+        self.assertEqual("scan.authority", rows[0].get("category"))
+        self.assertEqual(rows[0]["corr_id"], rows[0].get("flow_id"))
+        self.assertEqual(details["root_id"], details["subject_id"])
+        self.assertEqual(0, collector.snapshot()["drops"]["policy"])
+        serialized = json.dumps(rows)
+        self.assertNotIn("private-root", serialized)
+        self.assertNotIn("candidate.bin", serialized)
+
+    def test_input_arbitration_witness_captures_split_candidate_identity_without_rewalking(self):
+        cases = (
+            ("fractional_same_second", 9_007_200_000_000_000,
+             9_007_200_500_000_000, False, True),
+            ("missing_mtime", None, None, False, False),
+        )
+        for case, local_mtime, remote_mtime, strict_expected, portable_expected in cases:
+            with self.subTest(case=case):
+                collector = BreadcrumbTraceCollector(lambda: True, max_entries=32,
+                    policy={"default": "off", "rules": {"scan.authority": "info"}})
+                self.addCleanup(collector.close)
+                builder = ModelBuilder()
+                builder.set_base_logger(self.model_builder.logger)
+                remote = SystemFile("private-root", 200, True)
+                remote_candidate = SystemFile("candidate.bin", 100, False, mtime_ns=remote_mtime)
+                remote.add_child(remote_candidate)
+                remote.add_child(SystemFile("partial.bin", 100, False, is_staging=True))
+                local = SystemFile("private-root", 110, True)
+                local.add_child(SystemFile("candidate.bin", 100, False, mtime_ns=local_mtime))
+                local.add_child(SystemFile("partial.bin", 10, False, is_staging=True))
+                active = SystemFile("private-root", 20, True, is_staging=True)
+                active.add_child(SystemFile("partial.bin", 20, False, is_staging=True))
+                builder.set_remote_files([remote])
+                builder.set_local_files([local])
+                builder.set_active_files([active])
+                builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+                builder.build_model()
+
+                witness_rows = [row for row in self.__trace_entries(collector, True)
+                                if row["message"] == "input_arbitration_witness"]
+                rows = [row for row in witness_rows if row["details"]["phase"] == "remote_leaf_fill"]
+                self.assertTrue(rows)
+                candidate_events = [row for row in rows
+                                    if row["details"].get("split_candidate", {}).get("local_present") is True]
+                candidate_rows = [row["details"]["split_candidate"] for row in rows
+                                  if row["details"].get("split_candidate", {}).get("local_present") is True]
+                self.assertEqual(1, len(candidate_events))
+                self.assertEqual(1, len(candidate_rows))
+                self.assertEqual("scan.authority", candidate_events[0].get("category"))
+                self.assertEqual("model_builder_input_arbitration", candidate_events[0].get("stage"))
+                self.assertEqual("diagnostic", candidate_events[0].get("event_type"))
+                self.assertEqual(candidate_events[0].get("corr_id"), candidate_events[0].get("flow_id"))
+                self.assertEqual(0, collector.snapshot()["drops"]["policy"])
+                root_event = next(row for row in witness_rows
+                                  if row["details"]["phase"] == "root_fill" and
+                                  row["corr_id"] == candidate_events[0]["corr_id"])
+                self.assertEqual("scan.authority", root_event.get("category"))
+                self.assertEqual("model_builder_input_arbitration", root_event.get("stage"))
+                self.assertEqual("diagnostic", root_event.get("event_type"))
+                self.assertEqual(root_event.get("corr_id"), root_event.get("flow_id"))
+                self.assertEqual(root_event["details"]["root_id"], candidate_events[0]["details"]["root_id"])
+                for key in (
+                        "input_scope", "selection", "local_proof_generation",
+                        "local_proof_generation_known", "active_generation_known"):
+                    self.assertIn(key, root_event["details"])
+                    self.assertNotIn(key, candidate_events[0]["details"])
+                self.assertIn("root_id", candidate_events[0]["details"])
+                for key in ("filled_transferred_size", "filled_state", "filled_remote_transferable"):
+                    self.assertNotIn(key, candidate_events[0]["details"])
+                for key in ("filled_local_present", "filled_remote_present", "filled_local_size", "filled_remote_size"):
+                    self.assertIn(key, candidate_events[0]["details"])
+                details = candidate_rows[0]
+                self.assertEqual({
+                    "local_present", "local_size", "local_mtime_ns", "local_mtime_known",
+                    "remote_size", "remote_mtime_ns", "remote_mtime_known", "strict_verified",
+                    "portable_queue_exclusion_match", "provenance",
+                }, set(details))
+                self.assertEqual(100, details["local_size"])
+                self.assertEqual(100, details["remote_size"])
+                self.assertEqual(strict_expected, details["strict_verified"])
+                self.assertEqual(portable_expected, details["portable_queue_exclusion_match"])
+                self.assertEqual("split_candidate_local", details["provenance"])
+                self.assertEqual(local_mtime is not None, details["local_mtime_known"])
+                self.assertEqual(remote_mtime is not None, details["remote_mtime_known"])
+                if local_mtime is not None:
+                    self.assertEqual(str(local_mtime), details["local_mtime_ns"])
+                    self.assertEqual(str(remote_mtime), details["remote_mtime_ns"])
+                    self.assertGreater(local_mtime, 2 ** 53)
+                else:
+                    self.assertIsNone(details["local_mtime_ns"])
+                    self.assertIsNone(details["remote_mtime_ns"])
+                serialized = json.dumps(rows)
+                self.assertNotIn("private-root", serialized)
+                self.assertNotIn("candidate.bin", serialized)
 
     def test_input_arbitration_witness_disabled_and_failing_diagnostics_preserve_build(self):
         def build(emitter):

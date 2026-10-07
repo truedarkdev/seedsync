@@ -55,6 +55,7 @@ _STAGES = frozenset(
         "admission", "dispatch", "publication", "terminal", "queue_lifecycle", "queue_authority_handoff",
         "queue_readiness", "queue_exclusion", "model", "model_progress", "model_delta", "model_update",
         "model_publication", "model_summary", "model_finalization", "scan", "scan_adoption", "scan_authority",
+        "model_builder_input_arbitration",
         "scan_accumulator", "extract", "controller", "controller_boundary", "persist_transaction", "lifecycle",
         "completion_gate", "final_move_publication", "finalization_child", "transfer_stop", "command",
         "lftp_executor", "lftp_sidecar_validation", "lftp_path_pair_annotation", "lftp_status_poll",
@@ -153,6 +154,13 @@ _MODEL_INPUT_ARBITRATION_SUBJECTS = frozenset({"summary", "root", "remote_leaf"}
 _MODEL_INPUT_ARBITRATION_SCOPES = frozenset({"root"})
 _MODEL_INPUT_ARBITRATION_SELECTIONS = frozenset({"absent", "local", "active", "split", "unknown"})
 _MODEL_INPUT_ARBITRATION_STATES = frozenset({"queued", "downloading", "default", "downloaded", "move_failed"})
+_MODEL_INPUT_ARBITRATION_SELECTION_REASONS = frozenset({
+    "nested_active_omitted", "split_merge", "local_staging_retained",
+    "local_retained_over_active_staging", "active_selected", "local_selected",
+    "absent", "unknown",
+})
+_MODEL_INPUT_ARBITRATION_SPLIT_PROVENANCE = frozenset({"split_candidate_local"})
+_DECIMAL_IDENTITY = re.compile(r"^(?:0|[1-9][0-9]{0,18})$")
 _OPAQUE_TOKEN = re.compile(r"^[0-9a-f]{16}$")
 _INPUT_ARBITRATION_BUILD_TOKEN = re.compile(r"^input-arbitration:([0-9a-f]{16})$")
 _QUEUE_LIFECYCLE_BOOLS = frozenset({
@@ -248,6 +256,7 @@ def _queue_lifecycle_facts(details: Mapping[str, object]) -> dict[str, object] |
     def fixed(key: str, allowed: frozenset[str]) -> str:
         value = details.get(key)
         return value if isinstance(value, str) and value in allowed else "unknown"
+
     facts: dict[str, object] = {
         "schema": "queue.lifecycle.v1",
         "event": fixed("event", _QUEUE_LIFECYCLE_EVENTS),
@@ -518,30 +527,61 @@ def _input_arbitration_facts(row: Mapping[str, object], metadata: Mapping[str, o
     """Project the producer's capped, finalized input-arbitration envelope."""
     if details.get("schema") != _MODEL_INPUT_ARBITRATION_SCHEMA:
         return None
+    source_inputs = details.get("source_inputs")
+    source_inputs = source_inputs if isinstance(source_inputs, Mapping) else details
+    selection_guards = details.get("selection_guards")
+    selection_guards = selection_guards if isinstance(selection_guards, Mapping) else details
+    split_candidate = details.get("split_candidate")
+    split_candidate = split_candidate if isinstance(split_candidate, Mapping) else details
+
+    def compact_key(source: Mapping[str, object], *keys: str) -> str:
+        return next((key for key in keys if key in source), keys[-1])
 
     def fixed(key: str, allowed: frozenset[str]) -> str:
         value = details.get(key)
+        return value if isinstance(value, str) and value in allowed else "unknown"
+
+    def optional_fixed(key: str, allowed: frozenset[str]) -> str | None:
+        if key not in details:
+            return "unknown"
+        value = details[key]
+        if value is None:
+            return None
         return value if isinstance(value, str) and value in allowed else "unknown"
 
     def opaque(key: str) -> str:
         value = details.get(key)
         return value if isinstance(value, str) and _OPAQUE_TOKEN.fullmatch(value) else "unknown"
 
-    def integer(key: str) -> int | None | str:
-        if key not in details:
+    def integer(key: str, source: Mapping[str, object] | None = None) -> int | None | str:
+        source = details if source is None else source
+        if key not in source:
             return "unknown"
-        value = details[key]
+        value = source[key]
         if value is None:
             return None
         return value if type(value) is int and 0 <= value <= 2**63 - 1 else "unknown"
 
-    def boolean(key: str) -> bool | None | str:
-        if key not in details:
+    def boolean(key: str, source: Mapping[str, object] | None = None) -> bool | None | str:
+        source = details if source is None else source
+        if key not in source:
             return "unknown"
-        value = details[key]
+        value = source[key]
         if value is None:
             return None
         return value if type(value) is bool else "unknown"
+
+    def decimal_identity(key: str, source: Mapping[str, object], raw_key: str | None = None) -> str | None:
+        raw_key = key if raw_key is None else raw_key
+        """Keep wide nanosecond identities exact through JSON projection."""
+        if raw_key not in source:
+            return "unknown"
+        value = source[raw_key]
+        if value is None:
+            return None
+        if not isinstance(value, str) or not _DECIMAL_IDENTITY.fullmatch(value):
+            return "unknown"
+        return value if int(value) <= 2**63 - 1 else "unknown"
 
     corr_id = row.get("corr_id", metadata.get("corr_id"))
     flow_id = row.get("flow_id", metadata.get("flow_id"))
@@ -558,18 +598,63 @@ def _input_arbitration_facts(row: Mapping[str, object], metadata: Mapping[str, o
         "subject_id": opaque("subject_id"),
         "input_scope": fixed("input_scope", _MODEL_INPUT_ARBITRATION_SCOPES),
         "selection": fixed("selection", _MODEL_INPUT_ARBITRATION_SELECTIONS),
+        "selection_reason": optional_fixed("selection_reason", _MODEL_INPUT_ARBITRATION_SELECTION_REASONS),
     }
     for key in ("root_rows_sampled", "root_rows_omitted", "remote_leaf_rows_sampled", "remote_leaf_rows_omitted"):
         value = integer(key)
         result[key] = value
-    for key in ("local_proof_generation", "local_input_size", "active_input_size", "remote_input_size",
-                "filled_local_size", "filled_remote_size", "filled_transferred_size"):
+    result["local_proof_generation"] = integer("local_proof_generation")
+    for key, compact in (("local_input_size", "lb"), ("active_input_size", "ab"),
+                         ("remote_input_size", "rb")):
+        result[key] = integer(compact_key(source_inputs, compact, key), source_inputs)
+    for key in ("filled_local_size", "filled_remote_size", "filled_transferred_size"):
         result[key] = integer(key)
-    for key in ("local_proof_generation_known", "active_generation_known", "local_input_present",
-                "local_input_is_staging", "active_input_present", "active_input_is_staging",
-                "remote_input_present", "remote_input_is_dir", "filled_local_present", "filled_remote_present",
-                "filled_remote_transferable"):
+    for key, compact in (("local_input_present", "lp"), ("local_input_is_staging", "ls"),
+                         ("active_input_present", "ap"), ("active_input_is_staging", "as"),
+                         ("remote_input_present", "rp"), ("remote_input_is_dir", "rd")):
+        result[key] = boolean(compact_key(source_inputs, compact, key), source_inputs)
+    for key in ("local_proof_generation_known", "active_generation_known", "filled_local_present",
+                "filled_remote_present", "filled_remote_transferable"):
         result[key] = boolean(key)
+    for key, compact, previous_nested in (
+        ("local_staging_descendant", "sd", "staging_descendant"),
+        ("local_staging_collision_descendant", "cd", "collision_descendant"),
+        ("split_has_verified_leaf", "sv", "verified_split_leaf"),
+        ("local_candidate_eligible", "lce", "local_candidate_eligible"),
+        ("local_size_ge_active", "sga", "size_ge_active"),
+        ("remote_indicates_newer", "rn", "remote_newer"),
+    ):
+        result[key] = boolean(compact_key(selection_guards, compact, previous_nested, key), selection_guards)
+
+    split_boolean_fields = {
+        "split_candidate_local_present": "local_present",
+        "split_candidate_local_mtime_known": "local_mtime_known",
+        "split_candidate_remote_mtime_known": "remote_mtime_known",
+        "split_candidate_strict_verified": "strict_verified",
+        "split_candidate_portable_queue_exclusion_match": "portable_queue_exclusion_match",
+    }
+    for output_key, nested_key in split_boolean_fields.items():
+        raw_key = nested_key if split_candidate is not details else output_key
+        result[output_key] = boolean(raw_key, split_candidate)
+    for output_key, nested_key in (("split_candidate_local_size", "local_size"),
+                                   ("split_candidate_remote_size", "remote_size")):
+        raw_key = nested_key if split_candidate is not details else output_key
+        result[output_key] = integer(raw_key, split_candidate)
+    for output_key, nested_key in (("split_candidate_local_mtime_ns", "local_mtime_ns"),
+                                   ("split_candidate_remote_mtime_ns", "remote_mtime_ns")):
+        raw_key = nested_key if split_candidate is not details else output_key
+        result[output_key] = decimal_identity(output_key, split_candidate, raw_key)
+    provenance_key = "provenance" if split_candidate is not details else "split_candidate_provenance"
+    if provenance_key not in split_candidate:
+        result["split_candidate_provenance"] = "unknown"
+    elif split_candidate[provenance_key] is None:
+        result["split_candidate_provenance"] = None
+    else:
+        provenance = split_candidate[provenance_key]
+        result["split_candidate_provenance"] = (
+            provenance if isinstance(provenance, str) and provenance in _MODEL_INPUT_ARBITRATION_SPLIT_PROVENANCE
+            else "unknown"
+        )
     state = details.get("filled_state")
     result["filled_state"] = state if isinstance(state, str) and state in _MODEL_INPUT_ARBITRATION_STATES else "unknown"
     return result

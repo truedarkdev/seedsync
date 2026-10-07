@@ -2,6 +2,7 @@ from pathlib import Path
 import importlib.util
 from io import BytesIO
 import json
+import os
 import sys
 import threading
 from urllib.error import HTTPError
@@ -15,6 +16,29 @@ observer = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = observer
 assert SPEC.loader is not None
 SPEC.loader.exec_module(observer)
+
+CAPTURE_SPEC = importlib.util.spec_from_file_location(
+    "breadcrumb_spool_capture",
+    Path(__file__).parents[1] / "breadcrumb_spool_capture.py",
+)
+capture = importlib.util.module_from_spec(CAPTURE_SPEC)
+sys.modules[CAPTURE_SPEC.name] = capture
+assert CAPTURE_SPEC.loader is not None
+CAPTURE_SPEC.loader.exec_module(capture)
+
+for _parent in Path(__file__).resolve().parents:
+    _common_root = _parent / "src/python"
+    if _common_root.is_dir():
+        sys.path.insert(0, str(_common_root))
+        break
+try:
+    from common.breadcrumb_trace import BreadcrumbTraceCollector
+    from system import SystemFile
+    from controller import ModelBuilder
+except ImportError:
+    BreadcrumbTraceCollector = None
+    SystemFile = None
+    ModelBuilder = None
 
 RUNNER_SPEC = importlib.util.spec_from_file_location(
     "incoming_live_queue_runner", Path(__file__).parents[1] / "incoming_live_queue_runner.py")
@@ -137,6 +161,16 @@ def test_input_arbitration_projection_is_finite_and_preserves_unknowns(tmp_path)
             "remote_input_size": 8, "filled_local_size": 0, "filled_remote_size": 8,
             "filled_transferred_size": None, "local_proof_generation_known": False,
             "active_generation_known": True, "local_input_present": True, "local_input_is_staging": False,
+            "selection_reason": "active_selected", "local_staging_descendant": True,
+            "local_staging_collision_descendant": None, "split_has_verified_leaf": False,
+            "local_candidate_eligible": True, "local_size_ge_active": True, "remote_indicates_newer": True,
+            "split_candidate_local_present": True, "split_candidate_local_size": 1072,
+            "split_candidate_local_mtime_ns": "1790873610000000000",
+            "split_candidate_local_mtime_known": True, "split_candidate_remote_size": 1072,
+            "split_candidate_remote_mtime_ns": "1790873610500000000",
+            "split_candidate_remote_mtime_known": True, "split_candidate_strict_verified": False,
+            "split_candidate_portable_queue_exclusion_match": True,
+            "split_candidate_provenance": "split_candidate_local",
             "active_input_present": True, "active_input_is_staging": False, "remote_input_present": True,
             "remote_input_is_dir": True, "filled_local_present": True, "filled_remote_present": True,
             "filled_remote_transferable": "unknown", "filled_state": "unknown",
@@ -153,21 +187,195 @@ def test_input_arbitration_projection_is_finite_and_preserves_unknowns(tmp_path)
     assert safe["build_token"] == "0123456789abcdef"
     assert safe["root_id"] == safe["subject_id"] == "fedcba9876543210"
     assert safe["local_input_size"] == 0 and safe["local_proof_generation"] is None
+    assert safe["selection_reason"] == "active_selected"
+    assert safe["local_staging_descendant"] is True and safe["local_staging_collision_descendant"] is None
+    assert safe["split_candidate_local_mtime_ns"] == "1790873610000000000"
+    assert int(safe["split_candidate_local_mtime_ns"]) > 2**53
+    assert safe["split_candidate_provenance"] == "split_candidate_local"
     assert safe["filled_remote_transferable"] == safe["filled_state"] == "unknown"
     assert "private_path" not in safe
+
+    # New finalized envelopes nest source, selection, and split-leaf facts.
+    # The sink sanitizer normalizes only the allowlisted keys and keeps wide
+    # raw mtime identities as decimal strings.
+    canonical = dict(projection)
+    canonical_facts = dict(projection["input_arbitration"])
+    for key in (
+        "local_input_present", "local_input_size", "local_input_is_staging",
+        "active_input_present", "active_input_size", "active_input_is_staging",
+        "remote_input_present", "remote_input_size", "remote_input_is_dir",
+    ):
+        canonical_facts.pop(key, None)
+    for key in (
+        "local_staging_descendant", "local_staging_collision_descendant", "split_has_verified_leaf",
+        "local_candidate_eligible", "local_size_ge_active", "remote_indicates_newer",
+    ):
+        canonical_facts.pop(key, None)
+    for key in (
+        "split_candidate_local_present", "split_candidate_local_size", "split_candidate_local_mtime_ns",
+        "split_candidate_local_mtime_known", "split_candidate_remote_size", "split_candidate_remote_mtime_ns",
+        "split_candidate_remote_mtime_known", "split_candidate_strict_verified",
+        "split_candidate_portable_queue_exclusion_match", "split_candidate_provenance",
+    ):
+        canonical_facts.pop(key, None)
+    canonical_facts.update({
+        "source_inputs": {
+            "lp": True, "lb": 0, "ls": False,
+            "ap": True, "ab": 5, "as": False,
+            "rp": True, "rb": 8, "rd": True,
+            "private_path": "/private/drop",
+        },
+        "selection_guards": {
+            "sd": True, "cd": None,
+            "sv": False, "lce": True,
+            "sga": True, "rn": True,
+            "private_flag": True,
+        },
+        "split_candidate": {
+            "local_present": True, "local_size": 1072, "local_mtime_ns": "1790873610000000000",
+            "local_mtime_known": True, "remote_size": 1072, "remote_mtime_ns": "1790873610500000000",
+            "remote_mtime_known": True, "strict_verified": False,
+            "portable_queue_exclusion_match": True, "provenance": "split_candidate_local",
+            "private_path": "/private/drop",
+        },
+    })
+    canonical["input_arbitration"] = canonical_facts
+    canonical_safe = observer._sanitize_capture_projection(canonical)["input_arbitration"]
+    assert canonical_safe["local_input_size"] == 0
+    assert canonical_safe["local_candidate_eligible"] is True
+    assert canonical_safe["local_staging_collision_descendant"] is None
+    assert canonical_safe["split_candidate_local_mtime_ns"] == "1790873610000000000"
+    assert int(canonical_safe["split_candidate_local_mtime_ns"]) > 2**53
+    assert canonical_safe["split_candidate_provenance"] == "split_candidate_local"
+    assert "private_path" not in json.dumps(canonical_safe)
+
+    # Preserve the immediately preceding long nested envelope as well.
+    previous_nested = dict(canonical)
+    previous_facts = dict(canonical_facts)
+    previous_facts["source_inputs"] = {
+        "local_input_present": True, "local_input_size": 0, "local_input_is_staging": False,
+        "active_input_present": True, "active_input_size": 5, "active_input_is_staging": False,
+        "remote_input_present": True, "remote_input_size": 8, "remote_input_is_dir": True,
+    }
+    previous_facts["selection_guards"] = {
+        "staging_descendant": True, "collision_descendant": None, "verified_split_leaf": False,
+        "local_candidate_eligible": True, "size_ge_active": True, "remote_newer": True,
+    }
+    previous_nested["input_arbitration"] = previous_facts
+    previous_safe = observer._sanitize_capture_projection(previous_nested)["input_arbitration"]
+    assert previous_safe["local_input_size"] == 0
+    assert previous_safe["local_staging_collision_descendant"] is None
+    assert previous_safe["remote_indicates_newer"] is True
+
+    finalized_like = {
+        "source": "model_builder", "category": "scan.authority", "level": "info",
+        "stage": "model_builder_input_arbitration", "event_type": "diagnostic",
+        "message": "input_arbitration_witness", "corr_id": "input-arbitration:0123456789abcdef",
+        "flow_id": "input-arbitration:0123456789abcdef", "trace_scope": "flow",
+        "version": 42, "created_ms": 100,
+        "details": canonical_facts,
+    }
+    projected, irrelevant = capture._projection(finalized_like)
+    assert not irrelevant and projected is not None
+    capture_sink = observer.JsonArtifactSink(tmp_path / "nested-consumer-sink.jsonl")
+    capture_sink.persist({
+        "schema": "incoming-recovery-observer-sample.v1", "event": "capture", "outcome": "success",
+        "capture": {"state": "record", "source": "controller", "projection": projected},
+    })
+    saved = json.loads((tmp_path / "nested-consumer-sink.jsonl").read_text(encoding="utf-8"))
+    saved_facts = saved["capture"]["projection"]["input_arbitration"]
+    assert saved_facts["build_token"] == "0123456789abcdef"
+    assert saved_facts["selection_reason"] == "active_selected"
+    assert saved_facts["split_candidate_local_mtime_ns"] == "1790873610000000000"
+    assert "private_path" not in json.dumps(saved_facts)
 
     malformed = dict(projection)
     malformed["input_arbitration"] = {
         **projection["input_arbitration"],
         "root_id": "/private/path", "build_token": "not-an-app-token",
         "local_input_size": True, "remote_input_present": 1,
+        "selection_reason": "/private/path", "local_staging_descendant": 1,
+        "split_candidate_local_mtime_ns": 1790873610000000000,
+        "split_candidate_remote_mtime_ns": "01790873610500000000",
+        "split_candidate_provenance": {"private": "value"},
         "filled_state": {"private": "value"},
     }
     bounded = observer._sanitize_capture_projection(malformed)["input_arbitration"]
     assert bounded["root_id"] == bounded["build_token"] == "unknown"
     assert bounded["local_input_size"] == bounded["remote_input_present"] == "unknown"
+    assert bounded["selection_reason"] == bounded["local_staging_descendant"] == "unknown"
+    assert bounded["split_candidate_local_mtime_ns"] == bounded["split_candidate_remote_mtime_ns"] == "unknown"
+    assert bounded["split_candidate_provenance"] == "unknown"
     assert bounded["filled_state"] == "unknown"
     assert observer._sanitize_capture_projection({**projection, "input_arbitration": {"schema": "wrong"}}).get("input_arbitration") is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires native durable file acknowledgement")
+@pytest.mark.skipif(BreadcrumbTraceCollector is None or ModelBuilder is None, reason="production builder unavailable")
+def test_finalized_nested_input_witness_reaches_capture_and_json_sink(tmp_path):
+    spool = tmp_path / "real-producer-spool"
+    spool.mkdir()
+    output = tmp_path / "real-producer-sink.jsonl"
+    collector = BreadcrumbTraceCollector(
+        lambda: True, max_entries=128,
+        policy={"default": "off", "rules": {"scan.authority": "info"}},
+        durable_enabled=True, durable_path=str(spool),
+    )
+    builder = ModelBuilder()
+    epoch_ns = 1_790_873_610_000_000_000
+    remote = SystemFile("bounded-root", 2_981_866_544, True, mtime_ns=epoch_ns + 24_000_000_000)
+    remote.add_child(SystemFile("payload.iso", 2_981_865_472, False, mtime_ns=epoch_ns + 24_000_000_000))
+    remote.add_child(SystemFile("checksums.txt", 1_072, False, mtime_ns=epoch_ns + 500_000_000))
+    local = SystemFile("bounded-root", 35_759_708_487, True, mtime_ns=epoch_ns)
+    local.add_child(SystemFile("payload.iso", 2_981_865_472, False, is_staging=True,
+                               mtime_ns=epoch_ns + 24_000_000_000))
+    local.add_child(SystemFile("checksums.txt", 1_072, False, mtime_ns=epoch_ns))
+    active = SystemFile("bounded-root", 2_981_865_472, True)
+    active.add_child(SystemFile("payload.iso", 2_981_865_472, False, mtime_ns=epoch_ns + 24_000_000_000))
+    builder.set_remote_files([remote])
+    builder.set_local_files([local])
+    builder.set_active_files([active])
+    builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+    try:
+        assert builder.build_model().get_file("bounded-root") is not None
+        assert collector.flush_durable(2.0)
+    finally:
+        collector.close(timeout=2.0)
+
+    finalized = [
+        json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    source_rows = [row for row in finalized if row.get("message") == "input_arbitration_witness"]
+    assert len(source_rows) == 4
+    assert all(row.get("trace_scope") == "flow" and row.get("corr_id") == row.get("flow_id")
+               and row["corr_id"].startswith("input-arbitration:") for row in source_rows)
+    sink = observer.JsonArtifactSink(output)
+    versions = []
+    for row in source_rows:
+        projection, irrelevant = capture._projection(row)
+        assert not irrelevant and projection is not None
+        versions.append(projection["numbers"]["version"])
+        sink.persist({
+            "schema": "incoming-recovery-observer-sample.v1", "event": "capture", "outcome": "success",
+            "capture": {"state": "record", "source": "controller", "projection": projection},
+        })
+    assert versions == sorted(versions) and len(set(versions)) == 4
+
+    saved = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines() if line.strip()]
+    facts = [row["capture"]["projection"]["input_arbitration"] for row in saved]
+    root = next(item for item in facts if item["phase"] == "root_fill")
+    assert root["selection_reason"] == "active_selected"
+    assert root["local_candidate_eligible"] is True
+    assert root["local_staging_descendant"] is True
+    assert root["remote_indicates_newer"] is True
+    checksum = next(item for item in facts if item["split_candidate_remote_size"] == 1_072)
+    assert checksum["split_candidate_local_mtime_ns"] == str(epoch_ns)
+    assert checksum["split_candidate_remote_mtime_ns"] == str(epoch_ns + 500_000_000)
+    assert int(checksum["split_candidate_local_mtime_ns"]) > 2**53
+    assert checksum["split_candidate_strict_verified"] is False
+    assert checksum["split_candidate_portable_queue_exclusion_match"] is True
+    assert checksum["split_candidate_provenance"] == "split_candidate_local"
 
 
 def test_delete_local_projection_sanitizer_preserves_only_typed_outcome_facts(tmp_path):
