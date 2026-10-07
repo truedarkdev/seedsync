@@ -506,6 +506,43 @@ def test_delete_local_projection_sanitizer_preserves_only_typed_outcome_facts(tm
     assert not any(key.startswith("delete_local_") for key in malformed)
 
 
+def test_queue_readiness_projection_sanitizer_preserves_finite_boundaries():
+    value = {
+        "kind": "event", "source": "controller", "category": "queue.readiness",
+        "event_type": "diagnostic", "stage": "queue_readiness", "level": "info",
+        "queue_readiness": {
+            "schema": "queue_readiness.v2", "event": "queue_final_decision",
+            "phase": "final_decision", "origin": "manual", "outcome": "deferred",
+            "reason": "initial_scan_authority_pending", "decision_boundary": "scan_authority",
+            "decision": "defer", "dispatch_attempted": False, "local_reconciled": False,
+            "remote_reconciled": False, "unknown_local_overlay": True,
+            "path_pair_scope_configured": True, "publication_id": 4, "model_version": 9,
+            "unapproved_field": "private-value",
+        },
+    }
+    safe = observer._sanitize_capture_projection(value)
+    assert safe["queue_readiness"]["event"] == "queue_final_decision"
+    assert safe["queue_readiness"]["local_reconciled"] is False
+    assert safe["queue_readiness"]["publication_id"] == 4
+    assert "unapproved_field" not in json.dumps(safe)
+    assert "private-value" not in json.dumps(safe)
+
+    malformed = observer._sanitize_capture_projection({
+        "kind": "event", "source": "controller", "category": "queue.readiness",
+        "event_type": "diagnostic", "stage": "queue_readiness", "level": "info",
+        "queue_readiness": {
+            "schema": "private-schema", "event": "private-event", "phase": "private-phase",
+            "origin": "private-origin", "outcome": "private-outcome", "reason": "private-reason",
+            "dispatch_attempted": "false", "model_version": 2**31,
+        },
+    })
+    assert malformed["queue_readiness"]["schema"] == "queue_readiness.v1"
+    assert malformed["queue_readiness"]["event"] == "unknown"
+    assert malformed["queue_readiness"]["phase"] == "unknown"
+    assert malformed["queue_readiness"]["dispatch_attempted"] is None
+    assert malformed["queue_readiness"]["model_version"] is None
+
+
 def test_completion_move_projection_sanitizer_preserves_finite_facts():
     safe = observer._sanitize_capture_projection({
         "completion_gate": {

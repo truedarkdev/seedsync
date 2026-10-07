@@ -516,12 +516,50 @@ _CAPTURE_LIFECYCLE_BOOLS = {
     "pre_send_drain_job_or_progress", "pre_send_drain_prompt_or_echo",
 }
 _CAPTURE_READINESS_SCHEMAS = {"queue_readiness.v1", "queue_readiness.v2"}
-_CAPTURE_READINESS_EVENTS = {"queue_callback", "queue_http_wait"}
-_CAPTURE_READINESS_PHASES = {"entry", "wait_return", "unknown"}
-_CAPTURE_READINESS_OUTCOMES = {"accepted", "success", "failure", "failed", "timeout", "unknown"}
+_CAPTURE_READINESS_EVENTS = {
+    "queue_admission", "queue_callback", "queue_dispatch_boundary", "queue_final_decision",
+    "queue_http_wait", "queue_model_boundary", "queue_preflight_outcome", "queue_rescan_readiness",
+}
+_CAPTURE_READINESS_PHASES = {
+    "admission", "dispatch_boundary", "entry", "final_decision", "model_boundary", "preflight",
+    "rescan_deadline", "rescan_deadline_grace", "rescan_ready", "rescan_request", "rescan_unknown",
+    "wait_return", "unknown",
+}
+_CAPTURE_READINESS_OUTCOMES = {
+    "accepted", "clear", "deferred", "dispatched", "failed", "failure", "pending", "ready",
+    "rejected", "success", "timeout", "unknown",
+}
 _CAPTURE_READINESS_ORIGINS = {"auto_queue", "manual", "unknown"}
-_CAPTURE_READINESS_REASONS = {"none", "awaiting_scan_publication", "initial_scan_authority_deadline", "comparison_pending", "scoped_rescan_token_unknown", "scoped_rescan_request_failed", "scoped_rescan_requested", "unknown"}
+_CAPTURE_READINESS_REASONS = {
+    "none", "awaiting_scan_publication", "initial_scan_authority_deadline", "comparison_pending",
+    "scoped_rescan_token_unknown", "scoped_rescan_request_failed", "scoped_rescan_requested", "unknown",
+    "authoritative_local_root", "authoritative_scoped_scan", "collision_equal_scoped_rescan",
+    "collision_authority_stale", "collision_not_terminalizable", "collision_preflight_error",
+    "collision_deferred_terminal", "collision_authority_unknown", "no_unresolved_collision",
+    "duplicate_waiter_coalesced", "idempotent_claim_settlement_pending", "initial_scan_authority_pending",
+    "initial_local_scan_failed", "initial_local_scan_unknown", "initial_remote_scan_failed",
+    "initial_remote_scan_unknown", "initial_local_scan_session_changed", "initial_remote_scan_session_changed",
+    "initial_local_scan_generation_reset", "initial_remote_scan_generation_reset",
+    "collision_initial_local_scan_failed", "collision_initial_local_scan_unknown",
+    "collision_initial_remote_scan_failed", "collision_initial_remote_scan_unknown",
+    "collision_initial_local_scan_session_changed", "collision_initial_remote_scan_session_changed",
+    "collision_initial_local_scan_generation_reset", "collision_initial_remote_scan_generation_reset",
+}
 _CAPTURE_READINESS_BOOLEANS = {"ready"}
+_CAPTURE_READINESS_BOOLEAN_FIELDS = {
+    "accepted", "already_active", "already_dispatched", "collision_terminalizable", "collision_unresolved",
+    "dispatch_attempted", "exclusions_present", "explicit_stop", "is_dir", "local_reconciled",
+    "local_root_scan_proof_current", "operation_sequence_present", "path_pair_scope_configured",
+    "queue_depth_known", "remote_available", "remote_reconciled", "retry_after_ambiguity",
+    "stop_boundary", "transferable_remote_content", "unknown_local_overlay",
+}
+_CAPTURE_READINESS_EXTRA_ENUMS = {
+    "decision_boundary": {"scan_authority"},
+    "decision": {"defer"},
+    "collision_observation": {"absent", "not_applicable", "present", "unknown"},
+    "dispatch_mode": {"async", "sync"},
+    "local_scope_basis": {"pair", "selected_root"},
+}
 _CAPTURE_MODEL_PAGE_SNAPSHOT_OUTCOMES = {"success", "error", "unknown"}
 _CAPTURE_MODEL_PAGE_SNAPSHOT_ERRORS = {"cancelled", "model_error", "runtime_error", "unknown"}
 _CAPTURE_PROGRESS_LINEAGE_SCHEMA = "model_progress_lineage_summary.v1"
@@ -920,10 +958,24 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
         for key in _CAPTURE_READINESS_BOOLEANS:
             if type(readiness.get(key)) is bool:
                 safe_readiness[key] = readiness[key]
+        for key in _CAPTURE_READINESS_BOOLEAN_FIELDS:
+            if key in readiness:
+                item = readiness[key]
+                safe_readiness[key] = item if type(item) is bool else None
+        for key, allowed in _CAPTURE_READINESS_EXTRA_ENUMS.items():
+            if key in readiness:
+                item = readiness[key]
+                safe_readiness[key] = item if isinstance(item, str) and item in allowed else "unknown"
         for key in ("callback_index", "callback_count", "error_code", "queue_depth"):
             item = readiness.get(key)
             if type(item) is int and 0 <= item <= 2**63 - 1:
                 safe_readiness[key] = item
+            elif key in readiness:
+                safe_readiness[key] = None
+        for key in ("publication_id", "model_version"):
+            if key in readiness:
+                item = readiness[key]
+                safe_readiness[key] = item if type(item) is int and 0 <= item <= 2**31 - 1 else None
         result["queue_readiness"] = safe_readiness
     model_page_snapshot = value.get("model_page_snapshot")
     if isinstance(model_page_snapshot, Mapping):

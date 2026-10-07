@@ -729,6 +729,84 @@ def test_queue_readiness_source_projection_is_finite_and_redacted(tmp_path: Path
     }
 
 
+def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(tmp_path: Path) -> None:
+    if Controller is None or BreadcrumbTraceCollector is None:
+        pytest.skip("production controller breadcrumb emitter is unavailable")
+    spool, artifact = _prepare(tmp_path)
+    collector = BreadcrumbTraceCollector(
+        lambda: True, max_entries=64,
+        policy={"default": "off", "rules": {"queue.readiness": "info", "controller": "info"}},
+        durable_enabled=True, durable_path=str(spool),
+    )
+    reader = _reader(spool, artifact, max_records=256)
+    producer = Controller.__new__(Controller)
+    producer._Controller__context = SimpleNamespace(breadcrumb_trace=collector)
+    secret = "private-queue-target.bin"
+    try:
+        # Exercise the production Controller readiness emitter across admission,
+        # model decision, rescan deferral and dispatch boundaries.
+        readiness_rows = (
+            ("queue_admission", {"schema": "queue_readiness.v1", "phase": "admission", "origin": "manual",
+                                 "accepted": True, "queue_depth": 2, "queue_depth_known": True,
+                                 "private_path": "/must/not/escape"}),
+            ("queue_model_boundary", {"schema": "queue_readiness.v1", "phase": "model_boundary", "origin": "manual",
+                                      "explicit_stop": False, "already_active": False,
+                                      "collision_observation": "absent", "collision_unresolved": False,
+                                      "local_root_scan_proof_current": False}),
+            ("queue_rescan_readiness", {"schema": "queue_readiness.v1", "phase": "rescan_request", "origin": "manual",
+                                        "outcome": "pending", "reason": "scoped_rescan_requested", "ready": False}),
+            ("queue_final_decision", {"schema": "queue_readiness.v2", "phase": "final_decision", "origin": "manual",
+                                      "outcome": "deferred", "decision_boundary": "scan_authority",
+                                      "decision": "defer", "reason": "initial_scan_authority_pending",
+                                      "dispatch_attempted": False, "local_reconciled": False,
+                                      "remote_reconciled": False, "unknown_local_overlay": True,
+                                      "path_pair_scope_configured": True, "publication_id": 7, "model_version": 8}),
+            ("queue_dispatch_boundary", {"schema": "queue_readiness.v1", "phase": "dispatch_boundary", "origin": "manual",
+                                         "dispatch_attempted": True, "dispatch_mode": "async",
+                                         "operation_sequence_present": True, "explicit_stop": False,
+                                         "collision_observation": "absent", "exclusions_present": False}),
+        )
+        # Establish a genuine producer session boundary and nonempty finalized
+        # spool before the independent reader arms at EOF. A hand-authored
+        # health file would not prove the collector's current session is live.
+        assert collector.record(
+            "controller", "durable_boundary_probe", {},
+            category="controller", event_type="diagnostic",
+            stage="queue_readiness_test_boundary", level="info",
+        ) in {"retained", "enqueued"}
+        assert collector.wait_for_ingress(2.0)
+        assert collector.flush_durable(2.0)
+        durable_state = collector.durable_snapshot()
+        assert durable_state["session_boundary_written"] is True
+        assert durable_state["written"] >= 1
+        reader.start()
+        for message, details in readiness_rows:
+            assert Controller._Controller__record_queue_readiness_trace(
+                producer, secret, message, details,
+            ) is None
+        assert collector.wait_for_ingress(2.0)
+        assert collector.flush_durable(2.0)
+        assert reader.poll() == len(readiness_rows)
+    finally:
+        reader.close()
+        collector.close(timeout=2.0)
+
+    artifact_text = artifact.read_text(encoding="utf-8")
+    assert secret not in artifact_text
+    assert "/must/not/escape" not in artifact_text
+    records = [item for item in _artifacts(artifact) if item["capture"].get("state") == "record"]
+    projections = [item["capture"]["projection"] for item in records]
+    readiness = [item["queue_readiness"] for item in projections if "queue_readiness" in item]
+    assert [item["event"] for item in readiness[:len(readiness_rows)]] == [row[0] for row in readiness_rows]
+    assert readiness[2]["phase"] == "rescan_request" and readiness[2]["reason"] == "scoped_rescan_requested"
+    assert readiness[3]["decision_boundary"] == "scan_authority"
+    assert readiness[3]["local_reconciled"] is False and readiness[3]["publication_id"] == 7
+    persisted = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
+    finalized = [row for row in persisted if row.get("message") in {event for event, _ in readiness_rows}]
+    assert len(finalized) == len(readiness_rows)
+    assert all("metadata" not in row and isinstance(row.get("details"), dict) for row in finalized)
+
+
 def test_model_page_snapshot_source_projection_is_finite_and_redacted(tmp_path: Path) -> None:
     spool, artifact = _prepare(tmp_path)
     row = _row(

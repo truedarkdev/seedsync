@@ -118,15 +118,50 @@ _QUEUE_LIFECYCLE_ENUMS = {
     "future_state": frozenset({"finalized", "pending", "unknown"}),
 }
 _QUEUE_READINESS_SCHEMAS = frozenset({"queue_readiness.v1", "queue_readiness.v2"})
-_QUEUE_READINESS_EVENTS = frozenset({"queue_callback", "queue_http_wait"})
-_QUEUE_READINESS_PHASES = frozenset({"entry", "wait_return", "unknown"})
-_QUEUE_READINESS_OUTCOMES = frozenset({"accepted", "success", "failure", "failed", "timeout", "unknown"})
+_QUEUE_READINESS_EVENTS = frozenset({
+    "queue_admission", "queue_callback", "queue_dispatch_boundary", "queue_final_decision",
+    "queue_http_wait", "queue_model_boundary", "queue_preflight_outcome", "queue_rescan_readiness",
+})
+_QUEUE_READINESS_PHASES = frozenset({
+    "admission", "dispatch_boundary", "entry", "final_decision", "model_boundary", "preflight",
+    "rescan_deadline", "rescan_deadline_grace", "rescan_ready", "rescan_request", "rescan_unknown",
+    "wait_return", "unknown",
+})
+_QUEUE_READINESS_OUTCOMES = frozenset({
+    "accepted", "clear", "deferred", "dispatched", "failed", "failure", "pending", "ready",
+    "rejected", "success", "timeout", "unknown",
+})
 _QUEUE_READINESS_ORIGINS = frozenset({"auto_queue", "manual", "unknown"})
 _QUEUE_READINESS_REASONS = frozenset({
     "none", "awaiting_scan_publication", "initial_scan_authority_deadline", "comparison_pending",
     "scoped_rescan_token_unknown", "scoped_rescan_request_failed", "scoped_rescan_requested", "unknown",
+    "authoritative_local_root", "authoritative_scoped_scan", "collision_equal_scoped_rescan",
+    "collision_authority_stale", "collision_not_terminalizable", "collision_preflight_error",
+    "collision_deferred_terminal", "collision_authority_unknown", "no_unresolved_collision",
+    "duplicate_waiter_coalesced", "idempotent_claim_settlement_pending", "initial_scan_authority_pending",
+    "initial_local_scan_failed", "initial_local_scan_unknown", "initial_remote_scan_failed",
+    "initial_remote_scan_unknown", "initial_local_scan_session_changed", "initial_remote_scan_session_changed",
+    "initial_local_scan_generation_reset", "initial_remote_scan_generation_reset",
+    "collision_initial_local_scan_failed", "collision_initial_local_scan_unknown",
+    "collision_initial_remote_scan_failed", "collision_initial_remote_scan_unknown",
+    "collision_initial_local_scan_session_changed", "collision_initial_remote_scan_session_changed",
+    "collision_initial_local_scan_generation_reset", "collision_initial_remote_scan_generation_reset",
 })
 _QUEUE_READINESS_BOOLEANS = frozenset({"ready"})
+_QUEUE_READINESS_BOOLEAN_FIELDS = frozenset({
+    "accepted", "already_active", "already_dispatched", "collision_terminalizable", "collision_unresolved",
+    "dispatch_attempted", "exclusions_present", "explicit_stop", "is_dir", "local_reconciled",
+    "local_root_scan_proof_current", "operation_sequence_present", "path_pair_scope_configured",
+    "queue_depth_known", "remote_available", "remote_reconciled", "retry_after_ambiguity",
+    "stop_boundary", "transferable_remote_content", "unknown_local_overlay",
+})
+_QUEUE_READINESS_EXTRA_ENUMS = {
+    "decision_boundary": frozenset({"scan_authority"}),
+    "decision": frozenset({"defer"}),
+    "collision_observation": frozenset({"absent", "not_applicable", "present", "unknown"}),
+    "dispatch_mode": frozenset({"async", "sync"}),
+    "local_scope_basis": frozenset({"pair", "selected_root"}),
+}
 _MODEL_PAGE_SNAPSHOT_OUTCOMES = frozenset({"success", "error"})
 _MODEL_PAGE_SNAPSHOT_ERRORS = frozenset({"cancelled", "model_error", "runtime_error", "unknown"})
 _MODEL_PAGE_SNAPSHOT_NUMBERS = frozenset({
@@ -487,10 +522,24 @@ def _queue_readiness_facts(message: object, details: Mapping[str, object]) -> di
         value = details.get(key)
         if type(value) is bool:
             result[key] = value
+    for key, allowed in _QUEUE_READINESS_EXTRA_ENUMS.items():
+        value = details.get(key)
+        if key in details:
+            result[key] = value if isinstance(value, str) and value in allowed else "unknown"
+    for key in _QUEUE_READINESS_BOOLEAN_FIELDS:
+        value = details.get(key)
+        if key in details:
+            result[key] = value if type(value) is bool else None
     for key in ("callback_index", "callback_count", "error_code", "queue_depth"):
         value = details.get(key)
         if type(value) is int and 0 <= value <= 2**63 - 1:
             result[key] = value
+        elif key in details:
+            result[key] = None
+    for key in ("publication_id", "model_version"):
+        value = details.get(key)
+        if key in details:
+            result[key] = value if type(value) is int and 0 <= value <= 2**31 - 1 else None
     return result
 
 
