@@ -39,7 +39,7 @@ _CATEGORIES = frozenset(
         "model.publication", "model.finalization", "model.root_progress", "status",
         "transfer.lftp", "transfer.lftp.executor", "transfer.lftp.membership",
         "transfer.lftp.status", "transfer.stop", "scan.authority", "scan.adoption", "scan.failure",
-        "scan.result", "scan.terminal_publication", "final_move.publication",
+        "scan.result", "scan.terminal_publication", "scan.lifecycle", "final_move.publication",
         "finalization.child", "controller", "scanner_process", "lftp.sidecar",
         "lftp.command", "lftp.status", "completion.gate", "transfer.lftp.command", "root.progress",
     }
@@ -197,8 +197,21 @@ _MODEL_INPUT_ARBITRATION_SELECTION_REASONS = frozenset({
 _MODEL_INPUT_ARBITRATION_SPLIT_PROVENANCE = frozenset({"split_candidate_local"})
 _COMPLETION_SCAN_JOIN_SCHEMA = "completion_scan_join.v1"
 _COMPLETION_SCAN_JOIN_MODES = frozenset({"legacy", "progressive", "unknown"})
+_SCAN_TICK_MODES = frozenset({"legacy", "progressive"})
+_SCAN_LIFECYCLE_MESSAGES = frozenset({"scan_accumulator_before_apply", "scan_accumulator_after_apply"})
+_SCAN_LIFECYCLE_COUNTERS = (
+    "event_count", "full_event_count", "distinct_generation_count", "min_generation", "max_generation",
+    "scanned_pair_count", "completed_pair_count", "unknown_pair_count", "root_count", "file_count",
+    "monotonic_ms", "accumulator_working_root_count", "accumulator_committed_root_count",
+    "accumulator_authoritative_root_count", "accumulator_touched_root_count",
+)
+_SCAN_TICK_BOOLEAN_KEYS = {
+    "present": "p", "progress": "pr", "final": "f", "failed": "fa", "full": "fu",
+    "new_authority": "na",
+}
 _DECIMAL_IDENTITY = re.compile(r"^(?:0|[1-9][0-9]{0,18})$")
 _OPAQUE_TOKEN = re.compile(r"^[0-9a-f]{16}$")
+_SCAN_SESSION_DIGEST = re.compile(r"^[0-9a-f]{12}$")
 _INPUT_ARBITRATION_BUILD_TOKEN = re.compile(r"^input-arbitration:([0-9a-f]{16})$")
 _QUEUE_LIFECYCLE_BOOLS = frozenset({
     "fresh", "healthy", "process_alive_before", "process_alive_after", "process_alive",
@@ -859,6 +872,73 @@ def _completion_scan_join_facts(details: Mapping[str, object], message: object) 
     }
 
 
+def _local_scan_tick_facts(details: Mapping[str, object]) -> dict[str, object] | None:
+    payload = details.get("local_scan_tick")
+    if not isinstance(payload, Mapping):
+        return None
+
+    def boolean(key: str) -> bool | None | str:
+        if key not in payload:
+            return "unknown"
+        value = payload[key]
+        return value if value is None or type(value) is bool else "unknown"
+
+    mode = payload.get("m")
+    session = payload.get("s")
+    generation = payload.get("g")
+    result: dict[str, object] = {
+        "present": boolean("p"),
+        "mode": mode if isinstance(mode, str) and mode in _SCAN_TICK_MODES else "unknown",
+        "session_digest": (
+            "unknown" if "s" not in payload else
+            session if session is None or (isinstance(session, str) and _SCAN_SESSION_DIGEST.fullmatch(session)) else "unknown"
+        ),
+        "generation": (
+            "unknown" if "g" not in payload else
+            generation if generation is None or (type(generation) is int and 0 <= generation <= 2**63 - 1)
+            else "unknown"
+        ),
+    }
+    for field, compact in _SCAN_TICK_BOOLEAN_KEYS.items():
+        if field == "present":
+            continue
+        result[field] = boolean(compact)
+    return result
+
+
+def _scan_lifecycle_facts(
+        details: Mapping[str, object], message: object, corr_id: object,
+) -> dict[str, object] | None:
+    if not isinstance(message, str) or message not in _SCAN_LIFECYCLE_MESSAGES:
+        return None
+    result: dict[str, object] = {"message": message}
+    side = details.get("scanner_side")
+    result["scanner_side"] = side if isinstance(side, str) and side in {"local", "remote"} else "unknown"
+    session_match = (
+        re.fullmatch(r"(?:local|remote):([0-9a-f]{12})", corr_id)
+        if result["scanner_side"] in {"local", "remote"} and isinstance(corr_id, str) else None
+    )
+    if session_match is not None and corr_id.startswith(result["scanner_side"] + ":"):
+        result["session_digest"] = session_match.group(1)
+    else:
+        result["session_digest"] = "unknown"
+    for key in _SCAN_LIFECYCLE_COUNTERS:
+        value = details.get(key)
+        result[key] = (
+            "unknown" if key not in details else
+            value if value is None or (type(value) is int and 0 <= value <= 2**63 - 1) else "unknown"
+        )
+    for key in ("targeted", "final", "full", "progress", "failed", "handoff_root_present"):
+        if key not in details:
+            result[key] = "unknown"
+        else:
+            value = details[key]
+            result[key] = value if value is None or type(value) is bool else "unknown"
+    fence = details.get("fence")
+    result["fence"] = fence if fence == "none" else "unknown"
+    return result
+
+
 def select_input_arbitration_rows(records: object, root_id: object) -> dict[str, object]:
     """Select app-emitted root rows and their same-build leaf/summary rows.
 
@@ -924,6 +1004,12 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         _completion_scan_join_facts(details, message)
         if category == "scan.authority" and message == "scan_root_adopted" else None
     )
+    has_local_scan_tick = category == "scan.adoption" or (
+        category == "scan.authority" and details.get("schema") == _MODEL_INPUT_ARBITRATION_SCHEMA
+        and details.get("phase") == "root_source"
+    )
+    local_scan_tick = _local_scan_tick_facts(details) if has_local_scan_tick else None
+    scan_lifecycle = _scan_lifecycle_facts(details, message, row.get("corr_id")) if category == "scan.lifecycle" else None
     if category == "final_move.publication" and isinstance(message, str) and message in _FINAL_MOVE_PUBLICATION_MESSAGES and final_move is None:
         return None, True
     if category == "queue.readiness" and readiness is None:
@@ -980,6 +1066,10 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["input_arbitration"] = input_arbitration
     if scan_join is not None:
         result["scan_join"] = scan_join
+    if local_scan_tick is not None:
+        result["local_scan_tick"] = local_scan_tick
+    if scan_lifecycle is not None:
+        result["scan_lifecycle"] = scan_lifecycle
     return result, False
 
 

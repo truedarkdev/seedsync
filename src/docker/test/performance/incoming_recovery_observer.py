@@ -446,7 +446,7 @@ _CAPTURE_CATEGORIES = frozenset({
     "queue.lifecycle", "queue.admission", "queue.executor", "queue.authority", "queue.readiness", "queue.exclusion", "model_page_snapshot",
     "model.lifecycle", "model.progress", "model.publication", "model.finalization", "model.root_progress", "status",
     "transfer.lftp", "transfer.lftp.executor", "transfer.lftp.membership", "transfer.lftp.status", "transfer.stop",
-    "scan.authority", "scan.adoption", "scan.failure", "scan.result", "scan.terminal_publication", "final_move.publication",
+    "scan.authority", "scan.adoption", "scan.failure", "scan.result", "scan.lifecycle", "scan.terminal_publication", "final_move.publication",
     "finalization.child", "controller", "scanner_process", "lftp.sidecar", "lftp.command", "lftp.status",
     "completion.gate", "transfer.lftp.command", "root.progress", "unknown",
 })
@@ -637,6 +637,15 @@ _CAPTURE_INPUT_ARBITRATION_OPAQUE = re.compile(r"^[0-9a-f]{16}$")
 _CAPTURE_INPUT_ARBITRATION_DECIMAL_IDENTITY = re.compile(r"^(?:0|[1-9][0-9]{0,18})$")
 _CAPTURE_COMPLETION_SCAN_JOIN_SCHEMA = "completion_scan_join.v1"
 _CAPTURE_COMPLETION_SCAN_JOIN_MODES = {"legacy", "progressive", "unknown"}
+_CAPTURE_SCAN_TICK_MODES = {"legacy", "progressive"}
+_CAPTURE_SCAN_SESSION_DIGEST = re.compile(r"^[0-9a-f]{12}$")
+_CAPTURE_SCAN_LIFECYCLE_MESSAGES = {"scan_accumulator_before_apply", "scan_accumulator_after_apply"}
+_CAPTURE_SCAN_LIFECYCLE_COUNTERS = (
+    "event_count", "full_event_count", "distinct_generation_count", "min_generation", "max_generation",
+    "scanned_pair_count", "completed_pair_count", "unknown_pair_count", "root_count", "file_count",
+    "monotonic_ms", "accumulator_working_root_count", "accumulator_committed_root_count",
+    "accumulator_authoritative_root_count", "accumulator_touched_root_count",
+)
 
 
 def _sanitize_input_arbitration(value: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -792,6 +801,60 @@ def _sanitize_scan_join(value: Mapping[str, object]) -> Mapping[str, object] | N
     ):
         item = value.get(key, "unknown")
         result[key] = item if item is None or type(item) is bool else "unknown"
+    return result
+
+
+def _sanitize_local_scan_tick(value: Mapping[str, object]) -> Mapping[str, object] | None:
+    result: dict[str, object] = {}
+    for key in ("present", "progress", "final", "failed", "full", "new_authority"):
+        if key not in value:
+            result[key] = "unknown"
+        else:
+            item = value[key]
+            result[key] = item if item is None or type(item) is bool else "unknown"
+    mode = value.get("mode")
+    result["mode"] = mode if isinstance(mode, str) and mode in _CAPTURE_SCAN_TICK_MODES else "unknown"
+    session = value.get("session_digest", "unknown")
+    result["session_digest"] = (
+        session if session is None or (
+            isinstance(session, str) and _CAPTURE_SCAN_SESSION_DIGEST.fullmatch(session)
+        ) else "unknown"
+    )
+    generation = value.get("generation", "unknown")
+    result["generation"] = (
+        generation if generation == "unknown" or generation is None or
+        (type(generation) is int and 0 <= generation <= 2**63 - 1) else "unknown"
+    )
+    return result
+
+
+def _sanitize_scan_lifecycle_event(value: Mapping[str, object]) -> Mapping[str, object] | None:
+    message = value.get("message")
+    if not isinstance(message, str) or message not in _CAPTURE_SCAN_LIFECYCLE_MESSAGES:
+        return None
+    result: dict[str, object] = {"message": message}
+    side = value.get("scanner_side")
+    result["scanner_side"] = side if isinstance(side, str) and side in {"local", "remote"} else "unknown"
+    session = value.get("session_digest", "unknown")
+    result["session_digest"] = (
+        session if session is None or (
+            isinstance(session, str) and _CAPTURE_SCAN_SESSION_DIGEST.fullmatch(session)
+        ) else "unknown"
+    )
+    for key in _CAPTURE_SCAN_LIFECYCLE_COUNTERS:
+        item = value.get(key, "unknown")
+        result[key] = (
+            item if item == "unknown" or item is None or
+            (type(item) is int and 0 <= item <= 2**63 - 1) else "unknown"
+        )
+    for key in ("targeted", "final", "full", "progress", "failed", "handoff_root_present"):
+        if key not in value:
+            result[key] = "unknown"
+        else:
+            item = value[key]
+            result[key] = item if item is None or type(item) is bool else "unknown"
+    fence = value.get("fence")
+    result["fence"] = fence if fence == "none" else "unknown"
     return result
 
 
@@ -1005,6 +1068,14 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
         safe_scan_join = _sanitize_scan_join(scan_join)
         if safe_scan_join is not None:
             result["scan_join"] = safe_scan_join
+    local_scan_tick = value.get("local_scan_tick")
+    if isinstance(local_scan_tick, Mapping):
+        result["local_scan_tick"] = _sanitize_local_scan_tick(local_scan_tick)
+    scan_lifecycle_event = value.get("scan_lifecycle")
+    if isinstance(scan_lifecycle_event, Mapping):
+        safe_scan_lifecycle_event = _sanitize_scan_lifecycle_event(scan_lifecycle_event)
+        if safe_scan_lifecycle_event is not None:
+            result["scan_lifecycle"] = safe_scan_lifecycle_event
     return result
 
 

@@ -7374,6 +7374,28 @@ class ModelBuilder:
                 "subject_id": opaque_trace_correlation(file_id),
                 "p": dict(facts["root_source"]),
             }
+            raw_tick = self.__stop_resume_trace_cycle_context.get("local_scan_tick")
+            if isinstance(raw_tick, dict) and type(raw_tick.get("p")) is bool and \
+                    raw_tick.get("m") in ("legacy", "progressive") and \
+                    type(raw_tick.get("na")) is bool:
+                session_digest = raw_tick.get("s")
+                if not isinstance(session_digest, str) or len(session_digest) != 12 or \
+                        any(character not in "0123456789abcdef" for character in session_digest):
+                    session_digest = None
+                generation = raw_tick.get("g")
+                if type(generation) is not int or generation < 0 or generation > 2 ** 63 - 1:
+                    generation = None
+                details["local_scan_tick"] = {
+                    "p": raw_tick["p"],
+                    "m": raw_tick["m"],
+                    "s": session_digest,
+                    "g": generation,
+                    "pr": raw_tick.get("pr") if type(raw_tick.get("pr")) is bool else None,
+                    "f": raw_tick.get("f") if type(raw_tick.get("f")) is bool else None,
+                    "fa": raw_tick.get("fa") if type(raw_tick.get("fa")) is bool else None,
+                    "fu": raw_tick.get("fu") if type(raw_tick.get("fu")) is bool else None,
+                    "na": raw_tick["na"],
+                }
             self.__stop_resume_trace_breadcrumb.record(
                 "model_builder", "input_arbitration_witness", details,
                 category="scan.authority", corr_id=context["corr"], flow_id=context["corr"],

@@ -71,6 +71,11 @@ class TestModelBuilder(unittest.TestCase):
             builder.set_remote_files([remote])
             builder.set_local_files([local])
             builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+            local_scan_tick = {
+                "p": True, "m": "progressive", "s": "0123456789ab", "g": 2 ** 53 + 3,
+                "pr": True, "f": False, "fa": False, "fu": False, "na": False,
+            }
+            builder.set_stop_resume_trace_cycle_context({"local_scan_tick": local_scan_tick})
             first = builder.build_model()
             self.assertIs(first, builder.build_model())  # Cached reads create no invented build.
             active = SystemFile("input-root", 100, True)
@@ -105,6 +110,7 @@ class TestModelBuilder(unittest.TestCase):
                 source = next(row for row in related if row["details"]["phase"] == "root_source")
                 self.assertEqual(root_row["details"]["root_id"], source["details"]["root_id"])
                 self.assertEqual({"lo", "ps", "pb"}, set(source["details"]["p"]))
+                self.assertEqual(local_scan_tick, source["details"]["local_scan_tick"])
                 self.assertEqual(opaque_trace_correlation(
                     "system-root-object|{}".format(id(local))
                 ), source["details"]["p"]["lo"])
@@ -403,17 +409,20 @@ class TestModelBuilder(unittest.TestCase):
                 self.assertNotIn("candidate.bin", serialized)
 
     def test_input_arbitration_witness_disabled_and_failing_diagnostics_preserve_build(self):
-        def build(emitter, target_ids):
+        def build(emitter, target_ids, local_scan_tick=None):
             builder = ModelBuilder()
             builder.set_base_logger(self.model_builder.logger)
             remote = SystemFile("neutral-root", 10, True)
             remote.add_child(SystemFile("payload.bin", 10, False))
             builder.set_remote_files([remote])
             builder.set_stop_resume_trace_breadcrumb(emitter)
+            builder.set_stop_resume_trace_cycle_context({"local_scan_tick": local_scan_tick})
             root = builder.build_model(diagnostic_target_root_ids=target_ids).get_file("neutral-root")
             return (root.state, root.local_present, root.remote_size, root.complete_local_coverage)
         target_ids = (ModelFile.build_file_id("neutral-root", None),)
-        baseline = build(None, target_ids)
+        tick = {"p": True, "m": "legacy", "s": "0123456789ab", "g": 1,
+                "pr": False, "f": True, "fa": False, "fu": True, "na": True}
+        baseline = build(None, target_ids, tick)
         class Disabled:
             def is_effectively_enabled(self, category, level="info"):
                 return False
@@ -422,15 +431,15 @@ class TestModelBuilder(unittest.TestCase):
         with patch("controller.model_builder.ModelBuilder._ModelBuilder__input_witness_root",
                    side_effect=AssertionError("disabled source facts")), \
              patch("controller.model_builder.time.monotonic_ns", side_effect=AssertionError("disabled clock")):
-            self.assertEqual(baseline, build(Disabled(), target_ids))
+            self.assertEqual(baseline, build(Disabled(), target_ids, tick))
         class Failing:
             def is_effectively_enabled(self, category, level="info"):
                 return category == "scan.authority"
             def record(self, *args, **kwargs):
                 raise RuntimeError("diagnostic sink failure")
-        self.assertEqual(baseline, build(Failing(), target_ids))
+        self.assertEqual(baseline, build(Failing(), target_ids, tick))
         with patch("controller.model_builder.opaque_trace_correlation", side_effect=RuntimeError("correlation failure")):
-            self.assertEqual(baseline, build(Failing(), target_ids))
+            self.assertEqual(baseline, build(Failing(), target_ids, tick))
 
     def setUp(self):
         logger = logging.getLogger(TestModelBuilder.__name__)

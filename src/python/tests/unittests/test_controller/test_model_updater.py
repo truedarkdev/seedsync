@@ -28,6 +28,7 @@ from controller.model_updater import (
     _active_delta_status_match_evidence,
     _active_delta_status_missing_provenance,
     _fresh_unique_replacement_statuses,
+    _local_scan_tick_details,
     _record_active_delta_rejection_summary,
     _record_scan_adoption_breadcrumb,
     _record_selected_root_scan_join,
@@ -92,6 +93,47 @@ from system.scanner import SystemScanner
 
 
 class TestModelUpdater(unittest.TestCase):
+    def test_local_scan_tick_details_distinguishes_current_result_states(self):
+        same_generation_progress = ScannerResult(
+            datetime.now(), [], generation=7, is_progress=True, is_scan_final=False,
+            failed=False, is_full_snapshot=False, session_token="same-session",
+        )
+        healthy_final = ScannerResult(
+            datetime.now(), [], generation=8, is_progress=False, is_scan_final=True,
+            failed=False, is_full_snapshot=True, session_token="final-session",
+        )
+        failed_partial = ScannerResult(
+            datetime.now(), [], generation=9, is_progress=True, is_scan_final=False,
+            failed=True, is_full_snapshot=False, session_token="failed-session",
+        )
+        cases = (
+            (None, False, False, {
+                "p": False, "m": "legacy", "s": None, "g": None,
+                "pr": None, "f": None, "fa": None, "fu": None, "na": False,
+            }),
+            (same_generation_progress, True, False, {
+                "p": True, "m": "progressive", "s": trace_session_digest("same-session"),
+                "g": 7, "pr": True, "f": False, "fa": False, "fu": False, "na": False,
+            }),
+            (healthy_final, False, True, {
+                "p": True, "m": "legacy", "s": trace_session_digest("final-session"),
+                "g": 8, "pr": False, "f": True, "fa": False, "fu": True, "na": True,
+            }),
+            (failed_partial, True, True, {
+                "p": True, "m": "progressive", "s": trace_session_digest("failed-session"),
+                "g": 9, "pr": True, "f": False, "fa": True, "fu": False, "na": True,
+            }),
+        )
+        for scan, mode, new_authority, expected in cases:
+            with self.subTest(generation=expected["g"], present=expected["p"]):
+                self.assertEqual(expected, _local_scan_tick_details(
+                    scan, progressive_mode=mode, new_authority=new_authority,
+                ))
+        out_of_range = ScannerResult(datetime.now(), [], generation=2 ** 63, session_token="wide-session")
+        self.assertIsNone(_local_scan_tick_details(
+            out_of_range, progressive_mode=False, new_authority=False,
+        )["g"])
+
     def test_confirmed_delete_source_persists_success_and_refusal(self):
         with tempfile.TemporaryDirectory() as path:
             trace = BreadcrumbTraceCollector(lambda: True, max_entries=16,
@@ -2463,7 +2505,9 @@ class TestModelUpdater(unittest.TestCase):
         self.addCleanup(durable_dir.cleanup)
         trace = BreadcrumbTraceCollector(
             lambda: True, max_entries=128,
-            policy={"default": "off", "rules": {"scan.authority": "info"}},
+            policy={"default": "off", "rules": {
+                "scan.authority": "info", "scan.adoption": "info", "scan.lifecycle": "info",
+            }},
             durable_enabled=True, durable_path=durable_dir.name,
         )
         self.addCleanup(trace.close)
@@ -2479,6 +2523,9 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__context.breadcrumb_trace = trace
         controller._Controller__local_scan_process = local_process
         controller._Controller__remote_scan_process = remote_process
+        local_accumulator = _ProgressiveScanAccumulator()
+        local_accumulator.set_session_token("prior-local-session")
+        controller._Controller__progressive_local_scan_state = local_accumulator
 
         def record_breadcrumb(**kwargs):
             values = dict(kwargs)
@@ -2552,6 +2599,32 @@ class TestModelUpdater(unittest.TestCase):
             for row in event_rows if row.get("message") == "input_arbitration_witness" and
             row.get("details", {}).get("phase") == "root_source"
         }
+        expected_tick = {
+            "p": True,
+            "m": "progressive",
+            "s": trace_session_digest(local_process.session_token),
+            "g": 1,
+            "pr": True,
+            "f": True,
+            "fa": False,
+            "fu": True,
+            "na": True,
+        }
+        self.assertTrue(any(
+            row.get("details", {}).get("local_scan_tick") == expected_tick
+            for row in event_rows if row.get("message") == "scan_adoption"
+        ))
+        self.assertTrue(any(
+            row.get("details", {}).get("local_scan_tick") == expected_tick
+            for row in source_rows.values()
+        ))
+        self.assertTrue(any(
+            row.get("category") == "scan.lifecycle" and
+            row.get("details", {}).get("scanner_side") == "local" and
+            row.get("corr_id") == "local:" + expected_tick["s"] and
+            row.get("details", {}).get("generation") == expected_tick["g"]
+            for row in event_rows
+        ))
         self.assertEqual(expected_ids, set(adopted_scan_rows))
         # Preserve the existing unbound pending-target row: it is a local-scan
         # join, but it has no accepted/source object and was not adopted.

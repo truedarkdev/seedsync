@@ -506,12 +506,42 @@ def _scan_adoption_root_sample(
     }, tuple(values))
 
 
+def _local_scan_tick_details(
+        scan: Optional[ScannerResult], *, progressive_mode: bool, new_authority: bool,
+) -> dict[str, object]:
+    """Build finite current-result evidence without changing scan decisions."""
+    details: dict[str, object] = {
+        "p": scan is not None,
+        "m": "progressive" if progressive_mode else "legacy",
+        "s": None, "g": None, "pr": None, "f": None, "fa": None, "fu": None,
+        "na": bool(new_authority),
+    }
+    if scan is None:
+        return details
+    try:
+        session = getattr(scan, "session_token", None)
+        if isinstance(session, str):
+            details["s"] = trace_session_digest(session)
+        generation = getattr(scan, "generation", None)
+        if type(generation) is int and 0 <= generation <= 2 ** 63 - 1:
+            details["g"] = generation
+        for key, attribute in (("pr", "is_progress"), ("f", "is_scan_final"),
+                               ("fa", "failed"), ("fu", "is_full_snapshot")):
+            value = getattr(scan, attribute, None)
+            details[key] = value if type(value) is bool else None
+    except Exception:
+        # A diagnostic property failure leaves remaining fields unknown only.
+        pass
+    return details
+
+
 def _record_scan_adoption_breadcrumb(
         controller: "Controller", *, local_scan_generation: object, local_scan_final: object,
         local_scan_healthy: object, phase: str, source_roots: Optional[Iterable[object]] = None,
         builder_roots: Optional[Iterable[object]] = None, model_roots: Optional[Iterable[object]] = None,
         model_version: object = 0, source_adoption: str = "unknown",
         publication_outcome: str = "pending", fast_path_rejection_reason: Optional[str] = None,
+        local_scan_tick: Optional[dict[str, object]] = None,
 ) -> None:
     """Record bounded, opaque scan-adoption evidence after an existing decision."""
     if not _controller_breadcrumb_effectively_enabled(controller, _SCAN_ADOPTION_TRACE_CATEGORY, "info"):
@@ -571,6 +601,7 @@ def _record_scan_adoption_breadcrumb(
             "source_adoption": source_adoption,
             "publication_outcome": publication_outcome,
             "fast_path_rejection_reason": fast_path_rejection_reason,
+            "local_scan_tick": dict(local_scan_tick) if isinstance(local_scan_tick, dict) else None,
         },
     )
 
@@ -8366,16 +8397,6 @@ class ModelUpdater(_ControllerCoreAccess):
             latest_active_scan,
         )
 
-        model_builder.set_stop_resume_trace_cycle_context({
-            "lftp_status_source": lftp_status_source,
-            "lftp_status_healthy": lftp_status_poll_healthy,
-            "lftp_status_fresh": lftp_status_snapshot_fresh,
-            "lftp_status_count": len(lftp_statuses),
-            "active_scan_arrived": latest_active_scan is not None,
-            "local_scan_arrived": latest_local_scan is not None,
-            "remote_scan_arrived": latest_remote_scan is not None,
-        })
-
         stage_timer.switch(DURATION_MODEL_UPDATE_BUILDER_SYNC)
         scan_adoption_trace_enabled = _controller_breadcrumb_effectively_enabled(
             controller, _SCAN_ADOPTION_TRACE_CATEGORY, "info",
@@ -8389,6 +8410,24 @@ class ModelUpdater(_ControllerCoreAccess):
             or type(previous_local_scan_generation) is not int
             or scan_generation(latest_local_scan) != previous_local_scan_generation
         )
+        current_local_scan_tick = None
+        if scan_adoption_trace_enabled or _controller_breadcrumb_effectively_enabled(
+                controller, "scan.authority", "info",
+        ):
+            current_local_scan_tick = _local_scan_tick_details(
+                latest_local_scan, progressive_mode=progressive_mode,
+                new_authority=bool(local_scan_new_authority),
+            )
+        model_builder.set_stop_resume_trace_cycle_context({
+            "lftp_status_source": lftp_status_source,
+            "lftp_status_healthy": lftp_status_poll_healthy,
+            "lftp_status_fresh": lftp_status_snapshot_fresh,
+            "lftp_status_count": len(lftp_statuses),
+            "active_scan_arrived": latest_active_scan is not None,
+            "local_scan_arrived": latest_local_scan is not None,
+            "remote_scan_arrived": latest_remote_scan is not None,
+            "local_scan_tick": current_local_scan_tick,
+        })
         # Update model builder state.
         authoritative_pair_delta_builds: list[object] = []
         authoritative_pair_delta_staged_count = 0
@@ -8498,6 +8537,7 @@ class ModelUpdater(_ControllerCoreAccess):
                             source_adoption=(
                                 "awaiting_joint" if progressive_mode else "accepted_current"
                             ),
+                            local_scan_tick=current_local_scan_tick,
                         )
                     except Exception:
                         controller.logger.debug("Ignoring scan adoption breadcrumb failure", exc_info=True)
@@ -12955,6 +12995,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         and local_final and not local_scan_failed else "prior_authority",
                         publication_outcome=outcome,
                         fast_path_rejection_reason=fast_path_rejection_reason,
+                        local_scan_tick=current_local_scan_tick,
                     )
                 except Exception:
                     controller.logger.debug("Ignoring scan adoption breadcrumb failure", exc_info=True)

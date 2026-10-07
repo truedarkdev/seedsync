@@ -387,6 +387,57 @@ def test_scan_join_and_root_source_projection_are_bounded_and_preserve_unknowns(
     assert malformed_root["input_arbitration"]["local_proof_object_bound"] == "unknown"
 
 
+def test_local_scan_tick_and_lifecycle_projection_preserve_unknowns_and_sanitize():
+    tick = observer._sanitize_capture_projection({
+        "kind": "event", "source": "model_updater", "category": "scan.adoption",
+        "event_type": "state_transition", "stage": "scan_adoption", "level": "info", "numbers": {},
+        "local_scan_tick": {
+            "present": True, "mode": "progressive", "session_digest": "0123456789ab",
+            "generation": 7, "progress": True, "final": False, "failed": False,
+            "full": None, "new_authority": True, "private_path": "/secret/root",
+        },
+    })
+    assert tick["local_scan_tick"] == {
+        "present": True, "mode": "progressive", "session_digest": "0123456789ab",
+        "generation": 7, "progress": True, "final": False, "failed": False,
+        "full": None, "new_authority": True,
+    }
+    assert "private_path" not in json.dumps(tick)
+
+    lifecycle = observer._sanitize_capture_projection({
+        "kind": "event", "source": "model_updater", "category": "scan.lifecycle",
+        "event_type": "diagnostic", "stage": "scan_accumulator", "level": "info", "numbers": {},
+        "scan_lifecycle": {
+            "message": "scan_accumulator_after_apply", "scanner_side": "local",
+            "session_digest": "fedcba987654", "event_count": 2, "completed_pair_count": 1,
+            "targeted": True, "final": False, "fence": "none", "private_label": "do-not-copy",
+        },
+    })
+    assert lifecycle["category"] == "scan.lifecycle"
+    assert lifecycle["scan_lifecycle"]["message"] == "scan_accumulator_after_apply"
+    assert lifecycle["scan_lifecycle"]["completed_pair_count"] == 1
+    assert lifecycle["scan_lifecycle"]["scanned_pair_count"] == "unknown"
+    assert "private_label" not in json.dumps(lifecycle)
+
+    malformed = observer._sanitize_capture_projection({
+        **tick, "local_scan_tick": {
+            "present": 1, "mode": "private-mode", "session_digest": "/path",
+            "generation": True, "progress": "true", "final": None,
+        },
+    })["local_scan_tick"]
+    assert malformed["present"] == malformed["mode"] == malformed["session_digest"] == "unknown"
+    assert malformed["generation"] == malformed["progress"] == "unknown"
+    assert malformed["final"] is None
+    wrong_width = observer._sanitize_capture_projection({
+        **tick, "local_scan_tick": {**tick["local_scan_tick"], "session_digest": "0123456789abcdef"},
+    })["local_scan_tick"]
+    assert wrong_width["session_digest"] == "unknown"
+    oversized_generation = observer._sanitize_capture_projection({
+        **tick, "local_scan_tick": {"p": True, "m": "legacy", "s": None, "g": 2**63},
+    })["local_scan_tick"]
+    assert oversized_generation["generation"] == "unknown"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires native durable file acknowledgement")
 @pytest.mark.skipif(BreadcrumbTraceCollector is None or ModelBuilder is None, reason="production builder unavailable")
 def test_finalized_nested_input_witness_reaches_capture_and_json_sink(tmp_path):

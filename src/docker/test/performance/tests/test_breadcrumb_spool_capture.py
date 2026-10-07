@@ -33,12 +33,15 @@ for _common_root in _COMMON_ROOTS:
         sys.path.insert(0, str(_common_root))
         break
 try:
-    from common.breadcrumb_trace import BreadcrumbTraceCollector
+    from common.breadcrumb_trace import BreadcrumbTraceCollector, trace_session_digest
     from system import SystemFile
     from controller import Controller, ModelBuilder
+    from controller.model_updater import _record_lifecycle_scan_breadcrumb
 except ImportError:
     BreadcrumbTraceCollector = None
+    trace_session_digest = None
     Controller = None
+    _record_lifecycle_scan_breadcrumb = None
     SystemFile = None
     ModelBuilder = None
 
@@ -1223,6 +1226,193 @@ def test_finalized_scan_adoption_and_root_source_reach_json_sink_with_unknowns(t
     assert root["input_arbitration"]["local_proof_session_digest"] == "8899aabbccddeeff"
     assert root["input_arbitration"]["local_proof_object_bound"] is False
     assert "private_path" not in json.dumps(projected)
+
+
+@pytest.mark.skipif(BreadcrumbTraceCollector is None or trace_session_digest is None or _record_lifecycle_scan_breadcrumb is None, reason="production breadcrumb producer is unavailable")
+def test_finalized_local_scan_tick_and_lifecycle_reach_json_sink_in_order(tmp_path: Path) -> None:
+    spool, artifact = _prepare(tmp_path)
+    collector = BreadcrumbTraceCollector(
+        lambda: True, max_entries=16,
+        policy={"default": "off", "rules": {"scan.adoption": "info", "scan.authority": "info", "scan.lifecycle": "info"}},
+        durable_enabled=True, durable_path=str(spool),
+    )
+    reader = _reader(spool, artifact)
+    session_digest = trace_session_digest("local scan session")
+    assert re.fullmatch(r"[0-9a-f]{12}", session_digest)
+    producer = SimpleNamespace(_Controller__context=SimpleNamespace(breadcrumb_trace=collector))
+    tick = {
+        "p": True, "m": "progressive", "s": session_digest, "g": 4,
+        "pr": True, "f": False, "fa": False, "fu": False, "na": True,
+        "private_path": "/private/drop",
+    }
+    try:
+        assert collector.record(
+            "model_updater", "baseline", {}, category="scan.adoption", stage="scan_adoption",
+            event_type="state_transition", level="info",
+        ) in {"retained", "enqueued"}
+        assert collector.flush_durable(2.0)
+        reader.start()
+        # A production collector writes and finalizes all four envelopes; the
+        # consumer then reads the durable file and persists its JSON artifact.
+        rows = (
+            ("scan.adoption", "scan_adoption", "scan_adoption", "state_transition", {"local_scan_tick": tick}),
+            ("scan.authority", "input_arbitration_witness", "model_builder_input_arbitration", "diagnostic", {
+                "schema": "model_input_arbitration.v1", "phase": "root_source", "subject_kind": "root",
+                "root_id": "0123456789abcdef", "subject_id": "fedcba9876543210", "input_scope": "root",
+                "selection": "local", "p": {"lo": "0011223344556677", "ps": None, "pb": None},
+                "local_scan_tick": tick,
+            }),
+            ("scan.lifecycle", "scan_accumulator_before_apply", "scan_accumulator", "diagnostic", {
+                "scanner_side": "local", "event_count": 1,
+                "full_event_count": 0, "distinct_generation_count": 1, "min_generation": 4,
+                "max_generation": 4, "targeted": True, "generation": 4, "final": False,
+                "full": False, "progress": True, "failed": False, "scanned_pair_count": 1,
+                "completed_pair_count": 0, "unknown_pair_count": 1, "root_count": 1, "file_count": 0,
+                "handoff_root_present": False, "fence": "none", "monotonic_ms": 50,
+                "accumulator_working_root_count": 1, "accumulator_committed_root_count": 0,
+                "accumulator_authoritative_root_count": 0, "accumulator_touched_root_count": 1,
+                "private_label": "/secret/path",
+            }),
+            ("scan.lifecycle", "scan_accumulator_after_apply", "scan_accumulator", "diagnostic", {
+                "scanner_side": "local", "event_count": 1,
+                "full_event_count": 0, "distinct_generation_count": 1, "min_generation": 4,
+                "max_generation": 4, "targeted": True, "generation": 4, "final": False,
+                "full": False, "progress": True, "failed": False, "scanned_pair_count": 1,
+                "completed_pair_count": 1, "unknown_pair_count": 0, "root_count": 1, "file_count": 1,
+                "handoff_root_present": True, "fence": "none", "monotonic_ms": 51,
+                "accumulator_working_root_count": 1, "accumulator_committed_root_count": 1,
+                "accumulator_authoritative_root_count": 1, "accumulator_touched_root_count": 1,
+            }),
+        )
+        for category, message, stage, event_type, details in rows:
+            if category == "scan.lifecycle":
+                _record_lifecycle_scan_breadcrumb(
+                    producer, "local", "local scan session", message, details,
+                )
+                continue
+            assert collector.record(
+                "model_updater", message, details, category=category, stage=stage,
+                event_type=event_type, level="info", corr_id="same:0123456789abcdef",
+                flow_id="same:0123456789abcdef", trace_scope="flow",
+            ) in {"retained", "enqueued"}
+        assert collector.flush_durable(2.0)
+        assert reader.poll() == 4
+    finally:
+        reader.close()
+        collector.close(timeout=2.0)
+
+    saved_envelopes = [row for row in _artifacts(artifact)
+                       if row["capture"].get("state") == "record"]
+    finalized_with_cursors: list[tuple[int, int, dict[str, object]]] = []
+    cursor = 0
+    for line in (spool / "breadcrumbs.jsonl").read_bytes().splitlines(keepends=True):
+        end = cursor + len(line)
+        if line.strip():
+            finalized_with_cursors.append((cursor, end, json.loads(line)))
+        cursor = end
+    finalized = [row for _start, _end, row in finalized_with_cursors]
+    baseline_index = next(
+        index for index, row in enumerate(finalized)
+        if row.get("category") == "scan.adoption" and row.get("message") == "baseline"
+    )
+    armed_rows = finalized_with_cursors[baseline_index + 1:]
+    assert len(armed_rows) == len(saved_envelopes) == 4
+    capture_clocks: list[tuple[int, int]] = []
+    paired = list(zip(armed_rows, saved_envelopes))
+    captured_ranges: list[tuple[int, int]] = []
+    raw_identities: list[tuple[object, ...]] = []
+    captured_identities: list[tuple[object, ...]] = []
+    for (start, end, raw), envelope in paired:
+        capture_row = envelope["capture"]
+        assert capture_row["state"] == "record"
+        capture_start, capture_end = capture_row["cursor_start"], capture_row["cursor_end"]
+        assert capture_start <= start < end <= capture_end
+        captured_ranges.append((capture_start, capture_end))
+        projection = capture_row["projection"]
+        assert (projection["category"], projection["stage"], projection["event_type"]) == (
+            raw["category"], raw["stage"], raw["event_type"],
+        )
+        capture_clocks.append((capture_row["utc_ms"], capture_row["monotonic_ms"]))
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        details = raw.get("details") if isinstance(raw.get("details"), dict) else {}
+        expected_numbers = capture._numeric_values(raw, metadata, details)
+        assert projection["numbers"] == expected_numbers
+        corr_id = raw.get("corr_id", raw.get("correlation_id", metadata.get("corr_id", metadata.get("correlation_id"))))
+        flow_id = raw.get("flow_id", metadata.get("flow_id"))
+        file_id = raw.get("file_id", metadata.get("file_id"))
+        pair_id = raw.get("path_pair_id", metadata.get("path_pair_id"))
+        raw_identities.append((
+            raw.get("created_ns"), raw.get("created_ms"), raw.get("category"), raw.get("stage"),
+            raw.get("event_type"), capture._hash(corr_id), capture._hash(flow_id),
+            capture._hash(file_id), capture._hash(pair_id), expected_numbers,
+        ))
+        captured_identities.append((
+            capture_row.get("created_ns"), capture_row.get("created_ms"), projection.get("category"),
+            projection.get("stage"), projection.get("event_type"), projection.get("corr_hash"),
+            projection.get("flow_hash"), projection.get("file_hash"), projection.get("pair_hash"),
+            projection.get("numbers"),
+        ))
+    assert all(left[0] <= right[0] and left[1] <= right[1]
+               for left, right in zip(capture_clocks, capture_clocks[1:]))
+    assert raw_identities == captured_identities
+    assert all(any(batch_start <= start and end <= batch_end
+                   for batch_start, batch_end in captured_ranges)
+               for start, end, _row in armed_rows)
+    saved = [envelope["capture"]["projection"] for envelope in saved_envelopes]
+    lifecycle_rows = [row for row in finalized if row.get("category") == "scan.lifecycle"]
+    assert len(lifecycle_rows) == 2
+    assert [row["message"] for row in lifecycle_rows] == [
+        "scan_accumulator_before_apply", "scan_accumulator_after_apply",
+    ]
+    assert all(row["corr_id"] == "local:" + session_digest for row in lifecycle_rows)
+    assert all(row["details"].get("session_digest") != session_digest for row in lifecycle_rows)
+    adoption_projection = next(
+        projection for (_start, _end, raw), projection in zip(armed_rows, saved)
+        if raw.get("category") == "scan.adoption"
+    )
+    root_source_projection = next(
+        projection for (_start, _end, raw), projection in zip(armed_rows, saved)
+        if raw.get("category") == "scan.authority"
+        and raw.get("details", {}).get("phase") == "root_source"
+    )
+    before_projection = next(
+        projection for (_start, _end, raw), projection in zip(armed_rows, saved)
+        if raw.get("message") == "scan_accumulator_before_apply"
+    )
+    after_projection = next(
+        projection for (_start, _end, raw), projection in zip(armed_rows, saved)
+        if raw.get("message") == "scan_accumulator_after_apply"
+    )
+    assert adoption_projection["local_scan_tick"] == {
+        "present": True, "mode": "progressive", "session_digest": session_digest, "generation": 4,
+        "progress": True, "final": False, "failed": False, "full": False, "new_authority": True,
+    }
+    assert root_source_projection["local_scan_tick"] == adoption_projection["local_scan_tick"]
+    assert before_projection["scan_lifecycle"]["message"] == "scan_accumulator_before_apply"
+    assert before_projection["scan_lifecycle"]["session_digest"] == session_digest
+    assert before_projection["scan_lifecycle"]["completed_pair_count"] == 0
+    assert after_projection["scan_lifecycle"]["message"] == "scan_accumulator_after_apply"
+    assert after_projection["scan_lifecycle"]["session_digest"] == session_digest
+    assert after_projection["scan_lifecycle"]["completed_pair_count"] == 1
+    assert before_projection["corr_hash"] == after_projection["corr_hash"]
+    assert before_projection["scan_lifecycle"]["scanner_side"] == "local"
+    assert "private_path" not in json.dumps(saved) and "private_label" not in json.dumps(saved)
+    malformed, irrelevant = capture._projection({
+        "category": "scan.adoption", "source": "model_updater", "event_type": "state_transition",
+        "stage": "scan_adoption", "level": "info", "message": "scan_adoption",
+        "details": {"local_scan_tick": {**tick, "s": "0123456789abcdef", "g": 2**63}},
+    })
+    assert not irrelevant and malformed is not None
+    assert malformed["local_scan_tick"]["session_digest"] == "unknown"
+    assert malformed["local_scan_tick"]["generation"] == "unknown"
+    wrong_side, irrelevant = capture._projection({
+        "category": "scan.lifecycle", "source": "model_updater", "event_type": "diagnostic",
+        "stage": "scan_accumulator", "level": "info", "message": "scan_accumulator_after_apply",
+        "corr_id": "remote:0123456789ab",
+        "details": {"scanner_side": "local", "session_digest": "0123456789ab"},
+    })
+    assert not irrelevant and wrong_side is not None
+    assert wrong_side["scan_lifecycle"]["session_digest"] == "unknown"
 
 
 @pytest.mark.skipif(BreadcrumbTraceCollector is None or ModelBuilder is None, reason="production model builder is unavailable")
