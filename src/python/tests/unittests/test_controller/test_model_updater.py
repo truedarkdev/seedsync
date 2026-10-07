@@ -40,6 +40,7 @@ from controller.model_updater import (
     _record_lftp_status_membership_transition,
     _lftp_status_lineage_trace_enabled,
     _record_pending_queue_overlay_publications,
+    _run_local_root_proof_writer,
     _ProgressiveScanAccumulator,
     _JointProgressiveReconciler,
     _filter_progressive_remote_state,
@@ -15276,6 +15277,125 @@ class TestModelUpdater(unittest.TestCase):
                 else:
                     controller._Controller__move_from_staging.assert_not_called()
 
+    def test_local_root_proof_transition_diagnostics_fail_isolated(self):
+        sentinel = object()
+        writer = MagicMock(return_value=sentinel)
+        controller = SimpleNamespace()
+        with patch("controller.model_updater._pending_root_proof_trace_targets", side_effect=RuntimeError("probe")):
+            self.assertIs(sentinel, _run_local_root_proof_writer(
+                controller, object(), "set_local_files", "legacy_scan_final", writer,
+            ))
+        writer.assert_called_once_with()
+
+        selector_trace = SimpleNamespace(is_effectively_enabled=lambda category, level: True)
+        selector_controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=selector_trace),
+        )
+        selector = MagicMock(side_effect=RuntimeError("selection"))
+        builder = ModelBuilder()
+        with patch.object(builder, "set_local_files", wraps=builder.set_local_files) as actual_writer:
+            self.assertIsNone(_run_local_root_proof_writer(
+                selector_controller, builder, "set_local_files", "legacy_scan_final",
+                lambda: builder.set_local_files([]), target_ids=selector,
+            ))
+        selector.assert_called_once_with()
+        actual_writer.assert_called_once_with([])
+
+        trace = SimpleNamespace(
+            is_effectively_enabled=lambda category, level: True,
+            record=MagicMock(side_effect=RuntimeError("trace")),
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__pending_completion_file_names={("private-name", None, None)},
+        )
+        builder = SimpleNamespace(local_root_scan_proof_comparison_details=MagicMock(return_value={
+            "entry": "absent", "builder": "unknown", "expected": "not_checked",
+        }))
+        writer = MagicMock(return_value=sentinel)
+        self.assertIs(sentinel, _run_local_root_proof_writer(
+            controller, builder, "set_local_files", "legacy_scan_final", writer,
+            target_ids=(ModelFile.build_file_id("private-name", None),),
+        ))
+        writer.assert_called_once_with()
+
+        original = RuntimeError("authoritative writer")
+        writer = MagicMock(side_effect=original)
+        with self.assertRaisesRegex(RuntimeError, "authoritative writer") as raised:
+            _run_local_root_proof_writer(
+                controller, builder, "set_local_files", "legacy_scan_final", writer,
+                target_ids=(ModelFile.build_file_id("private-name", None),),
+            )
+        self.assertIs(original, raised.exception)
+        writer.assert_called_once_with()
+
+    def test_local_root_proof_transition_reports_clear_and_prune(self):
+        root = SystemFile("pending.bin", 4, True)
+        file_id = ModelFile.build_file_id(root.name, None)
+        root.path_pair_id = None
+        events = []
+        trace = SimpleNamespace(
+            is_effectively_enabled=lambda category, level: category == "scan.root_shape",
+            record=lambda component, message, details, **kwargs: events.append(dict(details)),
+        )
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _Controller__pending_completion_file_names=set(),
+        )
+
+        builder = ModelBuilder()
+        builder.adopt_local_root_scan_sources({file_id: (root, "session", 1)})
+        _run_local_root_proof_writer(
+            controller, builder, "adopt_local_root_scan_sources", "nonprogressive_empty",
+            lambda: builder.adopt_local_root_scan_sources({}), input_sources={}, input_presence="absent",
+            target_ids=(file_id,),
+        )
+        cleared = events[-1]
+        self.assertEqual("cleared", cleared["transition"])
+        self.assertEqual("present", cleared["before_proof"])
+        self.assertEqual("absent", cleared["after_proof"])
+
+        events.clear()
+        builder.adopt_local_root_scan_sources({file_id: (root, "session", 1)})
+        _run_local_root_proof_writer(
+            controller, builder, "set_local_files", "legacy_scan_final",
+            lambda: builder.set_local_files([]),
+            target_ids=(file_id,),
+        )
+        pruned = events[-1]
+        self.assertEqual("pruned", pruned["transition"])
+        self.assertEqual("present", pruned["before_proof"])
+        self.assertEqual("absent", pruned["after_proof"])
+
+    def test_local_root_proof_transition_selects_active_root_before_pending(self):
+        controller = self._make_v092_pending_completion_controller(directory_root=True)
+        controller._Controller__pending_completion_file_names = set()
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=16,
+            policy={"default": "off", "rules": {"scan.root_shape": "info"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        active = LftpJobStatus(
+            1, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "pending.bin", "",
+        )
+        active.total_transfer_state = LftpJobStatus.TransferState(10, 10, 100, 1, 9)
+        controller._Controller__lftp.status.return_value = [active]
+        controller._Controller__next_lftp_status_poll_at = None
+        file_id = ModelFile.build_file_id("pending.bin", None)
+
+        with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+            ModelUpdater(controller).update()
+
+        event = next(
+            event for event in trace.snapshot()["entries"]
+            if event.get("message") == "local_root_proof_transition"
+            and event.get("details", {}).get("writer") == "adopt_local_root_scan_sources"
+        )
+        self.assertEqual("completion:{}".format(opaque_trace_correlation(file_id)), event["corr_id"])
+        self.assertEqual("present", event["details"]["before_proof"])
+        self.assertEqual("absent", event["details"]["after_proof"])
+        self.assertEqual("cleared", event["details"]["transition"])
+
     def test_v092_pending_completion_authority_wake_is_hot_gated_and_durable(self):
         controller = self._make_v092_pending_completion_controller(directory_root=True)
         controller._Controller__reconciled_local_path_pair_ids = set()
@@ -15302,7 +15422,9 @@ class TestModelUpdater(unittest.TestCase):
         with tempfile.TemporaryDirectory() as spool_path:
             trace = BreadcrumbTraceCollector(
                 lambda: True, max_entries=16, durable_enabled=True, durable_path=spool_path,
-                policy={"default": "off", "rules": {"completion.gate": "info"}},
+                policy={"default": "off", "rules": {
+                    "completion.gate": "info", "scan.root_shape": "info",
+                }},
             )
             controller._Controller__context.breadcrumb_trace = trace
             builder.adopt_local_root_scan_sources({
@@ -15359,6 +15481,10 @@ class TestModelUpdater(unittest.TestCase):
             record for record in records
             if record.get("message") == "pending_completion_authority_wake"
         )
+        transition_event = next(
+            record for record in records
+            if record.get("message") == "local_root_proof_transition"
+        )
         self.assertGreaterEqual(health.get("written", 0), 1)
         self.assertEqual("completion.gate", event["category"])
         self.assertEqual("completion_gate", event["stage"])
@@ -15379,6 +15505,12 @@ class TestModelUpdater(unittest.TestCase):
             "builder": "match", "expected": "not_checked",
         }, event["details"]["local_root_proof_checks"])
         self.assertEqual("unknown", event["details"]["local_root_scan_start_relation"])
+        self.assertEqual("local_root_proof_transition.v1", transition_event["details"]["schema"])
+        self.assertIn(transition_event["details"]["writer"], {
+            "set_local_files", "adopt_local_root_scan_sources",
+        })
+        self.assertEqual("completed", transition_event["details"]["outcome"])
+        self.assertEqual(17, len(transition_event["details"]))
         if capture_records is not None:
             captured = next(
                 record["capture"]["projection"] for record in capture_records
@@ -15394,6 +15526,29 @@ class TestModelUpdater(unittest.TestCase):
                 "result": True, "start_relation": "unknown", "entry": "present", "run": "match",
                 "generation": "match", "builder": "match", "expected": "not_checked",
             }, captured["completion_gate"]["local_root_proof"])
+            captured_transition = next(
+                record["capture"]["projection"]["local_root_proof_transition"]
+                for record in capture_records
+                if record.get("capture", {}).get("state") == "record"
+                and "local_root_proof_transition" in record["capture"]["projection"]
+            )
+            self.assertEqual("scan.root_shape", next(
+                record["capture"]["projection"]["category"] for record in capture_records
+                if record.get("capture", {}).get("state") == "record"
+                and "local_root_proof_transition" in record["capture"]["projection"]
+            ))
+            self.assertEqual("model_builder_local_root_proof_transition", next(
+                record["capture"]["projection"]["stage"] for record in capture_records
+                if record.get("capture", {}).get("state") == "record"
+                and "local_root_proof_transition" in record["capture"]["projection"]
+            ))
+            self.assertEqual("local_root_proof_transition.v1", captured_transition["schema"])
+            self.assertIn(captured_transition["writer"], {
+                "set_local_files", "adopt_local_root_scan_sources",
+            })
+            self.assertEqual(0, captured_transition["target_index"])
+            self.assertIn(captured_transition["before_proof"], {"absent", "malformed", "present", "unknown"})
+            self.assertIn(captured_transition["after_proof"], {"absent", "malformed", "present", "unknown"})
             captured_text = json.dumps(capture_records)
             self.assertNotIn("pending-local-session", captured_text)
             self.assertNotIn("pending.bin", captured_text)
@@ -15401,6 +15556,29 @@ class TestModelUpdater(unittest.TestCase):
             self.assertTrue(captured["corr_hash"])
             self.assertIsNotNone(capture_size)
             self.assertLess(capture_size, 262144)
+            malformed, irrelevant = capture._projection({
+                "source": "model_updater", "category": "scan.root_shape",
+                "event_type": "diagnostic", "stage": "model_builder_local_root_proof_transition",
+                "level": "info", "message": "local_root_proof_transition",
+                "details": {
+                    "schema": "local_root_proof_transition.v1", "root_corr": "C:\\private\\root",
+                    "writer": "private-writer", "route": "private-route", "transition": "cleared",
+                    "before_proof": "private-session", "after_proof": "absent",
+                    "before_source": "mismatch", "after_source": "unknown",
+                    "before_expected": "not_checked", "after_expected": "mismatch",
+                    "coverage": "complete", "input_presence": "present", "outcome": "completed",
+                    "selected_count": True, "omitted_count": 0, "target_index": 1000,
+                },
+            })
+            self.assertFalse(irrelevant)
+            safe = observer._sanitize_capture_projection(malformed)["local_root_proof_transition"]
+            self.assertIsNone(safe["root_corr"])
+            self.assertEqual("unknown", safe["writer"])
+            self.assertEqual("unknown", safe["route"])
+            self.assertEqual("unknown", safe["before_proof"])
+            self.assertIsNone(safe["selected_count"])
+            self.assertIsNone(safe["target_index"])
+            self.assertNotIn("private", json.dumps(safe))
         self.assertEqual("completion:{}".format(opaque_trace_correlation(
             ModelFile.build_file_id("pending.bin", None),
         )), event["corr_id"])

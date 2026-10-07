@@ -922,6 +922,192 @@ def _controller_breadcrumb_effectively_enabled(
     )
 
 
+_LOCAL_ROOT_PROOF_TRANSITION_SCHEMA = "local_root_proof_transition.v1"
+_LOCAL_ROOT_PROOF_TRANSITION_MAX_TARGETS = 8
+_LOCAL_ROOT_PROOF_TRANSITION_VALUES = frozenset({"match", "mismatch", "unknown", "not_checked"})
+_LOCAL_ROOT_PROOF_TRANSITION_ENTRIES = frozenset({"absent", "malformed", "present", "unknown"})
+_LOCAL_ROOT_PROOF_TRANSITION_ROUTES = frozenset({
+    "legacy_scan_final", "progressive_pair_fallback", "progressive_joint_no_delta",
+    "progressive_root_sources", "progressive_root_sources_empty", "nonprogressive_empty",
+    "accumulator_missing", "source_collection_failed", "unknown",
+})
+
+
+def _pending_root_proof_trace_targets(controller: object, target_ids: object):
+    """Bound proof facts to this update's already-selected diagnostic roots."""
+    if not _controller_breadcrumb_effectively_enabled(controller, "scan.root_shape", "info"):
+        return None
+    targets = tuple(dict.fromkeys(
+        file_id for file_id in target_ids if isinstance(file_id, str)
+    )) if isinstance(target_ids, (set, frozenset, list, tuple)) else ()
+    if len(targets) > _LOCAL_ROOT_PROOF_TRANSITION_MAX_TARGETS:
+        targets = targets[:_LOCAL_ROOT_PROOF_TRANSITION_MAX_TARGETS]
+    coverage = "unknown" if len(targets) == _LOCAL_ROOT_PROOF_TRANSITION_MAX_TARGETS else "complete"
+    return {
+        "targets": targets, "selected_count": len(targets),
+        "omitted_count": None if coverage == "unknown" else 0,
+        "coverage": coverage,
+    }
+
+
+def _local_root_proof_transition_snapshot(builder: object, file_id: str, expected_source=None):
+    details = None
+    try:
+        reader = getattr(builder, "local_root_scan_proof_comparison_details", None)
+        if callable(reader):
+            details = reader(file_id, None, None, expected_source=expected_source)
+    except Exception:
+        details = None
+    if not isinstance(details, dict):
+        return {"proof": "unknown", "source": "unknown", "expected": "unknown"}
+    entry = details.get("entry")
+    source = details.get("builder")
+    expected = details.get("expected")
+    return {
+        "proof": entry if isinstance(entry, str) and entry in _LOCAL_ROOT_PROOF_TRANSITION_ENTRIES else "unknown",
+        "source": source if isinstance(source, str) and source in _LOCAL_ROOT_PROOF_TRANSITION_VALUES else "unknown",
+        "expected": expected if isinstance(expected, str) and expected in _LOCAL_ROOT_PROOF_TRANSITION_VALUES else "unknown",
+    }
+
+
+def _local_root_proof_transition_outcome(writer, before, after, result, before_expected, after_expected):
+    if result == "failed":
+        return "failed"
+    before_present = before.get("proof") == "present"
+    after_present = after.get("proof") == "present"
+    if writer == "set_local_files" and before_present and not after_present:
+        return "pruned"
+    if writer == "adopt_local_root_scan_sources" and before_present and not after_present:
+        return "cleared"
+    if not before_present and after_present:
+        return "bound"
+    if writer == "adopt_local_root_scan_sources" and before_present and after_present and \
+            before_expected == "mismatch" and after_expected == "match":
+        return "rebound"
+    if before_present and after_present and before.get("source") == "match" and after.get("source") == "match":
+        return "retained"
+    if not before_present and not after_present:
+        return "absent"
+    return "unknown"
+
+
+def _record_local_root_proof_transition(
+        controller: object, file_id: Optional[str], *, writer: str, route: str,
+        input_presence: str, before: Mapping[str, str], after: Mapping[str, str],
+        outcome: str, selection: Mapping[str, object], target_index: Optional[int] = None,
+) -> None:
+    """Record one flat, opaque selected-root transition; diagnostic failures are isolated."""
+    try:
+        context = getattr(controller, "_Controller__context", None)
+        trace = getattr(context, "breadcrumb_trace", None)
+        if not _breadcrumb_effectively_enabled(trace, "scan.root_shape", "info"):
+            return
+        root_corr = "completion:" + opaque_trace_correlation(file_id) if isinstance(file_id, str) else None
+        before_expected = before.get("expected", "unknown")
+        after_expected = after.get("expected", "unknown")
+        transition = _local_root_proof_transition_outcome(
+            writer, before, after, outcome, before_expected, after_expected,
+        )
+        details = {
+            "schema": _LOCAL_ROOT_PROOF_TRANSITION_SCHEMA,
+            "root_corr": root_corr,
+            "writer": writer if writer in {"set_local_files", "adopt_local_root_scan_sources"} else "unknown",
+            "route": route if route in _LOCAL_ROOT_PROOF_TRANSITION_ROUTES else "unknown",
+            "input_presence": input_presence if input_presence in {"present", "absent", "invalid", "not_applicable", "unknown"} else "unknown",
+            "outcome": outcome if outcome in {"completed", "failed"} else "unknown",
+            "transition": transition,
+            "before_proof": before.get("proof", "unknown"),
+            "before_source": before.get("source", "unknown"),
+            "before_expected": before_expected,
+            "after_proof": after.get("proof", "unknown"),
+            "after_source": after.get("source", "unknown"),
+            "after_expected": after_expected,
+            "coverage": selection.get("coverage", "unknown"),
+            "selected_count": selection.get("selected_count"),
+            "omitted_count": selection.get("omitted_count", 0),
+            "target_index": target_index,
+        }
+        recorder = getattr(trace, "record", None)
+        if not callable(recorder):
+            return
+        signature = json.dumps(details, sort_keys=True, separators=(",", ":"))
+        recorder(
+            "model_updater", "local_root_proof_transition", details,
+            stage="model_builder_local_root_proof_transition",
+            event_type="diagnostic", category="scan.root_shape", level="info",
+            corr_id=root_corr or opaque_trace_correlation(_LOCAL_ROOT_PROOF_TRANSITION_SCHEMA),
+            trace_scope="completion",
+            _coalesce_key=opaque_trace_correlation(signature),
+        )
+    except Exception:
+        return
+
+
+def _run_local_root_proof_writer(
+        controller: object, builder: object, writer: str, route: str, call: Callable[[], object],
+        *, target_ids: object = (), input_sources: Optional[Mapping[str, object]] = None,
+        input_presence: str = "not_applicable",
+) -> object:
+    """Wrap a real builder proof writer with opt-in scalar before/after evidence."""
+    try:
+        selected_ids = target_ids() if callable(target_ids) else target_ids
+        selection = _pending_root_proof_trace_targets(controller, selected_ids)
+    except BaseException:
+        return call()
+    if selection is None:
+        return call()
+    try:
+        targets = selection["targets"]
+        expected_sources: dict[str, Optional[SystemFile]] = {}
+        before: dict[str, dict[str, str]] = {}
+        per_target_input: dict[str, str] = {}
+        for file_id in targets:
+            raw = input_sources.get(file_id) if isinstance(input_sources, Mapping) else None
+            expected = raw[0] if isinstance(raw, tuple) and len(raw) == 3 and isinstance(raw[0], SystemFile) else None
+            expected_sources[file_id] = expected
+            before[file_id] = _local_root_proof_transition_snapshot(builder, file_id, expected)
+            if input_sources is None:
+                per_target_input[file_id] = input_presence
+            elif file_id not in input_sources:
+                per_target_input[file_id] = "absent"
+            elif expected is not None:
+                per_target_input[file_id] = "present"
+            else:
+                per_target_input[file_id] = "invalid"
+    except BaseException:
+        # Diagnostic preparation must never prevent or alter the authoritative write.
+        return call()
+
+    def record(outcome: str) -> None:
+        try:
+            if not targets:
+                if selection.get("selected_count") or selection.get("coverage") == "unknown":
+                    _record_local_root_proof_transition(
+                        controller, None, writer=writer, route=route, input_presence="unknown",
+                        before={"proof": "unknown", "source": "unknown", "expected": "unknown"},
+                        after={"proof": "unknown", "source": "unknown", "expected": "unknown"},
+                        outcome=outcome, selection=selection,
+                    )
+            for index, file_id in enumerate(targets):
+                after = _local_root_proof_transition_snapshot(builder, file_id, expected_sources.get(file_id))
+                _record_local_root_proof_transition(
+                    controller, file_id, writer=writer, route=route,
+                    input_presence=per_target_input.get(file_id, "unknown"),
+                    before=before[file_id], after=after, outcome=outcome,
+                    selection=selection, target_index=index,
+                )
+        except BaseException:
+            pass
+
+    try:
+        value = call()
+    except BaseException:
+        record("failed")
+        raise
+    record("completed")
+    return value
+
+
 def _queue_flow_ids_for_files(
         controller: object, file_ids: Iterable[object],
 ) -> list[str]:
@@ -8059,9 +8245,10 @@ class ModelUpdater(_ControllerCoreAccess):
                 for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
             }
 
-        def diagnostic_target_root_ids(extra_ids: object = ()) -> tuple[str, ...]:
+        def diagnostic_target_root_ids(extra_ids: object = (), *, root_proof: bool = False) -> tuple[str, ...]:
             """Prioritize roots already selected by this update's bounded work."""
-            if not _controller_breadcrumb_effectively_enabled(controller, "scan.authority", "info"):
+            category = "scan.root_shape" if root_proof else "scan.authority"
+            if not _controller_breadcrumb_effectively_enabled(controller, category, "info"):
                 return ()
             selection_limit = 8
             selected = []
@@ -8070,7 +8257,7 @@ class ModelUpdater(_ControllerCoreAccess):
             def add(values: object) -> None:
                 if len(selected) >= selection_limit:
                     return
-                if not isinstance(values, (set, frozenset, list, tuple)):
+                if not isinstance(values, Iterable) or isinstance(values, (str, bytes, Mapping)):
                     return
                 for file_id in values:
                     if len(selected) >= selection_limit:
@@ -8512,7 +8699,14 @@ class ModelUpdater(_ControllerCoreAccess):
                     accepted_local_files = _merge_targeted_legacy_scan_files(
                         controller, "local", latest_local_scan, latest_local_scan.files,
                     )
-                    model_builder.set_local_files(accepted_local_files)
+                    _run_local_root_proof_writer(
+                        controller, model_builder, "set_local_files", "legacy_scan_final",
+                        lambda: model_builder.set_local_files(accepted_local_files),
+                        target_ids=lambda: diagnostic_target_root_ids(
+                            (ModelFile.build_file_id(file.name, file.path_pair_id) for file in accepted_local_files),
+                            root_proof=True,
+                        ),
+                    )
                     _record_selected_root_scan_join(
                         controller, latest_local_scan, side="local",
                         pending_targets=controller._Controller__pending_completion_file_names,
@@ -8757,11 +8951,25 @@ class ModelUpdater(_ControllerCoreAccess):
                         else:
                             # A legacy builder cannot preserve pair buckets;
                             # retain its established whole-source adapter.
-                            model_builder.set_local_files(joint_local_files)
+                            _run_local_root_proof_writer(
+                                controller, model_builder, "set_local_files", "progressive_pair_fallback",
+                                lambda: model_builder.set_local_files(joint_local_files),
+                                target_ids=lambda: diagnostic_target_root_ids(
+                                    (ModelFile.build_file_id(file.name, file.path_pair_id) for file in joint_local_files),
+                                    root_proof=True,
+                                ),
+                            )
                             model_builder.set_remote_files(joint_remote_files)
                             progressive_source_buckets_adopted = True
                     elif not authoritative_pair_delta_builds:
-                        model_builder.set_local_files(joint_local_files)
+                        _run_local_root_proof_writer(
+                            controller, model_builder, "set_local_files", "progressive_joint_no_delta",
+                            lambda: model_builder.set_local_files(joint_local_files),
+                            target_ids=lambda: diagnostic_target_root_ids(
+                                (ModelFile.build_file_id(file.name, file.path_pair_id) for file in joint_local_files),
+                                root_proof=True,
+                            ),
+                        )
                         model_builder.set_remote_files(joint_remote_files)
                         progressive_source_buckets_adopted = True
                         inventory_completion = getattr(model_builder, "record_local_inventory_completion", None)
@@ -12640,15 +12848,31 @@ class ModelUpdater(_ControllerCoreAccess):
         if callable(local_root_source_adopter):
             local_root_sources: dict[str, tuple[SystemFile, str, int]] = {}
             local_root_source_adoption_succeeded = False
+            local_root_source_route = "nonprogressive_empty"
+            local_root_source_input_known = False
             local_accumulator = getattr(controller, "_Controller__progressive_local_scan_state", None)
             if progressive_mode and isinstance(local_accumulator, _ProgressiveScanAccumulator):
                 try:
                     local_root_sources = local_accumulator.current_root_scan_sources()
+                    local_root_source_route = "progressive_root_sources" if local_root_sources else \
+                        "progressive_root_sources_empty"
+                    local_root_source_input_known = True
                 except Exception:
                     local_root_sources = {}
-            try:
+                    local_root_source_route = "source_collection_failed"
+            elif progressive_mode:
+                local_root_source_route = "accumulator_missing"
+            def adopt_local_root_sources():
                 with controller._Controller__model_lock:
-                    local_root_source_adopter(local_root_sources)
+                    return _run_local_root_proof_writer(
+                        controller, model_builder, "adopt_local_root_scan_sources", local_root_source_route,
+                        lambda: local_root_source_adopter(local_root_sources),
+                        target_ids=lambda: diagnostic_target_root_ids(local_root_sources, root_proof=True),
+                        input_sources=local_root_sources if local_root_source_input_known else None,
+                        input_presence="unknown" if not local_root_source_input_known else "absent",
+                    )
+            try:
+                adopt_local_root_sources()
                 local_root_source_adoption_succeeded = True
             except Exception:
                 # Failed source adoption must not publish Queue proof or fail

@@ -458,7 +458,7 @@ _CAPTURE_CATEGORIES = frozenset({
     "queue.lifecycle", "queue.admission", "queue.executor", "queue.authority", "queue.readiness", "queue.exclusion", "model_page_snapshot",
     "model.lifecycle", "model.progress", "model.publication", "model.finalization", "model.root_progress", "status",
     "transfer.lftp", "transfer.lftp.executor", "transfer.lftp.membership", "transfer.lftp.status", "transfer.stop",
-    "scan.authority", "scan.adoption", "scan.failure", "scan.result", "scan.lifecycle", "scan.terminal_publication", "final_move.publication",
+    "scan.authority", "scan.adoption", "scan.failure", "scan.result", "scan.lifecycle", "scan.root_shape", "scan.terminal_publication", "final_move.publication",
     "finalization.child", "controller", "scanner_process", "lftp.sidecar", "lftp.command", "lftp.status",
     "completion.gate", "transfer.lftp.command", "root.progress", "unknown",
 })
@@ -470,7 +470,7 @@ _CAPTURE_STAGES = frozenset({
     "controller_boundary", "persist_transaction", "lifecycle", "completion_gate", "final_move_publication",
     "finalization_child", "transfer_stop", "command", "lftp_executor", "lftp_sidecar_validation",
     "lftp_path_pair_annotation", "lftp_status_poll", "lftp_command_boundary", "scoped_model_stream", "retirement_cleanup",
-    "path_pair_runtime", "root_progress_status", "completion_gate", "lftp_command_boundary", "ordinary", "refresh", "finish", "transfer", "unknown",
+    "path_pair_runtime", "root_progress_status", "completion_gate", "model_builder_local_root_proof_transition", "lftp_command_boundary", "ordinary", "refresh", "finish", "transfer", "unknown",
 })
 _CAPTURE_KINDS = frozenset({"event", "progress", "status", "completion", "unknown"})
 _CAPTURE_LEVELS = frozenset({"info", "warning", "error", "critical", "debug", "unknown"})
@@ -632,6 +632,19 @@ _CAPTURE_GATE_OUTCOMES = {"stopped", "deferred", "downloaded", "unknown"}
 _CAPTURE_PENDING_MOVE_MESSAGES = {"pending_completion_move_decision"}
 _CAPTURE_GATE_DECISION_MESSAGES = {"completion_gate_decision"}
 _CAPTURE_PENDING_COMPLETION_AUTHORITY_WAKE_MESSAGE = "pending_completion_authority_wake"
+_CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_SCHEMA = "local_root_proof_transition.v1"
+_CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_MAX_TARGETS = 8
+_CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_RELATIONS = {"match", "mismatch", "unknown", "not_checked"}
+_CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_ENTRIES = {"absent", "malformed", "present", "unknown"}
+_CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_WRITERS = {"set_local_files", "adopt_local_root_scan_sources", "unknown"}
+_CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_ROUTES = {
+    "legacy_scan_final", "progressive_pair_fallback", "progressive_joint_no_delta",
+    "progressive_root_sources", "progressive_root_sources_empty", "nonprogressive_empty",
+    "accumulator_missing", "source_collection_failed", "unknown",
+}
+_CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_STATES = {
+    "completed", "failed", "pruned", "cleared", "bound", "rebound", "retained", "absent", "unknown",
+}
 _CAPTURE_LOCAL_ROOT_PROOF_RELATIONS = {"match", "mismatch", "unknown"}
 _CAPTURE_LOCAL_ROOT_PROOF_ENTRIES = {"absent", "malformed", "present", "unknown"}
 _CAPTURE_LOCAL_ROOT_PROOF_EXPECTED = _CAPTURE_LOCAL_ROOT_PROOF_RELATIONS | {"not_checked"}
@@ -1102,6 +1115,35 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
                 "expected": proof.get("expected") if isinstance(proof.get("expected"), str) and proof.get("expected") in _CAPTURE_LOCAL_ROOT_PROOF_EXPECTED else "unknown",
             }
         result["completion_gate"] = safe_gate
+    proof_transition = value.get("local_root_proof_transition")
+    if isinstance(proof_transition, Mapping):
+        safe_transition: dict[str, object] = {
+            "schema": _CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_SCHEMA
+            if proof_transition.get("schema") == _CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_SCHEMA else "unknown",
+            "root_corr": proof_transition.get("root_corr") if isinstance(proof_transition.get("root_corr"), str)
+            and re.fullmatch(r"completion:[0-9a-f]{16}", proof_transition["root_corr"]) else None,
+        }
+        for key, allowed in (
+            ("writer", _CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_WRITERS),
+            ("route", _CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_ROUTES),
+            ("transition", _CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_STATES),
+            ("before_proof", _CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_ENTRIES),
+            ("after_proof", _CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_ENTRIES),
+            ("before_source", _CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_RELATIONS),
+            ("after_source", _CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_RELATIONS),
+            ("before_expected", _CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_RELATIONS),
+            ("after_expected", _CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_RELATIONS),
+            ("coverage", {"complete", "partial", "omitted", "unknown"}),
+            ("input_presence", {"present", "absent", "invalid", "not_applicable", "unknown"}),
+            ("outcome", {"completed", "failed", "unknown"}),
+        ):
+            item = proof_transition.get(key)
+            safe_transition[key] = item if isinstance(item, str) and item in allowed else "unknown"
+        for key in ("selected_count", "omitted_count", "target_index"):
+            item = proof_transition.get(key)
+            maximum = _CAPTURE_LOCAL_ROOT_PROOF_TRANSITION_MAX_TARGETS - 1 if key == "target_index" else 2 ** 31 - 1
+            safe_transition[key] = item if type(item) is int and 0 <= item <= maximum else None
+        result["local_root_proof_transition"] = safe_transition
     final_move = value.get("final_move_publication")
     if isinstance(final_move, Mapping):
         message = final_move.get("message")

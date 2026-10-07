@@ -39,7 +39,7 @@ _CATEGORIES = frozenset(
         "model.publication", "model.finalization", "model.root_progress", "status",
         "transfer.lftp", "transfer.lftp.executor", "transfer.lftp.membership",
         "transfer.lftp.status", "transfer.stop", "scan.authority", "scan.adoption", "scan.failure",
-        "scan.result", "scan.terminal_publication", "scan.lifecycle", "final_move.publication",
+        "scan.result", "scan.terminal_publication", "scan.lifecycle", "scan.root_shape", "final_move.publication",
         "finalization.child", "controller", "scanner_process", "lftp.sidecar",
         "lftp.command", "lftp.status", "completion.gate", "transfer.lftp.command", "root.progress",
     }
@@ -60,7 +60,7 @@ _STAGES = frozenset(
         "completion_gate", "final_move_publication", "finalization_child", "transfer_stop", "command",
         "lftp_executor", "lftp_sidecar_validation", "lftp_path_pair_annotation", "lftp_status_poll",
         "lftp_command_boundary", "scoped_model_stream", "retirement_cleanup", "path_pair_runtime",
-        "root_progress_status", "completion_gate", "ordinary", "refresh", "finish", "transfer", "model_page_snapshot",
+        "root_progress_status", "completion_gate", "model_builder_local_root_proof_transition", "ordinary", "refresh", "finish", "transfer", "model_page_snapshot",
     }
 )
 _LEVELS = frozenset({"info", "warning", "error", "critical", "debug"})
@@ -267,6 +267,20 @@ _COMPLETION_GATE_OUTCOMES = frozenset({"stopped", "deferred", "downloaded", "unk
 _PENDING_COMPLETION_MOVE_MESSAGES = frozenset({"pending_completion_move_decision"})
 _COMPLETION_GATE_DECISION_MESSAGES = frozenset({"completion_gate_decision"})
 _PENDING_COMPLETION_AUTHORITY_WAKE_MESSAGE = "pending_completion_authority_wake"
+_LOCAL_ROOT_PROOF_TRANSITION_MESSAGE = "local_root_proof_transition"
+_LOCAL_ROOT_PROOF_TRANSITION_SCHEMA = "local_root_proof_transition.v1"
+_LOCAL_ROOT_PROOF_TRANSITION_MAX_TARGETS = 8
+_LOCAL_ROOT_PROOF_TRANSITION_RELATIONS = frozenset({"match", "mismatch", "unknown", "not_checked"})
+_LOCAL_ROOT_PROOF_TRANSITION_ENTRIES = frozenset({"absent", "malformed", "present", "unknown"})
+_LOCAL_ROOT_PROOF_TRANSITION_WRITERS = frozenset({"set_local_files", "adopt_local_root_scan_sources", "unknown"})
+_LOCAL_ROOT_PROOF_TRANSITION_ROUTES = frozenset({
+    "legacy_scan_final", "progressive_pair_fallback", "progressive_joint_no_delta",
+    "progressive_root_sources", "progressive_root_sources_empty", "nonprogressive_empty",
+    "accumulator_missing", "source_collection_failed", "unknown",
+})
+_LOCAL_ROOT_PROOF_TRANSITION_STATES = frozenset({
+    "completed", "failed", "pruned", "cleared", "bound", "rebound", "retained", "absent", "unknown",
+})
 _LOCAL_ROOT_PROOF_SHAPES = frozenset({"directory_root", "non_directory", "unknown"})
 _LOCAL_ROOT_PROOF_RELATIONS = frozenset({"match", "mismatch", "unknown"})
 _LOCAL_ROOT_PROOF_ENTRIES = frozenset({"absent", "malformed", "present", "unknown"})
@@ -545,6 +559,37 @@ def _completion_gate_facts(details: Mapping[str, object], message: object = None
         result["exact_final_file_proof"] = (
             details.get("exact_final_file_proof") if type(details.get("exact_final_file_proof")) is bool else None
         )
+    return result
+
+
+def _local_root_proof_transition_facts(details: Mapping[str, object], message: object = None) -> dict[str, object] | None:
+    if message != _LOCAL_ROOT_PROOF_TRANSITION_MESSAGE:
+        return None
+    result: dict[str, object] = {
+        "schema": _LOCAL_ROOT_PROOF_TRANSITION_SCHEMA if details.get("schema") == _LOCAL_ROOT_PROOF_TRANSITION_SCHEMA else "unknown",
+        "root_corr": details.get("root_corr") if isinstance(details.get("root_corr"), str)
+        and re.fullmatch(r"completion:[0-9a-f]{16}", details["root_corr"]) else None,
+    }
+    for key, allowed in (
+        ("writer", _LOCAL_ROOT_PROOF_TRANSITION_WRITERS),
+        ("route", _LOCAL_ROOT_PROOF_TRANSITION_ROUTES),
+        ("transition", _LOCAL_ROOT_PROOF_TRANSITION_STATES),
+        ("before_proof", _LOCAL_ROOT_PROOF_TRANSITION_ENTRIES),
+        ("after_proof", _LOCAL_ROOT_PROOF_TRANSITION_ENTRIES),
+        ("before_source", _LOCAL_ROOT_PROOF_TRANSITION_RELATIONS),
+        ("after_source", _LOCAL_ROOT_PROOF_TRANSITION_RELATIONS),
+        ("before_expected", _LOCAL_ROOT_PROOF_TRANSITION_RELATIONS),
+        ("after_expected", _LOCAL_ROOT_PROOF_TRANSITION_RELATIONS),
+        ("coverage", frozenset({"complete", "partial", "omitted", "unknown"})),
+        ("input_presence", frozenset({"present", "absent", "invalid", "not_applicable", "unknown"})),
+        ("outcome", frozenset({"completed", "failed", "unknown"})),
+    ):
+        value = details.get(key)
+        result[key] = value if isinstance(value, str) and value in allowed else "unknown"
+    for key in ("selected_count", "omitted_count", "target_index"):
+        value = details.get(key)
+        maximum = _LOCAL_ROOT_PROOF_TRANSITION_MAX_TARGETS - 1 if key == "target_index" else 2 ** 31 - 1
+        result[key] = value if type(value) is int and 0 <= value <= maximum else None
     return result
 
 
@@ -1164,6 +1209,10 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         if category == "transfer.lftp.membership" else None
     )
     gate = _completion_gate_facts(details, message) if category == "completion.gate" else None
+    proof_transition = (
+        _local_root_proof_transition_facts(details, message)
+        if category == "scan.root_shape" else None
+    )
     final_move = (
         _final_move_publication_facts(details, message) if category == "final_move.publication" else None
     )
@@ -1232,6 +1281,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["lftp_status_membership"] = lftp_status_membership
     if gate is not None:
         result["completion_gate"] = gate
+    if proof_transition is not None:
+        result["local_root_proof_transition"] = proof_transition
     if final_move is not None:
         result["final_move_publication"] = final_move
     if automatic_move_boundary is not None:
