@@ -165,6 +165,36 @@ class TestModelBuilder(unittest.TestCase):
                 self.assertIn(key, row["details"])
         self.assertEqual(0, collector.snapshot()["drops"]["policy"])
 
+    def test_explicit_input_arbitration_targets_extend_root_sample_to_eight(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=64,
+            policy={"default": "off", "rules": {"scan.authority": "info"}})
+        self.addCleanup(collector.close)
+        builder = ModelBuilder()
+        roots = [SystemFile("selected-root-{}".format(index), 12, True) for index in range(10)]
+        builder.set_remote_files(roots)
+        builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        target_ids = tuple(ModelFile.build_file_id(root.name, root.path_pair_id) for root in roots)
+
+        builder.build_model(diagnostic_target_root_ids=target_ids)
+
+        rows = [row for row in self.__trace_entries(collector, True)
+                if row["message"] == "input_arbitration_witness"]
+        summary = next(row["details"] for row in rows if row["details"]["phase"] == "summary")
+        root_rows = [row for row in rows if row["details"]["phase"] == "root_fill"]
+        source_rows = [row for row in rows if row["details"]["phase"] == "root_source"]
+        expected_root_ids = {
+            opaque_trace_correlation(file_id) for file_id in target_ids[:8]
+        }
+        self.assertEqual(8, summary["root_rows_sampled"])
+        self.assertEqual(2, summary["root_rows_omitted"])
+        self.assertEqual(8, len(root_rows))
+        self.assertEqual(8, len(source_rows))
+        self.assertEqual(expected_root_ids, {row["details"]["root_id"] for row in root_rows})
+        self.assertEqual(expected_root_ids, {row["details"]["root_id"] for row in source_rows})
+        self.assertEqual(17, len(rows))
+        self.assertEqual({"scan.authority"}, {row.get("category") for row in rows})
+        self.assertEqual(0, collector.snapshot()["drops"]["policy"])
+
     def test_root_source_witness_binds_exact_builder_local_object_and_cache_hit_is_semantic_noop(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=32,
             policy={"default": "off", "rules": {"scan.authority": "info"}})

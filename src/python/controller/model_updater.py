@@ -119,53 +119,78 @@ def _record_selected_root_scan_join(
         controller: "Controller", scan: object, *, side: str,
         pending_targets: object,
         local_scan_mode: object = None, accepted_local_roots: object = None,
+        selected_root_targets: object = (),
 ) -> None:
     """Join an accepted scan's opaque session identity to selected roots, boundedly."""
     try:
         if not _controller_breadcrumb_effectively_enabled(controller, "scan.authority", "info"):
             return
         if side == "local" and accepted_local_roots is not None:
-            if not isinstance(pending_targets, (set, frozenset, list, tuple)):
-                return
             targets = []
             seen = set()
             omitted = False
-            for entry in pending_targets:
-                if not isinstance(entry, tuple) or len(entry) < 2 or \
-                        not isinstance(entry[0], str) or not entry[0] or \
-                        (entry[1] is not None and not isinstance(entry[1], str)):
-                    continue
-                file_id = ModelFile.build_file_id(entry[0], entry[1])
-                if file_id in seen:
-                    continue
-                if len(targets) >= _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT:
-                    omitted = True
-                    break
-                seen.add(file_id)
-                targets.append((file_id, entry[1]))
+            if isinstance(pending_targets, (set, frozenset, list, tuple)):
+                for entry in pending_targets:
+                    if not isinstance(entry, tuple) or len(entry) < 2 or \
+                            not isinstance(entry[0], str) or not entry[0] or \
+                            (entry[1] is not None and not isinstance(entry[1], str)):
+                        continue
+                    file_id = ModelFile.build_file_id(entry[0], entry[1])
+                    if file_id in seen:
+                        continue
+                    if len(targets) >= _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT:
+                        omitted = True
+                        break
+                    seen.add(file_id)
+                    targets.append((file_id, entry[1]))
+            if isinstance(selected_root_targets, (list, tuple, set, frozenset)):
+                for entry in selected_root_targets:
+                    if not isinstance(entry, tuple) or len(entry) != 2 or \
+                            not isinstance(entry[0], str) or not entry[0] or \
+                            (entry[1] is not None and not isinstance(entry[1], str)):
+                        continue
+                    file_id, pair_id = entry
+                    if file_id in seen:
+                        continue
+                    if len(targets) >= _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT:
+                        omitted = True
+                        break
+                    seen.add(file_id)
+                    targets.append((file_id, pair_id))
             if not targets:
                 return
 
             accepted_by_id = {}
             accepted_known = isinstance(accepted_local_roots, (dict, list, tuple, set, frozenset))
+            target_ids = {file_id for file_id, _pair_id in targets}
             if isinstance(accepted_local_roots, dict):
-                for file_id, entry in accepted_local_roots.items():
+                for file_id in target_ids:
+                    entry = accepted_local_roots.get(file_id)
                     root = entry[0] if isinstance(entry, tuple) and len(entry) == 3 else None
                     if isinstance(file_id, str) and isinstance(root, SystemFile):
                         accepted_by_id[file_id] = (root, entry[1], entry[2])
             elif isinstance(accepted_local_roots, (list, tuple, set, frozenset)):
                 for root in accepted_local_roots:
                     if isinstance(root, SystemFile):
-                        accepted_by_id[ModelFile.build_file_id(root.name, root.path_pair_id)] = (
-                            root, None, None,
-                        )
+                        file_id = ModelFile.build_file_id(root.name, root.path_pair_id)
+                        if file_id in target_ids:
+                            accepted_by_id[file_id] = (root, None, None)
+                            target_ids.discard(file_id)
+                            if not target_ids:
+                                break
 
             scan_roots = {}
             raw_roots = getattr(scan, "files", None)
             if isinstance(raw_roots, (list, tuple)):
+                scan_targets = {file_id for file_id, _pair_id in targets}
                 for root in raw_roots:
                     if isinstance(root, SystemFile):
-                        scan_roots[ModelFile.build_file_id(root.name, root.path_pair_id)] = root
+                        file_id = ModelFile.build_file_id(root.name, root.path_pair_id)
+                        if file_id in scan_targets:
+                            scan_roots[file_id] = root
+                            scan_targets.discard(file_id)
+                            if not scan_targets:
+                                break
             scan_pair_tokens = getattr(scan, "_scan_authority_tokens_by_pair", None)
             scan_session = getattr(scan, "session_token", None)
             scan_generation = getattr(scan, "generation", None)
@@ -7240,6 +7265,55 @@ class ModelUpdater(_ControllerCoreAccess):
                 (file.path_pair_id, file.name) for file in result.files
             }
 
+        local_scan_root_targets_cache: Optional[tuple[tuple[str, Optional[str]], ...]] = None
+
+        def current_local_scan_root_targets() -> tuple[tuple[str, Optional[str]], ...]:
+            """Return a bounded sample from only this invocation's local scan scope."""
+            nonlocal local_scan_root_targets_cache
+            if local_scan_root_targets_cache is not None:
+                return local_scan_root_targets_cache
+            if not _controller_breadcrumb_effectively_enabled(controller, "scan.authority", "info"):
+                local_scan_root_targets_cache = ()
+                return local_scan_root_targets_cache
+            result = latest_local_scan
+            if result is None or bool(getattr(result, "failed", False)):
+                local_scan_root_targets_cache = ()
+                return local_scan_root_targets_cache
+            raw_scanned_ids = getattr(result, "scanned_path_pair_ids", None)
+            if not isinstance(raw_scanned_ids, (set, frozenset)):
+                local_scan_root_targets_cache = ()
+                return local_scan_root_targets_cache
+            scanned_ids = raw_scanned_ids
+            selected: list[tuple[str, Optional[str]]] = []
+            seen: set[str] = set()
+
+            def add(path_pair_id: Optional[str], root_name: object) -> bool:
+                if path_pair_id not in scanned_ids or not isinstance(root_name, str) or not root_name:
+                    return True
+                file_id = ModelFile.build_file_id(root_name, path_pair_id)
+                if file_id in seen:
+                    return True
+                seen.add(file_id)
+                selected.append((file_id, path_pair_id))
+                # Keep one extra identity as a bounded omission sentinel for
+                # the existing scan-join sample-limit accounting.
+                return len(selected) <= _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT
+
+            if progressive_mode:
+                for path_pair_id, root_name in side_touched_keys("local", result):
+                    if not add(path_pair_id, root_name):
+                        break
+            else:
+                roots = getattr(result, "files", None)
+                if not isinstance(roots, (list, tuple)):
+                    local_scan_root_targets_cache = ()
+                    return local_scan_root_targets_cache
+                for root in roots:
+                    if isinstance(root, SystemFile) and not add(root.path_pair_id, root.name):
+                        break
+            local_scan_root_targets_cache = tuple(selected)
+            return local_scan_root_targets_cache
+
         joint_local_files: list[SystemFile] = []
         joint_remote_files: list[SystemFile] = []
         joint_unknown_local_ids: set[Optional[str]] = set()
@@ -7958,28 +8032,32 @@ class ModelUpdater(_ControllerCoreAccess):
             """Prioritize roots already selected by this update's bounded work."""
             if not _controller_breadcrumb_effectively_enabled(controller, "scan.authority", "info"):
                 return ()
+            selection_limit = 8
             selected = []
             seen = set()
 
             def add(values: object) -> None:
-                if len(selected) >= 4:
+                if len(selected) >= selection_limit:
                     return
                 if not isinstance(values, (set, frozenset, list, tuple)):
                     return
                 for file_id in values:
-                    if len(selected) >= 4:
+                    if len(selected) >= selection_limit:
                         return
                     if isinstance(file_id, str) and file_id not in seen:
                         seen.add(file_id)
                         selected.append(file_id)
-                        if len(selected) >= 4:
+                        if len(selected) >= selection_limit:
                             return
 
             add(pending_completion_file_ids())
             add(active_lftp_status_file_ids)
             add(pre_poll_active_lftp_file_ids)
             add(extra_ids)
-            if scoped_final_pair_ids and len(selected) < 4:
+            add(tuple(
+                file_id for file_id, _pair_id in current_local_scan_root_targets()
+            ))
+            if scoped_final_pair_ids and len(selected) < selection_limit:
                 for file in tuple(joint_local_files) + tuple(joint_remote_files):
                     if file.path_pair_id not in scoped_final_pair_ids:
                         continue
@@ -7987,7 +8065,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     if file_id not in seen:
                         seen.add(file_id)
                         selected.append(file_id)
-                        if len(selected) >= 4:
+                        if len(selected) >= selection_limit:
                             break
             return tuple(selected)
 
@@ -8400,6 +8478,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         controller, latest_local_scan, side="local",
                         pending_targets=controller._Controller__pending_completion_file_names,
                         local_scan_mode="legacy", accepted_local_roots=accepted_local_files,
+                        selected_root_targets=current_local_scan_root_targets(),
                     )
                     inventory_completion = getattr(model_builder, "record_local_inventory_completion", None)
                     if callable(inventory_completion):
@@ -12532,6 +12611,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     controller, latest_local_scan, side="local",
                     pending_targets=controller._Controller__pending_completion_file_names,
                     local_scan_mode="progressive", accepted_local_roots=local_root_sources,
+                    selected_root_targets=current_local_scan_root_targets(),
                 )
 
         if remote_reconciliation_established and reconciliation_healthy \

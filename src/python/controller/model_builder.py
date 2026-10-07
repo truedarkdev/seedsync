@@ -5141,7 +5141,7 @@ class ModelBuilder:
             if input_witness is None or file_id not in input_witness.get("priority_roots", ()):
                 return
             selected = input_witness.setdefault("selection_by_root", {})
-            if len(selected) >= 4 and file_id not in selected:
+            if len(selected) >= input_witness.get("root_row_limit", 4) and file_id not in selected:
                 return
             selected[file_id] = {
                 "selection_reason": reason,
@@ -7288,16 +7288,19 @@ class ModelBuilder:
                 for file_id in diagnostic_target_root_ids:
                     if isinstance(file_id, str) and file_id not in priority_roots:
                         priority_roots.append(file_id)
-                        if len(priority_roots) == 4:
+                        if len(priority_roots) == 8:
                             break
+            explicit_priority_roots = bool(priority_roots)
             if not priority_roots:
                 for file_id, node in self.__active_files.items():
                     if self.__nested_active_file_root_file_id(node) is None:
                         priority_roots.append(file_id)
                         if len(priority_roots) == 4:
                             break
+            root_row_limit = 8 if explicit_priority_roots else 4
             return {"corr": "input-arbitration:" + opaque_trace_correlation(str(time.monotonic_ns())),
                     "priority_roots": tuple(priority_roots),
+                    "root_row_limit": root_row_limit,
                     "selection_by_root": {},
                     "split_leaf_facts": {},
                     "root_rows_sampled": 0, "root_rows_omitted": 0,
@@ -7393,7 +7396,8 @@ class ModelBuilder:
                     "remote_leaf_rows_sampled", "remote_leaf_rows_omitted")})
             else:
                 prefix = "remote_leaf" if leaf else "root"
-                if facts is None or context[prefix + "_rows_sampled"] >= (8 if leaf else 4):
+                row_limit = 8 if leaf else context["root_row_limit"]
+                if facts is None or context[prefix + "_rows_sampled"] >= row_limit:
                     context[prefix + "_rows_omitted"] += 1
                     return
                 if not leaf:
@@ -7523,7 +7527,7 @@ class ModelBuilder:
             remote = remote_files.get(file_id, None)
             local = effective_local_files.get(file_id, None)
             input_facts = self.__input_witness_root(input_witness, file_id, remote, local) if input_witness is not None and \
-                input_witness["root_rows_sampled"] < 4 and \
+                input_witness["root_rows_sampled"] < input_witness["root_row_limit"] and \
                 (not input_witness["priority_roots"] or file_id in input_witness["priority_roots"]) else None
             status = self.__lftp_statuses.get(file_id, None)
             is_stopped = self.__is_stopped_file(file_id, remote, local)

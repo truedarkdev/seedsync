@@ -329,6 +329,59 @@ class TestModelUpdater(unittest.TestCase):
         self.assertTrue(legacy_facts["tc"])
         self.assertEqual(opaque_trace_correlation("system-root-object|{}".format(id(legacy_source))),
                          legacy_facts["ao"])
+
+        controller._record_completion_scan_join_breadcrumb.reset_mock()
+        with patch("controller.model_updater._controller_breadcrumb_effectively_enabled", return_value=True):
+            _record_selected_root_scan_join(
+                controller, legacy_scan, side="local", pending_targets=set(),
+                local_scan_mode="legacy", accepted_local_roots=[legacy_source],
+                selected_root_targets=((file_id, pair_id),),
+            )
+        idle_facts = controller._record_completion_scan_join_breadcrumb.call_args.args[2]["p"]
+        self.assertEqual(1, controller._record_completion_scan_join_breadcrumb.call_count)
+        self.assertEqual(opaque_trace_correlation(
+            "system-root-object|{}".format(id(target))), idle_facts["so"])
+        self.assertEqual(opaque_trace_correlation(
+            "system-root-object|{}".format(id(legacy_source))), idle_facts["ao"])
+        self.assertFalse(controller._record_completion_scan_join_breadcrumb.call_args.args[2][
+            "selected_root_omissions"])
+
+        roots = []
+        accepted_roots = {}
+        selected_targets = []
+        for index in range(20):
+            root = SystemFile("bounded-root-{}".format(index), index + 1, True)
+            root.path_pair_id = pair_id
+            roots.append(root)
+            root_id = ModelFile.build_file_id(root.name, pair_id)
+            accepted_roots[root_id] = (root, "scan-session", 1)
+            selected_targets.append((root_id, pair_id))
+        bounded_scan = ScannerResult(
+            datetime.now(), roots, scanned_path_pair_ids={pair_id},
+            completed_path_pair_ids={pair_id}, generation=1,
+            session_token="scan-session",
+        )
+        bounded_scan._scan_authority_tokens_by_pair = {pair_id: ("scan-session", 1)}
+        controller._record_completion_scan_join_breadcrumb.reset_mock()
+        with patch("controller.model_updater._controller_breadcrumb_effectively_enabled", return_value=True):
+            _record_selected_root_scan_join(
+                controller, bounded_scan, side="local", pending_targets=set(),
+                local_scan_mode="progressive", accepted_local_roots=accepted_roots,
+                selected_root_targets=tuple(selected_targets),
+            )
+        bounded_calls = controller._record_completion_scan_join_breadcrumb.call_args_list
+        self.assertEqual(16, len(bounded_calls))
+        self.assertTrue(all(call.args[2]["selected_root_omissions"] for call in bounded_calls))
+
+        controller._record_completion_scan_join_breadcrumb.reset_mock()
+        with patch("controller.model_updater._controller_breadcrumb_effectively_enabled", return_value=False):
+            _record_selected_root_scan_join(
+                controller, bounded_scan, side="local", pending_targets=set(),
+                local_scan_mode="progressive", accepted_local_roots=accepted_roots,
+                selected_root_targets=tuple(selected_targets),
+            )
+        controller._record_completion_scan_join_breadcrumb.assert_not_called()
+
     def test_active_scan_adoption_join_keeps_incomplete_results_and_bounds_roots(self):
         controller = SimpleNamespace(
             logger=MagicMock(),
@@ -2404,6 +2457,149 @@ class TestModelUpdater(unittest.TestCase):
                 "mismatched_session": mismatched_session_state,
             },
         )
+
+    def test_idle_scoped_local_scan_reaches_scan_join_and_builder_source_from_process_queue(self):
+        durable_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(durable_dir.cleanup)
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=128,
+            policy={"default": "off", "rules": {"scan.authority": "info"}},
+            durable_enabled=True, durable_path=durable_dir.name,
+        )
+        self.addCleanup(trace.close)
+        local_process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+        remote_process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+        self.addCleanup(local_process.close_queues)
+        self.addCleanup(remote_process.close_queues)
+        builder = ModelBuilder()
+        builder.set_stop_resume_trace_breadcrumb(trace.create_emitter())
+        controller, builder = self._make_progressive_update_controller(
+            None, authoritative=False, model_builder=builder, model=builder.build_model(),
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__local_scan_process = local_process
+        controller._Controller__remote_scan_process = remote_process
+
+        def record_breadcrumb(**kwargs):
+            values = dict(kwargs)
+            message = values.pop("message")
+            details = values.pop("details")
+            trace.record("controller", message, details, **values)
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        controller._record_completion_scan_join_breadcrumb = lambda file_id, message, details: \
+            Controller._record_completion_scan_join_breadcrumb(
+                controller, file_id, message, details,
+            )
+
+        roots = []
+        for index in range(5):
+            root = SystemFile("scoped-root-{}".format(index), 8 + index, True)
+            root.path_pair_id = "scoped-pair"
+            roots.append(root)
+        outside_scope = SystemFile("outside-root", 9, True)
+        outside_scope.path_pair_id = "other-pair"
+        result = ScannerResult(
+            datetime.now(), roots + [outside_scope],
+            scanned_path_pair_ids={"scoped-pair"},
+            completed_path_pair_ids={"scoped-pair"},
+            generation=1, is_progress=True, is_scan_final=True,
+            session_token=local_process.session_token,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"scoped-pair"},
+            root_names={root.name for root in roots},
+            root_scan_outcomes_by_pair={
+                "scoped-pair": {root.name: (True, True) for root in roots}
+            },
+        )
+        local_process._ScannerProcess__publish_result(result)
+        ModelUpdater(controller).update()
+
+        flushed = trace.flush_durable(2.0)
+        health = trace.durable_snapshot()
+        if os.name == "nt" and not flushed:
+            # The writer emits the JSONL rows, but Windows ACL verification
+            # disables the durable health acknowledgement/offline retrieval.
+            self.assertEqual("windows_acl_unverified", health.get("path_safety"), health)
+            self.assertEqual("unsupported", health.get("offline_retrieval"), health)
+            self.assertGreater(health.get("accepted", 0), 0, health)
+            self.assertEqual(health.get("accepted"), health.get("written"), health)
+            self.assertEqual(0, health.get("lost"), health)
+            self.assertEqual(0, health.get("writer_failures"), health)
+            self.assertEqual(0, health.get("flush_failures"), health)
+        else:
+            self.assertTrue(flushed, health)
+        durable_path = os.path.join(durable_dir.name, "breadcrumbs.jsonl")
+        self.assertTrue(os.path.isfile(durable_path))
+        with open(durable_path, encoding="utf-8") as handle:
+            rows = [json.loads(line) for line in handle if line.strip()]
+        event_rows = [row for row in rows if isinstance(row.get("message"), str)]
+        expected_ids = {
+            opaque_trace_correlation(ModelFile.build_file_id(root.name, "scoped-pair"))
+            for root in roots
+        }
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        scan_rows = {
+            row["corr_id"][len("completion:"):]: row
+            for row in event_rows if row.get("message") == "scan_root_adopted" and
+            isinstance(row.get("corr_id"), str) and row["corr_id"].startswith("completion:")
+        }
+        adopted_scan_rows = {
+            root_id: row for root_id, row in scan_rows.items()
+            if row.get("details", {}).get("adopted") is True
+        }
+        source_rows = {
+            row.get("details", {}).get("root_id"): row
+            for row in event_rows if row.get("message") == "input_arbitration_witness" and
+            row.get("details", {}).get("phase") == "root_source"
+        }
+        self.assertEqual(expected_ids, set(adopted_scan_rows))
+        # Preserve the existing unbound pending-target row: it is a local-scan
+        # join, but it has no accepted/source object and was not adopted.
+        for root_id, row in scan_rows.items():
+            if root_id in expected_ids:
+                continue
+            self.assertFalse(row["details"]["adopted"])
+            self.assertFalse(row["details"]["root_present"])
+            self.assertEqual("progressive", row["details"]["p"]["m"])
+            self.assertIsNone(row["details"]["p"]["so"])
+            self.assertIsNone(row["details"]["p"]["ao"])
+        self.assertTrue(expected_ids.issubset(source_rows))
+        self.assertLessEqual(len(source_rows), 8)
+        last_target_id = opaque_trace_correlation(
+            ModelFile.build_file_id(roots[-1].name, "scoped-pair")
+        )
+        self.assertIn(last_target_id, source_rows)
+        for root in roots:
+            expected_id = opaque_trace_correlation(
+                ModelFile.build_file_id(root.name, "scoped-pair")
+            )
+            scan_row = scan_rows[expected_id]
+            source_row = source_rows[expected_id]
+            self.assertEqual(opaque_trace_correlation(
+                "system-root-object|{}".format(id(root))), scan_row["details"]["p"]["so"])
+            self.assertEqual(scan_row["details"]["p"]["ao"], source_row["details"]["p"]["lo"])
+            self.assertEqual("completion_scan_join.v1", scan_row["details"]["schema"])
+            self.assertEqual("model_input_arbitration.v1", source_row["details"]["schema"])
+            self.assertEqual("scan.authority", scan_row["category"])
+            self.assertEqual("scan.authority", source_row["category"])
+            self.assertLess(event_rows.index(scan_row), event_rows.index(source_row))
+        root_fill_ids = {
+            row.get("details", {}).get("root_id")
+            for row in event_rows if row.get("message") == "input_arbitration_witness" and
+            row.get("details", {}).get("phase") == "root_fill"
+        }
+        if root_fill_ids:
+            self.assertTrue(expected_ids.issubset(root_fill_ids))
+        self.assertFalse(any(
+            row.get("message") == "scan_root_adopted" and row.get("corr_id") == "completion:" +
+            opaque_trace_correlation(ModelFile.build_file_id("outside-root", "other-pair"))
+            for row in event_rows
+        ))
+        retained_path = os.environ.get("SEEDSYNC_COMPLETION_FINALIZED_ROWS_PATH")
+        if retained_path:
+            with open(retained_path, "a", encoding="utf-8") as handle:
+                for row in event_rows:
+                    handle.write(json.dumps(row, separators=(",", ":")) + "\n")
 
     def test_nonfull_completion_marker_does_not_complete_or_mark_pair_full(self):
         accumulator = _ProgressiveScanAccumulator()
@@ -9018,6 +9214,9 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__pending_completion_file_names = {
             ("pending-{}".format(index), None, None) for index in range(4)
         }
+        controller._Controller__prev_downloading_file_names = {
+            ("active-{}".format(index), None, None) for index in range(5)
+        }
 
         ModelUpdater(controller).update()
 
@@ -9025,11 +9224,17 @@ class TestModelUpdater(unittest.TestCase):
         build_args, build_kwargs = model_builder.build_progressive_roots.call_args
         self.assertEqual((partial.files, partial.files, {None}), build_args)
         selected_ids = build_kwargs["diagnostic_target_root_ids"]
-        self.assertEqual(4, len(selected_ids))
-        self.assertCountEqual(
-            [ModelFile.build_file_id("pending-{}".format(index), None) for index in range(4)],
-            selected_ids,
-        )
+        self.assertEqual(8, len(selected_ids))
+        pending_ids = {
+            ModelFile.build_file_id("pending-{}".format(index), None) for index in range(4)
+        }
+        active_ids = {
+            ModelFile.build_file_id("active-{}".format(index), None) for index in range(5)
+        }
+        selected_set = set(selected_ids)
+        self.assertTrue(pending_ids.issubset(selected_set))
+        self.assertEqual(4, len(selected_set.intersection(active_ids)))
+        self.assertTrue(selected_set.issubset(pending_ids.union(active_ids)))
         self.assertNotIn(ModelFile.build_file_id("root", None), selected_ids)
         model_builder.set_remote_files.assert_not_called()
         model_builder.set_local_files.assert_not_called()
