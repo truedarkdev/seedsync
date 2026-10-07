@@ -602,6 +602,59 @@ def test_composed_producer_rows_retain_finite_lifecycle_facts_and_hashes(tmp_pat
     assert all(label not in text for label in ("private-flow-label", "private-correlation-label", "private-file-label", "private-pair-label"))
 
 
+def test_pending_completion_wake_projects_bounded_local_root_proof_comparisons(tmp_path: Path) -> None:
+    spool, artifact = _prepare(tmp_path)
+    details = {
+        "schema": "pending_completion_authority_wake.v1",
+        "decision": "blocked",
+        "reason": "local_scope_unreconciled",
+        "local_root_proof_shape": "directory_root",
+        "local_root_proof_inputs_known": True,
+        "local_root_proof_checker_available": True,
+        "local_root_proof_result": False,
+        "local_root_scan_start_relation": "unknown",
+        "local_root_proof_checks": {
+            "entry": "present", "run": "mismatch", "generation": "match",
+            "builder": "match", "expected": "not_checked",
+        },
+        "private_session": "private-session-label",
+        "raw_path": "/private/root",
+    }
+    reader = _reader(spool, artifact)
+    try:
+        reader.start()
+        (spool / "breadcrumbs.jsonl").write_bytes(_row(
+            category="completion.gate", event_type="diagnostic", stage="completion_gate",
+            source="model_updater", label="pending_completion_authority_wake", details=details,
+        ))
+        assert reader.poll() == 1
+    finally:
+        reader.close()
+    text = artifact.read_text(encoding="utf-8")
+    records = _artifacts(artifact)
+    projection = next(
+        item["capture"]["projection"] for item in records
+        if item.get("capture", {}).get("state") == "record"
+    )
+    assert (projection["category"], projection["stage"], projection["event_type"]) == (
+        "completion.gate", "completion_gate", "diagnostic",
+    )
+    assert projection["completion_gate"] == {
+        "boundary": "completion_gate", "decision": "blocked",
+        "reason": "local_scope_unreconciled", "message": "pending_completion_authority_wake",
+        "schema": "pending_completion_authority_wake.v1",
+        "local_root_proof": {
+            "shape": "directory_root", "inputs_known": True, "checker_available": True,
+            "result": False, "start_relation": "unknown", "entry": "present",
+            "run": "mismatch", "generation": "match", "builder": "match",
+            "expected": "not_checked",
+        },
+    }
+    assert "private-session-label" not in text
+    assert "/private/root" not in text
+    assert "private-correlation-label" not in text
+
+
 def test_malformed_and_oversized_lines_are_explicit_loss(tmp_path: Path) -> None:
     spool, artifact = _prepare(tmp_path)
     reader = _reader(spool, artifact)

@@ -631,6 +631,10 @@ _CAPTURE_GATE_REASONS = {
 _CAPTURE_GATE_OUTCOMES = {"stopped", "deferred", "downloaded", "unknown"}
 _CAPTURE_PENDING_MOVE_MESSAGES = {"pending_completion_move_decision"}
 _CAPTURE_GATE_DECISION_MESSAGES = {"completion_gate_decision"}
+_CAPTURE_PENDING_COMPLETION_AUTHORITY_WAKE_MESSAGE = "pending_completion_authority_wake"
+_CAPTURE_LOCAL_ROOT_PROOF_RELATIONS = {"match", "mismatch", "unknown"}
+_CAPTURE_LOCAL_ROOT_PROOF_ENTRIES = {"absent", "malformed", "present", "unknown"}
+_CAPTURE_LOCAL_ROOT_PROOF_EXPECTED = _CAPTURE_LOCAL_ROOT_PROOF_RELATIONS | {"not_checked"}
 _CAPTURE_PENDING_MOVE_PHASES = {"authority", "move", "candidate"}
 _CAPTURE_PENDING_MOVE_PROOF_SOURCES = {
     "model_lookup", "local_scan_scope", "remote_scan_scope", "lftp_status",
@@ -1075,6 +1079,28 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
             )
             exact_final = gate.get("exact_final_file_proof")
             safe_gate["exact_final_file_proof"] = exact_final if type(exact_final) is bool else None
+        elif message == _CAPTURE_PENDING_COMPLETION_AUTHORITY_WAKE_MESSAGE:
+            safe_gate["message"] = message
+            safe_gate["schema"] = (
+                "pending_completion_authority_wake.v1"
+                if gate.get("schema") == "pending_completion_authority_wake.v1" else "unknown"
+            )
+            proof = gate.get("local_root_proof")
+            proof = proof if isinstance(proof, Mapping) else {}
+            shape = proof.get("shape")
+            relation = proof.get("start_relation")
+            safe_gate["local_root_proof"] = {
+                "shape": shape if isinstance(shape, str) and shape in {"directory_root", "non_directory", "unknown"} else "unknown",
+                "inputs_known": proof.get("inputs_known") if type(proof.get("inputs_known")) is bool else None,
+                "checker_available": proof.get("checker_available") if type(proof.get("checker_available")) is bool else None,
+                "result": proof.get("result") if type(proof.get("result")) is bool else None,
+                "start_relation": relation if isinstance(relation, str) and relation in {"before", "after", "unknown"} else "unknown",
+                "entry": proof.get("entry") if isinstance(proof.get("entry"), str) and proof.get("entry") in _CAPTURE_LOCAL_ROOT_PROOF_ENTRIES else "unknown",
+                "run": proof.get("run") if isinstance(proof.get("run"), str) and proof.get("run") in _CAPTURE_LOCAL_ROOT_PROOF_RELATIONS else "unknown",
+                "generation": proof.get("generation") if isinstance(proof.get("generation"), str) and proof.get("generation") in _CAPTURE_LOCAL_ROOT_PROOF_RELATIONS else "unknown",
+                "builder": proof.get("builder") if isinstance(proof.get("builder"), str) and proof.get("builder") in _CAPTURE_LOCAL_ROOT_PROOF_RELATIONS else "unknown",
+                "expected": proof.get("expected") if isinstance(proof.get("expected"), str) and proof.get("expected") in _CAPTURE_LOCAL_ROOT_PROOF_EXPECTED else "unknown",
+            }
         result["completion_gate"] = safe_gate
     final_move = value.get("final_move_publication")
     if isinstance(final_move, Mapping):

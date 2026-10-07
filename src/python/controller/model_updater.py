@@ -9214,6 +9214,15 @@ class ModelUpdater(_ControllerCoreAccess):
                     details["local_root_proof_checker_available"] = False
                     return details
                 details["local_root_proof_checker_available"] = True
+                comparisons = getattr(builder, "local_root_scan_proof_comparison_details", None)
+                if callable(comparisons):
+                    try:
+                        proof_checks = comparisons(file_id, session_token, generation)
+                        if isinstance(proof_checks, dict):
+                            details["local_root_proof_checks"] = proof_checks
+                    except Exception:
+                        # Comparison evidence is optional and cannot gate the checker.
+                        pass
                 if details["local_root_proof_shape"] == "directory_root" and inputs_known:
                     result = checker(file_id, session_token, generation)
                     if type(result) is bool:

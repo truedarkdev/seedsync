@@ -1,10 +1,13 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import builtins
+import importlib.util
 import unittest
 import logging
 import json
 import os
+from pathlib import Path
+import sys
 import tempfile
 import time
 from copy import copy
@@ -90,6 +93,41 @@ from model.diff import ModelDiff
 from model import ActiveProgressOverlay, Model, ModelFile
 from system import SystemFile
 from system.scanner import SystemScanner
+
+
+def _load_breadcrumb_spool_capture_modules():
+    performance_dir = Path(__file__).resolve().parents[4] / "docker" / "test" / "performance"
+    previous_observer = sys.modules.get("incoming_recovery_observer")
+    previous_capture = sys.modules.get("breadcrumb_spool_capture")
+    def restore() -> None:
+        for name, previous in (
+            ("incoming_recovery_observer", previous_observer),
+            ("breadcrumb_spool_capture", previous_capture),
+        ):
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+    try:
+        observer_spec = importlib.util.spec_from_file_location(
+            "incoming_recovery_observer", performance_dir / "incoming_recovery_observer.py",
+        )
+        assert observer_spec is not None and observer_spec.loader is not None
+        observer = importlib.util.module_from_spec(observer_spec)
+        sys.modules[observer_spec.name] = observer
+        observer_spec.loader.exec_module(observer)
+        capture_spec = importlib.util.spec_from_file_location(
+            "breadcrumb_spool_capture", performance_dir / "breadcrumb_spool_capture.py",
+        )
+        assert capture_spec is not None and capture_spec.loader is not None
+        capture = importlib.util.module_from_spec(capture_spec)
+        sys.modules[capture_spec.name] = capture
+        capture_spec.loader.exec_module(capture)
+    except BaseException:
+        restore()
+        raise
+    return capture, observer, restore
 
 
 class TestModelUpdater(unittest.TestCase):
@@ -15248,11 +15286,14 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__context.breadcrumb_trace = disabled
         with patch.object(builder, "has_current_local_root_scan_proof",
                           wraps=builder.has_current_local_root_scan_proof) as proof_check, \
+                patch.object(builder, "local_root_scan_proof_comparison_details",
+                             wraps=builder.local_root_scan_proof_comparison_details) as proof_details, \
                 patch.object(updater, "_record_completion_gate_breadcrumb") as record, \
                 patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
             updater.update()
         record.assert_not_called()
         proof_check.assert_not_called()
+        proof_details.assert_not_called()
         self.assertEqual({}, updater._ModelUpdater__completion_gate_trace_signatures)
         self.assertIn(
             ("pending.bin", None, None), controller._Controller__pending_completion_file_names,
@@ -15270,9 +15311,48 @@ class TestModelUpdater(unittest.TestCase):
                     "pending-local-session", 4,
                 ),
             })
-            with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
-                updater.update()
-            health = trace.close()
+            capture_records = None
+            capture_size = None
+            reader = None
+            restore_capture_modules = None
+            reader_started = False
+            try:
+                if os.name != "nt":
+                    capture, observer, restore_capture_modules = _load_breadcrumb_spool_capture_modules()
+                    # Create the durable active file before arming; the reader starts at EOF,
+                    # so only the following production wake event enters the capture.
+                    self.assertIn(trace.record(
+                        "model_updater", "capture_arm_boundary", {},
+                        stage="completion_gate", event_type="diagnostic",
+                        category="completion.gate", level="info",
+                    ), {"retained", "enqueued"})
+                    self.assertTrue(trace.wait_for_ingress(2.0))
+                    self.assertTrue(trace.flush_durable(2.0))
+                    durable_state = trace.durable_snapshot()
+                    self.assertTrue(durable_state["session_boundary_written"])
+                    self.assertGreaterEqual(durable_state["written"], 1)
+                    capture_path = os.path.join(spool_path, "proof-capture.jsonl")
+                    reader = capture.BreadcrumbSpoolCapture(
+                        spool_path, observer.JsonArtifactSink(capture_path),
+                    )
+                    reader.start()
+                    reader_started = True
+                with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
+                    updater.update()
+                if reader is not None:
+                    self.assertTrue(trace.flush_durable(2.0))
+                    self.assertGreaterEqual(reader.poll(), 1)
+                    reader.close()
+                    reader_started = False
+                    with open(capture_path, encoding="utf-8") as handle:
+                        capture_records = [json.loads(line) for line in handle if line.strip()]
+                    capture_size = os.path.getsize(capture_path)
+            finally:
+                if reader is not None and reader_started:
+                    reader.close()
+                if restore_capture_modules is not None:
+                    restore_capture_modules()
+                health = trace.close()
             with open(os.path.join(spool_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
                 records = [json.loads(line) for line in handle if line.strip()]
         event = next(
@@ -15288,17 +15368,47 @@ class TestModelUpdater(unittest.TestCase):
             "schema", "decision", "reason", "local_root_proof_shape",
             "local_root_proof_inputs_known", "local_root_proof_checker_available",
             "local_root_proof_result", "local_root_scan_start_relation",
+            "local_root_proof_checks",
         }, set(event["details"]))
         self.assertEqual("directory_root", event["details"]["local_root_proof_shape"])
         self.assertTrue(event["details"]["local_root_proof_inputs_known"])
         self.assertTrue(event["details"]["local_root_proof_checker_available"])
         self.assertTrue(event["details"]["local_root_proof_result"])
+        self.assertEqual({
+            "entry": "present", "run": "match", "generation": "match",
+            "builder": "match", "expected": "not_checked",
+        }, event["details"]["local_root_proof_checks"])
         self.assertEqual("unknown", event["details"]["local_root_scan_start_relation"])
+        if capture_records is not None:
+            captured = next(
+                record["capture"]["projection"] for record in capture_records
+                if record.get("capture", {}).get("state") == "record"
+                and record["capture"]["projection"].get("completion_gate", {}).get("message")
+                == "pending_completion_authority_wake"
+            )
+            self.assertEqual("completion.gate", captured["category"])
+            self.assertEqual("completion_gate", captured["stage"])
+            self.assertEqual("diagnostic", captured["event_type"])
+            self.assertEqual({
+                "shape": "directory_root", "inputs_known": True, "checker_available": True,
+                "result": True, "start_relation": "unknown", "entry": "present", "run": "match",
+                "generation": "match", "builder": "match", "expected": "not_checked",
+            }, captured["completion_gate"]["local_root_proof"])
+            captured_text = json.dumps(capture_records)
+            self.assertNotIn("pending-local-session", captured_text)
+            self.assertNotIn("pending.bin", captured_text)
+            self.assertTrue(captured["flow_hash"])
+            self.assertTrue(captured["corr_hash"])
+            self.assertIsNotNone(capture_size)
+            self.assertLess(capture_size, 262144)
         self.assertEqual("completion:{}".format(opaque_trace_correlation(
             ModelFile.build_file_id("pending.bin", None),
         )), event["corr_id"])
         self.assertIsNone(event["flow_id"])
-        self.assertNotIn("pending.bin", json.dumps(event))
+        event_text = json.dumps(event, separators=(",", ":"))
+        self.assertNotIn("pending.bin", event_text)
+        self.assertNotIn("pending-local-session", event_text)
+        self.assertLess(len(event_text.encode("utf-8")), 8192)
 
         failing_trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
         controller._Controller__context.breadcrumb_trace = failing_trace
@@ -15348,7 +15458,28 @@ class TestModelUpdater(unittest.TestCase):
         with patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[]):
             adopt_proof()
             updater.update()
-            self.assertTrue(wakes()[-1]["details"]["local_root_proof_result"])
+            current = wakes()[-1]["details"]
+            self.assertTrue(current["local_root_proof_result"])
+            self.assertEqual({
+                "entry": "present", "run": "match", "generation": "match",
+                "builder": "match", "expected": "not_checked",
+            }, current["local_root_proof_checks"])
+
+            with patch.object(
+                    builder, "local_root_scan_proof_comparison_details",
+                    side_effect=RuntimeError("diagnostic comparison unavailable")):
+                controller._Controller__next_lftp_status_poll_at = None
+                updater.update()
+            isolated_failure = wakes()[-1]["details"]
+            self.assertIs(type(isolated_failure["local_root_proof_result"]), bool)
+            self.assertIs(
+                isolated_failure["local_root_proof_result"],
+                builder.has_current_local_root_scan_proof(
+                    ModelFile.build_file_id("pending.bin", None),
+                    process.session_token, process.generation,
+                ),
+            )
+            self.assertNotIn("local_root_proof_checks", isolated_failure)
 
             process.generation = 5
             adopt_proof()
@@ -15358,6 +15489,10 @@ class TestModelUpdater(unittest.TestCase):
             self.assertTrue(stale["local_root_proof_inputs_known"])
             self.assertTrue(stale["local_root_proof_checker_available"])
             self.assertFalse(stale["local_root_proof_result"])
+            self.assertEqual({
+                "entry": "present", "run": "match", "generation": "mismatch",
+                "builder": "match", "expected": "not_checked",
+            }, stale["local_root_proof_checks"])
 
             class RaisingProofMap(dict):
                 def get(self, key, default=None):
@@ -15372,6 +15507,10 @@ class TestModelUpdater(unittest.TestCase):
             failed = wakes()[-1]["details"]
             self.assertTrue(failed["local_root_proof_checker_available"])
             self.assertEqual("unknown", failed["local_root_proof_result"])
+            self.assertEqual({
+                "entry": "unknown", "run": "unknown", "generation": "unknown",
+                "builder": "unknown", "expected": "not_checked",
+            }, failed["local_root_proof_checks"])
             builder._ModelBuilder__local_root_scan_proofs = saved_proofs
 
             original_record = trace.record

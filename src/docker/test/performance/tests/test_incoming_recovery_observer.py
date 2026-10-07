@@ -698,6 +698,69 @@ def test_completion_move_projection_sanitizer_preserves_finite_facts():
     assert malformed["final_move_publication"]["destination_exists"] is None
 
 
+def test_pending_completion_wake_projection_sanitizer_preserves_only_finite_proof_facts():
+    safe = observer._sanitize_capture_projection({
+        "completion_gate": {
+            "boundary": "completion_gate", "message": "pending_completion_authority_wake",
+            "schema": "pending_completion_authority_wake.v1", "decision": "blocked",
+            "reason": "local_scope_unreconciled", "local_root_proof": {
+                "shape": "directory_root", "inputs_known": True, "checker_available": True,
+                "result": False, "start_relation": "after", "entry": "present", "run": "mismatch",
+                "generation": "match", "builder": "match", "expected": "not_checked",
+                "private_session": "do-not-copy", "raw_path": "/private/root",
+            },
+            "raw_path": "/private/root",
+        },
+    })
+    assert safe["completion_gate"] == {
+        "boundary": "completion_gate", "message": "pending_completion_authority_wake",
+        "schema": "pending_completion_authority_wake.v1", "decision": "blocked",
+        "reason": "local_scope_unreconciled", "local_root_proof": {
+            "shape": "directory_root", "inputs_known": True, "checker_available": True,
+            "result": False, "start_relation": "after", "entry": "present", "run": "mismatch",
+            "generation": "match", "builder": "match", "expected": "not_checked",
+        },
+    }
+
+    malformed = observer._sanitize_capture_projection({
+        "completion_gate": {
+            "boundary": "completion_gate", "message": "pending_completion_authority_wake",
+            "schema": "private-schema", "local_root_proof": {
+                "shape": "private", "inputs_known": "false", "checker_available": None,
+                "result": "unknown", "start_relation": ["private"], "entry": "private",
+                "run": "private", "generation": "private", "builder": "private", "expected": "private",
+            },
+        },
+    })["completion_gate"]
+    assert malformed["schema"] == "unknown"
+    assert malformed["local_root_proof"] == {
+        "shape": "unknown", "inputs_known": None, "checker_available": None,
+        "result": None, "start_relation": "unknown", "entry": "unknown", "run": "unknown",
+        "generation": "unknown", "builder": "unknown", "expected": "unknown",
+    }
+
+
+def test_pending_completion_wake_projection_keeps_unknown_distinct_from_false():
+    projection = capture._projection({
+        "source": "model_updater", "message": "pending_completion_authority_wake",
+        "category": "completion.gate", "event_type": "diagnostic", "stage": "completion_gate",
+        "level": "info", "details": {
+            "schema": "pending_completion_authority_wake.v1", "decision": "blocked",
+            "reason": "local_scope_unreconciled", "local_root_proof_shape": "directory_root",
+            "local_root_proof_result": "unknown", "local_root_proof_checks": {
+                "entry": "malformed", "run": "unknown", "generation": "mismatch",
+                "builder": "unknown", "expected": "not_checked",
+            },
+        },
+    })[0]
+    proof = projection["completion_gate"]["local_root_proof"]
+    assert proof["result"] is None
+    assert proof["entry"] == "malformed"
+    assert proof["run"] == "unknown"
+    assert proof["generation"] == "mismatch"
+    assert proof["builder"] == "unknown"
+
+
 def test_model_finalization_projection_sanitizer_keeps_only_bounded_schema_fields():
     safe = observer._sanitize_capture_projection({
         "model_finalization": {

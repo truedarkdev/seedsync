@@ -11333,6 +11333,55 @@ class TestModelBuilder(unittest.TestCase):
             staging_id, "local-session", 4,
         ))
 
+    def test_local_root_scan_proof_comparison_details_are_finite_and_diagnostic_only(self):
+        builder = self.model_builder
+        root = SystemFile("private-root", 4, True)
+        root.path_pair_id = "pair-a"
+        file_id = ModelFile.build_file_id(root.name, root.path_pair_id)
+
+        absent = builder.local_root_scan_proof_comparison_details(file_id, "private-session", 4)
+        self.assertEqual({
+            "entry": "absent", "run": "unknown", "generation": "unknown",
+            "builder": "unknown", "expected": "not_checked",
+        }, absent)
+        self.assertFalse(builder.has_current_local_root_scan_proof(file_id, "private-session", 4))
+
+        proofs = builder._ModelBuilder__local_root_scan_proofs
+        proofs[file_id] = ("private-session",)
+        malformed = builder.local_root_scan_proof_comparison_details(file_id, "private-session", 4)
+        self.assertEqual("malformed", malformed["entry"])
+        self.assertEqual("unknown", malformed["run"])
+        self.assertFalse(builder.has_current_local_root_scan_proof(file_id, "private-session", 4))
+
+        proofs.pop(file_id)
+        builder.adopt_local_root_scan_sources({file_id: (root, "private-session", 4)})
+        matched = builder.local_root_scan_proof_comparison_details(
+            file_id, "private-session", 4, expected_source=root,
+        )
+        self.assertEqual({
+            "entry": "present", "run": "match", "generation": "match",
+            "builder": "match", "expected": "match",
+        }, matched)
+        self.assertTrue(builder.has_current_local_root_scan_proof(
+            file_id, "private-session", 4, expected_source=root,
+        ))
+        self.assertEqual("mismatch", builder.local_root_scan_proof_comparison_details(
+            file_id, "other-session", 4,
+        )["run"])
+        self.assertEqual("mismatch", builder.local_root_scan_proof_comparison_details(
+            file_id, "private-session", 5,
+        )["generation"])
+
+        replacement = SystemFile("private-root", 4, True)
+        replacement.path_pair_id = "pair-a"
+        builder._ModelBuilder__local_files_by_pair["pair-a"][file_id] = replacement
+        stale_source = builder.local_root_scan_proof_comparison_details(file_id, "private-session", 4)
+        self.assertEqual("mismatch", stale_source["builder"])
+        self.assertFalse(builder.has_current_local_root_scan_proof(file_id, "private-session", 4))
+        self.assertEqual("mismatch", builder.local_root_scan_proof_comparison_details(
+            file_id, "private-session", 4, expected_source=replacement,
+        )["expected"])
+
     def test_local_source_adoption_trace_emits_root_proof_only_after_binding(self):
         builder = ModelBuilder()
         root = SystemFile("private-root", 4, True)

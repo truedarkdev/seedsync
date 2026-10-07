@@ -266,6 +266,11 @@ _COMPLETION_GATE_REASONS = frozenset({
 _COMPLETION_GATE_OUTCOMES = frozenset({"stopped", "deferred", "downloaded", "unknown"})
 _PENDING_COMPLETION_MOVE_MESSAGES = frozenset({"pending_completion_move_decision"})
 _COMPLETION_GATE_DECISION_MESSAGES = frozenset({"completion_gate_decision"})
+_PENDING_COMPLETION_AUTHORITY_WAKE_MESSAGE = "pending_completion_authority_wake"
+_LOCAL_ROOT_PROOF_SHAPES = frozenset({"directory_root", "non_directory", "unknown"})
+_LOCAL_ROOT_PROOF_RELATIONS = frozenset({"match", "mismatch", "unknown"})
+_LOCAL_ROOT_PROOF_ENTRIES = frozenset({"absent", "malformed", "present", "unknown"})
+_LOCAL_ROOT_PROOF_EXPECTED = _LOCAL_ROOT_PROOF_RELATIONS | frozenset({"not_checked"})
 _PENDING_COMPLETION_MOVE_PHASES = frozenset({"authority", "move", "candidate"})
 _PENDING_COMPLETION_MOVE_PROOF_SOURCES = frozenset({
     "model_lookup", "local_scan_scope", "remote_scan_scope", "lftp_status",
@@ -493,6 +498,37 @@ def _completion_gate_facts(details: Mapping[str, object], message: object = None
         value = details.get(key)
         if isinstance(value, str) and value in allowed:
             result[key] = value
+    if message == _PENDING_COMPLETION_AUTHORITY_WAKE_MESSAGE:
+        result["message"] = message
+        result["schema"] = (
+            "pending_completion_authority_wake.v1"
+            if details.get("schema") == "pending_completion_authority_wake.v1" else "unknown"
+        )
+        shape = details.get("local_root_proof_shape")
+        start_relation = details.get("local_root_scan_start_relation")
+        checks = details.get("local_root_proof_checks")
+        checks = checks if isinstance(checks, Mapping) else {}
+        result["local_root_proof"] = {
+            "shape": shape if isinstance(shape, str) and shape in _LOCAL_ROOT_PROOF_SHAPES else "unknown",
+            "inputs_known": details.get("local_root_proof_inputs_known")
+            if type(details.get("local_root_proof_inputs_known")) is bool else None,
+            "checker_available": details.get("local_root_proof_checker_available")
+            if type(details.get("local_root_proof_checker_available")) is bool else None,
+            "result": details.get("local_root_proof_result")
+            if type(details.get("local_root_proof_result")) is bool else None,
+            "start_relation": start_relation
+            if isinstance(start_relation, str) and start_relation in {"before", "after"} else "unknown",
+            "entry": checks.get("entry")
+            if isinstance(checks.get("entry"), str) and checks.get("entry") in _LOCAL_ROOT_PROOF_ENTRIES else "unknown",
+            "run": checks.get("run")
+            if isinstance(checks.get("run"), str) and checks.get("run") in _LOCAL_ROOT_PROOF_RELATIONS else "unknown",
+            "generation": checks.get("generation")
+            if isinstance(checks.get("generation"), str) and checks.get("generation") in _LOCAL_ROOT_PROOF_RELATIONS else "unknown",
+            "builder": checks.get("builder")
+            if isinstance(checks.get("builder"), str) and checks.get("builder") in _LOCAL_ROOT_PROOF_RELATIONS else "unknown",
+            "expected": checks.get("expected")
+            if isinstance(checks.get("expected"), str) and checks.get("expected") in _LOCAL_ROOT_PROOF_EXPECTED else "unknown",
+        }
     value = details.get("pending_transition")
     if isinstance(value, str) and value in {"registered", "cleared", "retained"}:
         result["pending_transition"] = value

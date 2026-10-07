@@ -2934,6 +2934,50 @@ class ModelBuilder:
             self.__local_file(file_id) is proof[2] and \
             (expected_source is None or proof[2] is expected_source)
 
+    def local_root_scan_proof_comparison_details(
+            self, file_id: str, session_token: object, generation: object,
+            *, expected_source: Optional[SystemFile] = None,
+    ) -> dict[str, str]:
+        """Return finite diagnostic comparisons without changing proof authority."""
+        details = {
+            "entry": "unknown", "run": "unknown", "generation": "unknown",
+            "builder": "unknown", "expected": "not_checked" if expected_source is None else "unknown",
+        }
+        missing = object()
+        try:
+            proof = self.__local_root_scan_proofs.get(file_id, missing)
+        except Exception:
+            return details
+        if proof is missing:
+            details["entry"] = "absent"
+            if expected_source is None:
+                details["expected"] = "not_checked"
+            return details
+        if not isinstance(proof, tuple) or len(proof) != 3 or \
+                type(proof[0]) is not str or not proof[0] or \
+                type(proof[1]) is not int or proof[1] < 0 or \
+                not isinstance(proof[2], SystemFile):
+            details["entry"] = "malformed"
+            if expected_source is None:
+                details["expected"] = "not_checked"
+            return details
+
+        details["entry"] = "present"
+        if type(session_token) is str and session_token:
+            details["run"] = "match" if proof[0] == session_token else "mismatch"
+        if type(generation) is int and generation >= 0:
+            details["generation"] = "match" if proof[1] == generation else "mismatch"
+        try:
+            current_source = self.__local_file(file_id)
+            details["builder"] = "match" if current_source is proof[2] else "mismatch"
+        except Exception:
+            pass
+        if expected_source is None:
+            details["expected"] = "not_checked"
+        else:
+            details["expected"] = "match" if proof[2] is expected_source else "mismatch"
+        return details
+
     @staticmethod
     def __normalize_current_local_scan_authority(
             session_token: object, generation: object, reconciled_remote_path_pair_ids: object,
