@@ -24,7 +24,7 @@ from controller.model_builder import _RecentLiveTransferSnapshot, _TransferState
 from controller.model_updater import ModelUpdater
 from controller.extract import ExtractStatus
 from controller.validate import ValidateStatus
-from common.breadcrumb_trace import BreadcrumbTraceCollector
+from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation, trace_session_digest
 from common.performance_diagnostics import (
     COUNTER_PAIR_SAFETY_REJECT_STATUS_ONLY_NAME,
     COUNTER_PAIR_SAFETY_REJECT_ACTIVE_ONLY_NAME,
@@ -83,14 +83,14 @@ class TestModelBuilder(unittest.TestCase):
             rows = [row for row in rows if row.get("message") == "input_arbitration_witness"]
             print("INPUT_WITNESS_FINALIZED=" + json.dumps(rows, sort_keys=True))
             roots = [row for row in rows if row["details"]["phase"] == "root_fill"]
-            self.assertEqual(6, len(rows))
+            self.assertEqual(8, len(rows))
             self.assertEqual(2, len(roots))
             self.assertEqual(["local", "active"], [row["details"]["selection"] for row in roots])
             self.assertNotEqual(roots[0]["corr_id"], roots[1]["corr_id"])
             self.assertEqual(roots[0]["details"]["root_id"], roots[1]["details"]["root_id"])
             for root_row, model in zip(roots, (first, second)):
                 related = [row for row in rows if row["corr_id"] == root_row["corr_id"]]
-                self.assertEqual(["remote_leaf_fill", "root_fill", "summary"],
+                self.assertEqual(["remote_leaf_fill", "root_source", "root_fill", "summary"],
                                  [row["details"]["phase"] for row in related])
                 filled = model.get_file("input-root")
                 self.assertEqual(root_row["details"]["root_id"], root_row["details"]["subject_id"])
@@ -102,6 +102,14 @@ class TestModelBuilder(unittest.TestCase):
                 self.assertFalse(root_row["details"]["active_generation_known"])
                 self.assertIsNone(root_row["details"]["local_proof_generation"])
                 self.assertFalse(root_row["details"]["local_proof_generation_known"])
+                source = next(row for row in related if row["details"]["phase"] == "root_source")
+                self.assertEqual(root_row["details"]["root_id"], source["details"]["root_id"])
+                self.assertEqual({"lo", "ps", "pb"}, set(source["details"]["p"]))
+                self.assertEqual(opaque_trace_correlation(
+                    "system-root-object|{}".format(id(local))
+                ), source["details"]["p"]["lo"])
+                self.assertIsNone(source["details"]["p"]["ps"])
+                self.assertIsNone(source["details"]["p"]["pb"])
             for row in rows:
                 self.assertNotIn("input-root", json.dumps(row))
                 self.assertNotIn("payload.bin", json.dumps(row))
@@ -129,17 +137,21 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(64, summary["remote_leaf_rows_omitted"])
         for key in ("filled_transferred_size", "filled_state", "filled_remote_transferable"):
             self.assertNotIn(key, summary)
-        self.assertEqual(13, len(rows))
+        self.assertEqual(17, len(rows))
         root_rows = [row for row in rows if row["details"]["phase"] == "root_fill"]
+        source_rows = [row for row in rows if row["details"]["phase"] == "root_source"]
         leaf_rows = [row for row in rows if row["details"]["phase"] == "remote_leaf_fill"]
         self.assertEqual(4, len(root_rows))
+        self.assertEqual(4, len(source_rows))
         self.assertEqual(4, len({row["details"]["subject_id"] for row in root_rows}))
         self.assertEqual(8, len(leaf_rows))
+        self.assertEqual(4, len({row["details"]["subject_id"] for row in source_rows}))
         self.assertEqual(8, len({row["details"]["subject_id"] for row in leaf_rows}))
         self.assertEqual(1, len({row["corr_id"] for row in rows}))
         self.assertEqual({"scan.authority"}, {row.get("category") for row in rows})
         self.assertTrue(all(row.get("corr_id") == row.get("flow_id") for row in rows))
         self.assertEqual("summary", rows[-1]["details"]["phase"])
+        self.assertTrue(all(set(row["details"]["p"]) == {"lo", "ps", "pb"} for row in source_rows))
         for row in root_rows:
             for key in ("filled_transferred_size", "filled_state", "filled_remote_transferable"):
                 self.assertNotIn(key, row["details"])
@@ -152,6 +164,38 @@ class TestModelBuilder(unittest.TestCase):
                     "local_proof_generation_known", "active_generation_known"):
                 self.assertIn(key, row["details"])
         self.assertEqual(0, collector.snapshot()["drops"]["policy"])
+
+    def test_root_source_witness_binds_exact_builder_local_object_and_cache_hit_is_semantic_noop(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=32,
+            policy={"default": "off", "rules": {"scan.authority": "info"}})
+        self.addCleanup(collector.close)
+        builder = ModelBuilder()
+        local = SystemFile("opaque-root", 3, True)
+        local.path_pair_id = "pair"
+        builder.set_local_files([local])
+        file_id = ModelFile.build_file_id(local.name, local.path_pair_id)
+        builder.adopt_local_root_scan_sources({file_id: (local, "opaque-session", 9)})
+        builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+
+        first = builder.build_model(diagnostic_target_root_ids=(file_id,))
+        first_root = first.get_file(file_id)
+        first_contents = (first_root.local_present, first_root.remote_present, first_root.local_size)
+        self.assertIs(first, builder.build_model(diagnostic_target_root_ids=(file_id,)))
+        cached_root = first.get_file(file_id)
+        self.assertEqual(first_contents, (cached_root.local_present, cached_root.remote_present,
+                                          cached_root.local_size))
+        rows = [row for row in self.__trace_entries(collector, True)
+                if row["message"] == "input_arbitration_witness" and
+                row["details"]["phase"] == "root_source"]
+        self.assertEqual(2, len(rows))
+        for row in rows:
+            facts = row["details"]["p"]
+            self.assertEqual({"lo", "ps", "pb"}, set(facts))
+            self.assertEqual(opaque_trace_correlation("system-root-object|{}".format(id(local))), facts["lo"])
+            self.assertEqual(trace_session_digest("opaque-session"), facts["ps"])
+            self.assertTrue(facts["pb"])
+            self.assertNotIn("opaque-root", json.dumps(row))
+            self.assertNotIn("opaque-session", json.dumps(row))
 
     def test_input_arbitration_witness_split_and_active_sampling_priority(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=128,
@@ -329,16 +373,17 @@ class TestModelBuilder(unittest.TestCase):
                 self.assertNotIn("candidate.bin", serialized)
 
     def test_input_arbitration_witness_disabled_and_failing_diagnostics_preserve_build(self):
-        def build(emitter):
+        def build(emitter, target_ids):
             builder = ModelBuilder()
             builder.set_base_logger(self.model_builder.logger)
             remote = SystemFile("neutral-root", 10, True)
             remote.add_child(SystemFile("payload.bin", 10, False))
             builder.set_remote_files([remote])
             builder.set_stop_resume_trace_breadcrumb(emitter)
-            root = builder.build_model().get_file("neutral-root")
+            root = builder.build_model(diagnostic_target_root_ids=target_ids).get_file("neutral-root")
             return (root.state, root.local_present, root.remote_size, root.complete_local_coverage)
-        baseline = build(None)
+        target_ids = (ModelFile.build_file_id("neutral-root", None),)
+        baseline = build(None, target_ids)
         class Disabled:
             def is_effectively_enabled(self, category, level="info"):
                 return False
@@ -347,15 +392,15 @@ class TestModelBuilder(unittest.TestCase):
         with patch("controller.model_builder.ModelBuilder._ModelBuilder__input_witness_root",
                    side_effect=AssertionError("disabled source facts")), \
              patch("controller.model_builder.time.monotonic_ns", side_effect=AssertionError("disabled clock")):
-            self.assertEqual(baseline, build(Disabled()))
+            self.assertEqual(baseline, build(Disabled(), target_ids))
         class Failing:
             def is_effectively_enabled(self, category, level="info"):
                 return category == "scan.authority"
             def record(self, *args, **kwargs):
                 raise RuntimeError("diagnostic sink failure")
-        self.assertEqual(baseline, build(Failing()))
+        self.assertEqual(baseline, build(Failing(), target_ids))
         with patch("controller.model_builder.opaque_trace_correlation", side_effect=RuntimeError("correlation failure")):
-            self.assertEqual(baseline, build(Failing()))
+            self.assertEqual(baseline, build(Failing(), target_ids))
 
     def setUp(self):
         logger = logging.getLogger(TestModelBuilder.__name__)

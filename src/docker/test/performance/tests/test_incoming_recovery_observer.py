@@ -310,6 +310,83 @@ def test_input_arbitration_projection_is_finite_and_preserves_unknowns(tmp_path)
     assert observer._sanitize_capture_projection({**projection, "input_arbitration": {"schema": "wrong"}}).get("input_arbitration") is None
 
 
+def test_scan_join_and_root_source_projection_are_bounded_and_preserve_unknowns():
+    value = {
+        "kind": "event", "source": "scanner", "category": "scan.adoption",
+        "event_type": "diagnostic", "stage": "scan_adoption", "level": "info", "numbers": {},
+        "scan_join": {
+            "schema": "completion_scan_join.v1", "local_scan_mode": "progressive",
+            "scan_source_root_object_digest": "0123456789abcdef",
+            "accepted_root_object_digest": "fedcba9876543210", "source_pair_scanned": True,
+            "source_pair_completed": False, "source_pair_unknown": None, "source_pair_targeted": True,
+            "target_pair_covered": None, "private_path": "/private/drop",
+        },
+    }
+    safe = observer._sanitize_capture_projection(value)
+    assert safe["category"] == "scan.adoption" and safe["stage"] == "scan_adoption"
+    assert safe["scan_join"]["scan_source_root_object_digest"] == "0123456789abcdef"
+    assert safe["scan_join"]["source_pair_unknown"] is None
+    assert "private_path" not in json.dumps(safe)
+
+    finalized_scan = {
+        "source": "controller", "category": "scan.authority", "level": "info",
+        "stage": "scan_authority", "event_type": "state_transition", "message": "scan_root_adopted",
+        "corr_id": "completion:0123456789abcdef", "flow_id": None,
+        "trace_scope": "flow", "created_ms": 123, "version": 7,
+        "details": {"schema": "completion_scan_join.v1", "p": {
+            "m": "legacy", "so": "0123456789abcdef", "ao": "fedcba9876543210",
+            "sp": True, "cp": False, "up": None, "tp": True, "tc": None,
+        }},
+    }
+    projected_scan, irrelevant = capture._projection(finalized_scan)
+    assert not irrelevant and projected_scan is not None
+    assert projected_scan["numbers"]["version"] == 7
+    assert projected_scan["scan_join"]["local_scan_mode"] == "legacy"
+    assert projected_scan["scan_join"]["target_pair_covered"] is None
+    malformed = dict(value)
+    malformed["scan_join"] = {
+        **value["scan_join"], "scan_source_root_object_digest": "/secret/path",
+        "source_pair_scanned": 1, "local_scan_mode": "secret-label",
+    }
+    bounded = observer._sanitize_capture_projection(malformed)["scan_join"]
+    assert bounded["scan_source_root_object_digest"] == "unknown"
+    assert bounded["source_pair_scanned"] == "unknown"
+    assert bounded["local_scan_mode"] == "unknown"
+
+    root_source = {
+        "schema": "model_input_arbitration.v1", "phase": "root_source", "subject_kind": "root",
+        "build_token": "0123456789abcdef", "root_id": "fedcba9876543210",
+        "subject_id": "fedcba9876543210", "input_scope": "root", "selection": "local",
+        "local_root_object_digest": "0011223344556677", "local_proof_session_digest": "8899aabbccddeeff",
+        "local_proof_object_bound": False,
+    }
+    root_safe = observer._sanitize_capture_projection({**value, "input_arbitration": root_source})
+    assert root_safe["input_arbitration"]["phase"] == "root_source"
+    assert root_safe["input_arbitration"]["local_root_object_digest"] == "0011223344556677"
+    assert root_safe["input_arbitration"]["local_proof_session_digest"] == "8899aabbccddeeff"
+    assert root_safe["input_arbitration"]["local_proof_object_bound"] is False
+    finalized_root_source = {
+        "source": "model_updater", "category": "scan.authority", "level": "info",
+        "stage": "model_builder_input_arbitration", "event_type": "diagnostic",
+        "message": "input_arbitration_witness", "corr_id": "input-arbitration:0123456789abcdef",
+        "flow_id": "input-arbitration:0123456789abcdef", "trace_scope": "flow",
+        "created_ms": 124, "version": 8,
+        "details": {**root_source, "p": {
+            "local_root_object_digest": "0011223344556677",
+            "local_proof_session_digest": "8899aabbccddeeff", "local_proof_object_bound": False,
+        }},
+    }
+    projected_root, irrelevant = capture._projection(finalized_root_source)
+    assert not irrelevant and projected_root is not None
+    assert projected_root["input_arbitration"]["phase"] == "root_source"
+    assert projected_root["input_arbitration"]["local_proof_object_bound"] is False
+    root_source["local_root_object_digest"] = "/secret/path"
+    root_source["local_proof_object_bound"] = 0
+    malformed_root = observer._sanitize_capture_projection({**value, "input_arbitration": root_source})
+    assert malformed_root["input_arbitration"]["local_root_object_digest"] == "unknown"
+    assert malformed_root["input_arbitration"]["local_proof_object_bound"] == "unknown"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires native durable file acknowledgement")
 @pytest.mark.skipif(BreadcrumbTraceCollector is None or ModelBuilder is None, reason="production builder unavailable")
 def test_finalized_nested_input_witness_reaches_capture_and_json_sink(tmp_path):
@@ -347,7 +424,7 @@ def test_finalized_nested_input_witness_reaches_capture_and_json_sink(tmp_path):
         if line.strip()
     ]
     source_rows = [row for row in finalized if row.get("message") == "input_arbitration_witness"]
-    assert len(source_rows) == 4
+    assert len(source_rows) == 5
     assert all(row.get("trace_scope") == "flow" and row.get("corr_id") == row.get("flow_id")
                and row["corr_id"].startswith("input-arbitration:") for row in source_rows)
     sink = observer.JsonArtifactSink(output)
@@ -360,15 +437,20 @@ def test_finalized_nested_input_witness_reaches_capture_and_json_sink(tmp_path):
             "schema": "incoming-recovery-observer-sample.v1", "event": "capture", "outcome": "success",
             "capture": {"state": "record", "source": "controller", "projection": projection},
         })
-    assert versions == sorted(versions) and len(set(versions)) == 4
+    assert versions == sorted(versions) and len(set(versions)) == 5
 
     saved = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines() if line.strip()]
     facts = [row["capture"]["projection"]["input_arbitration"] for row in saved]
+    root_source = next(item for item in facts if item["phase"] == "root_source")
+    assert root_source["local_root_object_digest"] != "unknown"
+    assert root_source["local_proof_object_bound"] in {True, False, None, "unknown"}
     root = next(item for item in facts if item["phase"] == "root_fill")
-    assert root["selection_reason"] == "active_selected"
-    assert root["local_candidate_eligible"] is True
+    assert root["selection"] == "split"
+    assert root["selection_reason"] == "split_merge"
+    assert root["local_candidate_eligible"] is None
+    assert root["local_size_ge_active"] is None
     assert root["local_staging_descendant"] is True
-    assert root["remote_indicates_newer"] is True
+    assert root["remote_indicates_newer"] is None
     checksum = next(item for item in facts if item["split_candidate_remote_size"] == 1_072)
     assert checksum["split_candidate_local_mtime_ns"] == str(epoch_ns)
     assert checksum["split_candidate_remote_mtime_ns"] == str(epoch_ns + 500_000_000)

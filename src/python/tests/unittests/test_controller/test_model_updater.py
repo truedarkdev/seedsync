@@ -273,6 +273,62 @@ class TestModelUpdater(unittest.TestCase):
                 controller, result, side="remote", pending_targets={target},
             )
 
+    def test_selected_local_root_scan_join_binds_accepted_source_and_preserves_unknown_coverage(self):
+        controller = SimpleNamespace(
+            logger=MagicMock(),
+            _record_completion_scan_join_breadcrumb=MagicMock(),
+        )
+        pair_id = "private-pair"
+        target = SystemFile("private-root", 7, True)
+        target.path_pair_id = pair_id
+        source = SystemFile("private-root", 7, True)
+        source.path_pair_id = pair_id
+        file_id = ModelFile.build_file_id(target.name, pair_id)
+        scan = ScannerResult(
+            datetime.now(), [target], generation=4, session_token="private-session",
+            is_scan_final=False, scanned_path_pair_ids={pair_id},
+            completed_path_pair_ids=set(), unknown_path_pair_ids={pair_id},
+            is_targeted_scan=True,
+        )
+        scan._scan_authority_tokens_by_pair = {pair_id: ("private-session", 4)}
+        accepted = {file_id: (source, "private-session", 4)}
+        with patch("controller.model_updater._controller_breadcrumb_effectively_enabled", return_value=True):
+            _record_selected_root_scan_join(
+                controller, scan, side="local", pending_targets={(target.name, pair_id, "opaque")},
+                local_scan_mode="progressive", accepted_local_roots=accepted,
+            )
+        details = controller._record_completion_scan_join_breadcrumb.call_args.args[2]
+        facts = details["p"]
+        self.assertEqual({"m", "so", "ao", "sp", "cp", "up", "tp", "tc"}, set(facts))
+        self.assertEqual("progressive", facts["m"])
+        self.assertEqual(opaque_trace_correlation("system-root-object|{}".format(id(target))), facts["so"])
+        self.assertEqual(opaque_trace_correlation("system-root-object|{}".format(id(source))), facts["ao"])
+        self.assertTrue(facts["sp"])
+        self.assertFalse(facts["cp"])
+        self.assertTrue(facts["up"])
+        self.assertTrue(facts["tp"])
+        self.assertFalse(facts["tc"])
+        serialized = json.dumps(details)
+        for private in ("private-root", pair_id, "private-session"):
+            self.assertNotIn(private, serialized)
+
+        controller._record_completion_scan_join_breadcrumb.reset_mock()
+        legacy_source = SystemFile("private-root", 7, True)
+        legacy_source.path_pair_id = pair_id
+        legacy_scan = ScannerResult(
+            datetime.now(), [target], generation=5, session_token="legacy-session",
+            scanned_path_pair_ids={pair_id}, completed_path_pair_ids={pair_id},
+        )
+        with patch("controller.model_updater._controller_breadcrumb_effectively_enabled", return_value=True):
+            _record_selected_root_scan_join(
+                controller, legacy_scan, side="local", pending_targets={(target.name, pair_id, "opaque")},
+                local_scan_mode="legacy", accepted_local_roots=[legacy_source],
+            )
+        legacy_facts = controller._record_completion_scan_join_breadcrumb.call_args.args[2]["p"]
+        self.assertEqual("legacy", legacy_facts["m"])
+        self.assertTrue(legacy_facts["tc"])
+        self.assertEqual(opaque_trace_correlation("system-root-object|{}".format(id(legacy_source))),
+                         legacy_facts["ao"])
     def test_active_scan_adoption_join_keeps_incomplete_results_and_bounds_roots(self):
         controller = SimpleNamespace(
             logger=MagicMock(),
@@ -8959,14 +9015,22 @@ class TestModelUpdater(unittest.TestCase):
             local_scan=partial,
             authoritative=False,
         )
+        controller._Controller__pending_completion_file_names = {
+            ("pending-{}".format(index), None, None) for index in range(4)
+        }
 
         ModelUpdater(controller).update()
 
-        model_builder.build_progressive_roots.assert_called_once_with(
-            partial.files,
-            partial.files,
-            {None},
+        model_builder.build_progressive_roots.assert_called_once()
+        build_args, build_kwargs = model_builder.build_progressive_roots.call_args
+        self.assertEqual((partial.files, partial.files, {None}), build_args)
+        selected_ids = build_kwargs["diagnostic_target_root_ids"]
+        self.assertEqual(4, len(selected_ids))
+        self.assertCountEqual(
+            [ModelFile.build_file_id("pending-{}".format(index), None) for index in range(4)],
+            selected_ids,
         )
+        self.assertNotIn(ModelFile.build_file_id("root", None), selected_ids)
         model_builder.set_remote_files.assert_not_called()
         model_builder.set_local_files.assert_not_called()
         model_builder.set_unknown_local_path_pair_ids.assert_called_once_with({None})

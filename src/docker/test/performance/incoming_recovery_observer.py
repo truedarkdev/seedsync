@@ -446,7 +446,7 @@ _CAPTURE_CATEGORIES = frozenset({
     "queue.lifecycle", "queue.admission", "queue.executor", "queue.authority", "queue.readiness", "queue.exclusion", "model_page_snapshot",
     "model.lifecycle", "model.progress", "model.publication", "model.finalization", "model.root_progress", "status",
     "transfer.lftp", "transfer.lftp.executor", "transfer.lftp.membership", "transfer.lftp.status", "transfer.stop",
-    "scan.authority", "scan.failure", "scan.result", "scan.terminal_publication", "final_move.publication",
+    "scan.authority", "scan.adoption", "scan.failure", "scan.result", "scan.terminal_publication", "final_move.publication",
     "finalization.child", "controller", "scanner_process", "lftp.sidecar", "lftp.command", "lftp.status",
     "completion.gate", "transfer.lftp.command", "root.progress", "unknown",
 })
@@ -584,7 +584,7 @@ _CAPTURE_COMMAND_OUTPUTS = {"empty", "connecting", "backend_error", "other"}
 _CAPTURE_COMMAND_COUNT_BUCKETS = {"0", "1", "2-4", "5-16", "17-64", "65-256", "257+", "unknown"}
 _CAPTURE_COMMAND_BYTE_BUCKETS = {"0", "1-127", "128-511", "512-2047", "2048-8191", "8192-32767", "32768+", "unknown"}
 _CAPTURE_INPUT_ARBITRATION_SCHEMA = "model_input_arbitration.v1"
-_CAPTURE_INPUT_ARBITRATION_PHASES = {"summary", "root_fill", "remote_leaf_fill"}
+_CAPTURE_INPUT_ARBITRATION_PHASES = {"summary", "root_fill", "remote_leaf_fill", "root_source"}
 _CAPTURE_INPUT_ARBITRATION_SUBJECTS = {"summary", "root", "remote_leaf"}
 _CAPTURE_INPUT_ARBITRATION_SCOPES = {"root"}
 _CAPTURE_INPUT_ARBITRATION_SELECTIONS = {"absent", "local", "active", "split", "unknown"}
@@ -597,6 +597,8 @@ _CAPTURE_INPUT_ARBITRATION_SELECTION_REASONS = {
 _CAPTURE_INPUT_ARBITRATION_SPLIT_PROVENANCE = {"split_candidate_local"}
 _CAPTURE_INPUT_ARBITRATION_OPAQUE = re.compile(r"^[0-9a-f]{16}$")
 _CAPTURE_INPUT_ARBITRATION_DECIMAL_IDENTITY = re.compile(r"^(?:0|[1-9][0-9]{0,18})$")
+_CAPTURE_COMPLETION_SCAN_JOIN_SCHEMA = "completion_scan_join.v1"
+_CAPTURE_COMPLETION_SCAN_JOIN_MODES = {"legacy", "progressive", "unknown"}
 
 
 def _sanitize_input_arbitration(value: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -722,6 +724,36 @@ def _sanitize_input_arbitration(value: Mapping[str, object]) -> Mapping[str, obj
         )
     state = value.get("filled_state")
     result["filled_state"] = state if isinstance(state, str) and state in _CAPTURE_INPUT_ARBITRATION_STATES else "unknown"
+    if result["phase"] == "root_source":
+        for key in ("local_root_object_digest", "local_proof_session_digest"):
+            item = value.get(key, "unknown")
+            result[key] = item if item is None or (
+                isinstance(item, str) and _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(item)
+            ) else "unknown"
+        item = value.get("local_proof_object_bound", "unknown")
+        result["local_proof_object_bound"] = item if item is None or type(item) is bool else "unknown"
+    return result
+
+
+def _sanitize_scan_join(value: Mapping[str, object]) -> Mapping[str, object] | None:
+    if value.get("schema") != _CAPTURE_COMPLETION_SCAN_JOIN_SCHEMA:
+        return None
+    mode = value.get("local_scan_mode")
+    result: dict[str, object] = {
+        "schema": _CAPTURE_COMPLETION_SCAN_JOIN_SCHEMA,
+        "local_scan_mode": mode if isinstance(mode, str) and mode in _CAPTURE_COMPLETION_SCAN_JOIN_MODES else "unknown",
+    }
+    for key in ("scan_source_root_object_digest", "accepted_root_object_digest"):
+        item = value.get(key, "unknown")
+        result[key] = item if item is None or (
+            isinstance(item, str) and _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(item)
+        ) else "unknown"
+    for key in (
+        "source_pair_scanned", "source_pair_completed", "source_pair_unknown",
+        "source_pair_targeted", "target_pair_covered",
+    ):
+        item = value.get(key, "unknown")
+        result[key] = item if item is None or type(item) is bool else "unknown"
     return result
 
 
@@ -916,6 +948,11 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
         safe_input_arbitration = _sanitize_input_arbitration(input_arbitration)
         if safe_input_arbitration is not None:
             result["input_arbitration"] = safe_input_arbitration
+    scan_join = value.get("scan_join")
+    if isinstance(scan_join, Mapping):
+        safe_scan_join = _sanitize_scan_join(scan_join)
+        if safe_scan_join is not None:
+            result["scan_join"] = safe_scan_join
     return result
 
 

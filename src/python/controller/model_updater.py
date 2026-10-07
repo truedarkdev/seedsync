@@ -118,10 +118,128 @@ _SCAN_STATUS_PUBLICATION_JOIN_LIMIT = 4
 def _record_selected_root_scan_join(
         controller: "Controller", scan: object, *, side: str,
         pending_targets: object,
+        local_scan_mode: object = None, accepted_local_roots: object = None,
 ) -> None:
     """Join an accepted scan's opaque session identity to selected roots, boundedly."""
     try:
         if not _controller_breadcrumb_effectively_enabled(controller, "scan.authority", "info"):
+            return
+        if side == "local" and accepted_local_roots is not None:
+            if not isinstance(pending_targets, (set, frozenset, list, tuple)):
+                return
+            targets = []
+            seen = set()
+            omitted = False
+            for entry in pending_targets:
+                if not isinstance(entry, tuple) or len(entry) < 2 or \
+                        not isinstance(entry[0], str) or not entry[0] or \
+                        (entry[1] is not None and not isinstance(entry[1], str)):
+                    continue
+                file_id = ModelFile.build_file_id(entry[0], entry[1])
+                if file_id in seen:
+                    continue
+                if len(targets) >= _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT:
+                    omitted = True
+                    break
+                seen.add(file_id)
+                targets.append((file_id, entry[1]))
+            if not targets:
+                return
+
+            accepted_by_id = {}
+            accepted_known = isinstance(accepted_local_roots, (dict, list, tuple, set, frozenset))
+            if isinstance(accepted_local_roots, dict):
+                for file_id, entry in accepted_local_roots.items():
+                    root = entry[0] if isinstance(entry, tuple) and len(entry) == 3 else None
+                    if isinstance(file_id, str) and isinstance(root, SystemFile):
+                        accepted_by_id[file_id] = (root, entry[1], entry[2])
+            elif isinstance(accepted_local_roots, (list, tuple, set, frozenset)):
+                for root in accepted_local_roots:
+                    if isinstance(root, SystemFile):
+                        accepted_by_id[ModelFile.build_file_id(root.name, root.path_pair_id)] = (
+                            root, None, None,
+                        )
+
+            scan_roots = {}
+            raw_roots = getattr(scan, "files", None)
+            if isinstance(raw_roots, (list, tuple)):
+                for root in raw_roots:
+                    if isinstance(root, SystemFile):
+                        scan_roots[ModelFile.build_file_id(root.name, root.path_pair_id)] = root
+            scan_pair_tokens = getattr(scan, "_scan_authority_tokens_by_pair", None)
+            scan_session = getattr(scan, "session_token", None)
+            scan_generation = getattr(scan, "generation", None)
+            scan_final = getattr(scan, "is_scan_final", None)
+            targeted_scan = getattr(scan, "is_targeted_scan", None)
+            scanned_pairs = getattr(scan, "scanned_path_pair_ids", None)
+            completed_pairs = getattr(scan, "completed_path_pair_ids", None)
+            unknown_pairs = getattr(scan, "unknown_path_pair_ids", None)
+
+            def pair_member(values: object, pair_id: Optional[str]) -> Optional[bool]:
+                if isinstance(values, (set, frozenset)):
+                    return pair_id in values
+                return None
+
+            mode = local_scan_mode if local_scan_mode in {"legacy", "progressive"} else "unknown"
+            for file_id, pair_id in targets:
+                accepted = accepted_by_id.get(file_id)
+                accepted_root = accepted[0] if accepted is not None else None
+                accepted_session = accepted[1] if accepted is not None else None
+                accepted_generation = accepted[2] if accepted is not None else None
+                token = scan_pair_tokens.get(pair_id) if isinstance(scan_pair_tokens, dict) else None
+                if isinstance(token, tuple) and len(token) == 2:
+                    scan_pair_session, scan_pair_generation = token
+                else:
+                    scan_pair_session, scan_pair_generation = scan_session, scan_generation
+                pair_session, pair_generation = scan_pair_session, scan_pair_generation
+                coverage_comparable = True
+                if isinstance(accepted_session, str) and accepted_session and \
+                        type(accepted_generation) is int and accepted_generation >= 0:
+                    coverage_comparable = (accepted_session, accepted_generation) == (
+                        scan_pair_session, scan_pair_generation,
+                    )
+                    pair_session, pair_generation = accepted_session, accepted_generation
+                session_known = isinstance(pair_session, str) and bool(pair_session)
+                generation_known = type(pair_generation) is int and pair_generation >= 0
+                source_scanned = pair_member(scanned_pairs, pair_id) if coverage_comparable else None
+                source_completed = pair_member(completed_pairs, pair_id) if coverage_comparable else None
+                source_unknown = pair_member(unknown_pairs, pair_id) if coverage_comparable else None
+                final_known = type(scan_final) is bool and coverage_comparable
+                if source_completed is True:
+                    target_covered = True
+                elif source_completed is False and final_known and source_scanned is not None and \
+                        source_unknown is not None:
+                    target_covered = bool(scan_final and source_scanned and not source_unknown)
+                else:
+                    target_covered = None
+                details = {
+                    "scan_side": "local",
+                    "local_scan_digest": trace_session_digest(pair_session) if session_known else None,
+                    "scan_generation": pair_generation if generation_known else None,
+                    "scan_final": scan_final if final_known else None,
+                    "scan_final_known": final_known,
+                    "adopted": accepted_root is not None if accepted_known else None,
+                    "root_present": accepted_root is not None if accepted_known else None,
+                    "selected_root_omissions": omitted,
+                    "captured_monotonic_ns": time.monotonic_ns(),
+                    "p": {
+                        "m": mode,
+                        "so": opaque_trace_correlation(
+                            "system-root-object|{}".format(id(scan_roots[file_id]))
+                        ) if file_id in scan_roots else None,
+                        "ao": opaque_trace_correlation(
+                            "system-root-object|{}".format(id(accepted_root))
+                        ) if isinstance(accepted_root, SystemFile) else None,
+                        "sp": source_scanned,
+                        "cp": source_completed,
+                        "up": source_unknown,
+                        "tp": targeted_scan if type(targeted_scan) is bool else None,
+                        "tc": target_covered,
+                    },
+                }
+                controller._record_completion_scan_join_breadcrumb(
+                    file_id, "scan_root_adopted", details,
+                )
             return
         session_token = getattr(scan, "session_token", None)
         generation = getattr(scan, "generation", None)
@@ -7836,6 +7954,43 @@ class ModelUpdater(_ControllerCoreAccess):
                 for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
             }
 
+        def diagnostic_target_root_ids(extra_ids: object = ()) -> tuple[str, ...]:
+            """Prioritize roots already selected by this update's bounded work."""
+            if not _controller_breadcrumb_effectively_enabled(controller, "scan.authority", "info"):
+                return ()
+            selected = []
+            seen = set()
+
+            def add(values: object) -> None:
+                if len(selected) >= 4:
+                    return
+                if not isinstance(values, (set, frozenset, list, tuple)):
+                    return
+                for file_id in values:
+                    if len(selected) >= 4:
+                        return
+                    if isinstance(file_id, str) and file_id not in seen:
+                        seen.add(file_id)
+                        selected.append(file_id)
+                        if len(selected) >= 4:
+                            return
+
+            add(pending_completion_file_ids())
+            add(active_lftp_status_file_ids)
+            add(pre_poll_active_lftp_file_ids)
+            add(extra_ids)
+            if scoped_final_pair_ids and len(selected) < 4:
+                for file in tuple(joint_local_files) + tuple(joint_remote_files):
+                    if file.path_pair_id not in scoped_final_pair_ids:
+                        continue
+                    file_id = ModelFile.build_file_id(file.name, file.path_pair_id)
+                    if file_id not in seen:
+                        seen.add(file_id)
+                        selected.append(file_id)
+                        if len(selected) >= 4:
+                            break
+            return tuple(selected)
+
         def pending_completion_presentation_file_ids() -> set[str]:
             # Compatibility floors recorded before this ownership record remain
             # presentation-capable. New pending completions use the record so
@@ -8219,11 +8374,6 @@ class ModelUpdater(_ControllerCoreAccess):
             local_final = bool(getattr(latest_local_scan, "is_scan_final", True)) and \
                 not bool(getattr(latest_local_scan, "unknown_path_pair_ids", set()))
             inventory_observer = getattr(model_builder, "observe_local_scan_result", None)
-            if not local_scan_failed and local_scan_new_authority:
-                _record_selected_root_scan_join(
-                    controller, latest_local_scan, side="local",
-                    pending_targets=controller._Controller__pending_completion_file_names,
-                )
             if callable(inventory_observer):
                 raw_scanned_ids = getattr(latest_local_scan, "scanned_path_pair_ids", set())
                 raw_completed_ids = getattr(latest_local_scan, "completed_path_pair_ids", set())
@@ -8242,9 +8392,15 @@ class ModelUpdater(_ControllerCoreAccess):
             recovered_extracted_file_ids = []
             if not local_scan_failed and local_final:
                 if not progressive_mode:
-                    model_builder.set_local_files(_merge_targeted_legacy_scan_files(
+                    accepted_local_files = _merge_targeted_legacy_scan_files(
                         controller, "local", latest_local_scan, latest_local_scan.files,
-                    ))
+                    )
+                    model_builder.set_local_files(accepted_local_files)
+                    _record_selected_root_scan_join(
+                        controller, latest_local_scan, side="local",
+                        pending_targets=controller._Controller__pending_completion_file_names,
+                        local_scan_mode="legacy", accepted_local_roots=accepted_local_files,
+                    )
                     inventory_completion = getattr(model_builder, "record_local_inventory_completion", None)
                     if callable(inventory_completion):
                         completed_ids = set(getattr(latest_local_scan, "completed_path_pair_ids", set()))
@@ -8433,11 +8589,30 @@ class ModelUpdater(_ControllerCoreAccess):
                     if scoped_final_pair_ids and pair_delta_capable and callable(pair_delta_builder):
                         for pair_id in scoped_final_pair_ids:
                             try:
+                                pair_local_sources = [
+                                    file for file in joint_local_files if file.path_pair_id == pair_id
+                                ]
+                                pair_remote_sources = [
+                                    file for file in joint_remote_files if file.path_pair_id == pair_id
+                                ]
+                                pair_target_ids = {
+                                    ModelFile.build_file_id(name, target_pair)
+                                    for name, target_pair, _ in controller._Controller__pending_completion_file_names
+                                    if target_pair == pair_id
+                                }
+                                pair_target_ids.update(
+                                    ModelFile.build_file_id(file.name, pair_id)
+                                    for file in pair_local_sources + pair_remote_sources
+                                )
+                                pair_diagnostic_ids = diagnostic_target_root_ids(pair_target_ids)
+                                pair_diagnostic_kwargs = {"diagnostic_target_root_ids": pair_diagnostic_ids} \
+                                    if pair_diagnostic_ids else {}
                                 pair_build = pair_delta_builder(
                                     pair_id,
-                                    [file for file in joint_local_files if file.path_pair_id == pair_id],
-                                    [file for file in joint_remote_files if file.path_pair_id == pair_id],
+                                    pair_local_sources,
+                                    pair_remote_sources,
                                     joint_unknown_local_ids,
+                                    **pair_diagnostic_kwargs,
                                 )
                             except Exception:
                                 pair_build = None
@@ -9275,15 +9450,19 @@ class ModelUpdater(_ControllerCoreAccess):
                 file for file in joint_remote_files
                 if (file.path_pair_id, file.name) in progressive_joint_delta_keys
             ]
-            partial_model = model_builder.build_progressive_roots(
-                progressive_local_delta_files,
-                progressive_remote_delta_files,
-                progressive_unknown_before_event.union(joint_unknown_local_ids),
-            )
             delta_file_ids = {
                 ModelFile.build_file_id(name, path_pair_id)
                 for path_pair_id, name in progressive_joint_delta_keys
             }
+            partial_diagnostic_ids = diagnostic_target_root_ids(delta_file_ids)
+            partial_diagnostic_kwargs = {"diagnostic_target_root_ids": partial_diagnostic_ids} \
+                if partial_diagnostic_ids else {}
+            partial_model = model_builder.build_progressive_roots(
+                progressive_local_delta_files,
+                progressive_remote_delta_files,
+                progressive_unknown_before_event.union(joint_unknown_local_ids),
+                **partial_diagnostic_kwargs,
+            )
 
             def tree_file_count(file: ModelFile) -> int:
                 return 1 + sum(tree_file_count(child) for child in file.get_children())
@@ -10180,7 +10359,13 @@ class ModelUpdater(_ControllerCoreAccess):
                     except Exception:
                         started_at = None
                     try:
-                        new_model = model_builder.build_model(**current_local_scan_authority_kwargs)
+                        full_diagnostic_ids = diagnostic_target_root_ids()
+                        full_diagnostic_kwargs = {"diagnostic_target_root_ids": full_diagnostic_ids} \
+                            if full_diagnostic_ids else {}
+                        new_model = model_builder.build_model(
+                            **current_local_scan_authority_kwargs,
+                            **full_diagnostic_kwargs,
+                        )
                     except Exception:
                         retire_deferred_rejected_overlay()
                         raise
@@ -12326,6 +12511,7 @@ class ModelUpdater(_ControllerCoreAccess):
         local_root_source_adopter = getattr(model_builder, "adopt_local_root_scan_sources", None)
         if callable(local_root_source_adopter):
             local_root_sources: dict[str, tuple[SystemFile, str, int]] = {}
+            local_root_source_adoption_succeeded = False
             local_accumulator = getattr(controller, "_Controller__progressive_local_scan_state", None)
             if progressive_mode and isinstance(local_accumulator, _ProgressiveScanAccumulator):
                 try:
@@ -12335,10 +12521,18 @@ class ModelUpdater(_ControllerCoreAccess):
             try:
                 with controller._Controller__model_lock:
                     local_root_source_adopter(local_root_sources)
+                local_root_source_adoption_succeeded = True
             except Exception:
                 # Failed source adoption must not publish Queue proof or fail
                 # the ordinary model-update cycle.
                 controller.logger.debug("Ignoring local root source adoption failure", exc_info=True)
+            if progressive_mode and local_root_source_adoption_succeeded and \
+                    latest_local_scan is not None and not local_scan_failed:
+                _record_selected_root_scan_join(
+                    controller, latest_local_scan, side="local",
+                    pending_targets=controller._Controller__pending_completion_file_names,
+                    local_scan_mode="progressive", accepted_local_roots=local_root_sources,
+                )
 
         if remote_reconciliation_established and reconciliation_healthy \
                 and not remote_scan_failed and not controller._Controller__startup_recovery_done:

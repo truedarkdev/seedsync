@@ -15,7 +15,7 @@ import time
 from system import SystemFile
 from lftp import LftpJobStatus
 from model import ActiveProgressOverlay, ModelFile, Model, ModelError
-from common.breadcrumb_trace import BreadcrumbTraceEmitter, opaque_trace_correlation
+from common.breadcrumb_trace import BreadcrumbTraceEmitter, opaque_trace_correlation, trace_session_digest
 from common.performance_diagnostics import (
     COUNTER_PAIR_SAFETY_REJECT_CROSS_PAIR_TOUCH,
     COUNTER_PAIR_SAFETY_REJECT_DIRTY_INPUT,
@@ -5482,6 +5482,7 @@ class ModelBuilder:
         local_files: List[SystemFile],
         remote_files: List[SystemFile],
         unknown_local_path_pair_ids: Set[Optional[str]],
+        diagnostic_target_root_ids: object = None,
     ) -> Model:
         """Render a progressive root delta without walking retained roots.
 
@@ -5559,7 +5560,7 @@ class ModelBuilder:
         partial.__unknown_local_path_pair_ids = set(unknown_local_path_pair_ids)
         partial.__local_root_paths = dict(self.__local_root_paths)
         partial.__local_staging_paths = dict(self.__local_staging_paths)
-        return partial.build_model()
+        return partial.build_model(diagnostic_target_root_ids=diagnostic_target_root_ids)
 
     def __pair_delta_is_globally_safe(
             self, path_pair_id: Optional[str], local_files: dict[str, SystemFile],
@@ -5653,6 +5654,7 @@ class ModelBuilder:
     def build_authoritative_pair_roots(
             self, path_pair_id: Optional[str], local_files: List[SystemFile],
             remote_files: List[SystemFile], unknown_local_path_pair_ids: Set[Optional[str]],
+            diagnostic_target_root_ids: object = None,
     ) -> Optional[_AuthoritativePairBuild]:
         """Stage a complete pair replacement without mutating authoritative maps."""
         next_local = {
@@ -5733,7 +5735,7 @@ class ModelBuilder:
             dict(self.__remote_files_by_pair.get(path_pair_id, {})),
             next_local,
             next_remote,
-            partial.build_model(),
+            partial.build_model(diagnostic_target_root_ids=diagnostic_target_root_ids),
             current_unknown_ids,
             partial.get_unresolved_staging_collision_file_ids(),
             partial.get_terminalizable_staging_collision_file_ids(),
@@ -7277,16 +7279,23 @@ class ModelBuilder:
         self.__active_transfer_delta_selector_failure = None
         self.__active_transfer_delta_status_missing_match = None
 
-    def __input_witness_context(self) -> Optional[dict]:
+    def __input_witness_context(self, diagnostic_target_root_ids: object = None) -> Optional[dict]:
         if not self.__is_stop_resume_trace_enabled("scan.authority", "info"):
             return None
         try:
             priority_roots = []
-            for file_id, node in self.__active_files.items():
-                if self.__nested_active_file_root_file_id(node) is None:
-                    priority_roots.append(file_id)
-                    if len(priority_roots) == 4:
-                        break
+            if isinstance(diagnostic_target_root_ids, (tuple, list, set, frozenset)):
+                for file_id in diagnostic_target_root_ids:
+                    if isinstance(file_id, str) and file_id not in priority_roots:
+                        priority_roots.append(file_id)
+                        if len(priority_roots) == 4:
+                            break
+            if not priority_roots:
+                for file_id, node in self.__active_files.items():
+                    if self.__nested_active_file_root_file_id(node) is None:
+                        priority_roots.append(file_id)
+                        if len(priority_roots) == 4:
+                            break
             return {"corr": "input-arbitration:" + opaque_trace_correlation(str(time.monotonic_ns())),
                     "priority_roots": tuple(priority_roots),
                     "selection_by_root": {},
@@ -7307,9 +7316,19 @@ class ModelBuilder:
             proof = self.__local_root_scan_proofs.get(file_id)
             generation = proof[1] if isinstance(proof, tuple) and len(proof) == 3 and \
                 proof[2] is local and type(proof[1]) is int and proof[1] >= 0 else None
+            proof_shape = isinstance(proof, tuple) and len(proof) == 3 and \
+                isinstance(proof[0], str) and bool(proof[0]) and isinstance(proof[2], SystemFile)
             facts = {"root_id": opaque_trace_correlation(file_id), "input_scope": "root",
                      "selection": selection, "local_proof_generation": generation,
                      "local_proof_generation_known": generation is not None, "active_generation_known": False}
+            builder_local = local
+            facts["root_source"] = {
+                "lo": opaque_trace_correlation(
+                    "system-root-object|{}".format(id(builder_local))
+                ) if isinstance(builder_local, SystemFile) else None,
+                "ps": trace_session_digest(proof[0]) if proof_shape else None,
+                "pb": (proof[2] is builder_local) if proof_shape else None,
+            }
             selection_facts = context.get("selection_by_root", {}).get(file_id, {})
             facts["selection_reason"] = selection_facts.get(
                 "selection_reason",
@@ -7338,6 +7357,29 @@ class ModelBuilder:
         except Exception:
             return None
 
+    def __record_input_root_source_witness(
+            self, context: Optional[dict], file_id: str, facts: Optional[dict],
+    ) -> None:
+        if context is None or facts is None:
+            return
+        try:
+            details = {
+                "schema": "model_input_arbitration.v1",
+                "phase": "root_source",
+                "subject_kind": "root",
+                "root_id": facts["root_id"],
+                "subject_id": opaque_trace_correlation(file_id),
+                "p": dict(facts["root_source"]),
+            }
+            self.__stop_resume_trace_breadcrumb.record(
+                "model_builder", "input_arbitration_witness", details,
+                category="scan.authority", corr_id=context["corr"], flow_id=context["corr"],
+                level="info", stage="model_builder_input_arbitration",
+                event_type="diagnostic", trace_scope="flow",
+            )
+        except Exception:
+            pass
+
     def __record_input_witness(self, context: Optional[dict], facts: Optional[dict] = None,
                                model_file: Optional[ModelFile] = None, *, leaf: bool = False,
                                leaf_facts: Optional[dict] = None) -> None:
@@ -7354,6 +7396,8 @@ class ModelBuilder:
                 if facts is None or context[prefix + "_rows_sampled"] >= (8 if leaf else 4):
                     context[prefix + "_rows_omitted"] += 1
                     return
+                if not leaf:
+                    self.__record_input_root_source_witness(context, model_file.file_id, facts)
                 details = {"schema": "model_input_arbitration.v1"}
                 context[prefix + "_rows_sampled"] += 1
                 state = model_file.state.name.lower()
@@ -7366,7 +7410,7 @@ class ModelBuilder:
                         key: facts[key] for key in leaf_context_fields if key in facts
                     })
                 else:
-                    details.update(facts)
+                    details.update({key: value for key, value in facts.items() if key != "root_source"})
                 details.update({"phase": "remote_leaf_fill" if leaf else "root_fill",
                     "subject_kind": "remote_leaf" if leaf else "root",
                     "subject_id": opaque_trace_correlation(model_file.file_id),
@@ -7397,12 +7441,22 @@ class ModelBuilder:
     def build_model(
             self, *, local_scan_session: object = None, local_scan_generation: object = None,
             reconciled_remote_path_pair_ids: object = None,
+            diagnostic_target_root_ids: object = None,
     ) -> Model:
         local_scan_authority = self.__normalize_current_local_scan_authority(
             local_scan_session, local_scan_generation, reconciled_remote_path_pair_ids,
         )
         if self.__cached_model is not None:
             if self.__cached_model_local_scan_authority == local_scan_authority:
+                if isinstance(diagnostic_target_root_ids, (tuple, list, set, frozenset)) and \
+                        diagnostic_target_root_ids:
+                    context = self.__input_witness_context(diagnostic_target_root_ids)
+                    if context is not None:
+                        for file_id in context["priority_roots"]:
+                            local = self.__local_file(file_id)
+                            remote = self.__remote_file(file_id)
+                            facts = self.__input_witness_root(context, file_id, remote, local)
+                            self.__record_input_root_source_witness(context, file_id, facts)
                 return self.__cached_model
             self.__cached_model = None
 
@@ -7419,7 +7473,7 @@ class ModelBuilder:
         # Model publication is a high-volume diagnostic. Snapshot its explicit
         # opt-in once so a disabled build does not enter per-node trace code.
         model_publication_trace_enabled = self.__is_model_publication_trace_enabled()
-        input_witness = self.__input_witness_context()
+        input_witness = self.__input_witness_context(diagnostic_target_root_ids)
         effective_local_files = self.__build_effective_local_files(
             input_witness, local_scan_authority=local_scan_authority,
         )

@@ -38,7 +38,7 @@ _CATEGORIES = frozenset(
         "queue.readiness", "queue.exclusion", "model.lifecycle", "model.progress", "model_page_snapshot",
         "model.publication", "model.finalization", "model.root_progress", "status",
         "transfer.lftp", "transfer.lftp.executor", "transfer.lftp.membership",
-        "transfer.lftp.status", "transfer.stop", "scan.authority", "scan.failure",
+        "transfer.lftp.status", "transfer.stop", "scan.authority", "scan.adoption", "scan.failure",
         "scan.result", "scan.terminal_publication", "final_move.publication",
         "finalization.child", "controller", "scanner_process", "lftp.sidecar",
         "lftp.command", "lftp.status", "completion.gate", "transfer.lftp.command", "root.progress",
@@ -149,7 +149,7 @@ _MODEL_PROGRESS_LINEAGE_MISSING_PHASES = frozenset({
     "none", "status_consume", "model_mutation", "updater_decision", "multiple",
 })
 _MODEL_INPUT_ARBITRATION_SCHEMA = "model_input_arbitration.v1"
-_MODEL_INPUT_ARBITRATION_PHASES = frozenset({"summary", "root_fill", "remote_leaf_fill"})
+_MODEL_INPUT_ARBITRATION_PHASES = frozenset({"summary", "root_fill", "remote_leaf_fill", "root_source"})
 _MODEL_INPUT_ARBITRATION_SUBJECTS = frozenset({"summary", "root", "remote_leaf"})
 _MODEL_INPUT_ARBITRATION_SCOPES = frozenset({"root"})
 _MODEL_INPUT_ARBITRATION_SELECTIONS = frozenset({"absent", "local", "active", "split", "unknown"})
@@ -160,6 +160,8 @@ _MODEL_INPUT_ARBITRATION_SELECTION_REASONS = frozenset({
     "absent", "unknown",
 })
 _MODEL_INPUT_ARBITRATION_SPLIT_PROVENANCE = frozenset({"split_candidate_local"})
+_COMPLETION_SCAN_JOIN_SCHEMA = "completion_scan_join.v1"
+_COMPLETION_SCAN_JOIN_MODES = frozenset({"legacy", "progressive", "unknown"})
 _DECIMAL_IDENTITY = re.compile(r"^(?:0|[1-9][0-9]{0,18})$")
 _OPAQUE_TOKEN = re.compile(r"^[0-9a-f]{16}$")
 _INPUT_ARBITRATION_BUILD_TOKEN = re.compile(r"^input-arbitration:([0-9a-f]{16})$")
@@ -745,7 +747,67 @@ def _input_arbitration_facts(row: Mapping[str, object], metadata: Mapping[str, o
         )
     state = details.get("filled_state")
     result["filled_state"] = state if isinstance(state, str) and state in _MODEL_INPUT_ARBITRATION_STATES else "unknown"
+    if result["phase"] == "root_source":
+        provenance = details.get("root_source")
+        provenance = provenance if isinstance(provenance, Mapping) else details.get("p")
+        provenance = provenance if isinstance(provenance, Mapping) else {}
+
+        def nested_opaque(key: str) -> str | None:
+            if key not in provenance:
+                return "unknown"
+            value = provenance[key]
+            if value is None:
+                return None
+            return value if isinstance(value, str) and _OPAQUE_TOKEN.fullmatch(value) else "unknown"
+
+        result["local_root_object_digest"] = (
+            nested_opaque("lo") if "lo" in provenance else nested_opaque("local_root_object_digest")
+        )
+        result["local_proof_session_digest"] = (
+            nested_opaque("ps") if "ps" in provenance else nested_opaque("local_proof_session_digest")
+        )
+        proof_bound_key = "pb" if "pb" in provenance else "local_proof_object_bound"
+        result["local_proof_object_bound"] = boolean(proof_bound_key, provenance)
     return result
+
+
+def _completion_scan_join_facts(details: Mapping[str, object], message: object) -> dict[str, object] | None:
+    if details.get("schema") != _COMPLETION_SCAN_JOIN_SCHEMA or message != "scan_root_adopted":
+        return None
+    payload = details.get("p")
+    payload = payload if isinstance(payload, Mapping) else {}
+
+    def lookup(compact: str, canonical: str) -> str:
+        return compact if compact in payload else canonical
+
+    def opaque(compact: str, canonical: str) -> str | None:
+        key = lookup(compact, canonical)
+        if key not in payload:
+            return "unknown"
+        value = payload[key]
+        if value is None:
+            return None
+        return value if isinstance(value, str) and _OPAQUE_TOKEN.fullmatch(value) else "unknown"
+
+    def boolean(compact: str, canonical: str) -> bool | None | str:
+        key = lookup(compact, canonical)
+        if key not in payload:
+            return "unknown"
+        value = payload[key]
+        return value if value is None or type(value) is bool else "unknown"
+
+    mode = payload.get("m", payload.get("local_scan_mode"))
+    return {
+        "schema": _COMPLETION_SCAN_JOIN_SCHEMA,
+        "local_scan_mode": mode if isinstance(mode, str) and mode in _COMPLETION_SCAN_JOIN_MODES else "unknown",
+        "scan_source_root_object_digest": opaque("so", "scan_source_root_object_digest"),
+        "accepted_root_object_digest": opaque("ao", "accepted_root_object_digest"),
+        "source_pair_scanned": boolean("sp", "source_pair_scanned"),
+        "source_pair_completed": boolean("cp", "source_pair_completed"),
+        "source_pair_unknown": boolean("up", "source_pair_unknown"),
+        "source_pair_targeted": boolean("tp", "source_pair_targeted"),
+        "target_pair_covered": boolean("tc", "target_pair_covered"),
+    }
 
 
 def select_input_arbitration_rows(records: object, root_id: object) -> dict[str, object]:
@@ -809,6 +871,10 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     model_page_snapshot = _model_page_snapshot_facts(details) if category == "model_page_snapshot" else None
     model_progress_lineage = _model_progress_lineage_facts(details) if category == "model.progress" else None
     input_arbitration = _input_arbitration_facts(row, metadata, details)
+    scan_join = (
+        _completion_scan_join_facts(details, message)
+        if category == "scan.authority" and message == "scan_root_adopted" else None
+    )
     if category == "final_move.publication" and isinstance(message, str) and message in _FINAL_MOVE_PUBLICATION_MESSAGES and final_move is None:
         return None, True
     if category == "queue.readiness" and readiness is None:
@@ -819,6 +885,10 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         return None, True
     if details.get("schema") == _MODEL_INPUT_ARBITRATION_SCHEMA and (
         category != "scan.authority" or row.get("message", metadata.get("message")) != "input_arbitration_witness"
+    ):
+        return None, True
+    if details.get("schema") == _COMPLETION_SCAN_JOIN_SCHEMA and (
+        category != "scan.authority" or message != "scan_root_adopted" or scan_join is None
     ):
         return None, True
     lifecycle_event = lifecycle.get("event") if lifecycle else None
@@ -859,6 +929,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["model_progress_lineage"] = model_progress_lineage
     if input_arbitration is not None:
         result["input_arbitration"] = input_arbitration
+    if scan_join is not None:
+        result["scan_join"] = scan_join
     return result, False
 
 

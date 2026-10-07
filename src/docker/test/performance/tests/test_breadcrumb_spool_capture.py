@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,9 +35,10 @@ for _common_root in _COMMON_ROOTS:
 try:
     from common.breadcrumb_trace import BreadcrumbTraceCollector
     from system import SystemFile
-    from controller import ModelBuilder
+    from controller import Controller, ModelBuilder
 except ImportError:
     BreadcrumbTraceCollector = None
+    Controller = None
     SystemFile = None
     ModelBuilder = None
 
@@ -996,17 +998,17 @@ def test_finalized_input_arbitration_selects_actual_root_builds_and_summaries(tm
         second_model = builder.build_model()
         assert first_model is not second_model
         assert collector.flush_durable(2.0)
-        assert reader.poll() == 6
+        assert reader.poll() == 8
     finally:
         reader.close()
         collector.close(timeout=2.0)
 
     durable = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
     finalized = [row for row in durable if row.get("message") == "input_arbitration_witness"]
-    assert len(finalized) == 6
+    assert len(finalized) == 8
     assert all("metadata" not in row and row.get("trace_scope") == "flow" for row in finalized)
     assert all(type(row.get("version")) is int for row in finalized)
-    assert len({row["version"] for row in finalized}) == 6
+    assert len({row["version"] for row in finalized}) == 8
     assert "private-root-label" not in json.dumps(finalized)
     assert "private-leaf-label.bin" not in json.dumps(finalized)
 
@@ -1015,7 +1017,7 @@ def test_finalized_input_arbitration_selects_actual_root_builds_and_summaries(tm
         if item["capture"].get("state") == "record"
         and item["capture"].get("projection", {}).get("category") == "scan.authority"
     ]
-    assert len(projected) == 6
+    assert len(projected) == 8
     roots = [item for item in projected if item["input_arbitration"]["phase"] == "root_fill"]
     assert len(roots) == 2
     root_token = roots[0]["input_arbitration"]["root_id"]
@@ -1024,13 +1026,13 @@ def test_finalized_input_arbitration_selects_actual_root_builds_and_summaries(tm
     assert selected["state"] == "selected"
     assert len(selected["build_tokens"]) == 2
     assert all(len(token) == 16 for token in selected["build_tokens"])
-    assert len(selected["records"]) == 6
+    assert len(selected["records"]) == 8
     for token in selected["build_tokens"]:
         build_rows = [row for row in selected["records"] if row["input_arbitration"]["build_token"] == token]
         assert {row["input_arbitration"]["phase"] for row in build_rows} == {
-            "root_fill", "remote_leaf_fill", "summary",
+            "root_source", "root_fill", "remote_leaf_fill", "summary",
         }
-        assert len({row["numbers"]["version"] for row in build_rows}) == 3
+        assert len({row["numbers"]["version"] for row in build_rows}) == 4
         assert {row["input_arbitration"]["subject_kind"] for row in build_rows} == {
             "root", "remote_leaf", "summary",
         }
@@ -1050,6 +1052,7 @@ def test_finalized_input_arbitration_selects_actual_root_builds_and_summaries(tm
     assert not irrelevant and wrapped_projection is not None
     facts = wrapped_projection["input_arbitration"]
     assert facts["root_id"] == root_token
+    assert facts["phase"] == "root_fill"
     assert facts["build_token"] in selected["build_tokens"]
     assert "private_header" not in json.dumps(wrapped_projection)
 
@@ -1067,6 +1070,81 @@ def test_finalized_input_arbitration_selects_actual_root_builds_and_summaries(tm
     facts = safe["input_arbitration"]
     assert facts["filled_state"] == "unknown" and facts["filled_remote_transferable"] == "unknown"
     assert facts["local_input_size"] is None and facts["local_input_present"] == "unknown"
+
+
+@pytest.mark.skipif(BreadcrumbTraceCollector is None or Controller is None, reason="production breadcrumb producer is unavailable")
+def test_finalized_scan_adoption_and_root_source_reach_json_sink_with_unknowns(tmp_path: Path) -> None:
+    spool, artifact = _prepare(tmp_path)
+    collector = BreadcrumbTraceCollector(
+        lambda: True, max_entries=32,
+        policy={"default": "off", "rules": {"scan.authority": "info"}},
+        durable_enabled=True, durable_path=str(spool),
+    )
+    reader = _reader(spool, artifact)
+    producer = Controller.__new__(Controller)
+    producer._Controller__context = SimpleNamespace(breadcrumb_trace=collector)
+    scan_details = {"p": {
+        "m": "progressive", "so": "0123456789abcdef", "ao": "fedcba9876543210",
+        "sp": True, "cp": False, "up": None, "tp": True, "tc": None,
+        "private_path": "/private/drop",
+    }}
+    try:
+        # Require a finalized production record before arming, then capture the
+        # same production route's later root-adoption record.
+        Controller._record_completion_scan_join_breadcrumb(
+            producer, "0123456789abcdef", "active_scan_root_adopted", scan_details,
+        )
+        assert collector.flush_durable(2.0)
+        reader.start()
+        Controller._record_completion_scan_join_breadcrumb(
+            producer, "0123456789abcdef", "scan_root_adopted", scan_details,
+        )
+        root_details = {
+            "schema": "model_input_arbitration.v1", "phase": "root_source", "subject_kind": "root",
+            "root_id": "0123456789abcdef", "subject_id": "fedcba9876543210", "input_scope": "root",
+            "selection": "local", "p": {
+                "lo": "0011223344556677", "ps": "8899aabbccddeeff", "pb": False,
+                "private_path": "/private/drop",
+            },
+        }
+        assert collector.record(
+            "model_updater", "input_arbitration_witness", root_details,
+            category="scan.authority", stage="model_builder_input_arbitration", event_type="diagnostic",
+            level="info", corr_id="input-arbitration:0123456789abcdef",
+            flow_id="input-arbitration:0123456789abcdef", trace_scope="flow",
+        ) in {"retained", "enqueued"}
+        assert collector.flush_durable(2.0)
+        assert reader.poll() == 2
+    finally:
+        reader.close()
+        collector.close(timeout=2.0)
+
+    rows = _artifacts(artifact)
+    projected = [row["capture"]["projection"] for row in rows if row["capture"].get("state") == "record"]
+    assert len(projected) == 2
+    finalized = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()
+                 if line.strip()]
+    assert any(row.get("category") == "scan.authority" and row.get("stage") == "scan_authority"
+               and row.get("event_type") == "state_transition" and row.get("message") == "scan_root_adopted"
+               and row.get("details", {}).get("schema") == "completion_scan_join.v1" for row in finalized)
+    adoption = next(item for item in projected if item["category"] == "scan.authority"
+                    and item["stage"] == "scan_authority"
+                    and item.get("scan_join", {}).get("schema") == "completion_scan_join.v1")
+    assert adoption["scan_join"] == {
+        "schema": "completion_scan_join.v1", "local_scan_mode": "progressive",
+        "scan_source_root_object_digest": "0123456789abcdef",
+        "accepted_root_object_digest": "fedcba9876543210", "source_pair_scanned": True,
+        "source_pair_completed": False, "source_pair_unknown": None, "source_pair_targeted": True,
+        "target_pair_covered": None,
+    }
+    root = next(item for item in projected if item["category"] == "scan.authority"
+                and item.get("input_arbitration", {}).get("phase") == "root_source")
+    assert root["input_arbitration"]["phase"] == "root_source"
+    assert root["input_arbitration"]["root_id"] == "0123456789abcdef"
+    assert root["input_arbitration"]["local_root_object_digest"] == "0011223344556677"
+    assert root["input_arbitration"]["local_proof_session_digest"] == "8899aabbccddeeff"
+    assert root["input_arbitration"]["local_proof_object_bound"] is False
+    assert "private_path" not in json.dumps(projected)
 
 
 @pytest.mark.skipif(BreadcrumbTraceCollector is None or ModelBuilder is None, reason="production model builder is unavailable")
@@ -1160,12 +1238,12 @@ def test_finalized_split_arbitration_preserves_selection_guards_and_wide_mtimes(
         assert leaf["local_proof_generation_known"] == leaf["active_generation_known"] == "unknown"
     root = next(item["input_arbitration"] for item in projections
                 if item.get("input_arbitration", {}).get("phase") == "root_fill")
-    assert root["selection"] == "active" and root["selection_reason"] == "active_selected"
+    assert root["selection"] == "split" and root["selection_reason"] == "split_merge"
     assert root["local_staging_descendant"] is True
     assert root["local_staging_collision_descendant"] is False
     assert root["split_has_verified_leaf"] is False
-    assert root["local_candidate_eligible"] is True and root["local_size_ge_active"] is True
-    assert root["remote_indicates_newer"] is True
+    assert root["local_candidate_eligible"] is None and root["local_size_ge_active"] is None
+    assert root["remote_indicates_newer"] is None
     checksum = next(item["input_arbitration"] for item in projections
                     if item.get("input_arbitration", {}).get("split_candidate_remote_size") == 1_072)
     assert checksum["split_candidate_local_present"] is True
