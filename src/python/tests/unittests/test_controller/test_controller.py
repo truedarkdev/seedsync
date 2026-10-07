@@ -12337,6 +12337,154 @@ class TestController(unittest.TestCase):
 
             self.assertEqual(_MoveMutationOutcome.UNCERTAIN, tracker.outcome)
 
+    def test_automatic_directory_merge_boundary_yields_and_revalidates_per_child(self):
+        source_root = Path(__file__).resolve().parents[3]
+        controller_module = sys.modules[Controller.__module__]
+        self.assertEqual(
+            source_root / "controller" / "controller.py",
+            Path(controller_module.__file__).resolve(),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "staging")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "sample")
+            destination_tree = os.path.join(final_root, "sample")
+            source_nested = os.path.join(source_tree, "nested")
+            destination_nested = os.path.join(destination_tree, "nested")
+            source_child = os.path.join(source_nested, "payload.bin")
+            destination_child = os.path.join(destination_nested, "payload.bin")
+            stopped_source_child = os.path.join(source_nested, "stopped.bin")
+            stopped_destination_child = os.path.join(destination_nested, "stopped.bin")
+            companion = os.path.join(destination_tree, "Final")
+            os.makedirs(source_nested)
+            os.makedirs(destination_nested)
+            Path(source_child).write_bytes(b"payload")
+            Path(stopped_source_child).write_bytes(b"stopped-payload")
+            Path(companion).write_bytes(b"final-companion")
+
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            model_lock = RLock()
+            self.controller._Controller__model_lock = model_lock
+            self.controller._Controller__command_queue = Queue()
+            self.controller._Controller__command_flow_lock = Lock()
+            self.controller._Controller__active_command_processes = []
+            self.controller._Controller__progress_publication_epoch = 0
+            self.controller._Controller__scan_authority_publication_id = 1
+            self.controller._Controller__scan_authority_tokens = {
+                "local": {None: ("local-session", 0)},
+                "remote": {None: ("remote-session", 0)},
+            }
+            for side, session in (
+                    ("active", "active-session"),
+                    ("local", "local-session"),
+                    ("remote", "remote-session")):
+                process = getattr(self.controller, "_Controller__{}_scan_process".format(side))
+                process.session_token = session
+                process.generation = 0
+            self.controller._Controller__model = Model()
+            self.controller._Controller__pending_completion_publications = {
+                ModelFile.build_file_id("sample", None): SimpleNamespace(job_identity=(1, "job")),
+            }
+            self.controller._Controller__updater._record_completion_gate_breadcrumb.reset_mock()
+            file = SimpleNamespace(
+                file_id=ModelFile.build_file_id("sample", None), name="sample", full_path="sample",
+                path_pair_id=None, state=ModelFile.State.DOWNLOADED, local_size=7, remote_size=7, modified=None,
+            )
+            timed_lock = _ModelUpdateTimedModelLock(model_lock, None)
+            boundary = _AutomaticMoveBoundary(
+                self.controller._Controller__updater, self.controller, timed_lock, file, None,
+            )
+
+            copy_started = (threading.Event(), threading.Event())
+            resume_copy = (threading.Event(), threading.Event())
+            publish_started = threading.Event()
+            resume_publish = threading.Event()
+            original_copy = Controller._Controller__copy_to_publish_temporary
+            copy_count = [0]
+            rename_calls = []
+            result = []
+            errors = []
+
+            def delayed_copy(*args, **kwargs):
+                index = copy_count[0]
+                copy_count[0] += 1
+                copy_started[index].set()
+                if not resume_copy[index].wait(2):
+                    raise TimeoutError("test did not release delayed private copy")
+                return original_copy(*args, **kwargs)
+
+            def reject_rename_without_replace(source, destination):
+                rename_calls.append((source, destination))
+                if len(rename_calls) == 2:
+                    publish_started.set()
+                    if not resume_publish.wait(2):
+                        raise TimeoutError("test did not release gated publication")
+                raise OSError(errno.EINVAL, "filesystem requires exclusive-copy fallback", destination)
+
+            def run_move():
+                try:
+                    with timed_lock:
+                        result.append(self.controller._Controller__move_from_staging(
+                            "sample", automatic_move_boundary=boundary,
+                        ))
+                except BaseException as error:
+                    errors.append(error)
+
+            worker = threading.Thread(target=run_move)
+            try:
+                with patch.object(
+                        Controller, "_Controller__rename_no_replace",
+                        side_effect=reject_rename_without_replace,
+                ), patch.object(
+                        Controller, "_Controller__copy_to_publish_temporary",
+                        side_effect=delayed_copy,
+                ):
+                    worker.start()
+                    self.assertTrue(copy_started[0].wait(1))
+                    lock_available_during_copy = model_lock.acquire(timeout=0.25)
+                    if lock_available_during_copy:
+                        model_lock.release()
+                    resume_copy[0].set()
+                    self.assertTrue(publish_started.wait(1))
+                    lock_held_for_publish = not model_lock.acquire(timeout=0.05)
+                    if not lock_held_for_publish:
+                        model_lock.release()
+                    resume_publish.set()
+                    self.assertTrue(copy_started[1].wait(1))
+                    lock_available_for_stopped_copy = model_lock.acquire(timeout=0.25)
+                    if lock_available_for_stopped_copy:
+                        model_lock.release()
+                    self.controller._Controller__command_queue.put(Controller.Command(
+                        Controller.Command.Action.STOP, "sample",
+                    ))
+                    resume_copy[1].set()
+                    worker.join(2)
+            finally:
+                resume_copy[0].set()
+                resume_copy[1].set()
+                resume_publish.set()
+                if worker.is_alive():
+                    worker.join(2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual([], errors)
+            self.assertTrue(lock_available_during_copy)
+            self.assertTrue(lock_available_for_stopped_copy)
+            self.assertTrue(lock_held_for_publish)
+            self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result[0])
+            self.assertEqual(b"payload", Path(destination_child).read_bytes())
+            self.assertEqual(b"final-companion", Path(companion).read_bytes())
+            self.assertFalse(os.path.lexists(source_child))
+            self.assertTrue(os.path.lexists(stopped_source_child))
+            self.assertFalse(os.path.lexists(stopped_destination_child))
+            self.assertTrue(os.path.lexists(source_tree))
+            self.assertEqual(3, len(rename_calls))
+            self.assertFalse(any(entry.startswith(".seedsync-publish-")
+                                 for root, dirs, files in os.walk(destination_tree)
+                                 for entry in dirs + files))
+
     def test_automatic_move_boundary_defers_regular_and_directory_fallback_before_publish(self):
         class Boundary:
             def __init__(self):
@@ -12805,8 +12953,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__updater.begin_final_move_local_root_invalidation.return_value = 17
         self.controller._Controller__safe_existing_directory = MagicMock(return_value=True)
 
-        def partial_merge(*args):
-            args[-1].mutated()
+        def partial_merge(src, dst, path_pair_id=None, required_collision_sources=None,
+                          mutation_tracker=None, *, automatic_move_boundary=None):
+            mutation_tracker.mutated()
             return False
 
         self.controller._Controller__merge_staging_directory_no_replace = MagicMock(side_effect=partial_merge)

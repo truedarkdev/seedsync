@@ -7181,7 +7181,8 @@ class Controller:
     def __merge_staging_directory_no_replace(
             self, src: str, dst: str, path_pair_id: Optional[str] = None,
             required_collision_sources: Optional[set[str]] = None,
-            mutation_tracker: Optional[_MoveMutationTracker] = None) -> bool:
+            mutation_tracker: Optional[_MoveMutationTracker] = None,
+            *, automatic_move_boundary: Optional[object] = None) -> bool:
         """Publish missing descendants and retain every collision in staging.
 
         A split-root directory is expected after an interrupted portable
@@ -7253,13 +7254,15 @@ class Controller:
             try:
                 destination_stat = os.lstat(destination_child)
             except FileNotFoundError:
-                self.__publish_staging_no_replace(source_child, destination_child, mutation_tracker)
+                self.__publish_staging_no_replace(
+                    source_child, destination_child, mutation_tracker, automatic_move_boundary,
+                )
                 continue
             if stat.S_ISDIR(source_stat.st_mode) and not stat.S_ISLNK(source_stat.st_mode) and \
                     stat.S_ISDIR(destination_stat.st_mode) and not stat.S_ISLNK(destination_stat.st_mode):
                 nested_merge_succeeded = self.__merge_staging_directory_no_replace(
                     source_child, destination_child, path_pair_id, required_collision_sources,
-                    mutation_tracker,
+                    mutation_tracker, automatic_move_boundary=automatic_move_boundary,
                 )
                 if required_collision_sources is not None and not nested_merge_succeeded and any(
                         self.__path_is_within(path, source_child)
@@ -7477,6 +7480,7 @@ class Controller:
                 self.__collision_merge_deferred = False
                 if not self.__merge_staging_directory_no_replace(
                         src, dst, path_pair_id, required_collision_sources, mutation_tracker,
+                        automatic_move_boundary=automatic_move_boundary,
                 ):
                     if self.__collision_merge_deferred:
                         return Controller.MoveFromStagingResult.DEFERRED
