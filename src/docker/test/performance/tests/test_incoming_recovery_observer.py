@@ -704,6 +704,66 @@ def test_pending_transfer_gate_requires_exact_local_paths_and_safe_lifecycle_bef
     assert sent == []
 
 
+def test_fresh_download_gate_is_opt_in_and_requires_remote_only_shape():
+    gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", require_remote_only=True)
+    ready = responses()
+    ready["/server/model/v1/pairs/pair-1/roots?limit=200"]["records"][0].update({
+        "remote_present": True, "remote_has_transferable_content": True,
+        "local_present": False, "complete_local_coverage": False,
+        "final_move_succeeded": False, "explicitly_stopped": False,
+    })
+    gate.preflight(lambda path: ready[path])
+
+    for changed in (
+        {"local_present": True}, {"complete_local_coverage": True},
+        {"explicitly_stopped": True}, {"remote_has_transferable_content": False},
+    ):
+        blocked = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", require_remote_only=True)
+        candidate = responses()
+        candidate["/server/model/v1/pairs/pair-1/roots?limit=200"]["records"][0].update({
+            "remote_present": True, "remote_has_transferable_content": True,
+            "local_present": False, "complete_local_coverage": False,
+            "final_move_succeeded": False, "explicitly_stopped": False,
+            **changed,
+        })
+        with pytest.raises(observer.ObserverSchemaError, match="not queue-ready"):
+            blocked.preflight(lambda path: candidate[path])
+
+    with pytest.raises(observer.ObserverSchemaError, match="mutually exclusive"):
+        observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", require_pending_transfer=True,
+                           require_remote_only=True)
+
+
+def test_transport_timing_sanitizer_preserves_exact_decimal_and_drops_malformed_values():
+    artifact = observer._sanitize_artifact({
+        "schema": "incoming-recovery-observer-event.v1", "event": "transport_timing",
+        "transport_timing": {
+            "request_kind": "get", "endpoint_class": "status", "outcome": "success",
+            "start_utc_ns": str(2**53 + 7), "end_utc_ns": str(2**53 + 17),
+            "start_monotonic_ns": str(2**53 + 9), "end_monotonic_ns": str(2**53 + 19),
+            "elapsed_ns": 10, "status_code": 200, "secret": "discard",
+        },
+    })["transport_timing"]
+    assert artifact["start_utc_ns"] == str(2**53 + 7)
+    assert artifact["end_monotonic_ns"] == str(2**53 + 19)
+    assert artifact["elapsed_ns"] == 10
+    malformed = observer._sanitize_artifact({
+        "transport_timing": {
+            "request_kind": [], "endpoint_class": {}, "outcome": True,
+            "start_utc_ns": 2**53 + 7, "end_utc_ns": "-1",
+            "start_monotonic_ns": "9223372036854775808", "end_monotonic_ns": "1.0",
+            "elapsed_ns": True, "status_code": True, "error_type": [],
+        },
+    })["transport_timing"]
+    assert malformed["request_kind"] == "unknown"
+    assert malformed["endpoint_class"] == "unknown"
+    assert malformed["outcome"] == "unknown"
+    assert all(malformed[field] is None for field in (
+        "start_utc_ns", "end_utc_ns", "start_monotonic_ns", "end_monotonic_ns",
+        "elapsed_ns", "status_code", "error_type",
+    ))
+
+
 def test_json_sink_persists_sanitized_preflight_success_and_failure(tmp_path):
     artifact_path = tmp_path / "observer.jsonl"
     gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", artifact_path=artifact_path)

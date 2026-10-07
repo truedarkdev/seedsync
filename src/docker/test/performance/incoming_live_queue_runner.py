@@ -11,6 +11,8 @@ from pathlib import Path
 import secrets
 import stat
 import sys
+import time
+from typing import Mapping
 import urllib.request
 from urllib.error import HTTPError
 from urllib.parse import quote
@@ -340,23 +342,98 @@ def _require_private_trusted_root_config(config_path: Path) -> None:
 
 class HttpAdapter:
     """Keep secrets in the caller and return an explicit Queue status result."""
-    def __init__(self, key_path: Path, opener=urllib.request.urlopen, *, post_timeout_seconds: int = 35):
+    _MAX_BODY_BYTES = 4 * 1024 * 1024
+
+    def __init__(self, key_path: Path, opener=urllib.request.urlopen, *, post_timeout_seconds: int = 35,
+                 timing_sink: object | None = None):
         self.key_path, self.post_timeout_seconds, self.opener = key_path, post_timeout_seconds, opener
+        self.timing_sink = timing_sink
+
+    @staticmethod
+    def _timing(method: str, path: str, start_utc_ns: int, start_mono_ns: int,
+                end_utc_ns: int, end_mono_ns: int, *, outcome: str,
+                status_code: int | None = None, error: BaseException | None = None) -> dict[str, object]:
+        return {
+            "schema": "incoming-recovery-transport-timing.v1",
+            "request_kind": "queue_post" if method == "POST" else "get",
+            "endpoint_class": "queue" if method == "POST" else _observer.endpoint_class(path),
+            "outcome": outcome,
+            "status_code": status_code,
+            "error_type": _observer._safe_error_type(error) if error is not None else None,
+            "start_utc_ns": str(start_utc_ns),
+            "end_utc_ns": str(end_utc_ns),
+            "start_monotonic_ns": str(start_mono_ns),
+            "end_monotonic_ns": str(end_mono_ns),
+            "elapsed_ns": max(0, end_mono_ns - start_mono_ns),
+        }
+
+    def _persist_get_timing(self, timing: Mapping[str, object]) -> None:
+        if self.timing_sink is not None:
+            _observer._persist_artifact(self.timing_sink, {
+                "schema": "incoming-recovery-observer-event.v1",
+                "event": "transport_timing",
+                "transport_timing": timing,
+            })
+
+    @classmethod
+    def _read_bounded(cls, response) -> bytes:
+        body = response.read(cls._MAX_BODY_BYTES + 1)
+        if not isinstance(body, bytes):
+            raise TypeError("HTTP response body is not bytes")
+        if len(body) > cls._MAX_BODY_BYTES:
+            raise ValueError("HTTP response exceeds the bounded observer body size")
+        return body
 
     def request(self, path: str, method: str = "GET"):
         key = self.key_path.read_text(encoding="utf-8").strip()
         request = urllib.request.Request("http://127.0.0.1:8800" + path, method=method,
             headers={"Authorization": "Bearer " + key})
+        start_utc_ns = time.time_ns()
+        start_mono_ns = time.monotonic_ns()
+        status_code: int | None = None
+        outcome = "success"
         try:
             with self.opener(request, timeout=self.post_timeout_seconds if method == "POST" else 5) as response:
-                body = response.read()
-                if method == "POST":
-                    return QueueTransportResponse(response.status, body)
-                return json.loads(body.decode("utf-8"))
+                body = self._read_bounded(response)
+                status_code = response.status
         except HTTPError as error:
-            if method != "POST":
-                raise
-            return QueueTransportResponse(error.code, error.read())
+            outcome = "http_error"
+            status_code = error.code
+            try:
+                body = self._read_bounded(error)
+            except BaseException:
+                body = b""
+            end_mono_ns = time.monotonic_ns()
+            end_utc_ns = time.time_ns()
+            timing = self._timing(method, path, start_utc_ns, start_mono_ns,
+                                  end_utc_ns, end_mono_ns, outcome=outcome,
+                                  status_code=status_code, error=error)
+            if method == "POST":
+                return QueueTransportResponse(status_code, body, timing)
+            self._persist_get_timing(timing)
+            raise
+        except BaseException as error:
+            end_mono_ns = time.monotonic_ns()
+            end_utc_ns = time.time_ns()
+            timing = self._timing(method, path, start_utc_ns, start_mono_ns,
+                                  end_utc_ns, end_mono_ns, outcome="transport_error", error=error)
+            if method == "POST":
+                try:
+                    error.queue_transport_timing = timing
+                except BaseException:
+                    pass
+            else:
+                self._persist_get_timing(timing)
+            raise
+        end_mono_ns = time.monotonic_ns()
+        end_utc_ns = time.time_ns()
+        timing = self._timing(method, path, start_utc_ns, start_mono_ns,
+                              end_utc_ns, end_mono_ns, outcome=outcome,
+                              status_code=status_code)
+        if method == "POST":
+            return QueueTransportResponse(status_code, body, timing)
+        self._persist_get_timing(timing)
+        return json.loads(body.decode("utf-8"))
 
 
 def main(
@@ -365,6 +442,9 @@ def main(
 ) -> int:
     config_file = Path(config_path)
     config = json.loads(config_file.read_text(encoding="utf-8"))
+    allow_fresh_download = config.get("allow_fresh_download", False)
+    if type(allow_fresh_download) is not bool:
+        raise SystemExit("allow_fresh_download must be a boolean")
     source_manifest_config = config.get("source_manifest")
     if source_manifest_config is not None and not isinstance(source_manifest_config, dict):
         raise SystemExit("source_manifest config must be an object")
@@ -452,23 +532,27 @@ def main(
     # client remains alive through the final response/artifact boundary.
     post_timeout = _EXPERIMENTAL_POST_TIMEOUT_SECONDS if experimental_enabled else 35
     experimental_sample_interval = 10.0 if experimental_enabled else 0.0
-    adapter = HttpAdapter(Path(config["key_path"]), post_timeout_seconds=post_timeout)
+    artifact_sink = _observer.JsonArtifactSink(config["artifact_path"])
+    adapter = HttpAdapter(Path(config["key_path"]), post_timeout_seconds=post_timeout,
+                          timing_sink=artifact_sink)
     attempt_state_path = config.get("attempt_state_path")
     if not dry_run and (not isinstance(attempt_state_path, str) or not attempt_state_path):
         raise SystemExit("Queue attempt_state_path is required")
     gate = QueueGate(config["pair_id"], config["pair_name"], config["root_id"],
-        config["root_name"], require_pending_transfer=True, artifact_path=config["artifact_path"],
+        config["root_name"], require_pending_transfer=not allow_fresh_download,
+        require_remote_only=allow_fresh_download, artifact_sink=artifact_sink,
         attempt_state_path=attempt_state_path)
     if dry_run:
         gate.preflight(adapter.request)
-        _observer.FixedGetSampler(tuple(config["passive_paths"]), artifact_path=config["artifact_path"],
+        _observer.FixedGetSampler(tuple(config["passive_paths"]), artifact_sink=artifact_sink,
             continue_on_error=False).sample(adapter.request)
         return 0
     if os.environ.get("INCOMING_RECOVERY_ALLOW_QUEUE") != "1":
         raise SystemExit("Queue gate must be explicitly enabled")
     caller = PassiveQueueCaller(gate, adapter.request,
         lambda path: adapter.request(path, "POST"), tuple(config["passive_paths"]),
-        config["artifact_path"], os.environ, post_timeout, experimental_sample_interval)
+        config["artifact_path"], os.environ, post_timeout, experimental_sample_interval,
+        artifact_sink=artifact_sink)
     response = caller.run()
     return 0 if 200 <= response.status < 300 else 1
 

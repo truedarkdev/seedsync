@@ -33,12 +33,15 @@ class QueueTransportResponse:
 
     status: int
     body: bytes = b""
+    transport_timing: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if type(self.status) is not int or not 100 <= self.status <= 599:
             raise ObserverSchemaError("Queue transport status is invalid")
         if not isinstance(self.body, bytes):
             raise ObserverSchemaError("Queue transport body must be bytes")
+        if self.transport_timing is not None and not isinstance(self.transport_timing, Mapping):
+            raise ObserverSchemaError("Queue transport timing must be a mapping")
 
 
 @dataclass
@@ -97,6 +100,7 @@ class PassiveQueueCaller:
     environment: Mapping[str, str]
     client_timeout_seconds: int = 35
     passive_sample_interval_seconds: float = 0.0
+    artifact_sink: object | None = None
 
     def run(self) -> object:
         stop = threading.Event()
@@ -110,8 +114,12 @@ class PassiveQueueCaller:
             try:
                 first_sample = True
                 while True:
-                    sampler = FixedGetSampler(self.passive_paths, artifact_path=self.artifact_path,
-                                              continue_on_error=False)
+                    sampler = FixedGetSampler(
+                        self.passive_paths,
+                        artifact_path=self.artifact_path if self.artifact_sink is None else None,
+                        artifact_sink=self.artifact_sink,
+                        continue_on_error=False,
+                    )
                     sampler.sample(
                         self.get,
                         before_request=started_boundary.set if first_sample and started_boundary is not None else None,
@@ -409,6 +417,7 @@ _ARTIFACT_ALLOWED_KEYS = frozenset({
     "model_snapshot", "target_outcome", "target_visible_state", "target_explicitly_stopped", "target_gap_count",
     "target_max_observed_gap_ms", "target_expected_interval_ms", "target_max_gap_ms",
     "target_first_sample_monotonic_ms", "target_last_sample_monotonic_ms",
+    "transport_timing",
     "runtime_version",
 })
 _ARTIFACT_SAFE_REASONS = _QUEUE_PREFLIGHT_REASONS | frozenset({
@@ -420,6 +429,9 @@ _ARTIFACT_SAFE_REASONS = _QUEUE_PREFLIGHT_REASONS | frozenset({
 _ARTIFACT_ERROR_TYPES = frozenset({
     "auth_error", "http_error", "timeout", "transport_error", "observer_error", "selector_error",
 })
+_TRANSPORT_TIMESTAMP_FIELDS = (
+    "start_utc_ns", "end_utc_ns", "start_monotonic_ns", "end_monotonic_ns",
+)
 _ARTIFACT_TARGET_OUTCOMES = frozenset({
     "completed", "stopped", "rollback", "deadline", "read_failure", "selector_unknown", "unknown",
 })
@@ -1265,6 +1277,33 @@ def _sanitize_scan_lifecycle(value: object) -> Mapping[str, object]:
     return sanitized
 
 
+def _sanitize_transport_timing(value: object) -> Mapping[str, object]:
+    """Retain only exact bounded transport boundaries and fixed classifications."""
+    source = value if isinstance(value, Mapping) else {}
+    request_kind = source.get("request_kind")
+    endpoint_class = source.get("endpoint_class")
+    outcome = source.get("outcome")
+    error_type = source.get("error_type")
+    result: dict[str, object] = {
+        "schema": "incoming-recovery-transport-timing.v1",
+        "request_kind": request_kind if isinstance(request_kind, str) and request_kind in {"get", "queue_post"} else "unknown",
+        "endpoint_class": endpoint_class if isinstance(endpoint_class, str) and endpoint_class in (_ENDPOINT_CLASSES | {"queue"}) else "unknown",
+        "outcome": outcome if isinstance(outcome, str) and outcome in {"success", "http_error", "transport_error"} else "unknown",
+        "status_code": source.get("status_code")
+        if type(source.get("status_code")) is int and 100 <= source.get("status_code") <= 599 else None,
+        "error_type": error_type if isinstance(error_type, str) and error_type in _ARTIFACT_ERROR_TYPES else None,
+    }
+    for key in _TRANSPORT_TIMESTAMP_FIELDS:
+        item = source.get(key)
+        result[key] = (
+            item if isinstance(item, str) and re.fullmatch(r"(?:0|[1-9][0-9]{0,18})", item)
+            and int(item) <= 2**63 - 1 else None
+        )
+    elapsed = source.get("elapsed_ns")
+    result["elapsed_ns"] = elapsed if type(elapsed) is int and 0 <= elapsed <= 604_800_000_000_000 else None
+    return result
+
+
 def _sanitize_artifact(value: object) -> Mapping[str, object]:
     """Allow-list artifact fields so injected sinks cannot retain HTTP/private data."""
     if not isinstance(value, Mapping):
@@ -1329,6 +1368,8 @@ def _sanitize_artifact(value: object) -> Mapping[str, object]:
             sanitized[key] = _sanitize_discriminator_diagnostics(item)
         elif key == "capture":
             sanitized[key] = _sanitize_capture(item)
+        elif key == "transport_timing":
+            sanitized[key] = _sanitize_transport_timing(item)
         elif key == "model_snapshot":
             if isinstance(item, Mapping):
                 safe_snapshot: dict[str, object] = {
@@ -1385,14 +1426,16 @@ class JsonArtifactSink:
 
     def __init__(self, path: str | os.PathLike[str]):
         self.path = Path(path)
+        self._lock = threading.Lock()
 
     def persist(self, artifact: Mapping[str, object]) -> None:
         record = _sanitize_artifact(artifact)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
 
     append = persist
 
@@ -2069,6 +2112,7 @@ class QueueGate:
     expected_pair_local_path: str | None = None
     expected_root_relative_path: str | None = None
     require_pending_transfer: bool = False
+    require_remote_only: bool = False
     passed: bool = False
     scan_lifecycle: Mapping[str, object] | None = None
     last_queue_evidence: Mapping[str, object] | None = None
@@ -2105,6 +2149,10 @@ class QueueGate:
             raise ObserverCaptureError("Queue durable attempt marker persistence failed") from exc
 
     def __post_init__(self) -> None:
+        if type(self.require_pending_transfer) is not bool or type(self.require_remote_only) is not bool:
+            raise ObserverSchemaError("Queue lifecycle mode must be boolean")
+        if self.require_pending_transfer and self.require_remote_only:
+            raise ObserverSchemaError("Queue lifecycle modes are mutually exclusive")
         if self.artifact_sink is not None and self.artifact_path is not None:
             raise ValueError("provide artifact_sink or artifact_path, not both")
         if self.artifact_path is not None:
@@ -2145,15 +2193,15 @@ class QueueGate:
                 raise ObserverSchemaError("target root identity changed")
             if self.expected_root_relative_path is not None and root.get("full_path") != self.expected_root_relative_path:
                 raise ObserverSchemaError("target root relative path changed")
-            if self.require_pending_transfer:
+            if self.require_pending_transfer or self.require_remote_only:
                 expected_flags = {
                     "remote_present": True,
                     "remote_has_transferable_content": True,
-                    "local_present": True,
                     "complete_local_coverage": False,
                     "final_move_succeeded": False,
                     "explicitly_stopped": False,
                 }
+                expected_flags["local_present"] = not self.require_remote_only
                 for field_name, expected_value in expected_flags.items():
                     if root.get(field_name) is not expected_value:
                         raise ObserverSchemaError("target lifecycle is not queue-ready: {}".format(field_name))
@@ -2220,6 +2268,9 @@ class QueueGate:
                 "schema": "incoming-recovery-queue-error.v1", "kind": "queue_error",
                 "error_type": _safe_error_type(exc), "scan_lifecycle": self.scan_lifecycle,
             }
+            transport_timing = getattr(exc, "queue_transport_timing", None)
+            if isinstance(transport_timing, Mapping):
+                self.last_queue_evidence["transport_timing"] = transport_timing
             if self.first_failure_evidence is None:
                 self.first_failure_evidence = self.last_queue_evidence
             self._persist({
@@ -2240,6 +2291,9 @@ class QueueGate:
             **queue_response_evidence(status, body),
             "scan_lifecycle": self.scan_lifecycle,
         }
+        transport_timing = getattr(response, "transport_timing", None)
+        if isinstance(transport_timing, Mapping):
+            self.last_queue_evidence["transport_timing"] = transport_timing
         status_failure = not 200 <= status < 300
         first_failure = False
         if status_failure:

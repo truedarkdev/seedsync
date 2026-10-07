@@ -215,7 +215,7 @@ def test_experimental_queue_timeout_requires_exact_environment_gate(monkeypatch,
             pass
 
     class FakeCaller:
-        def __init__(self, _gate, _get, _post, _paths, _artifact, _environment, timeout, interval):
+        def __init__(self, _gate, _get, _post, _paths, _artifact, _environment, timeout, interval, **_kwargs):
             observed["timeout"] = timeout
             observed["interval"] = interval
 
@@ -250,7 +250,7 @@ def test_experimental_queue_timeout_uses_exact_environment_gate_without_config_s
             pass
 
     class FakeCaller:
-        def __init__(self, _gate, _get, _post, _paths, _artifact, _environment, timeout, interval):
+        def __init__(self, _gate, _get, _post, _paths, _artifact, _environment, timeout, interval, **_kwargs):
             observed.update(timeout=timeout, interval=interval)
 
         def run(self):
@@ -278,7 +278,7 @@ def test_http_adapter_keeps_get_budget_while_experiment_post_has_terminal_margin
         def __exit__(self, *_args):
             return False
 
-        def read(self):
+        def read(self, _size=-1):
             return b"{}"
 
     def opener(request, timeout):
@@ -289,6 +289,131 @@ def test_http_adapter_keeps_get_budget_while_experiment_post_has_terminal_margin
     assert adapter.request("/server/status") == {}
     assert adapter.request("/server/command/queue/value", "POST").status == 200
     assert calls == [("GET", 5), ("POST", 610)]
+
+
+@pytest.mark.parametrize(("config_value", "expected_pending", "expected_remote"), [
+    (None, True, False), (True, False, True), (False, True, False),
+])
+def test_queue_mode_selects_fresh_remote_only_explicitly(monkeypatch, tmp_path, config_value,
+                                                         expected_pending, expected_remote):
+    config_path = tmp_path / "runner.json"
+    config = {
+        "key_path": str(tmp_path / "key"), "pair_id": "pair", "pair_name": "pair",
+        "root_id": "root", "root_name": "root", "artifact_path": str(tmp_path / "artifact"),
+        "attempt_state_path": str(tmp_path / "attempt.json"), "passive_paths": ["/server/status"],
+    }
+    if config_value is not None:
+        config["allow_fresh_download"] = config_value
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    observed = {}
+
+    class FakeGate:
+        def __init__(self, *_args, **kwargs):
+            observed.update(kwargs)
+
+    class FakeCaller:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self):
+            return runner.QueueTransportResponse(200)
+
+    monkeypatch.setattr(runner, "QueueGate", FakeGate)
+    monkeypatch.setattr(runner, "PassiveQueueCaller", FakeCaller)
+    monkeypatch.setenv("INCOMING_RECOVERY_ALLOW_QUEUE", "1")
+    assert runner.main(str(config_path)) == 0
+    assert observed["require_pending_transfer"] is expected_pending
+    assert observed["require_remote_only"] is expected_remote
+
+
+@pytest.mark.parametrize("bad_value", ("true", 1, None, [], {}))
+def test_invalid_fresh_download_config_fails_before_gate_or_transport(monkeypatch, tmp_path, bad_value):
+    config_path = tmp_path / "runner.json"
+    config_path.write_text(json.dumps({"allow_fresh_download": bad_value}), encoding="utf-8")
+    monkeypatch.setattr(runner, "QueueGate", lambda *_args, **_kwargs: pytest.fail("gate must not be built"))
+    with pytest.raises(SystemExit, match="allow_fresh_download must be a boolean"):
+        runner.main(str(config_path))
+
+
+def test_http_adapter_persists_exact_bounded_get_timing_and_queue_timing(tmp_path, monkeypatch):
+    key_path = tmp_path / "key"
+    key_path.write_text("private-token", encoding="utf-8")
+    artifact = tmp_path / "events.jsonl"
+    sink = runner._observer.JsonArtifactSink(artifact)
+    calls = []
+
+    class Response:
+        status = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size=-1):
+            assert size == runner.HttpAdapter._MAX_BODY_BYTES + 1
+            return self.payload
+
+    def opener(request, timeout):
+        calls.append((request.method, timeout))
+        return Response(b"{}")
+
+    stamps = iter((2**53 + 5, 2**53 + 10, 2**53 + 15, 2**53 + 20,
+                   2**53 + 25, 2**53 + 30, 2**53 + 35, 2**53 + 40))
+    monkeypatch.setattr(runner.time, "time_ns", lambda: next(stamps))
+    monkeypatch.setattr(runner.time, "monotonic_ns", lambda: next(stamps))
+    adapter = runner.HttpAdapter(key_path, opener, timing_sink=sink)
+    assert adapter.request("/server/status") == {}
+    result = adapter.request("/server/command/queue/file?file_id=secret", "POST")
+    assert result.status == 200
+    assert calls == [("GET", 5), ("POST", 35)]
+    records = [json.loads(line) for line in artifact.read_text(encoding="utf-8").splitlines()]
+    get_timing = records[0]["transport_timing"]
+    assert get_timing["start_utc_ns"] == str(2**53 + 5)
+    assert get_timing["start_monotonic_ns"] == str(2**53 + 10)
+    assert get_timing["end_monotonic_ns"] == str(2**53 + 15)
+    assert get_timing["end_utc_ns"] == str(2**53 + 20)
+    assert result.transport_timing["start_utc_ns"] == str(2**53 + 25)
+    # Exercise the actual gate→JsonArtifactSink finalized artifact boundary.
+    gate = runner.QueueGate("pair", "pair", "root", "Incoming", artifact_sink=sink)
+    gate.passed = True
+    gate.queue(lambda _path: result)
+    output = artifact.read_text(encoding="utf-8")
+    records = [json.loads(line) for line in output.splitlines()]
+    queue_record = next(record for record in records if record.get("event") == "queue")
+    assert "private-token" not in output and "private-url" not in output and "secret" not in output
+    assert queue_record["queue_evidence"]["transport_timing"]["start_utc_ns"] == str(2**53 + 25)
+
+
+def test_http_adapter_keeps_queue_transport_error_timing_without_retry(tmp_path):
+    key_path = tmp_path / "key"
+    key_path.write_text("private-token", encoding="utf-8")
+    artifact = tmp_path / "error.jsonl"
+    calls = []
+
+    def opener(_request, timeout):
+        calls.append(timeout)
+        raise TimeoutError("private transport details")
+
+    adapter = runner.HttpAdapter(key_path, opener)
+    gate = runner.QueueGate("pair", "pair", "root", "Incoming", artifact_sink=runner._observer.JsonArtifactSink(artifact))
+    gate.passed = True
+    with pytest.raises(TimeoutError):
+        gate.queue(lambda path: adapter.request(path, "POST"))
+    assert len(calls) == 1
+    records = [json.loads(line) for line in artifact.read_text(encoding="utf-8").splitlines()]
+    queue_record = next(record for record in records if record.get("event") == "queue")
+    timing = queue_record["failure"]["transport_timing"]
+    assert timing["outcome"] == "transport_error"
+    assert timing["error_type"] == "timeout"
+    assert timing["start_utc_ns"].isdigit() and timing["end_monotonic_ns"].isdigit()
+    serialized = artifact.read_text(encoding="utf-8")
+    assert "private transport details" not in serialized
+    assert "private-token" not in serialized and "file_id=secret" not in serialized
 
 
 @pytest.mark.parametrize("status", (409, 504))
