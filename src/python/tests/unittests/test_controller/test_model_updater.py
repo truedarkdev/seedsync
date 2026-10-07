@@ -14112,6 +14112,16 @@ class TestModelUpdater(unittest.TestCase):
     def test_v092_pending_path_pair_moves_only_after_both_final_scans_reconcile_it(self):
         path_pair_id = "pair-b"
         controller = self._make_v092_pending_completion_controller(path_pair_id=path_pair_id)
+        builder = controller._Controller__model_builder
+        original_build = builder.build_model
+        original_coverage = builder.has_complete_local_coverage
+        original_identity = builder.has_verified_complete_staging_remote_identity
+        builder.build_model = MagicMock(wraps=original_build)
+        builder.has_complete_local_coverage = MagicMock(wraps=original_coverage)
+        builder.has_verified_complete_staging_remote_identity = MagicMock(wraps=original_identity)
+        controller._record_completion_scan_join_breadcrumb = MagicMock()
+        controller._Controller__local_scan_process.session_token = "current-session"
+        controller._Controller__local_scan_process.generation = 23
         local = SystemFile("pending.bin", 10, False, is_staging=True, mtime_ns=1)
         local.path_pair_id = path_pair_id
         remote = SystemFile("pending.bin", 10, False, mtime_ns=1)
@@ -14128,6 +14138,18 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertEqual({path_pair_id}, controller._Controller__reconciled_local_path_pair_ids)
         self.assertEqual({path_pair_id}, controller._Controller__reconciled_remote_path_pair_ids)
+        authority = {
+            "local_scan_session": "current-session",
+            "local_scan_generation": 23,
+            "reconciled_remote_path_pair_ids": frozenset({path_pair_id}),
+        }
+        builder.build_model.assert_called_once_with(**authority)
+        self.assertTrue(any(call.args == (ModelFile.build_file_id("pending.bin", path_pair_id),)
+                            and call.kwargs == authority
+                            for call in builder.has_complete_local_coverage.call_args_list))
+        self.assertTrue(any(call.args == (ModelFile.build_file_id("pending.bin", path_pair_id),)
+                            and call.kwargs == authority
+                            for call in builder.has_verified_complete_staging_remote_identity.call_args_list))
         controller._Controller__move_from_staging.assert_called_once_with("pending.bin", path_pair_id)
         self.assertEqual(set(), controller._Controller__pending_completion_file_names)
 

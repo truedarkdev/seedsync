@@ -259,6 +259,11 @@ class ModelBuilder:
         self.__final_move_succeeded_files: set[str] = set()
         self.__unknown_local_path_pair_ids: set[Optional[str]] = set()
         self.__local_root_scan_proofs: dict[str, tuple[str, int, SystemFile]] = {}
+        # This is only the input key for the cached render; proof eligibility
+        # is rechecked against the current proof map and exact source each use.
+        self.__cached_model_local_scan_authority: Optional[
+            tuple[str, int, frozenset[Optional[str]]]
+        ] = None
         self.__local_root_paths: dict[Optional[str], str] = {}
         self.__local_staging_paths: dict[Optional[str], str] = {}
         self.__suppressed_ambiguous_extracted_file_names: set[str] = set()
@@ -2870,8 +2875,9 @@ class ModelBuilder:
             )
         except Exception:
             trace_enabled = False
+        cached_authority = self.__cached_model_local_scan_authority
         changed_proof_ids = set()
-        if trace_enabled:
+        if trace_enabled or (self.__cached_model is not None and cached_authority is not None):
             for file_id in set(previous_proofs).union(bound_proofs):
                 previous_proof = previous_proofs.get(file_id)
                 bound_proof = bound_proofs.get(file_id)
@@ -2882,7 +2888,24 @@ class ModelBuilder:
                         previous_proof[1] != bound_proof[1] or previous_proof[2] is not bound_proof[2]
                 if changed:
                     changed_proof_ids.add(file_id)
-        if changed_proof_ids:
+        if self.__cached_model is not None and cached_authority is not None and changed_proof_ids:
+            reconciled_remote_ids = cached_authority[2]
+            proof_changed_for_eligible_pair = any(
+                (proof := proof_map.get(file_id)) is not None and
+                proof[2].path_pair_id in self.__unknown_local_path_pair_ids and
+                proof[2].path_pair_id in reconciled_remote_ids
+                for file_id in changed_proof_ids
+                for proof_map in (previous_proofs, bound_proofs)
+            )
+            if proof_changed_for_eligible_pair:
+                # A same-content scan can rebind or clear the exact proof
+                # source without changing the local tree value. Do not keep
+                # a cached merge whose proof was tied to that older object.
+                self.__invalidate_cache(
+                    MODEL_BUILDER_INVALIDATION_LOCAL_FILES,
+                    affected_file_ids=changed_proof_ids,
+                )
+        if changed_proof_ids and trace_enabled:
             changed_pair_ids = set()
             for file_id in changed_proof_ids:
                 for proof in (previous_proofs.get(file_id), bound_proofs.get(file_id)):
@@ -2910,6 +2933,18 @@ class ModelBuilder:
             proof[0] == session_token and proof[1] == generation and \
             self.__local_file(file_id) is proof[2] and \
             (expected_source is None or proof[2] is expected_source)
+
+    @staticmethod
+    def __normalize_current_local_scan_authority(
+            session_token: object, generation: object, reconciled_remote_path_pair_ids: object,
+    ) -> Optional[tuple[str, int, frozenset[Optional[str]]]]:
+        if not isinstance(session_token, str) or not session_token or \
+                type(generation) is not int or generation < 0 or \
+                not isinstance(reconciled_remote_path_pair_ids, (set, frozenset)) or \
+                any(pair_id is not None and not isinstance(pair_id, str)
+                    for pair_id in reconciled_remote_path_pair_ids):
+            return None
+        return session_token, generation, frozenset(reconciled_remote_path_pair_ids)
 
     def get_trusted_final_leaf_paths(
             self, file_id: str, *, local_scan_session: object = None,
@@ -3201,7 +3236,11 @@ class ModelBuilder:
         visit(remote_root, local_root, "")
         return tuple(sorted(set(paths)))
 
-    def has_complete_local_coverage(self, file_id: str) -> bool:
+    def has_complete_local_coverage(
+            self, file_id: str, *, local_scan_session: object = None,
+            local_scan_generation: object = None,
+            reconciled_remote_path_pair_ids: object = None,
+    ) -> bool:
         """Whether the current remote/effective-local tree proves completion.
 
         This is intentionally narrower than model state: pending completion
@@ -3210,7 +3249,12 @@ class ModelBuilder:
         active-only paths that only inflate aggregate directory size.
         """
         remote_file = self.__remote_file(file_id)
-        local_file = self.__build_effective_local_files().get(file_id)
+        local_scan_authority = self.__normalize_current_local_scan_authority(
+            local_scan_session, local_scan_generation, reconciled_remote_path_pair_ids,
+        )
+        local_file = self.__build_effective_local_files(
+            local_scan_authority=local_scan_authority,
+        ).get(file_id)
         return self.__effective_local_tree_proves_completion(remote_file, local_file)
 
     def get_finalizable_staging_leaf_candidates(self) -> tuple[tuple[str, str], ...]:
@@ -3298,7 +3342,11 @@ class ModelBuilder:
             return "mtime"
         return "match"
 
-    def has_verified_complete_staging_remote_identity(self, file_id: str) -> bool:
+    def has_verified_complete_staging_remote_identity(
+            self, file_id: str, *, local_scan_session: object = None,
+            local_scan_generation: object = None,
+            reconciled_remote_path_pair_ids: object = None,
+    ) -> bool:
         """Prove a pending automatic move has exact staged source identity.
 
         ``has_complete_local_coverage`` intentionally remains a compatibility
@@ -3313,9 +3361,14 @@ class ModelBuilder:
         This derives proof from existing scan inputs only; it stores no new
         state.
         """
+        local_scan_authority = self.__normalize_current_local_scan_authority(
+            local_scan_session, local_scan_generation, reconciled_remote_path_pair_ids,
+        )
         return self.__trees_have_verified_complete_staging_remote_identity(
             self.__remote_file(file_id),
-            self.__build_effective_local_files().get(file_id),
+            self.__build_effective_local_files(
+                local_scan_authority=local_scan_authority,
+            ).get(file_id),
         )
 
     def has_verified_complete_staging_remote_identity_for_authoritative_pair(
@@ -4788,9 +4841,20 @@ class ModelBuilder:
                                              remote_file: Optional[SystemFile],
                                              leaf_observer: Optional[Callable[
                                                  [SystemFile, SystemFile, bool], None
-                                             ]] = None) -> bool:
+                                             ]] = None,
+                                             queue_leaf_observer: Optional[Callable[
+                                                 [SystemFile, SystemFile, bool], None
+                                             ]] = None,
+                                             active_file: Optional[SystemFile] = None,
+                                             active_path_missing: bool = False,
+                                             active_path_conflict: bool = False) -> bool:
         if remote_file is None or existing_file.is_dir != remote_file.is_dir:
             return False
+        if queue_leaf_observer is not None and not active_path_missing and not active_path_conflict:
+            if active_file is None:
+                active_path_missing = True
+            elif active_file.is_dir != existing_file.is_dir:
+                active_path_conflict = True
         if not existing_file.is_dir:
             verified = not existing_file.has_staging_collision and \
                 ModelBuilder.__is_verified_final_leaf(remote_file, existing_file)
@@ -4799,11 +4863,37 @@ class ModelBuilder:
                     leaf_observer(remote_file, existing_file, verified)
                 except Exception:
                     pass
+            if queue_leaf_observer is not None:
+                try:
+                    queue_leaf_observer(
+                        remote_file, existing_file,
+                        active_path_missing and not active_path_conflict,
+                    )
+                except Exception:
+                    pass
             return verified
         remote_children = {child.name: child for child in remote_file.iter_children()}
+        active_children = {
+            child.name: child for child in active_file.iter_children()
+        } if queue_leaf_observer is not None and not active_path_missing and \
+            not active_path_conflict and active_file is not None and active_file.is_dir else {}
         return any(
             ModelBuilder.__has_verified_split_root_final_leaf(
                 child, remote_children.get(child.name), leaf_observer,
+                queue_leaf_observer,
+                active_children.get(child.name) if queue_leaf_observer is not None and
+                not active_path_missing and not active_path_conflict else None,
+                active_path_missing or (
+                    queue_leaf_observer is not None and
+                    not active_path_missing and not active_path_conflict and
+                    child.name not in active_children
+                ),
+                active_path_conflict or (
+                    queue_leaf_observer is not None and
+                    not active_path_missing and not active_path_conflict and
+                    child.name in active_children and
+                    active_children[child.name].is_dir != child.is_dir
+                ),
             )
             for child in existing_file.iter_children()
         )
@@ -5038,7 +5128,10 @@ class ModelBuilder:
             for remote_child in remote_children.values()
         )
 
-    def __build_effective_local_files(self, input_witness: Optional[dict] = None) -> Dict[str, SystemFile]:
+    def __build_effective_local_files(
+            self, input_witness: Optional[dict] = None, *,
+            local_scan_authority: Optional[tuple[str, int, frozenset[Optional[str]]]] = None,
+    ) -> Dict[str, SystemFile]:
         if not self.__active_files:
             return self.__local_files()
 
@@ -5079,6 +5172,15 @@ class ModelBuilder:
                 if not staging_descendant:
                     collision_descendant = self.__has_staging_collision_descendant(existing_file)
                 if staging_descendant or collision_descendant:
+                    queue_trusted_final_leaf_absent_from_active = False
+                    path_pair_id = self.__file_id_path_pair_id(file_id)
+                    known_path_pair = path_pair_id not in self.__unknown_local_path_pair_ids
+                    if not known_path_pair and local_scan_authority is not None:
+                        session_token, generation, reconciled_remote_ids = local_scan_authority
+                        known_path_pair = path_pair_id in reconciled_remote_ids and \
+                            self.has_current_local_root_scan_proof(
+                                file_id, session_token, generation, expected_source=existing_file,
+                            )
                     leaf_observer = None
                     if input_witness is not None and file_id in input_witness.get("priority_roots", ()):
                         def capture_split_leaf(
@@ -5115,8 +5217,22 @@ class ModelBuilder:
                                 pass
 
                         leaf_observer = capture_split_leaf
+                    queue_leaf_observer = None
+                    if known_path_pair:
+                        def capture_queue_trusted_split_leaf(
+                                remote_leaf: SystemFile, local_leaf: SystemFile, active_missing: bool,
+                        ) -> None:
+                            nonlocal queue_trusted_final_leaf_absent_from_active
+                            if active_missing and not local_leaf.status_sidecar_ready and \
+                                    ModelBuilder.__leaf_matches_remote_queue_exclusion_identity(
+                                        remote_leaf, local_leaf,
+                                    ):
+                                queue_trusted_final_leaf_absent_from_active = True
+
+                        queue_leaf_observer = capture_queue_trusted_split_leaf
                     verified_split_leaf = self.__has_verified_split_root_final_leaf(
                         existing_file, remote_file, leaf_observer,
+                        queue_leaf_observer, active_file,
                     )
                     if verified_split_leaf:
                         record_selection(
@@ -5132,6 +5248,17 @@ class ModelBuilder:
                     split_collision_descendant = self.__has_staging_collision_descendant(existing_file)
                     if collision_descendant is None:
                         collision_descendant = split_collision_descendant
+                    if not split_collision_descendant and queue_trusted_final_leaf_absent_from_active:
+                        record_selection(
+                            file_id, "split_merge",
+                            local_staging_descendant=staging_descendant,
+                            local_staging_collision_descendant=collision_descendant,
+                            split_has_verified_leaf=verified_split_leaf,
+                        )
+                        effective_local_files[file_id] = self.__merge_active_split_root(
+                            existing_file, active_file, remote_file
+                        )
+                        continue
                     if split_collision_descendant:
                         record_selection(
                             file_id, "split_merge",
@@ -6917,16 +7044,20 @@ class ModelBuilder:
         removed = previous.difference(normalized)
         self.__unknown_local_path_pair_ids = normalized
         cached_model = self.__cached_model
-        # Queue safety and model summaries read this overlay directly.  A new
-        # unknown pair only makes the cached render stale when it must hide an
-        # already rendered Deleted root; every other additive change can keep
-        # the standing authoritative model without another full tree walk.
+        # Queue safety and model summaries read this overlay directly.  An
+        # added pair requires a rebuild when it hides a Deleted root or when
+        # local and active roots exist for it and trusted-final merging can change.
         added_hides_deleted = cached_model is not None and any(
             (model_file := cached_model.get_file(file_id)).path_pair_id in added and
             model_file.state == ModelFile.State.DELETED
             for file_id in cached_model.get_file_ids()
         )
-        if cached_model is None or removed or added_hides_deleted:
+        added_has_local_active_root = cached_model is not None and any(
+            file_id in self.__active_files
+            for path_pair_id in added
+            for file_id in self.__local_files_by_pair.get(path_pair_id, {})
+        )
+        if cached_model is None or removed or added_hides_deleted or added_has_local_active_root:
             self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS)
 
     def set_downloaded_timestamps(self, downloaded_timestamps: Dict[str, float]) -> None:
@@ -7263,9 +7394,17 @@ class ModelBuilder:
         except Exception:
             pass
 
-    def build_model(self) -> Model:
+    def build_model(
+            self, *, local_scan_session: object = None, local_scan_generation: object = None,
+            reconciled_remote_path_pair_ids: object = None,
+    ) -> Model:
+        local_scan_authority = self.__normalize_current_local_scan_authority(
+            local_scan_session, local_scan_generation, reconciled_remote_path_pair_ids,
+        )
         if self.__cached_model is not None:
-            return self.__cached_model
+            if self.__cached_model_local_scan_authority == local_scan_authority:
+                return self.__cached_model
+            self.__cached_model = None
 
         model = Model()
         model.logger = self.__build_dummy_model_logger()  # ignore the logs for this temp model
@@ -7281,7 +7420,9 @@ class ModelBuilder:
         # opt-in once so a disabled build does not enter per-node trace code.
         model_publication_trace_enabled = self.__is_model_publication_trace_enabled()
         input_witness = self.__input_witness_context()
-        effective_local_files = self.__build_effective_local_files(input_witness)
+        effective_local_files = self.__build_effective_local_files(
+            input_witness, local_scan_authority=local_scan_authority,
+        )
         self.__cached_unresolved_staging_collision_file_ids = {
             file_id
             for file_id, local_file in effective_local_files.items()
@@ -7585,6 +7726,7 @@ class ModelBuilder:
         self.__sweep_recent_live_transfer_snapshots(seen_file_ids)
         model.set_tree_file_count(len(seen_file_ids))
         self.__cached_model = model
+        self.__cached_model_local_scan_authority = local_scan_authority
         self.__invalidation_reasons.clear()
         self.__pending_invalidation_tokens.clear()
         self.__lftp_touched_root_file_ids.clear()

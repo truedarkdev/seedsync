@@ -167,13 +167,50 @@ _QUEUE_LIFECYCLE_BOOLS = frozenset({
     "fresh", "healthy", "process_alive_before", "process_alive_after", "process_alive",
     "pre_send_drain_queue_done", "pre_send_drain_job_or_progress", "pre_send_drain_prompt_or_echo",
 })
-_COMPLETION_GATE_DECISIONS = frozenset({"blocked", "no_retirement", "excluded", "pending", "attempt_eligible", "deferred", "unknown"})
+_COMPLETION_GATE_DECISIONS = frozenset({"blocked", "no_retirement", "excluded", "pending", "attempt_eligible", "deferred", "skipped", "result", "cancelled", "unknown"})
 _COMPLETION_GATE_REASONS = frozenset({
     "completion_detection_not_authoritative", "still_active", "explicit_stop", "lftp_job_finished", "candidate_pair_unselected",
     "no_model_diff", "candidate_authorized", "adopted", "retry_or_failure_limit", "completion_evidence_missing",
-    "completion_authority_missing", "complete_local_coverage", "unknown",
+    "completion_authority_missing", "complete_local_coverage", "not_pending", "explicitly_stopped",
+    "discarded_missing_local", "terminal_state", "model_missing", "local_scope_unreconciled",
+    "remote_scope_unreconciled", "poll_unhealthy", "idle_unauthoritative", "active_exact_owner",
+    "active_unscoped_owner", "staging_identity_unverified", "local_coverage_incomplete",
+    "move_completed", "move_already_completed", "move_deferred", "move_failed",
+    "move_no_applicable", "move_conflict", "move_boundary_unavailable", "move_reservation_unavailable",
+    "candidate_pair_unselected", "already_attempted", "retry_limit_reached", "retry_not_due",
+    "explicit_stop", "unknown",
 })
 _COMPLETION_GATE_OUTCOMES = frozenset({"stopped", "deferred", "downloaded", "unknown"})
+_PENDING_COMPLETION_MOVE_MESSAGES = frozenset({"pending_completion_move_decision"})
+_COMPLETION_GATE_DECISION_MESSAGES = frozenset({"completion_gate_decision"})
+_PENDING_COMPLETION_MOVE_PHASES = frozenset({"authority", "move", "candidate"})
+_PENDING_COMPLETION_MOVE_PROOF_SOURCES = frozenset({
+    "model_lookup", "local_scan_scope", "remote_scan_scope", "lftp_status",
+    "staging_remote_identity", "complete_local_coverage", "move_result", "move_reservation",
+    "candidate_scope", "explicit_stop",
+})
+_PENDING_COMPLETION_MOVE_RESULTS = frozenset({
+    "not_attempted", "completed", "already_completed", "deferred", "failed",
+    "no_move_applicable", "conflict", "unknown",
+})
+_FINAL_MOVE_PUBLICATION_MESSAGES = frozenset({"final_move_publication"})
+_FINAL_MOVE_PUBLICATION_PHASES = frozenset({
+    "cleanup", "copy", "copy_complete", "copy_failure", "create_temporary",
+    "fallback", "publish", "remove_source", "reserve_start", "verify",
+})
+_FINAL_MOVE_PUBLICATION_OPERATIONS = frozenset({
+    "cleanup", "copy", "create_temporary", "fallback", "publish", "remove_source", "reserve", "verify",
+})
+_FINAL_MOVE_PUBLICATION_SIDES = frozenset({"destination", "destination_parent", "source", "temporary"})
+_FINAL_MOVE_ERRNO_CLASSES = frozenset({
+    "none", "enoent", "eexist", "permission", "enospc", "exdev", "einval", "enosys",
+    "eio", "eagain", "eloop", "eisdir", "enotempty", "ecanceled", "enotsup", "unknown",
+})
+_FINAL_MOVE_MUTATION_STATES = frozenset({"no_mutation", "mutated", "uncertain"})
+_FINAL_MOVE_EXISTS_FIELDS = frozenset({
+    "temporary_created", "residue_present", "source_exists", "destination_parent_exists", "destination_exists",
+})
+_FINAL_MOVE_COPY_METRICS = frozenset({"copy_bytes_ns", "temporary_fsync_ns", "metadata_copy_ns"})
 _AUTOMATIC_MOVE_BOUNDARY_SCHEMA = "automatic_move_copy_boundary.v1"
 _AUTOMATIC_MOVE_BOUNDARY_PHASE_DECISIONS = {
     "prepublish_gate": frozenset({"deferred", "failed", "published"}),
@@ -276,11 +313,30 @@ def _queue_lifecycle_facts(details: Mapping[str, object]) -> dict[str, object] |
     return facts
 
 
-def _completion_gate_facts(details: Mapping[str, object]) -> dict[str, object] | None:
+def _completion_gate_facts(details: Mapping[str, object], message: object = None) -> dict[str, object] | None:
+    if isinstance(message, str) and message in _PENDING_COMPLETION_MOVE_MESSAGES:
+        result: dict[str, object] = {
+            "boundary": "completion_gate",
+            "message": message,
+            "schema": details.get("schema") if details.get("schema") == "pending_completion_move_decision.v1" else "unknown",
+        }
+        for key, allowed in (
+            ("phase", _PENDING_COMPLETION_MOVE_PHASES),
+            ("decision", _COMPLETION_GATE_DECISIONS),
+            ("reason", _COMPLETION_GATE_REASONS),
+            ("proof_source", _PENDING_COMPLETION_MOVE_PROOF_SOURCES),
+            ("move_result", _PENDING_COMPLETION_MOVE_RESULTS),
+        ):
+            value = details.get("stage") if key == "phase" else details.get(key)
+            result[key] = value if isinstance(value, str) and value in allowed else (None if value is None else "unknown")
+        return result
+
     fields = {"decision", "reason", "terminal_outcome", "pending_transition", "explicit_stop"}
     if not fields.intersection(details):
         return None
     result: dict[str, object] = {"boundary": "completion_gate"}
+    if isinstance(message, str) and message in _COMPLETION_GATE_DECISION_MESSAGES:
+        result["message"] = message
     for key, allowed in (("decision", _COMPLETION_GATE_DECISIONS), ("reason", _COMPLETION_GATE_REASONS), ("terminal_outcome", _COMPLETION_GATE_OUTCOMES)):
         value = details.get(key)
         if isinstance(value, str) and value in allowed:
@@ -291,6 +347,38 @@ def _completion_gate_facts(details: Mapping[str, object]) -> dict[str, object] |
     for key in _COMPLETION_GATE_BOOLS:
         value = details.get(key)
         if type(value) is bool:
+            result[key] = value
+    if isinstance(message, str) and message in _COMPLETION_GATE_DECISION_MESSAGES:
+        physical_proof = details.get("physical_proof")
+        result["physical_proof"] = (
+            physical_proof if isinstance(physical_proof, str) and physical_proof in {"proven", "missing", "unknown"}
+            else (None if physical_proof is None else "unknown")
+        )
+        result["exact_final_file_proof"] = (
+            details.get("exact_final_file_proof") if type(details.get("exact_final_file_proof")) is bool else None
+        )
+    return result
+
+
+def _final_move_publication_facts(details: Mapping[str, object], message: object) -> dict[str, object] | None:
+    if not isinstance(message, str) or message not in _FINAL_MOVE_PUBLICATION_MESSAGES:
+        return None
+    result: dict[str, object] = {"message": message}
+    for key, allowed in (
+        ("phase", _FINAL_MOVE_PUBLICATION_PHASES),
+        ("operation", _FINAL_MOVE_PUBLICATION_OPERATIONS),
+        ("side", _FINAL_MOVE_PUBLICATION_SIDES),
+        ("errno_class", _FINAL_MOVE_ERRNO_CLASSES),
+        ("mutation_state", _FINAL_MOVE_MUTATION_STATES),
+    ):
+        value = details.get(key)
+        result[key] = value if isinstance(value, str) and value in allowed else (None if value is None else "unknown")
+    for key in _FINAL_MOVE_EXISTS_FIELDS:
+        value = details.get(key)
+        result[key] = value if type(value) is bool else None
+    for key in _FINAL_MOVE_COPY_METRICS:
+        value = details.get(key)
+        if type(value) is int and 0 <= value < 2**63:
             result[key] = value
     return result
 
@@ -704,11 +792,15 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     event_type = _allowed_field(row, metadata, "event_type", _EVENT_TYPES)
     stage = _allowed_field(row, metadata, "stage", _STAGES)
     level = _allowed_field(row, metadata, "level", _LEVELS)
+    message = row.get("message", metadata.get("message"))
     numbers = _numeric_values(row, metadata, details)
     lifecycle = _queue_lifecycle_facts(details) if category == "queue.lifecycle" else None
-    gate = _completion_gate_facts(details) if category == "completion.gate" else None
+    gate = _completion_gate_facts(details, message) if category == "completion.gate" else None
+    final_move = (
+        _final_move_publication_facts(details, message) if category == "final_move.publication" else None
+    )
     automatic_move_boundary = (
-        _automatic_move_copy_boundary_facts(row.get("message", metadata.get("message")), details)
+        _automatic_move_copy_boundary_facts(message, details)
         if category == "completion.gate" else None
     )
     command = _lftp_command_facts(details) if category == "transfer.lftp.command" else None
@@ -717,6 +809,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     model_page_snapshot = _model_page_snapshot_facts(details) if category == "model_page_snapshot" else None
     model_progress_lineage = _model_progress_lineage_facts(details) if category == "model.progress" else None
     input_arbitration = _input_arbitration_facts(row, metadata, details)
+    if category == "final_move.publication" and isinstance(message, str) and message in _FINAL_MOVE_PUBLICATION_MESSAGES and final_move is None:
+        return None, True
     if category == "queue.readiness" and readiness is None:
         return None, True
     if category == "model_page_snapshot" and model_page_snapshot is None:
@@ -749,6 +843,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["lifecycle"] = lifecycle
     if gate is not None:
         result["completion_gate"] = gate
+    if final_move is not None:
+        result["final_move_publication"] = final_move
     if automatic_move_boundary is not None:
         result["automatic_move_copy_boundary"] = automatic_move_boundary
     if command is not None:

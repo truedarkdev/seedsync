@@ -424,6 +424,54 @@ def test_delete_local_projection_sanitizer_preserves_only_typed_outcome_facts(tm
     assert not any(key.startswith("delete_local_") for key in malformed)
 
 
+def test_completion_move_projection_sanitizer_preserves_finite_facts():
+    safe = observer._sanitize_capture_projection({
+        "completion_gate": {
+            "boundary": "completion_gate", "message": "pending_completion_move_decision",
+            "schema": "pending_completion_move_decision.v1", "phase": "move", "decision": "result",
+            "reason": "move_deferred", "proof_source": "move_result", "move_result": "deferred",
+            "raw_path": "/private/path",
+        },
+        "final_move_publication": {
+            "message": "final_move_publication", "phase": "publish", "operation": "publish",
+            "side": "destination", "errno_class": "eexist", "mutation_state": "uncertain",
+            "temporary_created": None, "residue_present": False, "source_exists": True,
+            "destination_parent_exists": True, "destination_exists": True, "copy_bytes_ns": 2**53 + 1,
+            "destination_path": "/private/path",
+        },
+    })
+    assert safe["completion_gate"] == {
+        "boundary": "completion_gate", "message": "pending_completion_move_decision",
+        "schema": "pending_completion_move_decision.v1", "phase": "move", "decision": "result",
+        "reason": "move_deferred", "proof_source": "move_result", "move_result": "deferred",
+    }
+    assert safe["final_move_publication"]["temporary_created"] is None
+    assert safe["final_move_publication"]["residue_present"] is False
+    assert safe["final_move_publication"]["destination_exists"] is True
+    assert safe["final_move_publication"]["copy_bytes_ns"] == 2**53 + 1
+    assert "raw_path" not in safe["completion_gate"]
+    assert "destination_path" not in safe["final_move_publication"]
+
+    malformed = observer._sanitize_capture_projection({
+        "completion_gate": {
+            "boundary": "completion_gate", "message": "pending_completion_move_decision",
+            "schema": "private", "phase": "private", "decision": "private", "reason": "private",
+            "proof_source": "private", "move_result": "private",
+        },
+        "final_move_publication": {
+            "message": "final_move_publication", "phase": "private", "operation": "private",
+            "side": "private", "errno_class": "private", "mutation_state": "private",
+            "destination_exists": "true",
+        },
+    })
+    assert malformed["completion_gate"]["schema"] == "unknown"
+    assert all(malformed["completion_gate"][key] == "unknown" for key in (
+        "phase", "decision", "reason", "proof_source", "move_result",
+    ))
+    assert malformed["final_move_publication"]["phase"] == "unknown"
+    assert malformed["final_move_publication"]["destination_exists"] is None
+
+
 def test_pending_transfer_gate_requires_exact_local_paths_and_safe_lifecycle_before_queue():
     gate = observer.QueueGate(
         PAIR, "Pr0n", ROOT, "Incoming",

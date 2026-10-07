@@ -536,12 +536,48 @@ _CAPTURE_PROGRESS_LINEAGE_BUILD_KINDS = {"candidate", "full", "none"}
 _CAPTURE_PROGRESS_LINEAGE_STATUS_COUNT_BUCKETS = {"0", "1", "2-4", "5+"}
 _CAPTURE_PROGRESS_LINEAGE_DURATION_BUCKETS = {"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}
 _CAPTURE_PROGRESS_LINEAGE_MISSING_PHASES = {"none", "status_consume", "model_mutation", "updater_decision", "multiple"}
-_CAPTURE_GATE_DECISIONS = {"blocked", "no_retirement", "excluded", "pending", "attempt_eligible", "deferred", "unknown"}
+_CAPTURE_GATE_DECISIONS = {"blocked", "no_retirement", "excluded", "pending", "attempt_eligible", "deferred", "skipped", "result", "cancelled", "unknown"}
 _CAPTURE_GATE_REASONS = {
     "completion_detection_not_authoritative", "still_active", "explicit_stop", "lftp_job_finished", "candidate_pair_unselected",
     "no_model_diff", "candidate_authorized", "adopted", "retry_or_failure_limit", "completion_evidence_missing", "completion_authority_missing", "complete_local_coverage", "unknown",
+    "not_pending", "explicitly_stopped", "discarded_missing_local", "terminal_state", "model_missing",
+    "local_scope_unreconciled", "remote_scope_unreconciled", "poll_unhealthy", "idle_unauthoritative",
+    "active_exact_owner", "active_unscoped_owner", "staging_identity_unverified", "local_coverage_incomplete",
+    "move_completed", "move_already_completed", "move_deferred", "move_failed", "move_no_applicable", "move_conflict",
+    "move_boundary_unavailable", "move_reservation_unavailable", "candidate_pair_unselected", "already_attempted",
+    "retry_limit_reached", "retry_not_due", "explicit_stop",
 }
 _CAPTURE_GATE_OUTCOMES = {"stopped", "deferred", "downloaded", "unknown"}
+_CAPTURE_PENDING_MOVE_MESSAGES = {"pending_completion_move_decision"}
+_CAPTURE_GATE_DECISION_MESSAGES = {"completion_gate_decision"}
+_CAPTURE_PENDING_MOVE_PHASES = {"authority", "move", "candidate"}
+_CAPTURE_PENDING_MOVE_PROOF_SOURCES = {
+    "model_lookup", "local_scan_scope", "remote_scan_scope", "lftp_status",
+    "staging_remote_identity", "complete_local_coverage", "move_result", "move_reservation",
+    "candidate_scope", "explicit_stop",
+}
+_CAPTURE_PENDING_MOVE_RESULTS = {
+    "not_attempted", "completed", "already_completed", "deferred", "failed",
+    "no_move_applicable", "conflict", "unknown",
+}
+_CAPTURE_FINAL_MOVE_MESSAGES = {"final_move_publication"}
+_CAPTURE_FINAL_MOVE_PHASES = {
+    "cleanup", "copy", "copy_complete", "copy_failure", "create_temporary",
+    "fallback", "publish", "remove_source", "reserve_start", "verify",
+}
+_CAPTURE_FINAL_MOVE_OPERATIONS = {
+    "cleanup", "copy", "create_temporary", "fallback", "publish", "remove_source", "reserve", "verify",
+}
+_CAPTURE_FINAL_MOVE_SIDES = {"destination", "destination_parent", "source", "temporary"}
+_CAPTURE_FINAL_MOVE_ERRNOS = {
+    "none", "enoent", "eexist", "permission", "enospc", "exdev", "einval", "enosys",
+    "eio", "eagain", "eloop", "eisdir", "enotempty", "ecanceled", "enotsup", "unknown",
+}
+_CAPTURE_FINAL_MOVE_MUTATIONS = {"no_mutation", "mutated", "uncertain"}
+_CAPTURE_FINAL_MOVE_EXISTS_FIELDS = {
+    "temporary_created", "residue_present", "source_exists", "destination_parent_exists", "destination_exists",
+}
+_CAPTURE_FINAL_MOVE_COPY_METRICS = {"copy_bytes_ns", "temporary_fsync_ns", "metadata_copy_ns"}
 _CAPTURE_COMMAND_KINDS = {"get", "mirror", "pget"}
 _CAPTURE_COMMAND_PHASES = {"submitted", "prompt_ready", "prompt_timeout", "process_eof", "backend_error"}
 _CAPTURE_COMMAND_OUTPUTS = {"empty", "connecting", "backend_error", "other"}
@@ -778,7 +814,52 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
         for key in {"poll_eligible", "poll_fresh", "poll_healthy", "previous_active", "current_active", "marker_observed", "local_scan_forced", "explicit_stop", "build_ran", "candidate_present", "live_present", "local_size_present", "remote_size_present", "complete_local_coverage", "exact_final_file_proof", "model_diff_present", "completion_proved"}:
             if type(gate.get(key)) is bool:
                 safe_gate[key] = gate[key]
+        message = gate.get("message")
+        if isinstance(message, str) and message in _CAPTURE_PENDING_MOVE_MESSAGES:
+            safe_gate["message"] = message
+            schema = gate.get("schema")
+            safe_gate["schema"] = schema if schema == "pending_completion_move_decision.v1" else "unknown"
+            for key, allowed in (
+                ("phase", _CAPTURE_PENDING_MOVE_PHASES),
+                ("decision", _CAPTURE_GATE_DECISIONS),
+                ("reason", _CAPTURE_GATE_REASONS),
+                ("proof_source", _CAPTURE_PENDING_MOVE_PROOF_SOURCES),
+                ("move_result", _CAPTURE_PENDING_MOVE_RESULTS),
+            ):
+                item = gate.get(key, "unknown")
+                safe_gate[key] = item if item is None or (isinstance(item, str) and item in allowed) else "unknown"
+        elif isinstance(message, str) and message in _CAPTURE_GATE_DECISION_MESSAGES:
+            safe_gate["message"] = message
+            physical_proof = gate.get("physical_proof", "unknown")
+            safe_gate["physical_proof"] = (
+                physical_proof if physical_proof is None or (isinstance(physical_proof, str) and physical_proof in {"proven", "missing", "unknown"})
+                else "unknown"
+            )
+            exact_final = gate.get("exact_final_file_proof")
+            safe_gate["exact_final_file_proof"] = exact_final if type(exact_final) is bool else None
         result["completion_gate"] = safe_gate
+    final_move = value.get("final_move_publication")
+    if isinstance(final_move, Mapping):
+        message = final_move.get("message")
+        if isinstance(message, str) and message in _CAPTURE_FINAL_MOVE_MESSAGES:
+            safe_final_move: dict[str, object] = {"message": message}
+            for key, allowed in (
+                ("phase", _CAPTURE_FINAL_MOVE_PHASES),
+                ("operation", _CAPTURE_FINAL_MOVE_OPERATIONS),
+                ("side", _CAPTURE_FINAL_MOVE_SIDES),
+                ("errno_class", _CAPTURE_FINAL_MOVE_ERRNOS),
+                ("mutation_state", _CAPTURE_FINAL_MOVE_MUTATIONS),
+            ):
+                item = final_move.get(key, "unknown")
+                safe_final_move[key] = item if item is None or (isinstance(item, str) and item in allowed) else "unknown"
+            for key in _CAPTURE_FINAL_MOVE_EXISTS_FIELDS:
+                item = final_move.get(key)
+                safe_final_move[key] = item if item is None or type(item) is bool else None
+            for key in _CAPTURE_FINAL_MOVE_COPY_METRICS:
+                item = final_move.get(key)
+                if type(item) is int and 0 <= item < 2**63:
+                    safe_final_move[key] = item
+            result["final_move_publication"] = safe_final_move
     command = value.get("lftp_command")
     if isinstance(command, Mapping):
         safe_command: dict[str, object] = {"schema": "lftp.command_boundary.v1"} if command.get("schema") == "lftp.command_boundary.v1" else {}

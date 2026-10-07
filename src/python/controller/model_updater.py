@@ -8835,6 +8835,17 @@ class ModelUpdater(_ControllerCoreAccess):
         reconciled_remote_path_pair_ids = set(getattr(
             controller, "_Controller__reconciled_remote_path_pair_ids", set()
         ))
+        local_scan_process = getattr(controller, "_Controller__local_scan_process", None)
+        local_scan_session = getattr(local_scan_process, "session_token", None)
+        local_scan_generation = getattr(local_scan_process, "generation", None)
+        current_local_scan_authority_kwargs: dict[str, object] = {}
+        if type(local_scan_session) is str and local_scan_session and \
+                type(local_scan_generation) is int and local_scan_generation >= 0:
+            current_local_scan_authority_kwargs = {
+                "local_scan_session": local_scan_session,
+                "local_scan_generation": local_scan_generation,
+                "reconciled_remote_path_pair_ids": frozenset(reconciled_remote_path_pair_ids),
+            }
         active_lftp_status_file_ids = {
             status.file_id for status in lftp_statuses
             if status.state in (
@@ -10169,7 +10180,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     except Exception:
                         started_at = None
                     try:
-                        new_model = model_builder.build_model()
+                        new_model = model_builder.build_model(**current_local_scan_authority_kwargs)
                     except Exception:
                         retire_deferred_rejected_overlay()
                         raise
@@ -10246,7 +10257,9 @@ class ModelUpdater(_ControllerCoreAccess):
                 if authoritative_pair_build is not None and \
                         candidate_pair_id(file_id) == authoritative_pair_build.path_pair_id:
                     return file_id in authoritative_pair_build.complete_local_coverage_file_ids
-                return model_builder.has_complete_local_coverage(file_id)
+                return model_builder.has_complete_local_coverage(
+                    file_id, **current_local_scan_authority_kwargs,
+                )
 
             def candidate_verified_staging_identity(file_id: str) -> bool:
                 """Read physical completion proof from the candidate's source.
@@ -10270,7 +10283,9 @@ class ModelUpdater(_ControllerCoreAccess):
                 identity_proof = getattr(
                     model_builder, "has_verified_complete_staging_remote_identity", None,
                 )
-                return callable(identity_proof) and identity_proof(file_id) is True
+                return callable(identity_proof) and identity_proof(
+                    file_id, **current_local_scan_authority_kwargs,
+                ) is True
 
             def candidate_has_resumable_checkpoint(file_id: str) -> bool:
                 """Require this update's physical active-scan sidecar proof.

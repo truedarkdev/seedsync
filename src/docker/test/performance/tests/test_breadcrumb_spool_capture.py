@@ -799,6 +799,170 @@ def test_collector_durable_flat_envelope_reaches_reader_projection(tmp_path: Pat
     assert any(item.get("model_page_snapshot", {}).get("outcome") == "success" for item in projections)
 
 
+@pytest.mark.skipif(BreadcrumbTraceCollector is None, reason="production breadcrumb collector is unavailable")
+def test_finalized_completion_and_final_move_events_reach_json_sink_in_order(tmp_path: Path) -> None:
+    spool = tmp_path / "completion-publication-spool"
+    spool.mkdir()
+    artifact = tmp_path / "completion-publication-capture.jsonl"
+    collector = BreadcrumbTraceCollector(
+        lambda: True,
+        policy={"default": "off", "rules": {"queue.readiness": "info", "completion.gate": "info", "final_move.publication": "info"}},
+        durable_enabled=True,
+        durable_path=str(spool),
+        durable_enabled_getter=lambda: True,
+    )
+    correlation = "completion:0123456789abcdef"
+    flow = "lftp-poll:fedcba9876543210"
+    events = (
+        ("completion.gate", "completion_gate", "completion_gate_decision", {
+            "completion_proved": True, "decision": "attempt_eligible", "reason": "complete_local_coverage",
+            "physical_proof": "proven", "exact_final_file_proof": True,
+            "pending_transition": "cleared", "terminal_outcome": "downloaded",
+        }),
+        ("completion.gate", "completion_gate", "pending_completion_move_decision", {
+            "schema": "pending_completion_move_decision.v1", "stage": "authority", "decision": "skipped",
+            "reason": "local_scope_unreconciled", "proof_source": "local_scan_scope", "move_result": "not_attempted",
+        }),
+        ("completion.gate", "completion_gate", "pending_completion_move_decision", {
+            "schema": "pending_completion_move_decision.v1", "stage": "move", "decision": "result",
+            "reason": "move_deferred", "proof_source": "move_result", "move_result": "deferred",
+        }),
+        ("final_move.publication", "final_move_publication", "final_move_publication", {
+            "phase": "publish", "operation": "publish", "side": "destination", "errno_class": "eexist",
+            "mutation_state": "uncertain", "source_exists": True, "destination_exists": True,
+            "destination_parent_exists": True, "temporary_created": None, "residue_present": False,
+            "source_path": "PRIVATE-SOURCE-PATH", "destination_path": "PRIVATE-DESTINATION-PATH",
+        }),
+        ("final_move.publication", "final_move_publication", "final_move_publication", {
+            "phase": "verify", "operation": "verify", "side": "destination", "errno_class": "none",
+            "mutation_state": "mutated", "source_exists": False, "destination_exists": True,
+            "destination_parent_exists": True, "temporary_created": True, "residue_present": False,
+            "copy_bytes_ns": 2, "temporary_fsync_ns": 3, "metadata_copy_ns": 4,
+        }),
+        ("final_move.publication", "final_move_publication", "final_move_publication", {
+            "phase": "PRIVATE-PHASE", "operation": "PRIVATE-OPERATION", "side": "PRIVATE-SIDE",
+            "errno_class": "PRIVATE-ERRNO", "mutation_state": "PRIVATE-STATE",
+            "destination_exists": "PRIVATE-BOOL", "destination_path": "PRIVATE-PATH",
+        }),
+        ("completion.gate", "completion_gate", "pending_completion_move_decision", {
+            "schema": "pending_completion_move_decision.v1", "stage": "candidate", "decision": "cancelled",
+            "reason": "explicit_stop", "proof_source": "explicit_stop", "move_result": "not_attempted",
+        }),
+        ("completion.gate", "completion_gate", "pending_completion_move_decision", {
+            "schema": "PRIVATE-SCHEMA", "stage": "PRIVATE-PHASE", "decision": "PRIVATE-DECISION",
+            "reason": "PRIVATE-REASON", "proof_source": "PRIVATE-PATH", "move_result": {"unsafe": True},
+        }),
+    )
+    try:
+        assert collector.record(
+            "controller", "baseline", {"schema": "queue_readiness.v1", "phase": "entry", "outcome": "accepted"},
+            category="queue.readiness", event_type="callback", stage="queue_readiness", level="info",
+        ) in {"retained", "enqueued"}
+        assert collector.flush_durable(2.0)
+        reader = _reader(spool, artifact)
+        try:
+            reader.start()
+            for category, stage, message, details in events:
+                assert collector.record(
+                    "model_updater" if category == "completion.gate" else "controller",
+                    message, details, category=category, event_type="diagnostic", stage=stage,
+                    level="info", corr_id=correlation, flow_id=flow, trace_scope="flow",
+                    file_id="private-file-identity", path_pair_id="private-pair-identity",
+                ) in {"retained", "enqueued"}
+            assert collector.flush_durable(2.0)
+            assert reader.poll() == len(events)
+        finally:
+            reader.close()
+        finalized = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
+        selected = [row for row in finalized if row.get("message") in {
+            "completion_gate_decision", "pending_completion_move_decision", "final_move_publication",
+        }]
+        assert len(selected) == len(events)
+        assert all(row.get("trace_scope") == "flow" and row.get("corr_id") == correlation for row in selected)
+    finally:
+        collector.close(timeout=2.0)
+
+    saved = [item for item in _artifacts(artifact) if item["capture"].get("state") == "record"]
+    projections = [item["capture"]["projection"] for item in saved]
+    projected_messages = [
+        (item.get("completion_gate") or item.get("final_move_publication") or {}).get("message")
+        for item in projections
+    ]
+    assert projected_messages == [row["message"] for row in selected]
+    assert len({item["corr_hash"] for item in projections}) == 1
+    expected_numbers = [capture._numeric_values(row, row.get("metadata", {}), row.get("details", {}))
+                        for row in selected]
+    assert [item["numbers"] for item in projections] == expected_numbers
+    assert [item["capture"]["cursor_start"] for item in saved] == sorted(item["capture"]["cursor_start"] for item in saved)
+    gate_decision = next(item["completion_gate"] for item in projections
+                         if item.get("completion_gate", {}).get("message") == "completion_gate_decision")
+    assert gate_decision["completion_proved"] is True
+    assert gate_decision["physical_proof"] == "proven"
+    assert gate_decision["exact_final_file_proof"] is True
+    gate_skipped = next(item["completion_gate"] for item in projections
+                        if item.get("completion_gate", {}).get("phase") == "authority")
+    assert gate_skipped["schema"] == "pending_completion_move_decision.v1"
+    assert (gate_skipped["phase"], gate_skipped["decision"], gate_skipped["reason"],
+            gate_skipped["proof_source"], gate_skipped["move_result"]) == (
+        "authority", "skipped", "local_scope_unreconciled", "local_scan_scope", "not_attempted",
+    )
+    gate_deferred = next(item["completion_gate"] for item in projections
+                         if item.get("completion_gate", {}).get("phase") == "move")
+    assert (gate_deferred["phase"], gate_deferred["decision"], gate_deferred["move_result"]) == (
+        "move", "result", "deferred",
+    )
+    failed_move = next(item["final_move_publication"] for item in projections
+                       if item.get("final_move_publication", {}).get("phase") == "publish")
+    assert failed_move["errno_class"] == "eexist" and failed_move["mutation_state"] == "uncertain"
+    assert failed_move["temporary_created"] is None and failed_move["destination_exists"] is True
+    assert any(item.get("final_move_publication", {}).get("phase") == "verify" for item in projections)
+    candidate_cancel = next(item["completion_gate"] for item in projections
+                            if item.get("completion_gate", {}).get("phase") == "candidate")
+    assert (candidate_cancel["phase"], candidate_cancel["decision"], candidate_cancel["reason"],
+            candidate_cancel["proof_source"]) == ("candidate", "cancelled", "explicit_stop", "explicit_stop")
+    malformed_saved = next(item["completion_gate"] for item in projections
+                           if item.get("completion_gate", {}).get("message") == "pending_completion_move_decision"
+                           and item.get("completion_gate", {}).get("schema") == "unknown")
+    assert all(malformed_saved[key] == "unknown" for key in ("phase", "decision", "reason", "proof_source", "move_result"))
+    malformed_move = next(item["final_move_publication"] for item in projections
+                          if item.get("final_move_publication", {}).get("phase") == "unknown")
+    assert all(malformed_move[key] == "unknown" for key in (
+        "operation", "side", "errno_class", "mutation_state",
+    ))
+    assert malformed_move["destination_exists"] is None
+    assert "PRIVATE-" not in artifact.read_text(encoding="utf-8")
+    sanitized = [observer._sanitize_capture_projection(item) for item in projections]
+    assert next(item["completion_gate"] for item in sanitized
+                if item.get("completion_gate", {}).get("phase") == "authority")["proof_source"] == "local_scan_scope"
+    assert next(item["final_move_publication"] for item in sanitized
+                if item.get("final_move_publication", {}).get("phase") == "publish")["errno_class"] == "eexist"
+
+    malformed = capture._projection({
+        "category": "completion.gate", "source": "model_updater", "event_type": "diagnostic",
+        "stage": "completion_gate", "message": "pending_completion_move_decision",
+        "corr_id": correlation,
+        "details": {"schema": "PRIVATE-SCHEMA", "stage": "PRIVATE-PHASE", "decision": "PRIVATE-DECISION",
+                    "reason": "PRIVATE-REASON", "proof_source": "PRIVATE-PATH", "move_result": {"unsafe": True}},
+    })[0]
+    assert malformed is not None
+    assert malformed["completion_gate"]["schema"] == "unknown"
+    assert all(malformed["completion_gate"][key] == "unknown" for key in ("phase", "decision", "reason", "proof_source", "move_result"))
+    assert "PRIVATE-" not in json.dumps(malformed)
+
+    bad_final_move = capture._projection({
+        "category": "final_move.publication", "source": "controller", "event_type": "diagnostic",
+        "stage": "final_move_publication", "message": "final_move_publication", "corr_id": correlation,
+        "details": {"phase": "PRIVATE-PHASE", "operation": "PRIVATE-OP", "side": "PRIVATE-SIDE",
+                    "errno_class": "PRIVATE-ERROR", "mutation_state": "PRIVATE-STATE",
+                    "destination_path": "PRIVATE-PATH", "destination_exists": "PRIVATE-BOOL"},
+    })[0]
+    assert bad_final_move is not None
+    facts = bad_final_move["final_move_publication"]
+    assert all(facts[key] == "unknown" for key in ("phase", "operation", "side", "errno_class", "mutation_state"))
+    assert facts["destination_exists"] is None
+    assert "PRIVATE-" not in json.dumps(bad_final_move)
+
+
 @pytest.mark.skipif(BreadcrumbTraceCollector is None or ModelBuilder is None, reason="production model builder is unavailable")
 def test_finalized_input_arbitration_selects_actual_root_builds_and_summaries(tmp_path: Path) -> None:
     spool = tmp_path / "input-arbitration-spool"

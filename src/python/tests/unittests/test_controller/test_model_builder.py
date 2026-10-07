@@ -4593,6 +4593,290 @@ class TestModelBuilder(unittest.TestCase):
                 _, children = build(size, mtime, is_staging, has_collision)
                 self.assertNotIn("final-sibling.bin", children)
 
+    def test_active_staging_overlay_merges_queue_trusted_final_only_leaf_without_active_overlap(self):
+        epoch = 1_700_000_000_000_000_000
+        pair_id = "pair-a"
+        file_id = ModelFile.build_file_id("release", pair_id)
+        remote_root = SystemFile("release", 96, True, mtime_ns=epoch + 2_000_000_000)
+        remote_root.path_pair_id = pair_id
+        remote_checksum = SystemFile("final.bin", 64, False, mtime_ns=epoch + 123_456_789)
+        remote_root.add_child(remote_checksum)
+        remote_root.add_child(SystemFile("delta.bin", 32, False, mtime_ns=epoch))
+
+        final_root = SystemFile("release", 80, True, mtime_ns=epoch)
+        final_root.path_pair_id = pair_id
+        final_leaf = SystemFile("final.bin", 64, False, mtime_ns=epoch)
+        partial_delta = SystemFile("delta.bin", 16, False, is_staging=True, mtime_ns=epoch)
+        final_root.add_child(final_leaf)
+        final_root.add_child(partial_delta)
+
+        active_root = SystemFile("release", 32, True, is_staging=True, mtime_ns=epoch)
+        active_root.path_pair_id = pair_id
+        active_delta = SystemFile("delta.bin", 32, False, mtime_ns=epoch)
+        active_root.add_child(active_delta)
+
+        builder = ModelBuilder()
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([final_root])
+        builder.set_active_files([active_root])
+
+        self.assertFalse(ModelBuilder._ModelBuilder__has_verified_split_root_final_leaf(
+            final_root, remote_root,
+        ))
+        self.assertEqual(("final.bin",), builder.get_trusted_final_leaf_paths(file_id))
+        input_witness = {"priority_roots": {file_id}}
+        effective_root = builder._ModelBuilder__build_effective_local_files(input_witness)[file_id]
+        effective_children = {child.name: child for child in effective_root.iter_children()}
+        checksum_facts = input_witness["split_leaf_facts"][id(remote_checksum)]
+
+        self.assertIs(final_leaf, effective_children["final.bin"])
+        self.assertEqual(32, effective_children["delta.bin"].size)
+        self.assertTrue(effective_root.has_staging_origin)
+        self.assertFalse(checksum_facts["strict_verified"])
+        self.assertTrue(checksum_facts["portable_queue_exclusion_match"])
+        known_model = builder.build_model()
+        model_root = known_model.get_file(file_id)
+        self.assertTrue(model_root.complete_local_coverage)
+        self.assertEqual(ModelFile.State.DOWNLOADED, model_root.state)
+        self.assertTrue(builder.has_complete_local_coverage(file_id))
+        self.assertTrue(builder.has_verified_complete_staging_remote_identity(file_id))
+
+        builder.set_unknown_local_path_pair_ids({pair_id})
+        unknown_model = builder.build_model()
+        self.assertIsNot(known_model, unknown_model)
+        unknown_root = unknown_model.get_file(file_id)
+        unknown_children = {child.name: child for child in unknown_root.get_children()}
+        self.assertFalse(unknown_children["final.bin"].local_present)
+        self.assertTrue(unknown_children["delta.bin"].local_present)
+        self.assertFalse(unknown_root.complete_local_coverage)
+        self.assertFalse(builder.has_complete_local_coverage(file_id))
+        builder.set_unknown_local_path_pair_ids({pair_id})
+        self.assertIs(unknown_model, builder.build_model())
+
+    def test_active_staging_overlay_does_not_admit_untrusted_or_overlapping_final_only_leaf(self):
+        epoch = 1_700_000_000_000_000_000
+        remote_mtime = epoch + 123_456_789
+
+        def build(
+                *, local_size=64, local_mtime=epoch, local_staging=False,
+                local_collision=False, local_is_dir=False, active_overlap=False,
+                unknown_pair=False,
+        ):
+            pair_id = "pair-a"
+            file_id = ModelFile.build_file_id("release", pair_id)
+            remote_root = SystemFile("release", 96, True, mtime_ns=epoch + 2_000_000_000)
+            remote_root.path_pair_id = pair_id
+            remote_root.add_child(SystemFile("final.bin", 64, False, mtime_ns=remote_mtime))
+            remote_root.add_child(SystemFile("delta.bin", 32, False, mtime_ns=epoch))
+
+            local_root = SystemFile("release", local_size + 16, True, mtime_ns=epoch)
+            local_root.path_pair_id = pair_id
+            candidate = SystemFile(
+                "final.bin", local_size, local_is_dir,
+                is_staging=local_staging, mtime_ns=local_mtime,
+            )
+            candidate.has_staging_collision = local_collision
+            local_root.add_child(candidate)
+            local_root.add_child(SystemFile(
+                "delta.bin", 16, False, is_staging=True, mtime_ns=epoch,
+            ))
+
+            active_root = SystemFile(
+                "release", 32 + (64 if active_overlap else 0), True,
+                is_staging=True, mtime_ns=epoch,
+            )
+            active_root.path_pair_id = pair_id
+            active_root.add_child(SystemFile("delta.bin", 32, False, mtime_ns=epoch))
+            if active_overlap:
+                active_root.add_child(SystemFile(
+                    "final.bin", 64, False, mtime_ns=remote_mtime,
+                ))
+
+            builder = ModelBuilder()
+            builder.set_remote_files([remote_root])
+            builder.set_local_files([local_root])
+            builder.set_active_files([active_root])
+            if unknown_pair:
+                builder.set_unknown_local_path_pair_ids({pair_id})
+            return builder, file_id
+
+        rejected_candidates = (
+            ("fractional-v-fractional", {"local_mtime": epoch + 600_000_000}),
+            ("different-size", {"local_size": 63}),
+            ("missing-mtime", {"local_mtime": None}),
+            ("staging-source", {"local_staging": True}),
+            ("collision-source", {"local_collision": True}),
+            ("type-mismatch", {"local_is_dir": True}),
+            ("unknown-pair", {"unknown_pair": True}),
+        )
+        for name, options in rejected_candidates:
+            with self.subTest(name=name):
+                builder, file_id = build(**options)
+                effective_root = builder._ModelBuilder__build_effective_local_files()[file_id]
+                effective_children = {child.name: child for child in effective_root.iter_children()}
+                self.assertNotIn("final.bin", effective_children)
+                self.assertEqual((), builder.get_trusted_final_leaf_paths(file_id))
+
+        with self.subTest(name="active-overlap"):
+            builder, file_id = build(active_overlap=True)
+            effective_root = builder._ModelBuilder__build_effective_local_files()[file_id]
+            checksum = next(
+                child for child in effective_root.iter_children() if child.name == "final.bin"
+            )
+            self.assertTrue(checksum.is_staging)
+            self.assertEqual(("final.bin",), builder.get_trusted_final_leaf_paths(file_id))
+
+    def test_unknown_pair_split_merge_requires_current_bound_scan_and_remote_authority(self):
+        pair_id = "pair-current"
+        file_id = ModelFile.build_file_id("release", pair_id)
+        epoch = 1_700_000_000_000_000_000
+        remote_root = SystemFile("release", 96, True, mtime_ns=epoch + 2_000_000_000)
+        remote_root.path_pair_id = pair_id
+        remote_root.add_child(SystemFile("final.bin", 64, False, mtime_ns=epoch + 123_456_789))
+        remote_root.add_child(SystemFile("delta.bin", 32, False, mtime_ns=epoch))
+
+        local_root = SystemFile("release", 80, True, mtime_ns=epoch)
+        local_root.path_pair_id = pair_id
+        local_root.add_child(SystemFile("final.bin", 64, False, mtime_ns=epoch))
+        local_root.add_child(SystemFile("delta.bin", 16, False, is_staging=True, mtime_ns=epoch))
+        active_root = SystemFile("release", 32, True, is_staging=True, mtime_ns=epoch)
+        active_root.path_pair_id = pair_id
+        active_root.add_child(SystemFile("delta.bin", 32, False, mtime_ns=epoch))
+
+        builder = ModelBuilder()
+        builder.set_remote_files([remote_root])
+        builder.set_unknown_local_path_pair_ids({pair_id})
+        builder.adopt_local_root_scan_sources({file_id: (local_root, "scan-session-a", 17)})
+        builder.set_active_files([active_root])
+
+        def assert_not_admitted(model):
+            root = model.get_file(file_id)
+            children = {child.name: child for child in root.get_children()}
+            self.assertFalse(children["final.bin"].local_present)
+            self.assertTrue(children["delta.bin"].local_present)
+            self.assertFalse(root.complete_local_coverage)
+            self.assertFalse(builder.has_complete_local_coverage(
+                file_id, local_scan_session="scan-session-a", local_scan_generation=17,
+                reconciled_remote_path_pair_ids={"other-pair"},
+            ))
+            self.assertFalse(builder.has_verified_complete_staging_remote_identity(
+                file_id, local_scan_session="scan-session-a", local_scan_generation=17,
+                reconciled_remote_path_pair_ids={"other-pair"},
+            ))
+
+        assert_not_admitted(builder.build_model())
+        admitted = builder.build_model(
+            local_scan_session="scan-session-a", local_scan_generation=17,
+            reconciled_remote_path_pair_ids={pair_id},
+        )
+        self.assertIs(admitted, builder.build_model(
+            local_scan_session="scan-session-a", local_scan_generation=17,
+            reconciled_remote_path_pair_ids={pair_id},
+        ))
+        root = admitted.get_file(file_id)
+        children = {child.name: child for child in root.get_children()}
+        self.assertTrue(children["final.bin"].local_present)
+        self.assertTrue(children["delta.bin"].local_present)
+        self.assertTrue(root.complete_local_coverage)
+        self.assertTrue(builder.has_complete_local_coverage(
+            file_id, local_scan_session="scan-session-a", local_scan_generation=17,
+            reconciled_remote_path_pair_ids={pair_id},
+        ))
+        self.assertTrue(builder.has_verified_complete_staging_remote_identity(
+            file_id, local_scan_session="scan-session-a", local_scan_generation=17,
+            reconciled_remote_path_pair_ids={pair_id},
+        ))
+        self.assertFalse(ModelBuilder._ModelBuilder__has_verified_split_root_final_leaf(
+            local_root, remote_root,
+        ))
+
+        for changed_context in (
+                {},
+                {"local_scan_session": "scan-session-b", "local_scan_generation": 17,
+                 "reconciled_remote_path_pair_ids": {pair_id}},
+                {"local_scan_session": "scan-session-a", "local_scan_generation": 18,
+                 "reconciled_remote_path_pair_ids": {pair_id}},
+                {"local_scan_session": "scan-session-a", "local_scan_generation": 17,
+                 "reconciled_remote_path_pair_ids": {"other-pair"}},
+        ):
+            with self.subTest(context=changed_context):
+                rebuilt = builder.build_model(**changed_context)
+                self.assertIsNot(admitted, rebuilt)
+                rebuilt_children = {
+                    child.name: child for child in rebuilt.get_file(file_id).get_children()
+                }
+                self.assertFalse(rebuilt_children["final.bin"].local_present)
+                self.assertTrue(rebuilt_children["delta.bin"].local_present)
+                self.assertFalse(rebuilt.get_file(file_id).complete_local_coverage)
+                self.assertFalse(builder.has_complete_local_coverage(file_id, **changed_context))
+                self.assertFalse(builder.has_verified_complete_staging_remote_identity(
+                    file_id, **changed_context,
+                ))
+
+        current_authority = {
+            "local_scan_session": "scan-session-a",
+            "local_scan_generation": 17,
+            "reconciled_remote_path_pair_ids": {pair_id},
+        }
+        admitted = builder.build_model(**current_authority)
+        self.assertTrue(admitted.get_file(file_id).complete_local_coverage)
+        builder.adopt_local_root_scan_sources({})
+        self.assertTrue(builder.has_changes())
+        proof_removed = builder.build_model(**current_authority)
+        self.assertFalse(proof_removed.get_file(file_id).complete_local_coverage)
+        self.assertFalse(builder.has_complete_local_coverage(file_id, **current_authority))
+        self.assertFalse(builder.has_verified_complete_staging_remote_identity(
+            file_id, **current_authority,
+        ))
+
+        builder.adopt_local_root_scan_sources({
+            file_id: (local_root, "scan-session-a", 17),
+        })
+        self.assertTrue(builder.has_changes())
+        rebound = builder.build_model(**current_authority)
+        self.assertTrue(rebound.get_file(file_id).complete_local_coverage)
+
+        replacement = SystemFile("release", 80, True, mtime_ns=epoch + 1)
+        replacement.path_pair_id = pair_id
+        replacement.add_child(SystemFile("final.bin", 64, False, mtime_ns=epoch))
+        replacement.add_child(SystemFile("delta.bin", 16, False, is_staging=True, mtime_ns=epoch))
+        builder.set_local_files([replacement])
+        source_mismatch = builder.build_model(**current_authority)
+        source_children = {
+            child.name: child for child in source_mismatch.get_file(file_id).get_children()
+        }
+        self.assertFalse(source_children["final.bin"].local_present)
+        self.assertTrue(source_children["delta.bin"].local_present)
+        self.assertFalse(source_mismatch.get_file(file_id).complete_local_coverage)
+        self.assertFalse(builder.has_complete_local_coverage(file_id, **current_authority))
+        self.assertFalse(builder.has_verified_complete_staging_remote_identity(
+            file_id, **current_authority,
+        ))
+
+    def test_unknown_pair_addition_preserves_idle_and_unrelated_cached_models(self):
+        idle_builder = ModelBuilder()
+        idle_cached_model = idle_builder.build_model()
+        idle_builder.set_unknown_local_path_pair_ids({"idle-pair"})
+        self.assertIs(idle_cached_model, idle_builder.build_model())
+
+        pair_id = "pair-local"
+        remote_root = SystemFile("release", 10, True)
+        remote_root.path_pair_id = pair_id
+        remote_root.add_child(SystemFile("file.bin", 10, False))
+        local_root = SystemFile("release", 10, True)
+        local_root.path_pair_id = pair_id
+        local_root.add_child(SystemFile("file.bin", 10, False))
+        active_root = SystemFile("release", 5, True, is_staging=True)
+        active_root.path_pair_id = pair_id
+        active_root.add_child(SystemFile("partial.bin", 5, False, is_staging=True))
+        unrelated_builder = ModelBuilder()
+        unrelated_builder.set_remote_files([remote_root])
+        unrelated_builder.set_local_files([local_root])
+        unrelated_builder.set_active_files([active_root])
+        unrelated_cached_model = unrelated_builder.build_model()
+        unrelated_builder.set_unknown_local_path_pair_ids({"different-pair"})
+        self.assertIs(unrelated_cached_model, unrelated_builder.build_model())
+
     def test_active_split_root_projects_final_only_bytes_omitted_by_staging_overlay(self):
         remote_root = SystemFile("sample-directory", 40, True)
         remote_root.add_child(SystemFile("anchor.zero", 0, False))
