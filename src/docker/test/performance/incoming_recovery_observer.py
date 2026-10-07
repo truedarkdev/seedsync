@@ -523,6 +523,24 @@ _CAPTURE_LIFECYCLE_ENUMS = {
     "command_outcome": {"success", "prompt_timeout", "eof", "error", "unknown"}, "reaped": {"signal", "exit", "alive", "not_alive", "unknown"},
     "future_state": {"finalized", "pending", "unknown"},
 }
+_CAPTURE_LFTP_STATUS_AUTHORITY_SCHEMA = "lftp_status_authority.v1"
+_CAPTURE_LFTP_STATUS_MEMBERSHIP_SCHEMA = "lftp_status_membership.v2"
+_CAPTURE_LFTP_STATUS_SOURCES = {
+    "cached_error", "cached_idle", "cached_inflight", "cached_retry", "cached_unhealthy",
+    "error_empty", "fresh_healthy", "fresh_unhealthy", "inflight_empty", "retry_empty",
+    "unhealthy_empty", "unknown",
+}
+_CAPTURE_LFTP_STATUS_OUTCOMES = _CAPTURE_LFTP_STATUS_SOURCES | {"inflight", "fresh_healthy_empty"}
+_CAPTURE_LFTP_STATUS_PARSER_OUTCOMES = {
+    "complete_success", "blank_empty", "partial_queue", "hard_error", "not_attempted", "unknown",
+}
+_CAPTURE_LFTP_STATUS_FAILURES = {
+    "none", "inflight", "retry_pending", "parser_error", "command_error", "timeout", "eof",
+    "terminal_backlog", "unhealthy_snapshot", "unknown",
+}
+_CAPTURE_LFTP_STATUS_FUTURE_STATES = {"none", "pending", "done", "unknown"}
+_CAPTURE_LFTP_STATUS_COUNT_MAX = 128
+_CAPTURE_LFTP_STATUS_MEMBERSHIP_COUNT_MAX = 2048
 _CAPTURE_LIFECYCLE_BOOLS = {
     "fresh", "healthy", "process_alive_before", "process_alive_after", "process_alive", "pre_send_drain_queue_done",
     "pre_send_drain_job_or_progress", "pre_send_drain_prompt_or_echo",
@@ -883,6 +901,62 @@ def _sanitize_scan_lifecycle_event(value: Mapping[str, object]) -> Mapping[str, 
     return result
 
 
+def _sanitize_lftp_status_authority(value: object) -> Mapping[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    result: dict[str, object] = {
+        "schema": _CAPTURE_LFTP_STATUS_AUTHORITY_SCHEMA
+        if value.get("schema") == _CAPTURE_LFTP_STATUS_AUTHORITY_SCHEMA else "unknown",
+    }
+    for key, allowed in (
+        ("phase", {"status_inlet", "unknown"}),
+        ("outcome", _CAPTURE_LFTP_STATUS_OUTCOMES),
+        ("parser_outcome", _CAPTURE_LFTP_STATUS_PARSER_OUTCOMES),
+        ("source", _CAPTURE_LFTP_STATUS_SOURCES),
+        ("failure_reason", _CAPTURE_LFTP_STATUS_FAILURES),
+    ):
+        item = value.get(key)
+        result[key] = item if item is None or (isinstance(item, str) and item in allowed) else "unknown"
+    future_state = value.get("status_future_state")
+    result["status_future_state"] = (
+        future_state if isinstance(future_state, str) and future_state in _CAPTURE_LFTP_STATUS_FUTURE_STATES else
+        ("unknown" if future_state is not None else None)
+    )
+    for key in ("fresh", "healthy", "cache_present", "retry_active", "idle_authoritative", "poll_due"):
+        item = value.get(key)
+        result[key] = item if item is None or type(item) is bool else None
+    for key in (
+        "status_count", "active_count", "raw_status_count", "filtered_status_count",
+        "queue_dispatch_pending_count", "lftp_queue_operation_pending_count", "lftp_queue_operation_done_count",
+    ):
+        item = value.get(key)
+        result[key] = item if item is None or (type(item) is int and 0 <= item <= _CAPTURE_LFTP_STATUS_COUNT_MAX) else None
+    return result
+
+
+def _sanitize_lftp_status_membership(value: object) -> Mapping[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    result: dict[str, object] = {
+        "schema": _CAPTURE_LFTP_STATUS_MEMBERSHIP_SCHEMA
+        if value.get("schema") == _CAPTURE_LFTP_STATUS_MEMBERSHIP_SCHEMA else "unknown",
+    }
+    for key, allowed in (("phase", {"status_membership", "unknown"}), ("source", _CAPTURE_LFTP_STATUS_SOURCES)):
+        item = value.get(key)
+        result[key] = item if item is None or (isinstance(item, str) and item in allowed) else "unknown"
+    for key in ("fresh", "healthy", "idle_authoritative", "raw_status_count_overflow", "filtered_status_count_overflow"):
+        item = value.get(key)
+        result[key] = item if item is None or type(item) is bool else None
+    for key in ("chunk_index", "chunk_count", "transition_count", "raw_status_count", "filtered_status_count"):
+        item = value.get(key)
+        result[key] = item if item is None or (type(item) is int and 0 <= item <= _CAPTURE_LFTP_STATUS_MEMBERSHIP_COUNT_MAX) else None
+    digest = value.get("transition_set_digest")
+    result["transition_set_digest"] = (
+        digest if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{16}", digest) else "unknown"
+    )
+    return result
+
+
 def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         return {"kind": "unknown"}
@@ -960,6 +1034,12 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
             if type(item) is bool:
                 safe[key] = item
         result["lifecycle"] = safe
+    lftp_status_authority = _sanitize_lftp_status_authority(value.get("lftp_status_authority"))
+    if lftp_status_authority is not None:
+        result["lftp_status_authority"] = lftp_status_authority
+    lftp_status_membership = _sanitize_lftp_status_membership(value.get("lftp_status_membership"))
+    if lftp_status_membership is not None:
+        result["lftp_status_membership"] = lftp_status_membership
     gate = value.get("completion_gate")
     if isinstance(gate, Mapping):
         safe_gate: dict[str, object] = {"boundary": "completion_gate"}

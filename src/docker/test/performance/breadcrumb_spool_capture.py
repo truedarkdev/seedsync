@@ -117,6 +117,26 @@ _QUEUE_LIFECYCLE_ENUMS = {
     "reaped": frozenset({"signal", "exit", "alive", "not_alive", "unknown"}),
     "future_state": frozenset({"finalized", "pending", "unknown"}),
 }
+_LFTP_STATUS_POLL_MESSAGE = "lftp_status_poll"
+_LFTP_STATUS_MEMBERSHIP_MESSAGE = "lftp_status_membership_transition"
+_LFTP_STATUS_AUTHORITY_SCHEMA = "lftp_status_authority.v1"
+_LFTP_STATUS_MEMBERSHIP_SCHEMA = "lftp_status_membership.v2"
+_LFTP_STATUS_SOURCES = frozenset({
+    "cached_error", "cached_idle", "cached_inflight", "cached_retry", "cached_unhealthy",
+    "error_empty", "fresh_healthy", "fresh_unhealthy", "inflight_empty", "retry_empty",
+    "unhealthy_empty", "unknown",
+})
+_LFTP_STATUS_OUTCOMES = _LFTP_STATUS_SOURCES | frozenset({"inflight", "fresh_healthy_empty"})
+_LFTP_STATUS_PARSER_OUTCOMES = frozenset({
+    "complete_success", "blank_empty", "partial_queue", "hard_error", "not_attempted", "unknown",
+})
+_LFTP_STATUS_FAILURES = frozenset({
+    "none", "inflight", "retry_pending", "parser_error", "command_error", "timeout", "eof",
+    "terminal_backlog", "unhealthy_snapshot", "unknown",
+})
+_LFTP_STATUS_FUTURE_STATES = frozenset({"none", "pending", "done", "unknown"})
+_LFTP_STATUS_COUNT_MAX = 128
+_LFTP_STATUS_MEMBERSHIP_COUNT_MAX = 2048
 _QUEUE_READINESS_SCHEMAS = frozenset({"queue_readiness.v1", "queue_readiness.v2"})
 _QUEUE_READINESS_EVENTS = frozenset({
     "queue_admission", "queue_callback", "queue_dispatch_boundary", "queue_final_decision",
@@ -374,6 +394,75 @@ def _queue_lifecycle_facts(details: Mapping[str, object]) -> dict[str, object] |
         if type(value) is bool:
             facts[key] = value
     return facts
+
+
+def _lftp_status_authority_facts(details: Mapping[str, object], message: object) -> dict[str, object] | None:
+    if message != _LFTP_STATUS_POLL_MESSAGE or details.get("schema") != _LFTP_STATUS_AUTHORITY_SCHEMA:
+        return None
+
+    def fixed(key: str, allowed: frozenset[str]) -> str | None:
+        value = details.get(key)
+        if value is None:
+            return None if key in details else "unknown"
+        return value if isinstance(value, str) and value in allowed else "unknown"
+
+    def boolean(key: str) -> bool | None:
+        value = details.get(key)
+        return value if type(value) is bool else None
+
+    result: dict[str, object] = {
+        "schema": _LFTP_STATUS_AUTHORITY_SCHEMA,
+        "phase": fixed("phase", frozenset({"status_inlet", "unknown"})),
+        "outcome": fixed("outcome", _LFTP_STATUS_OUTCOMES),
+        "parser_outcome": fixed("parser_outcome", _LFTP_STATUS_PARSER_OUTCOMES),
+        "source": fixed("source", _LFTP_STATUS_SOURCES),
+        "failure_reason": fixed("failure_reason", _LFTP_STATUS_FAILURES),
+    }
+    for key in ("fresh", "healthy", "cache_present", "retry_active", "idle_authoritative", "poll_due"):
+        result[key] = boolean(key)
+    for key in (
+        "status_count", "active_count", "raw_status_count", "filtered_status_count",
+        "queue_dispatch_pending_count", "lftp_queue_operation_pending_count", "lftp_queue_operation_done_count",
+    ):
+        value = details.get(key)
+        result[key] = value if type(value) is int and 0 <= value <= _LFTP_STATUS_COUNT_MAX else None
+    future_state = details.get("status_future_state")
+    result["status_future_state"] = (
+        future_state if isinstance(future_state, str) and future_state in _LFTP_STATUS_FUTURE_STATES else
+        ("unknown" if future_state is not None else None)
+    )
+    return result
+
+
+def _lftp_status_membership_facts(details: Mapping[str, object], message: object) -> dict[str, object] | None:
+    if message != _LFTP_STATUS_MEMBERSHIP_MESSAGE or details.get("schema") != _LFTP_STATUS_MEMBERSHIP_SCHEMA:
+        return None
+
+    def fixed(key: str, allowed: frozenset[str]) -> str | None:
+        value = details.get(key)
+        if value is None:
+            return None if key in details else "unknown"
+        return value if isinstance(value, str) and value in allowed else "unknown"
+
+    def boolean(key: str) -> bool | None:
+        value = details.get(key)
+        return value if type(value) is bool else None
+
+    result: dict[str, object] = {
+        "schema": _LFTP_STATUS_MEMBERSHIP_SCHEMA,
+        "phase": fixed("phase", frozenset({"status_membership", "unknown"})),
+        "source": fixed("source", _LFTP_STATUS_SOURCES),
+    }
+    for key in ("fresh", "healthy", "idle_authoritative", "raw_status_count_overflow", "filtered_status_count_overflow"):
+        result[key] = boolean(key)
+    for key in ("chunk_index", "chunk_count", "transition_count", "raw_status_count", "filtered_status_count"):
+        value = details.get(key)
+        result[key] = value if type(value) is int and 0 <= value <= _LFTP_STATUS_MEMBERSHIP_COUNT_MAX else None
+    digest = details.get("transition_set_digest")
+    result["transition_set_digest"] = (
+        digest if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{16}", digest) else "unknown"
+    )
+    return result
 
 
 def _completion_gate_facts(details: Mapping[str, object], message: object = None) -> dict[str, object] | None:
@@ -1030,6 +1119,14 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     message = row.get("message", metadata.get("message"))
     numbers = _numeric_values(row, metadata, details)
     lifecycle = _queue_lifecycle_facts(details) if category == "queue.lifecycle" else None
+    lftp_status_authority = (
+        _lftp_status_authority_facts(details, message)
+        if category == "transfer.lftp.status" else None
+    )
+    lftp_status_membership = (
+        _lftp_status_membership_facts(details, message)
+        if category == "transfer.lftp.membership" else None
+    )
     gate = _completion_gate_facts(details, message) if category == "completion.gate" else None
     final_move = (
         _final_move_publication_facts(details, message) if category == "final_move.publication" else None
@@ -1093,6 +1190,10 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     }
     if lifecycle is not None:
         result["lifecycle"] = lifecycle
+    if lftp_status_authority is not None:
+        result["lftp_status_authority"] = lftp_status_authority
+    if lftp_status_membership is not None:
+        result["lftp_status_membership"] = lftp_status_membership
     if gate is not None:
         result["completion_gate"] = gate
     if final_move is not None:

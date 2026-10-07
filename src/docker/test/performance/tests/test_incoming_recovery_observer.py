@@ -438,6 +438,62 @@ def test_local_scan_tick_and_lifecycle_projection_preserve_unknowns_and_sanitize
     assert oversized_generation["generation"] == "unknown"
 
 
+def test_lftp_status_health_projection_preserves_unknowns_and_omits_private_rows():
+    projected, irrelevant = capture._projection({
+        "category": "transfer.lftp.status", "message": "lftp_status_poll",
+        "source": "model_updater", "event_type": "state_transition", "stage": "lftp_status",
+        "level": "warning", "corr_id": "lftp:0123456789abcdef",
+        "flow_id": "lftp-poll:0123456789abcdef", "trace_scope": "flow",
+        "details": {
+            "schema": "lftp_status_authority.v1", "phase": "status_inlet",
+            "outcome": "fresh_unhealthy", "parser_outcome": "hard_error",
+            "source": "fresh_unhealthy", "failure_reason": "unhealthy_snapshot",
+            "fresh": True, "healthy": False, "cache_present": False, "retry_active": True,
+            "idle_authoritative": None, "poll_due": True, "status_count": 0,
+            "active_count": 0, "raw_status_count": 0, "filtered_status_count": 0,
+            "queue_dispatch_pending_count": 1, "lftp_queue_operation_pending_count": 0,
+            "lftp_queue_operation_done_count": 0, "status_future_state": "pending",
+            "private_path": "secret/path", "transitions": ["private-file-id"],
+        },
+    })
+    assert not irrelevant and projected is not None
+    safe = observer._sanitize_capture_projection(projected)
+    status = safe["lftp_status_authority"]
+    assert status["source"] == "fresh_unhealthy" and status["healthy"] is False
+    assert status["idle_authoritative"] is None and status["status_future_state"] == "pending"
+    assert "private_path" not in json.dumps(safe) and "private-file-id" not in json.dumps(safe)
+
+    projected_membership, irrelevant = capture._projection({
+        "category": "transfer.lftp.membership", "message": "lftp_status_membership_transition",
+        "source": "model_updater", "event_type": "state_transition", "stage": "lftp_status_membership",
+        "level": "info", "corr_id": "lftp:fedcba9876543210",
+        "flow_id": "lftp-poll:0123456789abcdef", "trace_scope": "flow",
+        "details": {
+            "schema": "lftp_status_membership.v2", "phase": "status_membership",
+            "source": "fresh_healthy", "fresh": True, "healthy": True,
+            "idle_authoritative": None, "raw_status_count_overflow": False,
+            "filtered_status_count_overflow": False, "chunk_index": 0, "chunk_count": 1,
+            "transition_count": 1, "raw_status_count": 1, "filtered_status_count": 1,
+            "transition_set_digest": "0123456789abcdef", "poll_correlation": "private-correlation",
+            "transitions": ["private-path-and-file-token"],
+        },
+    })
+    assert not irrelevant and projected_membership is not None
+    safe_membership = observer._sanitize_capture_projection(projected_membership)["lftp_status_membership"]
+    assert safe_membership["idle_authoritative"] is None and safe_membership["transition_count"] == 1
+    assert "transitions" not in safe_membership and "poll_correlation" not in safe_membership
+    malformed = observer._sanitize_capture_projection({
+        **projected_membership,
+        "lftp_status_membership": {
+            **projected_membership["lftp_status_membership"], "chunk_index": True,
+            "transition_count": 2049, "idle_authoritative": "false",
+            "transition_set_digest": "private-value",
+        },
+    })["lftp_status_membership"]
+    assert malformed["chunk_index"] is None and malformed["transition_count"] is None
+    assert malformed["idle_authoritative"] is None and malformed["transition_set_digest"] == "unknown"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="requires native durable file acknowledgement")
 @pytest.mark.skipif(BreadcrumbTraceCollector is None or ModelBuilder is None, reason="production builder unavailable")
 def test_finalized_nested_input_witness_reaches_capture_and_json_sink(tmp_path):

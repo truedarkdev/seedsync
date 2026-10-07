@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -36,15 +37,22 @@ try:
     from common.breadcrumb_trace import BreadcrumbTraceCollector, trace_session_digest
     from system import SystemFile
     from controller import Controller, ModelBuilder
-    from controller.model_updater import _ModelFinalizationBreadcrumbSpan, _record_lifecycle_scan_breadcrumb
+    from lftp import LftpJobStatus
+    from controller.model_updater import (
+        _ModelFinalizationBreadcrumbSpan, _record_lftp_status_breadcrumb,
+        _record_lftp_status_membership_transition, _record_lifecycle_scan_breadcrumb,
+    )
 except ImportError:
     BreadcrumbTraceCollector = None
     trace_session_digest = None
     Controller = None
     _record_lifecycle_scan_breadcrumb = None
     _ModelFinalizationBreadcrumbSpan = None
+    _record_lftp_status_breadcrumb = None
+    _record_lftp_status_membership_transition = None
     SystemFile = None
     ModelBuilder = None
+    LftpJobStatus = None
 
 
 def _health(path: Path, *, session: str = "session-1", lost: int = 0, rotation_count: int = 0) -> None:
@@ -983,6 +991,92 @@ def test_collector_durable_flat_envelope_reaches_reader_projection(tmp_path: Pat
     projections = [item["capture"]["projection"] for item in _artifacts(artifact) if item["capture"].get("state") == "record"]
     assert any(item.get("queue_readiness", {}).get("event") == "queue_callback" for item in projections)
     assert any(item.get("model_page_snapshot", {}).get("outcome") == "success" for item in projections)
+
+
+@pytest.mark.skipif(
+    BreadcrumbTraceCollector is None or Controller is None or _record_lftp_status_breadcrumb is None
+    or _record_lftp_status_membership_transition is None or LftpJobStatus is None,
+    reason="production LFTP breadcrumb producer is unavailable",
+)
+def test_finalized_lftp_health_and_membership_reach_canonical_json_sink(tmp_path: Path) -> None:
+    spool = tmp_path / "lftp-health-spool"
+    spool.mkdir()
+    artifact = tmp_path / "lftp-health-capture.jsonl"
+    collector = BreadcrumbTraceCollector(
+        lambda: True,
+        policy={"default": "off", "rules": {
+            "transfer.lftp.status": "warning", "transfer.lftp.membership": "info",
+            "queue.lifecycle": "info",
+        }},
+        durable_enabled=True, durable_path=str(spool), durable_enabled_getter=lambda: True,
+    )
+    controller = Controller.__new__(Controller)
+    controller._Controller__context = SimpleNamespace(breadcrumb_trace=collector)
+    controller._Controller__model = SimpleNamespace(version=1)
+    controller._Controller__lftp = SimpleNamespace(backend_name="lftp")
+    controller._Controller__last_lftp_statuses = []
+    controller._Controller__lftp_idle_status_authoritative = False
+    controller._Controller__lftp_status_cache_expires_at = None
+    controller._Controller__lftp_status_poll_retry_active = False
+    controller._Controller__work_state_lock = threading.RLock()
+    controller._Controller__pending_queue_dispatches = {}
+    controller._Controller__progress_publication_epoch = 0
+    try:
+        assert collector.record(
+            "controller", "baseline", {"schema": "baseline.v1"},
+            category="transfer.lftp.status", level="warning",
+        ) in {"retained", "enqueued"}
+        assert collector.flush_durable(2.0)
+        reader = _reader(spool, artifact)
+        try:
+            reader.start()
+            _record_lftp_status_breadcrumb(
+                controller, (), source="fresh_unhealthy", fresh=True, healthy=False,
+                failure_reason="unhealthy_snapshot", poll_correlation="lftp-poll:0123456789abcdef",
+            )
+            status = LftpJobStatus(
+                1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+                "private-status-label", "",
+            )
+            status.path_pair_id = "synthetic-pair"
+            _record_lftp_status_membership_transition(
+                controller, (status,), (), (), previous_malformed_ids=set(),
+                current_malformed_ids=set(), source="fresh_unhealthy", fresh=True, healthy=False,
+                poll_correlation="lftp-poll:0123456789abcdef",
+            )
+            for failure_reason in ("timeout", "eof", "terminal_backlog"):
+                controller._Controller__lftp.last_status_poll_failure_reason = failure_reason
+                _record_lftp_status_breadcrumb(
+                    controller, (), source="error_empty", fresh=False, healthy=False,
+                    poll_correlation="lftp-poll:0123456789abcdef",
+                )
+            assert collector.flush_durable(2.0)
+            assert reader.poll() >= 5
+        finally:
+            reader.close()
+        finalized = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
+        events = [row for row in finalized if row.get("message") in {
+            "lftp_status_poll", "lftp_status_membership_transition",
+        }]
+        assert [row["message"] for row in events] == [
+            "lftp_status_poll", "lftp_status_membership_transition",
+            "lftp_status_poll", "lftp_status_poll", "lftp_status_poll",
+        ]
+        projections = [item["capture"]["projection"] for item in _artifacts(artifact) if item.get("capture", {}).get("state") == "record"]
+        status_projections = [item["lftp_status_authority"] for item in projections if "lftp_status_authority" in item]
+        membership_projection = next(item["lftp_status_membership"] for item in projections if "lftp_status_membership" in item)
+        assert status_projections[0]["source"] == "fresh_unhealthy" and status_projections[0]["healthy"] is False
+        assert status_projections[0]["idle_authoritative"] is None
+        assert [item["failure_reason"] for item in status_projections] == [
+            "unhealthy_snapshot", "timeout", "eof", "terminal_backlog",
+        ]
+        assert membership_projection["source"] == "fresh_unhealthy" and membership_projection["healthy"] is False
+        assert membership_projection["transition_count"] == 1 and membership_projection["filtered_status_count"] == 0
+        assert "transitions" not in membership_projection and "poll_correlation" not in membership_projection
+        text = artifact.read_text(encoding="utf-8")
+        assert "synthetic-status-id" not in text and "lftp-job:" not in text
+    finally:
+        collector.close(timeout=2.0)
 
 
 @pytest.mark.skipif(BreadcrumbTraceCollector is None, reason="production breadcrumb collector is unavailable")
