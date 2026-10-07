@@ -36,12 +36,13 @@ try:
     from common.breadcrumb_trace import BreadcrumbTraceCollector, trace_session_digest
     from system import SystemFile
     from controller import Controller, ModelBuilder
-    from controller.model_updater import _record_lifecycle_scan_breadcrumb
+    from controller.model_updater import _ModelFinalizationBreadcrumbSpan, _record_lifecycle_scan_breadcrumb
 except ImportError:
     BreadcrumbTraceCollector = None
     trace_session_digest = None
     Controller = None
     _record_lifecycle_scan_breadcrumb = None
+    _ModelFinalizationBreadcrumbSpan = None
     SystemFile = None
     ModelBuilder = None
 
@@ -833,6 +834,108 @@ def test_model_page_snapshot_source_projection_is_finite_and_redacted(tmp_path: 
     assert projection["model_page_snapshot"] == {
         "outcome": "success", "scope_version": 4, "global_version": 9,
         "lock_wait_ms": 1, "lock_hold_ms": 2, "snapshot_elapsed_ms": 3,
+    }
+
+
+@pytest.mark.skipif(BreadcrumbTraceCollector is None or _ModelFinalizationBreadcrumbSpan is None, reason="production finalization span is unavailable")
+def test_actual_model_finalization_span_reaches_finalized_reader_and_json_sink(tmp_path: Path) -> None:
+    spool = tmp_path / "model-finalization-spool"
+    spool.mkdir()
+    artifact = tmp_path / "model-finalization-capture.jsonl"
+    collector = BreadcrumbTraceCollector(
+        lambda: True,
+        policy={"default": "off", "rules": {"queue.readiness": "info", "model.finalization": "info"}},
+        durable_enabled=True,
+        durable_path=str(spool),
+        durable_enabled_getter=lambda: True,
+    )
+    controller = SimpleNamespace(
+        _Controller__context=SimpleNamespace(breadcrumb_trace=collector),
+        _Controller__lftp_status_poll_correlation="lftp-poll:0123456789abcdef",
+    )
+
+    def record_breadcrumb(**kwargs: object) -> None:
+        collector.record(
+            "controller", kwargs["message"], kwargs["details"],
+            stage=kwargs["stage"], event_type=kwargs["event_type"],
+            category=kwargs["category"], level=kwargs["level"],
+            corr_id=kwargs["corr_id"], flow_id=kwargs.get("flow_id"),
+            trace_scope=kwargs.get("trace_scope", "flow"),
+        )
+
+    controller._Controller__record_breadcrumb = record_breadcrumb
+    reader = None
+    try:
+        assert collector.record(
+            "controller", "baseline", {"schema": "queue_readiness.v1", "phase": "entry", "outcome": "accepted"},
+            category="queue.readiness", event_type="callback", stage="queue_readiness", level="info",
+        ) in {"retained", "enqueued"}
+        assert collector.flush_durable(2.0)
+        reader = _reader(spool, artifact)
+        reader.start()
+        entry_ns = 2**53 + 117
+        terminal_ns = entry_ns + 8_000_000
+        entry_cpu_ns = 2**53 + 31
+        terminal_cpu_ns = entry_cpu_ns + 2_000_000
+        span = _ModelFinalizationBreadcrumbSpan(
+            controller, "model_lock_wait", "private-raw-correlation",
+            defer_recording=True, eager_entry=True,
+        )
+        span.__enter__(boundary_ns=entry_ns, boundary_cpu_ns=entry_cpu_ns)
+        assert collector.flush_durable(2.0)
+        assert reader.poll() == 1
+        span.__exit__(None, None, None, boundary_ns=terminal_ns, boundary_cpu_ns=terminal_cpu_ns)
+        assert collector.flush_durable(2.0)
+        assert reader.poll() == 0
+        span.flush()
+        assert collector.flush_durable(2.0)
+        assert reader.poll() == 1
+    finally:
+        if reader is not None:
+            reader.close()
+        collector.close(timeout=2.0)
+
+    durable_rows = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
+    finalized = [row for row in durable_rows if row.get("category") == "model.finalization"]
+    assert [row["details"]["phase"] for row in finalized] == ["entry", "complete"]
+    assert all(row["details"]["schema"] == "model_finalization.v2" for row in finalized)
+    artifacts = [item for item in _artifacts(artifact) if item["capture"].get("state") == "record"]
+    projections = [item["capture"]["projection"] for item in artifacts]
+    spans = [item["model_finalization"] for item in projections]
+    assert spans == [
+        {
+            "schema": "model_finalization.v2", "phase": "entry", "stage": "model_lock_wait",
+            "outcome": "started", "wall_ms": 0, "thread_cpu_ms": 0,
+            "lock_wait_ms": None, "lock_hold_ms": None, "boundary_monotonic_ns": str(entry_ns),
+        },
+        {
+            "schema": "model_finalization.v2", "phase": "complete", "stage": "model_lock_wait",
+            "outcome": "completed", "wall_ms": 8, "thread_cpu_ms": 2,
+            "lock_wait_ms": 8, "lock_hold_ms": None, "boundary_monotonic_ns": str(terminal_ns),
+        },
+    ]
+    assert projections[0]["corr_hash"] == projections[1]["corr_hash"]
+    assert [item["capture"]["cursor_start"] for item in artifacts] == sorted(
+        item["capture"]["cursor_start"] for item in artifacts
+    )
+    rendered = artifact.read_text(encoding="utf-8")
+    assert "private-raw-correlation" not in rendered
+    assert '"cpu_clock"' not in rendered
+    assert str(entry_ns) in rendered and str(terminal_ns) in rendered
+
+    malformed, irrelevant = capture._projection(json.loads(_row(
+        category="model.finalization", stage="model_finalization", label="model_finalization_complete",
+        details={
+            "schema": "model_finalization.v2", "phase": "complete", "stage": "model_lock_wait",
+            "outcome": "completed", "wall_ms": True, "thread_cpu_ms": 1.5,
+            "lock_wait_ms": -1, "lock_hold_ms": 2**63, "boundary_monotonic_ns": None,
+        },
+    )))
+    assert not irrelevant and malformed is not None
+    assert malformed["model_finalization"] == {
+        "schema": "model_finalization.v2", "phase": "complete", "stage": "model_lock_wait",
+        "outcome": "completed", "wall_ms": None, "thread_cpu_ms": None,
+        "lock_wait_ms": None, "lock_hold_ms": None, "boundary_monotonic_ns": None,
     }
 
 

@@ -642,6 +642,35 @@ def test_completion_move_projection_sanitizer_preserves_finite_facts():
     assert malformed["final_move_publication"]["destination_exists"] is None
 
 
+def test_model_finalization_projection_sanitizer_keeps_only_bounded_schema_fields():
+    safe = observer._sanitize_capture_projection({
+        "model_finalization": {
+            "schema": "model_finalization.v2", "phase": "complete", "stage": "model_lock_wait",
+            "outcome": "completed", "wall_ms": 17, "thread_cpu_ms": 3,
+            "lock_wait_ms": 17, "lock_hold_ms": None, "boundary_monotonic_ns": "9007199254741110",
+            "private_detail": "discard",
+        },
+    })["model_finalization"]
+    assert safe == {
+        "schema": "model_finalization.v2", "phase": "complete", "stage": "model_lock_wait",
+        "outcome": "completed", "wall_ms": 17, "thread_cpu_ms": 3,
+        "lock_wait_ms": 17, "lock_hold_ms": None, "boundary_monotonic_ns": "9007199254741110",
+    }
+
+    malformed = observer._sanitize_capture_projection({
+        "model_finalization": {
+            "schema": "private", "phase": "private", "stage": "private", "outcome": "private",
+            "wall_ms": True, "thread_cpu_ms": -1, "lock_wait_ms": 1.5,
+            "lock_hold_ms": 86_400_001, "boundary_monotonic_ns": 2**53 + 1,
+        },
+    })["model_finalization"]
+    assert malformed == {
+        "schema": "unknown", "phase": "unknown", "stage": "unknown", "outcome": "unknown",
+        "wall_ms": None, "thread_cpu_ms": None, "lock_wait_ms": None, "lock_hold_ms": None,
+        "boundary_monotonic_ns": None,
+    }
+
+
 def test_pending_transfer_gate_requires_exact_local_paths_and_safe_lifecycle_before_queue():
     gate = observer.QueueGate(
         PAIR, "Pr0n", ROOT, "Incoming",

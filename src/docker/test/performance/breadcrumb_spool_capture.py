@@ -167,6 +167,19 @@ _MODEL_PAGE_SNAPSHOT_ERRORS = frozenset({"cancelled", "model_error", "runtime_er
 _MODEL_PAGE_SNAPSHOT_NUMBERS = frozenset({
     "scope_version", "global_version", "lock_wait_ms", "lock_hold_ms", "snapshot_elapsed_ms",
 })
+_MODEL_FINALIZATION_SCHEMA = "model_finalization.v2"
+_MODEL_FINALIZATION_PHASES = frozenset({"entry", "complete", "error"})
+_MODEL_FINALIZATION_OUTCOMES = frozenset({"started", "completed", "failed"})
+_MODEL_FINALIZATION_STAGES = frozenset({
+    "unknown", "update_lock_wait", "update_lock_hold", "update_lock_release",
+    "model_lock_wait", "model_lock_hold", "model_lock_release", "model_build",
+    "candidate_composition", "diff_construction", "diff_application", "completion_gate",
+    "marker_reconciliation", "pair_adoption", "full_adoption", "final_publication",
+    "summary_publication",
+})
+_MODEL_FINALIZATION_DURATION_MAX_MS = 86_400_000
+_MODEL_FINALIZATION_DURATION_KEYS = ("wall_ms", "thread_cpu_ms", "lock_wait_ms", "lock_hold_ms")
+_MODEL_FINALIZATION_BOUNDARY_MAX_NS = 2**63 - 1
 _MODEL_PROGRESS_LINEAGE_SCHEMA = "model_progress_lineage_summary.v1"
 _MODEL_PROGRESS_LINEAGE_MAX_VERSION_RANGES = 8
 _MODEL_PROGRESS_LINEAGE_SOURCES = frozenset({
@@ -569,6 +582,37 @@ def _model_page_snapshot_facts(details: Mapping[str, object]) -> dict[str, objec
         value = details.get(key)
         if type(value) is int and 0 <= value <= 2**31 - 1:
             result[key] = value
+    return result
+
+
+def _model_finalization_facts(details: Mapping[str, object]) -> dict[str, object] | None:
+    """Project the updater's fixed, bounded model-finalization span schema."""
+    if details.get("schema") != _MODEL_FINALIZATION_SCHEMA:
+        return None
+    phase = details.get("phase")
+    stage = details.get("stage")
+    outcome = details.get("outcome")
+    if not (
+        isinstance(phase, str) and phase in _MODEL_FINALIZATION_PHASES
+        and isinstance(stage, str) and stage in _MODEL_FINALIZATION_STAGES
+        and isinstance(outcome, str) and outcome in _MODEL_FINALIZATION_OUTCOMES
+    ):
+        return None
+    result: dict[str, object] = {
+        "schema": _MODEL_FINALIZATION_SCHEMA,
+        "phase": phase,
+        "stage": stage,
+        "outcome": outcome,
+    }
+    for key in _MODEL_FINALIZATION_DURATION_KEYS:
+        value = details.get(key)
+        result[key] = value if type(value) is int and 0 <= value <= _MODEL_FINALIZATION_DURATION_MAX_MS else None
+    boundary_ns = details.get("boundary_monotonic_ns")
+    result["boundary_monotonic_ns"] = (
+        str(boundary_ns)
+        if type(boundary_ns) is int and 0 <= boundary_ns <= _MODEL_FINALIZATION_BOUNDARY_MAX_NS
+        else None
+    )
     return result
 
 
@@ -998,6 +1042,7 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     delete_local = _delete_local_command_facts(row, metadata, details)
     readiness = _queue_readiness_facts(row.get("message"), details) if category == "queue.readiness" else None
     model_page_snapshot = _model_page_snapshot_facts(details) if category == "model_page_snapshot" else None
+    model_finalization = _model_finalization_facts(details) if category == "model.finalization" else None
     model_progress_lineage = _model_progress_lineage_facts(details) if category == "model.progress" else None
     input_arbitration = _input_arbitration_facts(row, metadata, details)
     scan_join = (
@@ -1015,6 +1060,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     if category == "queue.readiness" and readiness is None:
         return None, True
     if category == "model_page_snapshot" and model_page_snapshot is None:
+        return None, True
+    if category == "model.finalization" and model_finalization is None:
         return None, True
     if details.get("schema") == _MODEL_PROGRESS_LINEAGE_SCHEMA and model_progress_lineage is None:
         return None, True
@@ -1060,6 +1107,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["queue_readiness"] = readiness
     if model_page_snapshot is not None:
         result["model_page_snapshot"] = model_page_snapshot
+    if model_finalization is not None:
+        result["model_finalization"] = model_finalization
     if model_progress_lineage is not None:
         result["model_progress_lineage"] = model_progress_lineage
     if input_arbitration is not None:

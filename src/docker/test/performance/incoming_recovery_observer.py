@@ -562,6 +562,19 @@ _CAPTURE_READINESS_EXTRA_ENUMS = {
 }
 _CAPTURE_MODEL_PAGE_SNAPSHOT_OUTCOMES = {"success", "error", "unknown"}
 _CAPTURE_MODEL_PAGE_SNAPSHOT_ERRORS = {"cancelled", "model_error", "runtime_error", "unknown"}
+_CAPTURE_MODEL_FINALIZATION_PHASES = {"entry", "complete", "error", "unknown"}
+_CAPTURE_MODEL_FINALIZATION_STAGES = {
+    "unknown", "update_lock_wait", "update_lock_hold", "update_lock_release",
+    "model_lock_wait", "model_lock_hold", "model_lock_release", "model_build",
+    "candidate_composition", "diff_construction", "diff_application", "completion_gate",
+    "marker_reconciliation", "pair_adoption", "full_adoption", "final_publication",
+    "summary_publication",
+}
+_CAPTURE_MODEL_FINALIZATION_OUTCOMES = {"started", "completed", "failed", "unknown"}
+_CAPTURE_MODEL_FINALIZATION_DURATION_MAX_MS = 86_400_000
+_CAPTURE_MODEL_FINALIZATION_DURATION_KEYS = ("wall_ms", "thread_cpu_ms", "lock_wait_ms", "lock_hold_ms")
+_CAPTURE_MODEL_FINALIZATION_BOUNDARY_MAX_NS = 2**63 - 1
+_CAPTURE_MODEL_FINALIZATION_BOUNDARY_TEXT = re.compile(r"^(?:0|[1-9][0-9]{0,18})$")
 _CAPTURE_PROGRESS_LINEAGE_SCHEMA = "model_progress_lineage_summary.v1"
 _CAPTURE_PROGRESS_LINEAGE_MAX_VERSION_RANGES = 8
 _CAPTURE_PROGRESS_LINEAGE_SOURCES = {
@@ -1053,6 +1066,33 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
             if type(item) is int and 0 <= item <= 2**31 - 1:
                 safe_snapshot[key] = item
         result["model_page_snapshot"] = safe_snapshot
+    model_finalization = value.get("model_finalization")
+    if isinstance(model_finalization, Mapping):
+        safe_finalization: dict[str, object] = {
+            "schema": "model_finalization.v2" if model_finalization.get("schema") == "model_finalization.v2" else "unknown",
+        }
+        for key, allowed in (
+            ("phase", _CAPTURE_MODEL_FINALIZATION_PHASES),
+            ("stage", _CAPTURE_MODEL_FINALIZATION_STAGES),
+            ("outcome", _CAPTURE_MODEL_FINALIZATION_OUTCOMES),
+        ):
+            item = model_finalization.get(key)
+            safe_finalization[key] = item if isinstance(item, str) and item in allowed else "unknown"
+        for key in _CAPTURE_MODEL_FINALIZATION_DURATION_KEYS:
+            item = model_finalization.get(key)
+            safe_finalization[key] = (
+                item if type(item) is int and 0 <= item <= _CAPTURE_MODEL_FINALIZATION_DURATION_MAX_MS
+                else None
+            )
+        boundary_ns = model_finalization.get("boundary_monotonic_ns")
+        safe_finalization["boundary_monotonic_ns"] = (
+            boundary_ns
+            if isinstance(boundary_ns, str)
+            and _CAPTURE_MODEL_FINALIZATION_BOUNDARY_TEXT.fullmatch(boundary_ns)
+            and int(boundary_ns) <= _CAPTURE_MODEL_FINALIZATION_BOUNDARY_MAX_NS
+            else None
+        )
+        result["model_finalization"] = safe_finalization
     lineage = value.get("model_progress_lineage")
     if isinstance(lineage, Mapping):
         safe_lineage = _sanitize_progress_lineage(lineage)
