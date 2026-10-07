@@ -6706,19 +6706,30 @@ class Controller:
 
     def record_queue_http_wait_trace(
             self, file_id: str, completed: bool, callback_success: object,
-            flow_id: Optional[str] = None,
+            flow_id: Optional[str] = None, duration_ms: object = None,
     ) -> None:
         """Record the Queue HTTP wait result without request identity."""
         outcome = "timeout"
         if completed:
             outcome = "success" if callback_success is True else \
                 "failure" if callback_success is False else "unknown"
-        self.__record_queue_readiness_trace(file_id, "queue_http_wait", {
+        details: dict[str, object] = {
             "schema": "queue_readiness.v1",
             "phase": "wait_return",
             "outcome": outcome,
-        }, flow_id=(flow_id if isinstance(flow_id, str) else
-                    self.__queue_flow_id_for_pending_file(file_id)))
+        }
+        if type(duration_ms) is int and 0 <= duration_ms <= 2**31 - 1:
+            details["duration_ms"] = duration_ms
+        self.__record_queue_readiness_trace(
+            file_id, "queue_http_wait", details,
+            flow_id=(flow_id if isinstance(flow_id, str) else
+                     self.__queue_flow_id_for_pending_file(file_id)),
+        )
+
+    def queue_http_wait_trace_enabled(self) -> bool:
+        """Return whether the existing Queue-readiness INFO trace is enabled."""
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        return _breadcrumb_effectively_enabled(breadcrumb_trace, "queue.readiness", "info")
 
     def __queue_flow_id_for_pending_file(self, file_id: object) -> Optional[str]:
         """Reuse the existing pending dispatch identity when it is available."""

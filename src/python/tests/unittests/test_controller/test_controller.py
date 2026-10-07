@@ -7,6 +7,7 @@ import logging
 import shutil
 import stat
 import threading
+import sys
 import time
 import tempfile
 import unittest
@@ -60,7 +61,7 @@ from model import ActiveProgressOverlay, IModelListener, Model, ModelDiff, Model
 from system import SystemFile
 from web.serialize.serialize_model import SerializeModel
 from transfer import RcloneTransferError
-from web.handler.controller import ControllerHandler
+from web.handler.controller import ControllerHandler, WebResponseActionCallback
 
 
 class TestController(unittest.TestCase):
@@ -7641,6 +7642,325 @@ class TestController(unittest.TestCase):
         self.controller.record_queue_http_wait_trace("wait-disabled", False, None)
 
         self.assertEqual([], trace.snapshot()["entries"])
+
+    def test_queue_http_wait_trace_includes_only_bounded_exact_duration(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+
+        self.controller.record_queue_http_wait_trace(
+            "private-duration", True, True, duration_ms=321,
+        )
+        for index, invalid_duration in enumerate((True, -1, 2**31, 1.5)):
+            self.controller.record_queue_http_wait_trace(
+                "private-unknown-duration-{}".format(index), False, None,
+                duration_ms=invalid_duration,
+            )
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(5, len(entries))
+        self.assertEqual(321, entries[0]["details"]["duration_ms"])
+        self.assertEqual("success", entries[0]["details"]["outcome"])
+        self.assertTrue(all("duration_ms" not in entry["details"] for entry in entries[1:]))
+        self.assertTrue(all(entry["details"]["outcome"] == "timeout" for entry in entries[1:]))
+
+    def test_queue_http_wait_duration_measures_only_callback_wait_and_survives_sink(self):
+        file_id = "private-queue-wait-target"
+        flow_id = "fractional-queue:0123456789abcdef"
+        phases = []
+        clock_values = iter((1_000_000_000, 1_251_000_000))
+
+        def queue_command(command):
+            phases.append("queue_command")
+            callback = command.callbacks[0]
+            callback.queue_trace_flow_id = flow_id
+            callback.on_success()
+
+        def monotonic_ns():
+            phases.append("clock")
+            return next(clock_values)
+
+        original_wait = WebResponseActionCallback.wait
+
+        def observed_wait(callback, timeout=None):
+            phases.append("wait")
+            return original_wait(callback, timeout=timeout)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            spool = os.path.join(temp_dir, "breadcrumbs")
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "off", "rules": {"queue.readiness": "info"}},
+                max_entries=16,
+                durable_enabled=True,
+                durable_path=spool,
+            )
+            self.controller._Controller__context.breadcrumb_trace = trace
+            self.controller.queue_command = MagicMock(side_effect=queue_command)
+            handler = ControllerHandler(self.controller)
+            try:
+                with (
+                    patch.object(handler, "_ControllerHandler__command_timing_started", return_value=None),
+                    patch.object(handler, "_ControllerHandler__query_param", return_value=None),
+                    patch.object(
+                        handler,
+                        "_ControllerHandler__resolve_command_identifier",
+                        return_value=(file_id, None, None),
+                    ),
+                    patch.object(handler, "_queue_action_timeout", return_value=1.0),
+                    patch("web.handler.controller.time.monotonic_ns", side_effect=monotonic_ns),
+                    patch.object(WebResponseActionCallback, "wait", new=observed_wait),
+                ):
+                    response = handler._ControllerHandler__handle_action_queue(file_id)
+
+                self.assertEqual(200, response.status_code)
+                self.assertEqual(["queue_command", "clock", "wait", "clock"], phases)
+                if os.name == "nt":
+                    # This runtime cannot certify the durable health file ACL;
+                    # the Linux native closure exercises the finalized spool.
+                    row = next(
+                        item for item in trace.snapshot()["entries"]
+                        if item.get("message") == "queue_http_wait"
+                    )
+                else:
+                    self.assertTrue(trace.wait_for_ingress(2.0), trace.durable_snapshot())
+                    self.assertTrue(trace.flush_durable(2.0), trace.durable_snapshot())
+                    with open(os.path.join(spool, "breadcrumbs.jsonl"), encoding="utf-8") as stream:
+                        rows = [json.loads(line) for line in stream if line.strip()]
+                    row = next(item for item in rows if item.get("message") == "queue_http_wait")
+                self.assertEqual(251, row["details"]["duration_ms"])
+                self.assertEqual("success", row["details"]["outcome"])
+                self.assertEqual(flow_id, row["flow_id"])
+                self.assertNotIn(file_id, json.dumps(row))
+
+                performance_path = Path(__file__).resolve().parents[5] / "src" / "docker" / "test" / "performance"
+                performance_path_text = str(performance_path)
+                sys.path.insert(0, performance_path_text)
+                try:
+                    import breadcrumb_spool_capture
+                    from incoming_recovery_observer import JsonArtifactSink
+                finally:
+                    sys.path.remove(performance_path_text)
+                self.assertEqual(
+                    performance_path / "breadcrumb_spool_capture.py",
+                    Path(breadcrumb_spool_capture.__file__).resolve(),
+                )
+                projection, unsupported = breadcrumb_spool_capture._projection(row)
+                self.assertFalse(unsupported)
+                sink_path = os.path.join(temp_dir, "capture.jsonl")
+                JsonArtifactSink(sink_path).persist({
+                    "schema": "breadcrumb-spool-capture.v1",
+                    "event": "spool",
+                    "phase": "record",
+                    "outcome": "success",
+                    "capture": {"state": "record", "projection": projection},
+                })
+                with open(sink_path, encoding="utf-8") as stream:
+                    artifact = json.loads(stream.readline())
+                saved_projection = artifact["capture"]["projection"]
+                self.assertEqual(251, saved_projection["numbers"]["duration_ms"])
+                self.assertEqual("success", saved_projection["queue_readiness"]["outcome"])
+            finally:
+                trace.close(timeout=2.0)
+
+    def test_queue_http_wait_duration_keeps_failure_and_timeout_outcomes(self):
+        file_id = "private-queue-wait-target"
+        flow_id = "fractional-queue:0123456789abcdef"
+        performance_path = Path(__file__).resolve().parents[5] / "src" / "docker" / "test" / "performance"
+        performance_path_text = str(performance_path)
+        sys.path.insert(0, performance_path_text)
+        try:
+            import breadcrumb_spool_capture
+            from incoming_recovery_observer import JsonArtifactSink
+        finally:
+            sys.path.remove(performance_path_text)
+        self.assertEqual(
+            performance_path / "breadcrumb_spool_capture.py",
+            Path(breadcrumb_spool_capture.__file__).resolve(),
+        )
+
+        for result_kind, expected_status, expected_outcome in (
+            ("failure", 503, "failure"),
+            ("timeout", 504, "timeout"),
+        ):
+            with self.subTest(result_kind=result_kind):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    spool = os.path.join(temp_dir, "breadcrumbs")
+                    sink_path = os.path.join(temp_dir, "capture.jsonl")
+                    trace = BreadcrumbTraceCollector(
+                        lambda: True,
+                        policy={"default": "off", "rules": {
+                            "queue.readiness": "info", "controller": "info",
+                        }},
+                        max_entries=16,
+                        durable_enabled=True,
+                        durable_path=spool,
+                    )
+                    reader = None
+                    try:
+                        if os.name != "nt":
+                            self.assertIn(
+                                trace.record(
+                                    "controller", "durable_boundary_probe", {},
+                                    category="controller", event_type="diagnostic",
+                                    stage="queue_readiness_test_boundary", level="info",
+                                ),
+                                {"retained", "enqueued"},
+                            )
+                            self.assertTrue(trace.wait_for_ingress(2.0))
+                            self.assertTrue(trace.flush_durable(2.0), trace.durable_snapshot())
+                            reader = breadcrumb_spool_capture.BreadcrumbSpoolCapture(
+                                spool, JsonArtifactSink(sink_path), max_records=32,
+                            )
+                            reader.start()
+
+                        self.controller._Controller__context.breadcrumb_trace = trace
+
+                        def queue_command(command):
+                            callback = command.callbacks[0]
+                            callback.queue_trace_flow_id = flow_id
+                            if result_kind == "failure":
+                                callback.on_failure("private failure", 503)
+
+                        self.controller.queue_command = MagicMock(side_effect=queue_command)
+                        handler = ControllerHandler(self.controller)
+                        with (
+                            patch.object(handler, "_ControllerHandler__command_timing_started", return_value=None),
+                            patch.object(handler, "_ControllerHandler__query_param", return_value=None),
+                            patch.object(
+                                handler,
+                                "_ControllerHandler__resolve_command_identifier",
+                                return_value=(file_id, None, None),
+                            ),
+                            patch.object(handler, "_queue_action_timeout", return_value=0.0),
+                            patch(
+                                "web.handler.controller.time.monotonic_ns",
+                                side_effect=(2_000_000_000, 2_075_000_000),
+                            ),
+                        ):
+                            response = handler._ControllerHandler__handle_action_queue(file_id)
+
+                        self.assertEqual(expected_status, response.status_code)
+                        if os.name == "nt":
+                            # Windows cannot certify the durable health-file ACL here.
+                            row = next(
+                                item for item in trace.snapshot()["entries"]
+                                if item.get("message") == "queue_http_wait"
+                            )
+                            projection, unsupported = breadcrumb_spool_capture._projection(row)
+                            self.assertFalse(unsupported)
+                            JsonArtifactSink(sink_path).persist({
+                                "schema": "breadcrumb-spool-capture.v1",
+                                "event": "spool",
+                                "phase": "record",
+                                "outcome": "success",
+                                "capture": {"state": "record", "projection": projection},
+                            })
+                            with open(sink_path, encoding="utf-8") as stream:
+                                artifact = json.loads(stream.readline())
+                            saved_projection = artifact["capture"]["projection"]
+                        else:
+                            self.assertTrue(trace.wait_for_ingress(2.0), trace.durable_snapshot())
+                            self.assertTrue(trace.flush_durable(2.0), trace.durable_snapshot())
+                            with open(os.path.join(spool, "breadcrumbs.jsonl"), encoding="utf-8") as stream:
+                                rows = [json.loads(line) for line in stream if line.strip()]
+                            row = next(item for item in rows if item.get("message") == "queue_http_wait")
+                            self.assertEqual(flow_id, row["flow_id"])
+                            self.assertNotIn(file_id, json.dumps(row))
+                            self.assertEqual(1, reader.poll())
+                            with open(sink_path, encoding="utf-8") as stream:
+                                artifacts = [json.loads(line) for line in stream if line.strip()]
+                            artifact = next(
+                                item for item in artifacts
+                                if item.get("capture", {}).get("state") == "record" and
+                                item.get("capture", {}).get("projection", {}).get("queue_readiness", {}).get("event") ==
+                                "queue_http_wait"
+                            )
+                            saved_projection = artifact["capture"]["projection"]
+                            flow_hash = saved_projection["flow_hash"]
+                            self.assertEqual(16, len(flow_hash))
+                            self.assertTrue(all(char in "0123456789abcdef" for char in flow_hash))
+                            self.assertNotIn(flow_id, json.dumps(artifact))
+                            self.assertNotIn(file_id, json.dumps(artifact))
+
+                        self.assertEqual(75, saved_projection["numbers"]["duration_ms"])
+                        self.assertEqual(expected_outcome, saved_projection["queue_readiness"]["outcome"])
+                        self.assertEqual("queue_http_wait", saved_projection["queue_readiness"]["event"])
+                    finally:
+                        if reader is not None:
+                            reader.close()
+                        trace.close(timeout=2.0)
+
+    def test_queue_http_wait_duration_clock_failures_and_disabled_gate_are_isolated(self):
+        for policy, clock_failure, expected_calls, duration_present in (
+            ({"default": "off", "rules": {"queue.readiness": "info"}}, RuntimeError("start"), 1, False),
+            ({"default": "off", "rules": {"queue.readiness": "info"}},
+             (2_000_000_000, RuntimeError("end")), 2, False),
+            ({"default": "off"}, AssertionError("disabled clock"), 0, False),
+        ):
+            with self.subTest(policy=policy, duration_present=duration_present):
+                trace = BreadcrumbTraceCollector(lambda: True, policy=policy, max_entries=8)
+                self.controller._Controller__context.breadcrumb_trace = trace
+                self.controller.queue_command = MagicMock(
+                    side_effect=lambda command: command.callbacks[0].on_success(),
+                )
+                handler = ControllerHandler(self.controller)
+                with (
+                    patch.object(handler, "_ControllerHandler__command_timing_started", return_value=None),
+                    patch.object(handler, "_ControllerHandler__query_param", return_value=None),
+                    patch.object(
+                        handler,
+                        "_ControllerHandler__resolve_command_identifier",
+                        return_value=("private-queue-wait-target", None, None),
+                    ),
+                    patch.object(handler, "_queue_action_timeout", return_value=0.0),
+                    patch(
+                        "web.handler.controller.time.monotonic_ns",
+                        side_effect=clock_failure,
+                    ) as monotonic_ns,
+                ):
+                    response = handler._ControllerHandler__handle_action_queue("target")
+
+                self.assertEqual(200, response.status_code)
+                self.assertEqual(expected_calls, monotonic_ns.call_count)
+                entries = trace.snapshot()["entries"]
+                if policy["default"] == "off" and "rules" not in policy:
+                    self.assertEqual([], entries)
+                else:
+                    entry = next(item for item in entries if item.get("message") == "queue_http_wait")
+                    self.assertEqual(duration_present, "duration_ms" in entry["details"])
+                    self.assertEqual("success", entry["details"]["outcome"])
+                trace.close()
+
+        class RaisingGate:
+            def is_effectively_enabled(self, *_args):
+                raise RuntimeError("diagnostic gate unavailable")
+
+        self.controller._Controller__context.breadcrumb_trace = RaisingGate()
+        self.controller.queue_command = MagicMock(
+            side_effect=lambda command: command.callbacks[0].on_success(),
+        )
+        handler = ControllerHandler(self.controller)
+        with (
+            patch.object(handler, "_ControllerHandler__command_timing_started", return_value=None),
+            patch.object(handler, "_ControllerHandler__query_param", return_value=None),
+            patch.object(
+                handler,
+                "_ControllerHandler__resolve_command_identifier",
+                return_value=("private-queue-wait-target", None, None),
+            ),
+            patch.object(handler, "_queue_action_timeout", return_value=0.0),
+            patch(
+                "web.handler.controller.time.monotonic_ns",
+                side_effect=AssertionError("failed gate must not read clock"),
+            ) as monotonic_ns,
+        ):
+            response = handler._ControllerHandler__handle_action_queue("target")
+        self.assertEqual(200, response.status_code)
+        monotonic_ns.assert_not_called()
 
     def test_queue_http_wait_flow_reuses_pending_opaque_flow_under_ordinary_policy(self):
         trace = BreadcrumbTraceCollector(

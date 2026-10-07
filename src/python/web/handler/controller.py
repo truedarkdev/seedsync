@@ -185,14 +185,42 @@ class ControllerHandler(IHandler):
         file_name: str,
         timeout: float | None = None,
         timing_context: dict[str, object] | None = None,
+        wait_measurement: dict[str, int] | None = None,
     ) -> tuple[WebResponseActionCallback, bool]:
         command = Controller.Command(action, file_name)
         if timing_context is not None:
             command.diagnostic_timing = timing_context
         callback = WebResponseActionCallback()
         command.add_callback(callback)
+        measure_queue_wait = False
+        if action is Controller.Command.Action.QUEUE and wait_measurement is not None:
+            try:
+                measure_queue_wait = self.__controller.queue_http_wait_trace_enabled() is True
+            except BaseException:
+                # Optional diagnostic gating must not alter command behavior.
+                pass
         self.__controller.queue_command(command)
-        return callback, callback.wait(timeout=timeout)
+        wait_started_ns = None
+        if measure_queue_wait:
+            try:
+                candidate_ns = time.monotonic_ns()
+                if type(candidate_ns) is int and candidate_ns >= 0:
+                    wait_started_ns = candidate_ns
+            except BaseException:
+                # A clock failure leaves the diagnostic duration unknown.
+                pass
+        completed = callback.wait(timeout=timeout)
+        if measure_queue_wait and wait_started_ns is not None and wait_measurement is not None:
+            try:
+                wait_finished_ns = time.monotonic_ns()
+                if type(wait_finished_ns) is int and wait_finished_ns >= wait_started_ns:
+                    wait_measurement["duration_ms"] = min(
+                        2**31 - 1, (wait_finished_ns - wait_started_ns) // 1_000_000,
+                    )
+            except BaseException:
+                # Duration collection must never change the wait result.
+                pass
+        return callback, completed
 
     @staticmethod
     def __queue_trace_headers(callback: WebResponseActionCallback) -> dict[str, str]:
@@ -321,15 +349,18 @@ class ControllerHandler(IHandler):
 
         timing_context = self.__command_timing_context(handler_entry_ns)
 
+        wait_measurement: dict[str, int] = {}
         callback, completed = self.__execute_action(
             Controller.Command.Action.QUEUE,
             file_identifier,
             timeout=self._queue_action_timeout(),
             timing_context=timing_context,
+            wait_measurement=wait_measurement,
         )
         self.__controller.record_queue_http_wait_trace(
             file_identifier, completed, callback.success,
             flow_id=callback.queue_trace_flow_id,
+            duration_ms=wait_measurement.get("duration_ms"),
         )
         headers = self.__queue_trace_headers(callback)
         if not completed:
