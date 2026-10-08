@@ -8271,6 +8271,15 @@ class ModelUpdater(_ControllerCoreAccess):
             add(pending_completion_file_ids())
             add(active_lftp_status_file_ids)
             add(pre_poll_active_lftp_file_ids)
+            try:
+                deferred_intents = getattr(
+                    controller, "_Controller__deferred_queue_intents", None,
+                )
+                if isinstance(deferred_intents, Mapping):
+                    add(deferred_intents.keys())
+            except Exception:
+                # Optional diagnostic selection must not affect model updates.
+                pass
             add(extra_ids)
             add(tuple(
                 file_id for file_id, _pair_id in current_local_scan_root_targets()

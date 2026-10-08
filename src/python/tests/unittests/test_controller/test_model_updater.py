@@ -9384,6 +9384,76 @@ class TestModelUpdater(unittest.TestCase):
         model_builder.set_unknown_local_path_pair_ids.assert_called_once_with({None})
         model_builder.build_model.assert_not_called()
 
+    def test_deferred_intent_root_selection_is_bounded_and_fail_isolated(self):
+        partial = self._progressive_result(final=False, unknown={None})
+        deferred_id = ModelFile.build_file_id("deferred-only", None)
+        controller, model_builder = self._make_progressive_update_controller(
+            partial, local_scan=partial, authoritative=False,
+        )
+        controller._Controller__deferred_queue_intents = {deferred_id: object()}
+
+        ModelUpdater(controller).update()
+
+        model_builder.build_progressive_roots.assert_called_once()
+        selected_ids = model_builder.build_progressive_roots.call_args.kwargs[
+            "diagnostic_target_root_ids"
+        ]
+        self.assertIn(deferred_id, selected_ids)
+        self.assertNotIn(deferred_id, {
+            ModelFile.build_file_id(file.name, file.path_pair_id) for file in partial.files
+        })
+        self.assertFalse(controller._Controller__pending_completion_file_names)
+        self.assertFalse(controller._Controller__prev_downloading_file_names)
+
+        class BrokenKeysView:
+            def __init__(self):
+                self.iterated = False
+
+            def __iter__(self):
+                self.iterated = True
+                raise RuntimeError("unavailable optional diagnostic keys")
+
+        broken_keys_view = BrokenKeysView()
+
+        class BrokenKeysMapping(dict):
+            def keys(self):
+                return broken_keys_view
+
+        broken_controller, broken_builder = self._make_progressive_update_controller(
+            partial, local_scan=partial, authoritative=False,
+        )
+        broken_controller._Controller__deferred_queue_intents = BrokenKeysMapping(
+            {deferred_id: object()},
+        )
+
+        ModelUpdater(broken_controller).update()
+
+        broken_builder.build_progressive_roots.assert_called_once()
+        self.assertTrue(broken_keys_view.iterated)
+
+        class UnreadMapping(dict):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.keys_calls = 0
+
+            def keys(self):
+                self.keys_calls += 1
+                return super().keys()
+
+        disabled_controller, disabled_builder = self._make_progressive_update_controller(
+            partial, local_scan=partial, authoritative=False,
+        )
+        unread_mapping = UnreadMapping({deferred_id: object()})
+        disabled_controller._Controller__deferred_queue_intents = unread_mapping
+        disabled_controller._Controller__context.breadcrumb_trace.is_effectively_enabled = (
+            lambda category, level="info": False
+        )
+
+        ModelUpdater(disabled_controller).update()
+
+        disabled_builder.build_progressive_roots.assert_called_once()
+        self.assertEqual(0, unread_mapping.keys_calls)
+
     def _progressive_identity_fixture(self, partial_model, *, live_pair_id="pair-a"):
         """Build a pair-scoped progressive tick around a supplied partial model."""
         pair_id = "pair-a"
