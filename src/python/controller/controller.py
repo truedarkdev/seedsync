@@ -3366,32 +3366,54 @@ class Controller:
             unknown_path_pair_ids = unknown_snapshotter() if callable(unknown_snapshotter) else ()
             return path_pair_id not in unknown_path_pair_ids
 
-    def __has_current_local_root_scan_proof(self, file: ModelFile) -> bool:
-        """Whether this exact directory root has current local and remote evidence."""
+    def __current_local_root_scan_proof(self, file: ModelFile) -> Optional[tuple[SystemFile, str, int]]:
+        """Return exact current root proof only above its pair/full work floor."""
         if not file.is_dir or file.full_path != file.name:
-            return False
+            return None
         remote_reconciled = getattr(self, "_Controller__reconciled_remote_path_pair_ids", set())
         if not isinstance(remote_reconciled, set) or file.path_pair_id not in remote_reconciled:
-            return False
+            return None
         builder = getattr(self, "_Controller__model_builder", None)
         unknown_snapshotter = getattr(builder, "unknown_local_path_pair_ids_snapshot", None)
         checker = getattr(builder, "has_current_local_root_scan_proof", None)
         if not callable(unknown_snapshotter) or not callable(checker):
-            return False
+            return None
         try:
             unknown_pairs = unknown_snapshotter()
             if not isinstance(unknown_pairs, (set, frozenset, list, tuple)) or \
                     file.path_pair_id not in unknown_pairs:
-                return False
+                return None
             process = getattr(self, "_Controller__local_scan_process", None)
-            return checker(
-                file.file_id,
-                getattr(process, "session_token", None),
-                getattr(process, "generation", None),
-            ) is True
+            snapshotter = getattr(process, "root_scan_authority_snapshot", None)
+            accumulator = getattr(self, "_Controller__progressive_local_scan_state", None)
+            source_reader = getattr(accumulator, "current_root_scan_source_with_proof", None)
+            if not callable(snapshotter) or not callable(source_reader):
+                return None
+            snapshot = snapshotter(file.path_pair_id)
+            source = source_reader(file.path_pair_id, file.name)
+            if not isinstance(snapshot, tuple) or len(snapshot) != 3 or \
+                    type(snapshot[0]) is not str or not snapshot[0] or \
+                    type(snapshot[1]) is not int or snapshot[1] < 0 or \
+                    type(snapshot[2]) is not int or snapshot[2] < 0 or \
+                    not isinstance(source, tuple) or len(source) != 3:
+                return None
+            root, root_session, root_generation = source
+            if not isinstance(root, SystemFile) or root_session != snapshot[0] or \
+                    type(root_generation) is not int or root_generation < snapshot[2] or \
+                    root_generation > snapshot[1]:
+                return None
+            if checker(
+                    file.file_id, root_session, root_generation, expected_source=root,
+            ) is not True:
+                return None
+            return root, root_session, root_generation
         except Exception:
             # Queue authority is fail-closed if optional proof inspection fails.
-            return False
+            return None
+
+    def __has_current_local_root_scan_proof(self, file: ModelFile) -> bool:
+        """Whether this exact directory root has current local and remote evidence."""
+        return self.__current_local_root_scan_proof(file) is not None
 
     def __has_fresh_local_root_scan_proof(
             self, file: ModelFile, intent: DeferredQueueIntent,
@@ -3405,15 +3427,11 @@ class Controller:
                 not isinstance(generations[0], tuple) or len(generations[0]) != 2:
             return False
         baseline_session, baseline_generation = generations[0]
-        process = getattr(self, "_Controller__local_scan_process", None)
-        session = getattr(process, "session_token", None)
-        generation = getattr(process, "generation", None)
         if type(baseline_session) is not str or not baseline_session or \
-                type(baseline_generation) is not int or baseline_generation < 0 or \
-                type(session) is not str or session != baseline_session or \
-                type(generation) is not int or generation <= baseline_generation:
+                type(baseline_generation) is not int or baseline_generation < 0:
             return False
-        return self.__has_current_local_root_scan_proof(file)
+        proof = self.__current_local_root_scan_proof(file)
+        return proof is not None and proof[1] == baseline_session and proof[2] > baseline_generation
 
     def is_remote_delete_eligible(self, file: ModelFile) -> bool:
         """Require final publication proof before deleting staged remote data."""
@@ -10890,8 +10908,15 @@ class Controller:
             scan_tokens = {}
 
         def baseline(side: str, process: object) -> Optional[tuple[str, int]]:
-            session_token = getattr(process, "session_token", None)
-            generation = getattr(process, "generation", None)
+            if side == "local":
+                snapshotter = getattr(process, "root_scan_authority_snapshot", None)
+                snapshot = snapshotter(pair_id) if callable(snapshotter) else None
+                if not isinstance(snapshot, tuple) or len(snapshot) != 3:
+                    return None
+                session_token, generation = snapshot[:2]
+            else:
+                session_token = getattr(process, "session_token", None)
+                generation = getattr(process, "generation", None)
             if type(session_token) is not str or not session_token or type(generation) is not int:
                 return None
             side_tokens = scan_tokens.get(side)
@@ -12291,7 +12316,39 @@ class Controller:
                         # Install the visible intent before submitting. This
                         # is deliberately local: Queue HTTP acknowledgement
                         # must not wait for the LFTP prompt.
-                        pending_queue_dispatches[file.file_id] = dispatch
+                        root_proof_needed = file.is_dir and command.origin != "auto_queue" and \
+                            not self.is_path_pair_reconciled(file.path_pair_id)
+                        if root_proof_needed:
+                            process = getattr(self, "_Controller__local_scan_process", None)
+                            admission_lock = getattr(process, "root_scan_admission_lock", None)
+                            proof_current = False
+                            if callable(getattr(admission_lock, "__enter__", None)):
+                                # Recheck only the O(1) proof immediately at
+                                # in-memory dispatch admission; do not hold the
+                                # scanner lock across collision work or LFTP.
+                                with admission_lock:
+                                    proof_current = self.__has_current_local_root_scan_proof(file)
+                                    if proof_current:
+                                        pending_queue_dispatches[file.file_id] = dispatch
+                            # If work was admitted before this check, retain
+                            # the command for the normal deferred-rescan path.
+                            # Queue insertion happens after releasing the
+                            # scanner lock to preserve the established lock
+                            # order.
+                            if not proof_current:
+                                self.__command_queue.put(command)
+                                self.__record_queue_readiness_trace(file.file_id, "queue_final_decision", {
+                                    "schema": "queue_readiness.v1",
+                                    "phase": "final_decision",
+                                    "origin": "manual",
+                                    "outcome": "deferred",
+                                    "reason": "local_scan_authority_changed_before_dispatch",
+                                    "dispatch_attempted": False,
+                                })
+                                self.wake_process()
+                                continue
+                        else:
+                            pending_queue_dispatches[file.file_id] = dispatch
                         self.__record_queue_readiness_trace(file.file_id, "queue_dispatch_boundary", {
                             "schema": "queue_readiness.v1",
                             "phase": "dispatch_boundary",

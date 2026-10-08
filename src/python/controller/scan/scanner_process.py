@@ -828,6 +828,17 @@ class ScannerProcess:
         self.__scan_target_queue: Optional[queue.Queue[Optional[str]]] = queue.Queue()
         self.__wake_event: Optional[threading.Event] = threading.Event()
         self.__scanner = scanner
+        self.__configured_path_pair_ids: Optional[frozenset[str | None]] = None
+        configured_ids = getattr(scanner, "scanned_path_pair_ids", None)
+        if callable(configured_ids):
+            try:
+                configured_snapshot = configured_ids()
+                if isinstance(configured_snapshot, (set, frozenset)) and all(
+                        value is None or type(value) is str for value in configured_snapshot):
+                    self.__configured_path_pair_ids = frozenset(configured_snapshot)
+            except Exception:
+                # Unknown configured scope cannot authorize a pair-specific floor.
+                pass
         self.__interval_in_ms = interval_in_ms
         self.__last_recoverable_error_message: Optional[str] = None
         self.verbose = verbose
@@ -847,6 +858,8 @@ class ScannerProcess:
         # scan admission atomically transfers it to the scanner copied by that
         # worker.  In particular, never mutate a scanner while it is scanning.
         self.__scan_admission_lock = threading.RLock()
+        self.__latest_admitted_generation_by_pair: dict[str, int] = {}
+        self.__full_scan_generation_floor = 0
         self.__pending_accepted_root_fingerprints: object = {}
         self.__has_pending_accepted_root_fingerprints = False
         self.__priority_interrupt_event = threading.Event()
@@ -889,7 +902,46 @@ class ScannerProcess:
     @property
     def generation(self) -> int:
         """Return the generation assigned to the currently active scan work."""
-        return self.__scan_generation
+        with self.__scan_admission_lock:
+            return self.__scan_generation
+
+    @property
+    def root_scan_admission_lock(self):
+        """Lock used to linearize root-proof checks with scan admission."""
+        return self.__scan_admission_lock
+
+    def root_scan_authority_snapshot(self, path_pair_id: Optional[str]) -> Optional[tuple[str, int, int]]:
+        """Return session, current generation, and the selected root's work floor."""
+        if path_pair_id is not None and type(path_pair_id) is not str:
+            return None
+        with self.__scan_admission_lock:
+            if not isinstance(self.__session_token, str) or not self.__session_token or \
+                    type(self.__scan_generation) is not int or self.__scan_generation < 0:
+                return None
+            pair_generation = self.__latest_admitted_generation_by_pair.get(path_pair_id, 0) \
+                if path_pair_id is not None else 0
+            return (
+                self.__session_token,
+                self.__scan_generation,
+                max(self.__full_scan_generation_floor, pair_generation),
+            )
+
+    def __admit_scan_generation_locked(self, scope: Optional[set[str]]) -> int:
+        """Advance generation and its authority floor while holding admission lock."""
+        self.__scan_generation += 1
+        generation = self.__scan_generation
+        if scope is None:
+            self.__full_scan_generation_floor = max(self.__full_scan_generation_floor, generation)
+            return generation
+        configured = self.__configured_path_pair_ids
+        if not isinstance(scope, set) or not scope or configured is None or any(
+                type(pair_id) is not str or pair_id not in configured for pair_id in scope):
+            # Unknown selection must not be mistaken for pair-local work.
+            self.__full_scan_generation_floor = max(self.__full_scan_generation_floor, generation)
+            return generation
+        for pair_id in scope:
+            self.__latest_admitted_generation_by_pair[pair_id] = generation
+        return generation
 
     def set_mp_log_queue(self, log_queue: MPQueue[logging.LogRecord], log_level: int) -> None:
         self._mp_log_queue = log_queue
@@ -965,7 +1017,6 @@ class ScannerProcess:
         assert self.__queue is not None
         spawn_context = multiprocessing.get_context("spawn")
         receive_connection, send_connection = spawn_context.Pipe(duplex=False)
-        self.__scan_generation += 1
         diagnostics = self.__performance_diagnostics
         if diagnostics is None:
             diagnostics_enabled, diagnostics_generation = False, 0
@@ -976,20 +1027,28 @@ class ScannerProcess:
         # either part of this worker's scanner snapshot or staged for its
         # successor; it cannot replace the scanner state mid-handoff.
         with self.__scan_admission_lock:
-            self.__apply_pending_accepted_root_fingerprints()
-            worker = _create_scanner_worker(
-                self.__scanner, None, scan_target_path_pair_ids, send_connection,
-                self.__breadcrumb_trace, flow_id, self._mp_log_queue, self._mp_log_level,
-                self.__scan_generation, self.__session_token,
-                diagnostics_enabled, diagnostics_generation,
-            )
-            worker.daemon = True
-            worker.start()
+            generation = self.__admit_scan_generation_locked(scan_target_path_pair_ids)
+            try:
+                self.__apply_pending_accepted_root_fingerprints()
+                worker = _create_scanner_worker(
+                    self.__scanner, None, scan_target_path_pair_ids, send_connection,
+                    self.__breadcrumb_trace, flow_id, self._mp_log_queue, self._mp_log_level,
+                    generation, self.__session_token,
+                    diagnostics_enabled, diagnostics_generation,
+                )
+                worker.daemon = True
+                worker.start()
+            except BaseException:
+                # Keep the admission floor after any worker construction or
+                # partial-start failure, and release both local pipe ends.
+                send_connection.close()
+                receive_connection.close()
+                raise
+            self.__scan_worker = worker
+            self.__scan_worker_target_path_pair_ids = scan_target_path_pair_ids
+            self.__scan_worker_started_at = timestamp_start
+            self.__scan_worker_control_connection = receive_connection
         send_connection.close()
-        self.__scan_worker = worker
-        self.__scan_worker_target_path_pair_ids = scan_target_path_pair_ids
-        self.__scan_worker_started_at = timestamp_start
-        self.__scan_worker_control_connection = receive_connection
         # A failed-to-start or very small one-shot worker may already have
         # exited.  Surface its outcome now; normal scans remain asynchronous.
         if not worker.is_alive():
@@ -1012,8 +1071,10 @@ class ScannerProcess:
                 breadcrumb_setter(self.__breadcrumb_trace)
             if callable(setter):
                 setter(scan_target_path_pair_ids)
+            generation = self.__admit_scan_generation_locked(scan_target_path_pair_ids)
+            self.__inline_scan_target_path_pair_ids = scan_target_path_pair_ids
+            self.__inline_scan_active.set()
         scan_started_at = datetime.now()
-        self.__scan_generation += 1
         progress_emitted = False
         progress_files_by_pair: dict[Optional[str], list[SystemFile]] = {}
         unchanged_root_fingerprints_by_pair: dict[Optional[str], dict[str, str]] = {}
@@ -1036,7 +1097,7 @@ class ScannerProcess:
             if _scanner_side(self.__scanner) in ("local", "remote") and files:
                 _record_root_shape_breadcrumb(
                     self.__breadcrumb_trace, files, complete, "unknown", "scanner_process",
-                    scanner_side=_scanner_side(self.__scanner), generation=self.__scan_generation,
+                    scanner_side=_scanner_side(self.__scanner), generation=generation,
                     session_token=self.__session_token, progressive=True,
                     phase="scanner_process_progress", flow_id=flow_id,
                 )
@@ -1044,7 +1105,7 @@ class ScannerProcess:
             self.__publish_result(ScannerResult(
                 datetime.now(), files,
                 scanned_path_pair_ids={path_pair_id},
-                generation=self.__scan_generation,
+                generation=generation,
                 is_progress=True,
                 root_names=None if root_names is None else set(root_names),
                 completed_path_pair_ids={path_pair_id} if complete else set(),
@@ -1061,7 +1122,7 @@ class ScannerProcess:
                 self.__publish_result(ScannerResult(
                     datetime.now(), list(progress_files_by_pair.get(path_pair_id, [])),
                     scanned_path_pair_ids={path_pair_id},
-                    generation=self.__scan_generation,
+                    generation=generation,
                     is_progress=True,
                     completed_path_pair_ids={path_pair_id},
                     is_full_snapshot=True,
@@ -1075,15 +1136,13 @@ class ScannerProcess:
                     scan_started_at=scan_started_at,
                 ))
         self.__scanner.set_progress_callback(publish_progress)
-        self.__inline_scan_target_path_pair_ids = scan_target_path_pair_ids
-        self.__inline_scan_active.set()
         try:
             files = self.__scanner.scan()
             malformed = self.__scanner.pop_malformed_status_only_file_ids()
             managed = self.__scanner.pop_managed_extract_file_ids()
             self.__last_recoverable_error_message = None
             result = ScannerResult(timestamp_start, files, malformed, managed,
-                                    self.__scanner.scanned_path_pair_ids(), generation=self.__scan_generation,
+                                    self.__scanner.scanned_path_pair_ids(), generation=generation,
                                     is_progress=progress_emitted,
                 completed_path_pair_ids=self.__scanner.scanned_path_pair_ids()
                                     if progress_emitted else set(),
@@ -1101,7 +1160,7 @@ class ScannerProcess:
             if _scanner_side(self.__scanner) in ("local", "remote"):
                 _record_root_shape_breadcrumb(
                     self.__breadcrumb_trace, files, True, "unknown", "scanner_process",
-                    scanner_side=_scanner_side(self.__scanner), generation=self.__scan_generation,
+                    scanner_side=_scanner_side(self.__scanner), generation=generation,
                     session_token=self.__session_token, progressive=progress_emitted,
                     phase="scanner_process_return", flow_id=flow_id,
                 )
@@ -1109,14 +1168,14 @@ class ScannerProcess:
                     "file_count": len(files), "targeted": scan_target_path_pair_ids is not None,
                     "scanner_side": _scanner_side(self.__scanner),
                     "progress": progress_emitted, "failed": False,
-                    "generation": self.__scan_generation,
+                    "generation": generation,
                     "session_digest": trace_session_digest(self.__session_token),
                     "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
                 }, flow_id=flow_id)
         except ScannerError as error:
             if not error.recoverable:
                 self.__record_breadcrumb("scan_failed", lambda: {
-                    "failed": True, "generation": self.__scan_generation,
+                    "failed": True, "generation": generation,
                     "scanner_side": _scanner_side(self.__scanner),
                     "session_digest": trace_session_digest(self.__session_token),
                     "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
@@ -1133,7 +1192,7 @@ class ScannerProcess:
             result = ScannerResult(timestamp_start, [] if progress_emitted else files, malformed, managed,
                                    failed_ids,
                                    failed=True, error_message=error_message,
-                                   generation=self.__scan_generation,
+                                   generation=generation,
                                    is_progress=progress_emitted or bool(failed_ids),
                                    unknown_path_pair_ids=failed_ids,
                                    is_targeted_scan=scan_target_path_pair_ids is not None,
@@ -1148,7 +1207,7 @@ class ScannerProcess:
                 "file_count": len(files), "failed": True,
                 "scanner_side": _scanner_side(self.__scanner),
                 "targeted": scan_target_path_pair_ids is not None,
-                "generation": self.__scan_generation,
+                "generation": generation,
                 "session_digest": trace_session_digest(self.__session_token),
                 "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
             }, event_type="failure", flow_id=flow_id)

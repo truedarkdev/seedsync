@@ -2552,6 +2552,85 @@ class TestScannerProcess(unittest.TestCase):
         )
         mock_scanner.scan.assert_called_once_with()
 
+    def test_admitted_pair_and_full_scan_floors_survive_unread_results(self):
+        class ConfiguredScanner(DummyScanner):
+            def __init__(self):
+                self.target = None
+
+            def scanned_path_pair_ids(self):
+                return {"pair-a", "pair-b"} if self.target is None else set(self.target)
+
+            def set_scan_target_path_pair_ids(self, target):
+                self.target = None if target is None else set(target)
+
+        scanner = ConfiguredScanner()
+        process = ScannerProcess(scanner=scanner, interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+
+        process.force_scan("pair-a")
+        process.run_loop()
+        process.force_scan("pair-a")
+        process.run_loop()
+        process.force_scan("pair-a")
+        process.run_loop()  # Its accepted result remains unread in the bounded result queue.
+        self.assertTrue(process.has_pending_results())
+        process.force_scan("pair-b")
+        before_start = process.root_scan_authority_snapshot("pair-a")
+        self.assertEqual(3, process.root_scan_authority_snapshot("pair-b")[1])
+        self.assertEqual((before_start[0], 3, 0), process.root_scan_authority_snapshot("pair-b"))
+        process.run_loop()
+
+        session, generation, pair_floor = process.root_scan_authority_snapshot("pair-a")
+        self.assertEqual(4, generation)
+        self.assertEqual(3, pair_floor)
+        self.assertEqual((session, 4, 4), process.root_scan_authority_snapshot("pair-b"))
+        self.assertEqual((session, 3, 3), before_start)
+
+        process.force_scan()
+        self.assertEqual(4, process.root_scan_authority_snapshot("pair-a")[1])
+        process.run_loop()
+        self.assertEqual(5, process.root_scan_authority_snapshot("pair-a")[2])
+        process.force_scan("pair-a")
+        process.run_loop()
+        self.assertEqual(6, process.root_scan_authority_snapshot("pair-a")[2])
+        self.assertEqual(5, process.root_scan_authority_snapshot("pair-b")[2])
+
+        process.force_scan("not-configured")
+        process.run_loop()
+        self.assertEqual(7, process.root_scan_authority_snapshot("pair-a")[1])
+        self.assertEqual(7, process.root_scan_authority_snapshot("pair-a")[2])
+        self.assertEqual(7, process.root_scan_authority_snapshot("pair-b")[2])
+
+        restarted = ScannerProcess(scanner=ConfiguredScanner(), interval_in_ms=0, verbose=False)
+        self.addCleanup(restarted.close_queues)
+        self.assertNotEqual(session, restarted.session_token)
+        self.assertEqual((restarted.session_token, 0, 0), restarted.root_scan_authority_snapshot("pair-a"))
+
+    def test_failed_worker_start_keeps_admitted_pair_floor(self):
+        class ConfiguredScanner(DummyScanner):
+            def scanned_path_pair_ids(self):
+                return {"pair-a"}
+
+        class FailedStart:
+            daemon = False
+
+            def start(self):
+                raise RuntimeError("start failed")
+
+        process = ScannerProcess(
+            scanner=ConfiguredScanner(), interval_in_ms=0, verbose=False,
+            recycle_scan_worker=True,
+        )
+        self.addCleanup(process.close_queues)
+        process.force_scan("pair-a")
+
+        with patch("controller.scan.scanner_process._create_scanner_worker", return_value=FailedStart()):
+            with self.assertRaisesRegex(RuntimeError, "start failed"):
+                process._ScannerProcess__run_recycled_scan()
+
+        self.assertEqual(1, process.root_scan_authority_snapshot("pair-a")[1])
+        self.assertEqual(1, process.root_scan_authority_snapshot("pair-a")[2])
+
     def test_run_loop_coalesces_multiple_targeted_scan_requests(self):
         mock_scanner = DummyScanner()
         mock_scanner.scan = MagicMock(return_value=[])

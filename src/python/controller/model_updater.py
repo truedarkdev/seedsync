@@ -3937,6 +3937,31 @@ class _ProgressiveScanAccumulator:
         root = self.__authoritative_by_pair.get(path_pair_id, {}).get(root_name)
         return (root, started_at) if isinstance(root, SystemFile) else None
 
+    def current_root_scan_source_with_proof(
+            self, path_pair_id: Optional[str], root_name: str,
+    ) -> Optional[tuple[SystemFile, str, int]]:
+        """Return one accepted root's exact source and pair-scoped proof token."""
+        if not isinstance(root_name, str) or not root_name:
+            return None
+        generation = self.__active_generation.get(path_pair_id)
+        if type(generation) is not int or generation < 0:
+            return None
+        evidence = self.__root_scan_outcomes_by_pair.get(path_pair_id)
+        if evidence is None or evidence[0] != generation:
+            return None
+        outcome_and_start = evidence[1].get(root_name)
+        if not isinstance(outcome_and_start, tuple) or len(outcome_and_start) != 2 or \
+                outcome_and_start[0] != (True, True):
+            return None
+        if any(status == "confirmed_delete" for _, status in
+               self.__move_invalidations_by_root.get((path_pair_id, root_name), {}).values()):
+            return None
+        root = self.__authoritative_by_pair.get(path_pair_id, {}).get(root_name)
+        if not isinstance(root, SystemFile) or not root.is_dir or root.name != root_name or \
+                root.path_pair_id != path_pair_id:
+            return None
+        return root, self.__session_token, generation
+
     def current_root_scan_proofs(self) -> dict[str, tuple[str, int]]:
         """Return proof tokens only for roots with accepted current source data."""
         return {

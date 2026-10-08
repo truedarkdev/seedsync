@@ -142,6 +142,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__remote_scan_process.generation = 0
         self.controller._Controller__local_scan_process.session_token = "local-test-session"
         self.controller._Controller__remote_scan_process.session_token = "remote-test-session"
+        self.controller._Controller__local_scan_process.root_scan_authority_snapshot.return_value = (
+            "local-test-session", 0, 0,
+        )
         self.controller._Controller__active_scanner = MagicMock()
         self.controller._Controller__local_scanner = MagicMock()
         self.controller._Controller__remote_scanner = MagicMock()
@@ -17206,26 +17209,60 @@ class TestController(unittest.TestCase):
     def test_directory_root_proof_requires_literal_true_from_optional_checker(self):
         file = ModelFile("selected", True)
         file.path_pair_id = "pair-a"
+        root = SystemFile("selected", 1, True)
+        root.path_pair_id = "pair-a"
         self.controller._Controller__reconciled_remote_path_pair_ids = {"pair-a"}
+        authority = ["local-session", 3, 2]
+        source = [root, "local-session", 2]
         self.controller._Controller__local_scan_process = SimpleNamespace(
-            session_token="local-session", generation=1,
+            root_scan_authority_snapshot=lambda pair_id: tuple(authority),
+        )
+        self.controller._Controller__progressive_local_scan_state = SimpleNamespace(
+            current_root_scan_source_with_proof=lambda pair_id, name: tuple(source),
         )
 
         for result in (1, "truthy", object(), MagicMock()):
             with self.subTest(result_type=type(result).__name__):
                 builder = SimpleNamespace(
                     unknown_local_path_pair_ids_snapshot=lambda: frozenset({"pair-a"}),
-                    has_current_local_root_scan_proof=lambda *_args: result,
+                    has_current_local_root_scan_proof=lambda *_args, **_kwargs: result,
                 )
                 self.controller._Controller__model_builder = builder
                 self.assertFalse(self.controller._Controller__has_current_local_root_scan_proof(file))
 
+        comparisons = []
+
+        def accepted_proof(_file_id, session, generation, **kwargs):
+            comparisons.append((session, generation, kwargs.get("expected_source")))
+            return True
+
         builder = SimpleNamespace(
             unknown_local_path_pair_ids_snapshot=lambda: frozenset({"pair-a"}),
-            has_current_local_root_scan_proof=lambda *_args: True,
+            has_current_local_root_scan_proof=accepted_proof,
         )
         self.controller._Controller__model_builder = builder
         self.assertTrue(self.controller._Controller__has_current_local_root_scan_proof(file))
+        self.assertEqual([("local-session", 2, root)], comparisons)
+
+        # A completed root from A's generation remains current across a newer
+        # unrelated global generation, while newer A work immediately raises
+        # A's pair floor and makes that same old root ineligible.
+        authority[:] = ["local-session", 3, 3]
+        self.assertFalse(self.controller._Controller__has_current_local_root_scan_proof(file))
+        authority[:] = ["local-session", 1, 0]
+        self.assertFalse(self.controller._Controller__has_current_local_root_scan_proof(file))
+        authority[:] = ["new-session", 3, 2]
+        self.assertFalse(self.controller._Controller__has_current_local_root_scan_proof(file))
+
+        authority[:] = ["local-session", 3, 2]
+        intent = SimpleNamespace(
+            file_id=file.file_id,
+            path_pair_id=file.path_pair_id,
+            rescan_generations=(("local-session", 1), ("remote-session", 1)),
+        )
+        self.assertTrue(self.controller._Controller__has_fresh_local_root_scan_proof(file, intent))
+        intent.rescan_generations = (("local-session", 2), ("remote-session", 1))
+        self.assertFalse(self.controller._Controller__has_fresh_local_root_scan_proof(file, intent))
 
     def test_cold_start_publishes_healthy_pair_before_unreadable_sibling(self):
         healthy_pair_id = "pair-cold-healthy"
@@ -17623,6 +17660,30 @@ class TestController(unittest.TestCase):
             for _cycle in range(5):
                 updater.update()
 
+            # The selected staging root completed in the current local
+            # generation even though another root made this pair incomplete.
+            # A later unrelated pair scan must not invalidate that accepted
+            # root merely because the scanner's global generation advances.
+            selected_staging_root = controller._Controller__model.get_file(staging_id)
+            self.assertIsNotNone(selected_staging_root)
+            self.assertTrue(controller._Controller__has_current_local_root_scan_proof(selected_staging_root))
+            accepted_staging_proof = local_process.root_scan_authority_snapshot(healthy_pair_id)
+            accepted_staging_source = controller._Controller__progressive_local_scan_state.\
+                current_root_scan_source_with_proof(healthy_pair_id, "stage-root")
+            self.assertIsNotNone(accepted_staging_source)
+            local_process.prioritize_scan(blocked_pair_id, require_successor=True)
+            local_process.run_loop()
+            self.assertEqual(accepted_staging_proof[1] + 1, local_process.generation)
+            self.assertEqual(accepted_staging_proof[2],
+                             local_process.root_scan_authority_snapshot(healthy_pair_id)[2])
+            self.assertGreater(
+                local_process.root_scan_authority_snapshot(blocked_pair_id)[2], accepted_staging_proof[2],
+            )
+            self.assertTrue(controller._Controller__has_current_local_root_scan_proof(selected_staging_root))
+            for _cycle in range(5):
+                updater.update()
+            self.assertTrue(controller._Controller__has_current_local_root_scan_proof(selected_staging_root))
+
             retained_summary = controller.get_model_summary()
             retained_pairs = {item["path_pair_id"]: item for item in retained_summary["path_pairs"]}
             retained_serialized = SerializeModel().model(list(controller._Controller__model.iter_files()))
@@ -17712,6 +17773,31 @@ class TestController(unittest.TestCase):
                     for root in builder.remote_source_roots_snapshot()
                 },
             )
+
+            # A newer A result can be queued and then overtaken by B before
+            # the updater adopts it. The retained A2 source must not regain
+            # authority just because the bounded result queue keeps B's later
+            # failure and drops A3's pending publication.
+            prior_a_generation = accepted_staging_source[2]
+            local_process.prioritize_scan(healthy_pair_id, require_successor=True)
+            local_process.run_loop()
+            a3_generation = local_process.generation
+            self.assertGreater(a3_generation, prior_a_generation)
+            self.assertEqual(
+                a3_generation, local_process.root_scan_authority_snapshot(healthy_pair_id)[2],
+            )
+            self.assertTrue(local_process.has_pending_results())
+            self.assertFalse(controller._Controller__has_current_local_root_scan_proof(selected_staging_root))
+            local_process.prioritize_scan(blocked_pair_id, require_successor=True)
+            local_process.run_loop()
+            self.assertGreater(local_process.generation, a3_generation)
+            self.assertEqual(
+                a3_generation, local_process.root_scan_authority_snapshot(healthy_pair_id)[2],
+            )
+            self.assertEqual(
+                local_process.generation, local_process.root_scan_authority_snapshot(blocked_pair_id)[2],
+            )
+            self.assertFalse(controller._Controller__has_current_local_root_scan_proof(selected_staging_root))
 
     def test_confirmed_nested_delete_does_not_re_adopt_a_queued_predelete_scan(self):
         pair_id = "delete-target-pair"
@@ -18616,6 +18702,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pair_staging_paths = {"pair-a": "/local/a/incomplete"}
         self.controller._Controller__reconciled_local_path_pair_ids = {"pair-a"}
         self.controller._Controller__reconciled_remote_path_pair_ids = {"pair-a"}
+        self.controller._Controller__local_scan_process.root_scan_authority_snapshot.return_value = (
+            "local-test-session", 0, 0,
+        )
         self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset({"pair-a"})
 
         blocked_callback = MagicMock()
@@ -18652,6 +18741,54 @@ class TestController(unittest.TestCase):
         admitted_callback.on_success.assert_called_once_with()
         blocked_callback.on_failure.assert_not_called()
         admitted_callback.on_failure.assert_not_called()
+
+    def test_manual_directory_queue_rechecks_root_proof_at_dispatch_admission(self):
+        file = ModelFile("release", True)
+        file.path_pair_id = "pair-a"
+        file.remote_size = 100
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "pair-a": SimpleNamespace(remote_path="/remote/a", local_path="/local/a")
+        }
+        self.controller._Controller__path_pair_staging_paths = {"pair-a": "/local/a/incomplete"}
+        self.controller._Controller__reconciled_local_path_pair_ids = set()
+        self.controller._Controller__reconciled_remote_path_pair_ids = {"pair-a"}
+        self.controller._Controller__model_builder.unknown_local_path_pair_ids_snapshot.return_value = frozenset(
+            {"pair-a"},
+        )
+        self.controller._Controller__model_builder.get_trusted_final_leaf_paths.return_value = ()
+        local_process = SimpleNamespace(
+            root_scan_admission_lock=RLock(),
+            session_token="local-test-session",
+            generation=0,
+            root_scan_authority_snapshot=lambda _pair_id: ("local-test-session", 0, 0),
+            prioritize_scan=MagicMock(),
+        )
+        self.controller._Controller__local_scan_process = local_process
+        self.controller._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
+        proof_decisions = iter((True, False, False))
+        self.controller._Controller__has_current_local_root_scan_proof = MagicMock(
+            side_effect=lambda _file: next(proof_decisions),
+        )
+        readiness = MagicMock()
+        self.controller._Controller__record_queue_readiness_trace = readiness
+
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+        self.assertEqual(3, self.controller._Controller__has_current_local_root_scan_proof.call_count)
+        local_process.prioritize_scan.assert_called_once_with("pair-a", require_successor=True)
+        intent = self.controller._Controller__deferred_queue_intents[file.file_id]
+        self.assertEqual("initial_rescan", intent.phase)
+        self.assertTrue(intent.rescan_requested)
+        self.assertTrue(any(
+            call.args[1] == "queue_final_decision" and
+            call.args[2].get("reason") == "local_scan_authority_changed_before_dispatch"
+            for call in readiness.call_args_list
+        ))
 
     def test_delete_local_plan_includes_exact_final_and_staging_file_locations(self):
         with tempfile.TemporaryDirectory() as temp_dir:
