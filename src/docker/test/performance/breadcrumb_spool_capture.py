@@ -313,6 +313,11 @@ _FINAL_MOVE_EXISTS_FIELDS = frozenset({
     "temporary_created", "residue_present", "source_exists", "destination_parent_exists", "destination_exists",
 })
 _FINAL_MOVE_COPY_METRICS = frozenset({"copy_bytes_ns", "temporary_fsync_ns", "metadata_copy_ns"})
+_FINAL_MOVE_REMOVE_SOURCE_METRICS = frozenset({
+    "outer_source_recheck_ns", "source_identity_check_ns", "claim_rename_ns",
+    "claim_parent_sync_ns", "claimed_identity_tree_validation_ns", "claim_delete_ns",
+    "claim_final_sync_ns", "caller_parent_sync_ns",
+})
 _AUTOMATIC_MOVE_BOUNDARY_SCHEMA = "automatic_move_copy_boundary.v1"
 _AUTOMATIC_MOVE_BOUNDARY_PHASE_DECISIONS = {
     "prepublish_gate": frozenset({"deferred", "failed", "published"}),
@@ -613,6 +618,10 @@ def _final_move_publication_facts(details: Mapping[str, object], message: object
         value = details.get(key)
         if type(value) is int and 0 <= value < 2**63:
             result[key] = value
+    for key in _FINAL_MOVE_REMOVE_SOURCE_METRICS:
+        value = details.get(key)
+        if key in details:
+            result[key] = value if value is None or (type(value) is int and 0 <= value < 2**63) else None
     return result
 
 

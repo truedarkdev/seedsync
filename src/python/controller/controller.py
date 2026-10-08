@@ -548,6 +548,18 @@ class _MovePublicationDeferred(Exception):
     """A fresh lifecycle or command gate rejected publication before commit."""
 
 
+_FINAL_MOVE_REMOVE_SOURCE_METRICS = (
+    "outer_source_recheck_ns",
+    "source_identity_check_ns",
+    "claim_rename_ns",
+    "claim_parent_sync_ns",
+    "claimed_identity_tree_validation_ns",
+    "claim_delete_ns",
+    "claim_final_sync_ns",
+    "caller_parent_sync_ns",
+)
+
+
 class _MoveMutationTracker:
     """Fail closed: only an observed no-mutation path may cancel a fence."""
 
@@ -576,6 +588,33 @@ class _MoveMutationTracker:
         except Exception:
             return False
 
+    @staticmethod
+    def start_publication_phase(enabled: bool) -> Optional[int]:
+        """Read a clock only for explicitly enabled publication diagnostics."""
+        if not enabled:
+            return None
+        try:
+            value = time.perf_counter_ns()
+            return value if type(value) is int and 0 <= value <= 9_223_372_036_854_775_807 else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def finish_publication_phase(
+            metrics: Optional[dict[str, Optional[int]]], key: str, started_ns: Optional[int]) -> None:
+        """Store only a bounded duration; timer failures never affect publication."""
+        if metrics is None or started_ns is None or key not in _FINAL_MOVE_REMOVE_SOURCE_METRICS:
+            return
+        try:
+            finished_ns = time.perf_counter_ns()
+            if type(finished_ns) is not int or not 0 <= finished_ns <= 9_223_372_036_854_775_807:
+                return
+            duration_ns = finished_ns - started_ns
+            if 0 <= duration_ns <= 9_223_372_036_854_775_807:
+                metrics[key] = duration_ns
+        except Exception:
+            return
+
     def record_publication(
             self,
             phase: str,
@@ -589,6 +628,7 @@ class _MoveMutationTracker:
             temporary_created: Optional[bool] = None,
             residue_path: Optional[str] = None,
             copy_metrics: Optional[dict[str, int]] = None,
+            publication_metrics: Optional[dict[str, Optional[int]]] = None,
     ) -> None:
         """Emit fixed-schema, identity-free final publication evidence."""
         breadcrumb_trace = self.breadcrumb_trace
@@ -626,6 +666,13 @@ class _MoveMutationTracker:
                     value = copy_metrics.get(key)
                     if type(value) is int and 0 <= value <= 9_223_372_036_854_775_807:
                         details[key] = value
+            if phase == "remove_source" and isinstance(publication_metrics, dict):
+                for key in _FINAL_MOVE_REMOVE_SOURCE_METRICS:
+                    value = publication_metrics.get(key)
+                    details[key] = (
+                        value if type(value) is int and 0 <= value <= 9_223_372_036_854_775_807
+                        else None
+                    )
             breadcrumb_trace.record(
                 "controller",
                 "final_move_publication",
@@ -7661,7 +7708,8 @@ class Controller:
     @staticmethod
     def __remove_published_source(
             src: str, expected_stat: os.stat_result, expected_snapshot: Optional[bytes],
-            validate_before_delete: Optional[Callable[[str], None]] = None) -> None:
+            validate_before_delete: Optional[Callable[[str], None]] = None,
+            publication_metrics: Optional[dict[str, Optional[int]]] = None) -> None:
         """Remove a source only after its replacement has been published.
 
         Claim the source into an unguessable private sibling before deletion.
@@ -7669,8 +7717,14 @@ class Controller:
         mismatched claim is retained rather than deleted; no replacement at
         the public source pathname is removed by cleanup.
         """
-        if not Controller.__same_path_identity(src, expected_stat):
-            raise OSError(errno.EAGAIN, "staging source changed before deletion", src)
+        started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
+        try:
+            if not Controller.__same_path_identity(src, expected_stat):
+                raise OSError(errno.EAGAIN, "staging source changed before deletion", src)
+        finally:
+            _MoveMutationTracker.finish_publication_phase(
+                publication_metrics, "source_identity_check_ns", started_ns,
+            )
         source_parent = os.path.dirname(src)
         for _ in range(16):
             claimed_path = os.path.join(source_parent, ".seedsync-retire-" + secrets.token_hex(24))
@@ -7678,28 +7732,62 @@ class Controller:
                 break
         else:
             raise OSError(errno.EEXIST, "could not reserve private source cleanup path", src)
-        os.rename(src, claimed_path)
+        started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
+        try:
+            os.rename(src, claimed_path)
+        finally:
+            _MoveMutationTracker.finish_publication_phase(
+                publication_metrics, "claim_rename_ns", started_ns,
+            )
         try:
             # The public source name is gone after the claim rename.  Persist
             # the parent before validating or deleting so a crash cannot lose
             # both the public name and an unpersisted retained claim.
-            Controller.__sync_directory_if_supported(source_parent)
-            if not Controller.__same_path_identity(claimed_path, expected_stat) or \
-                    (expected_snapshot is not None and
-                     Controller.__source_tree_snapshot(claimed_path, ignore_root_ctime=True) != expected_snapshot):
-                raise OSError(errno.EAGAIN, "staging source changed during cleanup claim", src)
-            if validate_before_delete is not None:
-                validate_before_delete(claimed_path)
-            if os.path.isdir(claimed_path) and not os.path.islink(claimed_path):
-                Controller.__reject_nested_mounts_or_reparse_points(claimed_path)
-                shutil.rmtree(claimed_path)
-            else:
-                os.unlink(claimed_path)
+            started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
+            try:
+                Controller.__sync_directory_if_supported(source_parent)
+            finally:
+                _MoveMutationTracker.finish_publication_phase(
+                    publication_metrics, "claim_parent_sync_ns", started_ns,
+                )
+
+            started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
+            try:
+                if not Controller.__same_path_identity(claimed_path, expected_stat) or \
+                        (expected_snapshot is not None and
+                         Controller.__source_tree_snapshot(claimed_path, ignore_root_ctime=True) != expected_snapshot):
+                    raise OSError(errno.EAGAIN, "staging source changed during cleanup claim", src)
+                if validate_before_delete is not None:
+                    validate_before_delete(claimed_path)
+                claimed_is_directory = os.path.isdir(claimed_path) and not os.path.islink(claimed_path)
+                if claimed_is_directory:
+                    Controller.__reject_nested_mounts_or_reparse_points(claimed_path)
+            finally:
+                _MoveMutationTracker.finish_publication_phase(
+                    publication_metrics, "claimed_identity_tree_validation_ns", started_ns,
+                )
+
+            started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
+            try:
+                if claimed_is_directory:
+                    shutil.rmtree(claimed_path)
+                else:
+                    os.unlink(claimed_path)
+            finally:
+                _MoveMutationTracker.finish_publication_phase(
+                    publication_metrics, "claim_delete_ns", started_ns,
+                )
         finally:
             # Also persist both retained mismatch claims and successful
             # deletions.  Capability-limited platforms keep their documented
             # best-effort behavior in __sync_directory_if_supported.
-            Controller.__sync_directory_if_supported(source_parent)
+            started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
+            try:
+                Controller.__sync_directory_if_supported(source_parent)
+            finally:
+                _MoveMutationTracker.finish_publication_phase(
+                    publication_metrics, "claim_final_sync_ns", started_ns,
+                )
 
     @staticmethod
     def __claimed_regular_file_matches_destination(
@@ -9218,6 +9306,9 @@ class Controller:
         temporary_root: Optional[str] = None
         temporary_created = False
         publication_error = False
+        publication_metrics: Optional[dict[str, Optional[int]]] = None
+        if mutation_tracker is not None and mutation_tracker.publication_diagnostics_enabled():
+            publication_metrics = {key: None for key in _FINAL_MOVE_REMOVE_SOURCE_METRICS}
         try:
             try:
                 if mutation_tracker is None:
@@ -9344,10 +9435,25 @@ class Controller:
                     )
             temporary_path = None
             try:
-                if cls.__source_tree_snapshot(src) != source_snapshot:
-                    raise OSError(errno.EAGAIN, "staging source changed during publication", src)
-                cls.__remove_published_source(src, source_stat, source_claim_snapshot)
-                cls.__sync_directory_if_supported(os.path.dirname(src))
+                started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
+                try:
+                    if cls.__source_tree_snapshot(src) != source_snapshot:
+                        raise OSError(errno.EAGAIN, "staging source changed during publication", src)
+                finally:
+                    _MoveMutationTracker.finish_publication_phase(
+                        publication_metrics, "outer_source_recheck_ns", started_ns,
+                    )
+                cls.__remove_published_source(
+                    src, source_stat, source_claim_snapshot,
+                    publication_metrics=publication_metrics,
+                )
+                started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
+                try:
+                    cls.__sync_directory_if_supported(os.path.dirname(src))
+                finally:
+                    _MoveMutationTracker.finish_publication_phase(
+                        publication_metrics, "caller_parent_sync_ns", started_ns,
+                    )
             except BaseException as error:
                 if mutation_tracker is not None:
                     mutation_tracker.record_publication(
@@ -9356,6 +9462,7 @@ class Controller:
                         destination_parent_path=destination_parent,
                         destination_path=dst,
                         temporary_created=temporary_created,
+                        publication_metrics=publication_metrics,
                     )
                 raise
             if mutation_tracker is not None:
@@ -9365,6 +9472,7 @@ class Controller:
                     destination_parent_path=destination_parent,
                     destination_path=dst,
                     temporary_created=temporary_created,
+                    publication_metrics=publication_metrics,
                 )
         except BaseException:
             publication_error = True

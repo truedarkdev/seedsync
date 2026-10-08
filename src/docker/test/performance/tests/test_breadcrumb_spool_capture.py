@@ -552,6 +552,38 @@ def test_actual_finalized_delete_local_failure_rows_survive_projection_and_sink(
     assert "release.bin" not in text and "<redacted>" not in text
 
 
+def test_actual_finalized_remove_source_timings_survive_projection_and_sink(tmp_path: Path) -> None:
+    success_path = os.environ.get("SEEDSYNC_CUSTODY_FINALIZED_ROWS_PATH")
+    failure_path = os.environ.get("SEEDSYNC_CUSTODY_FAILURE_FINALIZED_ROWS_PATH")
+    if not success_path or not failure_path:
+        pytest.skip("actual finalized remove-source success and failure rows were not supplied")
+    success_output, success_text = _roundtrip_finalized_delete_local_rows(tmp_path / "success", success_path)
+    failure_output, failure_text = _roundtrip_finalized_delete_local_rows(tmp_path / "failure", failure_path)
+    success_records = [
+        item["capture"]["projection"] for item in success_output
+        if item.get("capture", {}).get("state") == "record"
+    ]
+    failure_records = [
+        item["capture"]["projection"] for item in failure_output
+        if item.get("capture", {}).get("state") == "record"
+    ]
+    success = next(item["final_move_publication"] for item in success_records
+                   if item.get("final_move_publication", {}).get("phase") == "remove_source")
+    failure = next(item["final_move_publication"] for item in failure_records
+                   if item.get("final_move_publication", {}).get("phase") == "remove_source")
+    metric_keys = {
+        "outer_source_recheck_ns", "source_identity_check_ns", "claim_rename_ns",
+        "claim_parent_sync_ns", "claimed_identity_tree_validation_ns", "claim_delete_ns",
+        "claim_final_sync_ns", "caller_parent_sync_ns",
+    }
+    assert metric_keys <= success.keys() and metric_keys <= failure.keys()
+    assert all(type(success[key]) is int and success[key] >= 0 for key in metric_keys)
+    assert all(type(failure[key]) is int and failure[key] >= 0 for key in metric_keys - {"caller_parent_sync_ns"})
+    assert failure["caller_parent_sync_ns"] is None
+    assert "retained-claim.bin" not in success_text + failure_text
+    assert "staging" not in success_text + failure_text
+
+
 def test_composed_producer_rows_retain_finite_lifecycle_facts_and_hashes(tmp_path: Path) -> None:
     spool, artifact = _prepare(tmp_path)
     rows = [
@@ -1173,6 +1205,15 @@ def test_finalized_completion_and_final_move_events_reach_json_sink_in_order(tmp
             "copy_bytes_ns": 2, "temporary_fsync_ns": 3, "metadata_copy_ns": 4,
         }),
         ("final_move.publication", "final_move_publication", "final_move_publication", {
+            "phase": "remove_source", "operation": "remove_source", "side": "source",
+            "errno_class": "none", "mutation_state": "mutated", "source_exists": False,
+            "outer_source_recheck_ns": 2**53 + 1, "source_identity_check_ns": 2,
+            "claim_rename_ns": 3, "claim_parent_sync_ns": 4,
+            "claimed_identity_tree_validation_ns": 5, "claim_delete_ns": 6,
+            "claim_final_sync_ns": 7, "caller_parent_sync_ns": 8,
+            "source_path": "/private/source",
+        }),
+        ("final_move.publication", "final_move_publication", "final_move_publication", {
             "phase": "PRIVATE-PHASE", "operation": "PRIVATE-OPERATION", "side": "PRIVATE-SIDE",
             "errno_class": "PRIVATE-ERRNO", "mutation_state": "PRIVATE-STATE",
             "destination_exists": "PRIVATE-BOOL", "destination_path": "PRIVATE-PATH",
@@ -1223,6 +1264,11 @@ def test_finalized_completion_and_final_move_events_reach_json_sink_in_order(tmp
     ]
     assert projected_messages == [row["message"] for row in selected]
     assert len({item["corr_hash"] for item in projections}) == 1
+    remove_projection = next(item["final_move_publication"] for item in projections
+                             if item.get("final_move_publication", {}).get("phase") == "remove_source")
+    assert remove_projection["outer_source_recheck_ns"] == 2**53 + 1
+    assert remove_projection["claim_final_sync_ns"] == 7
+    assert "source_path" not in json.dumps(remove_projection)
     expected_numbers = [capture._numeric_values(row, row.get("metadata", {}), row.get("details", {}))
                         for row in selected]
     assert [item["numbers"] for item in projections] == expected_numbers

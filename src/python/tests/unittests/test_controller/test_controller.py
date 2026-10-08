@@ -32,7 +32,8 @@ from controller.scan import (
 )
 from controller.controller import (
     ControllerError, DeferredQueueIntent, DownloadStartLifecycleEntry, PendingQueueDispatch,
-    _LftpOperation, _LftpQueueResult, _MoveMutationOutcome, _MoveMutationTracker,
+    _FINAL_MOVE_REMOVE_SOURCE_METRICS, _LftpOperation, _LftpQueueResult,
+    _MoveMutationOutcome, _MoveMutationTracker,
     _lftp_executor_exception_family, _lftp_executor_trace_enabled,
 )
 from controller.persist_keys import KEY_SEP, persist_key
@@ -21773,6 +21774,12 @@ class TestController(unittest.TestCase):
             self.assertNotIn(destination, json.dumps(entries))
             self.assertEqual(b"private-payload", Path(destination).read_bytes())
             self.assertFalse(os.path.exists(source))
+            remove_source = [entry for entry in entries if entry["details"]["phase"] == "remove_source"]
+            self.assertEqual(1, len(remove_source))
+            remove_details = remove_source[0]["details"]
+            for key in _FINAL_MOVE_REMOVE_SOURCE_METRICS:
+                self.assertIs(type(remove_details[key]), int, key)
+                self.assertGreaterEqual(remove_details[key], 0, key)
             self.assertTrue(trace.flush_durable(2.0))
             trace.close(2.0)
             with open(os.path.join(spool, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
@@ -21787,6 +21794,69 @@ class TestController(unittest.TestCase):
             if artifact_path:
                 with open(artifact_path, "a", encoding="utf-8") as handle:
                     handle.write(json.dumps(finalized[0], sort_keys=True) + "\n")
+            custody_artifact_path = os.environ.get("SEEDSYNC_CUSTODY_FINALIZED_ROWS_PATH")
+            if custody_artifact_path:
+                with open(custody_artifact_path, "wb") as handle:
+                    handle.write(Path(os.path.join(spool, "breadcrumbs.jsonl")).read_bytes())
+
+    def test_remove_source_phase_failure_records_partial_timings_and_retains_claim(self):
+        name = "retained-claim.bin"
+        with tempfile.TemporaryDirectory() as root:
+            spool = os.path.join(root, "breadcrumbs")
+            trace = BreadcrumbTraceCollector(
+                lambda: True, max_entries=16, durable_enabled=True, durable_path=spool,
+            )
+            trace.sync_enabled_state()
+            source_parent = os.path.join(root, "staging")
+            source = os.path.join(source_parent, name)
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, name)
+            os.makedirs(source_parent); os.mkdir(destination_parent)
+            os.mkdir(source)
+            Path(os.path.join(source, "payload.bin")).write_bytes(b"payload")
+            tracker = _MoveMutationTracker(name, trace)
+            original_rmtree = shutil.rmtree
+
+            def fail_claim_delete(path, *args, **kwargs):
+                if os.path.basename(path).startswith(".seedsync-retire-"):
+                    raise OSError(errno.EIO, "injected claim cleanup failure")
+                return original_rmtree(path, *args, **kwargs)
+
+            with patch.object(
+                    Controller, "_Controller__rename_no_replace",
+                    side_effect=OSError(errno.EINVAL, "unsupported")), \
+                    patch("controller.controller.shutil.rmtree", side_effect=fail_claim_delete):
+                with self.assertRaises(OSError):
+                    Controller._Controller__publish_staging_no_replace(source, destination, tracker)
+
+            self.assertFalse(os.path.lexists(source))
+            self.assertTrue(os.path.exists(destination))
+            retained_claims = [
+                os.path.join(source_parent, entry)
+                for entry in os.listdir(source_parent)
+                if entry.startswith(".seedsync-retire-")
+            ]
+            self.assertEqual(1, len(retained_claims))
+            self.assertEqual(b"payload", Path(os.path.join(retained_claims[0], "payload.bin")).read_bytes())
+            remove_source = next(
+                entry for entry in trace.snapshot()["entries"]
+                if entry["details"]["phase"] == "remove_source"
+            )
+            details = remove_source["details"]
+            self.assertEqual("eio", details["errno_class"])
+            for key in _FINAL_MOVE_REMOVE_SOURCE_METRICS[:-1]:
+                self.assertIs(type(details[key]), int, key)
+                self.assertGreaterEqual(details[key], 0, key)
+            self.assertIsNone(details["caller_parent_sync_ns"])
+            serialized = json.dumps(remove_source)
+            self.assertNotIn(name, serialized)
+            self.assertNotIn(source_parent, serialized)
+            self.assertTrue(trace.flush_durable(2.0))
+            trace.close(2.0)
+            artifact_path = os.environ.get("SEEDSYNC_CUSTODY_FAILURE_FINALIZED_ROWS_PATH")
+            if artifact_path:
+                with open(artifact_path, "wb") as handle:
+                    handle.write(Path(os.path.join(spool, "breadcrumbs.jsonl")).read_bytes())
 
     def test_regular_file_copy_failures_are_classified_and_diagnostics_fail_open(self):
         for operation, error_number, target in (
@@ -21903,6 +21973,13 @@ class TestController(unittest.TestCase):
             )
             self.assertFalse({"copy_bytes_ns", "temporary_fsync_ns", "metadata_copy_ns"} &
                              set(copy_complete["details"]))
+            remove_source = next(
+                entry for entry in clock_events if entry["details"]["phase"] == "remove_source"
+            )
+            self.assertEqual(
+                {key: None for key in _FINAL_MOVE_REMOVE_SOURCE_METRICS},
+                {key: remove_source["details"][key] for key in _FINAL_MOVE_REMOVE_SOURCE_METRICS},
+            )
         clock_failure.close()
 
         bounded_clock = BreadcrumbTraceCollector(lambda: True, max_entries=8)

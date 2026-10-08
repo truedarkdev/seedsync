@@ -676,6 +676,11 @@ _CAPTURE_FINAL_MOVE_EXISTS_FIELDS = {
     "temporary_created", "residue_present", "source_exists", "destination_parent_exists", "destination_exists",
 }
 _CAPTURE_FINAL_MOVE_COPY_METRICS = {"copy_bytes_ns", "temporary_fsync_ns", "metadata_copy_ns"}
+_CAPTURE_FINAL_MOVE_REMOVE_SOURCE_METRICS = {
+    "outer_source_recheck_ns", "source_identity_check_ns", "claim_rename_ns",
+    "claim_parent_sync_ns", "claimed_identity_tree_validation_ns", "claim_delete_ns",
+    "claim_final_sync_ns", "caller_parent_sync_ns",
+}
 _CAPTURE_COMMAND_KINDS = {"get", "mirror", "pget"}
 _CAPTURE_COMMAND_PHASES = {"submitted", "prompt_ready", "prompt_timeout", "process_eof", "backend_error"}
 _CAPTURE_COMMAND_OUTPUTS = {"empty", "connecting", "backend_error", "other"}
@@ -1165,6 +1170,13 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
                 item = final_move.get(key)
                 if type(item) is int and 0 <= item < 2**63:
                     safe_final_move[key] = item
+            for key in _CAPTURE_FINAL_MOVE_REMOVE_SOURCE_METRICS:
+                if key not in final_move:
+                    continue
+                item = final_move.get(key)
+                safe_final_move[key] = (
+                    item if item is None or (type(item) is int and 0 <= item < 2**63) else None
+                )
             result["final_move_publication"] = safe_final_move
     command = value.get("lftp_command")
     if isinstance(command, Mapping):

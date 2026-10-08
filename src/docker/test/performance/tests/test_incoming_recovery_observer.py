@@ -663,6 +663,10 @@ def test_completion_move_projection_sanitizer_preserves_finite_facts():
             "side": "destination", "errno_class": "eexist", "mutation_state": "uncertain",
             "temporary_created": None, "residue_present": False, "source_exists": True,
             "destination_parent_exists": True, "destination_exists": True, "copy_bytes_ns": 2**53 + 1,
+            "outer_source_recheck_ns": 2**53 + 3, "source_identity_check_ns": None,
+            "claim_rename_ns": 5, "claim_parent_sync_ns": 7,
+            "claimed_identity_tree_validation_ns": 11, "claim_delete_ns": 13,
+            "claim_final_sync_ns": 17, "caller_parent_sync_ns": 19,
             "destination_path": "/private/path",
         },
     })
@@ -675,6 +679,9 @@ def test_completion_move_projection_sanitizer_preserves_finite_facts():
     assert safe["final_move_publication"]["residue_present"] is False
     assert safe["final_move_publication"]["destination_exists"] is True
     assert safe["final_move_publication"]["copy_bytes_ns"] == 2**53 + 1
+    assert safe["final_move_publication"]["outer_source_recheck_ns"] == 2**53 + 3
+    assert safe["final_move_publication"]["source_identity_check_ns"] is None
+    assert safe["final_move_publication"]["claim_final_sync_ns"] == 17
     assert "raw_path" not in safe["completion_gate"]
     assert "destination_path" not in safe["final_move_publication"]
 
