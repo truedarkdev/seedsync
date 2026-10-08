@@ -1471,3 +1471,59 @@ def test_durable_marker_persistence_failure_remains_consumed_for_restart(monkeyp
     resumed.preflight(lambda path: responses()[path])
     with pytest.raises(observer.ObserverSchemaError, match="already consumed"):
         resumed.queue(lambda _path: pytest.fail("POST must not run"))
+
+
+def test_confirmed_delete_gate_sanitizer_keeps_only_schema_shaped_facts():
+    safe = observer._sanitize_capture_projection({
+        "kind": "event", "source": "model_updater", "category": "completion.gate",
+        "event_type": "diagnostic", "stage": "completion_gate", "level": "info",
+        "completion_gate": {
+            "boundary": "completion_gate", "message": "confirmed_local_delete_source",
+            "schema": "confirmed_local_delete_source.v1", "delete_confirmed": True,
+            "fence_result": False, "target_scope": "nested_path",
+            "local_scan_binding_known": False, "local_generation_known": True,
+            "local_generation": str(2**53 + 17), "private_path": "/private/root/file",
+            "session_token": "private-session",
+        },
+    })["completion_gate"]
+    assert safe == {
+        "boundary": "completion_gate", "message": "confirmed_local_delete_source",
+        "schema": "confirmed_local_delete_source.v1", "delete_confirmed": True,
+        "fence_result": False, "target_scope": "nested_path",
+        "local_scan_binding_known": False, "local_generation_known": True,
+        "local_generation": str(2**53 + 17),
+    }
+
+    malformed = observer._sanitize_capture_projection({
+        "completion_gate": {
+            "boundary": "completion_gate", "message": "confirmed_delete_fence_disposition",
+            "schema": "confirmed_delete_fence_disposition.v1", "decision": "released",
+            "release_basis": "current_root", "captured_generation_known": True,
+            "captured_generation": str(2**63), "event_generation_known": "true",
+            "event_generation": "01", "local_scan_binding_known": False,
+            "scan_started_at_known": True, "scan_started_at_ms": "9007199254740993",
+            "root_present": True, "root_final_complete": True,
+            "root_staging_complete": "true", "root_is_dir": True,
+            "root_size": str(2**53 + 101), "raw_path": "/private/root",
+        },
+    })["completion_gate"]
+    assert malformed["decision"] == "released" and malformed["release_basis"] == "current_root"
+    assert malformed["captured_generation_known"] is True
+    assert malformed["captured_generation"] == "unknown"
+    assert malformed["event_generation_known"] is None and malformed["event_generation"] == "unknown"
+    assert malformed["local_scan_binding_known"] is False
+    assert malformed["scan_started_at_ms"] == "9007199254740993"
+    assert malformed["root_final_complete"] is True and malformed["root_staging_complete"] is None
+    assert malformed["root_size"] == str(2**53 + 101)
+    assert "raw_path" not in json.dumps(malformed)
+
+    wrong_schema = observer._sanitize_capture_projection({
+        "completion_gate": {
+            "boundary": "completion_gate", "message": "confirmed_local_delete_source",
+            "schema": "private", "fence_result": True, "local_generation": "12",
+            "private_path": "/private/root",
+        },
+    })["completion_gate"]
+    assert wrong_schema["schema"] == "unknown"
+    assert wrong_schema["fence_result"] is None and wrong_schema["local_generation"] == "unknown"
+    assert "private_path" not in json.dumps(wrong_schema)

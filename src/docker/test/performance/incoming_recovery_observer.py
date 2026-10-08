@@ -626,6 +626,14 @@ _CAPTURE_PROGRESS_LINEAGE_STATUS_COUNT_BUCKETS = {"0", "1", "2-4", "5+"}
 _CAPTURE_PROGRESS_LINEAGE_DURATION_BUCKETS = {"0-4", "5-19", "20-99", "100-499", "500-1999", "2000+"}
 _CAPTURE_PROGRESS_LINEAGE_MISSING_PHASES = {"none", "status_consume", "model_mutation", "updater_decision", "multiple"}
 _CAPTURE_GATE_DECISIONS = {"blocked", "no_retirement", "excluded", "pending", "attempt_eligible", "deferred", "skipped", "result", "cancelled", "unknown"}
+_CAPTURE_CONFIRMED_LOCAL_DELETE_MESSAGE = "confirmed_local_delete_source"
+_CAPTURE_CONFIRMED_LOCAL_DELETE_SCHEMA = "confirmed_local_delete_source.v1"
+_CAPTURE_CONFIRMED_DELETE_FENCE_MESSAGE = "confirmed_delete_fence_disposition"
+_CAPTURE_CONFIRMED_DELETE_FENCE_SCHEMA = "confirmed_delete_fence_disposition.v1"
+_CAPTURE_CONFIRMED_DELETE_TARGET_SCOPES = {"exact_root", "nested_path"}
+_CAPTURE_CONFIRMED_DELETE_FENCE_DECISIONS = {"released", "reset"}
+_CAPTURE_CONFIRMED_DELETE_RELEASE_BASES = {"current_root", "healthy_full_snapshot", "session_reset"}
+_CAPTURE_CONFIRMED_DELETE_DECIMAL = re.compile(r"^(?:0|[1-9][0-9]{0,18})$")
 _CAPTURE_GATE_REASONS = {
     "completion_detection_not_authoritative", "still_active", "explicit_stop", "lftp_job_finished", "candidate_pair_unselected",
     "no_model_diff", "candidate_authorized", "adopted", "retry_or_failure_limit", "completion_evidence_missing", "completion_authority_missing", "complete_local_coverage", "unknown",
@@ -1106,7 +1114,56 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
             if type(gate.get(key)) is bool:
                 safe_gate[key] = gate[key]
         message = gate.get("message")
-        if isinstance(message, str) and message in _CAPTURE_PENDING_MOVE_MESSAGES:
+        if isinstance(message, str) and message in {
+            _CAPTURE_CONFIRMED_LOCAL_DELETE_MESSAGE, _CAPTURE_CONFIRMED_DELETE_FENCE_MESSAGE,
+        }:
+            confirmed_delete = message == _CAPTURE_CONFIRMED_LOCAL_DELETE_MESSAGE
+            schema = _CAPTURE_CONFIRMED_LOCAL_DELETE_SCHEMA if confirmed_delete else _CAPTURE_CONFIRMED_DELETE_FENCE_SCHEMA
+            safe_gate["message"] = message
+            schema_known = gate.get("schema") == schema
+            safe_gate["schema"] = schema if schema_known else "unknown"
+            if confirmed_delete:
+                for key in ("delete_confirmed", "fence_result", "local_scan_binding_known", "local_generation_known"):
+                    item = gate.get(key)
+                    safe_gate[key] = item if schema_known and type(item) is bool else None
+                scope = gate.get("target_scope")
+                safe_gate["target_scope"] = (
+                    scope if schema_known and isinstance(scope, str) and scope in _CAPTURE_CONFIRMED_DELETE_TARGET_SCOPES
+                    else ("unknown" if scope is not None or not schema_known else None)
+                )
+                generation = gate.get("local_generation")
+                safe_gate["local_generation"] = (
+                    generation if schema_known and isinstance(generation, str)
+                    and _CAPTURE_CONFIRMED_DELETE_DECIMAL.fullmatch(generation)
+                    and int(generation) <= 2**63 - 1
+                    else (None if generation is None else "unknown")
+                )
+            else:
+                decision = gate.get("decision")
+                safe_gate["decision"] = (
+                    decision if schema_known and isinstance(decision, str) and decision in _CAPTURE_CONFIRMED_DELETE_FENCE_DECISIONS
+                    else ("unknown" if decision is not None or not schema_known else None)
+                )
+                basis = gate.get("release_basis")
+                safe_gate["release_basis"] = (
+                    basis if schema_known and isinstance(basis, str) and basis in _CAPTURE_CONFIRMED_DELETE_RELEASE_BASES
+                    else ("unknown" if basis is not None or not schema_known else None)
+                )
+                for key in (
+                    "captured_generation_known", "event_generation_known", "local_scan_binding_known",
+                    "scan_started_at_known", "root_present", "root_final_complete", "root_staging_complete", "root_is_dir",
+                ):
+                    item = gate.get(key)
+                    safe_gate[key] = item if schema_known and type(item) is bool else None
+                for key in ("captured_generation", "event_generation", "scan_started_at_ms", "root_size"):
+                    item = gate.get(key)
+                    safe_gate[key] = (
+                        item if schema_known and isinstance(item, str)
+                        and _CAPTURE_CONFIRMED_DELETE_DECIMAL.fullmatch(item)
+                        and int(item) <= 2**63 - 1
+                        else (None if item is None else "unknown")
+                    )
+        elif isinstance(message, str) and message in _CAPTURE_PENDING_MOVE_MESSAGES:
             safe_gate["message"] = message
             schema = gate.get("schema")
             safe_gate["schema"] = schema if schema == "pending_completion_move_decision.v1" else "unknown"

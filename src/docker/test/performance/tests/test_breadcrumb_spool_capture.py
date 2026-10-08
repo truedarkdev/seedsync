@@ -9,6 +9,7 @@ import re
 import sys
 import threading
 from types import SimpleNamespace
+from datetime import datetime
 
 import pytest
 
@@ -35,15 +36,19 @@ for _common_root in _COMMON_ROOTS:
         break
 try:
     from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation, trace_session_digest
+    from model import ModelFile
     from system import SystemFile
     from controller import Controller, ModelBuilder
+    from controller.scan import ScannerResult
     from lftp import LftpJobStatus
     from controller.model_updater import (
-        _ModelFinalizationBreadcrumbSpan, _record_lftp_status_breadcrumb,
+        ModelUpdater, _ModelFinalizationBreadcrumbSpan, _ensure_progressive_scan_state,
+        _record_lftp_status_breadcrumb,
         _record_lftp_status_membership_transition, _record_lifecycle_scan_breadcrumb,
     )
 except ImportError:
     BreadcrumbTraceCollector = None
+    ModelFile = None
     opaque_trace_correlation = None
     trace_session_digest = None
     Controller = None
@@ -53,6 +58,9 @@ except ImportError:
     _record_lftp_status_membership_transition = None
     SystemFile = None
     ModelBuilder = None
+    ModelUpdater = None
+    ScannerResult = None
+    _ensure_progressive_scan_state = None
     LftpJobStatus = None
 
 
@@ -1257,6 +1265,7 @@ def test_finalized_completion_and_final_move_events_reach_json_sink_in_order(tmp
     finally:
         collector.close(timeout=2.0)
 
+
     saved = [item for item in _artifacts(artifact) if item["capture"].get("state") == "record"]
     projections = [item["capture"]["projection"] for item in saved]
     projected_messages = [
@@ -1342,6 +1351,141 @@ def test_finalized_completion_and_final_move_events_reach_json_sink_in_order(tmp
     assert all(facts[key] == "unknown" for key in ("phase", "operation", "side", "errno_class", "mutation_state"))
     assert facts["destination_exists"] is None
     assert "PRIVATE-" not in json.dumps(bad_final_move)
+
+
+@pytest.mark.skipif(BreadcrumbTraceCollector is None or ModelUpdater is None, reason="production completion emitter is unavailable")
+def test_confirmed_delete_fence_facts_reach_json_sink_from_finalized_producer(tmp_path: Path) -> None:
+    spool = tmp_path / "delete-fence-spool"
+    spool.mkdir()
+    artifact = tmp_path / "delete-fence-capture.jsonl"
+    collector = BreadcrumbTraceCollector(
+        lambda: True,
+        policy={"default": "off", "rules": {"completion.gate": "info", "queue.readiness": "info"}},
+        durable_enabled=True,
+        durable_path=str(spool),
+        durable_enabled_getter=lambda: True,
+    )
+    session = "private-delete-session"
+    pair_id = "private-delete-pair"
+    root_name = "private-delete-root"
+    generation = 2**53 + 17
+    process = SimpleNamespace(session_token=session, generation=generation)
+    controller = SimpleNamespace(
+        _Controller__context=SimpleNamespace(breadcrumb_trace=collector),
+        _Controller__local_scan_process=process,
+        logger=SimpleNamespace(debug=lambda *args, **kwargs: None),
+    )
+    updater = ModelUpdater(controller)
+    controller._Controller__updater = updater
+    accumulator = _ensure_progressive_scan_state(
+        controller, "local", eager=True, bind_current_session=False,
+    )
+
+    root = SystemFile(root_name, 2**53 + 101, True)
+    root.path_pair_id = pair_id
+    root.add_child(SystemFile("private-payload.bin", 64))
+    first_scan = ScannerResult(
+        datetime.now(), [root], scanned_path_pair_ids={pair_id}, generation=generation,
+        is_progress=True, root_names={root_name}, completed_path_pair_ids={pair_id},
+        is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id}, session_token=session,
+        root_scan_outcomes_by_pair={pair_id: {root_name: (True, True)}}, scan_started_at=datetime.now(),
+    )
+    first_scan.files[0].path_pair_id = pair_id
+    accumulator.apply([first_scan])
+
+    try:
+        assert collector.record(
+            "controller", "baseline", {"schema": "queue_readiness.v1", "phase": "entry", "outcome": "accepted"},
+            category="queue.readiness", event_type="callback", stage="queue_readiness", level="info",
+        ) in {"retained", "enqueued"}
+        assert collector.flush_durable(2.0)
+        reader = _reader(spool, artifact)
+        try:
+            reader.start()
+            file_id = ModelFile.build_file_id(f"{root_name}/private-payload.bin", pair_id)
+            assert updater.confirm_local_delete(file_id, pair_id) is True
+
+            process.generation = None
+            assert updater.confirm_local_delete(file_id, pair_id) is False
+
+            fresh_root = SystemFile(root_name, 2**53 + 103, True)
+            fresh_root.path_pair_id = pair_id
+            fresh_scan = ScannerResult(
+                datetime.now(), [fresh_root], scanned_path_pair_ids={pair_id}, generation=generation + 1,
+                is_progress=True, root_names={root_name}, completed_path_pair_ids={pair_id},
+                is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id}, session_token=session,
+                root_scan_outcomes_by_pair={pair_id: {root_name: (True, True)}},
+                scan_started_at=datetime.now(),
+            )
+            accumulator.apply([fresh_scan])
+            assert collector.flush_durable(2.0)
+            assert reader.poll() == 3
+        finally:
+            reader.close()
+    finally:
+        collector.close(timeout=2.0)
+
+    rows = _artifacts(artifact)
+    selected = [row for row in rows if row.get("capture", {}).get("state") == "record"
+                and row["capture"]["projection"].get("completion_gate", {}).get("message") in {
+                    "confirmed_local_delete_source", "confirmed_delete_fence_disposition",
+                }]
+    finalized = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
+    emitted = [row for row in finalized if row.get("message") in {
+        "confirmed_local_delete_source", "confirmed_delete_fence_disposition",
+    }]
+    assert [row["capture"]["projection"]["completion_gate"]["message"] for row in selected] == [
+        "confirmed_local_delete_source", "confirmed_local_delete_source", "confirmed_delete_fence_disposition",
+    ]
+    assert [row["message"] for row in emitted] == [row["capture"]["projection"]["completion_gate"]["message"] for row in selected]
+    assert len(emitted) == 3
+    for source, sink in zip(emitted, selected):
+        projection = sink["capture"]["projection"]
+        assert projection["corr_hash"] == capture._hash(source["corr_id"])
+        assert projection["file_hash"] == capture._hash(source["file_id"])
+        assert projection["pair_hash"] == capture._hash(source["path_pair_id"])
+    projections = [row["capture"]["projection"] for row in selected]
+    success, refusal, disposition = [row["completion_gate"] for row in projections]
+    assert success["schema"] == "confirmed_local_delete_source.v1"
+    assert success["delete_confirmed"] is True and success["fence_result"] is True
+    assert success["target_scope"] == "nested_path"
+    assert success["local_scan_binding_known"] is True and success["local_generation_known"] is True
+    assert success["local_generation"] == str(generation)
+    assert refusal["fence_result"] is False and refusal["local_generation_known"] is False
+    assert refusal["local_generation"] is None
+    assert disposition["schema"] == "confirmed_delete_fence_disposition.v1"
+    assert disposition["decision"] == "released" and disposition["release_basis"] == "current_root"
+    assert disposition["event_generation"] == str(generation + 1)
+    assert disposition["event_generation_known"] is True and disposition["local_scan_binding_known"] is True
+    assert disposition["scan_started_at_known"] is True and disposition["scan_started_at_ms"] is not None
+    assert disposition["root_present"] is True and disposition["root_final_complete"] is True
+    assert disposition["root_staging_complete"] is True and disposition["root_is_dir"] is True
+    assert disposition["root_size"] == str(2**53 + 103)
+    assert len({projection["corr_hash"] for projection in projections}) == 1
+    sanitized = [observer._sanitize_capture_projection(projection)["completion_gate"] for projection in projections]
+    assert [item["fence_result"] for item in sanitized[:2]] == [True, False]
+    assert sanitized[2]["event_generation"] == str(generation + 1)
+    assert sanitized[2]["root_size"] == str(2**53 + 103)
+    artifact_text = artifact.read_text(encoding="utf-8")
+    for private in (session, pair_id, root_name, "private-payload.bin"):
+        assert private not in artifact_text
+
+    malformed, rejected = capture._projection({
+        "category": "completion.gate", "source": "model_updater", "event_type": "diagnostic",
+        "stage": "completion_gate", "level": "info", "message": "confirmed_local_delete_source",
+        "details": {
+            "schema": "confirmed_local_delete_source.v1", "delete_confirmed": "true",
+            "fence_result": 1, "target_scope": "private/path", "local_scan_binding_known": False,
+            "local_generation_known": True, "local_generation": True, "raw_path": "/private/root",
+        },
+    })
+    assert malformed is not None and rejected is False
+    malformed_gate = malformed["completion_gate"]
+    assert malformed_gate["delete_confirmed"] is None and malformed_gate["fence_result"] is None
+    assert malformed_gate["target_scope"] == "unknown" and malformed_gate["local_scan_binding_known"] is False
+    assert malformed_gate["local_generation_known"] is True and malformed_gate["local_generation"] == "unknown"
+    assert "raw_path" not in json.dumps(malformed)
+
 
 
 @pytest.mark.skipif(BreadcrumbTraceCollector is None or Controller is None, reason="production controller is unavailable")

@@ -259,6 +259,13 @@ _QUEUE_LIFECYCLE_BOOLS = frozenset({
     "pre_send_drain_queue_done", "pre_send_drain_job_or_progress", "pre_send_drain_prompt_or_echo",
 })
 _COMPLETION_GATE_DECISIONS = frozenset({"blocked", "no_retirement", "excluded", "pending", "attempt_eligible", "deferred", "skipped", "result", "cancelled", "unknown"})
+_CONFIRMED_LOCAL_DELETE_MESSAGE = "confirmed_local_delete_source"
+_CONFIRMED_LOCAL_DELETE_SCHEMA = "confirmed_local_delete_source.v1"
+_CONFIRMED_DELETE_FENCE_MESSAGE = "confirmed_delete_fence_disposition"
+_CONFIRMED_DELETE_FENCE_SCHEMA = "confirmed_delete_fence_disposition.v1"
+_CONFIRMED_DELETE_TARGET_SCOPES = frozenset({"exact_root", "nested_path"})
+_CONFIRMED_DELETE_FENCE_DECISIONS = frozenset({"released", "reset"})
+_CONFIRMED_DELETE_RELEASE_BASES = frozenset({"current_root", "healthy_full_snapshot", "session_reset"})
 _COMPLETION_GATE_REASONS = frozenset({
     "completion_detection_not_authoritative", "still_active", "explicit_stop", "lftp_job_finished", "candidate_pair_unselected",
     "no_model_diff", "candidate_authorized", "adopted", "retry_or_failure_limit", "completion_evidence_missing",
@@ -498,6 +505,59 @@ def _lftp_status_membership_facts(details: Mapping[str, object], message: object
 
 
 def _completion_gate_facts(details: Mapping[str, object], message: object = None) -> dict[str, object] | None:
+    if message == _CONFIRMED_LOCAL_DELETE_MESSAGE:
+        schema_known = details.get("schema") == _CONFIRMED_LOCAL_DELETE_SCHEMA
+        result: dict[str, object] = {
+            "boundary": "completion_gate",
+            "message": _CONFIRMED_LOCAL_DELETE_MESSAGE,
+            "schema": _CONFIRMED_LOCAL_DELETE_SCHEMA if schema_known else "unknown",
+        }
+        for key in ("delete_confirmed", "fence_result", "local_scan_binding_known", "local_generation_known"):
+            value = details.get(key)
+            result[key] = value if schema_known and type(value) is bool else None
+        scope = details.get("target_scope")
+        result["target_scope"] = (
+            scope if schema_known and isinstance(scope, str) and scope in _CONFIRMED_DELETE_TARGET_SCOPES
+            else ("unknown" if scope is not None or not schema_known else None)
+        )
+        generation = details.get("local_generation")
+        result["local_generation"] = (
+            str(generation) if schema_known and type(generation) is int and 0 <= generation <= 2**63 - 1
+            else (None if generation is None else "unknown")
+        )
+        return result
+
+    if message == _CONFIRMED_DELETE_FENCE_MESSAGE:
+        schema_known = details.get("schema") == _CONFIRMED_DELETE_FENCE_SCHEMA
+        result = {
+            "boundary": "completion_gate",
+            "message": _CONFIRMED_DELETE_FENCE_MESSAGE,
+            "schema": _CONFIRMED_DELETE_FENCE_SCHEMA if schema_known else "unknown",
+        }
+        decision = details.get("decision")
+        result["decision"] = (
+            decision if schema_known and isinstance(decision, str) and decision in _CONFIRMED_DELETE_FENCE_DECISIONS
+            else ("unknown" if decision is not None or not schema_known else None)
+        )
+        basis = details.get("release_basis")
+        result["release_basis"] = (
+            basis if schema_known and isinstance(basis, str) and basis in _CONFIRMED_DELETE_RELEASE_BASES
+            else ("unknown" if basis is not None or not schema_known else None)
+        )
+        for key in (
+            "captured_generation_known", "event_generation_known", "local_scan_binding_known",
+            "scan_started_at_known", "root_present", "root_final_complete", "root_staging_complete", "root_is_dir",
+        ):
+            value = details.get(key)
+            result[key] = value if schema_known and type(value) is bool else None
+        for key in ("captured_generation", "event_generation", "scan_started_at_ms", "root_size"):
+            value = details.get(key)
+            result[key] = (
+                str(value) if schema_known and type(value) is int and 0 <= value <= 2**63 - 1
+                else (None if value is None else "unknown")
+            )
+        return result
+
     if isinstance(message, str) and message in _PENDING_COMPLETION_MOVE_MESSAGES:
         result: dict[str, object] = {
             "boundary": "completion_gate",
