@@ -480,6 +480,14 @@ _CAPTURE_NUMBER_KEYS = frozenset({
     "percent", "processed", "progress", "queue_depth", "retries", "scanned", "size", "status_code", "total",
     "transferred", "unknown", "unresolved", "version", "written",
 })
+_CAPTURE_COMMAND_ADMISSION_TIMING_FIELDS = (
+    "handler_entry_ns", "handler_resolved_ns", "admission_attempt_ns",
+    "flow_id_lock_attempt_ns", "flow_id_lock_acquired_ns",
+    "flow_lock_attempt_ns", "flow_lock_acquired_ns", "queue_put_start_ns",
+    "queue_put_ns", "admission_complete_ns", "work_lock_attempt_ns",
+    "work_lock_acquired_ns", "queue_get_ns", "model_resolved_ns",
+)
+_CAPTURE_COMMAND_ADMISSION_TIMING_SCHEMA = "command_admission_timing.v1"
 _CAPTURE_AUTOMATIC_MOVE_PHASE_DECISIONS = {
     "prepublish_gate": frozenset({"deferred", "failed", "published"}),
     "copy_yield": frozenset({"started"}),
@@ -1002,6 +1010,29 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
                 bounded[key] = item
         if bounded:
             result["numbers"] = bounded
+    admission_timing = value.get("command_admission_timing")
+    if isinstance(admission_timing, Mapping):
+        schema_known = admission_timing.get("schema") == _CAPTURE_COMMAND_ADMISSION_TIMING_SCHEMA
+        correlation = admission_timing.get("correlation")
+        safe_timing: dict[str, object] = {
+            "schema": _CAPTURE_COMMAND_ADMISSION_TIMING_SCHEMA if schema_known else "unknown",
+            "correlation": (
+                correlation if isinstance(correlation, str) and len(correlation) == 16
+                and re.fullmatch(r"[0-9a-f]{16}", correlation)
+                else "unknown"
+            ),
+        }
+        for key in _CAPTURE_COMMAND_ADMISSION_TIMING_FIELDS:
+            item = admission_timing.get(key)
+            safe_timing[key] = (
+                item
+                if schema_known and isinstance(item, str)
+                and len(item) <= 19
+                and re.fullmatch(r"(?:0|[1-9][0-9]{0,18})", item)
+                and int(item) <= 2**63 - 1
+                else None
+            )
+        result["command_admission_timing"] = safe_timing
     for key in ("flow_hash", "corr_hash", "file_hash", "pair_hash"):
         item = value.get(key)
         if isinstance(item, str) and len(item) == 16 and all(char in "0123456789abcdef" for char in item):

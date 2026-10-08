@@ -34,7 +34,7 @@ for _common_root in _COMMON_ROOTS:
         sys.path.insert(0, str(_common_root))
         break
 try:
-    from common.breadcrumb_trace import BreadcrumbTraceCollector, trace_session_digest
+    from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation, trace_session_digest
     from system import SystemFile
     from controller import Controller, ModelBuilder
     from lftp import LftpJobStatus
@@ -44,6 +44,7 @@ try:
     )
 except ImportError:
     BreadcrumbTraceCollector = None
+    opaque_trace_correlation = None
     trace_session_digest = None
     Controller = None
     _record_lifecycle_scan_breadcrumb = None
@@ -1310,6 +1311,7 @@ def test_finalized_completion_and_final_move_events_reach_json_sink_in_order(tmp
     ))
     assert malformed_move["destination_exists"] is None
     assert "PRIVATE-" not in artifact.read_text(encoding="utf-8")
+
     sanitized = [observer._sanitize_capture_projection(item) for item in projections]
     assert next(item["completion_gate"] for item in sanitized
                 if item.get("completion_gate", {}).get("phase") == "authority")["proof_source"] == "local_scan_scope"
@@ -1340,6 +1342,127 @@ def test_finalized_completion_and_final_move_events_reach_json_sink_in_order(tmp
     assert all(facts[key] == "unknown" for key in ("phase", "operation", "side", "errno_class", "mutation_state"))
     assert facts["destination_exists"] is None
     assert "PRIVATE-" not in json.dumps(bad_final_move)
+
+
+@pytest.mark.skipif(BreadcrumbTraceCollector is None or Controller is None, reason="production controller is unavailable")
+def test_controller_admission_timing_reaches_finalized_reader_sink(tmp_path: Path) -> None:
+    spool = tmp_path / "command-admission-spool"
+    spool.mkdir()
+    artifact = tmp_path / "command-admission-capture.jsonl"
+    trace = BreadcrumbTraceCollector(
+        lambda: True, max_entries=32, policy={"default": "info"},
+        durable_enabled=True, durable_path=str(spool),
+    )
+    reader = _reader(spool, artifact, max_records=16, max_output_bytes=8192)
+    controller = Controller.__new__(Controller)
+    controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+    command = Controller.Command(
+        Controller.Command.Action.QUEUE, "private/path-sentinel.bin", flow_id="private-flow-sentinel",
+    )
+    timestamp_fields = (
+        "handler_entry_ns", "handler_resolved_ns", "admission_attempt_ns",
+        "flow_id_lock_attempt_ns", "flow_id_lock_acquired_ns",
+        "flow_lock_attempt_ns", "flow_lock_acquired_ns", "queue_put_start_ns",
+        "queue_put_ns", "admission_complete_ns", "work_lock_attempt_ns",
+        "work_lock_acquired_ns", "queue_get_ns", "model_resolved_ns",
+    )
+    expected_base = 2**53 + 117
+    messages = ("command_queued", "command_dequeued", "command_dispatched", "command_finished")
+    missing_timing_command = Controller.Command(
+        Controller.Command.Action.QUEUE, "private/without-timing.bin", flow_id="private-flow-without-timing",
+    )
+    try:
+        reader.start()
+        for index, message in enumerate(messages):
+            timing = {key: None for key in timestamp_fields}
+            timing.update({
+                "handler_entry_ns": expected_base + index,
+                "handler_resolved_ns": None,
+                "admission_attempt_ns": 2**63 - 1,
+                "flow_id_lock_attempt_ns": True,
+                "queue_put_ns": "private-malformed-timestamp",
+                "model_resolved_ns": 2**63,
+                "previous_record_timing": ("private-message-sentinel", 1, 2, 1),
+            })
+            command.diagnostic_timing = timing
+            controller._Controller__record_command_breadcrumb(  # exercise the existing producer
+                command, message, {"private-detail-sentinel": "must-not-project"},
+            )
+        controller._Controller__record_command_breadcrumb(
+            missing_timing_command, "command_finished", {},
+        )
+        assert trace.flush_durable(2.0)
+        assert reader.poll() == len(messages) + 1
+    finally:
+        reader.close()
+        trace.close(timeout=2.0)
+
+    rows = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
+    record_messages = (*messages, "command_finished")
+    emitted = [row for row in rows if row.get("message") in record_messages]
+    assert [row["message"] for row in emitted] == list(record_messages)
+    assert all(row["source"] == "controller" and row["category"] == "controller" and row["stage"] == "command" for row in emitted)
+    timed_emitted = emitted[:len(messages)]
+    assert all(row["details"]["admission_timing"]["schema"] == "command_admission_timing.v1" for row in timed_emitted)
+    assert all(row["details"]["admission_timing"]["correlation"] == opaque_trace_correlation(command.flow_id) for row in timed_emitted)
+    assert "admission_timing" not in emitted[-1]["details"]
+
+    saved = [item for item in _artifacts(artifact) if item.get("capture", {}).get("state") == "record"]
+    projections = [item["capture"]["projection"] for item in saved]
+    facts = [projection["command_admission_timing"] for projection in projections if "command_admission_timing" in projection]
+    assert len(facts) == len(messages)
+    assert [item["handler_entry_ns"] for item in facts] == [str(expected_base + index) for index in range(len(messages))]
+    assert len({item["correlation"] for item in facts}) == 1
+    assert all(item["schema"] == "command_admission_timing.v1" for item in facts)
+    assert all(item["admission_attempt_ns"] == str(2**63 - 1) for item in facts)
+    assert all(item["handler_resolved_ns"] is None for item in facts)
+    assert all(item["flow_id_lock_attempt_ns"] is None and item["queue_put_ns"] is None for item in facts)
+    assert all(item["model_resolved_ns"] is None for item in facts)
+    assert all(set(item) == {"schema", "correlation", *timestamp_fields} for item in facts)
+    assert all("previous_record_timing" not in item for item in facts)
+    assert [item["capture"]["projection"]["source"] for item in saved] == ["controller"] * (len(messages) + 1)
+    assert [item["capture"]["projection"]["category"] for item in saved] == ["controller"] * (len(messages) + 1)
+    assert [item["capture"]["projection"]["stage"] for item in saved] == ["command"] * (len(messages) + 1)
+    assert "command_admission_timing" not in projections[-1]
+    assert artifact.stat().st_size <= 8192
+    assert all("private-" not in json.dumps(item) for item in saved)
+
+    omitted, irrelevant = capture._projection({
+        "source": "controller", "category": "controller", "stage": "command",
+        "details": {"admission_timing": {
+            "schema": "command_admission_timing.v1", "correlation": "0123456789abcdef",
+            "handler_entry_ns": 2**53 + 117,
+        }},
+    })
+    assert not irrelevant and omitted is not None
+    omitted_facts = omitted["command_admission_timing"]
+    assert omitted_facts["handler_entry_ns"] == str(expected_base)
+    assert omitted_facts["handler_resolved_ns"] is None
+    malformed, irrelevant = capture._projection({
+        "source": "controller", "category": "controller", "stage": "command",
+        "details": {"admission_timing": {
+            "schema": "PRIVATE-SCHEMA", "correlation": "private-correlation",
+            "handler_entry_ns": 123,
+        }},
+    })
+    assert not irrelevant and malformed is not None
+    malformed_facts = malformed["command_admission_timing"]
+    assert malformed_facts["schema"] == "unknown" and malformed_facts["correlation"] == "unknown"
+    assert all(malformed_facts[key] is None for key in timestamp_fields)
+    assert "PRIVATE-" not in json.dumps(malformed)
+    sanitized = observer._sanitize_capture_projection({
+        "command_admission_timing": {
+            "schema": "command_admission_timing.v1", "correlation": "0123456789abcdef",
+            "handler_entry_ns": str(2**53 + 117), "handler_resolved_ns": "01",
+            "admission_attempt_ns": str(2**63), "previous_record_timing": ["private"],
+        },
+    })["command_admission_timing"]
+    assert sanitized["handler_entry_ns"] == str(2**53 + 117)
+    assert sanitized["handler_resolved_ns"] is None and sanitized["admission_attempt_ns"] is None
+    assert all(sanitized[key] is None for key in timestamp_fields if key not in {
+        "handler_entry_ns", "handler_resolved_ns", "admission_attempt_ns",
+    })
+    assert set(sanitized) == {"schema", "correlation", *timestamp_fields}
 
 
 @pytest.mark.skipif(BreadcrumbTraceCollector is None or ModelBuilder is None, reason="production model builder is unavailable")

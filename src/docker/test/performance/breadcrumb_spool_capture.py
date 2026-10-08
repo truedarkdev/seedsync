@@ -229,6 +229,14 @@ _MODEL_INPUT_ARBITRATION_SELECTION_REASONS = frozenset({
 })
 _MODEL_INPUT_ARBITRATION_SPLIT_PROVENANCE = frozenset({"split_candidate_local"})
 _COMPLETION_SCAN_JOIN_SCHEMA = "completion_scan_join.v1"
+_COMMAND_ADMISSION_TIMING_SCHEMA = "command_admission_timing.v1"
+_COMMAND_ADMISSION_TIMING_FIELDS = (
+    "handler_entry_ns", "handler_resolved_ns", "admission_attempt_ns",
+    "flow_id_lock_attempt_ns", "flow_id_lock_acquired_ns",
+    "flow_lock_attempt_ns", "flow_lock_acquired_ns", "queue_put_start_ns",
+    "queue_put_ns", "admission_complete_ns", "work_lock_attempt_ns",
+    "work_lock_acquired_ns", "queue_get_ns", "model_resolved_ns",
+)
 _COMPLETION_SCAN_JOIN_MODES = frozenset({"legacy", "progressive", "unknown"})
 _SCAN_TICK_MODES = frozenset({"legacy", "progressive"})
 _SCAN_LIFECYCLE_MESSAGES = frozenset({"scan_accumulator_before_apply", "scan_accumulator_after_apply"})
@@ -1195,6 +1203,31 @@ def select_input_arbitration_rows(records: object, root_id: object) -> dict[str,
     return {"state": "selected", "build_tokens": sorted(token_rows), "records": selected}
 
 
+def _command_admission_timing_facts(details: Mapping[str, object]) -> dict[str, object] | None:
+    if "admission_timing" not in details:
+        return None
+    timing = details.get("admission_timing")
+    timing = timing if isinstance(timing, Mapping) else {}
+    schema_known = timing.get("schema") == _COMMAND_ADMISSION_TIMING_SCHEMA
+    correlation = timing.get("correlation")
+    facts: dict[str, object] = {
+        "schema": _COMMAND_ADMISSION_TIMING_SCHEMA if schema_known else "unknown",
+        "correlation": (
+            correlation
+            if isinstance(correlation, str) and len(correlation) == 16 and re.fullmatch(r"[0-9a-f]{16}", correlation)
+            else "unknown"
+        ),
+    }
+    for key in _COMMAND_ADMISSION_TIMING_FIELDS:
+        item = timing.get(key)
+        facts[key] = (
+            str(item)
+            if schema_known and type(item) is int and 0 <= item <= 2**63 - 1
+            else None
+        )
+    return facts
+
+
 def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bool]:
     metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
     details = row.get("details") if isinstance(row.get("details"), Mapping) else {}
@@ -1235,6 +1268,10 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     model_page_snapshot = _model_page_snapshot_facts(details) if category == "model_page_snapshot" else None
     model_finalization = _model_finalization_facts(details) if category == "model.finalization" else None
     model_progress_lineage = _model_progress_lineage_facts(details) if category == "model.progress" else None
+    command_admission_timing = (
+        _command_admission_timing_facts(details)
+        if source == "controller" and category == "controller" and stage == "command" else None
+    )
     input_arbitration = _input_arbitration_facts(row, metadata, details)
     scan_join = (
         _completion_scan_join_facts(details, message)
@@ -1308,6 +1345,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["model_finalization"] = model_finalization
     if model_progress_lineage is not None:
         result["model_progress_lineage"] = model_progress_lineage
+    if command_admission_timing is not None:
+        result["command_admission_timing"] = command_admission_timing
     if input_arbitration is not None:
         result["input_arbitration"] = input_arbitration
     if scan_join is not None:
