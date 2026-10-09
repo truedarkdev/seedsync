@@ -3501,6 +3501,106 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual([], remote_files)
         self.assertNotIn("pair", unknown)
 
+    def test_joint_reconciler_refreshes_only_existing_local_roots_while_remote_is_unknown(self):
+        reconciler = _JointProgressiveReconciler()
+        key = ("pair", "root")
+        original_local = SystemFile("root", 10, True)
+        original_local.add_child(SystemFile("old.bin", 10))
+        original_remote = SystemFile("root", 12, True)
+        original_remote.add_child(SystemFile("remote.bin", 12))
+        for root in (original_local, original_remote):
+            root.path_pair_id = "pair"
+        reconciler.reconcile(
+            {key: original_local}, {key: original_local}, set(), {"pair"},
+            {key: original_remote}, {key: original_remote}, set(), {"pair"}, {"pair"},
+        )
+
+        refreshed_local = SystemFile("root", 20, True)
+        refreshed_local.add_child(SystemFile("new.bin", 20))
+        refreshed_local.path_pair_id = "pair"
+        new_root = SystemFile("unpublished", 3)
+        new_root.path_pair_id = "pair"
+        local_files, remote_files, unknown = reconciler.reconcile_delta(
+            {key: refreshed_local, ("pair", "unpublished"): new_root},
+            {key: refreshed_local, ("pair", "unpublished"): new_root}, set(), {"pair"},
+            {}, {}, {"pair"}, set(), {"pair"}, {key, ("pair", "unpublished")},
+        )
+        self.assertEqual(["new.bin"], [child.name for child in local_files[0].iter_children()])
+        self.assertIs(original_remote, remote_files[0])
+        self.assertNotIn("unpublished", [file.name for file in local_files + remote_files])
+        self.assertIn("pair", unknown)
+
+        # A local explicit absence is not enough to replace a prior root while
+        # the remote side remains unknown.
+        local_files, remote_files, unknown = reconciler.reconcile_delta(
+            {key: refreshed_local}, {key: None}, set(), {"pair"},
+            {}, {}, {"pair"}, set(), {"pair"}, {key},
+        )
+        self.assertEqual(["new.bin"], [child.name for child in local_files[0].iter_children()])
+        self.assertIs(original_remote, remote_files[0])
+        self.assertIn("pair", unknown)
+
+    def test_confirmed_delete_without_scan_binding_prunes_existing_authority_and_joint_cache(self):
+        pair_id = "pair"
+        local_root = SystemFile("root", 10, True)
+        local_root.add_child(SystemFile("gone.bin", 4))
+        local_root.add_child(SystemFile("keep.bin", 6))
+        remote_root = SystemFile("root", 12, True)
+        remote_root.add_child(SystemFile("remote.bin", 12))
+        local_root.path_pair_id = pair_id
+        remote_root.path_pair_id = pair_id
+        local_scan = self._local_full_snapshot([local_root], 7, pair_id)
+        local_scan.session_token = "accepted-session"
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([local_scan])
+        reconciler = _JointProgressiveReconciler()
+        key = (pair_id, "root")
+        reconciler.reconcile(
+            accumulator.snapshot(), accumulator.authority(), accumulator.incomplete_pairs(),
+            accumulator.completed_pairs(),
+            {key: remote_root}, {key: remote_root}, set(), {pair_id}, {pair_id},
+        )
+        controller = SimpleNamespace(
+            _Controller__local_scan_process=SimpleNamespace(session_token=None, generation=None),
+            _Controller__progressive_local_scan_state=accumulator,
+            _Controller__progressive_joint_reconciler=reconciler,
+            _Controller__context=SimpleNamespace(),
+            logger=MagicMock(),
+        )
+        updater = ModelUpdater(controller)
+
+        file_id = ModelFile.build_file_id("root/gone.bin", pair_id)
+        self.assertFalse(updater.confirm_local_delete(file_id, pair_id))
+        self.assertFalse(accumulator.has_move_invalidations())
+        self.assertEqual(
+            {"keep.bin"},
+            {child.name for child in accumulator.authority()[key].iter_children()},
+        )
+
+        # Reconciliation with the still-unknown peer uses the pruned accepted
+        # local source; the remote half remains the same cached object.
+        local_files, remote_files, unknown = reconciler.reconcile_delta(
+            accumulator.snapshot(), accumulator.authority(), accumulator.incomplete_pairs(),
+            accumulator.completed_pairs(),
+            {}, {}, {pair_id}, set(), {pair_id}, {key},
+        )
+        self.assertEqual(["keep.bin"], [child.name for child in local_files[0].iter_children()])
+        self.assertIs(remote_root, remote_files[0])
+        self.assertIn(pair_id, unknown)
+
+        self.assertFalse(
+            updater.confirm_local_delete(ModelFile.build_file_id("root", pair_id), pair_id),
+        )
+        self.assertNotIn(key, accumulator.authority())
+        local_files, remote_files, unknown = reconciler.reconcile_delta(
+            accumulator.snapshot(), accumulator.authority(), accumulator.incomplete_pairs(),
+            accumulator.completed_pairs(),
+            {}, {}, {pair_id}, set(), {pair_id}, {key},
+        )
+        self.assertEqual([], local_files)
+        self.assertIs(remote_root, remote_files[0])
+        self.assertIn(pair_id, unknown)
+
     def test_progressive_accumulator_keeps_unselected_committed_roots(self):
         accumulator = _ProgressiveScanAccumulator()
         first_a = SystemFile("a", 1)

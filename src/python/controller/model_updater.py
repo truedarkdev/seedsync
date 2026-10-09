@@ -3101,6 +3101,20 @@ class _ProgressiveScanAccumulator:
             self.__next_move_invalidation_token += 1
             entries[self.__next_move_invalidation_token] = (generation, "confirmed_delete")
 
+        self.__committed_by_pair.setdefault(path_pair_id, {})
+        self.prune_confirmed_local_deletion(path_pair_id, root_name, relative_path_segments)
+        return True
+
+    def prune_confirmed_local_deletion(
+            self, path_pair_id: Optional[str], root_name: str,
+            relative_path_segments: tuple[str, ...],
+    ) -> None:
+        """Prune existing local scan snapshots without adding a fence."""
+        if not isinstance(root_name, str) or not root_name or \
+                any(not isinstance(segment, str) or not segment or segment in (".", "..")
+                    for segment in relative_path_segments):
+            return
+
         def prune_root(files: dict[str, SystemFile]) -> None:
             root = files.get(root_name)
             if root is None:
@@ -3113,29 +3127,22 @@ class _ProgressiveScanAccumulator:
             else:
                 files[root_name] = updated
 
-        prune_root(self.__committed_by_pair.setdefault(path_pair_id, {}))
+        committed = self.__committed_by_pair.get(path_pair_id)
+        if committed is not None:
+            prune_root(committed)
         for generation_files in self.__working.values():
             pair_files = generation_files.get(path_pair_id)
             if pair_files is not None:
                 prune_root(pair_files)
         authoritative = self.__authoritative_by_pair.get(path_pair_id)
         if authoritative is not None:
-            root = authoritative.get(root_name)
-            if isinstance(root, SystemFile):
-                updated = ModelBuilder.prune_confirmed_local_deletion(
-                    root, relative_path_segments,
-                )
-                if updated is None:
-                    authoritative.pop(root_name, None)
-                else:
-                    authoritative[root_name] = updated
+            prune_root(authoritative)
         fingerprints = self.__committed_root_fingerprints.get(path_pair_id)
         if fingerprints is not None:
             fingerprints.pop(root_name, None)
             if not fingerprints:
                 self.__committed_root_fingerprints.pop(path_pair_id, None)
         self.__last_touched_keys.add((path_pair_id, root_name))
-        return True
 
     @staticmethod
     def __pair_for_file(file: SystemFile, result: ScannerResult) -> Optional[str]:
@@ -4090,6 +4097,15 @@ class _JointProgressiveReconciler:
             local_known = (pair_id, name) in local_authority or pair_id in local_completed
             remote_known = (pair_id, name) in remote_authority or pair_id in remote_completed
             if not local_known or not remote_known:
+                if local_known and not remote_known:
+                    # A fresh local authority can advance the local half of an
+                    # already-published root while its remote peer is unknown.
+                    # Never create a root here, and keep the last remote half.
+                    key = (pair_id, name)
+                    local_file = local_authority.get(key)
+                    published = self.__published_by_pair.get(pair_id, {}).get(name)
+                    if local_file is not None and published is not None:
+                        self.__published_by_pair[pair_id][name] = (local_file, published[1])
                 continue
             local_file = local_authority.get((pair_id, name))
             remote_file = remote_authority.get((pair_id, name))
@@ -4116,6 +4132,28 @@ class _JointProgressiveReconciler:
         unknown_local_pairs.update(enabled_pair_ids - set(local_completed))
         unknown_local_pairs.update(enabled_pair_ids - set(remote_completed))
         return local_files, remote_files, unknown_local_pairs
+
+    def prune_confirmed_local_deletion(
+            self, path_pair_id: Optional[str], root_name: str,
+            relative_path_segments: tuple[str, ...],
+    ) -> None:
+        """Prune one confirmed local deletion without changing remote authority."""
+        pair_roots = self.__published_by_pair.get(path_pair_id)
+        published = pair_roots.get(root_name) if pair_roots is not None else None
+        if published is None:
+            return
+        local_file, remote_file = published
+        if local_file is None:
+            return
+        updated_local = ModelBuilder.prune_confirmed_local_deletion(
+            local_file, relative_path_segments,
+        )
+        if updated_local is None and remote_file is None:
+            pair_roots.pop(root_name, None)
+            if not pair_roots:
+                self.__published_by_pair.pop(path_pair_id, None)
+            return
+        pair_roots[root_name] = (updated_local, remote_file)
 
     def reconcile(
         self,
@@ -5760,9 +5798,6 @@ class ModelUpdater(_ControllerCoreAccess):
                 pass
             return result
 
-        if not isinstance(session_token, str) or not session_token or \
-                type(generation) is not int or generation < 0:
-            return observed(False)
         try:
             identity = json.loads(file_id)
         except (TypeError, ValueError):
@@ -5775,9 +5810,27 @@ class ModelUpdater(_ControllerCoreAccess):
         path_segments = tuple(relative_path.split("/"))
         if not path_segments or any(segment in ("", ".", "..") for segment in path_segments):
             return observed(False)
+        root_name = path_segments[0]
+        descendant_segments = path_segments[1:]
+        existing_accumulator = getattr(
+            self._controller, "_Controller__progressive_local_scan_state", None,
+        )
+        if isinstance(existing_accumulator, _ProgressiveScanAccumulator):
+            existing_accumulator.prune_confirmed_local_deletion(
+                path_pair_id, root_name, descendant_segments,
+            )
+        reconciler = getattr(self._controller, "_Controller__progressive_joint_reconciler", None)
+        if isinstance(reconciler, _JointProgressiveReconciler):
+            reconciler.prune_confirmed_local_deletion(
+                path_pair_id, root_name, descendant_segments,
+            )
+
+        if not isinstance(session_token, str) or not session_token or \
+                type(generation) is not int or generation < 0:
+            return observed(False)
         accumulator = _ensure_progressive_scan_state(self._controller, "local", eager=True)
         return observed(accumulator.confirm_local_deletion(
-            path_pair_id, path_segments[0], path_segments[1:], generation, session_token,
+            path_pair_id, root_name, descendant_segments, generation, session_token,
         ))
 
     @staticmethod
