@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import sys
 import threading
+from unittest.mock import patch
 from types import SimpleNamespace
 from datetime import datetime
 from queue import Queue
@@ -37,7 +38,7 @@ for _common_root in _COMMON_ROOTS:
         break
 try:
     from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation, trace_session_digest
-    from model import ModelFile
+    from model import Model, ModelFile
     from system import SystemFile
     from controller import Controller, ModelBuilder
     from controller.controller import DeferredQueueIntent
@@ -51,6 +52,7 @@ try:
 except ImportError:
     BreadcrumbTraceCollector = None
     ModelFile = None
+    Model = None
     opaque_trace_correlation = None
     trace_session_digest = None
     Controller = None
@@ -1016,6 +1018,60 @@ def test_lifecycle_persist_projection_is_finite_and_source_shaped() -> None:
         "fence": "none", "state_category": "default",
     }
 
+    live_publication, irrelevant = capture._projection({
+        "source": "model_builder", "category": "lifecycle.persist", "message": "model_live_publication",
+        "event_type": "diagnostic", "stage": "persist_authority", "level": "info",
+        "corr_id": "0123456789abcdef", "details": {
+            "candidate_state": "downloaded", "live_state": "downloaded",
+            "build_kind": "full_build", "adoption_kind": "full_model_adopted",
+            "candidate_version": 2**53 + 1, "live_version": 2**53 + 3,
+            "scope_version": 2**53 + 5, "local_size": 2**53 + 7, "child_count": 3,
+            "local_flow_schema": "exact_local_flow_join.v1",
+            "local_flow_pre_poll_selected": False, "local_flow_input": "member",
+            "local_flow_basis": "accepted_current", "local_flow_generation": 2**53 + 9,
+            "local_flow_bucket": "member", "file_name": "private-name.iso", "path": "/private/path",
+        },
+    })
+    assert not irrelevant and live_publication is not None
+    assert live_publication["lifecycle_persist"] == {
+        "event": "model_live_publication", "corr_ref": "0123456789abcdef",
+        "candidate_state": "downloaded", "live_state": "downloaded",
+        "build_kind": "full_build", "adoption_kind": "full_model_adopted",
+        "candidate_version": str(2**53 + 1), "live_version": str(2**53 + 3),
+        "scope_version": str(2**53 + 5), "local_size": str(2**53 + 7), "child_count": "3",
+        "exact_local_flow_join": {
+            "schema": "exact_local_flow_join.v1", "pre_poll_selected": False,
+            "input": "member", "basis": "accepted_current",
+            "generation": str(2**53 + 9), "bucket": "member",
+        },
+    }
+    assert not {"scope_version", "local_size", "child_count"}.intersection(live_publication["numbers"])
+    assert "private-name.iso" not in json.dumps(live_publication) and "/private/path" not in json.dumps(live_publication)
+
+    malformed_publication, irrelevant = capture._projection({
+        "source": "model_builder", "category": "lifecycle.persist", "message": "model_live_publication",
+        "event_type": "diagnostic", "stage": "persist_authority", "level": "info",
+        "corr_id": "0123456789abcdef", "details": {
+            "candidate_state": "private-state", "live_state": "downloaded",
+            "build_kind": "private-build", "adoption_kind": "full_model_adopted",
+            "candidate_version": True, "live_version": 2**63,
+            "scope_version": 2**53 + 11, "local_size": True, "child_count": -1,
+            "local_flow_schema": "exact_local_flow_join.v1", "local_flow_pre_poll_selected": 1,
+            "local_flow_input": ["private"], "local_flow_basis": "accepted_current",
+            "local_flow_generation": 2**63, "local_flow_bucket": "member",
+        },
+    })
+    assert not irrelevant and malformed_publication is not None
+    malformed_facts = malformed_publication["lifecycle_persist"]
+    assert malformed_facts["candidate_state"] == "unknown"
+    assert malformed_facts["candidate_version"] is malformed_facts["live_version"] is None
+    assert malformed_facts["scope_version"] == str(2**53 + 11)
+    assert malformed_facts["local_size"] is malformed_facts["child_count"] is None
+    assert malformed_facts["exact_local_flow_join"] == {
+        "schema": "exact_local_flow_join.v1", "pre_poll_selected": None,
+        "input": "unknown", "basis": "accepted_current", "generation": None, "bucket": "member",
+    }
+
     malformed, irrelevant = capture._projection({
         "source": "model_builder", "category": "lifecycle.persist", "message": "persist_authority_before",
         "event_type": "diagnostic", "stage": "persist_authority", "level": "info",
@@ -1038,6 +1094,113 @@ def test_lifecycle_persist_projection_is_finite_and_source_shaped() -> None:
         })
         assert irrelevant is False and foreign is not None
         assert "lifecycle_persist" not in foreign
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires native durable file acknowledgement")
+@pytest.mark.skipif(BreadcrumbTraceCollector is None or ModelBuilder is None or Model is None,
+                    reason="production builder unavailable")
+def test_model_live_publication_facts_reach_finalized_reader_and_sink(tmp_path: Path) -> None:
+    spool = tmp_path / "live-publication-spool"
+    spool.mkdir()
+    output = tmp_path / "live-publication-sink.jsonl"
+    collector = BreadcrumbTraceCollector(
+        lambda: True, max_entries=64,
+        policy={"default": "off", "rules": {"lifecycle.persist": "info"}},
+        durable_enabled=True, durable_path=str(spool),
+    )
+    builder = ModelBuilder()
+    pair_id = "pair-live"
+    root_name = "live-scope"
+    root_id = ModelFile.build_file_id(root_name, pair_id)
+    local_root = SystemFile(root_name, 2**53 + 17, True)
+    local_root.path_pair_id = pair_id
+    local_root.add_child(SystemFile("payload.bin", 10, False))
+    local_root.add_child(SystemFile("checksums.txt", 7, False))
+    remote_root = SystemFile(root_name, 2**53 + 19, True)
+    remote_root.path_pair_id = pair_id
+    remote_root.add_child(SystemFile("payload.bin", 10, False))
+    remote_root.add_child(SystemFile("checksums.txt", 7, False))
+    builder.set_local_files([local_root])
+    builder.set_remote_files([remote_root])
+    builder.set_downloaded_files({root_id})
+    builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+
+    try:
+        candidate = builder.build_model()
+        subject_ids = builder.record_lifecycle_candidate_publication(candidate, "full_build")
+        assert subject_ids == {root_id}
+        live = Model()
+        live.add_file(candidate.get_file(root_id))
+        # Advance the same pair's real model version once more while retaining
+        # the selected root; the scope version remains a direct O(1) lookup.
+        unrelated = ModelFile("other-live-file", False)
+        unrelated.path_pair_id = pair_id
+        live.add_file(unrelated)
+        builder.record_lifecycle_live_publication(
+            candidate, live, subject_ids, "full_build", "full_model_adopted",
+        )
+        assert collector.flush_durable(2.0)
+    finally:
+        collector.close(timeout=2.0)
+
+    finalized = [
+        json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    publication_rows = [
+        row for row in finalized if row.get("message") in {"model_candidate", "model_live_publication"}
+    ]
+    assert [row["message"] for row in publication_rows] == ["model_candidate", "model_live_publication"]
+    assert publication_rows[0]["corr_id"] == publication_rows[1]["corr_id"]
+    assert all(row.get("source") == "model_builder" and row.get("category") == "lifecycle.persist"
+               and row.get("stage") == "persist_authority" for row in publication_rows)
+    assert all(row.get("file_id") is None and row.get("path_pair_id") is None for row in publication_rows)
+
+    sink = observer.JsonArtifactSink(output)
+    for row in publication_rows:
+        projection, irrelevant = capture._projection(row)
+        assert not irrelevant and projection is not None
+        safe_projection = observer._sanitize_capture_projection(projection)
+        sink.persist({
+            "schema": "incoming-recovery-observer-sample.v1", "event": "capture", "outcome": "success",
+            "capture": {"state": "record", "source": "controller", "projection": safe_projection},
+        })
+
+    saved = _artifacts(output)
+    assert len(saved) == 2
+    saved_facts = [row["capture"]["projection"]["lifecycle_persist"] for row in saved]
+    assert [facts["event"] for facts in saved_facts] == ["model_candidate", "model_live_publication"]
+    live_facts = saved_facts[1]
+    assert live_facts["scope_version"] == str(live.scope_version(pair_id))
+    assert live_facts["local_size"] == str(2**53 + 17)
+    assert live_facts["child_count"] == "2"
+    assert live_facts["candidate_version"] == str(candidate.version)
+    assert live_facts["live_version"] == str(live.version)
+    assert live_facts["exact_local_flow_join"]["schema"] == "exact_local_flow_join.v1"
+    artifact_text = output.read_text(encoding="utf-8")
+    assert root_name not in artifact_text and pair_id not in artifact_text
+
+    # The new O(1) measurements remain behind the existing category gate.
+    disabled_builder = ModelBuilder()
+    with patch.object(live, "scope_version", side_effect=AssertionError("disabled diagnostic read")):
+        disabled_builder.record_lifecycle_live_publication(
+            candidate, live, subject_ids, "full_build", "full_model_adopted",
+        )
+
+    class FailingEmitter:
+        @staticmethod
+        def is_effectively_enabled(category: object, level: object = "info") -> bool:
+            return category == "lifecycle.persist" and level == "info"
+
+        @staticmethod
+        def record(*args: object, **kwargs: object) -> str:
+            raise RuntimeError("diagnostic emitter unavailable")
+
+    failing_builder = ModelBuilder()
+    failing_builder.set_stop_resume_trace_breadcrumb(FailingEmitter())
+    failing_builder.record_lifecycle_live_publication(
+        candidate, live, subject_ids, "full_build", "candidate_not_adopted",
+    )
 
 
 def test_queue_readiness_nested_scan_diagnostics_keep_exact_finite_values() -> None:

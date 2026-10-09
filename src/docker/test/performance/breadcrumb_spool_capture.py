@@ -286,11 +286,22 @@ _SCANNER_PROCESS_DECISIONS = frozenset({
     "queued", "full_replaced", "coalesced_full", "coalesced_pair",
 })
 _SCANNER_PROCESS_PAIR_REF_LIMIT = 8
-_LIFECYCLE_PERSIST_MESSAGES = frozenset({"persist_authority_before", "persist_authority_after"})
+_LIFECYCLE_PERSIST_MESSAGES = frozenset({
+    "persist_authority_before", "persist_authority_after", "model_candidate", "model_live_publication",
+})
 _LIFECYCLE_PERSIST_STATES = frozenset({
     "default", "downloading", "queued", "downloaded", "deleted", "extracting", "extracted",
     "validating", "validated", "corrupt", "move_failed", "unknown",
 })
+_LIFECYCLE_PERSIST_PUBLICATION_STATES = _LIFECYCLE_PERSIST_STATES | frozenset({"absent"})
+_LIFECYCLE_PERSIST_BUILDS = frozenset({"full_build", "authoritative_pair_candidate"})
+_LIFECYCLE_PERSIST_ADOPTIONS = frozenset({
+    "authoritative_pair_adopted", "full_model_adopted", "candidate_not_adopted",
+})
+_LIFECYCLE_FLOW_INPUTS = frozenset({"member", "no_member", "unknown"})
+_LIFECYCLE_FLOW_BASES = frozenset({"accepted_current", "unknown"})
+_LIFECYCLE_FLOW_BUCKETS = frozenset({"member", "no_member", "unknown"})
+_LIFECYCLE_FLOW_SCHEMA = "exact_local_flow_join.v1"
 _LIFECYCLE_PERSIST_FENCES = frozenset({"none"})
 _LIFECYCLE_PERSIST_BOOLEANS = (
     "local_present", "remote_present", "local_size_present", "downloaded_marker_present",
@@ -1437,21 +1448,54 @@ def _lifecycle_persist_facts(
 ) -> dict[str, object] | None:
     if not isinstance(message, str) or message not in _LIFECYCLE_PERSIST_MESSAGES:
         return None
-    fence = details.get("fence")
     result: dict[str, object] = {
         "event": message,
         "corr_ref": corr_id if isinstance(corr_id, str) and _OPAQUE_TOKEN.fullmatch(corr_id) else None,
-        "fence": fence if isinstance(fence, str) and fence in _LIFECYCLE_PERSIST_FENCES else "unknown",
     }
     if message == "persist_authority_before":
+        fence = details.get("fence")
+        result["fence"] = fence if isinstance(fence, str) and fence in _LIFECYCLE_PERSIST_FENCES else "unknown"
         state = details.get("pre_state")
         result["pre_state"] = state if isinstance(state, str) and state in _LIFECYCLE_PERSIST_STATES else "unknown"
         for key in _LIFECYCLE_PERSIST_BOOLEANS:
             value = details.get(key)
             result[key] = value if type(value) is bool else None
-    else:
+        return result
+    if message == "persist_authority_after":
+        fence = details.get("fence")
+        result["fence"] = fence if isinstance(fence, str) and fence in _LIFECYCLE_PERSIST_FENCES else "unknown"
         state = details.get("state_category")
         result["state_category"] = state if isinstance(state, str) and state in _LIFECYCLE_PERSIST_STATES else "unknown"
+        return result
+
+    def enum(key: str, allowed: frozenset[str]) -> str:
+        value = details.get(key)
+        return value if isinstance(value, str) and value in allowed else "unknown"
+
+    def decimal(key: str) -> str | None:
+        value = details.get(key)
+        return str(value) if type(value) is int and 0 <= value <= 2**63 - 1 else None
+
+    result["candidate_state"] = enum("candidate_state", _LIFECYCLE_PERSIST_PUBLICATION_STATES)
+    if message == "model_live_publication":
+        result["live_state"] = enum("live_state", _LIFECYCLE_PERSIST_PUBLICATION_STATES)
+    result["build_kind"] = enum("build_kind", _LIFECYCLE_PERSIST_BUILDS)
+    result["adoption_kind"] = enum("adoption_kind", _LIFECYCLE_PERSIST_ADOPTIONS)
+    result["candidate_version"] = decimal("candidate_version")
+    result["live_version"] = decimal("live_version")
+    flow_schema = details.get("local_flow_schema")
+    result["exact_local_flow_join"] = {
+        "schema": _LIFECYCLE_FLOW_SCHEMA if flow_schema == _LIFECYCLE_FLOW_SCHEMA else "unknown",
+        "pre_poll_selected": details.get("local_flow_pre_poll_selected")
+        if type(details.get("local_flow_pre_poll_selected")) is bool else None,
+        "input": enum("local_flow_input", _LIFECYCLE_FLOW_INPUTS),
+        "basis": enum("local_flow_basis", _LIFECYCLE_FLOW_BASES),
+        "generation": decimal("local_flow_generation"),
+        "bucket": enum("local_flow_bucket", _LIFECYCLE_FLOW_BUCKETS),
+    }
+    if message == "model_live_publication":
+        for key in ("scope_version", "local_size", "child_count"):
+            result[key] = decimal(key)
     return result
 
 

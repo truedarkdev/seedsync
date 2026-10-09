@@ -769,12 +769,21 @@ _CAPTURE_SCANNER_PROCESS_DECISIONS = {
 }
 _CAPTURE_SCANNER_PAIR_REF_LIMIT = 8
 _CAPTURE_LIFECYCLE_PERSIST_MESSAGES = {
-    "persist_authority_before", "persist_authority_after",
+    "persist_authority_before", "persist_authority_after", "model_candidate", "model_live_publication",
 }
 _CAPTURE_LIFECYCLE_PERSIST_STATES = {
     "default", "downloading", "queued", "downloaded", "deleted", "extracting", "extracted",
     "validating", "validated", "corrupt", "move_failed", "unknown",
 }
+_CAPTURE_LIFECYCLE_PERSIST_PUBLICATION_STATES = _CAPTURE_LIFECYCLE_PERSIST_STATES | {"absent"}
+_CAPTURE_LIFECYCLE_PERSIST_BUILDS = {"full_build", "authoritative_pair_candidate"}
+_CAPTURE_LIFECYCLE_PERSIST_ADOPTIONS = {
+    "authoritative_pair_adopted", "full_model_adopted", "candidate_not_adopted",
+}
+_CAPTURE_LIFECYCLE_FLOW_SCHEMA = "exact_local_flow_join.v1"
+_CAPTURE_LIFECYCLE_FLOW_INPUTS = {"member", "no_member", "unknown"}
+_CAPTURE_LIFECYCLE_FLOW_BASES = {"accepted_current", "unknown"}
+_CAPTURE_LIFECYCLE_FLOW_BUCKETS = {"member", "no_member", "unknown"}
 _CAPTURE_LIFECYCLE_PERSIST_BOOLEANS = (
     "local_present", "remote_present", "local_size_present", "downloaded_marker_present",
     "final_move_marker_present", "unknown_local",
@@ -1058,17 +1067,54 @@ def _sanitize_lifecycle_persist(value: Mapping[str, object]) -> Mapping[str, obj
     result: dict[str, object] = {
         "event": event,
         "corr_ref": corr_ref if isinstance(corr_ref, str) and _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(corr_ref) else None,
-        "fence": value.get("fence") if value.get("fence") == "none" else "unknown",
     }
     if event == "persist_authority_before":
+        result["fence"] = value.get("fence") if value.get("fence") == "none" else "unknown"
         state = value.get("pre_state")
         result["pre_state"] = state if isinstance(state, str) and state in _CAPTURE_LIFECYCLE_PERSIST_STATES else "unknown"
         for key in _CAPTURE_LIFECYCLE_PERSIST_BOOLEANS:
             item = value.get(key)
             result[key] = item if type(item) is bool else None
-    else:
+        return result
+    if event == "persist_authority_after":
+        result["fence"] = value.get("fence") if value.get("fence") == "none" else "unknown"
         state = value.get("state_category")
         result["state_category"] = state if isinstance(state, str) and state in _CAPTURE_LIFECYCLE_PERSIST_STATES else "unknown"
+        return result
+
+    candidate_state = value.get("candidate_state")
+    result["candidate_state"] = candidate_state if isinstance(candidate_state, str) and \
+        candidate_state in _CAPTURE_LIFECYCLE_PERSIST_PUBLICATION_STATES else "unknown"
+    if event == "model_live_publication":
+        live_state = value.get("live_state")
+        result["live_state"] = live_state if isinstance(live_state, str) and \
+            live_state in _CAPTURE_LIFECYCLE_PERSIST_PUBLICATION_STATES else "unknown"
+    for key, allowed in (
+            ("build_kind", _CAPTURE_LIFECYCLE_PERSIST_BUILDS),
+            ("adoption_kind", _CAPTURE_LIFECYCLE_PERSIST_ADOPTIONS)):
+        item = value.get(key)
+        result[key] = item if isinstance(item, str) and item in allowed else "unknown"
+    for key in ("candidate_version", "live_version"):
+        result[key] = _queue_readiness_decimal(value.get(key))
+
+    flow = value.get("exact_local_flow_join")
+    flow = flow if isinstance(flow, Mapping) else {}
+    flow_input = flow.get("input")
+    flow_basis = flow.get("basis")
+    flow_bucket = flow.get("bucket")
+    result["exact_local_flow_join"] = {
+        "schema": _CAPTURE_LIFECYCLE_FLOW_SCHEMA
+        if flow.get("schema") == _CAPTURE_LIFECYCLE_FLOW_SCHEMA else "unknown",
+        "pre_poll_selected": flow.get("pre_poll_selected")
+        if type(flow.get("pre_poll_selected")) is bool else None,
+        "input": flow_input if isinstance(flow_input, str) and flow_input in _CAPTURE_LIFECYCLE_FLOW_INPUTS else "unknown",
+        "basis": flow_basis if isinstance(flow_basis, str) and flow_basis in _CAPTURE_LIFECYCLE_FLOW_BASES else "unknown",
+        "generation": _queue_readiness_decimal(flow.get("generation")),
+        "bucket": flow_bucket if isinstance(flow_bucket, str) and flow_bucket in _CAPTURE_LIFECYCLE_FLOW_BUCKETS else "unknown",
+    }
+    if event == "model_live_publication":
+        for key in ("scope_version", "local_size", "child_count"):
+            result[key] = _queue_readiness_decimal(value.get(key))
     return result
 
 

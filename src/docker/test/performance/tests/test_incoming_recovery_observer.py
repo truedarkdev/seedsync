@@ -516,6 +516,59 @@ def test_lifecycle_persist_projection_sanitizer_preserves_only_bounded_authority
         "fence": "none", "state_category": "default",
     }
 
+    wide = str(2**53 + 19)
+    publication = observer._sanitize_capture_projection({
+        "source": "model_builder", "category": "lifecycle.persist", "stage": "persist_authority",
+        "lifecycle_persist": {
+            "event": "model_live_publication", "corr_ref": "0123456789abcdef",
+            "candidate_state": "downloaded", "live_state": "downloaded",
+            "build_kind": "full_build", "adoption_kind": "full_model_adopted",
+            "candidate_version": wide, "live_version": "9",
+            "scope_version": wide, "local_size": wide, "child_count": "2",
+            "exact_local_flow_join": {
+                "schema": "exact_local_flow_join.v1", "pre_poll_selected": False,
+                "input": "member", "basis": "accepted_current", "generation": wide,
+                "bucket": "member", "path": "/private/path",
+            },
+            "path": "/private/path", "file_name": "private-name.iso",
+        },
+    })["lifecycle_persist"]
+    assert publication == {
+        "event": "model_live_publication", "corr_ref": "0123456789abcdef",
+        "candidate_state": "downloaded", "live_state": "downloaded",
+        "build_kind": "full_build", "adoption_kind": "full_model_adopted",
+        "candidate_version": wide, "live_version": "9",
+        "exact_local_flow_join": {
+            "schema": "exact_local_flow_join.v1", "pre_poll_selected": False,
+            "input": "member", "basis": "accepted_current", "generation": wide, "bucket": "member",
+        },
+        "scope_version": wide, "local_size": wide, "child_count": "2",
+    }
+    assert "private-name.iso" not in json.dumps(publication) and "/private/path" not in json.dumps(publication)
+
+    malformed_publication = observer._sanitize_capture_projection({
+        "source": "model_builder", "category": "lifecycle.persist", "stage": "persist_authority",
+        "lifecycle_persist": {
+            "event": "model_live_publication", "corr_ref": "0123456789abcdef",
+            "candidate_state": "private-state", "live_state": "downloaded",
+            "build_kind": "private-build", "adoption_kind": "full_model_adopted",
+            "candidate_version": True, "live_version": str(2**63),
+            "scope_version": True, "local_size": str(2**63), "child_count": "-1",
+            "exact_local_flow_join": {
+                "schema": "exact_local_flow_join.v1", "pre_poll_selected": 1,
+                "input": ["member"], "basis": "accepted_current", "generation": True, "bucket": "member",
+            },
+        },
+    })["lifecycle_persist"]
+    assert malformed_publication["candidate_state"] == malformed_publication["build_kind"] == "unknown"
+    assert malformed_publication["candidate_version"] is malformed_publication["live_version"] is None
+    assert malformed_publication["scope_version"] is malformed_publication["local_size"] is None
+    assert malformed_publication["child_count"] is None
+    assert malformed_publication["exact_local_flow_join"] == {
+        "schema": "exact_local_flow_join.v1", "pre_poll_selected": None,
+        "input": "unknown", "basis": "accepted_current", "generation": None, "bucket": "member",
+    }
+
     malformed = observer._sanitize_capture_projection({
         "source": "model_builder", "category": "lifecycle.persist", "stage": "persist_authority",
         "lifecycle_persist": {

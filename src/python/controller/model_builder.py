@@ -871,7 +871,25 @@ class ModelBuilder:
                 live_file = live.get_file(file_id)
                 live_state = self.__state_category(live_file)
             except ModelError:
-                pass
+                live_file = None
+            live_scope_version = None
+            live_local_size = None
+            live_child_count = None
+            if live_file is not None:
+                try:
+                    live_scope_version = self.__lifecycle_uint63(
+                        live.scope_version(live_file.path_pair_id),
+                    )
+                except Exception:
+                    pass
+                try:
+                    live_local_size = self.__lifecycle_uint63(live_file.local_size)
+                except Exception:
+                    pass
+                try:
+                    live_child_count = self.__lifecycle_uint63(live_file.child_count)
+                except Exception:
+                    pass
             self.__record_lifecycle_persist_breadcrumb_for_file_id("model_live_publication", file_id, {
                 "candidate_state": candidate_state,
                 "live_state": live_state,
@@ -879,6 +897,9 @@ class ModelBuilder:
                 "adoption_kind": adoption_kind,
                 "candidate_version": candidate.version,
                 "live_version": live.version,
+                "scope_version": live_scope_version,
+                "local_size": live_local_size,
+                "child_count": live_child_count,
                 **self.__lifecycle_local_flow_details(
                     file_id,
                     local_scan_snapshot=local_scan_snapshot,
@@ -892,6 +913,11 @@ class ModelBuilder:
                     pre_poll_file_ids=pre_poll_file_ids,
                 ),
             })
+
+    @staticmethod
+    def __lifecycle_uint63(value: object) -> Optional[int]:
+        """Keep live publication shape facts finite without coercing booleans."""
+        return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
 
     def record_lifecycle_completion_arbitration(
             self, file_id: str, completion_outcome: str,
