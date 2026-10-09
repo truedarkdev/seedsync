@@ -1864,6 +1864,19 @@ class ModelBuilder:
     def __is_target_archive_trace_enabled(self) -> bool:
         return self.__target_archive_trace_file_id is not None
 
+    @staticmethod
+    def __extract_trace_selector_name(identifier: Optional[str]) -> Optional[str]:
+        if identifier is None:
+            return None
+        try:
+            parsed_identifier = json.loads(identifier)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return identifier
+        if isinstance(parsed_identifier, list) and len(parsed_identifier) == 2 and \
+                isinstance(parsed_identifier[1], str):
+            return parsed_identifier[1]
+        return identifier
+
     def __trace_target_archive_selector_matches_model_file(self, model_file: ModelFile, root_file_id: str) -> bool:
         if not self.__is_target_archive_trace_enabled():
             return False
@@ -7851,19 +7864,23 @@ class ModelBuilder:
                     arbitration_source
                 )
             if self.__is_target_archive_trace_enabled():
-                self.__trace_target_archive_arbitration(
-                    model_file,
-                    status.file_id if status is not None else model_file.file_id,
-                    is_stopped,
-                    remote is not None,
-                    local is not None,
-                    local,
-                    model_file.file_id in self.__active_file_ids,
-                    ModelBuilder.__summarize_local_freshness(local),
-                    status,
-                    raw_current_transfer_state,
-                    arbitration_source
-                )
+                try:
+                    self.__trace_target_archive_arbitration(
+                        model_file,
+                        status.file_id if status is not None else model_file.file_id,
+                        is_stopped,
+                        remote is not None,
+                        local is not None,
+                        local,
+                        model_file.file_id in self.__active_file_ids,
+                        ModelBuilder.__summarize_local_freshness(local),
+                        status,
+                        raw_current_transfer_state,
+                        arbitration_source
+                    )
+                except Exception:
+                    # Optional target diagnostics cannot interrupt model publication.
+                    pass
 
             built_root_files.append(_BuiltRootFile(
                 model_file=model_file,

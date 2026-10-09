@@ -12333,6 +12333,80 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual("live_transfer", payload["source_kind"])
         self.assertFalse(payload["markers"]["downloaded"])
 
+    def test_target_archive_trace_accepts_configured_root_id_without_hiding_other_roots(self):
+        target = SystemFile("archive.zip", 1000, False)
+        target.path_pair_id = "pair-a"
+        unrelated = SystemFile("unrelated.bin", 50, False)
+        unrelated.path_pair_id = "pair-b"
+        self.model_builder.set_remote_files([target, unrelated])
+        target_id = ModelFile.build_file_id("archive.zip", "pair-a")
+        unrelated_id = ModelFile.build_file_id("unrelated.bin", "pair-b")
+        self.model_builder._ModelBuilder__target_archive_trace_file_id = target_id
+        trace_logger = self.model_builder._ModelBuilder__target_archive_trace_logger
+
+        with patch.object(trace_logger, "info") as trace_info:
+            model = self.model_builder.build_model()
+
+        self.assertEqual({target_id, unrelated_id}, model.get_file_ids())
+        self.assertEqual(1, trace_info.call_count)
+        payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual(target_id, payload["resolved_identity"]["file_id"])
+
+    def test_target_archive_trace_failure_does_not_change_built_model_rows(self):
+        def build(*, failure):
+            builder = ModelBuilder()
+            target = SystemFile("archive.zip", 1000, False)
+            target.path_pair_id = "pair-a"
+            unrelated = SystemFile("unrelated.bin", 50, False)
+            unrelated.path_pair_id = "pair-b"
+            builder.set_remote_files([target, unrelated])
+            builder._ModelBuilder__target_archive_trace_file_id = json.dumps(["pair-other", "archive.zip"])
+            trace_logger = builder._ModelBuilder__target_archive_trace_logger
+            if failure == "decoder":
+                with patch.object(
+                        builder, "_ModelBuilder__extract_trace_selector_name",
+                        side_effect=RuntimeError("diagnostic decoder"),
+                ) as decode:
+                    model = builder.build_model()
+                    decode.assert_called()
+                    return model
+            with patch.object(
+                    trace_logger, "info", side_effect=RuntimeError("diagnostic logger"),
+            ) as trace_info:
+                model = builder.build_model()
+                trace_info.assert_called()
+                return model
+
+        baseline_builder = ModelBuilder()
+        baseline_target = SystemFile("archive.zip", 1000, False)
+        baseline_target.path_pair_id = "pair-a"
+        baseline_unrelated = SystemFile("unrelated.bin", 50, False)
+        baseline_unrelated.path_pair_id = "pair-b"
+        baseline_builder.set_remote_files([baseline_target, baseline_unrelated])
+        baseline = baseline_builder.build_model()
+        baseline_rows = {
+            file_id: (baseline.get_file(file_id).remote_present, baseline.get_file(file_id).remote_size)
+            for file_id in baseline.get_file_ids()
+        }
+        for failure in ("decoder", "logger"):
+            with self.subTest(failure=failure):
+                model = build(failure=failure)
+                self.assertEqual(baseline.get_file_ids(), model.get_file_ids())
+                self.assertEqual(baseline_rows, {
+                    file_id: (model.get_file(file_id).remote_present, model.get_file(file_id).remote_size)
+                    for file_id in model.get_file_ids()
+                })
+
+    def test_target_archive_trace_default_off_does_not_call_logger(self):
+        remote = SystemFile("idle.bin", 10, False)
+        remote.path_pair_id = "pair-a"
+        self.model_builder.set_remote_files([remote])
+        trace_logger = self.model_builder._ModelBuilder__target_archive_trace_logger
+        with patch.object(trace_logger, "info") as trace_info:
+            model = self.model_builder.build_model()
+        self.assertEqual({ModelFile.build_file_id("idle.bin", "pair-a")}, model.get_file_ids())
+        trace_info.assert_not_called()
+
     def test_inactive_unrelated_files_are_not_traced(self):
         collector = self.__enable_trace()
         self.model_builder.set_remote_files([
