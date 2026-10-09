@@ -10,6 +10,7 @@ import sys
 import threading
 from types import SimpleNamespace
 from datetime import datetime
+from queue import Queue
 
 import pytest
 
@@ -39,6 +40,7 @@ try:
     from model import ModelFile
     from system import SystemFile
     from controller import Controller, ModelBuilder
+    from controller.controller import DeferredQueueIntent
     from controller.scan import ScannerResult
     from lftp import LftpJobStatus
     from controller.model_updater import (
@@ -59,6 +61,7 @@ except ImportError:
     SystemFile = None
     ModelBuilder = None
     ModelUpdater = None
+    DeferredQueueIntent = None
     ScannerResult = None
     _ensure_progressive_scan_state = None
     LftpJobStatus = None
@@ -901,6 +904,57 @@ def test_queue_readiness_source_projection_is_finite_and_redacted(tmp_path: Path
     }
 
 
+def test_queue_readiness_nested_scan_diagnostics_keep_exact_finite_values() -> None:
+    wide = 2**53 + 19
+    details = {
+        "schema": "queue_readiness.v1", "phase": "rescan_unknown", "outcome": "failed",
+        "origin": "manual", "reason": "initial_local_scan_failed",
+        "scan_failure": {
+            "side": "local", "kind": "failed", "scope": "targeted", "target_covered": True,
+            "terminal": False, "recoverable": True, "result_generation": wide,
+            "run_matches_baseline": True, "generation_vs_baseline": "newer",
+            "session_token": "do-not-copy", "path": "/private/path",
+        },
+        "fresh_root_proof": {
+            "result": "accepted", "reason": "accepted", "root_shape_ok": True,
+            "remote_ready": True, "overlay_unknown": True, "process_generation": wide,
+            "effective_work_floor": 4, "root_generation": wide, "source_present": True,
+            "run_matches_current": True, "builder_proof_matches_source": True,
+            "root_vs_work_floor": "at_or_above", "root_vs_process_generation": "at_or_below",
+            "run_matches_baseline": True, "generation_vs_baseline": "newer",
+            "session_token": "do-not-copy", "path": "/private/path",
+        },
+    }
+    facts = capture._queue_readiness_facts("queue_rescan_readiness", details)
+    assert facts is not None
+    assert facts["scan_failure"]["result_generation"] == str(wide)
+    assert facts["fresh_root_proof"]["process_generation"] == str(wide)
+    assert facts["fresh_root_proof"]["root_generation"] == str(wide)
+    text = json.dumps(facts)
+    assert "do-not-copy" not in text and "/private/path" not in text
+
+    finalized_projection = observer._sanitize_capture_projection({"queue_readiness": facts})
+    assert finalized_projection["queue_readiness"]["scan_failure"]["result_generation"] == str(wide)
+    assert finalized_projection["queue_readiness"]["fresh_root_proof"]["root_generation"] == str(wide)
+
+    malformed = capture._queue_readiness_facts("queue_rescan_readiness", {
+        **details,
+        "scan_failure": {"side": "secret", "terminal": 1, "result_generation": True},
+        "fresh_root_proof": {"result": "secret", "reason": "/private", "root_shape_ok": "true",
+                             "process_generation": wide + 1},
+    })
+    assert malformed is not None
+    malformed_final = observer._sanitize_capture_projection({"queue_readiness": malformed})
+    assert malformed_final["queue_readiness"]["scan_failure"] == {
+        "side": "unknown", "kind": "unknown", "scope": "unknown", "target_covered": None,
+        "terminal": None, "recoverable": None, "result_generation": None,
+        "run_matches_baseline": None, "generation_vs_baseline": "unknown",
+    }
+    assert malformed_final["queue_readiness"]["fresh_root_proof"]["result"] == "unknown"
+    assert malformed_final["queue_readiness"]["fresh_root_proof"]["root_shape_ok"] is None
+    assert malformed_final["queue_readiness"]["fresh_root_proof"]["process_generation"] == str(wide + 1)
+
+
 def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(tmp_path: Path) -> None:
     if Controller is None or BreadcrumbTraceCollector is None:
         pytest.skip("production controller breadcrumb emitter is unavailable")
@@ -956,9 +1010,65 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
             assert Controller._Controller__record_queue_readiness_trace(
                 producer, secret, message, details,
             ) is None
+        # Use the real failed-result intake to produce the final row. Its
+        # fixed diagnostic projection must remain safe through durable drain,
+        # the independent reader, and the real artifact sink.
+        pair_id = "private-scan-pair"
+        failed_file_id = ModelFile.build_file_id("private-scan-root", pair_id)
+        failed_intent = DeferredQueueIntent(
+            Controller.Command(Controller.Command.Action.QUEUE, failed_file_id),
+            failed_file_id, pair_id, phase="initial_rescan", rescan_requested=True,
+            rescan_generations=(("private-local-session", 0), ("private-remote-session", 0)),
+        )
+        producer._Controller__deferred_queue_intents = {failed_file_id: failed_intent}
+        producer._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
+        Controller._record_path_pair_scan_tokens(
+            producer,
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={pair_id}, failed=True,
+                generation=1, session_token="private-local-session", is_targeted_scan=True,
+                recoverable_failure_path_pair_ids={pair_id}, terminal_failure_path_pair_ids=set(),
+            ),
+            None,
+        )
+        proof_pair_id = "private-proof-pair"
+        proof_file_id = ModelFile.build_file_id("private-proof-root", proof_pair_id)
+        proof_file = ModelFile("private-proof-root", True)
+        proof_file.path_pair_id = proof_pair_id
+        proof_intent = DeferredQueueIntent(
+            Controller.Command(Controller.Command.Action.QUEUE, proof_file_id),
+            proof_file_id, proof_pair_id, phase="initial_rescan", rescan_requested=True,
+            rescan_generations=(("private-proof-session", 2), ("private-remote-session", 0)),
+            rescan_failure_reason="initial_local_scan_recoverable_failed",
+        )
+        proof_root = SystemFile("private-proof-root", 1, True)
+        proof_root.path_pair_id = proof_pair_id
+        producer._Controller__deferred_queue_intents = {proof_file_id: proof_intent}
+        producer._Controller__command_queue = Queue()
+        producer._Controller__model = SimpleNamespace(get_file=lambda _file_id: proof_file)
+        producer._Controller__persist = SimpleNamespace(stopped_file_names=set())
+        producer._Controller__reconciled_remote_path_pair_ids = {proof_pair_id}
+        producer._Controller__local_scan_process = SimpleNamespace(
+            session_token="private-proof-session", generation=5,
+            root_scan_authority_snapshot=lambda _pair_id: ("private-proof-session", 5, 3),
+        )
+        producer._Controller__remote_scan_process = SimpleNamespace(
+            session_token="private-remote-session", generation=1,
+        )
+        producer._Controller__progressive_local_scan_state = SimpleNamespace(
+            current_root_scan_source_with_proof=lambda _pair_id, _name: (
+                proof_root, "private-proof-session", 4,
+            ),
+        )
+        producer._Controller__model_builder = SimpleNamespace(
+            unknown_local_path_pair_ids_snapshot=lambda: frozenset({proof_pair_id}),
+            has_current_local_root_scan_proof=lambda *_args, **_kwargs: False,
+        )
+        producer._Controller__retire_deferred_queue_intent = lambda *_args, **_kwargs: True
+        Controller._Controller__prepare_deferred_queue_retries(producer)
         assert collector.wait_for_ingress(2.0)
         assert collector.flush_durable(2.0)
-        assert reader.poll() == len(readiness_rows)
+        assert reader.poll() == len(readiness_rows) + 2
     finally:
         reader.close()
         collector.close(timeout=2.0)
@@ -973,10 +1083,28 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     assert readiness[2]["phase"] == "rescan_request" and readiness[2]["reason"] == "scoped_rescan_requested"
     assert readiness[3]["decision_boundary"] == "scan_authority"
     assert readiness[3]["local_reconciled"] is False and readiness[3]["publication_id"] == 7
+    scan_failure = readiness[-2]["scan_failure"]
+    assert scan_failure == {
+        "side": "local", "kind": "failed", "scope": "targeted", "target_covered": True,
+        "terminal": False, "recoverable": True, "result_generation": "1",
+        "run_matches_baseline": True, "generation_vs_baseline": "newer",
+    }
+    fresh_root_proof = readiness[-1]["fresh_root_proof"]
+    assert fresh_root_proof["result"] == "rejected"
+    assert fresh_root_proof["reason"] == "builder_proof_mismatch"
+    assert fresh_root_proof["root_generation"] == "4"
+    assert fresh_root_proof["effective_work_floor"] == "3"
+    assert fresh_root_proof["builder_proof_matches_source"] is False
     persisted = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
-    finalized = [row for row in persisted if row.get("message") in {event for event, _ in readiness_rows}]
-    assert len(finalized) == len(readiness_rows)
+    finalized = [row for row in persisted if row.get("message") in
+                 ({event for event, _ in readiness_rows} | {"queue_rescan_readiness"})]
+    assert len(finalized) == len(readiness_rows) + 2
     assert all("metadata" not in row and isinstance(row.get("details"), dict) for row in finalized)
+    assert "private-scan-pair" not in artifact_text
+    assert "private-scan-root" not in artifact_text
+    assert "private-local-session" not in artifact_text
+    assert "private-proof-session" not in artifact_text
+    assert "private-proof-root" not in artifact_text
 
 
 def test_model_page_snapshot_source_projection_is_finite_and_redacted(tmp_path: Path) -> None:

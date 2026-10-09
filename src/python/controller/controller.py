@@ -3366,49 +3366,137 @@ class Controller:
             unknown_path_pair_ids = unknown_snapshotter() if callable(unknown_snapshotter) else ()
             return path_pair_id not in unknown_path_pair_ids
 
-    def __current_local_root_scan_proof(self, file: ModelFile) -> Optional[tuple[SystemFile, str, int]]:
+    def __current_local_root_scan_proof(
+            self, file: ModelFile, diagnostic: Optional[dict[str, object]] = None,
+    ) -> Optional[tuple[SystemFile, str, int]]:
         """Return exact current root proof only above its pair/full work floor."""
+        def record_diagnostic(**facts: object) -> None:
+            if diagnostic is None:
+                return
+            try:
+                diagnostic.update(facts)
+            except Exception:
+                # Optional observation must never change the authority result.
+                pass
+
+        def reject(reason: str, result: str = "rejected") -> None:
+            record_diagnostic(result=result, reason=reason)
+
         if not file.is_dir or file.full_path != file.name:
+            reject("root_shape")
             return None
         remote_reconciled = getattr(self, "_Controller__reconciled_remote_path_pair_ids", set())
-        if not isinstance(remote_reconciled, set) or file.path_pair_id not in remote_reconciled:
+        remote_ready = isinstance(remote_reconciled, set) and file.path_pair_id in remote_reconciled
+        record_diagnostic(remote_ready=remote_ready)
+        if not remote_ready:
+            reject("remote_not_ready")
             return None
         builder = getattr(self, "_Controller__model_builder", None)
         unknown_snapshotter = getattr(builder, "unknown_local_path_pair_ids_snapshot", None)
         checker = getattr(builder, "has_current_local_root_scan_proof", None)
         if not callable(unknown_snapshotter) or not callable(checker):
+            reject("builder_reader_unavailable", "unknown")
             return None
         try:
             unknown_pairs = unknown_snapshotter()
-            if not isinstance(unknown_pairs, (set, frozenset, list, tuple)) or \
-                    file.path_pair_id not in unknown_pairs:
+            if not isinstance(unknown_pairs, (set, frozenset, list, tuple)):
+                reject("overlay_unknown_unavailable", "unknown")
+                return None
+            overlay_unknown = file.path_pair_id in unknown_pairs
+            record_diagnostic(overlay_unknown=overlay_unknown)
+            if not overlay_unknown:
+                reject("overlay_not_unknown")
                 return None
             process = getattr(self, "_Controller__local_scan_process", None)
             snapshotter = getattr(process, "root_scan_authority_snapshot", None)
             accumulator = getattr(self, "_Controller__progressive_local_scan_state", None)
             source_reader = getattr(accumulator, "current_root_scan_source_with_proof", None)
             if not callable(snapshotter) or not callable(source_reader):
+                reject("scan_reader_unavailable", "unknown")
                 return None
             snapshot = snapshotter(file.path_pair_id)
+            snapshot_valid = isinstance(snapshot, tuple) and len(snapshot) == 3 and \
+                type(snapshot[0]) is str and bool(snapshot[0]) and \
+                type(snapshot[1]) is int and snapshot[1] >= 0 and \
+                type(snapshot[2]) is int and snapshot[2] >= 0
+            if snapshot_valid and diagnostic is not None:
+                record_diagnostic(
+                    process_generation=snapshot[1] if snapshot[1] <= 2**63 - 1 else None,
+                    effective_work_floor=snapshot[2] if snapshot[2] <= 2**63 - 1 else None,
+                )
             source = source_reader(file.path_pair_id, file.name)
-            if not isinstance(snapshot, tuple) or len(snapshot) != 3 or \
-                    type(snapshot[0]) is not str or not snapshot[0] or \
-                    type(snapshot[1]) is not int or snapshot[1] < 0 or \
-                    type(snapshot[2]) is not int or snapshot[2] < 0 or \
-                    not isinstance(source, tuple) or len(source) != 3:
+            if not snapshot_valid:
+                reject("scan_snapshot_unknown", "unknown")
+                return None
+            if source is None:
+                record_diagnostic(source_present=False)
+                reject("source_absent")
+                return None
+            if not isinstance(source, tuple) or len(source) != 3:
+                reject("source_shape_unknown", "unknown")
                 return None
             root, root_session, root_generation = source
-            if not isinstance(root, SystemFile) or root_session != snapshot[0] or \
-                    type(root_generation) is not int or root_generation < snapshot[2] or \
-                    root_generation > snapshot[1]:
+            if not isinstance(root, SystemFile):
+                reject("source_shape_unknown", "unknown")
                 return None
-            if checker(
-                    file.file_id, root_session, root_generation, expected_source=root,
-            ) is not True:
+            run_mismatch = root_session != snapshot[0]
+            if run_mismatch:
+                if diagnostic is not None:
+                    valid_generation = type(root_generation) is int and 0 <= root_generation <= 2**63 - 1
+                    record_diagnostic(
+                        source_present=True,
+                        run_matches_current=False,
+                        root_generation=root_generation if valid_generation else None,
+                        root_vs_work_floor=(
+                            "at_or_above" if root_generation >= snapshot[2] else "below"
+                        ) if valid_generation and snapshot[2] <= 2**63 - 1 else "unknown",
+                        root_vs_process_generation=(
+                            "at_or_below" if root_generation <= snapshot[1] else "ahead"
+                        ) if valid_generation and snapshot[1] <= 2**63 - 1 else "unknown",
+                    )
+                reject("run_mismatch")
                 return None
+            if type(root_generation) is not int:
+                if diagnostic is not None:
+                    record_diagnostic(
+                        source_present=True,
+                        run_matches_current=True,
+                        root_generation=None,
+                        root_vs_work_floor="unknown",
+                        root_vs_process_generation="unknown",
+                    )
+                reject("source_shape_unknown", "unknown")
+                return None
+            if diagnostic is not None:
+                record_diagnostic(
+                    source_present=True,
+                    run_matches_current=True,
+                    root_generation=root_generation if 0 <= root_generation <= 2**63 - 1 else None,
+                    root_vs_work_floor=(
+                        "at_or_above" if root_generation >= snapshot[2] else "below"
+                    ) if 0 <= root_generation <= 2**63 - 1 and snapshot[2] <= 2**63 - 1 else "unknown",
+                    root_vs_process_generation=(
+                        "at_or_below" if root_generation <= snapshot[1] else "ahead"
+                    ) if 0 <= root_generation <= 2**63 - 1 and snapshot[1] <= 2**63 - 1 else "unknown",
+                )
+            if root_generation < snapshot[2]:
+                reject("below_work_floor")
+                return None
+            if root_generation > snapshot[1]:
+                reject("ahead_of_process")
+                return None
+            builder_matches = checker(
+                file.file_id, root_session, root_generation, expected_source=root,
+            ) is True
+            record_diagnostic(builder_proof_matches_source=builder_matches)
+            if not builder_matches:
+                reject("builder_proof_mismatch")
+                return None
+            record_diagnostic(result="accepted", reason="accepted")
             return root, root_session, root_generation
         except Exception:
             # Queue authority is fail-closed if optional proof inspection fails.
+            reject("inspection_error", "unknown")
             return None
 
     def __has_current_local_root_scan_proof(self, file: ModelFile) -> bool:
@@ -3417,21 +3505,53 @@ class Controller:
 
     def __has_fresh_local_root_scan_proof(
             self, file: ModelFile, intent: DeferredQueueIntent,
+            diagnostic: Optional[dict[str, object]] = None,
     ) -> bool:
         """Whether the selected directory root was proved after this rescan began."""
+        def record_diagnostic(**facts: object) -> None:
+            if diagnostic is None:
+                return
+            try:
+                diagnostic.update(facts)
+            except Exception:
+                # Optional observation must never change the authority result.
+                pass
+
+        def reject(reason: str) -> bool:
+            record_diagnostic(result="rejected", reason=reason)
+            return False
+
         if not isinstance(file, ModelFile) or file.file_id != intent.file_id or \
                 file.path_pair_id != intent.path_pair_id or not file.is_dir or file.full_path != file.name:
-            return False
+            record_diagnostic(root_shape_ok=False)
+            return reject("root_shape")
+        record_diagnostic(root_shape_ok=True)
         generations = intent.rescan_generations
         if not isinstance(generations, tuple) or len(generations) != 2 or \
                 not isinstance(generations[0], tuple) or len(generations[0]) != 2:
-            return False
+            return reject("baseline_unavailable")
         baseline_session, baseline_generation = generations[0]
         if type(baseline_session) is not str or not baseline_session or \
                 type(baseline_generation) is not int or baseline_generation < 0:
+            return reject("baseline_unavailable")
+        proof = self.__current_local_root_scan_proof(file, diagnostic)
+        if proof is None:
             return False
-        proof = self.__current_local_root_scan_proof(file)
-        return proof is not None and proof[1] == baseline_session and proof[2] > baseline_generation
+        run_matches = proof[1] == baseline_session
+        if diagnostic is not None:
+            record_diagnostic(
+                run_matches_baseline=run_matches,
+                generation_vs_baseline=(
+                    "newer" if proof[2] > baseline_generation else
+                    "equal" if proof[2] == baseline_generation else "older"
+                ) if 0 <= proof[2] <= 2**63 - 1 and 0 <= baseline_generation <= 2**63 - 1 else "unknown",
+            )
+        if not run_matches:
+            return reject("baseline_run_mismatch")
+        if proof[2] <= baseline_generation:
+            return reject("baseline_not_newer")
+        record_diagnostic(result="accepted", reason="accepted")
+        return True
 
     def is_remote_delete_eligible(self, file: ModelFile) -> bool:
         """Require final publication proof before deleting staged remote data."""
@@ -3545,14 +3665,69 @@ class Controller:
                 ):
                     return
                 intent.rescan_failure_reason = reason
-                self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
+                details: dict[str, object] = {
                     "schema": "queue_readiness.v1",
                     "phase": "rescan_unknown",
                     "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
                     "outcome": outcome,
                     "reason": self.__external_initial_rescan_failure_reason(reason),
                     "ready": False,
-                })
+                }
+                try:
+                    if self.queue_http_wait_trace_enabled():
+                        failure_kind = outcome if outcome in ("failed", "unknown") else "unknown"
+                        result_session = getattr(result, "session_token", None)
+                        result_generation = getattr(result, "generation", None)
+                        baseline = None
+                        generations = intent.rescan_generations
+                        side_index = 0 if side == "local" else 1
+                        if isinstance(generations, tuple) and len(generations) == 2 and \
+                                isinstance(generations[side_index], tuple) and \
+                                len(generations[side_index]) == 2:
+                            baseline = generations[side_index]
+                        baseline_session = baseline[0] if baseline is not None else None
+                        baseline_generation = baseline[1] if baseline is not None else None
+                        run_matches = (
+                            result_session == baseline_session
+                            if type(result_session) is str and result_session and
+                            type(baseline_session) is str and baseline_session else None
+                        )
+                        generation_relation = "unknown"
+                        if run_matches is True and type(result_generation) is int and \
+                                0 <= result_generation <= 2**63 - 1 and \
+                                type(baseline_generation) is int and 0 <= baseline_generation <= 2**63 - 1:
+                            generation_relation = (
+                                "newer" if result_generation > baseline_generation else
+                                "equal" if result_generation == baseline_generation else "older"
+                            )
+
+                        def membership(values: object) -> Optional[bool]:
+                            if not isinstance(values, (set, frozenset, list, tuple)):
+                                return None
+                            try:
+                                return intent.path_pair_id in values
+                            except Exception:
+                                return None
+
+                        targeted = getattr(result, "is_targeted_scan", None)
+                        scan_failure: dict[str, object] = {
+                            "side": side if side in ("local", "remote") else "unknown",
+                            "kind": failure_kind,
+                            "scope": "targeted" if targeted is True else
+                            "non_targeted" if targeted is False else "unknown",
+                            "target_covered": True,
+                            "terminal": membership(getattr(result, "terminal_failure_path_pair_ids", None)),
+                            "recoverable": membership(getattr(result, "recoverable_failure_path_pair_ids", None)),
+                            "result_generation": result_generation if type(result_generation) is int and
+                            0 <= result_generation <= 2**63 - 1 else None,
+                            "run_matches_baseline": run_matches,
+                            "generation_vs_baseline": generation_relation,
+                        }
+                        details["scan_failure"] = scan_failure
+                except Exception:
+                    # Optional facts must not alter failure classification or notification.
+                    pass
+                self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", details)
 
             def mark_initial_rescan_failure(
                     affected_pair_ids: set[object], reason: str,
@@ -11297,9 +11472,32 @@ class Controller:
                         "initial_local_scan_recoverable_failed",
                         "initial_local_scan_recoverable_unknown",
                 ) and getattr(intent.command, "origin", "manual") == "manual":
+                    proof_diagnostic: Optional[dict[str, object]] = None
+                    try:
+                        if self.queue_http_wait_trace_enabled():
+                            proof_diagnostic = {}
+                    except Exception:
+                        proof_diagnostic = None
                     allow_local_root_proof = self.__has_fresh_local_root_scan_proof(
-                        deferred_file, intent,
+                        deferred_file, intent, proof_diagnostic,
                     )
+                    if proof_diagnostic is not None:
+                        try:
+                            self.__record_queue_readiness_trace(
+                                intent.file_id, "queue_rescan_readiness", {
+                                    "schema": "queue_readiness.v1",
+                                    "phase": "rescan_ready" if allow_local_root_proof else "rescan_unknown",
+                                    "origin": "manual",
+                                    "outcome": "ready" if allow_local_root_proof else "unknown",
+                                    "reason": "authoritative_local_root" if allow_local_root_proof else
+                                    self.__external_initial_rescan_failure_reason(failure_reason),
+                                    "ready": allow_local_root_proof,
+                                    "fresh_root_proof": proof_diagnostic,
+                                },
+                            )
+                        except Exception:
+                            # Predicate diagnostics never alter Queue retry behavior.
+                            pass
                     if allow_local_root_proof:
                         failure_reason = None
                 if failure_reason is not None:

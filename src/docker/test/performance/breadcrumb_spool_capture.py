@@ -182,6 +182,38 @@ _QUEUE_READINESS_EXTRA_ENUMS = {
     "dispatch_mode": frozenset({"async", "sync"}),
     "local_scope_basis": frozenset({"pair", "selected_root"}),
 }
+_QUEUE_SCAN_FAILURE_SIDES = frozenset({"local", "remote", "unknown"})
+_QUEUE_SCAN_FAILURE_KINDS = frozenset({"failed", "unknown"})
+_QUEUE_SCAN_FAILURE_SCOPES = frozenset({"targeted", "non_targeted", "unknown"})
+_QUEUE_SCAN_GENERATION_RELATIONS = frozenset({"newer", "equal", "older", "unknown"})
+_QUEUE_FRESH_ROOT_RESULTS = frozenset({"accepted", "rejected", "unknown"})
+_QUEUE_FRESH_ROOT_REASONS = frozenset({
+    "accepted", "root_shape", "remote_not_ready", "builder_reader_unavailable",
+    "overlay_unknown_unavailable", "overlay_not_unknown", "scan_reader_unavailable",
+    "scan_snapshot_unknown", "source_absent", "source_shape_unknown", "run_mismatch",
+    "below_work_floor", "ahead_of_process", "builder_proof_mismatch", "inspection_error",
+    "baseline_unavailable", "baseline_run_mismatch", "baseline_not_newer", "unknown",
+})
+_QUEUE_FRESH_ROOT_FLOOR_RELATIONS = frozenset({"at_or_above", "below", "unknown"})
+_QUEUE_FRESH_ROOT_PROCESS_RELATIONS = frozenset({"at_or_below", "ahead", "unknown"})
+_QUEUE_SCAN_FAILURE_INTEGER_MAX = 2**63 - 1
+_QUEUE_NESTED_DIAGNOSTIC_FIELDS = {
+    "scan_failure": (
+        {"side": _QUEUE_SCAN_FAILURE_SIDES, "kind": _QUEUE_SCAN_FAILURE_KINDS,
+         "scope": _QUEUE_SCAN_FAILURE_SCOPES, "generation_vs_baseline": _QUEUE_SCAN_GENERATION_RELATIONS},
+        ("target_covered", "terminal", "recoverable", "run_matches_baseline"),
+        ("result_generation",),
+    ),
+    "fresh_root_proof": (
+        {"result": _QUEUE_FRESH_ROOT_RESULTS, "reason": _QUEUE_FRESH_ROOT_REASONS,
+         "root_vs_work_floor": _QUEUE_FRESH_ROOT_FLOOR_RELATIONS,
+         "root_vs_process_generation": _QUEUE_FRESH_ROOT_PROCESS_RELATIONS,
+         "generation_vs_baseline": _QUEUE_SCAN_GENERATION_RELATIONS},
+        ("root_shape_ok", "remote_ready", "overlay_unknown", "source_present",
+         "run_matches_current", "builder_proof_matches_source", "run_matches_baseline"),
+        ("process_generation", "effective_work_floor", "root_generation"),
+    ),
+}
 _MODEL_PAGE_SNAPSHOT_OUTCOMES = frozenset({"success", "error"})
 _MODEL_PAGE_SNAPSHOT_ERRORS = frozenset({"cancelled", "model_error", "runtime_error", "unknown"})
 _MODEL_PAGE_SNAPSHOT_NUMBERS = frozenset({
@@ -804,6 +836,22 @@ def _delete_local_command_facts(
     return facts or None
 
 
+def _queue_nested_diagnostic_facts(value: object, fields: tuple[object, object, object]) -> dict[str, object]:
+    source = value if isinstance(value, Mapping) else {}
+    enum_fields, boolean_fields, integer_fields = fields
+    result: dict[str, object] = {}
+    for key, allowed in enum_fields.items():
+        item = source.get(key)
+        result[key] = item if isinstance(item, str) and item in allowed else "unknown"
+    for key in boolean_fields:
+        item = source.get(key)
+        result[key] = item if type(item) is bool else None
+    for key in integer_fields:
+        item = source.get(key)
+        result[key] = str(item) if type(item) is int and 0 <= item <= _QUEUE_SCAN_FAILURE_INTEGER_MAX else None
+    return result
+
+
 def _queue_readiness_facts(message: object, details: Mapping[str, object]) -> dict[str, object] | None:
     """Project only the finite, source-shaped Queue readiness discriminator."""
     schema = details.get("schema")
@@ -846,6 +894,9 @@ def _queue_readiness_facts(message: object, details: Mapping[str, object]) -> di
         value = details.get(key)
         if key in details:
             result[key] = value if type(value) is int and 0 <= value <= 2**31 - 1 else None
+    for key, fields in _QUEUE_NESTED_DIAGNOSTIC_FIELDS.items():
+        if key in details:
+            result[key] = _queue_nested_diagnostic_facts(details.get(key), fields)
     return result
 
 

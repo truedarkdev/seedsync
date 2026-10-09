@@ -598,6 +598,39 @@ _CAPTURE_READINESS_EXTRA_ENUMS = {
     "dispatch_mode": {"async", "sync"},
     "local_scope_basis": {"pair", "selected_root"},
 }
+_CAPTURE_SCAN_FAILURE_SIDES = {"local", "remote", "unknown"}
+_CAPTURE_SCAN_FAILURE_KINDS = {"failed", "unknown"}
+_CAPTURE_SCAN_FAILURE_SCOPES = {"targeted", "non_targeted", "unknown"}
+_CAPTURE_SCAN_GENERATION_RELATIONS = {"newer", "equal", "older", "unknown"}
+_CAPTURE_FRESH_ROOT_RESULTS = {"accepted", "rejected", "unknown"}
+_CAPTURE_FRESH_ROOT_REASONS = {
+    "accepted", "root_shape", "remote_not_ready", "builder_reader_unavailable",
+    "overlay_unknown_unavailable", "overlay_not_unknown", "scan_reader_unavailable",
+    "scan_snapshot_unknown", "source_absent", "source_shape_unknown", "run_mismatch",
+    "below_work_floor", "ahead_of_process", "builder_proof_mismatch", "inspection_error",
+    "baseline_unavailable", "baseline_run_mismatch", "baseline_not_newer", "unknown",
+}
+_CAPTURE_FRESH_ROOT_FLOOR_RELATIONS = {"at_or_above", "below", "unknown"}
+_CAPTURE_FRESH_ROOT_PROCESS_RELATIONS = {"at_or_below", "ahead", "unknown"}
+_CAPTURE_SCAN_GENERATION_MAX = 2**63 - 1
+_CAPTURE_NESTED_DIAGNOSTIC_FIELDS = {
+    "scan_failure": (
+        {"side": _CAPTURE_SCAN_FAILURE_SIDES, "kind": _CAPTURE_SCAN_FAILURE_KINDS,
+         "scope": _CAPTURE_SCAN_FAILURE_SCOPES,
+         "generation_vs_baseline": _CAPTURE_SCAN_GENERATION_RELATIONS},
+        ("target_covered", "terminal", "recoverable", "run_matches_baseline"),
+        ("result_generation",),
+    ),
+    "fresh_root_proof": (
+        {"result": _CAPTURE_FRESH_ROOT_RESULTS, "reason": _CAPTURE_FRESH_ROOT_REASONS,
+         "root_vs_work_floor": _CAPTURE_FRESH_ROOT_FLOOR_RELATIONS,
+         "root_vs_process_generation": _CAPTURE_FRESH_ROOT_PROCESS_RELATIONS,
+         "generation_vs_baseline": _CAPTURE_SCAN_GENERATION_RELATIONS},
+        ("root_shape_ok", "remote_ready", "overlay_unknown", "source_present",
+         "run_matches_current", "builder_proof_matches_source", "run_matches_baseline"),
+        ("process_generation", "effective_work_floor", "root_generation"),
+    ),
+}
 _CAPTURE_MODEL_PAGE_SNAPSHOT_OUTCOMES = {"success", "error", "unknown"}
 _CAPTURE_MODEL_PAGE_SNAPSHOT_ERRORS = {"cancelled", "model_error", "runtime_error", "unknown"}
 _CAPTURE_MODEL_FINALIZATION_PHASES = {"entry", "complete", "error", "unknown"}
@@ -995,6 +1028,27 @@ def _sanitize_lftp_status_membership(value: object) -> Mapping[str, object] | No
     return result
 
 
+def _queue_readiness_decimal(value: object) -> str | None:
+    if not isinstance(value, str) or not _CAPTURE_CONFIRMED_DELETE_DECIMAL.fullmatch(value):
+        return None
+    return value if int(value) <= _CAPTURE_SCAN_GENERATION_MAX else None
+
+
+def _queue_readiness_nested_diagnostic(value: object, fields: tuple[object, object, object]) -> dict[str, object]:
+    source = value if isinstance(value, Mapping) else {}
+    enum_fields, boolean_fields, integer_fields = fields
+    result: dict[str, object] = {}
+    for key, allowed in enum_fields.items():
+        item = source.get(key)
+        result[key] = item if isinstance(item, str) and item in allowed else "unknown"
+    for key in boolean_fields:
+        item = source.get(key)
+        result[key] = item if type(item) is bool else None
+    for key in integer_fields:
+        result[key] = _queue_readiness_decimal(source.get(key))
+    return result
+
+
 def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         return {"kind": "unknown"}
@@ -1346,6 +1400,9 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
             if key in readiness:
                 item = readiness[key]
                 safe_readiness[key] = item if type(item) is int and 0 <= item <= 2**31 - 1 else None
+        for key, fields in _CAPTURE_NESTED_DIAGNOSTIC_FIELDS.items():
+            if key in readiness:
+                safe_readiness[key] = _queue_readiness_nested_diagnostic(readiness.get(key), fields)
         result["queue_readiness"] = safe_readiness
     model_page_snapshot = value.get("model_page_snapshot")
     if isinstance(model_page_snapshot, Mapping):

@@ -17396,9 +17396,59 @@ class TestController(unittest.TestCase):
             path_pair_id=file.path_pair_id,
             rescan_generations=(("local-session", 1), ("remote-session", 1)),
         )
+        calls = {"snapshot": 0, "source": 0, "builder": 0}
+
+        def counted_snapshot(pair_id):
+            calls["snapshot"] += 1
+            return tuple(authority)
+
+        def counted_source(pair_id, name):
+            calls["source"] += 1
+            return tuple(source)
+
+        def counted_builder_proof(_file_id, session, generation, **kwargs):
+            calls["builder"] += 1
+            return accepted_proof(_file_id, session, generation, **kwargs)
+
+        self.controller._Controller__local_scan_process.root_scan_authority_snapshot = counted_snapshot
+        self.controller._Controller__progressive_local_scan_state.current_root_scan_source_with_proof = counted_source
+        self.controller._Controller__model_builder.has_current_local_root_scan_proof = counted_builder_proof
+        proof_diagnostic = {}
+        self.assertTrue(self.controller._Controller__has_fresh_local_root_scan_proof(
+            file, intent, proof_diagnostic,
+        ))
+        self.assertEqual({"snapshot": 1, "source": 1, "builder": 1}, calls)
+        self.assertEqual("accepted", proof_diagnostic["result"])
+        self.assertEqual("accepted", proof_diagnostic["reason"])
+        self.assertTrue(proof_diagnostic["root_shape_ok"])
+        self.assertTrue(proof_diagnostic["remote_ready"])
+        self.assertTrue(proof_diagnostic["overlay_unknown"])
+        self.assertTrue(proof_diagnostic["source_present"])
+        self.assertTrue(proof_diagnostic["run_matches_current"])
+        self.assertTrue(proof_diagnostic["builder_proof_matches_source"])
+        self.assertEqual("at_or_above", proof_diagnostic["root_vs_work_floor"])
+        self.assertEqual("at_or_below", proof_diagnostic["root_vs_process_generation"])
+        self.assertTrue(proof_diagnostic["run_matches_baseline"])
+        self.assertEqual("newer", proof_diagnostic["generation_vs_baseline"])
+
+        class UnwritableDiagnostic(dict):
+            def update(self, *_args, **_kwargs):
+                raise RuntimeError("diagnostic write failed")
+
+        self.assertTrue(self.controller._Controller__has_fresh_local_root_scan_proof(
+            file, intent, UnwritableDiagnostic(),
+        ))
+        self.assertEqual({"snapshot": 2, "source": 2, "builder": 2}, calls)
         self.assertTrue(self.controller._Controller__has_fresh_local_root_scan_proof(file, intent))
+        self.assertEqual({"snapshot": 3, "source": 3, "builder": 3}, calls)
         intent.rescan_generations = (("local-session", 2), ("remote-session", 1))
         self.assertFalse(self.controller._Controller__has_fresh_local_root_scan_proof(file, intent))
+        source[:] = [root, "stale-session", object()]
+        rejection_diagnostic = {}
+        self.assertIsNone(self.controller._Controller__current_local_root_scan_proof(
+            file, rejection_diagnostic,
+        ))
+        self.assertEqual("run_mismatch", rejection_diagnostic["reason"])
 
     def test_cold_start_publishes_healthy_pair_before_unreadable_sibling(self):
         healthy_pair_id = "pair-cold-healthy"
@@ -18711,7 +18761,8 @@ class TestController(unittest.TestCase):
                     ready_record = next(
                         entry for entry in readiness_records
                         if entry["message"] == "queue_rescan_readiness" and
-                        entry["details"].get("phase") == "rescan_ready"
+                        entry["details"].get("phase") == "rescan_ready" and
+                        "local_scope_basis" in entry["details"]
                     )
                     self.assertEqual("selected_root", ready_record["details"]["local_scope_basis"])
 
@@ -18776,6 +18827,12 @@ class TestController(unittest.TestCase):
                         callback.on_failure.assert_not_called()
 
     def test_terminal_local_scan_failure_supersedes_recoverable_rescan_reason(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
         pair_id = "pair-a"
         file_id = ModelFile.build_file_id("selected", pair_id)
         command = Controller.Command(Controller.Command.Action.QUEUE, file_id)
@@ -18826,6 +18883,23 @@ class TestController(unittest.TestCase):
             None,
         )
         self.assertEqual("initial_local_scan_unknown", intent.rescan_failure_reason)
+        scan_failures = [
+            entry["details"]["scan_failure"]
+            for entry in trace.snapshot(category_prefix="queue.readiness")["entries"]
+            if entry["message"] == "queue_rescan_readiness" and
+            isinstance(entry.get("details"), dict) and "scan_failure" in entry["details"]
+        ]
+        self.assertEqual(3, len(scan_failures))
+        self.assertEqual(
+            {"side": "local", "kind": "failed", "scope": "non_targeted", "target_covered": True,
+             "terminal": False, "recoverable": True, "result_generation": 1,
+             "run_matches_baseline": True, "generation_vs_baseline": "newer"},
+            scan_failures[0],
+        )
+        self.assertTrue(scan_failures[1]["terminal"])
+        self.assertFalse(scan_failures[1]["recoverable"])
+        self.assertEqual("unknown", scan_failures[2]["kind"])
+        self.assertTrue(scan_failures[2]["terminal"])
 
     def test_process_commands_queue_defers_manual_directory_until_path_pair_reconciles(self):
         file = ModelFile("release", True)

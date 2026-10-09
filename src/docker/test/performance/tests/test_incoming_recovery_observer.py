@@ -650,6 +650,51 @@ def test_queue_readiness_projection_sanitizer_preserves_finite_boundaries():
     assert malformed["queue_readiness"]["model_version"] is None
 
 
+def test_queue_readiness_scan_diagnostics_sanitize_exact_decimal_and_unknowns():
+    wide = str(2**53 + 19)
+    safe = observer._sanitize_capture_projection({
+        "queue_readiness": {
+            "schema": "queue_readiness.v1", "event": "queue_rescan_readiness",
+            "phase": "rescan_unknown", "origin": "manual", "outcome": "failed",
+            "reason": "initial_local_scan_failed",
+            "scan_failure": {
+                "side": "local", "kind": "failed", "scope": "targeted", "target_covered": True,
+                "terminal": False, "recoverable": True, "result_generation": wide,
+                "run_matches_baseline": True, "generation_vs_baseline": "newer",
+                "path": "/private/path", "session": "private-session",
+            },
+            "fresh_root_proof": {
+                "result": "rejected", "reason": "below_work_floor", "root_shape_ok": True,
+                "remote_ready": True, "overlay_unknown": True, "process_generation": wide,
+                "effective_work_floor": "4", "root_generation": wide, "source_present": True,
+                "run_matches_current": True, "builder_proof_matches_source": False,
+                "root_vs_work_floor": "below", "root_vs_process_generation": "at_or_below",
+                "run_matches_baseline": True, "generation_vs_baseline": "equal",
+                "path": "/private/path", "session": "private-session",
+            },
+        },
+    })
+    readiness = safe["queue_readiness"]
+    assert readiness["scan_failure"]["result_generation"] == wide
+    assert readiness["fresh_root_proof"]["process_generation"] == wide
+    assert readiness["fresh_root_proof"]["root_generation"] == wide
+    assert "/private/path" not in json.dumps(safe) and "private-session" not in json.dumps(safe)
+
+    malformed = observer._sanitize_capture_projection({
+        "queue_readiness": {
+            "schema": "queue_readiness.v1", "event": "queue_rescan_readiness",
+            "scan_failure": {"side": "local", "terminal": 1, "result_generation": "01"},
+            "fresh_root_proof": {"result": "accepted", "root_shape_ok": "true",
+                                 "root_generation": str(2**63)},
+        },
+    })["queue_readiness"]
+    assert malformed["scan_failure"]["side"] == "local"
+    assert malformed["scan_failure"]["terminal"] is None
+    assert malformed["scan_failure"]["result_generation"] is None
+    assert malformed["fresh_root_proof"]["root_shape_ok"] is None
+    assert malformed["fresh_root_proof"]["root_generation"] is None
+
+
 def test_completion_move_projection_sanitizer_preserves_finite_facts():
     safe = observer._sanitize_capture_projection({
         "completion_gate": {
