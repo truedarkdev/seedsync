@@ -486,6 +486,53 @@ def test_scanner_process_projection_sanitizer_preserves_bounded_current_run_fact
     assert malformed["decision"] == "unknown"
 
 
+def test_lifecycle_persist_projection_sanitizer_preserves_only_bounded_authority_facts():
+    before = observer._sanitize_capture_projection({
+        "source": "model_builder", "category": "lifecycle.persist", "stage": "persist_authority",
+        "lifecycle_persist": {
+            "event": "persist_authority_before", "corr_ref": "0123456789abcdef", "fence": "none",
+            "pre_state": "downloaded", "local_present": True, "remote_present": False,
+            "local_size_present": True, "downloaded_marker_present": True,
+            "final_move_marker_present": False, "unknown_local": False,
+            "path": "/private/path",
+        },
+    })
+    facts = before["lifecycle_persist"]
+    assert facts["event"] == "persist_authority_before"
+    assert facts["corr_ref"] == "0123456789abcdef"
+    assert facts["pre_state"] == "downloaded" and facts["fence"] == "none"
+    assert facts["local_present"] is True and facts["remote_present"] is False
+    assert "private/path" not in json.dumps(before)
+
+    after = observer._sanitize_capture_projection({
+        "source": "model_builder", "category": "lifecycle.persist", "stage": "persist_authority",
+        "lifecycle_persist": {
+            "event": "persist_authority_after", "corr_ref": "fedcba9876543210",
+            "state_category": "default", "fence": "none",
+        },
+    })["lifecycle_persist"]
+    assert after == {
+        "event": "persist_authority_after", "corr_ref": "fedcba9876543210",
+        "fence": "none", "state_category": "default",
+    }
+
+    malformed = observer._sanitize_capture_projection({
+        "source": "model_builder", "category": "lifecycle.persist", "stage": "persist_authority",
+        "lifecycle_persist": {
+            "event": "persist_authority_before", "corr_ref": "/private/path", "fence": "secret",
+            "pre_state": "secret", "local_present": 1, "remote_present": "false",
+        },
+    })["lifecycle_persist"]
+    assert malformed["corr_ref"] is None
+    assert malformed["fence"] == malformed["pre_state"] == "unknown"
+    assert malformed["local_present"] is malformed["remote_present"] is None
+    for key, wrong_value in (
+        ("source", "controller"), ("category", "model.lifecycle"), ("stage", "lifecycle"),
+    ):
+        foreign = observer._sanitize_capture_projection({**before, key: wrong_value})
+        assert "lifecycle_persist" not in foreign
+
+
 def test_lftp_status_health_projection_preserves_unknowns_and_omits_private_rows():
     projected, irrelevant = capture._projection({
         "category": "transfer.lftp.status", "message": "lftp_status_poll",

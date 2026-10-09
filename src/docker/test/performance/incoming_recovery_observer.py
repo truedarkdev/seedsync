@@ -449,14 +449,14 @@ def _safe_body_reason(value: object) -> str:
 
 
 _CAPTURE_SOURCES = frozenset({
-    "controller", "model_updater", "status", "scanner", "scanner_process", "lftp", "web", "system", "unknown",
+    "controller", "model_updater", "model_builder", "status", "scanner", "scanner_process", "lftp", "web", "system", "unknown",
 })
 _CAPTURE_EVENTS = frozenset({
     "queue", "callback", "status", "completion", "progress", "state_transition", "failure", "diagnostic", "breadcrumb", "unknown",
 })
 _CAPTURE_CATEGORIES = frozenset({
     "queue.lifecycle", "queue.admission", "queue.executor", "queue.authority", "queue.readiness", "queue.exclusion", "model_page_snapshot",
-    "model.lifecycle", "model.progress", "model.publication", "model.finalization", "model.root_progress", "status",
+    "model.lifecycle", "model.progress", "model.publication", "model.finalization", "model.root_progress", "lifecycle.persist", "status",
     "transfer.lftp", "transfer.lftp.executor", "transfer.lftp.membership", "transfer.lftp.status", "transfer.stop",
     "scan.authority", "scan.adoption", "scan.failure", "scan.result", "scan.lifecycle", "scan.root_shape", "scan.terminal_publication", "final_move.publication",
     "finalization.child", "controller", "scanner_process", "lftp.sidecar", "lftp.command", "lftp.status",
@@ -470,7 +470,7 @@ _CAPTURE_STAGES = frozenset({
     "controller_boundary", "persist_transaction", "lifecycle", "completion_gate", "final_move_publication",
     "finalization_child", "transfer_stop", "command", "lftp_executor", "lftp_sidecar_validation",
     "lftp_path_pair_annotation", "lftp_status_poll", "lftp_command_boundary", "scoped_model_stream", "retirement_cleanup",
-    "path_pair_runtime", "root_progress_status", "completion_gate", "model_builder_local_root_proof_transition", "lftp_command_boundary", "ordinary", "refresh", "finish", "transfer", "unknown",
+    "path_pair_runtime", "root_progress_status", "completion_gate", "model_builder_local_root_proof_transition", "persist_authority", "lftp_command_boundary", "ordinary", "refresh", "finish", "transfer", "unknown",
 })
 _CAPTURE_KINDS = frozenset({"event", "progress", "status", "completion", "unknown"})
 _CAPTURE_LEVELS = frozenset({"info", "warning", "error", "critical", "debug", "unknown"})
@@ -768,6 +768,17 @@ _CAPTURE_SCANNER_PROCESS_DECISIONS = {
     "queued", "full_replaced", "coalesced_full", "coalesced_pair",
 }
 _CAPTURE_SCANNER_PAIR_REF_LIMIT = 8
+_CAPTURE_LIFECYCLE_PERSIST_MESSAGES = {
+    "persist_authority_before", "persist_authority_after",
+}
+_CAPTURE_LIFECYCLE_PERSIST_STATES = {
+    "default", "downloading", "queued", "downloaded", "deleted", "extracting", "extracted",
+    "validating", "validated", "corrupt", "move_failed", "unknown",
+}
+_CAPTURE_LIFECYCLE_PERSIST_BOOLEANS = (
+    "local_present", "remote_present", "local_size_present", "downloaded_marker_present",
+    "final_move_marker_present", "unknown_local",
+)
 
 
 def _sanitize_input_arbitration(value: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -1036,6 +1047,28 @@ def _sanitize_scanner_process_event(value: Mapping[str, object]) -> Mapping[str,
         result[prefix + "_count"] = decimal(prefix + "_count")
         item = value.get(prefix + "_truncated")
         result[prefix + "_truncated"] = item if item is None or item == "unknown" or type(item) is bool else "unknown"
+    return result
+
+
+def _sanitize_lifecycle_persist(value: Mapping[str, object]) -> Mapping[str, object] | None:
+    event = value.get("event")
+    if not isinstance(event, str) or event not in _CAPTURE_LIFECYCLE_PERSIST_MESSAGES:
+        return None
+    corr_ref = value.get("corr_ref")
+    result: dict[str, object] = {
+        "event": event,
+        "corr_ref": corr_ref if isinstance(corr_ref, str) and _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(corr_ref) else None,
+        "fence": value.get("fence") if value.get("fence") == "none" else "unknown",
+    }
+    if event == "persist_authority_before":
+        state = value.get("pre_state")
+        result["pre_state"] = state if isinstance(state, str) and state in _CAPTURE_LIFECYCLE_PERSIST_STATES else "unknown"
+        for key in _CAPTURE_LIFECYCLE_PERSIST_BOOLEANS:
+            item = value.get(key)
+            result[key] = item if type(item) is bool else None
+    else:
+        state = value.get("state_category")
+        result["state_category"] = state if isinstance(state, str) and state in _CAPTURE_LIFECYCLE_PERSIST_STATES else "unknown"
     return result
 
 
@@ -1544,6 +1577,12 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
         safe_scanner_process_event = _sanitize_scanner_process_event(scanner_process_event)
         if safe_scanner_process_event is not None:
             result["scanner_process_event"] = safe_scanner_process_event
+    lifecycle_persist = value.get("lifecycle_persist")
+    if (result.get("source") == "model_builder" and result.get("category") == "lifecycle.persist"
+            and result.get("stage") == "persist_authority" and isinstance(lifecycle_persist, Mapping)):
+        safe_lifecycle_persist = _sanitize_lifecycle_persist(lifecycle_persist)
+        if safe_lifecycle_persist is not None:
+            result["lifecycle_persist"] = safe_lifecycle_persist
     return result
 
 

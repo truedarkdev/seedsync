@@ -985,6 +985,61 @@ def test_scanner_process_projection_keeps_force_baseline_separate_from_run() -> 
     assert oversized["scanner_process_event"]["scanned_count"] == "9"
 
 
+def test_lifecycle_persist_projection_is_finite_and_source_shaped() -> None:
+    before, irrelevant = capture._projection({
+        "source": "model_builder", "category": "lifecycle.persist", "message": "persist_authority_before",
+        "event_type": "diagnostic", "stage": "persist_authority", "level": "info",
+        "corr_id": "0123456789abcdef", "details": {
+            "local_present": True, "remote_present": False, "local_size_present": True,
+            "downloaded_marker_present": True, "final_move_marker_present": False, "unknown_local": False,
+            "pre_state": "downloaded", "fence": "none", "file_name": "private-name.iso",
+            "path": "/private/path",
+        },
+    })
+    assert irrelevant is False and before is not None
+    assert before["lifecycle_persist"] == {
+        "event": "persist_authority_before", "corr_ref": "0123456789abcdef", "fence": "none",
+        "pre_state": "downloaded", "local_present": True, "remote_present": False,
+        "local_size_present": True, "downloaded_marker_present": True,
+        "final_move_marker_present": False, "unknown_local": False,
+    }
+    assert "private-name.iso" not in json.dumps(before) and "/private/path" not in json.dumps(before)
+
+    after, irrelevant = capture._projection({
+        "source": "model_builder", "category": "lifecycle.persist", "message": "persist_authority_after",
+        "event_type": "diagnostic", "stage": "persist_authority", "level": "info",
+        "corr_id": "fedcba9876543210", "details": {"state_category": "default", "fence": "none"},
+    })
+    assert irrelevant is False and after is not None
+    assert after["lifecycle_persist"] == {
+        "event": "persist_authority_after", "corr_ref": "fedcba9876543210",
+        "fence": "none", "state_category": "default",
+    }
+
+    malformed, irrelevant = capture._projection({
+        "source": "model_builder", "category": "lifecycle.persist", "message": "persist_authority_before",
+        "event_type": "diagnostic", "stage": "persist_authority", "level": "info",
+        "corr_id": "/private/path", "details": {
+            "pre_state": "private-state", "fence": "/private/fence", "local_present": 1,
+        },
+    })
+    assert irrelevant is False and malformed is not None
+    facts = malformed["lifecycle_persist"]
+    assert facts["corr_ref"] is None and facts["pre_state"] == facts["fence"] == "unknown"
+    assert facts["local_present"] is None
+    for key, wrong_value in (
+        ("source", "controller"), ("category", "model.lifecycle"), ("stage", "lifecycle"),
+    ):
+        foreign, irrelevant = capture._projection({
+            "source": "model_builder", "category": "lifecycle.persist", "message": "persist_authority_before",
+            "event_type": "diagnostic", "stage": "persist_authority", "level": "info",
+            "corr_id": "0123456789abcdef", "details": {"pre_state": "downloaded", "fence": "none"},
+            key: wrong_value,
+        })
+        assert irrelevant is False and foreign is not None
+        assert "lifecycle_persist" not in foreign
+
+
 def test_queue_readiness_nested_scan_diagnostics_keep_exact_finite_values() -> None:
     wide = 2**53 + 19
     details = {

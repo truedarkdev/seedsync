@@ -36,7 +36,7 @@ _CATEGORIES = frozenset(
     {
         "queue.lifecycle", "queue.admission", "queue.executor", "queue.authority",
         "queue.readiness", "queue.exclusion", "model.lifecycle", "model.progress", "model_page_snapshot",
-        "model.publication", "model.finalization", "model.root_progress", "status",
+        "model.publication", "model.finalization", "model.root_progress", "lifecycle.persist", "status",
         "transfer.lftp", "transfer.lftp.executor", "transfer.lftp.membership",
         "transfer.lftp.status", "transfer.stop", "scan.authority", "scan.adoption", "scan.failure",
         "scan.result", "scan.terminal_publication", "scan.lifecycle", "scan.root_shape", "final_move.publication",
@@ -45,7 +45,7 @@ _CATEGORIES = frozenset(
     }
 )
 _SOURCES = frozenset(
-    {"controller", "model_updater", "status", "scanner", "scanner_process", "lftp", "web", "system"}
+    {"controller", "model_updater", "model_builder", "status", "scanner", "scanner_process", "lftp", "web", "system"}
 )
 _EVENT_TYPES = frozenset(
     {"queue", "callback", "status", "completion", "progress", "state_transition", "failure", "diagnostic", "breadcrumb"}
@@ -60,7 +60,7 @@ _STAGES = frozenset(
         "completion_gate", "final_move_publication", "finalization_child", "transfer_stop", "command",
         "lftp_executor", "lftp_sidecar_validation", "lftp_path_pair_annotation", "lftp_status_poll",
         "lftp_command_boundary", "scoped_model_stream", "retirement_cleanup", "path_pair_runtime",
-        "root_progress_status", "completion_gate", "model_builder_local_root_proof_transition", "ordinary", "refresh", "finish", "transfer", "model_page_snapshot",
+        "root_progress_status", "completion_gate", "model_builder_local_root_proof_transition", "persist_authority", "ordinary", "refresh", "finish", "transfer", "model_page_snapshot",
     }
 )
 _LEVELS = frozenset({"info", "warning", "error", "critical", "debug"})
@@ -286,6 +286,16 @@ _SCANNER_PROCESS_DECISIONS = frozenset({
     "queued", "full_replaced", "coalesced_full", "coalesced_pair",
 })
 _SCANNER_PROCESS_PAIR_REF_LIMIT = 8
+_LIFECYCLE_PERSIST_MESSAGES = frozenset({"persist_authority_before", "persist_authority_after"})
+_LIFECYCLE_PERSIST_STATES = frozenset({
+    "default", "downloading", "queued", "downloaded", "deleted", "extracting", "extracted",
+    "validating", "validated", "corrupt", "move_failed", "unknown",
+})
+_LIFECYCLE_PERSIST_FENCES = frozenset({"none"})
+_LIFECYCLE_PERSIST_BOOLEANS = (
+    "local_present", "remote_present", "local_size_present", "downloaded_marker_present",
+    "final_move_marker_present", "unknown_local",
+)
 _SCAN_TICK_BOOLEAN_KEYS = {
     "present": "p", "progress": "pr", "final": "f", "failed": "fa", "full": "fu",
     "new_authority": "na",
@@ -1422,6 +1432,29 @@ def _scanner_process_facts(
     return result
 
 
+def _lifecycle_persist_facts(
+        details: Mapping[str, object], message: object, corr_id: object,
+) -> dict[str, object] | None:
+    if not isinstance(message, str) or message not in _LIFECYCLE_PERSIST_MESSAGES:
+        return None
+    fence = details.get("fence")
+    result: dict[str, object] = {
+        "event": message,
+        "corr_ref": corr_id if isinstance(corr_id, str) and _OPAQUE_TOKEN.fullmatch(corr_id) else None,
+        "fence": fence if isinstance(fence, str) and fence in _LIFECYCLE_PERSIST_FENCES else "unknown",
+    }
+    if message == "persist_authority_before":
+        state = details.get("pre_state")
+        result["pre_state"] = state if isinstance(state, str) and state in _LIFECYCLE_PERSIST_STATES else "unknown"
+        for key in _LIFECYCLE_PERSIST_BOOLEANS:
+            value = details.get(key)
+            result[key] = value if type(value) is bool else None
+    else:
+        state = details.get("state_category")
+        result["state_category"] = state if isinstance(state, str) and state in _LIFECYCLE_PERSIST_STATES else "unknown"
+    return result
+
+
 def select_input_arbitration_rows(records: object, root_id: object) -> dict[str, object]:
     """Select app-emitted root rows and their same-build leaf/summary rows.
 
@@ -1496,6 +1529,10 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     scanner_process_event = (
         _scanner_process_facts(details, message, row.get("corr_id", metadata.get("corr_id")))
         if source == "scanner_process" and category == "scanner_process" and stage == "scan" else None
+    )
+    lifecycle_persist = (
+        _lifecycle_persist_facts(details, message, row.get("corr_id", metadata.get("corr_id")))
+        if source == "model_builder" and category == "lifecycle.persist" and stage == "persist_authority" else None
     )
     if scanner_process_event is not None:
         # Keep generation only in the decimal-string projection below; the
@@ -1617,6 +1654,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["scan_lifecycle"] = scan_lifecycle
     if scanner_process_event is not None:
         result["scanner_process_event"] = scanner_process_event
+    if lifecycle_persist is not None:
+        result["lifecycle_persist"] = lifecycle_persist
     return result, False
 
 
