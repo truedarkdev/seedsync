@@ -1286,13 +1286,104 @@ class TestModelBuilder(unittest.TestCase):
         self.assertFalse(self.model_builder.authorize_authoritative_pair_delta(
             lambda file_id: file_id in live_model.get_file_ids(), pair_build,
         ))
-        self.model_builder.commit_authoritative_pair_sources_for_full_rebuild(pair_build)
+        self.assertTrue(self.model_builder.commit_authoritative_pair_sources_for_full_rebuild(pair_build))
 
         self.assertEqual(
             {ModelFile.build_file_id("new.bin", "pair-a")},
             set(self.model_builder._ModelBuilder__remote_files_by_pair["pair-a"]),
         )
         self.assertTrue(self.model_builder.has_changes())
+
+    def test_authoritative_pair_fallback_refuses_changed_local_or_remote_source_base(self):
+        for changed_side in ("local", "remote"):
+            with self.subTest(changed_side=changed_side):
+                builder = ModelBuilder()
+                old_local = SystemFile("old-local.bin", 10, False)
+                old_local.path_pair_id = "pair-a"
+                old_remote = SystemFile("old-remote.bin", 20, False)
+                old_remote.path_pair_id = "pair-a"
+                builder.set_local_files([old_local])
+                builder.set_remote_files([old_remote])
+                builder.build_model()
+
+                staged_local = SystemFile("staged-local.bin", 30, False)
+                staged_local.path_pair_id = "pair-a"
+                staged_remote = SystemFile("staged-remote.bin", 40, False)
+                staged_remote.path_pair_id = "pair-a"
+                pair_build = builder.build_authoritative_pair_roots(
+                    "pair-a", [staged_local], [staged_remote], set(),
+                )
+                self.assertIsNotNone(pair_build)
+                assert pair_build is not None
+
+                changed = SystemFile("current-" + changed_side + ".bin", 50, False)
+                changed.path_pair_id = "pair-a"
+                if changed_side == "local":
+                    builder.set_local_files([changed])
+                else:
+                    builder.set_remote_files([changed])
+
+                current_local = dict(builder._ModelBuilder__local_files_by_pair["pair-a"])
+                current_remote = dict(builder._ModelBuilder__remote_files_by_pair["pair-a"])
+                self.assertFalse(builder.commit_authoritative_pair_sources_for_full_rebuild(pair_build))
+                self.assertEqual(
+                    set(current_local), set(builder._ModelBuilder__local_files_by_pair["pair-a"]),
+                )
+                self.assertEqual(
+                    set(current_remote), set(builder._ModelBuilder__remote_files_by_pair["pair-a"]),
+                )
+                for file_id, source in current_local.items():
+                    self.assertIs(source, builder._ModelBuilder__local_files_by_pair["pair-a"][file_id])
+                for file_id, source in current_remote.items():
+                    self.assertIs(source, builder._ModelBuilder__remote_files_by_pair["pair-a"][file_id])
+                self.assertTrue(builder.has_changes())
+
+    def test_authoritative_pair_fallback_refuses_nested_delete_after_authorization(self):
+        local_root = SystemFile("release", 20, True)
+        local_root.path_pair_id = "pair-a"
+        local_root.add_child(SystemFile("deleted.bin", 10, False))
+        local_root.add_child(SystemFile("keep.bin", 10, False))
+        remote_root = SystemFile("release", 20, True)
+        remote_root.path_pair_id = "pair-a"
+        remote_root.add_child(SystemFile("deleted.bin", 10, False))
+        remote_root.add_child(SystemFile("keep.bin", 10, False))
+        builder = ModelBuilder()
+        builder.set_local_files([local_root])
+        builder.set_remote_files([remote_root])
+        live = builder.build_model()
+        root_id = ModelFile.build_file_id("release", "pair-a")
+        deleted_id = ModelFile.build_file_id(os.path.join("release", "deleted.bin"), "pair-a")
+        staged_local = SystemFile("release", 21, True)
+        staged_local.path_pair_id = "pair-a"
+        staged_local.add_child(SystemFile("deleted.bin", 10, False))
+        staged_local.add_child(SystemFile("keep.bin", 11, False))
+        staged_remote = SystemFile("release", 21, True)
+        staged_remote.path_pair_id = "pair-a"
+        staged_remote.add_child(SystemFile("deleted.bin", 10, False))
+        staged_remote.add_child(SystemFile("keep.bin", 11, False))
+        pair_build = builder.build_authoritative_pair_roots(
+            "pair-a", [staged_local], [staged_remote], set(),
+        )
+        self.assertIsNotNone(pair_build)
+        assert pair_build is not None
+        self.assertTrue(builder.authorize_authoritative_pair_delta(
+            lambda file_id: file_id in live.get_file_ids(), pair_build,
+        ))
+
+        builder.confirm_local_deletions({deleted_id})
+        current_local_root = builder._ModelBuilder__local_files_by_pair["pair-a"][root_id]
+        self.assertEqual(
+            {"keep.bin"}, {child.name for child in current_local_root.iter_children()},
+        )
+        self.assertFalse(builder.authorize_authoritative_pair_delta(
+            lambda file_id: file_id in live.get_file_ids(), pair_build,
+        ))
+        self.assertFalse(builder.commit_authoritative_pair_sources_for_full_rebuild(pair_build))
+
+        retained_root = builder._ModelBuilder__local_files_by_pair["pair-a"][root_id]
+        self.assertIs(current_local_root, retained_root)
+        self.assertEqual({"keep.bin"}, {child.name for child in retained_root.iter_children()})
+        self.assertTrue(builder.has_changes())
 
     def test_active_transfer_delta_builds_only_known_changed_root_and_adopts_live_model(self):
         active = SystemFile("active.bin", 100, False)
@@ -11074,6 +11165,49 @@ class TestModelBuilder(unittest.TestCase):
             if entry["message"] == "local_source_adoption"
         ]
         self.assertEqual(1, len(entries))
+
+    def test_local_source_adoption_trace_distinguishes_selected_root_size_changes(self):
+        root_id = ModelFile.build_file_id("selected-root.bin", "pair-a")
+        self.model_builder._ModelBuilder__target_archive_trace_file_id = root_id
+        collector = self.__enable_local_source_adoption_trace()
+        old_root = SystemFile("selected-root.bin", 4, False)
+        old_root.path_pair_id = "pair-a"
+        self.model_builder.set_local_files([old_root])
+
+        updated_root = SystemFile("selected-root.bin", 9, False)
+        updated_root.path_pair_id = "pair-a"
+        self.model_builder.set_local_files([updated_root])
+
+        same_size_replacement = SystemFile("selected-root.bin", 9, True)
+        same_size_replacement.path_pair_id = "pair-a"
+        same_size_replacement.add_child(SystemFile("different-private-child.bin", 9, False))
+        self.model_builder.set_local_files([same_size_replacement])
+
+        entries = [
+            entry for entry in self.__trace_entries(collector, include_root_decisions=True)
+            if entry["message"] == "local_source_adoption"
+        ]
+        self.assertEqual(3, len(entries))
+        size_change = entries[-2]["details"]
+        self.assertEqual(4, size_change["selected_current_size"])
+        self.assertEqual(9, size_change["selected_incoming_size"])
+        details = entries[-1]["details"]
+        self.assertEqual("local_files_set", details["phase"])
+        self.assertEqual(1, details["current_root_count"])
+        self.assertEqual(1, details["incoming_root_count"])
+        self.assertEqual(1, details["committed_root_count"])
+        self.assertEqual(9, details["selected_current_size"])
+        self.assertEqual(9, details["selected_incoming_size"])
+        self.assertEqual(9, details["selected_committed_size"])
+        self.assertTrue(details["selected_current_present"])
+        self.assertTrue(details["selected_incoming_present"])
+        self.assertTrue(details["selected_committed_present"])
+        self.assertFalse(details["selected_current_same_incoming"])
+        self.assertFalse(details["selected_current_same_committed"])
+        self.assertTrue(details["selected_incoming_same_committed"])
+        self.assertNotEqual(root_id, details["selected_root_ref"])
+        self.assertNotIn("selected-root.bin", str(details))
+        self.assertNotIn("different-private-child.bin", str(details))
 
     def test_local_source_adoption_trace_joins_authoritative_pair_commit(self):
         root = SystemFile("private-root", 4, True)

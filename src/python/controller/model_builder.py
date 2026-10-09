@@ -5488,6 +5488,27 @@ class ModelBuilder:
                         prefix + "_" + name: count
                         for name, count in self.__local_source_root_counts(roots).items()
                     })
+                selected_root_id = self.__target_archive_trace_file_id
+                if isinstance(selected_root_id, str) and selected_root_id:
+                    details["selected_root_ref"] = opaque_trace_correlation(selected_root_id)
+                    selected_roots: dict[str, Optional[SystemFile]] = {}
+                    for prefix, roots in (
+                            ("current", current_roots),
+                            ("incoming", incoming_roots),
+                            ("committed", committed_roots),
+                    ):
+                        selected_root = roots.get(selected_root_id)
+                        selected_roots[prefix] = selected_root
+                        size = getattr(selected_root, "size", None)
+                        details["selected_" + prefix + "_present"] = selected_root is not None
+                        details["selected_" + prefix + "_size"] = size \
+                            if type(size) is int and size >= 0 else None
+                    for left, right in (("current", "incoming"), ("current", "committed"),
+                                        ("incoming", "committed")):
+                        left_root = selected_roots[left]
+                        right_root = selected_roots[right]
+                        details["selected_" + left + "_same_" + right] = \
+                            (left_root is right_root) if left_root is not None and right_root is not None else None
                 signature = json.dumps(details, sort_keys=True, separators=(",", ":"))
                 signature_key = ("local-source-adoption:" + pair_correlation, stage)
                 if self.__stop_resume_trace_last_signatures.get(signature_key) == "retained:" + signature:
@@ -5853,6 +5874,21 @@ class ModelBuilder:
         except Exception:
             return False
 
+    @staticmethod
+    def __same_source_bucket_by_identity(
+            current: object, previous: object,
+    ) -> bool:
+        """Compare a staged source bucket without descending into file trees."""
+        if current is previous:
+            return True
+        if not isinstance(current, dict) or not isinstance(previous, dict) or \
+                len(current) != len(previous):
+            return False
+        for file_id, source in previous.items():
+            if file_id not in current or current[file_id] is not source:
+                return False
+        return True
+
     def adopt_authoritative_pair_delta(
             self, applied_model: Model, pair_build: _AuthoritativePairBuild,
             applied_invalidation_tokens: Optional[Set[int]] = None,
@@ -5916,14 +5952,23 @@ class ModelBuilder:
 
     def commit_authoritative_pair_sources_for_full_rebuild(
             self, pair_build: _AuthoritativePairBuild,
-    ) -> None:
+    ) -> bool:
         """Keep a final scan authoritative when its live delta is rejected."""
+        pair_id = pair_build.path_pair_id
+        if not self.__same_source_bucket_by_identity(
+                self.__local_files_by_pair.get(pair_id, {}), pair_build.previous_local_files,
+        ) or not self.__same_source_bucket_by_identity(
+                self.__remote_files_by_pair.get(pair_id, {}), pair_build.previous_remote_files,
+        ):
+            self.request_rebuild()
+            return False
         local_sources_changed = self.__replace_authoritative_pair_sources(pair_build)
         self.__record_local_inventory_after_pair_source_commit(
             pair_build.path_pair_id, local_sources_changed,
         )
         self.__unknown_local_path_pair_ids = set(pair_build.unknown_local_path_pair_ids)
         self.request_rebuild()
+        return True
 
     def replace_completed_pair_sources_for_full_rebuild(
             self, path_pair_id: Optional[str], local_files: Optional[List[SystemFile]],

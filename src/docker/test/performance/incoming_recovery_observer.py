@@ -456,7 +456,7 @@ _CAPTURE_EVENTS = frozenset({
 })
 _CAPTURE_CATEGORIES = frozenset({
     "queue.lifecycle", "queue.admission", "queue.executor", "queue.authority", "queue.readiness", "queue.exclusion", "model_page_snapshot",
-    "model.lifecycle", "model.progress", "model.publication", "model.finalization", "model.root_progress", "lifecycle.persist", "status",
+    "model.lifecycle", "model.progress", "model.candidate", "model.publication", "model.finalization", "model.root_progress", "lifecycle.persist", "status",
     "transfer.lftp", "transfer.lftp.executor", "transfer.lftp.membership", "transfer.lftp.status", "transfer.stop",
     "scan.authority", "scan.adoption", "scan.failure", "scan.result", "scan.lifecycle", "scan.root_shape", "scan.terminal_publication", "final_move.publication",
     "finalization.child", "controller", "scanner_process", "lftp.sidecar", "lftp.command", "lftp.status",
@@ -1683,6 +1683,57 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
         safe_lifecycle_persist = _sanitize_lifecycle_persist(lifecycle_persist)
         if safe_lifecycle_persist is not None:
             result["lifecycle_persist"] = safe_lifecycle_persist
+    source_adoption = value.get("source_adoption")
+    if (result.get("source") == "model_builder" and result.get("category") == "scan.root_shape"
+            and isinstance(source_adoption, Mapping)):
+        schema_known = source_adoption.get("schema") == "model_builder.local_source_adoption.v1"
+        phase = source_adoption.get("phase")
+        pair_correlation = source_adoption.get("path_pair_correlation")
+        selected_root_ref = source_adoption.get("selected_root_ref")
+        safe_adoption: dict[str, object] = {
+            "schema": "model_builder.local_source_adoption.v1" if schema_known else "unknown",
+            "phase": phase if isinstance(phase, str) and phase in {
+                "local_files_set", "authoritative_pair_commit", "root_scan_proof_adoption",
+            } else "unknown",
+            "path_pair_correlation": pair_correlation if isinstance(pair_correlation, str)
+            and re.fullmatch(r"[0-9a-f]{16}", pair_correlation) else "unknown",
+            "selected_root_ref": selected_root_ref if isinstance(selected_root_ref, str)
+            and re.fullmatch(r"[0-9a-f]{16}", selected_root_ref) else None,
+            "source_generation_known": source_adoption.get("source_generation_known")
+            if type(source_adoption.get("source_generation_known")) is bool else None,
+        }
+        for prefix in ("current", "incoming", "committed"):
+            for suffix in ("root_count", "file_root_count", "directory_root_count"):
+                item = source_adoption.get(prefix + "_" + suffix)
+                safe_adoption[prefix + "_" + suffix] = (
+                    item if isinstance(item, str) and item.isdigit() and int(item) < 2**63 else None
+                )
+            present = source_adoption.get("selected_" + prefix + "_present")
+            safe_adoption["selected_" + prefix + "_present"] = present if type(present) is bool else None
+            size = source_adoption.get("selected_" + prefix + "_size")
+            safe_adoption["selected_" + prefix + "_size"] = (
+                size if isinstance(size, str) and size.isdigit() and int(size) < 2**63 else None
+            )
+        for left, right in (("current", "incoming"), ("current", "committed"), ("incoming", "committed")):
+            key = "selected_" + left + "_same_" + right
+            item = source_adoption.get(key)
+            safe_adoption[key] = item if type(item) is bool else None
+        result["source_adoption"] = safe_adoption
+    candidate_fallback = value.get("candidate_pair_fallback")
+    if (result.get("source") == "model_updater" and result.get("category") == "model.candidate"
+            and result.get("stage") == "model" and isinstance(candidate_fallback, Mapping)):
+        reason = candidate_fallback.get("reason")
+        count = candidate_fallback.get("staged_pair_count")
+        committer_available = candidate_fallback.get("committer_available")
+        accepted = candidate_fallback.get("source_commit_accepted")
+        result["candidate_pair_fallback"] = {
+            "reason": reason if isinstance(reason, str) and reason in {
+                "authorization_rejected", "exception", "missing_model", "prerequisites",
+            } else "unknown",
+            "staged_pair_count": count if isinstance(count, str) and count.isdigit() and len(count) <= 10 else None,
+            "committer_available": committer_available if type(committer_available) is bool else None,
+            "source_commit_accepted": accepted if type(accepted) is bool else None,
+        }
     return result
 
 

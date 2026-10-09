@@ -10123,12 +10123,20 @@ class ModelUpdater(_ControllerCoreAccess):
         pair_fallback_committer = getattr(
             model_builder, "commit_authoritative_pair_sources_for_full_rebuild", None
         )
+        if callable(pair_fallback_committer):
+            raw_pair_fallback_committer = pair_fallback_committer
+            pair_source_lock = getattr(controller, "_Controller__model_lock", None)
+            if pair_source_lock is not None:
+                def pair_fallback_committer(pair_build: object) -> object:
+                    with pair_source_lock:
+                        return raw_pair_fallback_committer(pair_build)
         pair_authorizer = getattr(model_builder, "authorize_authoritative_pair_delta", None)
         pair_adopter = getattr(model_builder, "adopt_authoritative_pair_delta", None)
 
         def record_candidate_attribution(
                 counter: str, message: str, reason: str, *,
                 staged_pair_count: int = 0, committer_available: bool = False,
+                source_commit_accepted: Optional[bool] = None,
         ) -> None:
             """Publish only closed-world candidate control-flow attribution."""
             try:
@@ -10149,6 +10157,8 @@ class ModelUpdater(_ControllerCoreAccess):
                             "reason": reason,
                             "staged_pair_count": staged_pair_count,
                             "committer_available": committer_available,
+                            **({"source_commit_accepted": source_commit_accepted}
+                               if type(source_commit_accepted) is bool else {}),
                         },
                         event_type="state_transition",
                         category="model.candidate",
@@ -10230,22 +10240,28 @@ class ModelUpdater(_ControllerCoreAccess):
                     authoritative_pair_build = None
             if not pair_safe:
                 authoritative_pair_fallback_reason = pair_fallback_reason
+                source_commit_accepted: Optional[bool] = None
+                if callable(pair_fallback_committer):
+                    fallback_commits_accepted = True
+                    for staged_pair_build in authoritative_pair_delta_builds:
+                        commit_result = pair_fallback_committer(staged_pair_build)
+                        if commit_result is False:
+                            fallback_commits_accepted = False
+                    # The fallback commits the staged pair's current local
+                    # and remote buckets. Its normal return is therefore the
+                    # same authority-adoption boundary as the fast path.
+                    progressive_source_buckets_adopted = fallback_commits_accepted
+                    source_commit_accepted = fallback_commits_accepted
+                else:
+                    model_builder.request_rebuild()
                 record_candidate_attribution(
                     COUNTER_CANDIDATE_PAIR_FALLBACK,
                     "candidate_pair_fallback",
                     pair_fallback_reason,
                     staged_pair_count=len(authoritative_pair_delta_builds),
                     committer_available=callable(pair_fallback_committer),
+                    source_commit_accepted=source_commit_accepted,
                 )
-                if callable(pair_fallback_committer):
-                    for staged_pair_build in authoritative_pair_delta_builds:
-                        pair_fallback_committer(staged_pair_build)
-                    # The fallback commits the staged pair's current local
-                    # and remote buckets. Its normal return is therefore the
-                    # same authority-adoption boundary as the fast path.
-                    progressive_source_buckets_adopted = True
-                else:
-                    model_builder.request_rebuild()
                 authoritative_pair_delta_builds = []
 
         # A live transfer status is the only input that can safely repaint an

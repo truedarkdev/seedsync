@@ -35,7 +35,7 @@ _READ_CHUNK_BYTES = 8192
 _CATEGORIES = frozenset(
     {
         "queue.lifecycle", "queue.admission", "queue.executor", "queue.authority",
-        "queue.readiness", "queue.exclusion", "model.lifecycle", "model.progress", "model_page_snapshot",
+        "queue.readiness", "queue.exclusion", "model.lifecycle", "model.progress", "model.candidate", "model_page_snapshot",
         "model.publication", "model.finalization", "model.root_progress", "lifecycle.persist", "status",
         "transfer.lftp", "transfer.lftp.executor", "transfer.lftp.membership",
         "transfer.lftp.status", "transfer.stop", "scan.authority", "scan.adoption", "scan.failure",
@@ -357,6 +357,8 @@ _COMPLETION_GATE_DECISION_MESSAGES = frozenset({"completion_gate_decision"})
 _PENDING_COMPLETION_AUTHORITY_WAKE_MESSAGE = "pending_completion_authority_wake"
 _LOCAL_ROOT_PROOF_TRANSITION_MESSAGE = "local_root_proof_transition"
 _LOCAL_ROOT_PROOF_TRANSITION_SCHEMA = "local_root_proof_transition.v1"
+_LOCAL_SOURCE_ADOPTION_SCHEMA = "model_builder.local_source_adoption.v1"
+_CANDIDATE_PAIR_FALLBACK_REASONS = frozenset({"authorization_rejected", "exception", "missing_model", "prerequisites"})
 _LOCAL_ROOT_PROOF_TRANSITION_MAX_TARGETS = 8
 _LOCAL_ROOT_PROOF_TRANSITION_RELATIONS = frozenset({"match", "mismatch", "unknown", "not_checked"})
 _LOCAL_ROOT_PROOF_TRANSITION_ENTRIES = frozenset({"absent", "malformed", "present", "unknown"})
@@ -776,6 +778,55 @@ def _local_root_proof_transition_facts(details: Mapping[str, object], message: o
         maximum = _LOCAL_ROOT_PROOF_TRANSITION_MAX_TARGETS - 1 if key == "target_index" else 2 ** 31 - 1
         result[key] = value if type(value) is int and 0 <= value <= maximum else None
     return result
+
+
+def _local_source_adoption_facts(details: Mapping[str, object], message: object) -> dict[str, object] | None:
+    if message != "local_source_adoption" or details.get("schema") != _LOCAL_SOURCE_ADOPTION_SCHEMA:
+        return None
+    pair_correlation = details.get("path_pair_correlation")
+    selected_root_ref = details.get("selected_root_ref")
+    phase = details.get("phase")
+    result: dict[str, object] = {
+        "schema": _LOCAL_SOURCE_ADOPTION_SCHEMA,
+        "phase": phase if isinstance(phase, str) and phase in {
+            "local_files_set", "authoritative_pair_commit", "root_scan_proof_adoption",
+        } else "unknown",
+        "path_pair_correlation": pair_correlation if isinstance(pair_correlation, str)
+        and re.fullmatch(r"[0-9a-f]{16}", pair_correlation) else "unknown",
+        "selected_root_ref": selected_root_ref if isinstance(selected_root_ref, str)
+        and re.fullmatch(r"[0-9a-f]{16}", selected_root_ref) else None,
+        "source_generation_known": details.get("source_generation_known")
+        if type(details.get("source_generation_known")) is bool else None,
+    }
+    for prefix in ("current", "incoming", "committed"):
+        for suffix in ("root_count", "file_root_count", "directory_root_count"):
+            item = details.get(prefix + "_" + suffix)
+            result[prefix + "_" + suffix] = str(item) if type(item) is int and 0 <= item < 2**63 else None
+        present = details.get("selected_" + prefix + "_present")
+        result["selected_" + prefix + "_present"] = present if type(present) is bool else None
+        size = details.get("selected_" + prefix + "_size")
+        result["selected_" + prefix + "_size"] = str(size) if type(size) is int and 0 <= size < 2**63 else None
+    for left, right in (("current", "incoming"), ("current", "committed"), ("incoming", "committed")):
+        key = "selected_" + left + "_same_" + right
+        item = details.get(key)
+        result[key] = item if type(item) is bool else None
+    return result
+
+
+def _candidate_pair_fallback_facts(details: Mapping[str, object], message: object) -> dict[str, object] | None:
+    if message != "candidate_pair_fallback":
+        return None
+    reason = details.get("reason")
+    staged_count = details.get("staged_pair_count")
+    committer_available = details.get("committer_available")
+    accepted = details.get("source_commit_accepted")
+    return {
+        "reason": reason if isinstance(reason, str) and reason in _CANDIDATE_PAIR_FALLBACK_REASONS else "unknown",
+        "staged_pair_count": str(staged_count)
+        if type(staged_count) is int and 0 <= staged_count < 2**31 else None,
+        "committer_available": committer_available if type(committer_available) is bool else None,
+        "source_commit_accepted": accepted if type(accepted) is bool else None,
+    }
 
 
 def _final_move_publication_facts(details: Mapping[str, object], message: object) -> dict[str, object] | None:
@@ -1649,6 +1700,14 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         _local_root_proof_transition_facts(details, message)
         if category == "scan.root_shape" else None
     )
+    source_adoption = (
+        _local_source_adoption_facts(details, message)
+        if source == "model_builder" and category == "scan.root_shape" else None
+    )
+    candidate_pair_fallback = (
+        _candidate_pair_fallback_facts(details, message)
+        if source == "model_updater" and category == "model.candidate" and stage == "model" else None
+    )
     final_move = (
         _final_move_publication_facts(details, message) if category == "final_move.publication" else None
     )
@@ -1723,6 +1782,10 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["completion_gate"] = gate
     if proof_transition is not None:
         result["local_root_proof_transition"] = proof_transition
+    if source_adoption is not None:
+        result["source_adoption"] = source_adoption
+    if candidate_pair_fallback is not None:
+        result["candidate_pair_fallback"] = candidate_pair_fallback
     if final_move is not None:
         result["final_move_publication"] = final_move
     if automatic_move_boundary is not None:

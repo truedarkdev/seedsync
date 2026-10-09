@@ -1740,3 +1740,52 @@ def test_confirmed_delete_gate_sanitizer_keeps_only_schema_shaped_facts():
     assert wrong_schema["schema"] == "unknown"
     assert wrong_schema["fence_result"] is None and wrong_schema["local_generation"] == "unknown"
     assert "private_path" not in json.dumps(wrong_schema)
+
+
+def test_source_base_diagnostics_survive_finite_projection_without_private_labels():
+    row = {
+        "source": "model_updater", "category": "model.candidate", "event_type": "state_transition",
+        "stage": "model", "level": "info", "message": "candidate_pair_fallback",
+        "corr_id": "model_update:aggregate",
+        "details": {
+            "reason": "authorization_rejected", "staged_pair_count": 1,
+            "committer_available": True, "source_commit_accepted": False,
+            "private_path": "/private/root",
+        },
+    }
+    projected, rejected = capture._projection(row)
+    assert not rejected and projected is not None
+    assert projected["candidate_pair_fallback"] == {
+        "reason": "authorization_rejected", "staged_pair_count": "1",
+        "committer_available": True, "source_commit_accepted": False,
+    }
+    safe = observer._sanitize_capture_projection(projected)
+    assert safe["candidate_pair_fallback"] == projected["candidate_pair_fallback"]
+    assert "/private/root" not in json.dumps(safe)
+
+    adoption, rejected = capture._projection({
+        "source": "model_builder", "category": "scan.root_shape", "event_type": "diagnostic",
+        "stage": "scan_adoption", "level": "info", "message": "local_source_adoption",
+        "details": {
+            "schema": "model_builder.local_source_adoption.v1", "phase": "local_files_set",
+            "path_pair_correlation": "0123456789abcdef", "source_generation_known": False,
+            "current_root_count": 1, "current_file_root_count": 1, "current_directory_root_count": 0,
+            "incoming_root_count": 1, "incoming_file_root_count": 1, "incoming_directory_root_count": 0,
+            "committed_root_count": 1, "committed_file_root_count": 1, "committed_directory_root_count": 0,
+            "selected_root_ref": "fedcba9876543210",
+            "selected_current_present": True, "selected_current_size": 2**53 + 1,
+            "selected_incoming_present": True, "selected_incoming_size": 2**53 + 9,
+            "selected_committed_present": True, "selected_committed_size": 2**53 + 9,
+            "selected_current_same_incoming": False, "selected_current_same_committed": False,
+            "selected_incoming_same_committed": True,
+            "private_name": "do-not-copy",
+        },
+    })
+    assert not rejected and adoption is not None
+    safe_adoption = observer._sanitize_capture_projection(adoption)["source_adoption"]
+    assert safe_adoption["selected_current_size"] == str(2**53 + 1)
+    assert safe_adoption["selected_incoming_size"] == str(2**53 + 9)
+    assert safe_adoption["selected_committed_size"] == str(2**53 + 9)
+    assert safe_adoption["selected_current_same_incoming"] is False
+    assert safe_adoption["selected_incoming_same_committed"] is True
+    assert "do-not-copy" not in json.dumps(safe_adoption)
