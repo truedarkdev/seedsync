@@ -31,7 +31,11 @@ from seedsync import Seedsync
 
 
 def _emit_worker_boundary(emitter):
-    emitter.record("controller", "worker_boundary", category="queue.lifecycle")
+    emitter.record("controller", "worker_default_scope", category="queue.lifecycle")
+    emitter.record(
+        "controller", "worker_boundary", category="queue.lifecycle",
+        trace_scope="global",
+    )
 
 
 class TestBreadcrumbDurableSpool(unittest.TestCase):
@@ -717,6 +721,91 @@ class TestBreadcrumbDurableSpool(unittest.TestCase):
             8 * 1024,
         )
 
+    def test_ingress_preserves_routing_metadata_before_selected_root_details(self):
+        revision = multiprocessing.Value("L", 3)
+        epoch = multiprocessing.Value("L", 4)
+        maximum = (2 ** 63) - 1
+        fixed_header = _bounded_ingress_record(
+            "", "", {}, {}, maximum,
+            multiprocessing.Value("Q", maximum),
+            multiprocessing.Value("Q", maximum),
+        )
+        self.assertIsNotNone(fixed_header)
+        self.assertEqual(fixed_header["created_ns"], maximum)
+        self.assertEqual(fixed_header["policy_revision"], maximum)
+        self.assertEqual(fixed_header["policy_epoch"], maximum)
+        self.assertLessEqual(
+            len(json.dumps(fixed_header, separators=(",", ":")).encode("utf-8")),
+            256,
+        )
+
+        stage = "model_builder_local_source_root_scan_proof_adoption"
+        details = {
+            "schema": "local_source_adoption.v1",
+            "phase": "selected_root_source_counts",
+            "path_pair_known": True,
+            "path_pair_correlation": "b" * 16,
+            "source_generation_known": True,
+            "current_root_count": 5,
+            "current_file_root_count": 0,
+            "current_directory_root_count": 5,
+            "incoming_root_count": 3,
+            "incoming_file_root_count": 0,
+            "incoming_directory_root_count": 3,
+            "committed_root_count": 5,
+            "committed_file_root_count": 0,
+            "committed_directory_root_count": 5,
+            "selected_root_ref": "a" * 16,
+            "selected_current_present": True,
+            "selected_current_size": 32_777_843_015,
+            "selected_incoming_present": False,
+            "selected_incoming_size": None,
+            "selected_committed_present": True,
+            "selected_committed_size": 32_777_843_015,
+            "selected_current_same_incoming": None,
+            "selected_current_same_committed": True,
+            "selected_incoming_same_committed": None,
+        }
+        metadata = {
+            "stage": stage,
+            "event_type": "diagnostic",
+            "category": "model_builder",
+            "level": "info",
+            "corr_id": "c" * 16,
+            "trace_scope": "flow",
+            "_coalesce_key": "local_source_adoption:" + "d" * 16,
+        }
+
+        record = _bounded_ingress_record(
+            "model_builder", "local_source_adoption", details, metadata,
+            time.time_ns(), revision, epoch,
+        )
+
+        self.assertIsNotNone(record)
+        self.assertEqual(record["metadata"], metadata)
+        self.assertEqual(record["details"], details)
+        self.assertLessEqual(len(record["metadata"]), 24)
+        self.assertLessEqual(len(record["details"]), 24)
+        self.assertLessEqual(
+            len(json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")),
+            8 * 1024,
+        )
+
+        details["selected_current_size"] = 4
+        details["selected_committed_size"] = (2 ** 63) + 17
+        wide_record = _bounded_ingress_record(
+            "model_builder", "local_source_adoption", details, metadata,
+            time.time_ns(), revision, epoch,
+        )
+        self.assertIsNotNone(wide_record)
+        self.assertEqual(wide_record["metadata"]["stage"], stage)
+        self.assertEqual(wide_record["details"]["selected_current_size"], 4)
+        self.assertEqual(wide_record["details"]["selected_committed_size"], (2 ** 63) + 17)
+        self.assertLessEqual(
+            len(json.dumps(wide_record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")),
+            8 * 1024,
+        )
+
     def test_retention_prune_failure_disables_future_durable_writes(self):
         with tempfile.TemporaryDirectory() as path:
             spool = BreadcrumbDurableSpool(
@@ -873,6 +962,15 @@ class TestBreadcrumbDurableSpool(unittest.TestCase):
             self.assertFalse(health.get("thread_alive", True))
             ingress = collector.ingress_snapshot()
             self.assertEqual(ingress["critical_enqueued"], ingress["critical_ack"])
+            with open(os.path.join(path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                worker_records = {
+                    record["message"]: record for line in handle if line.strip()
+                    for record in [json.loads(line)]
+                    if record.get("message") in ("worker_default_scope", "worker_boundary")
+                }
+            self.assertEqual({"worker_default_scope", "worker_boundary"}, set(worker_records))
+            self.assertEqual("flow", worker_records["worker_default_scope"]["trace_scope"])
+            self.assertEqual("global", worker_records["worker_boundary"]["trace_scope"])
 
     def test_concurrent_feeder_is_rejected_at_close_gate_with_bounded_return(self):
         with tempfile.TemporaryDirectory() as path:

@@ -46,7 +46,7 @@ _INGRESS_MAPPING_MAX_ITEMS = 24
 _INGRESS_LIST_MAX_ITEMS = 16
 _INGRESS_NODE_BUDGET = 256
 _INGRESS_STRING_MAX_CHARS = 256
-_INGRESS_FIXED_JSON_OVERHEAD = 2048
+_INGRESS_FIXED_JSON_OVERHEAD = 256
 _INGRESS_TAIL_OVERHEAD = 256
 _SHARED_POLICY_MAX_BYTES = 64 * 1024
 _EFFECTIVE_POLICY_CATEGORY_CACHE_MAX = 128
@@ -2202,7 +2202,10 @@ def _bounded_ingress_record(source: object, message: object, details: object,
     try:
         record = {
             "source": sanitize(source), "message": sanitize(message),
-            "details": sanitize(details), "metadata": sanitize(metadata),
+            # Admission and routing fields decide how the parent handles the
+            # record, so retain them before optional diagnostic payload when
+            # the shared byte budget is tight.
+            "metadata": sanitize(metadata), "details": sanitize(details),
             "created_ns": bounded_created_ns, "created_ms": bounded_created_ms,
             "policy_revision": revision,
             "policy_epoch": epoch,
@@ -6510,6 +6513,7 @@ class BreadcrumbTraceCollector:
                 allow_when_disabled=True,
                 stage=metadata.get("stage"),
                 event_type=metadata.get("event_type", "breadcrumb"),
+                trace_scope=metadata.get("trace_scope", "flow"),
                 category=metadata.get("category", source),
                 level=metadata.get("level", "info"),
                 corr_id=metadata.get("corr_id"),
