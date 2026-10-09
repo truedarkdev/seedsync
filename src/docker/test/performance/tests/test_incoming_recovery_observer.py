@@ -820,6 +820,12 @@ def test_queue_readiness_scan_diagnostics_sanitize_exact_decimal_and_unknowns():
                 "remote_ready": True, "overlay_unknown": True, "process_generation": wide,
                 "effective_work_floor": "4", "root_generation": wide, "source_present": True,
                 "run_matches_current": True, "builder_proof_matches_source": False,
+                "root_proof_gate": {
+                    "gate": "confirmed_delete", "active_generation": wide,
+                    "outcome_generation": str(int(wide) - 2), "root_final_complete": True,
+                    "root_staging_complete": False, "confirmed_delete_generation": "7",
+                    "source_root_present": False, "source_root_matches": False,
+                },
                 "root_vs_work_floor": "below", "root_vs_process_generation": "at_or_below",
                 "run_matches_baseline": True, "generation_vs_baseline": "equal",
                 "path": "/private/path", "session": "private-session",
@@ -836,6 +842,12 @@ def test_queue_readiness_scan_diagnostics_sanitize_exact_decimal_and_unknowns():
     assert readiness["scan_failure"]["failure_run_ref"] == "012345abcdef"
     assert readiness["fresh_root_proof"]["process_generation"] == wide
     assert readiness["fresh_root_proof"]["root_generation"] == wide
+    assert readiness["fresh_root_proof"]["root_proof_gate"] == {
+        "gate": "confirmed_delete", "active_generation": wide,
+        "outcome_generation": str(int(wide) - 2), "root_final_complete": True,
+        "root_staging_complete": False, "confirmed_delete_generation": "7",
+        "source_root_present": False, "source_root_matches": False,
+    }
     assert "/private/path" not in json.dumps(safe) and "private-session" not in json.dumps(safe)
 
     malformed = observer._sanitize_capture_projection({
@@ -847,6 +859,8 @@ def test_queue_readiness_scan_diagnostics_sanitize_exact_decimal_and_unknowns():
                              "failure_ignored_reason": "private", "baseline_generation": True,
                              "failure_run_ref": "/private/session"},
             "fresh_root_proof": {"result": "accepted", "root_shape_ok": "true",
+                                 "root_proof_gate": {"gate": "/private/gate", "active_generation": "01",
+                                                      "source_root_matches": 1},
                                  "root_generation": str(2**63)},
         },
     })["queue_readiness"]
@@ -861,6 +875,12 @@ def test_queue_readiness_scan_diagnostics_sanitize_exact_decimal_and_unknowns():
     assert malformed["scan_failure"]["failure_run_ref"] is None
     assert malformed["fresh_root_proof"]["root_shape_ok"] is None
     assert malformed["fresh_root_proof"]["root_generation"] is None
+    assert malformed["fresh_root_proof"]["root_proof_gate"] == {
+        "gate": "unknown", "active_generation": None, "outcome_generation": None,
+        "root_final_complete": None, "root_staging_complete": None,
+        "confirmed_delete_generation": None, "source_root_present": None,
+        "source_root_matches": None,
+    }
 
 
 def test_completion_move_projection_sanitizer_preserves_finite_facts():

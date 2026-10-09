@@ -196,6 +196,17 @@ _QUEUE_FRESH_ROOT_REASONS = frozenset({
     "below_work_floor", "ahead_of_process", "builder_proof_mismatch", "inspection_error",
     "baseline_unavailable", "baseline_run_mismatch", "baseline_not_newer", "unknown",
 })
+_QUEUE_ROOT_PROOF_GATES = frozenset({
+    "invalid_root", "no_active_generation", "no_current_outcome", "outcome_generation_mismatch",
+    "root_outcome_missing", "root_outcome_invalid", "root_incomplete", "confirmed_delete",
+    "source_absent", "source_shape", "accepted",
+})
+_QUEUE_ROOT_PROOF_GATE_BOOLEANS = (
+    "root_final_complete", "root_staging_complete", "source_root_present", "source_root_matches",
+)
+_QUEUE_ROOT_PROOF_GATE_GENERATIONS = (
+    "active_generation", "outcome_generation", "confirmed_delete_generation",
+)
 _QUEUE_FRESH_ROOT_FLOOR_RELATIONS = frozenset({"at_or_above", "below", "unknown"})
 _QUEUE_FRESH_ROOT_PROCESS_RELATIONS = frozenset({"at_or_below", "ahead", "unknown"})
 _QUEUE_SCAN_FAILURE_INTEGER_MAX = 2**63 - 1
@@ -985,6 +996,21 @@ def _queue_nested_diagnostic_facts(value: object, fields: tuple[object, object, 
     return result
 
 
+def _queue_root_proof_gate_facts(value: object) -> dict[str, object]:
+    source = value if isinstance(value, Mapping) else {}
+    gate = source.get("gate")
+    result: dict[str, object] = {
+        "gate": gate if isinstance(gate, str) and gate in _QUEUE_ROOT_PROOF_GATES else "unknown",
+    }
+    for key in _QUEUE_ROOT_PROOF_GATE_BOOLEANS:
+        item = source.get(key)
+        result[key] = item if type(item) is bool else None
+    for key in _QUEUE_ROOT_PROOF_GATE_GENERATIONS:
+        item = source.get(key)
+        result[key] = str(item) if type(item) is int and 0 <= item <= _QUEUE_SCAN_FAILURE_INTEGER_MAX else None
+    return result
+
+
 def _queue_readiness_facts(message: object, details: Mapping[str, object]) -> dict[str, object] | None:
     """Project only the finite, source-shaped Queue readiness discriminator."""
     schema = details.get("schema")
@@ -1033,6 +1059,8 @@ def _queue_readiness_facts(message: object, details: Mapping[str, object]) -> di
             facts = _queue_nested_diagnostic_facts(nested, fields)
             if key == "scan_failure":
                 facts.update(_scan_failure_origin_facts(nested if isinstance(nested, Mapping) else {}))
+            elif key == "fresh_root_proof" and isinstance(nested, Mapping) and "root_proof_gate" in nested:
+                facts["root_proof_gate"] = _queue_root_proof_gate_facts(nested.get("root_proof_gate"))
             result[key] = facts
     return result
 

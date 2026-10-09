@@ -17420,6 +17420,7 @@ class TestController(unittest.TestCase):
         self.assertEqual({"snapshot": 1, "source": 1, "builder": 1}, calls)
         self.assertEqual("accepted", proof_diagnostic["result"])
         self.assertEqual("accepted", proof_diagnostic["reason"])
+        self.assertNotIn("root_proof_gate", proof_diagnostic)
         self.assertTrue(proof_diagnostic["root_shape_ok"])
         self.assertTrue(proof_diagnostic["remote_ready"])
         self.assertTrue(proof_diagnostic["overlay_unknown"])
@@ -17449,6 +17450,7 @@ class TestController(unittest.TestCase):
             file, rejection_diagnostic,
         ))
         self.assertEqual("run_mismatch", rejection_diagnostic["reason"])
+        self.assertNotIn("root_proof_gate", rejection_diagnostic)
 
     def test_cold_start_publishes_healthy_pair_before_unreadable_sibling(self):
         healthy_pair_id = "pair-cold-healthy"

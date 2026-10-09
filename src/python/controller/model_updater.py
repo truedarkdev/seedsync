@@ -3961,29 +3961,169 @@ class _ProgressiveScanAccumulator:
         root = self.__authoritative_by_pair.get(path_pair_id, {}).get(root_name)
         return (root, started_at) if isinstance(root, SystemFile) else None
 
+    @staticmethod
+    def __record_current_root_scan_source_gate(
+            diagnostic: dict[str, object], gate: str, *,
+            active_generation: object = None, outcome_generation: object = None,
+            root_final_complete: object = None, root_staging_complete: object = None,
+            confirmed_delete_generation: object = None,
+            source_root_present: object = None, source_root_matches: object = None,
+    ) -> None:
+        def bounded_generation(value: object) -> Optional[int]:
+            return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+
+        try:
+            diagnostic["root_proof_gate"] = {
+                "gate": gate,
+                "active_generation": bounded_generation(active_generation),
+                "outcome_generation": bounded_generation(outcome_generation),
+                "root_final_complete": root_final_complete if type(root_final_complete) is bool else None,
+                "root_staging_complete": root_staging_complete if type(root_staging_complete) is bool else None,
+                "confirmed_delete_generation": bounded_generation(confirmed_delete_generation),
+                "source_root_present": source_root_present if type(source_root_present) is bool else None,
+                "source_root_matches": source_root_matches if type(source_root_matches) is bool else None,
+            }
+        except Exception:
+            # Optional observation cannot change source authority.
+            pass
+
     def current_root_scan_source_with_proof(
             self, path_pair_id: Optional[str], root_name: str,
     ) -> Optional[tuple[SystemFile, str, int]]:
         """Return one accepted root's exact source and pair-scoped proof token."""
+        return self.__current_root_scan_source_with_proof(path_pair_id, root_name, None)
+
+    def current_root_scan_source_with_proof_diagnostic(
+            self, path_pair_id: Optional[str], root_name: str,
+    ) -> tuple[Optional[tuple[SystemFile, str, int]], dict[str, object]]:
+        """Return the same O(1) proof read plus bounded rejection facts."""
+        diagnostic: dict[str, object] = {}
+        source = self.__current_root_scan_source_with_proof(path_pair_id, root_name, diagnostic)
+        try:
+            gate_facts = diagnostic.get("root_proof_gate")
+            if isinstance(gate_facts, dict) and (
+                    gate_facts.get("source_root_present") is None
+                    or gate_facts.get("source_root_matches") is None):
+                root = self.__authoritative_by_pair.get(path_pair_id, {}).get(root_name)
+                present = root is not None
+                matches = isinstance(root, SystemFile) and root.is_dir and root.name == root_name and \
+                    root.path_pair_id == path_pair_id
+                gate_facts["source_root_present"] = present
+                gate_facts["source_root_matches"] = matches
+        except Exception:
+            # Optional source-shape observation cannot change the proof result.
+            pass
+        return source, diagnostic
+
+    def __current_root_scan_source_with_proof(
+            self, path_pair_id: Optional[str], root_name: str,
+            diagnostic: Optional[dict[str, object]],
+    ) -> Optional[tuple[SystemFile, str, int]]:
         if not isinstance(root_name, str) or not root_name:
+            if diagnostic is not None:
+                self.__record_current_root_scan_source_gate(diagnostic, "invalid_root")
             return None
         generation = self.__active_generation.get(path_pair_id)
         if type(generation) is not int or generation < 0:
+            if diagnostic is not None:
+                self.__record_current_root_scan_source_gate(diagnostic, "no_active_generation")
             return None
         evidence = self.__root_scan_outcomes_by_pair.get(path_pair_id)
-        if evidence is None or evidence[0] != generation:
+        if evidence is None:
+            if diagnostic is not None:
+                self.__record_current_root_scan_source_gate(
+                    diagnostic, "no_current_outcome", active_generation=generation,
+                )
+            return None
+        if evidence[0] != generation:
+            if diagnostic is not None:
+                self.__record_current_root_scan_source_gate(
+                    diagnostic, "outcome_generation_mismatch", active_generation=generation,
+                    outcome_generation=evidence[0],
+                )
             return None
         outcome_and_start = evidence[1].get(root_name)
-        if not isinstance(outcome_and_start, tuple) or len(outcome_and_start) != 2 or \
-                outcome_and_start[0] != (True, True):
+        if outcome_and_start is None:
+            if diagnostic is not None:
+                self.__record_current_root_scan_source_gate(
+                    diagnostic, "root_outcome_missing", active_generation=generation,
+                    outcome_generation=evidence[0],
+                )
             return None
-        if any(status == "confirmed_delete" for _, status in
-               self.__move_invalidations_by_root.get((path_pair_id, root_name), {}).values()):
+        if not isinstance(outcome_and_start, tuple) or len(outcome_and_start) != 2:
+            if diagnostic is not None:
+                self.__record_current_root_scan_source_gate(
+                    diagnostic, "root_outcome_invalid", active_generation=generation,
+                    outcome_generation=evidence[0],
+                )
+            return None
+        final_complete = None
+        staging_complete = None
+        if diagnostic is not None:
+            root_outcome = outcome_and_start[0]
+            if isinstance(root_outcome, tuple) and len(root_outcome) == 2:
+                final_complete = root_outcome[0] if type(root_outcome[0]) is bool else None
+                staging_complete = root_outcome[1] if type(root_outcome[1]) is bool else None
+        else:
+            root_outcome = outcome_and_start[0]
+        if root_outcome != (True, True):
+            if diagnostic is not None:
+                self.__record_current_root_scan_source_gate(
+                    diagnostic, "root_incomplete", active_generation=generation,
+                    outcome_generation=evidence[0], root_final_complete=final_complete,
+                    root_staging_complete=staging_complete,
+                )
+            return None
+        if diagnostic is None:
+            confirmed_delete = any(status == "confirmed_delete" for _, status in
+                                   self.__move_invalidations_by_root.get((path_pair_id, root_name), {}).values())
+            delete_generation = None
+        else:
+            delete_generation = None
+            confirmed_delete = False
+            for captured_generation, status in self.__move_invalidations_by_root.get(
+                    (path_pair_id, root_name), {}).values():
+                if status == "confirmed_delete":
+                    confirmed_delete = True
+                    delete_generation = captured_generation
+                    break
+        if confirmed_delete:
+            if diagnostic is not None:
+                self.__record_current_root_scan_source_gate(
+                    diagnostic, "confirmed_delete", active_generation=generation,
+                    outcome_generation=evidence[0], root_final_complete=final_complete,
+                    root_staging_complete=staging_complete,
+                    confirmed_delete_generation=delete_generation,
+                )
             return None
         root = self.__authoritative_by_pair.get(path_pair_id, {}).get(root_name)
-        if not isinstance(root, SystemFile) or not root.is_dir or root.name != root_name or \
-                root.path_pair_id != path_pair_id:
+        if root is None:
+            if diagnostic is not None:
+                self.__record_current_root_scan_source_gate(
+                    diagnostic, "source_absent", active_generation=generation,
+                    outcome_generation=evidence[0], root_final_complete=final_complete,
+                    root_staging_complete=staging_complete,
+                        source_root_present=False, source_root_matches=False,
+                )
             return None
+        source_matches = isinstance(root, SystemFile) and root.is_dir and root.name == root_name and \
+            root.path_pair_id == path_pair_id
+        if not source_matches:
+            if diagnostic is not None:
+                self.__record_current_root_scan_source_gate(
+                    diagnostic, "source_shape", active_generation=generation,
+                    outcome_generation=evidence[0], root_final_complete=final_complete,
+                    root_staging_complete=staging_complete,
+                    source_root_present=True, source_root_matches=False,
+                )
+            return None
+        if diagnostic is not None:
+            self.__record_current_root_scan_source_gate(
+                diagnostic, "accepted", active_generation=generation,
+                outcome_generation=evidence[0], root_final_complete=final_complete,
+                root_staging_complete=staging_complete, source_root_present=True,
+                source_root_matches=True,
+            )
         return root, self.__session_token, generation
 
     def current_root_scan_proofs(self) -> dict[str, tuple[str, int]]:

@@ -3481,6 +3481,22 @@ class Controller:
                     effective_work_floor=snapshot[2] if snapshot[2] <= 2**63 - 1 else None,
                 )
             source = source_reader(file.path_pair_id, file.name)
+            if diagnostic is not None:
+                try:
+                    diagnostic_reader = getattr(
+                        type(accumulator), "current_root_scan_source_with_proof_diagnostic", None,
+                    )
+                    if callable(diagnostic_reader):
+                        _, companion_diagnostic = diagnostic_reader(
+                            accumulator, file.path_pair_id, file.name,
+                        )
+                        if isinstance(companion_diagnostic, dict):
+                            root_proof_gate = companion_diagnostic.get("root_proof_gate")
+                            if isinstance(root_proof_gate, dict):
+                                record_diagnostic(root_proof_gate=root_proof_gate)
+                except Exception:
+                    # Optional proof-gate detail cannot change source authority.
+                    pass
             if not snapshot_valid:
                 reject("scan_snapshot_unknown", "unknown")
                 return None
@@ -11767,6 +11783,12 @@ class Controller:
                                     "baseline_unavailable", "baseline_run_mismatch", "baseline_not_newer",
                                     "accepted",
                                 }
+                                allowed_accumulator_gates = {
+                                    "invalid_root", "no_active_generation", "no_current_outcome",
+                                    "outcome_generation_mismatch", "root_outcome_missing",
+                                    "root_outcome_invalid", "root_incomplete", "confirmed_delete",
+                                    "source_absent", "source_shape", "accepted",
+                                }
                                 generations = intent.rescan_generations
                                 baseline_generation = None
                                 if isinstance(generations, tuple) and len(generations) == 2 and \
@@ -11782,10 +11804,16 @@ class Controller:
                                 proof_result = proof_result if proof_result in ("accepted", "rejected") else "unknown"
                                 proof_reason = proof.get("reason")
                                 proof_reason = proof_reason if proof_reason in allowed_proof_reasons else "unknown"
+                                root_proof_gate = proof.get("root_proof_gate")
+                                root_proof_gate = root_proof_gate if isinstance(root_proof_gate, dict) else {}
+                                accumulator_gate = root_proof_gate.get("gate")
+                                accumulator_gate = accumulator_gate if accumulator_gate in allowed_accumulator_gates else "unknown"
                                 relation = proof.get("generation_vs_baseline")
                                 relation = relation if relation in ("newer", "equal", "older", "unknown") else "unknown"
                                 self.logger.warning(
                                     "Deferred Queue final rejection corr=%s reason=%s proof=%s proof_reason=%s "
+                                    "accumulator_gate=%s accumulator_generation=%s outcome_generation=%s "
+                                    "root_final_complete=%s root_staging_complete=%s delete_fence_generation=%s "
                                     "baseline_generation=%s root_generation=%s process_generation=%s "
                                     "work_floor=%s generation_vs_baseline=%s remote_ready=%s "
                                     "run_matches_current=%s builder_proof_matches_source=%s",
@@ -11793,6 +11821,14 @@ class Controller:
                                     failure_reason if failure_reason in allowed_failure_reasons else "unknown",
                                     proof_result,
                                     proof_reason,
+                                    accumulator_gate,
+                                    bounded_generation(root_proof_gate.get("active_generation")),
+                                    bounded_generation(root_proof_gate.get("outcome_generation")),
+                                    root_proof_gate.get("root_final_complete")
+                                    if type(root_proof_gate.get("root_final_complete")) is bool else "unknown",
+                                    root_proof_gate.get("root_staging_complete")
+                                    if type(root_proof_gate.get("root_staging_complete")) is bool else "unknown",
+                                    bounded_generation(root_proof_gate.get("confirmed_delete_generation")),
                                     baseline_generation if baseline_generation is not None else "unknown",
                                     bounded_generation(proof.get("root_generation")),
                                     bounded_generation(proof.get("process_generation")),

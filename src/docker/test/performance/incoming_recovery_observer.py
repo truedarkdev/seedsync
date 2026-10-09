@@ -612,6 +612,17 @@ _CAPTURE_FRESH_ROOT_REASONS = {
     "below_work_floor", "ahead_of_process", "builder_proof_mismatch", "inspection_error",
     "baseline_unavailable", "baseline_run_mismatch", "baseline_not_newer", "unknown",
 }
+_CAPTURE_ROOT_PROOF_GATES = {
+    "invalid_root", "no_active_generation", "no_current_outcome", "outcome_generation_mismatch",
+    "root_outcome_missing", "root_outcome_invalid", "root_incomplete", "confirmed_delete",
+    "source_absent", "source_shape", "accepted",
+}
+_CAPTURE_ROOT_PROOF_GATE_BOOLEANS = (
+    "root_final_complete", "root_staging_complete", "source_root_present", "source_root_matches",
+)
+_CAPTURE_ROOT_PROOF_GATE_GENERATIONS = (
+    "active_generation", "outcome_generation", "confirmed_delete_generation",
+)
 _CAPTURE_FRESH_ROOT_FLOOR_RELATIONS = {"at_or_above", "below", "unknown"}
 _CAPTURE_FRESH_ROOT_PROCESS_RELATIONS = {"at_or_below", "ahead", "unknown"}
 _CAPTURE_SCAN_GENERATION_MAX = 2**63 - 1
@@ -1245,6 +1256,20 @@ def _queue_readiness_nested_diagnostic(value: object, fields: tuple[object, obje
     return result
 
 
+def _queue_root_proof_gate_facts(value: object) -> dict[str, object]:
+    source = value if isinstance(value, Mapping) else {}
+    gate = source.get("gate")
+    result: dict[str, object] = {
+        "gate": gate if isinstance(gate, str) and gate in _CAPTURE_ROOT_PROOF_GATES else "unknown",
+    }
+    for key in _CAPTURE_ROOT_PROOF_GATE_BOOLEANS:
+        item = source.get(key)
+        result[key] = item if type(item) is bool else None
+    for key in _CAPTURE_ROOT_PROOF_GATE_GENERATIONS:
+        result[key] = _queue_readiness_decimal(source.get(key))
+    return result
+
+
 def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         return {"kind": "unknown"}
@@ -1606,6 +1631,8 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
                 facts = _queue_readiness_nested_diagnostic(nested, fields)
                 if key == "scan_failure":
                     facts.update(_sanitize_scan_failure_origin(nested if isinstance(nested, Mapping) else {}))
+                elif key == "fresh_root_proof" and isinstance(nested, Mapping) and "root_proof_gate" in nested:
+                    facts["root_proof_gate"] = _queue_root_proof_gate_facts(nested.get("root_proof_gate"))
                 safe_readiness[key] = facts
         result["queue_readiness"] = safe_readiness
     model_page_snapshot = value.get("model_page_snapshot")

@@ -8116,6 +8116,76 @@ class TestModelUpdater(unittest.TestCase):
         restarted.set_session_token("replacement-session")
         self.assertEqual({}, restarted.current_root_scan_sources())
 
+    def test_current_root_source_diagnostic_names_o1_accumulator_gate(self):
+        pair_id = "pair"
+        session = "local-session"
+
+        def accumulator_for(outcome):
+            root = SystemFile("root", 1, True)
+            root.path_pair_id = pair_id
+            outcomes = {pair_id: {"root": outcome}} if outcome is not None else {}
+            event = ScannerResult(
+                datetime.now(), [root], scanned_path_pair_ids={pair_id}, generation=7,
+                is_progress=True, session_token=session, root_scan_outcomes_by_pair=outcomes,
+            )
+            accumulator = _ProgressiveScanAccumulator()
+            accumulator.apply([event], {pair_id})
+            return accumulator, root
+
+        incomplete, _ = accumulator_for((True, False))
+        incomplete_source, incomplete_diagnostic = incomplete.current_root_scan_source_with_proof_diagnostic(
+            pair_id, "root",
+        )
+        self.assertIsNone(incomplete_source)
+        self.assertEqual("root_incomplete", incomplete_diagnostic["root_proof_gate"]["gate"])
+        self.assertEqual((7, 7, True, False), (
+            incomplete_diagnostic["root_proof_gate"]["active_generation"],
+            incomplete_diagnostic["root_proof_gate"]["outcome_generation"],
+            incomplete_diagnostic["root_proof_gate"]["root_final_complete"],
+            incomplete_diagnostic["root_proof_gate"]["root_staging_complete"],
+        ))
+        self.assertFalse(incomplete_diagnostic["root_proof_gate"]["source_root_present"])
+        self.assertFalse(incomplete_diagnostic["root_proof_gate"]["source_root_matches"])
+
+        no_outcome, _ = accumulator_for(None)
+        no_outcome_source, no_outcome_diagnostic = no_outcome.current_root_scan_source_with_proof_diagnostic(
+            pair_id, "root",
+        )
+        self.assertIsNone(no_outcome_source)
+        self.assertEqual("no_current_outcome", no_outcome_diagnostic["root_proof_gate"]["gate"])
+
+        deleted, _ = accumulator_for((True, True))
+        self.assertTrue(deleted.confirm_local_deletion(pair_id, "root", (), 7, session))
+        delete_source, delete_diagnostic = deleted.current_root_scan_source_with_proof_diagnostic(
+            pair_id, "root",
+        )
+        self.assertIsNone(delete_source)
+        self.assertEqual("confirmed_delete", delete_diagnostic["root_proof_gate"]["gate"])
+        self.assertEqual(7, delete_diagnostic["root_proof_gate"]["confirmed_delete_generation"])
+        self.assertFalse(delete_diagnostic["root_proof_gate"]["source_root_present"])
+        self.assertFalse(delete_diagnostic["root_proof_gate"]["source_root_matches"])
+
+        accepted, accepted_root = accumulator_for((True, True))
+        source, accepted_diagnostic = accepted.current_root_scan_source_with_proof_diagnostic(pair_id, "root")
+        self.assertEqual((accepted_root, session, 7), source)
+        self.assertEqual("accepted", accepted_diagnostic["root_proof_gate"]["gate"])
+        self.assertTrue(accepted_diagnostic["root_proof_gate"]["source_root_present"])
+        self.assertTrue(accepted_diagnostic["root_proof_gate"]["source_root_matches"])
+
+        mismatched, _ = accumulator_for((True, True))
+        wrong_root = SystemFile("root", 1, True)
+        wrong_root.path_pair_id = "other-pair"
+        mismatched._ProgressiveScanAccumulator__authoritative_by_pair[pair_id]["root"] = wrong_root
+        mismatch_source, mismatch_diagnostic = mismatched.current_root_scan_source_with_proof_diagnostic(
+            pair_id, "root",
+        )
+        self.assertIsNone(mismatch_source)
+        self.assertEqual("source_shape", mismatch_diagnostic["root_proof_gate"]["gate"])
+        self.assertTrue(mismatch_diagnostic["root_proof_gate"]["source_root_present"])
+        self.assertFalse(mismatch_diagnostic["root_proof_gate"]["source_root_matches"])
+
+        self.assertIsNone(incomplete.current_root_scan_source_with_proof(pair_id, "root"))
+
     def test_recoverable_pair_does_not_make_ordinary_incomplete_sibling_stale(self):
         """Only a terminal pair may be stale while another pair is simply scanning."""
         def file_for(pair_id, size):

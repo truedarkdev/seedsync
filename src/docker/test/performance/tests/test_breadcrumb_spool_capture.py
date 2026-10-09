@@ -45,7 +45,7 @@ try:
     from controller.scan import ScannerResult
     from lftp import LftpJobStatus
     from controller.model_updater import (
-        ModelUpdater, _ModelFinalizationBreadcrumbSpan, _ensure_progressive_scan_state,
+        ModelUpdater, _ModelFinalizationBreadcrumbSpan, _ProgressiveScanAccumulator, _ensure_progressive_scan_state,
         _record_lftp_status_breadcrumb,
         _record_lftp_status_membership_transition, _record_lifecycle_scan_breadcrumb,
     )
@@ -66,6 +66,7 @@ except ImportError:
     DeferredQueueIntent = None
     ScannerResult = None
     _ensure_progressive_scan_state = None
+    _ProgressiveScanAccumulator = None
     LftpJobStatus = None
 
 
@@ -1337,6 +1338,12 @@ def test_queue_readiness_nested_scan_diagnostics_keep_exact_finite_values() -> N
             "remote_ready": True, "overlay_unknown": True, "process_generation": wide,
             "effective_work_floor": 4, "root_generation": wide, "source_present": True,
             "run_matches_current": True, "builder_proof_matches_source": True,
+            "root_proof_gate": {
+                "gate": "accepted", "active_generation": wide, "outcome_generation": wide,
+                "root_final_complete": True, "root_staging_complete": True,
+                "confirmed_delete_generation": 4, "source_root_present": True,
+                "source_root_matches": True,
+            },
             "root_vs_work_floor": "at_or_above", "root_vs_process_generation": "at_or_below",
             "run_matches_baseline": True, "generation_vs_baseline": "newer",
             "session_token": "do-not-copy", "path": "/private/path",
@@ -1350,6 +1357,12 @@ def test_queue_readiness_nested_scan_diagnostics_keep_exact_finite_values() -> N
     assert facts["scan_failure"]["baseline_generation"] == str(wide - 3)
     assert facts["fresh_root_proof"]["process_generation"] == str(wide)
     assert facts["fresh_root_proof"]["root_generation"] == str(wide)
+    assert facts["fresh_root_proof"]["root_proof_gate"] == {
+        "gate": "accepted", "active_generation": str(wide), "outcome_generation": str(wide),
+        "root_final_complete": True, "root_staging_complete": True,
+        "confirmed_delete_generation": "4", "source_root_present": True,
+        "source_root_matches": True,
+    }
     text = json.dumps(facts)
     assert "do-not-copy" not in text and "/private/path" not in text
 
@@ -1364,6 +1377,9 @@ def test_queue_readiness_nested_scan_diagnostics_keep_exact_finite_values() -> N
         **details,
         "scan_failure": {"side": "secret", "terminal": 1, "result_generation": True},
         "fresh_root_proof": {"result": "secret", "reason": "/private", "root_shape_ok": "true",
+                             "root_proof_gate": {"gate": "/private/gate", "active_generation": True,
+                                                  "root_final_complete": "true",
+                                                  "source_root_present": 1},
                              "process_generation": wide + 1},
     })
     assert malformed is not None
@@ -1382,6 +1398,12 @@ def test_queue_readiness_nested_scan_diagnostics_keep_exact_finite_values() -> N
     assert malformed_final["queue_readiness"]["fresh_root_proof"]["result"] == "unknown"
     assert malformed_final["queue_readiness"]["fresh_root_proof"]["root_shape_ok"] is None
     assert malformed_final["queue_readiness"]["fresh_root_proof"]["process_generation"] == str(wide + 1)
+    assert malformed_final["queue_readiness"]["fresh_root_proof"]["root_proof_gate"] == {
+        "gate": "unknown", "active_generation": None, "outcome_generation": None,
+        "root_final_complete": None, "root_staging_complete": None,
+        "confirmed_delete_generation": None, "source_root_present": None,
+        "source_root_matches": None,
+    }
 
 
 def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(tmp_path: Path) -> None:
@@ -1501,11 +1523,14 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         producer._Controller__remote_scan_process = SimpleNamespace(
             session_token="private-remote-session", generation=1,
         )
-        producer._Controller__progressive_local_scan_state = SimpleNamespace(
-            current_root_scan_source_with_proof=lambda _pair_id, _name: (
-                proof_root, "private-proof-session", 4,
-            ),
+        proof_scan = ScannerResult(
+            datetime.now(), [proof_root], scanned_path_pair_ids={proof_pair_id}, generation=4,
+            is_progress=True, session_token="private-proof-session",
+            root_scan_outcomes_by_pair={proof_pair_id: {"private-proof-root": (True, False)}},
         )
+        proof_accumulator = _ProgressiveScanAccumulator()
+        proof_accumulator.apply([proof_scan], {proof_pair_id})
+        producer._Controller__progressive_local_scan_state = proof_accumulator
         producer._Controller__model_builder = SimpleNamespace(
             unknown_local_path_pair_ids_snapshot=lambda: frozenset({proof_pair_id}),
             has_current_local_root_scan_proof=lambda *_args, **_kwargs: False,
@@ -1552,10 +1577,13 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     assert ignored_failure["failure_run_ref"] == trace_session_digest("private-ignored-session")
     fresh_root_proof = readiness[-1]["fresh_root_proof"]
     assert fresh_root_proof["result"] == "rejected"
-    assert fresh_root_proof["reason"] == "builder_proof_mismatch"
-    assert fresh_root_proof["root_generation"] == "4"
-    assert fresh_root_proof["effective_work_floor"] == "3"
-    assert fresh_root_proof["builder_proof_matches_source"] is False
+    assert fresh_root_proof["reason"] == "source_absent"
+    assert fresh_root_proof["root_proof_gate"] == {
+        "gate": "root_incomplete", "active_generation": "4", "outcome_generation": "4",
+        "root_final_complete": True, "root_staging_complete": False,
+        "confirmed_delete_generation": None, "source_root_present": False,
+        "source_root_matches": False,
+    }
     persisted = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
     finalized = [row for row in persisted if row.get("message") in
                  ({event for event, _ in readiness_rows} | {"queue_rescan_readiness"})]
