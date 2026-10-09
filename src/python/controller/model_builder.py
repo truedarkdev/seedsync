@@ -2934,6 +2934,19 @@ class ModelBuilder:
             self.__local_file(file_id) is proof[2] and \
             (expected_source is None or proof[2] is expected_source)
 
+    def local_root_scan_proof_generation(self, file_id: str) -> Optional[int]:
+        """Read a bounded stored proof generation for optional diagnostics only."""
+        try:
+            proof = self.__local_root_scan_proofs.get(file_id)
+        except Exception:
+            return None
+        if not isinstance(proof, tuple) or len(proof) != 3 or \
+                type(proof[0]) is not str or not proof[0] or \
+                type(proof[1]) is not int or proof[1] < 0 or proof[1] > 2**63 - 1 or \
+                not isinstance(proof[2], SystemFile):
+            return None
+        return proof[1]
+
     def local_root_scan_proof_comparison_details(
             self, file_id: str, session_token: object, generation: object,
             *, expected_source: Optional[SystemFile] = None,

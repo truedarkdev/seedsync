@@ -616,6 +616,39 @@ def _completion_gate_facts(details: Mapping[str, object], message: object = None
             "expected": checks.get("expected")
             if isinstance(checks.get("expected"), str) and checks.get("expected") in _LOCAL_ROOT_PROOF_EXPECTED else "unknown",
         }
+        if "local_scan_alignment" in details:
+            authority = details.get("local_scan_alignment")
+            authority = authority if isinstance(authority, Mapping) else {}
+
+            def authority_decimal(key: str) -> str | None:
+                value = authority.get(key)
+                return str(value) if type(value) is int and 0 <= value <= 2**63 - 1 else None
+
+            def authority_bool(key: str) -> bool | None:
+                value = authority.get(key)
+                return value if type(value) is bool else None
+
+            floor_relation = authority.get("root_vs_work_floor")
+            retired_relation = authority.get("root_start_vs_retired")
+            result["local_scan_alignment"] = {
+                "process_generation": authority_decimal("process_generation"),
+                "effective_work_floor": authority_decimal("effective_work_floor"),
+                "builder_proof_generation": authority_decimal("builder_proof_generation"),
+                "accumulator_root_generation": authority_decimal("accumulator_root_generation"),
+                "accumulator_root_present": authority_bool("accumulator_root_present"),
+                "root_run_matches_process": authority_bool("root_run_matches_process"),
+                "builder_source_matches_accumulator": authority_bool("builder_source_matches_accumulator"),
+                "root_start_known": authority_bool("root_start_known"),
+                "publication_retired_known": authority_bool("publication_retired_known"),
+                "root_vs_work_floor": floor_relation
+                if isinstance(floor_relation, str) and floor_relation in {"at_or_above", "below", "unknown"}
+                else "unknown",
+                "root_start_vs_retired": retired_relation
+                if isinstance(retired_relation, str) and retired_relation in {"before", "equal", "after", "unknown"}
+                else "unknown",
+                "request_baseline_known": None,
+                "root_start_vs_request": "unknown",
+            }
     value = details.get("pending_transition")
     if isinstance(value, str) and value in {"registered", "cleared", "retained"}:
         result["pending_transition"] = value

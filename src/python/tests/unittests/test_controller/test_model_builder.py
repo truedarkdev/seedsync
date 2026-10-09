@@ -11340,6 +11340,7 @@ class TestModelBuilder(unittest.TestCase):
         file_id = ModelFile.build_file_id(root.name, root.path_pair_id)
 
         absent = builder.local_root_scan_proof_comparison_details(file_id, "private-session", 4)
+        self.assertIsNone(builder.local_root_scan_proof_generation(file_id))
         self.assertEqual({
             "entry": "absent", "run": "unknown", "generation": "unknown",
             "builder": "unknown", "expected": "not_checked",
@@ -11348,6 +11349,7 @@ class TestModelBuilder(unittest.TestCase):
 
         proofs = builder._ModelBuilder__local_root_scan_proofs
         proofs[file_id] = ("private-session",)
+        self.assertIsNone(builder.local_root_scan_proof_generation(file_id))
         malformed = builder.local_root_scan_proof_comparison_details(file_id, "private-session", 4)
         self.assertEqual("malformed", malformed["entry"])
         self.assertEqual("unknown", malformed["run"])
@@ -11355,6 +11357,7 @@ class TestModelBuilder(unittest.TestCase):
 
         proofs.pop(file_id)
         builder.adopt_local_root_scan_sources({file_id: (root, "private-session", 4)})
+        self.assertEqual(4, builder.local_root_scan_proof_generation(file_id))
         matched = builder.local_root_scan_proof_comparison_details(
             file_id, "private-session", 4, expected_source=root,
         )
@@ -11365,6 +11368,16 @@ class TestModelBuilder(unittest.TestCase):
         self.assertTrue(builder.has_current_local_root_scan_proof(
             file_id, "private-session", 4, expected_source=root,
         ))
+        proofs = builder._ModelBuilder__local_root_scan_proofs
+        proofs[file_id] = ("private-session", True, root)
+        self.assertIsNone(builder.local_root_scan_proof_generation(file_id))
+        proofs[file_id] = ("private-session", 2**63, root)
+        self.assertIsNone(builder.local_root_scan_proof_generation(file_id))
+        proofs[file_id] = (None, 4, root)
+        self.assertIsNone(builder.local_root_scan_proof_generation(file_id))
+        proofs[file_id] = ("private-session", 4, object())
+        self.assertIsNone(builder.local_root_scan_proof_generation(file_id))
+        proofs[file_id] = ("private-session", 4, root)
         self.assertEqual("mismatch", builder.local_root_scan_proof_comparison_details(
             file_id, "other-session", 4,
         )["run"])

@@ -1207,6 +1207,40 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
                 "builder": proof.get("builder") if isinstance(proof.get("builder"), str) and proof.get("builder") in _CAPTURE_LOCAL_ROOT_PROOF_RELATIONS else "unknown",
                 "expected": proof.get("expected") if isinstance(proof.get("expected"), str) and proof.get("expected") in _CAPTURE_LOCAL_ROOT_PROOF_EXPECTED else "unknown",
             }
+            if "local_scan_alignment" in gate:
+                authority = gate.get("local_scan_alignment")
+                authority = authority if isinstance(authority, Mapping) else {}
+
+                def authority_decimal(key: str) -> str | None:
+                    value = authority.get(key)
+                    return value if isinstance(value, str) and len(value) <= 19 and \
+                        _CAPTURE_CONFIRMED_DELETE_DECIMAL.fullmatch(value) and int(value) <= 2**63 - 1 else None
+
+                def authority_bool(key: str) -> bool | None:
+                    value = authority.get(key)
+                    return value if type(value) is bool else None
+
+                floor_relation = authority.get("root_vs_work_floor")
+                retired_relation = authority.get("root_start_vs_retired")
+                safe_gate["local_scan_alignment"] = {
+                    "process_generation": authority_decimal("process_generation"),
+                    "effective_work_floor": authority_decimal("effective_work_floor"),
+                    "builder_proof_generation": authority_decimal("builder_proof_generation"),
+                    "accumulator_root_generation": authority_decimal("accumulator_root_generation"),
+                    "accumulator_root_present": authority_bool("accumulator_root_present"),
+                    "root_run_matches_process": authority_bool("root_run_matches_process"),
+                    "builder_source_matches_accumulator": authority_bool("builder_source_matches_accumulator"),
+                    "root_start_known": authority_bool("root_start_known"),
+                    "publication_retired_known": authority_bool("publication_retired_known"),
+                    "root_vs_work_floor": floor_relation
+                    if isinstance(floor_relation, str) and floor_relation in {"at_or_above", "below", "unknown"}
+                    else "unknown",
+                    "root_start_vs_retired": retired_relation
+                    if isinstance(retired_relation, str) and retired_relation in {"before", "equal", "after", "unknown"}
+                    else "unknown",
+                    "request_baseline_known": None,
+                    "root_start_vs_request": "unknown",
+                }
         result["completion_gate"] = safe_gate
     proof_transition = value.get("local_root_proof_transition")
     if isinstance(proof_transition, Mapping):

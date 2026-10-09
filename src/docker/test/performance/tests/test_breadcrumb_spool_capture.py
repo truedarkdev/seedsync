@@ -658,6 +658,21 @@ def test_pending_completion_wake_projects_bounded_local_root_proof_comparisons(t
             "entry": "present", "run": "mismatch", "generation": "match",
             "builder": "match", "expected": "not_checked",
         },
+        "local_scan_alignment": {
+            "process_generation": 7,
+            "effective_work_floor": 4,
+            "builder_proof_generation": 4,
+            "accumulator_root_generation": 4,
+            "accumulator_root_present": True,
+            "root_run_matches_process": True,
+            "builder_source_matches_accumulator": True,
+            "root_start_known": True,
+            "publication_retired_known": True,
+            "root_vs_work_floor": "at_or_above",
+            "root_start_vs_retired": "before",
+            "request_baseline_known": True,
+            "root_start_vs_request": "after",
+        },
         "private_session": "private-session-label",
         "raw_path": "/private/root",
     }
@@ -690,10 +705,61 @@ def test_pending_completion_wake_projects_bounded_local_root_proof_comparisons(t
             "run": "mismatch", "generation": "match", "builder": "match",
             "expected": "not_checked",
         },
+        "local_scan_alignment": {
+            "process_generation": "7",
+            "effective_work_floor": "4",
+            "builder_proof_generation": "4",
+            "accumulator_root_generation": "4",
+            "accumulator_root_present": True,
+            "root_run_matches_process": True,
+            "builder_source_matches_accumulator": True,
+            "root_start_known": True,
+            "publication_retired_known": True,
+            "root_vs_work_floor": "at_or_above",
+            "root_start_vs_retired": "before",
+            "request_baseline_known": None,
+            "root_start_vs_request": "unknown",
+        },
     }
     assert "private-session-label" not in text
     assert "/private/root" not in text
     assert "private-correlation-label" not in text
+
+    malformed, irrelevant = capture._projection({
+        "source": "model_updater", "category": "completion.gate",
+        "event_type": "diagnostic", "stage": "completion_gate",
+        "message": "pending_completion_authority_wake", "level": "info",
+        "details": {
+            "schema": "pending_completion_authority_wake.v1", "decision": "blocked",
+            "reason": "local_scope_unreconciled", "local_root_proof_shape": "directory_root",
+            "local_scan_alignment": {
+                "process_generation": True,
+                "effective_work_floor": 2**63,
+                "builder_proof_generation": -1,
+                "accumulator_root_generation": 4,
+                "accumulator_root_present": "true",
+                "root_run_matches_process": False,
+                "builder_source_matches_accumulator": None,
+                "root_start_known": True,
+                "publication_retired_known": False,
+                "root_vs_work_floor": "private",
+                "root_start_vs_retired": ["before"],
+                "request_baseline_known": True,
+                "root_start_vs_request": "before",
+            },
+        },
+    })
+    assert not irrelevant
+    malformed_alignment = malformed["completion_gate"]["local_scan_alignment"]
+    assert malformed_alignment == {
+        "process_generation": None, "effective_work_floor": None,
+        "builder_proof_generation": None, "accumulator_root_generation": "4",
+        "accumulator_root_present": None, "root_run_matches_process": False,
+        "builder_source_matches_accumulator": None, "root_start_known": True,
+        "publication_retired_known": False, "root_vs_work_floor": "unknown",
+        "root_start_vs_retired": "unknown", "request_baseline_known": None,
+        "root_start_vs_request": "unknown",
+    }
 
 
 def test_malformed_and_oversized_lines_are_explicit_loss(tmp_path: Path) -> None:

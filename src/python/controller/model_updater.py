@@ -9401,6 +9401,131 @@ class ModelUpdater(_ControllerCoreAccess):
             ) and status.path_pair_id is None and isinstance(status.name, str)
         }
 
+        def pending_local_scan_authority_details(
+                file_id: str, pending_file: ModelFile,
+        ) -> dict[str, object]:
+            """Describe current scan/proof generations without changing wake authority."""
+            details: dict[str, object] = {
+                "process_generation": None,
+                "effective_work_floor": None,
+                "builder_proof_generation": None,
+                "accumulator_root_generation": None,
+                "accumulator_root_present": None,
+                "root_run_matches_process": None,
+                "builder_source_matches_accumulator": None,
+                "root_start_known": None,
+                "publication_retired_known": None,
+                "root_vs_work_floor": "unknown",
+                "root_start_vs_retired": "unknown",
+                "request_baseline_known": None,
+                "root_start_vs_request": "unknown",
+            }
+            process_session: Optional[str] = None
+            process = getattr(controller, "_Controller__local_scan_process", None)
+            snapshotter = getattr(process, "root_scan_authority_snapshot", None)
+            if callable(snapshotter):
+                try:
+                    snapshot = snapshotter(pending_file.path_pair_id)
+                except Exception:
+                    snapshot = None
+                if isinstance(snapshot, tuple) and len(snapshot) == 3:
+                    session, generation, floor = snapshot
+                    if type(session) is str and session and \
+                            type(generation) is int and 0 <= generation <= 2**63 - 1 and \
+                            type(floor) is int and 0 <= floor <= 2**63 - 1:
+                        process_session = session
+                        details["process_generation"] = generation
+                        details["effective_work_floor"] = floor
+
+            builder = getattr(controller, "_Controller__model_builder", None)
+            proof_generation_reader = getattr(builder, "local_root_scan_proof_generation", None)
+            if callable(proof_generation_reader):
+                try:
+                    proof_generation = proof_generation_reader(file_id)
+                except Exception:
+                    proof_generation = None
+                if type(proof_generation) is int and 0 <= proof_generation <= 2**63 - 1:
+                    details["builder_proof_generation"] = proof_generation
+
+            publications = getattr(
+                controller, "_Controller__pending_completion_publications", None,
+            )
+            retired_at = None
+            if isinstance(publications, dict):
+                publication = publications.get(file_id)
+                if isinstance(publication, _PendingCompletionPublication):
+                    retired_at = publication.retired_at
+                    details["publication_retired_known"] = isinstance(retired_at, datetime)
+
+            accumulator = getattr(controller, "_Controller__progressive_local_scan_state", None)
+            source_reader = getattr(accumulator, "current_root_scan_source_with_proof", None)
+            root_source: Optional[tuple[SystemFile, str, int]] = None
+            if callable(source_reader):
+                try:
+                    source = source_reader(pending_file.path_pair_id, pending_file.name)
+                except Exception:
+                    source = None
+                else:
+                    if source is None:
+                        details["accumulator_root_present"] = False
+                        details["root_start_known"] = False
+                    elif isinstance(source, tuple) and len(source) == 3:
+                        root, root_session, root_generation = source
+                        if isinstance(root, SystemFile) and root.is_dir and \
+                                root.name == pending_file.name and \
+                                root.path_pair_id == pending_file.path_pair_id and \
+                                type(root_session) is str and root_session and \
+                                type(root_generation) is int and 0 <= root_generation <= 2**63 - 1:
+                            root_source = (root, root_session, root_generation)
+                            details["accumulator_root_present"] = True
+                            details["accumulator_root_generation"] = root_generation
+                            if process_session is not None:
+                                details["root_run_matches_process"] = root_session == process_session
+                        else:
+                            details["accumulator_root_present"] = None
+
+            if root_source is not None:
+                root, root_session, root_generation = root_source
+                floor = details["effective_work_floor"]
+                if details["root_run_matches_process"] is True and type(floor) is int:
+                    details["root_vs_work_floor"] = \
+                        "at_or_above" if root_generation >= floor else "below"
+                comparison_reader = getattr(builder, "local_root_scan_proof_comparison_details", None)
+                if callable(comparison_reader):
+                    try:
+                        comparison = comparison_reader(
+                            file_id, root_session, root_generation, expected_source=root,
+                        )
+                    except Exception:
+                        comparison = None
+                    if isinstance(comparison, dict):
+                        builder_match = comparison.get("builder")
+                        expected_match = comparison.get("expected")
+                        if builder_match == "match" and expected_match == "match":
+                            details["builder_source_matches_accumulator"] = True
+                        elif builder_match == "mismatch" or expected_match == "mismatch":
+                            details["builder_source_matches_accumulator"] = False
+
+                started_at_reader = getattr(accumulator, "current_root_scan_source_started_at", None)
+                if callable(started_at_reader):
+                    try:
+                        started_at = started_at_reader(
+                            pending_file.path_pair_id, pending_file.name, root_session, root_generation,
+                        )
+                    except Exception:
+                        started_at = None
+                    else:
+                        details["root_start_known"] = isinstance(started_at, datetime)
+                else:
+                    started_at = None
+
+                if isinstance(started_at, datetime) and isinstance(retired_at, datetime):
+                    details["root_start_vs_retired"] = (
+                        "before" if started_at < retired_at else
+                        "equal" if started_at == retired_at else "after"
+                    )
+            return details
+
         def pending_root_local_scope_available(file_id: str, pending_file: ModelFile) -> bool:
             # The existing root proof covers local scan scope only. Remote,
             # ownership and physical payload checks still run independently.
@@ -9440,6 +9565,25 @@ class ModelUpdater(_ControllerCoreAccess):
                     details["local_root_proof_shape"] = "non_directory"
                 elif canonical and is_dir is True and full_path == name:
                     details["local_root_proof_shape"] = "directory_root"
+                    try:
+                        details["local_scan_alignment"] = \
+                            pending_local_scan_authority_details(file_id, pending_file)
+                    except Exception:
+                        details["local_scan_alignment"] = {
+                            "process_generation": None,
+                            "effective_work_floor": None,
+                            "builder_proof_generation": None,
+                            "accumulator_root_generation": None,
+                            "accumulator_root_present": None,
+                            "root_run_matches_process": None,
+                            "builder_source_matches_accumulator": None,
+                            "root_start_known": None,
+                            "publication_retired_known": None,
+                            "root_vs_work_floor": "unknown",
+                            "root_start_vs_retired": "unknown",
+                            "request_baseline_known": None,
+                            "root_start_vs_request": "unknown",
+                        }
                 else:
                     return details
 
