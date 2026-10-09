@@ -17,6 +17,7 @@ from queue import Queue
 from threading import Event, Lock as ThreadLock, RLock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
+from zoneinfo import ZoneInfo
 
 from controller import Controller, ControllerPersist, ModelBuilder
 from controller.controller import _LftpOperation, PendingQueueDispatch
@@ -4194,11 +4195,194 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertIn(("pair", "moved"), accumulator.snapshot())
         tokens = accumulator._ProgressiveScanAccumulator__move_invalidations_by_root
-        self.assertEqual((58, "committed"), tokens[("pair", "moved")][token])
+        self.assertEqual((58, "committed", None), tokens[("pair", "moved")][token])
 
         accumulator.apply([self._local_full_snapshot([], 61)])
         self.assertNotIn(("pair", "moved"), accumulator.snapshot())
         self.assertNotIn(("pair", "moved"), accumulator._ProgressiveScanAccumulator__move_invalidations_by_root)
+
+    def test_progressive_accumulator_post_move_exact_root_releases_before_failed_empty_final(self):
+        accumulator = _ProgressiveScanAccumulator()
+        session = "move-session"
+        previous = SystemFile("moved", 1, True)
+        previous.add_child(SystemFile("old.bin", 1))
+        previous.path_pair_id = "pair"
+        initial = ScannerResult(
+            datetime.now(), [previous], scanned_path_pair_ids={"pair"}, generation=56,
+            is_progress=True, root_names={"moved"}, session_token=session,
+            root_scan_outcomes_by_pair={"pair": {"moved": (True, True)}},
+            scan_started_at=datetime.now(),
+        )
+        accumulator.apply([initial])
+        self.assertEqual({}, accumulator._ProgressiveScanAccumulator__committed_by_pair)
+        root_id = ModelFile.build_file_id("moved", "pair")
+        self.assertIn(root_id, accumulator.current_root_scan_sources())
+
+        move_completed_at = datetime.now()
+        token = accumulator.begin_root_invalidation("pair", "moved", 58)
+        accumulator.finish_root_invalidation("pair", "moved", token, True, move_completed_at)
+        self.assertTrue(accumulator.confirm_local_deletion(
+            "pair", "moved", ("old.bin",), 58, session,
+        ))
+
+        fresh_root = SystemFile("moved", 4, True)
+        fresh_root.add_child(SystemFile("new.bin", 4))
+        fresh_root.path_pair_id = "pair"
+        root_progress = ScannerResult(
+            move_completed_at + timedelta(seconds=2), [fresh_root],
+            scanned_path_pair_ids={"pair"}, generation=59, is_progress=True,
+            root_names={"moved"}, root_scan_outcomes_by_pair={"pair": {"moved": (True, True)}},
+            scan_started_at=move_completed_at + timedelta(seconds=1), session_token=session,
+        )
+        accumulator.apply([root_progress])
+
+        tokens = accumulator._ProgressiveScanAccumulator__move_invalidations_by_root
+        self.assertNotIn(("pair", "moved"), tokens)
+        self.assertIs(fresh_root, accumulator.authority()[("pair", "moved")])
+        self.assertIn(root_id, accumulator.current_root_scan_sources())
+
+        failed_empty_final = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=59,
+            is_progress=True, is_scan_final=True, failed=True,
+            unknown_path_pair_ids={"pair"}, session_token=session,
+        )
+        accumulator.apply([failed_empty_final])
+
+        self.assertIs(fresh_root, accumulator.authority()[("pair", "moved")])
+        self.assertIs(
+            fresh_root, accumulator.current_root_scan_sources()[root_id][0],
+        )
+
+    def test_progressive_accumulator_post_move_release_requires_exact_fresh_complete_root(self):
+        move_completed_at = datetime.now()
+        invalid_cases = (
+            ("before", move_completed_at - timedelta(microseconds=1), (True, True), "pair", True),
+            ("equal", move_completed_at, (True, True), "pair", True),
+            ("missing start", None, (True, True), "pair", True),
+            ("incomparable start", datetime.now().astimezone(), (True, True), "pair", True),
+            ("incomplete staging", move_completed_at + timedelta(seconds=1), (True, False), "pair", True),
+            ("absent root", move_completed_at + timedelta(seconds=1), (True, True), "pair", False),
+            ("wrong pair", move_completed_at + timedelta(seconds=1), (True, True), "other", True),
+            ("integer lookalike", move_completed_at + timedelta(seconds=1), (1, 1), "pair", True),
+        )
+        for label, scan_started_at, outcome, root_pair_id, include_root in invalid_cases:
+            with self.subTest(case=label):
+                accumulator = _ProgressiveScanAccumulator()
+                old_root = SystemFile("moved", 1, True)
+                old_root.path_pair_id = "pair"
+                accumulator.apply([self._local_full_snapshot([old_root], 56)])
+                token = accumulator.begin_root_invalidation("pair", "moved", 58)
+                accumulator.finish_root_invalidation("pair", "moved", token, True, move_completed_at)
+                files = []
+                root_names = set()
+                if include_root:
+                    root = SystemFile("moved", 2, True)
+                    root.path_pair_id = root_pair_id
+                    files.append(root)
+                    root_names.add("moved")
+                event = ScannerResult(
+                    datetime.now(), files, scanned_path_pair_ids={"pair"}, generation=59,
+                    is_progress=True, root_names=root_names,
+                    root_scan_outcomes_by_pair={"pair": {"moved": outcome}},
+                    scan_started_at=scan_started_at,
+                )
+                accumulator.apply([event])
+                self.assertIn(token, accumulator._ProgressiveScanAccumulator__move_invalidations_by_root[
+                    ("pair", "moved")
+                ])
+
+    def test_progressive_accumulator_post_move_release_orders_stockholm_dst_fold_by_instant(self):
+        can_set_local_tz = hasattr(time, "tzset")
+        old_tz = os.environ.get("TZ")
+        try:
+            if can_set_local_tz:
+                os.environ["TZ"] = "Europe/Stockholm"
+                time.tzset()
+            zone = ZoneInfo("Europe/Stockholm")
+            aware_completion = datetime(2026, 10, 25, 2, 5, tzinfo=zone, fold=1)
+            aware_before = datetime(2026, 10, 25, 2, 55, tzinfo=zone, fold=0)
+            aware_equal = aware_completion
+            aware_after = datetime(2026, 10, 25, 2, 55, tzinfo=zone, fold=1)
+            cases = [("aware", aware_completion, aware_before, aware_equal, aware_after)]
+            if can_set_local_tz:
+                cases.append((
+                    "naive-local",
+                    aware_completion.replace(tzinfo=None),
+                    aware_before.replace(tzinfo=None),
+                    aware_equal.replace(tzinfo=None),
+                    aware_after.replace(tzinfo=None),
+                ))
+            for label, completed_at, before, equal, after in cases:
+                with self.subTest(clock_domain=label):
+                    self.assertLess(before.timestamp(), completed_at.timestamp())
+                    self.assertEqual(completed_at.timestamp(), equal.timestamp())
+                    self.assertGreater(after.timestamp(), completed_at.timestamp())
+                    accumulator = _ProgressiveScanAccumulator()
+                    old_root = SystemFile("moved", 1, True)
+                    old_root.path_pair_id = "pair"
+                    accumulator.apply([self._local_full_snapshot([old_root], 56)])
+                    token = accumulator.begin_root_invalidation("pair", "moved", 58)
+                    accumulator.finish_root_invalidation(
+                        "pair", "moved", token, True, completed_at,
+                    )
+
+                    for scan_started_at in (before, equal):
+                        root = SystemFile("moved", 2, True)
+                        root.path_pair_id = "pair"
+                        accumulator.apply([ScannerResult(
+                            datetime.now(), [root], scanned_path_pair_ids={"pair"}, generation=59,
+                            is_progress=True, root_names={"moved"},
+                            root_scan_outcomes_by_pair={"pair": {"moved": (True, True)}},
+                            scan_started_at=scan_started_at,
+                        )])
+                        self.assertIn(token, accumulator._ProgressiveScanAccumulator__move_invalidations_by_root[
+                            ("pair", "moved")
+                        ])
+
+                    root = SystemFile("moved", 3, True)
+                    root.path_pair_id = "pair"
+                    accumulator.apply([ScannerResult(
+                        datetime.now(), [root], scanned_path_pair_ids={"pair"}, generation=59,
+                        is_progress=True, root_names={"moved"},
+                        root_scan_outcomes_by_pair={"pair": {"moved": (True, True)}},
+                        scan_started_at=after,
+                    )])
+                    self.assertNotIn(
+                        ("pair", "moved"),
+                        accumulator._ProgressiveScanAccumulator__move_invalidations_by_root,
+                    )
+                    self.assertIs(root, accumulator.authority()[("pair", "moved")])
+        finally:
+            if can_set_local_tz:
+                if old_tz is None:
+                    os.environ.pop("TZ", None)
+                else:
+                    os.environ["TZ"] = old_tz
+                time.tzset()
+
+    def test_progressive_accumulator_pending_or_unfinished_move_token_cannot_be_released_by_root_progress(self):
+        move_completed_at = datetime.now()
+        for finish in (False, True):
+            with self.subTest(finish=finish):
+                accumulator = _ProgressiveScanAccumulator()
+                root = SystemFile("moved", 1, True)
+                root.path_pair_id = "pair"
+                accumulator.apply([self._local_full_snapshot([root], 56)])
+                token = accumulator.begin_root_invalidation("pair", "moved", 58)
+                if finish:
+                    accumulator.finish_root_invalidation("pair", "moved", token, True)
+                post_move = SystemFile("moved", 2, True)
+                post_move.path_pair_id = "pair"
+                accumulator.apply([ScannerResult(
+                    move_completed_at + timedelta(seconds=2), [post_move],
+                    scanned_path_pair_ids={"pair"}, generation=59, is_progress=True,
+                    root_names={"moved"},
+                    root_scan_outcomes_by_pair={"pair": {"moved": (True, True)}},
+                    scan_started_at=move_completed_at + timedelta(seconds=1),
+                )])
+                self.assertIn(token, accumulator._ProgressiveScanAccumulator__move_invalidations_by_root[
+                    ("pair", "moved")
+                ])
 
     def test_progressive_accumulator_commits_healthy_pair_when_another_pair_recovers_with_failure(self):
         accumulator = _ProgressiveScanAccumulator()

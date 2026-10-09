@@ -679,6 +679,9 @@ _CAPTURE_CONFIRMED_LOCAL_DELETE_MESSAGE = "confirmed_local_delete_source"
 _CAPTURE_CONFIRMED_LOCAL_DELETE_SCHEMA = "confirmed_local_delete_source.v1"
 _CAPTURE_CONFIRMED_DELETE_FENCE_MESSAGE = "confirmed_delete_fence_disposition"
 _CAPTURE_CONFIRMED_DELETE_FENCE_SCHEMA = "confirmed_delete_fence_disposition.v1"
+_CAPTURE_MOVE_ROOT_LIFECYCLE_MESSAGE = "move_root_invalidation_lifecycle"
+_CAPTURE_MOVE_ROOT_LIFECYCLE_SCHEMA = "move_root_invalidation_lifecycle.v1"
+_CAPTURE_MOVE_ROOT_LIFECYCLE_PHASES = {"created", "committed", "cancelled", "released", "protected"}
 _CAPTURE_CONFIRMED_DELETE_TARGET_SCOPES = {"exact_root", "nested_path"}
 _CAPTURE_CONFIRMED_DELETE_FENCE_DECISIONS = {"released", "reset"}
 _CAPTURE_CONFIRMED_DELETE_RELEASE_BASES = {"current_root", "healthy_full_snapshot", "session_reset"}
@@ -1442,6 +1445,29 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
                         and int(item) <= 2**63 - 1
                         else (None if item is None else "unknown")
                     )
+        elif message == _CAPTURE_MOVE_ROOT_LIFECYCLE_MESSAGE:
+            safe_gate["message"] = _CAPTURE_MOVE_ROOT_LIFECYCLE_MESSAGE
+            schema_known = gate.get("schema") == _CAPTURE_MOVE_ROOT_LIFECYCLE_SCHEMA
+            safe_gate["schema"] = _CAPTURE_MOVE_ROOT_LIFECYCLE_SCHEMA if schema_known else "unknown"
+            phase = gate.get("phase")
+            safe_gate["phase"] = (
+                phase if schema_known and isinstance(phase, str) and phase in _CAPTURE_MOVE_ROOT_LIFECYCLE_PHASES
+                else "unknown"
+            )
+            for key in (
+                "completion_known", "scan_started_after_completion", "root_present",
+                "root_final_complete", "root_staging_complete",
+            ):
+                item = gate.get(key)
+                safe_gate[key] = item if schema_known and type(item) is bool else None
+            for key in ("captured_generation", "event_generation"):
+                item = gate.get(key)
+                safe_gate[key] = (
+                    item if schema_known and isinstance(item, str)
+                    and _CAPTURE_CONFIRMED_DELETE_DECIMAL.fullmatch(item)
+                    and int(item) <= 2**63 - 1
+                    else (None if item is None else "unknown")
+                )
         elif isinstance(message, str) and message in _CAPTURE_PENDING_MOVE_MESSAGES:
             safe_gate["message"] = message
             schema = gate.get("schema")

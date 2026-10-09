@@ -7954,6 +7954,7 @@ class Controller:
             return Controller.MoveFromStagingResult.DEFERRED
 
         local_root_invalidation: Optional[tuple[str, int]] = None
+        move_completed_at: Optional[datetime] = None
         mutation_tracker = _MoveMutationTracker(
             trace_file_id,
             getattr(self.__context, "breadcrumb_trace", None),
@@ -8004,6 +8005,22 @@ class Controller:
                 # retaining this successful-return mark keeps lightweight
                 # adapters/mocks equally conservative.
                 mutation_tracker.mutated()
+            # Reaching this point means the complete file publication or
+            # directory merge returned successfully. Finish the exact token
+            # before force_scan can admit a scan whose start follows the move.
+            move_completed_at = datetime.now()
+            if local_root_invalidation is not None:
+                finish = getattr(
+                    getattr(self, "_Controller__updater", None),
+                    "finish_final_move_local_root_invalidation",
+                    None,
+                )
+                if callable(finish):
+                    invalidated_root, invalidation_token = local_root_invalidation
+                    finish(
+                        invalidated_root, path_pair_id, invalidation_token, True, move_completed_at,
+                    )
+                    local_root_invalidation = None
             self.logger.info("Moved '%s' from staging '%s' to '%s'", name, staging_path, final_path)
             breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
             trace_enabled = _breadcrumb_effectively_enabled(breadcrumb_trace, "controller", "info")

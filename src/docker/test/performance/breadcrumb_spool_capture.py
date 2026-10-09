@@ -347,6 +347,9 @@ _CONFIRMED_LOCAL_DELETE_MESSAGE = "confirmed_local_delete_source"
 _CONFIRMED_LOCAL_DELETE_SCHEMA = "confirmed_local_delete_source.v1"
 _CONFIRMED_DELETE_FENCE_MESSAGE = "confirmed_delete_fence_disposition"
 _CONFIRMED_DELETE_FENCE_SCHEMA = "confirmed_delete_fence_disposition.v1"
+_MOVE_ROOT_LIFECYCLE_MESSAGE = "move_root_invalidation_lifecycle"
+_MOVE_ROOT_LIFECYCLE_SCHEMA = "move_root_invalidation_lifecycle.v1"
+_MOVE_ROOT_LIFECYCLE_PHASES = frozenset({"created", "committed", "cancelled", "released", "protected"})
 _CONFIRMED_DELETE_TARGET_SCOPES = frozenset({"exact_root", "nested_path"})
 _CONFIRMED_DELETE_FENCE_DECISIONS = frozenset({"released", "reset"})
 _CONFIRMED_DELETE_RELEASE_BASES = frozenset({"current_root", "healthy_full_snapshot", "session_reset"})
@@ -637,6 +640,32 @@ def _completion_gate_facts(details: Mapping[str, object], message: object = None
             value = details.get(key)
             result[key] = value if schema_known and type(value) is bool else None
         for key in ("captured_generation", "event_generation", "scan_started_at_ms", "root_size"):
+            value = details.get(key)
+            result[key] = (
+                str(value) if schema_known and type(value) is int and 0 <= value <= 2**63 - 1
+                else (None if value is None else "unknown")
+            )
+        return result
+
+    if message == _MOVE_ROOT_LIFECYCLE_MESSAGE:
+        schema_known = details.get("schema") == _MOVE_ROOT_LIFECYCLE_SCHEMA
+        result = {
+            "boundary": "completion_gate",
+            "message": _MOVE_ROOT_LIFECYCLE_MESSAGE,
+            "schema": _MOVE_ROOT_LIFECYCLE_SCHEMA if schema_known else "unknown",
+        }
+        phase = details.get("phase")
+        result["phase"] = (
+            phase if schema_known and isinstance(phase, str) and phase in _MOVE_ROOT_LIFECYCLE_PHASES
+            else "unknown"
+        )
+        for key in (
+            "completion_known", "scan_started_after_completion", "root_present",
+            "root_final_complete", "root_staging_complete",
+        ):
+            value = details.get(key)
+            result[key] = value if schema_known and type(value) is bool else None
+        for key in ("captured_generation", "event_generation"):
             value = details.get(key)
             result[key] = (
                 str(value) if schema_known and type(value) is int and 0 <= value <= 2**63 - 1

@@ -10,7 +10,7 @@ import sys
 import threading
 from unittest.mock import patch
 from types import SimpleNamespace
-from datetime import datetime
+from datetime import datetime, timedelta
 from queue import Queue
 
 import pytest
@@ -2171,6 +2171,99 @@ def test_confirmed_delete_fence_facts_reach_json_sink_from_finalized_producer(tm
     assert malformed_gate["target_scope"] == "unknown" and malformed_gate["local_scan_binding_known"] is False
     assert malformed_gate["local_generation_known"] is True and malformed_gate["local_generation"] == "unknown"
     assert "raw_path" not in json.dumps(malformed)
+
+
+@pytest.mark.skipif(BreadcrumbTraceCollector is None or ModelUpdater is None, reason="production completion emitter is unavailable")
+def test_move_root_lifecycle_facts_reach_json_sink_from_finalized_producer(tmp_path: Path) -> None:
+    spool = tmp_path / "move-lifecycle-spool"
+    spool.mkdir()
+    artifact = tmp_path / "move-lifecycle-capture.jsonl"
+    collector = BreadcrumbTraceCollector(
+        lambda: True,
+        policy={"default": "off", "rules": {"completion.gate": "info"}},
+        durable_enabled=True,
+        durable_path=str(spool),
+        durable_enabled_getter=lambda: True,
+    )
+    controller = SimpleNamespace(
+        _Controller__context=SimpleNamespace(breadcrumb_trace=collector),
+        logger=SimpleNamespace(debug=lambda *args, **kwargs: None),
+    )
+    updater = ModelUpdater(controller)
+    controller._Controller__updater = updater
+    accumulator = _ensure_progressive_scan_state(
+        controller, "local", eager=True, bind_current_session=False,
+    )
+    try:
+        assert collector.record(
+            "model_updater", "move_root_lifecycle_test_baseline",
+            {"schema": "move_root_lifecycle_test_baseline.v1"},
+            category="completion.gate", event_type="diagnostic", stage="completion_gate", level="info",
+        ) in {"retained", "enqueued"}
+        assert collector.flush_durable(2.0)
+        reader = _reader(spool, artifact)
+        try:
+            reader.start()
+            move_completed_at = datetime.now()
+            token = updater.begin_final_move_local_root_invalidation(
+                "private-root", "private-pair", 2**53 + 17,
+            )
+            updater.finish_final_move_local_root_invalidation(
+                "private-root", "private-pair", token, True, move_completed_at,
+            )
+            root = SystemFile("private-root", 2**53 + 31, True)
+            root.path_pair_id = "private-pair"
+            scan = ScannerResult(
+                move_completed_at + timedelta(seconds=2), [root], scanned_path_pair_ids={"private-pair"},
+                generation=2**53 + 18, is_progress=True, root_names={"private-root"},
+                root_scan_outcomes_by_pair={"private-pair": {"private-root": (True, True)}},
+                scan_started_at=move_completed_at + timedelta(seconds=1),
+            )
+            accumulator.apply([scan])
+            assert collector.flush_durable(2.0)
+            assert reader.poll() >= 3
+        finally:
+            reader.close()
+    finally:
+        collector.close(timeout=2.0)
+
+    finalized = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
+    emitted = [row for row in finalized if row.get("message") == "move_root_invalidation_lifecycle"]
+    assert [row["details"]["phase"] for row in emitted] == ["created", "committed", "released"]
+    selected = [row for row in _artifacts(artifact) if row.get("capture", {}).get("state") == "record"
+                and row.get("capture", {}).get("projection", {}).get("completion_gate", {}).get("message") ==
+                "move_root_invalidation_lifecycle"]
+    projected = [row["capture"]["projection"] for row in selected]
+    assert [row["completion_gate"]["phase"] for row in projected] == ["created", "committed", "released"]
+    assert len(emitted) == len(selected) == 3
+    for source, sink in zip(emitted, selected):
+        capture_row = sink["capture"]
+        projection = capture_row["projection"]
+        metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+        assert capture_row.get("created_ns") == source.get("created_ns")
+        assert capture_row.get("created_ms") == source.get("created_ms")
+        assert projection["category"] == source.get("category", metadata.get("category"))
+        assert projection["stage"] == source.get("stage", metadata.get("stage"))
+        assert projection["event_type"] == source.get("event_type", metadata.get("event_type"))
+        corr_id = source.get("corr_id", metadata.get("corr_id"))
+        flow_id = source.get("flow_id", metadata.get("flow_id"))
+        file_id = source.get("file_id", metadata.get("file_id"))
+        pair_id = source.get("path_pair_id", metadata.get("path_pair_id"))
+        assert projection["corr_hash"] == capture._hash(corr_id)
+        assert projection["flow_hash"] == capture._hash(flow_id)
+        assert projection["file_hash"] == capture._hash(file_id)
+        assert projection["pair_hash"] == capture._hash(pair_id)
+    released = projected[-1]["completion_gate"]
+    assert released["schema"] == "move_root_invalidation_lifecycle.v1"
+    assert released["captured_generation"] == str(2**53 + 17)
+    assert released["event_generation"] == str(2**53 + 18)
+    assert released["completion_known"] is True and released["scan_started_after_completion"] is True
+    assert released["root_present"] is True and released["root_final_complete"] is True
+    assert released["root_staging_complete"] is True
+    safe = observer._sanitize_capture_projection(projected[-1])["completion_gate"]
+    assert safe == released
+    artifact_text = artifact.read_text(encoding="utf-8")
+    assert "private-root" not in artifact_text and "private-pair" not in artifact_text
 
 
 

@@ -12278,8 +12278,13 @@ class TestController(unittest.TestCase):
             self.controller._Controller__legacy_local_path = final_root
             self.controller._Controller__local_scan_process.generation = 58
             self.controller._Controller__updater.begin_final_move_local_root_invalidation.return_value = 17
+            order = []
+            finish = self.controller._Controller__updater.finish_final_move_local_root_invalidation
+            finish.side_effect = lambda *args: order.append(("finish", args))
+            force_scan = self.controller._Controller__local_scan_process.force_scan
+            force_scan.side_effect = lambda *args: order.append(("force_scan", args))
 
-            move.side_effect = lambda *_args: _args[-1].mutated()
+            move.side_effect = lambda *_args: _args[-2].mutated()
             result = self.controller._Controller__move_from_staging("nested/movie.mkv")
 
             self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
@@ -12288,10 +12293,12 @@ class TestController(unittest.TestCase):
                 "nested", None, 58,
             )
             move.assert_called_once()
-            self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
-            self.controller._Controller__updater.finish_final_move_local_root_invalidation.assert_called_once_with(
-                "nested", None, 17, True,
-            )
+            force_scan.assert_called_once_with()
+            finish.assert_called_once()
+            self.assertEqual(["finish", "force_scan"], [item[0] for item in order])
+            finish_args = finish.call_args.args
+            self.assertEqual(("nested", None, 17, True), finish_args[:4])
+            self.assertIsInstance(finish_args[4], datetime)
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace", side_effect=OSError("denied"))
     @patch("controller.controller.os.path.exists", return_value=True)
@@ -14524,7 +14531,7 @@ class TestController(unittest.TestCase):
             )
 
             tokens = accumulator._ProgressiveScanAccumulator__move_invalidations_by_root
-            self.assertEqual({58}, {generation for generation, status in tokens[(None, "release")].values()
+            self.assertEqual({58}, {generation for generation, status, _ in tokens[(None, "release")].values()
                                    if status == "committed"})
             self.assertTrue(os.path.exists(source))
 

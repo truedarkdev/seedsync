@@ -102,6 +102,26 @@ _COMPLETION_GATE_LFTP_SOURCES = frozenset({
     "cached_unhealthy", "error_empty", "fresh_healthy", "fresh_unhealthy",
     "inflight_empty", "retry_empty", "unhealthy_empty",
 })
+
+
+def _datetime_strictly_after(left: object, right: object) -> Optional[bool]:
+    """Compare datetimes by instant, preserving local-time DST folds.
+
+    Naive datetimes are interpreted in the process-local timezone, matching
+    the existing ``datetime.now()`` timestamps used by scanner and move
+    lifecycle records. Mixed naive/aware values and conversion failures are
+    unknown so callers retain their conservative behavior.
+    """
+    if not isinstance(left, datetime) or not isinstance(right, datetime):
+        return None
+    try:
+        left_aware = left.utcoffset() is not None
+        right_aware = right.utcoffset() is not None
+        if left_aware != right_aware:
+            return None
+        return left.astimezone(timezone.utc) > right.astimezone(timezone.utc)
+    except Exception:
+        return None
 _SCAN_AUTHORITY_DIAGNOSTIC_ONLY_KEYS = frozenset({
     "publication_id",
     "model_version",
@@ -2908,7 +2928,7 @@ class _ProgressiveScanAccumulator:
         self.__last_scan_marker_trace: tuple[dict[str, object], ...] = ()
         self.__last_root_shape_trace: Optional[dict[str, int]] = None
         self.__move_invalidations_by_root: dict[
-            tuple[Optional[str], str], dict[int, tuple[int, str]]
+            tuple[Optional[str], str], dict[int, tuple[int, str, Optional[datetime]]]
         ] = {}
         self.__next_move_invalidation_token = 0
         self.__fence_diagnostic_enabled: Optional[Callable[[], bool]] = None
@@ -2962,6 +2982,41 @@ class _ProgressiveScanAccumulator:
         except Exception:
             pass
 
+    def __record_move_root_lifecycle(
+            self, key, phase: str, captured_generation: int, *,
+            completed_at: Optional[datetime] = None, event=None,
+            scan_started_after_completion: Optional[bool] = None,
+            root_present: Optional[bool] = None,
+            root_final_complete: Optional[bool] = None,
+            root_staging_complete: Optional[bool] = None,
+    ) -> None:
+        """Record bounded facts for one exact move-invalidation lifecycle phase."""
+        try:
+            if not self.__fence_diagnostics_enabled() or self.__fence_diagnostic_recorder is None:
+                return
+            pair_id, root_name = key
+            generation = getattr(event, "generation", None)
+            generation = generation if type(generation) is int and 0 <= generation <= 2**63 - 1 else None
+            captured_known = type(captured_generation) is int and 0 <= captured_generation <= 2**63 - 1
+            self.__fence_diagnostic_recorder(pair_id, root_name, {
+                "message": "move_root_invalidation_lifecycle",
+                "schema": "move_root_invalidation_lifecycle.v1",
+                "phase": phase,
+                "captured_generation": captured_generation if captured_known else None,
+                "event_generation": generation,
+                "completion_known": isinstance(completed_at, datetime),
+                "scan_started_after_completion": (
+                    scan_started_after_completion
+                    if type(scan_started_after_completion) is bool else None
+                ),
+                "root_present": root_present if type(root_present) is bool else None,
+                "root_final_complete": root_final_complete if type(root_final_complete) is bool else None,
+                "root_staging_complete": root_staging_complete if type(root_staging_complete) is bool else None,
+            })
+        except Exception:
+            # Optional lifecycle evidence cannot alter scan or move authority.
+            pass
+
     def set_session_token(self, session_token: Optional[str]) -> None:
         """Bind active evidence to the current scanner process identity."""
         if not isinstance(session_token, str) or not session_token:
@@ -2977,7 +3032,7 @@ class _ProgressiveScanAccumulator:
         if self.__fence_diagnostics_enabled():
             try:
                 reset_fences = [(key, generation) for key, entries in self.__move_invalidations_by_root.items()
-                                for generation, status in entries.values() if status == "confirmed_delete"]
+                                for generation, status, _ in entries.values() if status == "confirmed_delete"]
             except Exception:
                 pass
         self.__session_token = session_token
@@ -3061,22 +3116,31 @@ class _ProgressiveScanAccumulator:
         self.__next_move_invalidation_token += 1
         token = self.__next_move_invalidation_token
         key = (path_pair_id, root_name)
-        self.__move_invalidations_by_root.setdefault(key, {})[token] = (generation, "pending")
+        self.__move_invalidations_by_root.setdefault(key, {})[token] = (generation, "pending", None)
+        self.__record_move_root_lifecycle(key, "created", generation)
         return token
 
     def finish_root_invalidation(
             self, path_pair_id: Optional[str], root_name: str, token: int, mutated: bool,
+            completed_at: Optional[datetime] = None,
     ) -> None:
         """Commit a mutated move or cancel only its exact no-mutation attempt."""
         key = (path_pair_id, root_name)
         entries = self.__move_invalidations_by_root.get(key)
         if entries is None or token not in entries:
             return
-        generation, _ = entries[token]
+        generation, _, _ = entries[token]
         if mutated:
-            entries[token] = (generation, "committed")
+            entries[token] = (
+                generation, "committed", completed_at if isinstance(completed_at, datetime) else None,
+            )
+            self.__record_move_root_lifecycle(
+                key, "committed", generation,
+                completed_at=completed_at if isinstance(completed_at, datetime) else None,
+            )
         else:
             entries.pop(token, None)
+            self.__record_move_root_lifecycle(key, "cancelled", generation)
             if not entries:
                 self.__move_invalidations_by_root.pop(key, None)
 
@@ -3093,13 +3157,13 @@ class _ProgressiveScanAccumulator:
         self.set_session_token(session_token)
         key = (path_pair_id, root_name)
         entries = self.__move_invalidations_by_root.setdefault(key, {})
-        for token, (captured_generation, status) in entries.items():
+        for token, (captured_generation, status, _) in entries.items():
             if status == "confirmed_delete":
-                entries[token] = (max(captured_generation, generation), status)
+                entries[token] = (max(captured_generation, generation), status, None)
                 break
         else:
             self.__next_move_invalidation_token += 1
-            entries[self.__next_move_invalidation_token] = (generation, "confirmed_delete")
+            entries[self.__next_move_invalidation_token] = (generation, "confirmed_delete", None)
 
         self.__committed_by_pair.setdefault(path_pair_id, {})
         self.prune_confirmed_local_deletion(path_pair_id, root_name, relative_path_segments)
@@ -3488,17 +3552,21 @@ class _ProgressiveScanAccumulator:
                 previous_generation = self.__active_generation.get(pair_id, -1)
                 event_outcomes = getattr(event, "root_scan_outcomes_by_pair", {})
                 pair_outcomes = event_outcomes.get(pair_id) if isinstance(event_outcomes, dict) else None
-                event_root_names = {
-                    file.name for file in event.files
-                    if self.__pair_for_file(file, event) == pair_id
-                }
+                event_root_names = set()
+                event_root_objects = {}
+                for file in event.files:
+                    if self.__pair_for_file(file, event) != pair_id:
+                        continue
+                    event_root_names.add(file.name)
+                    if isinstance(file, SystemFile) and isinstance(file.name, str):
+                        event_root_objects[file.name] = file
                 entries_for_pair = [
                     (key, entries) for key, entries in self.__move_invalidations_by_root.items()
                     if key[0] == pair_id
                 ]
                 for key, entries in entries_for_pair:
                     root_name = key[1]
-                    for token, (captured_generation, status) in list(entries.items()):
+                    for token, (captured_generation, status, completed_at) in list(entries.items()):
                         if status != "confirmed_delete" or generation <= captured_generation or \
                                 generation < previous_generation:
                             continue
@@ -3511,6 +3579,34 @@ class _ProgressiveScanAccumulator:
                                 key, captured_generation,
                                 "current_root" if has_current_root else "healthy_full_snapshot", event,
                             )
+                    # A complete exact-root result can supersede a committed
+                    # move fence even when another pair or the whole scan has
+                    # not completed. Keep the established full-snapshot path
+                    # below unchanged, and fail closed when move/scan timing
+                    # or source identity is unavailable.
+                    if not healthy_post_move_snapshot and not event.failed and \
+                            generation >= previous_generation and isinstance(pair_outcomes, dict) and \
+                            isinstance(pair_outcomes.get(root_name), tuple) and \
+                            len(pair_outcomes[root_name]) == 2 and \
+                            pair_outcomes[root_name][0] is True and pair_outcomes[root_name][1] is True:
+                        root = event_root_objects.get(root_name)
+                        started_at = getattr(event, "scan_started_at", None)
+                        if isinstance(root, SystemFile) and root.name == root_name and \
+                                self.__pair_for_file(root, event) == pair_id:
+                            for token, (captured_generation, status, completed_at) in list(entries.items()):
+                                if status != "committed" or generation <= captured_generation or \
+                                        not isinstance(completed_at, datetime):
+                                    continue
+                                started_after_move = _datetime_strictly_after(started_at, completed_at)
+                                if started_after_move is True:
+                                    entries.pop(token, None)
+                                    self.__record_move_root_lifecycle(
+                                        key, "released", captured_generation,
+                                        completed_at=completed_at, event=event,
+                                        scan_started_after_completion=True,
+                                        root_present=True, root_final_complete=True,
+                                        root_staging_complete=True,
+                                    )
                     if not entries:
                         self.__move_invalidations_by_root.pop(key, None)
                 protected_root_names = set()
@@ -3520,9 +3616,31 @@ class _ProgressiveScanAccumulator:
                     if any(
                             status == "confirmed_delete" or status == "pending" or
                             generation <= captured_generation or not healthy_post_move_snapshot
-                            for captured_generation, status in entries.values()
+                            for captured_generation, status, _ in entries.values()
                     ):
                         protected_root_names.add(root_name)
+                        if self.__fence_diagnostics_enabled():
+                            root = event_root_objects.get(root_name)
+                            outcome = pair_outcomes.get(root_name) if isinstance(pair_outcomes, dict) else None
+                            if isinstance(root, SystemFile) and root.name == root_name and \
+                                    self.__pair_for_file(root, event) == pair_id and \
+                                    isinstance(outcome, tuple) and len(outcome) == 2 and \
+                                    outcome[0] is True and outcome[1] is True:
+                                started_at = getattr(event, "scan_started_at", None)
+                                for captured_generation, status, completed_at in entries.values():
+                                    if status not in ("pending", "committed"):
+                                        continue
+                                    started_after_move = None
+                                    started_after_move = _datetime_strictly_after(started_at, completed_at)
+                                    self.__record_move_root_lifecycle(
+                                        (pair_id, root_name), "protected", captured_generation,
+                                        completed_at=completed_at, event=event,
+                                        scan_started_after_completion=started_after_move,
+                                        root_present=True,
+                                        root_final_complete=outcome[0],
+                                        root_staging_complete=outcome[1],
+                                    )
+                                    break
                 if root_shape_trace is not None:
                     root_shape_trace["protected_root_count"] += len(protected_root_names)
                 if generation < previous_generation:
@@ -3750,9 +3868,29 @@ class _ProgressiveScanAccumulator:
                     for key, entries in list(self.__move_invalidations_by_root.items()):
                         if key[0] != pair_id:
                             continue
-                        for token, (captured_generation, status) in list(entries.items()):
+                        for token, (captured_generation, status, completed_at) in list(entries.items()):
                             if status == "committed" and generation > captured_generation:
                                 entries.pop(token, None)
+                                if self.__fence_diagnostics_enabled():
+                                    root = event_root_objects.get(key[1])
+                                    outcome = pair_outcomes.get(key[1]) if isinstance(pair_outcomes, dict) else None
+                                    started_after_move = None
+                                    started_at = getattr(event, "scan_started_at", None)
+                                    started_after_move = _datetime_strictly_after(started_at, completed_at)
+                                    self.__record_move_root_lifecycle(
+                                        key, "released", captured_generation,
+                                        completed_at=completed_at, event=event,
+                                        scan_started_after_completion=started_after_move,
+                                        root_present=isinstance(root, SystemFile),
+                                        root_final_complete=(
+                                            outcome[0] if isinstance(outcome, tuple) and len(outcome) == 2
+                                            and type(outcome[0]) is bool else None
+                                        ),
+                                        root_staging_complete=(
+                                            outcome[1] if isinstance(outcome, tuple) and len(outcome) == 2
+                                            and type(outcome[1]) is bool else None
+                                        ),
+                                    )
                         if not entries:
                             self.__move_invalidations_by_root.pop(key, None)
 
@@ -3914,7 +4052,7 @@ class _ProgressiveScanAccumulator:
             authoritative_roots = self.__authoritative_by_pair.get(pair_id, {})
             for root_name, outcome_and_start in outcomes.items():
                 invalidations = self.__move_invalidations_by_root.get((pair_id, root_name), {})
-                if any(status == "confirmed_delete" for _, status in invalidations.values()):
+                if any(status == "confirmed_delete" for _, status, _ in invalidations.values()):
                     continue
                 current_root = authoritative_roots.get(root_name)
                 if outcome_and_start[0] == (True, True) and isinstance(current_root, SystemFile):
@@ -3941,7 +4079,7 @@ class _ProgressiveScanAccumulator:
         if not isinstance(outcome_and_start, tuple) or len(outcome_and_start) != 2 or \
                 outcome_and_start[0] != (True, True):
             return None
-        if any(status == "confirmed_delete" for _, status in
+        if any(status == "confirmed_delete" for _, status, _ in
                self.__move_invalidations_by_root.get((path_pair_id, root_name), {}).values()):
             return None
         current_root = self.__authoritative_by_pair.get(path_pair_id, {}).get(root_name)
@@ -4075,13 +4213,13 @@ class _ProgressiveScanAccumulator:
                 )
             return None
         if diagnostic is None:
-            confirmed_delete = any(status == "confirmed_delete" for _, status in
+            confirmed_delete = any(status == "confirmed_delete" for _, status, _ in
                                    self.__move_invalidations_by_root.get((path_pair_id, root_name), {}).values())
             delete_generation = None
         else:
             delete_generation = None
             confirmed_delete = False
-            for captured_generation, status in self.__move_invalidations_by_root.get(
+            for captured_generation, status, _ in self.__move_invalidations_by_root.get(
                     (path_pair_id, root_name), {}).values():
                 if status == "confirmed_delete":
                     confirmed_delete = True
@@ -4597,12 +4735,16 @@ def _ensure_progressive_scan_state(
         setattr(controller, "_Controller__progressive_{}_scan_state_eager".format(side), eager)
     updater = getattr(controller, "_Controller__updater", None)
     if side == "local" and isinstance(updater, ModelUpdater):
+        def record_fence_diagnostic(pair_id, root_name, details):
+            payload = dict(details)
+            message = payload.pop("message", "confirmed_delete_fence_disposition")
+            updater._record_completion_gate_breadcrumb(
+                ModelFile.build_file_id(root_name, pair_id), message, payload,
+            )
+
         accumulator.set_fence_diagnostic_callbacks(
             updater._completion_gate_trace_enabled,
-            lambda pair_id, root_name, details: updater._record_completion_gate_breadcrumb(
-                ModelFile.build_file_id(root_name, pair_id),
-                "confirmed_delete_fence_disposition", details,
-            ),
+            record_fence_diagnostic,
         )
     if bind_current_session and isinstance(
             getattr(controller, "_Controller__{}_scan_process".format(side), None),
@@ -5897,10 +6039,11 @@ class ModelUpdater(_ControllerCoreAccess):
 
     def finish_final_move_local_root_invalidation(
             self, root_name: str, path_pair_id: Optional[str], token: int, mutated: bool,
+            completed_at: Optional[datetime] = None,
     ) -> None:
         """Commit or cancel exactly one local-root physical move attempt."""
         accumulator = _ensure_progressive_scan_state(self._controller, "local")
-        accumulator.finish_root_invalidation(path_pair_id, root_name, token, mutated)
+        accumulator.finish_root_invalidation(path_pair_id, root_name, token, mutated, completed_at)
 
     def confirm_local_delete(self, file_id: str, path_pair_id: Optional[str]) -> bool:
         """Fence one confirmed delete against the scanner's current session/work."""

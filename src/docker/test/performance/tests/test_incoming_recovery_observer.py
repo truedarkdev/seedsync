@@ -1001,6 +1001,49 @@ def test_pending_completion_wake_projection_keeps_unknown_distinct_from_false():
     assert proof["builder"] == "unknown"
 
 
+def test_move_root_lifecycle_projection_sanitizer_preserves_only_bounded_facts():
+    projected, rejected = capture._projection({
+        "source": "model_updater", "category": "completion.gate", "event_type": "diagnostic",
+        "stage": "completion_gate", "level": "info", "message": "move_root_invalidation_lifecycle",
+        "corr_id": "completion:0123456789abcdef",
+        "details": {
+            "schema": "move_root_invalidation_lifecycle.v1", "phase": "released",
+            "captured_generation": 2**53 + 17, "event_generation": 2**53 + 18,
+            "completion_known": True, "scan_started_after_completion": True,
+            "root_present": True, "root_final_complete": True, "root_staging_complete": True,
+            "raw_path": "/private/root", "session_token": "private-session",
+        },
+    })
+    assert not rejected and projected is not None
+    safe = observer._sanitize_capture_projection(projected)["completion_gate"]
+    assert safe == {
+        "boundary": "completion_gate", "message": "move_root_invalidation_lifecycle",
+        "schema": "move_root_invalidation_lifecycle.v1", "phase": "released",
+        "captured_generation": str(2**53 + 17), "event_generation": str(2**53 + 18),
+        "completion_known": True, "scan_started_after_completion": True,
+        "root_present": True, "root_final_complete": True, "root_staging_complete": True,
+    }
+
+    malformed = observer._sanitize_capture_projection({
+        "completion_gate": {
+            "boundary": "completion_gate", "message": "move_root_invalidation_lifecycle",
+            "schema": "private-schema", "phase": "private-phase",
+            "captured_generation": str(2**63), "event_generation": "01",
+            "completion_known": 1, "scan_started_after_completion": "true",
+            "root_present": False, "root_final_complete": True, "root_staging_complete": None,
+            "raw_path": "/private/root",
+        },
+    })["completion_gate"]
+    assert malformed == {
+        "boundary": "completion_gate", "message": "move_root_invalidation_lifecycle",
+        "schema": "unknown", "phase": "unknown", "captured_generation": "unknown",
+        "event_generation": "unknown", "completion_known": None,
+        "scan_started_after_completion": None, "root_present": None,
+        "root_final_complete": None, "root_staging_complete": None,
+    }
+    assert "/private/root" not in json.dumps(safe) and "/private/root" not in json.dumps(malformed)
+
+
 def test_model_finalization_projection_sanitizer_keeps_only_bounded_schema_fields():
     safe = observer._sanitize_capture_projection({
         "model_finalization": {
