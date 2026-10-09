@@ -2759,6 +2759,10 @@ class _AutomaticMoveBoundary:
                 None if succeeded else "copy_failed", int(elapsed_ms),
             )
 
+    def cleanup_private(self, operation: Callable[[], object]) -> object:
+        """Yield only deletion of a validated, private source claim."""
+        return self.__timed_model_lock.run_unlocked(operation)
+
     def __pending_control_intent_unlocked(self, queued_commands: object) -> bool:
         file = self.__file
         target_paths = tuple(

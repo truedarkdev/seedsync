@@ -7727,13 +7727,15 @@ class Controller:
     def __remove_published_source(
             src: str, expected_stat: os.stat_result, expected_snapshot: Optional[bytes],
             validate_before_delete: Optional[Callable[[str], None]] = None,
-            publication_metrics: Optional[dict[str, Optional[int]]] = None) -> None:
+            publication_metrics: Optional[dict[str, Optional[int]]] = None,
+            cleanup_private: Optional[Callable[[Callable[[], object]], object]] = None) -> None:
         """Remove a source only after its replacement has been published.
 
         Claim the source into an unguessable private sibling before deletion.
         A noncooperating process can still race the claim rename itself, but a
         mismatched claim is retained rather than deleted; no replacement at
-        the public source pathname is removed by cleanup.
+        the public source pathname is removed by cleanup.  If supplied,
+        ``cleanup_private`` wraps only the validated claim deletion.
         """
         started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
         try:
@@ -7785,16 +7787,22 @@ class Controller:
                     publication_metrics, "claimed_identity_tree_validation_ns", started_ns,
                 )
 
-            started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
-            try:
-                if claimed_is_directory:
-                    shutil.rmtree(claimed_path)
-                else:
-                    os.unlink(claimed_path)
-            finally:
-                _MoveMutationTracker.finish_publication_phase(
-                    publication_metrics, "claim_delete_ns", started_ns,
-                )
+            def delete_claim() -> None:
+                started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
+                try:
+                    if claimed_is_directory:
+                        shutil.rmtree(claimed_path)
+                    else:
+                        os.unlink(claimed_path)
+                finally:
+                    _MoveMutationTracker.finish_publication_phase(
+                        publication_metrics, "claim_delete_ns", started_ns,
+                    )
+
+            if cleanup_private is not None:
+                cleanup_private(delete_claim)
+            else:
+                delete_claim()
         finally:
             # Also persist both retained mismatch claims and successful
             # deletions.  Capability-limited platforms keep their documented
@@ -9461,9 +9469,14 @@ class Controller:
                     _MoveMutationTracker.finish_publication_phase(
                         publication_metrics, "outer_source_recheck_ns", started_ns,
                     )
+                cleanup_private = getattr(automatic_move_boundary, "cleanup_private", None) \
+                    if automatic_move_boundary is not None else None
+                if not callable(cleanup_private):
+                    cleanup_private = None
                 cls.__remove_published_source(
                     src, source_stat, source_claim_snapshot,
                     publication_metrics=publication_metrics,
+                    cleanup_private=cleanup_private,
                 )
                 started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
                 try:

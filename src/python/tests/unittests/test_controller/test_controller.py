@@ -12544,6 +12544,142 @@ class TestController(unittest.TestCase):
                     entry.startswith(".seedsync-publish-") for entry in os.listdir(final_root)
                 ))
 
+    def test_automatic_move_boundary_yields_only_private_claim_deletion(self):
+        for fail_cleanup in (False, True):
+            with self.subTest(fail_cleanup=fail_cleanup), tempfile.TemporaryDirectory() as temp_dir:
+                source_parent = os.path.join(temp_dir, "staging")
+                destination_parent = os.path.join(temp_dir, "final")
+                os.mkdir(source_parent)
+                os.mkdir(destination_parent)
+                source = os.path.join(source_parent, "sample")
+                destination = os.path.join(destination_parent, "sample")
+                Path(source).write_bytes(b"payload")
+
+                model_lock = Lock()
+                work_state_lock = RLock()
+                file_id = ModelFile.build_file_id("sample", None)
+                controller = SimpleNamespace(
+                    _Controller__path_pair_refresh_lock=Lock(),
+                    _Controller__path_pair_refresh_requested=False,
+                    _Controller__path_pair_refresh_generation=0,
+                    _Controller__path_pairs_by_id={},
+                    _Controller__path_pair_staging_paths={},
+                    _Controller__legacy_local_path=destination_parent,
+                    _Controller__legacy_remote_path="remote",
+                    _Controller__staging_path=source_parent,
+                    _Controller__progress_publication_epoch=1,
+                    _Controller__scan_authority_publication_id=2,
+                    _Controller__scan_authority_tokens={
+                        "local": {None: ("local-session", 0)},
+                        "remote": {None: ("remote-session", 0)},
+                    },
+                    _Controller__active_scan_process=SimpleNamespace(session_token="active-session"),
+                    _Controller__local_scan_process=SimpleNamespace(session_token="local-session"),
+                    _Controller__remote_scan_process=SimpleNamespace(session_token="remote-session"),
+                    _Controller__pending_completion_publications={},
+                    _Controller__model=Model(),
+                    _Controller__command_flow_lock=Lock(),
+                    _Controller__command_queue=Queue(),
+                    _Controller__active_command_processes=[],
+                    _Controller__deferred_delete_command_refs=[],
+                    _Controller__work_state_lock=work_state_lock,
+                )
+                updater = SimpleNamespace(_record_completion_gate_breadcrumb=MagicMock())
+                file = SimpleNamespace(
+                    file_id=file_id, name="sample", full_path="sample", path_pair_id=None,
+                    state=ModelFile.State.DOWNLOADED, local_size=7, remote_size=7, modified=None,
+                )
+                timed_lock = _ModelUpdateTimedModelLock(model_lock, None)
+                boundary = _AutomaticMoveBoundary(updater, controller, timed_lock, file, None)
+                cleanup_started = threading.Event()
+                resume_cleanup = threading.Event()
+                claimed_paths = []
+                source_sync_lock_states = []
+                results = []
+                errors = []
+                original_unlink = os.unlink
+
+                def delayed_claim_unlink(path, *args, **kwargs):
+                    if os.path.basename(path).startswith(".seedsync-retire-"):
+                        claimed_paths.append(path)
+                        cleanup_started.set()
+                        if not resume_cleanup.wait(2):
+                            raise TimeoutError("test did not release private claim cleanup")
+                        if fail_cleanup:
+                            raise OSError(errno.EIO, "injected private claim cleanup failure")
+                    return original_unlink(path, *args, **kwargs)
+
+                def record_source_parent_sync(path):
+                    if path == source_parent:
+                        acquired = model_lock.acquire(blocking=False)
+                        source_sync_lock_states.append(not acquired)
+                        if acquired:
+                            model_lock.release()
+
+                def run_publish():
+                    try:
+                        with work_state_lock:
+                            with timed_lock:
+                                Controller._Controller__publish_staging_no_replace(
+                                    source, destination, automatic_move_boundary=boundary,
+                                )
+                                results.append("published")
+                    except BaseException as error:
+                        errors.append(error)
+
+                worker = threading.Thread(target=run_publish)
+                try:
+                    with patch.object(
+                            Controller, "_Controller__rename_no_replace",
+                            side_effect=OSError(errno.EINVAL, "copy fallback required"),
+                    ), patch.object(os, "unlink", side_effect=delayed_claim_unlink), patch.object(
+                            Controller, "_Controller__sync_directory_if_supported",
+                            side_effect=record_source_parent_sync,
+                    ):
+                        worker.start()
+                        self.assertTrue(cleanup_started.wait(1))
+                        self.assertTrue(claimed_paths)
+                        self.assertTrue(os.path.lexists(claimed_paths[0]))
+                        model_lock_available = model_lock.acquire(timeout=0.25)
+                        if model_lock_available:
+                            model_lock.release()
+
+                        work_lock_acquired = []
+
+                        def contend_for_work_state_lock():
+                            acquired = work_state_lock.acquire(timeout=0.1)
+                            work_lock_acquired.append(acquired)
+                            if acquired:
+                                work_state_lock.release()
+
+                        contender = threading.Thread(target=contend_for_work_state_lock)
+                        contender.start()
+                        contender.join(1)
+                        self.assertFalse(contender.is_alive())
+                        resume_cleanup.set()
+                        worker.join(2)
+                finally:
+                    resume_cleanup.set()
+                    if worker.is_alive():
+                        worker.join(2)
+
+                self.assertFalse(worker.is_alive())
+                self.assertTrue(model_lock_available)
+                self.assertEqual([False], work_lock_acquired)
+                self.assertGreaterEqual(len(source_sync_lock_states), 2)
+                self.assertTrue(all(source_sync_lock_states))
+                self.assertTrue(os.path.lexists(destination))
+                self.assertFalse(os.path.lexists(source))
+                if fail_cleanup:
+                    self.assertEqual([], results)
+                    self.assertEqual(1, len(errors))
+                    self.assertEqual(errno.EIO, errors[0].errno)
+                    self.assertTrue(os.path.lexists(claimed_paths[0]))
+                else:
+                    self.assertEqual(["published"], results)
+                    self.assertEqual([], errors)
+                    self.assertFalse(os.path.lexists(claimed_paths[0]))
+
     def test_automatic_move_boundary_revalidates_committed_authority_not_worker_generation(self):
         race_cases = (
             "stop", "delete", "epoch", "config", "worker_generation",
@@ -22404,13 +22540,17 @@ class TestController(unittest.TestCase):
                 events.append("validate")
                 return b"replacement"
 
+            cleanup_private = MagicMock(side_effect=lambda operation: operation())
             with patch.object(Controller, "_Controller__sync_directory_if_supported", side_effect=sync_parent), \
                     patch.object(Controller, "_Controller__source_tree_snapshot", side_effect=mismatched_snapshot):
                 with self.assertRaises(OSError) as error:
-                    Controller._Controller__remove_published_source(source, source_stat, source_snapshot)
+                    Controller._Controller__remove_published_source(
+                        source, source_stat, source_snapshot, cleanup_private=cleanup_private,
+                    )
 
             self.assertEqual(errno.EAGAIN, error.exception.errno)
             self.assertEqual(["sync", "validate", "sync"], events)
+            cleanup_private.assert_not_called()
             claims = [entry for entry in os.listdir(source_parent) if entry.startswith(".seedsync-retire-")]
             self.assertEqual(1, len(claims))
             self.assertEqual(b"source", Path(os.path.join(source_parent, claims[0])).read_bytes())
