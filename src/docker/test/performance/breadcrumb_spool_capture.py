@@ -278,6 +278,14 @@ _SCAN_LIFECYCLE_COUNTERS = (
     "monotonic_ms", "accumulator_working_root_count", "accumulator_committed_root_count",
     "accumulator_authoritative_root_count", "accumulator_touched_root_count",
 )
+_SCANNER_PROCESS_MESSAGES = frozenset({
+    "force_scan", "scan_started", "scan_completed", "scan_failed",
+    "scan_result_published", "scan_result_dropped",
+})
+_SCANNER_PROCESS_DECISIONS = frozenset({
+    "queued", "full_replaced", "coalesced_full", "coalesced_pair",
+})
+_SCANNER_PROCESS_PAIR_REF_LIMIT = 8
 _SCAN_TICK_BOOLEAN_KEYS = {
     "present": "p", "progress": "pr", "final": "f", "failed": "fa", "full": "fu",
     "new_authority": "na",
@@ -696,6 +704,12 @@ def _completion_gate_facts(details: Mapping[str, object], message: object = None
         )
         result["exact_final_file_proof"] = (
             details.get("exact_final_file_proof") if type(details.get("exact_final_file_proof")) is bool else None
+        )
+    if message == "completion_pending_registered" and "scan_pair_ref" in details:
+        pair_ref = details.get("scan_pair_ref")
+        result["scan_pair_ref"] = (
+            pair_ref if pair_ref == "full" or isinstance(pair_ref, str) and _OPAQUE_TOKEN.fullmatch(pair_ref)
+            else "unknown"
         )
     return result
 
@@ -1314,6 +1328,100 @@ def _scan_lifecycle_facts(
     return result
 
 
+def _scanner_process_facts(
+        details: Mapping[str, object], message: object, corr_id: object,
+) -> dict[str, object] | None:
+    if not isinstance(message, str) or message not in _SCANNER_PROCESS_MESSAGES:
+        return None
+
+    corr = re.fullmatch(r"(local|remote):([0-9a-f]{12}):((?:0|[1-9][0-9]{0,18}))", corr_id) \
+        if isinstance(corr_id, str) else None
+    corr_side = corr.group(1) if corr is not None else None
+    corr_generation = corr.group(3) if corr is not None and int(corr.group(3)) <= 2**63 - 1 else None
+    detail_side = details.get("scanner_side")
+    side = detail_side if isinstance(detail_side, str) and detail_side in {"local", "remote"} else corr_side
+    if side not in {"local", "remote"} or corr_side is not None and corr_side != side:
+        side = "unknown"
+
+    def exact_bool(key: str) -> bool | None | str:
+        if key not in details:
+            return None
+        value = details.get(key)
+        return value if value is None or type(value) is bool else "unknown"
+
+    def decimal(key: str) -> str | None | str:
+        if key not in details:
+            return None
+        value = details.get(key)
+        return str(value) if type(value) is int and 0 <= value <= 2**63 - 1 else "unknown"
+
+    result: dict[str, object] = {
+        "message": message,
+        "side": side,
+        "run_digest": corr.group(2) if corr is not None and side != "unknown" else "unknown",
+        "scan_run_ref": None,
+        "generation": corr_generation if side != "unknown" else "unknown",
+        "current_generation": decimal("current_generation"),
+        "scanner_ref": corr_id if message == "force_scan" and isinstance(corr_id, str)
+        and _OPAQUE_TOKEN.fullmatch(corr_id) else None,
+        "request_ref": None,
+        "decision": None,
+        "targeted": exact_bool("targeted"),
+        "final": exact_bool("final"),
+        "full": exact_bool("full"),
+        "progress": exact_bool("progress"),
+        "failed": exact_bool("failed"),
+        "monotonic_ms": decimal("monotonic_ms"),
+        "utc": details.get("utc") if isinstance(details.get("utc"), str) and re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+00:00", details["utc"],
+        ) else None,
+    }
+    if message == "force_scan" and "scan_run_ref" in details:
+        scan_run_ref = details.get("scan_run_ref")
+        result["scan_run_ref"] = (
+            scan_run_ref if isinstance(scan_run_ref, str) and _SCAN_SESSION_DIGEST.fullmatch(scan_run_ref)
+            else "unknown"
+        )
+    detail_generation = details.get("generation")
+    if type(detail_generation) is int and 0 <= detail_generation <= 2**63 - 1:
+        detail_generation_text = str(detail_generation)
+        if corr_generation is None or detail_generation_text == corr_generation:
+            result["generation"] = detail_generation_text
+        else:
+            result["generation"] = "unknown"
+    elif "generation" in details:
+        result["generation"] = "unknown"
+
+    if "decision" in details:
+        decision = details.get("decision")
+        result["decision"] = decision if isinstance(decision, str) and decision in _SCANNER_PROCESS_DECISIONS else "unknown"
+    if "request_correlation" in details:
+        request_ref = details.get("request_correlation")
+        result["request_ref"] = (
+            request_ref if request_ref == "full" or isinstance(request_ref, str) and _OPAQUE_TOKEN.fullmatch(request_ref)
+            else "unknown"
+        )
+
+    for prefix in ("requested", "scanned", "completed", "unknown"):
+        members_key = prefix + "_members"
+        raw_members = details.get(members_key)
+        members: list[str] | None
+        if members_key not in details:
+            members = None
+        elif isinstance(raw_members, (list, tuple)) and len(raw_members) <= _SCANNER_PROCESS_PAIR_REF_LIMIT:
+            if all(item == "full" or isinstance(item, str) and _OPAQUE_TOKEN.fullmatch(item)
+                   for item in raw_members):
+                members = list(raw_members)
+            else:
+                members = None
+        else:
+            members = None
+        result[prefix + "_refs"] = members
+        result[prefix + "_count"] = decimal(prefix + "_pair_count")
+        result[prefix + "_truncated"] = exact_bool(prefix + "_truncated")
+    return result
+
+
 def select_input_arbitration_rows(records: object, root_id: object) -> dict[str, object]:
     """Select app-emitted root rows and their same-build leaf/summary rows.
 
@@ -1385,6 +1493,14 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     level = _allowed_field(row, metadata, "level", _LEVELS)
     message = row.get("message", metadata.get("message"))
     numbers = _numeric_values(row, metadata, details)
+    scanner_process_event = (
+        _scanner_process_facts(details, message, row.get("corr_id", metadata.get("corr_id")))
+        if source == "scanner_process" and category == "scanner_process" and stage == "scan" else None
+    )
+    if scanner_process_event is not None:
+        # Keep generation only in the decimal-string projection below; the
+        # generic numeric map is consumed by JavaScript clients.
+        numbers.pop("generation", None)
     lifecycle = _queue_lifecycle_facts(details) if category == "queue.lifecycle" else None
     lftp_status_authority = (
         _lftp_status_authority_facts(details, message)
@@ -1499,6 +1615,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["local_scan_tick"] = local_scan_tick
     if scan_lifecycle is not None:
         result["scan_lifecycle"] = scan_lifecycle
+    if scanner_process_event is not None:
+        result["scanner_process_event"] = scanner_process_event
     return result, False
 
 

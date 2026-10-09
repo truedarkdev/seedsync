@@ -760,6 +760,14 @@ _CAPTURE_SCAN_LIFECYCLE_COUNTERS = (
     "monotonic_ms", "accumulator_working_root_count", "accumulator_committed_root_count",
     "accumulator_authoritative_root_count", "accumulator_touched_root_count",
 )
+_CAPTURE_SCANNER_PROCESS_MESSAGES = {
+    "force_scan", "scan_started", "scan_completed", "scan_failed",
+    "scan_result_published", "scan_result_dropped",
+}
+_CAPTURE_SCANNER_PROCESS_DECISIONS = {
+    "queued", "full_replaced", "coalesced_full", "coalesced_pair",
+}
+_CAPTURE_SCANNER_PAIR_REF_LIMIT = 8
 
 
 def _sanitize_input_arbitration(value: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -972,6 +980,65 @@ def _sanitize_scan_lifecycle_event(value: Mapping[str, object]) -> Mapping[str, 
     return result
 
 
+def _sanitize_scanner_process_event(value: Mapping[str, object]) -> Mapping[str, object] | None:
+    message = value.get("message")
+    if not isinstance(message, str) or message not in _CAPTURE_SCANNER_PROCESS_MESSAGES:
+        return None
+
+    def decimal(key: str) -> str | None:
+        item = value.get(key)
+        if item is None:
+            return None
+        if item == "unknown":
+            return "unknown"
+        return item if isinstance(item, str) and _CAPTURE_INPUT_ARBITRATION_DECIMAL_IDENTITY.fullmatch(item) \
+            and int(item) <= 2**63 - 1 else "unknown"
+
+    def pair_ref(item: object) -> bool:
+        return item == "full" or isinstance(item, str) and _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(item)
+
+    def refs(key: str) -> list[str] | None:
+        if key not in value or value.get(key) is None:
+            return None
+        raw = value.get(key)
+        if not isinstance(raw, list) or len(raw) > _CAPTURE_SCANNER_PAIR_REF_LIMIT or not all(pair_ref(item) for item in raw):
+            return None
+        return list(raw)
+
+    result: dict[str, object] = {
+        "message": message,
+        "side": value.get("side") if isinstance(value.get("side"), str) and
+        value.get("side") in {"local", "remote", "unknown"} else "unknown",
+        "run_digest": value.get("run_digest") if value.get("run_digest") == "unknown" or
+        value.get("run_digest") is None or isinstance(value.get("run_digest"), str) and
+        _CAPTURE_SCAN_SESSION_DIGEST.fullmatch(value.get("run_digest")) else "unknown",
+        "scan_run_ref": value.get("scan_run_ref") if value.get("scan_run_ref") == "unknown" or
+        value.get("scan_run_ref") is None or isinstance(value.get("scan_run_ref"), str) and
+        _CAPTURE_SCAN_SESSION_DIGEST.fullmatch(value.get("scan_run_ref")) else "unknown",
+        "generation": decimal("generation") if value.get("generation") is not None else value.get("generation"),
+        "current_generation": decimal("current_generation"),
+        "scanner_ref": value.get("scanner_ref") if pair_ref(value.get("scanner_ref")) else
+        ("unknown" if value.get("scanner_ref") is not None else None),
+        "request_ref": value.get("request_ref") if pair_ref(value.get("request_ref")) else
+        ("unknown" if value.get("request_ref") is not None else None),
+        "decision": value.get("decision") if isinstance(value.get("decision"), str) and
+        value.get("decision") in _CAPTURE_SCANNER_PROCESS_DECISIONS else
+        ("unknown" if value.get("decision") is not None else None),
+        "utc": value.get("utc") if isinstance(value.get("utc"), str) and
+        re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+00:00", value.get("utc")) else None,
+        "monotonic_ms": decimal("monotonic_ms"),
+    }
+    for key in ("targeted", "final", "full", "progress", "failed"):
+        item = value.get(key)
+        result[key] = item if item is None or item == "unknown" or type(item) is bool else "unknown"
+    for prefix in ("requested", "scanned", "completed", "unknown"):
+        result[prefix + "_refs"] = refs(prefix + "_refs")
+        result[prefix + "_count"] = decimal(prefix + "_count")
+        item = value.get(prefix + "_truncated")
+        result[prefix + "_truncated"] = item if item is None or item == "unknown" or type(item) is bool else "unknown"
+    return result
+
+
 def _sanitize_lftp_status_authority(value: object) -> Mapping[str, object] | None:
     if not isinstance(value, Mapping):
         return None
@@ -1167,6 +1234,10 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
         for key in {"poll_eligible", "poll_fresh", "poll_healthy", "previous_active", "current_active", "marker_observed", "local_scan_forced", "explicit_stop", "build_ran", "candidate_present", "live_present", "local_size_present", "remote_size_present", "complete_local_coverage", "exact_final_file_proof", "model_diff_present", "completion_proved"}:
             if type(gate.get(key)) is bool:
                 safe_gate[key] = gate[key]
+        pair_ref = gate.get("scan_pair_ref")
+        if pair_ref is not None:
+            safe_gate["scan_pair_ref"] = pair_ref if pair_ref == "full" or isinstance(pair_ref, str) and \
+                _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(pair_ref) else "unknown"
         message = gate.get("message")
         if isinstance(message, str) and message in {
             _CAPTURE_CONFIRMED_LOCAL_DELETE_MESSAGE, _CAPTURE_CONFIRMED_DELETE_FENCE_MESSAGE,
@@ -1467,6 +1538,12 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
         safe_scan_lifecycle_event = _sanitize_scan_lifecycle_event(scan_lifecycle_event)
         if safe_scan_lifecycle_event is not None:
             result["scan_lifecycle"] = safe_scan_lifecycle_event
+    scanner_process_event = value.get("scanner_process_event")
+    if (result.get("source") == "scanner_process" and result.get("category") == "scanner_process"
+            and result.get("stage") == "scan" and isinstance(scanner_process_event, Mapping)):
+        safe_scanner_process_event = _sanitize_scanner_process_event(scanner_process_event)
+        if safe_scanner_process_event is not None:
+            result["scanner_process_event"] = safe_scanner_process_event
     return result
 
 

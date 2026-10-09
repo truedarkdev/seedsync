@@ -1601,11 +1601,13 @@ class ScannerProcess:
         assert self.__wake_event is not None
         self.__wake_event.set()
         if _breadcrumb_effectively_enabled(self.__breadcrumb_trace, "scanner_process", "info"):
+            scan_run_ref = trace_session_digest(self.__session_token)
             self.__record_breadcrumb("force_scan", {
                 "decision": decision,
                 "request_correlation": _scan_pair_trace_token(path_pair_id),
                 "scanner_side": _scanner_side(self.__scanner),
-                "session_digest": trace_session_digest(self.__session_token),
+                "session_digest": scan_run_ref,
+                "scan_run_ref": scan_run_ref,
                 "current_generation": requested_generation,
                 "utc": requested_utc,
                 "monotonic_ms": requested_monotonic_ms,

@@ -86,7 +86,7 @@ from .controller_persist import ControllerPersist
 from .extract import ExtractCompletedResult, ExtractFailedResult, ExtractProcess, ExtractStatus
 from .model_builder import ModelBuilder
 from .scan import ScannerProcess, ScannerResult
-from .scan.scanner_process import _record_root_shape_breadcrumb
+from .scan.scanner_process import _record_root_shape_breadcrumb, _scan_pair_trace_token
 from .validate import ValidateProcess
 
 if TYPE_CHECKING:
@@ -6672,6 +6672,12 @@ class ModelUpdater(_ControllerCoreAccess):
                 "scan_health": "requested" if local_scan_forced else "unknown",
                 "scan_freshness": "unknown",
             }
+            if decision == "pending" and local_scan_forced:
+                try:
+                    details["scan_pair_ref"] = _scan_pair_trace_token(path_pair_id)
+                except Exception:
+                    # The optional join must not alter completion retirement.
+                    pass
             if message == "completion_retirement_not_detected":
                 membership = completion_status_membership_by_file_id.get(file_id) \
                     if isinstance(completion_status_membership_by_file_id, Mapping) else None

@@ -438,6 +438,54 @@ def test_local_scan_tick_and_lifecycle_projection_preserve_unknowns_and_sanitize
     assert oversized_generation["generation"] == "unknown"
 
 
+def test_scanner_process_projection_sanitizer_preserves_bounded_current_run_facts():
+    wide = str(2**53 + 17)
+    safe = observer._sanitize_capture_projection({
+        "kind": "event", "source": "scanner_process", "category": "scanner_process",
+        "event_type": "diagnostic", "stage": "scan", "level": "info", "numbers": {},
+        "scanner_process_event": {
+            "message": "force_scan", "side": "local", "run_digest": "unknown",
+            "scan_run_ref": "0123456789ab", "generation": None,
+            "current_generation": wide, "scanner_ref": "0123456789abcdef", "request_ref": "fedcba9876543210",
+            "decision": "queued", "targeted": None, "final": None, "full": None,
+            "progress": None, "failed": None, "utc": "2026-10-09T03:00:00.123+00:00",
+            "monotonic_ms": wide, "requested_refs": ["0123456789abcdef"], "requested_count": "1",
+            "requested_truncated": False, "private_path": "/secret/root",
+        },
+    })
+    facts = safe["scanner_process_event"]
+    assert facts["current_generation"] == wide
+    assert facts["monotonic_ms"] == wide
+    assert facts["generation"] is None
+    assert facts["run_digest"] == "unknown"
+    assert facts["scan_run_ref"] == "0123456789ab"
+    assert facts["requested_refs"] == ["0123456789abcdef"]
+    assert "private_path" not in json.dumps(safe)
+
+    for key, wrong_value in (
+        ("source", "controller"), ("category", "controller"), ("stage", "foreign"),
+    ):
+        foreign = observer._sanitize_capture_projection({**safe, key: wrong_value})
+        assert "scanner_process_event" not in foreign
+
+    malformed = observer._sanitize_capture_projection({
+        **safe, "scanner_process_event": {
+            **facts, "scan_run_ref": "private-session", "utc": "/private/path",
+            "generation": True, "current_generation": 2**63,
+            "targeted": 1, "requested_refs": ["0123456789abcdef"] * 9,
+            "requested_count": "01", "requested_truncated": "false", "decision": "private",
+        },
+    })["scanner_process_event"]
+    assert malformed["generation"] == malformed["current_generation"] == "unknown"
+    assert malformed["scan_run_ref"] == "unknown"
+    assert malformed["utc"] is None
+    assert malformed["targeted"] == "unknown"
+    assert malformed["requested_refs"] is None
+    assert malformed["requested_count"] == "unknown"
+    assert malformed["requested_truncated"] == "unknown"
+    assert malformed["decision"] == "unknown"
+
+
 def test_lftp_status_health_projection_preserves_unknowns_and_omits_private_rows():
     projected, irrelevant = capture._projection({
         "category": "transfer.lftp.status", "message": "lftp_status_poll",

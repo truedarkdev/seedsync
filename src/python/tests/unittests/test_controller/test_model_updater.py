@@ -60,6 +60,7 @@ from controller.model_updater import (
     _request_model_rebuild,
     _ensure_progressive_scan_state,
 )
+from controller.scan.scanner_process import _scan_pair_trace_token
 from common.performance_diagnostics import (
     CANDIDATE_LIFECYCLE_FALLBACK_REASON_EXCEPTION,
     CANDIDATE_PAIR_FALLBACK_REASON_AUTHORIZATION_REJECTED,
@@ -18112,6 +18113,7 @@ class TestModelUpdater(unittest.TestCase):
                 "terminal_outcome": "deferred",
                 "scan_health": "requested",
                 "scan_freshness": "unknown",
+                "scan_pair_ref": _scan_pair_trace_token("path-pair-a"),
             },
             pending["details"],
         )

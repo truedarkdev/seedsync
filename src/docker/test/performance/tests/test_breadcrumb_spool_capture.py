@@ -904,6 +904,87 @@ def test_queue_readiness_source_projection_is_finite_and_redacted(tmp_path: Path
     }
 
 
+def test_scanner_process_projection_keeps_force_baseline_separate_from_run() -> None:
+    wide = 2**53 + 17
+    forced, irrelevant = capture._projection({
+        "source": "scanner_process", "category": "scanner_process", "message": "force_scan",
+        "event_type": "diagnostic", "stage": "scan", "level": "info",
+        "corr_id": "0123456789abcdef", "details": {
+            "scanner_side": "local", "decision": "queued", "request_correlation": "fedcba9876543210",
+            "scan_run_ref": "0123456789ab", "current_generation": wide,
+            "utc": "2026-10-09T03:00:00.123+00:00",
+            "monotonic_ms": wide,
+        },
+    })
+    assert irrelevant is False and forced is not None
+    force = forced["scanner_process_event"]
+    assert force["message"] == "force_scan"
+    assert force["decision"] == "queued"
+    assert force["current_generation"] == str(wide)
+    assert force["generation"] is None
+    assert force["run_digest"] == "unknown"
+    assert force["scan_run_ref"] == "0123456789ab"
+    assert force["scanner_ref"] == "0123456789abcdef"
+    assert force["request_ref"] == "fedcba9876543210"
+    assert force["monotonic_ms"] == str(wide)
+    malformed_utc, irrelevant = capture._projection({
+        "source": "scanner_process", "category": "scanner_process", "message": "force_scan",
+        "event_type": "diagnostic", "stage": "scan", "level": "info",
+        "corr_id": "0123456789abcdef", "details": {
+            "scanner_side": "local", "scan_run_ref": "0123456789ab", "utc": "/private/path",
+        },
+    })
+    assert irrelevant is False and malformed_utc is not None
+    assert malformed_utc["scanner_process_event"]["utc"] is None
+    wrong_stage, irrelevant = capture._projection({
+        "source": "scanner_process", "category": "scanner_process", "message": "force_scan",
+        "event_type": "diagnostic", "stage": "foreign", "level": "info",
+        "corr_id": "0123456789abcdef", "details": {"scan_run_ref": "0123456789ab"},
+    })
+    assert irrelevant is False and wrong_stage is not None
+    assert "scanner_process_event" not in wrong_stage
+    wrong_source, irrelevant = capture._projection({
+        "source": "controller", "category": "scanner_process", "message": "force_scan",
+        "event_type": "diagnostic", "stage": "scan", "level": "info",
+        "corr_id": "0123456789abcdef", "details": {"scan_run_ref": "0123456789ab"},
+    })
+    assert irrelevant is False and wrong_source is not None
+    assert "scanner_process_event" not in wrong_source
+    assert "generation" not in forced["numbers"]
+
+    started, irrelevant = capture._projection({
+        "source": "scanner_process", "category": "scanner_process", "message": "scan_started",
+        "event_type": "diagnostic", "stage": "scan", "level": "info",
+        "corr_id": "local:0123456789ab:7", "details": {
+            "scanner_side": "local", "generation": 7, "session_digest": "must-not-copy",
+            "targeted": True, "full": False, "monotonic_ms": wide,
+            "requested_members": ["0123456789abcdef"], "requested_pair_count": 1,
+            "requested_truncated": False,
+        },
+    })
+    assert irrelevant is False and started is not None
+    run = started["scanner_process_event"]
+    assert run["run_digest"] == force["scan_run_ref"]
+    assert run["generation"] == "7"
+    assert run["targeted"] is True and run["full"] is False
+    assert run["requested_refs"] == ["0123456789abcdef"]
+    assert run["requested_count"] == "1"
+    assert run["requested_truncated"] is False
+    assert "generation" not in started["numbers"]
+
+    oversized, irrelevant = capture._projection({
+        "source": "scanner_process", "category": "scanner_process", "message": "scan_result_published",
+        "event_type": "diagnostic", "stage": "scan", "level": "info",
+        "corr_id": "local:0123456789ab:8", "details": {
+            "scanner_side": "local", "generation": 8, "scanned_members": ["a" * 16] * 9,
+            "scanned_pair_count": 9, "scanned_truncated": False,
+        },
+    })
+    assert irrelevant is False and oversized is not None
+    assert oversized["scanner_process_event"]["scanned_refs"] is None
+    assert oversized["scanner_process_event"]["scanned_count"] == "9"
+
+
 def test_queue_readiness_nested_scan_diagnostics_keep_exact_finite_values() -> None:
     wide = 2**53 + 19
     details = {
