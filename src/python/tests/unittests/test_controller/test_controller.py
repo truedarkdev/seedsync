@@ -18851,6 +18851,14 @@ class TestController(unittest.TestCase):
                 generation=1, session_token="local-session",
                 recoverable_failure_path_pair_ids={pair_id},
                 terminal_failure_path_pair_ids=set(),
+                failure_origin={
+                    "failure_site": "scan_had_errors",
+                    "failure_recoverable": True,
+                    "failure_errno": 13,
+                    "failure_exception": "permission_error",
+                    "failure_root_ref": "0123456789abcdef",
+                    "failure_pair_ref": opaque_trace_correlation("scan-pair|pair-a"),
+                },
             ),
             None,
         )
@@ -18894,12 +18902,89 @@ class TestController(unittest.TestCase):
             {"side": "local", "kind": "failed", "scope": "non_targeted", "target_covered": True,
              "terminal": False, "recoverable": True, "result_generation": 1,
              "run_matches_baseline": True, "generation_vs_baseline": "newer"},
-            scan_failures[0],
+            {key: scan_failures[0][key] for key in (
+                "side", "kind", "scope", "target_covered", "terminal", "recoverable",
+                "result_generation", "run_matches_baseline", "generation_vs_baseline",
+            )},
         )
+        self.assertEqual("scan_had_errors", scan_failures[0]["failure_site"])
+        self.assertTrue(scan_failures[0]["failure_recoverable"])
+        self.assertEqual(13, scan_failures[0]["failure_errno"])
+        self.assertEqual("permission_error", scan_failures[0]["failure_exception"])
+        self.assertEqual("0123456789abcdef", scan_failures[0]["failure_root_ref"])
+        self.assertEqual(opaque_trace_correlation("scan-pair|pair-a"), scan_failures[0]["failure_pair_ref"])
         self.assertTrue(scan_failures[1]["terminal"])
         self.assertFalse(scan_failures[1]["recoverable"])
         self.assertEqual("unknown", scan_failures[2]["kind"])
         self.assertTrue(scan_failures[2]["terminal"])
+
+    def test_final_local_scan_rejection_logs_bounded_proof_facts(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.assertTrue(self.controller.queue_http_wait_trace_enabled())
+        pair_id = "pair-final-reject"
+        file = ModelFile("selected", True)
+        file.path_pair_id = pair_id
+        file_id = file.file_id
+        self.controller._Controller__model.get_file.return_value = file
+        command = Controller.Command(Controller.Command.Action.QUEUE, file_id)
+        intent = DeferredQueueIntent(
+            command, file_id, pair_id,
+            phase="initial_rescan",
+            rescan_requested=True,
+            rescan_generations=(("local-session", 3), ("remote-session", 4)),
+            rescan_failure_reason="initial_local_scan_recoverable_failed",
+        )
+        self.controller._Controller__deferred_queue_intents_map()[file_id] = intent
+        self.controller._Controller__local_scan_process = SimpleNamespace(
+            session_token="local-session", generation=5,
+        )
+        self.controller._Controller__remote_scan_process = SimpleNamespace(
+            session_token="remote-session", generation=5,
+        )
+        self.controller._Controller__is_explicitly_stopped = lambda *_args: False
+
+        proof_calls = []
+
+        def reject_proof(_file, _intent, diagnostic):
+            proof_calls.append(True)
+            diagnostic.update({
+                "result": "rejected",
+                "reason": "below_work_floor",
+                "remote_ready": True,
+                "process_generation": 5,
+                "effective_work_floor": 5,
+                "root_generation": 4,
+                "generation_vs_baseline": "newer",
+                "run_matches_current": True,
+                "builder_proof_matches_source": False,
+            })
+            return False
+
+        self.controller._Controller__has_fresh_local_root_scan_proof = reject_proof
+        self.controller._Controller__retire_deferred_queue_intent = lambda *_args: True
+        self.controller._Controller__notify_deferred_queue_failure = lambda *_args: None
+
+        self.controller._Controller__prepare_deferred_queue_retries()
+
+        self.assertTrue(proof_calls)
+        self.controller.logger.warning.assert_called_once()
+        warning_args = self.controller.logger.warning.call_args.args
+        self.assertIn("Deferred Queue final rejection", warning_args[0])
+        self.assertEqual(
+            "fractional-mtime:{}".format(opaque_trace_correlation(file_id)),
+            warning_args[1],
+        )
+        self.assertIn("initial_local_scan_recoverable_failed", warning_args)
+        self.assertIn("below_work_floor", warning_args)
+        self.assertIn(3, warning_args)
+        self.assertIn(4, warning_args)
+        self.assertNotIn("pair-final-reject", repr(warning_args))
+        self.assertNotIn("selected", repr(warning_args))
 
     def test_process_commands_queue_defers_manual_directory_until_path_pair_reconciles(self):
         file = ModelFile("release", True)

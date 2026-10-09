@@ -285,6 +285,13 @@ _SCANNER_PROCESS_MESSAGES = frozenset({
 _SCANNER_PROCESS_DECISIONS = frozenset({
     "queued", "full_replaced", "coalesced_full", "coalesced_pair",
 })
+_SCANNER_PROCESS_FAILURE_SITES = frozenset({
+    "missing_final_root", "missing_staging_root", "scan_had_errors",
+    "system_scanner_error", "filesystem_error", "invalid_scan_path",
+})
+_SCANNER_PROCESS_FAILURE_EXCEPTIONS = frozenset({
+    "permission_error", "system_scanner_error", "os_error", "scanner_error", "unknown",
+})
 _SCANNER_PROCESS_PAIR_REF_LIMIT = 8
 _LIFECYCLE_PERSIST_MESSAGES = frozenset({
     "persist_authority_before", "persist_authority_after", "model_candidate", "model_live_publication",
@@ -871,6 +878,37 @@ def _delete_local_command_facts(
     return facts or None
 
 
+def _scan_failure_origin_facts(source: Mapping[str, object]) -> dict[str, object]:
+    failure_site = source.get("failure_site")
+    failure_recoverable = source.get("failure_recoverable")
+    failure_errno = source.get("failure_errno")
+    failure_exception = source.get("failure_exception")
+    result: dict[str, object] = {
+        "failure_site": (
+            failure_site if isinstance(failure_site, str) and failure_site in _SCANNER_PROCESS_FAILURE_SITES
+            else None
+        ),
+        "failure_recoverable": (
+            failure_recoverable if failure_recoverable is None or type(failure_recoverable) is bool else None
+        ),
+        "failure_errno": (
+            failure_errno if failure_errno is None or type(failure_errno) is int and 0 <= failure_errno <= 65535
+            else None
+        ),
+        "failure_exception": (
+            failure_exception if failure_exception is None or isinstance(failure_exception, str)
+            and failure_exception in _SCANNER_PROCESS_FAILURE_EXCEPTIONS else None
+        ),
+    }
+    for field in ("failure_root_ref", "failure_pair_ref"):
+        reference = source.get(field)
+        result[field] = (
+            reference if reference is None or isinstance(reference, str)
+            and _OPAQUE_TOKEN.fullmatch(reference) else None
+        )
+    return result
+
+
 def _queue_nested_diagnostic_facts(value: object, fields: tuple[object, object, object]) -> dict[str, object]:
     source = value if isinstance(value, Mapping) else {}
     enum_fields, boolean_fields, integer_fields = fields
@@ -931,7 +969,11 @@ def _queue_readiness_facts(message: object, details: Mapping[str, object]) -> di
             result[key] = value if type(value) is int and 0 <= value <= 2**31 - 1 else None
     for key, fields in _QUEUE_NESTED_DIAGNOSTIC_FIELDS.items():
         if key in details:
-            result[key] = _queue_nested_diagnostic_facts(details.get(key), fields)
+            nested = details.get(key)
+            facts = _queue_nested_diagnostic_facts(nested, fields)
+            if key == "scan_failure":
+                facts.update(_scan_failure_origin_facts(nested if isinstance(nested, Mapping) else {}))
+            result[key] = facts
     return result
 
 
@@ -1440,6 +1482,8 @@ def _scanner_process_facts(
         result[prefix + "_refs"] = members
         result[prefix + "_count"] = decimal(prefix + "_pair_count")
         result[prefix + "_truncated"] = exact_bool(prefix + "_truncated")
+    if message == "scan_failed":
+        result.update(_scan_failure_origin_facts(details))
     return result
 
 

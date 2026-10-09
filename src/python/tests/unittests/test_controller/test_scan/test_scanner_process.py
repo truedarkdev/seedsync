@@ -32,12 +32,13 @@ from common.performance_diagnostics import (
     PerformanceDiagnosticsCollector,
 )
 from controller import IScanner, ScannerProcess, ScannerError
-from controller.scan import MultiPathRemoteScanner, RemoteScanner
+from controller.scan import LocalScanner, MultiPathLocalScanner, MultiPathRemoteScanner, RemoteScanner
 from controller.scan.scanner_process import (
     ScannerResult, _ScannerQueueReleaseMarker, _create_scanner_worker, _publish_bounded_result,
     _build_root_shape_details, _record_root_shape_breadcrumb, _record_scan_breadcrumb, _run_scanner_once,
 )
 from controller.extract import ExtractProcess
+from model import ModelFile
 from ssh import SshcpError
 from system import SystemFile
 
@@ -2311,6 +2312,60 @@ class TestScannerProcess(unittest.TestCase):
         warning_message = process.logger.warning.call_args[0][0]
         self.assertIn("recoverable error", warning_message)
         self.assertIn("failed result", warning_message.lower())
+
+    def test_local_scan_failed_breadcrumb_carries_same_run_origin(self):
+        with tempfile.TemporaryDirectory(prefix="scanner_failure_origin") as temp_dir:
+            blocked_root = os.path.join(temp_dir, "blocked")
+            os.mkdir(blocked_root)
+            with open(os.path.join(blocked_root, "file.txt"), "w") as handle:
+                handle.write("content")
+            real_scandir = os.scandir
+            scanner = MultiPathLocalScanner([
+                LocalScanner(temp_dir, use_temp_file=False, path_pair_id="pair", path_pair_name="pair-name"),
+            ])
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "off", "rules": {"scanner_process": "info"}},
+                max_entries=16,
+            )
+            process = ScannerProcess(
+                scanner=scanner, interval_in_ms=1, verbose=False, breadcrumb_trace=trace,
+            )
+
+            def scandir(path):
+                if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(blocked_root)):
+                    raise PermissionError(13, "permission denied", path)
+                return real_scandir(path)
+
+            with patch("system.scanner.os.scandir", side_effect=scandir):
+                process.run_loop()
+
+            result = process.pop_latest_result()
+            self.assertIsNotNone(result)
+            self.assertTrue(result.failed)
+            self.assertEqual("scan_had_errors", result.failure_origin["failure_site"])
+            self.assertEqual(13, result.failure_origin["failure_errno"])
+            self.assertEqual("permission_error", result.failure_origin["failure_exception"])
+            entries = trace.snapshot(category_prefix="scanner_process")["entries"]
+            event = next(entry for entry in entries if entry["message"] == "scan_failed")
+            details = event["details"]
+            self.assertEqual("scan_had_errors", details["failure_site"])
+            self.assertTrue(details["failure_recoverable"])
+            self.assertEqual(13, details["failure_errno"])
+            self.assertEqual("permission_error", details["failure_exception"])
+            self.assertEqual(result.generation, details["generation"])
+            self.assertEqual("<redacted>", details["session_digest"])
+            self.assertEqual(
+                "local:{}:{}".format(trace_session_digest(result.session_token), result.generation),
+                event["corr_id"],
+            )
+            self.assertEqual(
+                opaque_trace_correlation("scan-root|" +
+                                         ModelFile.build_file_id("blocked", "pair")),
+                details["failure_root_ref"],
+            )
+            self.assertEqual(opaque_trace_correlation("scan-pair|pair"), details["failure_pair_ref"])
+            self.assertNotIn("blocked", repr(details))
 
     def test_recycled_recoverable_failure_retains_root_outcomes_without_recreating_dropped_roots(self):
         self.process = ScannerProcess(

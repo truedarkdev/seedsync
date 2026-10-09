@@ -987,6 +987,113 @@ def test_scanner_process_projection_keeps_force_baseline_separate_from_run() -> 
     assert oversized["scanner_process_event"]["scanned_count"] == "9"
 
 
+def test_scan_failure_origin_facts_are_finite_and_preserve_unknown_root() -> None:
+    generation = 2**53 + 17
+    row = {
+        "source": "scanner_process", "category": "scanner_process", "message": "scan_failed",
+        "event_type": "failure", "stage": "scan", "level": "error",
+        "corr_id": f"local:0123456789ab:{generation}",
+        "details": {
+            "scanner_side": "local", "generation": generation,
+            "failure_site": "scan_had_errors", "failure_recoverable": True,
+            "failure_errno": 13, "failure_exception": "permission_error",
+            "failure_root_ref": None, "failure_pair_ref": "0123456789abcdef",
+            "private_path": "/private/root", "exception_text": "do-not-copy",
+        },
+    }
+    projected, irrelevant = capture._projection(row)
+    assert irrelevant is False and projected is not None
+    event = projected["scanner_process_event"]
+    assert event["generation"] == str(generation)
+    assert event["failure_site"] == "scan_had_errors"
+    assert event["failure_recoverable"] is True
+    assert event["failure_errno"] == 13
+    assert event["failure_exception"] == "permission_error"
+    assert event["failure_root_ref"] is None
+    assert event["failure_pair_ref"] == "0123456789abcdef"
+    assert "failure_errno" not in projected["numbers"]
+    assert capture._scan_failure_origin_facts({
+        "failure_exception": "unknown", "failure_errno": 65535,
+    })["failure_exception"] == "unknown"
+    assert capture._scan_failure_origin_facts({"failure_errno": 65535})["failure_errno"] == 65535
+
+    finalized = observer._sanitize_capture_projection(projected)
+    safe_event = finalized["scanner_process_event"]
+    assert safe_event["generation"] == str(generation)
+    assert safe_event["failure_root_ref"] is None
+    assert safe_event["failure_pair_ref"] == "0123456789abcdef"
+    serialized = json.dumps(finalized)
+    assert "/private/root" not in serialized and "do-not-copy" not in serialized
+
+    malformed = dict(event)
+    malformed.update({
+        "failure_site": "private-site", "failure_recoverable": 1,
+        "failure_errno": 65536, "failure_exception": "private-exception",
+        "failure_root_ref": "0123456789ABCDEf", "failure_pair_ref": "short",
+    })
+    safe_malformed = observer._sanitize_capture_projection({
+        **projected, "scanner_process_event": malformed,
+    })["scanner_process_event"]
+    assert [safe_malformed[field] for field in (
+        "failure_site", "failure_recoverable", "failure_errno", "failure_exception",
+        "failure_root_ref", "failure_pair_ref",
+    )] == [None] * 6
+
+    queue_details = {
+        "schema": "queue_readiness.v1", "phase": "rescan_unknown", "outcome": "failed",
+        "origin": "manual", "reason": "initial_local_scan_failed",
+        "scan_failure": {
+            "side": "local", "kind": "failed", "scope": "targeted", "target_covered": True,
+            "terminal": False, "recoverable": False, "result_generation": generation,
+            "run_matches_baseline": True, "generation_vs_baseline": "newer",
+            "failure_site": "scan_had_errors", "failure_recoverable": True,
+            "failure_errno": 13, "failure_exception": "permission_error",
+            "failure_root_ref": None, "failure_pair_ref": "0123456789abcdef",
+            "private_path": "/private/root", "exception_text": "do-not-copy",
+        },
+    }
+    queue_facts = capture._queue_readiness_facts("queue_rescan_readiness", queue_details)
+    assert queue_facts is not None
+    queue_projection = observer._sanitize_capture_projection({"queue_readiness": queue_facts})
+    scan_failure = queue_projection["queue_readiness"]["scan_failure"]
+    assert scan_failure["kind"] == "failed" and scan_failure["side"] == "local"
+    assert scan_failure["recoverable"] is False
+    assert scan_failure["result_generation"] == str(generation)
+    assert scan_failure["failure_site"] == "scan_had_errors"
+    assert scan_failure["failure_recoverable"] is True
+    assert scan_failure["failure_errno"] == 13
+    assert scan_failure["failure_exception"] == "permission_error"
+    assert scan_failure["failure_root_ref"] is None
+    assert scan_failure["failure_pair_ref"] == "0123456789abcdef"
+    queue_serialized = json.dumps(queue_projection)
+    assert "/private/root" not in queue_serialized and "do-not-copy" not in queue_serialized
+
+    malformed_queue_details = {
+        **queue_details,
+        "scan_failure": {
+            **queue_details["scan_failure"],
+            "failure_site": "private-site", "failure_recoverable": 1,
+            "failure_errno": True, "failure_exception": "private-exception",
+            "failure_root_ref": "not-a-reference", "failure_pair_ref": "private-pair",
+        },
+    }
+    malformed_queue = capture._queue_readiness_facts("queue_rescan_readiness", malformed_queue_details)
+    assert malformed_queue is not None
+    safe_malformed_queue = observer._sanitize_capture_projection({
+        "queue_readiness": malformed_queue,
+    })["queue_readiness"]["scan_failure"]
+    assert [safe_malformed_queue[field] for field in (
+        "failure_site", "failure_recoverable", "failure_errno", "failure_exception",
+        "failure_root_ref", "failure_pair_ref",
+    )] == [None] * 6
+
+    started, irrelevant = capture._projection({
+        **row, "message": "scan_started", "details": {"scanner_side": "local", "generation": generation},
+    })
+    assert irrelevant is False and started is not None
+    assert not any(field.startswith("failure_") for field in started["scanner_process_event"])
+
+
 def test_lifecycle_persist_projection_is_finite_and_source_shaped() -> None:
     before, irrelevant = capture._projection({
         "source": "model_builder", "category": "lifecycle.persist", "message": "persist_authority_before",
@@ -1248,6 +1355,8 @@ def test_queue_readiness_nested_scan_diagnostics_keep_exact_finite_values() -> N
         "side": "unknown", "kind": "unknown", "scope": "unknown", "target_covered": None,
         "terminal": None, "recoverable": None, "result_generation": None,
         "run_matches_baseline": None, "generation_vs_baseline": "unknown",
+        "failure_site": None, "failure_recoverable": None, "failure_errno": None,
+        "failure_exception": None, "failure_root_ref": None, "failure_pair_ref": None,
     }
     assert malformed_final["queue_readiness"]["fresh_root_proof"]["result"] == "unknown"
     assert malformed_final["queue_readiness"]["fresh_root_proof"]["root_shape_ok"] is None
@@ -1387,6 +1496,8 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         "side": "local", "kind": "failed", "scope": "targeted", "target_covered": True,
         "terminal": False, "recoverable": True, "result_generation": "1",
         "run_matches_baseline": True, "generation_vs_baseline": "newer",
+        "failure_site": None, "failure_recoverable": None, "failure_errno": None,
+        "failure_exception": None, "failure_root_ref": None, "failure_pair_ref": None,
     }
     fresh_root_proof = readiness[-1]["fresh_root_proof"]
     assert fresh_root_proof["result"] == "rejected"

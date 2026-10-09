@@ -767,6 +767,13 @@ _CAPTURE_SCANNER_PROCESS_MESSAGES = {
 _CAPTURE_SCANNER_PROCESS_DECISIONS = {
     "queued", "full_replaced", "coalesced_full", "coalesced_pair",
 }
+_CAPTURE_SCANNER_PROCESS_FAILURE_SITES = {
+    "missing_final_root", "missing_staging_root", "scan_had_errors",
+    "system_scanner_error", "filesystem_error", "invalid_scan_path",
+}
+_CAPTURE_SCANNER_PROCESS_FAILURE_EXCEPTIONS = {
+    "permission_error", "system_scanner_error", "os_error", "scanner_error", "unknown",
+}
 _CAPTURE_SCANNER_PAIR_REF_LIMIT = 8
 _CAPTURE_LIFECYCLE_PERSIST_MESSAGES = {
     "persist_authority_before", "persist_authority_after", "model_candidate", "model_live_publication",
@@ -1000,6 +1007,37 @@ def _sanitize_scan_lifecycle_event(value: Mapping[str, object]) -> Mapping[str, 
     return result
 
 
+def _sanitize_scan_failure_origin(value: Mapping[str, object]) -> dict[str, object]:
+    failure_site = value.get("failure_site")
+    failure_recoverable = value.get("failure_recoverable")
+    failure_errno = value.get("failure_errno")
+    failure_exception = value.get("failure_exception")
+    result: dict[str, object] = {
+        "failure_site": (
+            failure_site if isinstance(failure_site, str) and failure_site in _CAPTURE_SCANNER_PROCESS_FAILURE_SITES
+            else None
+        ),
+        "failure_recoverable": (
+            failure_recoverable if failure_recoverable is None or type(failure_recoverable) is bool else None
+        ),
+        "failure_errno": (
+            failure_errno if failure_errno is None or type(failure_errno) is int and 0 <= failure_errno <= 65535
+            else None
+        ),
+        "failure_exception": (
+            failure_exception if failure_exception is None or isinstance(failure_exception, str)
+            and failure_exception in _CAPTURE_SCANNER_PROCESS_FAILURE_EXCEPTIONS else None
+        ),
+    }
+    for field in ("failure_root_ref", "failure_pair_ref"):
+        reference = value.get(field)
+        result[field] = (
+            reference if reference is None or isinstance(reference, str)
+            and _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(reference) else None
+        )
+    return result
+
+
 def _sanitize_scanner_process_event(value: Mapping[str, object]) -> Mapping[str, object] | None:
     message = value.get("message")
     if not isinstance(message, str) or message not in _CAPTURE_SCANNER_PROCESS_MESSAGES:
@@ -1056,6 +1094,8 @@ def _sanitize_scanner_process_event(value: Mapping[str, object]) -> Mapping[str,
         result[prefix + "_count"] = decimal(prefix + "_count")
         item = value.get(prefix + "_truncated")
         result[prefix + "_truncated"] = item if item is None or item == "unknown" or type(item) is bool else "unknown"
+    if message == "scan_failed":
+        result.update(_sanitize_scan_failure_origin(value))
     return result
 
 
@@ -1552,7 +1592,11 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
                 safe_readiness[key] = item if type(item) is int and 0 <= item <= 2**31 - 1 else None
         for key, fields in _CAPTURE_NESTED_DIAGNOSTIC_FIELDS.items():
             if key in readiness:
-                safe_readiness[key] = _queue_readiness_nested_diagnostic(readiness.get(key), fields)
+                nested = readiness.get(key)
+                facts = _queue_readiness_nested_diagnostic(nested, fields)
+                if key == "scan_failure":
+                    facts.update(_sanitize_scan_failure_origin(nested if isinstance(nested, Mapping) else {}))
+                safe_readiness[key] = facts
         result["queue_readiness"] = safe_readiness
     model_page_snapshot = value.get("model_page_snapshot")
     if isinstance(model_page_snapshot, Mapping):

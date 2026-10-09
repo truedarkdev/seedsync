@@ -3,11 +3,12 @@ import os
 import shutil
 import tempfile
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from model import ModelFile
 from controller.scan import LocalScanner, ScannerError, ScannerProcess
 from common import Localization
+from common.breadcrumb_trace import opaque_trace_correlation
 from common.performance_diagnostics import (
     DURATION_LOCAL_SCAN_AGGREGATION,
     DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
@@ -87,12 +88,55 @@ class TestLocalScanner(unittest.TestCase):
 
         self.assertEqual(Localization.Error.LOCAL_SERVER_SCAN, str(error.exception))
         self.assertTrue(error.exception.recoverable)
+        origin = error.exception.failure_origin
+        self.assertEqual("missing_final_root", origin["failure_site"])
+        self.assertTrue(origin["failure_recoverable"])
+        self.assertIsNone(origin["failure_errno"])
+        self.assertEqual("scanner_error", origin["failure_exception"])
+        self.assertEqual(
+            opaque_trace_correlation("scan-root|" + ModelFile.build_file_id("target", "pair")),
+            origin["failure_root_ref"],
+        )
+        self.assertEqual(opaque_trace_correlation("scan-pair|pair"), origin["failure_pair_ref"])
         self.assertEqual({"target"}, events[0][1])
         self.assertFalse(any(event[2] for event in events))
         missing = next(call for call in trace.record.call_args_list if call.args[1] == "scan_missing_root")
         self.assertEqual("final", missing.args[2]["root_role"])
         self.assertEqual("final", missing.args[2]["boundary"])
         self.assertNotIn("target", repr(missing))
+
+    def test_progressive_scan_permission_failure_carries_bounded_origin(self):
+        blocked_root = os.path.join(self.temp_dir, "blocked")
+        os.mkdir(blocked_root)
+        with open(os.path.join(blocked_root, "file.txt"), "w") as handle:
+            handle.write("content")
+        real_scandir = os.scandir
+        scanner = LocalScanner(self.temp_dir, use_temp_file=False, path_pair_id="pair")
+        trace = MagicMock()
+        trace.is_effectively_enabled.return_value = True
+        scanner.set_breadcrumb_trace(trace)
+        scanner.set_progress_callback(lambda *_args: None)
+
+        def scandir(path):
+            if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(blocked_root)):
+                raise PermissionError(13, "permission denied", path)
+            return real_scandir(path)
+
+        with patch("system.scanner.os.scandir", side_effect=scandir):
+            with self.assertRaises(ScannerError) as error:
+                scanner.scan()
+
+        origin = error.exception.failure_origin
+        self.assertEqual("scan_had_errors", origin["failure_site"])
+        self.assertTrue(origin["failure_recoverable"])
+        self.assertEqual(13, origin["failure_errno"])
+        self.assertEqual("permission_error", origin["failure_exception"])
+        self.assertEqual(
+            opaque_trace_correlation("scan-root|" + ModelFile.build_file_id("blocked", "pair")),
+            origin["failure_root_ref"],
+        )
+        self.assertEqual(opaque_trace_correlation("scan-pair|pair"), origin["failure_pair_ref"])
+        self.assertNotIn("blocked", repr(origin))
 
     def test_progressive_scan_fails_when_manifest_staging_root_disappears_before_scan(self):
         staging_dir = os.path.join(self.temp_dir, "staging")

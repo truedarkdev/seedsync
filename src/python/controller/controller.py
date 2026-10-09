@@ -69,7 +69,7 @@ from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE,
 )
 from common.exclude_patterns import ExactPathExclusion, parse_exclude_patterns
-from common.breadcrumb_trace import opaque_trace_correlation
+from common.breadcrumb_trace import opaque_trace_correlation, trace_session_digest
 from model import ModelError, ModelFile, Model, IModelListener
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from transfer import RcloneTransferBackend, create_transfer_backend, RcloneTransferError
@@ -268,6 +268,62 @@ def _breadcrumb_effectively_enabled(trace: object, category: str, level: str = "
             return False
     # Keep compatibility with the small record-only fakes used by callers.
     return True
+
+
+_LOCAL_SCAN_FAILURE_SITES = frozenset({
+    "missing_final_root", "missing_staging_root", "scan_had_errors",
+    "system_scanner_error", "filesystem_error", "invalid_scan_path",
+})
+_LOCAL_SCAN_FAILURE_CLASSES = frozenset({
+    "permission_error", "system_scanner_error", "os_error", "scanner_error", "unknown",
+})
+
+
+def _selected_scan_failure_origin(result: object, path_pair_id: object) -> dict[str, object]:
+    """Project LocalScanner origin only onto the exact same selected pair."""
+    try:
+        if type(path_pair_id) is not str or not path_pair_id:
+            return {}
+        origin = getattr(result, "failure_origin", None)
+        if not isinstance(origin, dict):
+            return {}
+        pair_ref = origin.get("failure_pair_ref")
+        if type(pair_ref) is not str or len(pair_ref) != 16 or any(
+                character not in "0123456789abcdef" for character in pair_ref):
+            return {}
+        failed_pair_ids: set[str] = set()
+        for attribute in ("recoverable_failure_path_pair_ids", "terminal_failure_path_pair_ids"):
+            values = getattr(result, attribute, None)
+            if isinstance(values, (set, frozenset, list, tuple)):
+                failed_pair_ids.update(value for value in values if type(value) is str)
+        # The result's native failed-scope IDs establish ownership here. Never
+        # recompute a worker-local opaque token in the controller process.
+        if failed_pair_ids != {path_pair_id}:
+            return {}
+
+        def digest(value: object) -> Optional[str]:
+            if type(value) is str and len(value) == 16 and all(
+                    character in "0123456789abcdef" for character in value):
+                return value
+            return None
+
+        site = origin.get("failure_site")
+        exception_class = origin.get("failure_exception")
+        root_ref = origin.get("failure_root_ref")
+        error_number = origin.get("failure_errno")
+        recoverable = origin.get("failure_recoverable")
+        return {
+            "failure_site": site if type(site) is str and site in _LOCAL_SCAN_FAILURE_SITES else "unknown",
+            "failure_recoverable": recoverable if type(recoverable) is bool else None,
+            "failure_errno": error_number if type(error_number) is int and 0 <= error_number <= 65535 else None,
+            "failure_exception": exception_class if type(exception_class) is str and
+            exception_class in _LOCAL_SCAN_FAILURE_CLASSES else None,
+            "failure_root_ref": digest(root_ref),
+            "failure_pair_ref": pair_ref,
+        }
+    except Exception:
+        # Diagnostic projection cannot change failed-result or Queue handling.
+        return {}
 
 
 _MODEL_PAGE_SNAPSHOT_TRACE_CATEGORY = "model_page_snapshot"
@@ -3665,6 +3721,15 @@ class Controller:
                 ):
                     return
                 intent.rescan_failure_reason = reason
+                readiness_diagnostics_enabled = False
+                try:
+                    readiness_diagnostics_enabled = self.queue_http_wait_trace_enabled()
+                except Exception:
+                    pass
+                failure_origin = _selected_scan_failure_origin(result, intent.path_pair_id) \
+                    if side == "local" and readiness_diagnostics_enabled else {}
+                scan_correlation = "unknown"
+                result_generation: object = None
                 details: dict[str, object] = {
                     "schema": "queue_readiness.v1",
                     "phase": "rescan_unknown",
@@ -3674,10 +3739,15 @@ class Controller:
                     "ready": False,
                 }
                 try:
-                    if self.queue_http_wait_trace_enabled():
+                    if readiness_diagnostics_enabled:
                         failure_kind = outcome if outcome in ("failed", "unknown") else "unknown"
                         result_session = getattr(result, "session_token", None)
                         result_generation = getattr(result, "generation", None)
+                        if side == "local" and type(result_session) is str and result_session and \
+                                type(result_generation) is int and 0 <= result_generation <= 2**63 - 1:
+                            scan_correlation = "local:{}:{}".format(
+                                trace_session_digest(result_session), result_generation,
+                            )
                         baseline = None
                         generations = intent.rescan_generations
                         side_index = 0 if side == "local" else 1
@@ -3723,10 +3793,29 @@ class Controller:
                             "run_matches_baseline": run_matches,
                             "generation_vs_baseline": generation_relation,
                         }
+                        scan_failure.update(failure_origin)
                         details["scan_failure"] = scan_failure
                 except Exception:
                     # Optional facts must not alter failure classification or notification.
                     pass
+                if failure_origin:
+                    try:
+                        self.logger.warning(
+                            "Deferred Queue selected scan failure corr=%s generation=%s site=%s "
+                            "recoverable=%s errno=%s class=%s pair=%s root=%s",
+                            scan_correlation,
+                            result_generation if type(result_generation) is int and
+                            0 <= result_generation <= 2**63 - 1 else "unknown",
+                            failure_origin["failure_site"],
+                            failure_origin["failure_recoverable"],
+                            failure_origin["failure_errno"],
+                            failure_origin["failure_exception"],
+                            failure_origin["failure_pair_ref"],
+                            failure_origin["failure_root_ref"],
+                        )
+                    except Exception:
+                        # The selected-scan failure mirror is diagnostic-only.
+                        pass
                 self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", details)
 
             def mark_initial_rescan_failure(
@@ -11468,16 +11557,18 @@ class Controller:
             if intent.phase == "initial_rescan":
                 failure_reason = self.__initial_rescan_failure_reason(intent)
                 allow_local_root_proof = False
+                proof_diagnostic: Optional[dict[str, object]] = None
+                readiness_diagnostics_enabled = False
+                try:
+                    readiness_diagnostics_enabled = self.queue_http_wait_trace_enabled()
+                except Exception:
+                    pass
                 if failure_reason in (
                         "initial_local_scan_recoverable_failed",
                         "initial_local_scan_recoverable_unknown",
                 ) and getattr(intent.command, "origin", "manual") == "manual":
-                    proof_diagnostic: Optional[dict[str, object]] = None
-                    try:
-                        if self.queue_http_wait_trace_enabled():
-                            proof_diagnostic = {}
-                    except Exception:
-                        proof_diagnostic = None
+                    if readiness_diagnostics_enabled:
+                        proof_diagnostic = {}
                     allow_local_root_proof = self.__has_fresh_local_root_scan_proof(
                         deferred_file, intent, proof_diagnostic,
                     )
@@ -11503,6 +11594,65 @@ class Controller:
                 if failure_reason is not None:
                     external_reason = self.__external_initial_rescan_failure_reason(failure_reason)
                     if self.__retire_deferred_queue_intent(file_id, external_reason):
+                        try:
+                            if readiness_diagnostics_enabled:
+                                proof = proof_diagnostic if isinstance(proof_diagnostic, dict) else {}
+                                allowed_failure_reasons = {
+                                    "initial_local_scan_failed", "initial_local_scan_recoverable_failed",
+                                    "initial_local_scan_unknown", "initial_local_scan_recoverable_unknown",
+                                    "initial_local_scan_session_changed", "initial_local_scan_generation_reset",
+                                    "initial_remote_scan_failed", "initial_remote_scan_unknown",
+                                    "initial_remote_scan_session_changed", "initial_remote_scan_generation_reset",
+                                }
+                                allowed_proof_reasons = {
+                                    "root_shape", "remote_not_ready", "builder_reader_unavailable",
+                                    "overlay_unknown_unavailable", "overlay_not_unknown",
+                                    "scan_reader_unavailable", "scan_snapshot_unknown", "source_absent",
+                                    "source_shape_unknown", "run_mismatch", "below_work_floor",
+                                    "ahead_of_process", "builder_proof_mismatch", "inspection_error",
+                                    "baseline_unavailable", "baseline_run_mismatch", "baseline_not_newer",
+                                    "accepted",
+                                }
+                                generations = intent.rescan_generations
+                                baseline_generation = None
+                                if isinstance(generations, tuple) and len(generations) == 2 and \
+                                        isinstance(generations[0], tuple) and len(generations[0]) == 2:
+                                    candidate = generations[0][1]
+                                    if type(candidate) is int and 0 <= candidate <= 2**63 - 1:
+                                        baseline_generation = candidate
+
+                                def bounded_generation(value: object) -> object:
+                                    return value if type(value) is int and 0 <= value <= 2**63 - 1 else "unknown"
+
+                                proof_result = proof.get("result")
+                                proof_result = proof_result if proof_result in ("accepted", "rejected") else "unknown"
+                                proof_reason = proof.get("reason")
+                                proof_reason = proof_reason if proof_reason in allowed_proof_reasons else "unknown"
+                                relation = proof.get("generation_vs_baseline")
+                                relation = relation if relation in ("newer", "equal", "older", "unknown") else "unknown"
+                                self.logger.warning(
+                                    "Deferred Queue final rejection corr=%s reason=%s proof=%s proof_reason=%s "
+                                    "baseline_generation=%s root_generation=%s process_generation=%s "
+                                    "work_floor=%s generation_vs_baseline=%s remote_ready=%s "
+                                    "run_matches_current=%s builder_proof_matches_source=%s",
+                                    "fractional-mtime:{}".format(opaque_trace_correlation(file_id)),
+                                    failure_reason if failure_reason in allowed_failure_reasons else "unknown",
+                                    proof_result,
+                                    proof_reason,
+                                    baseline_generation if baseline_generation is not None else "unknown",
+                                    bounded_generation(proof.get("root_generation")),
+                                    bounded_generation(proof.get("process_generation")),
+                                    bounded_generation(proof.get("effective_work_floor")),
+                                    relation,
+                                    proof.get("remote_ready") if type(proof.get("remote_ready")) is bool else "unknown",
+                                    proof.get("run_matches_current")
+                                    if type(proof.get("run_matches_current")) is bool else "unknown",
+                                    proof.get("builder_proof_matches_source")
+                                    if type(proof.get("builder_proof_matches_source")) is bool else "unknown",
+                                )
+                        except Exception:
+                            # The final rejection mirror is diagnostic-only.
+                            pass
                         self.__notify_deferred_queue_failure(intent, external_reason)
                     continue
                 # A scan result that was published before the boundary is

@@ -136,6 +136,8 @@ class MultiPathLocalScanner(IScanner):
     def scan(self) -> List[SystemFile]:
         all_files: List[SystemFile] = []
         recoverable_errors: List[str] = []
+        failure_origin: Optional[dict[str, object]] = None
+        recoverable_error_count = 0
         self.__failed_path_pair_ids = set()
         scanners = [scanner for scanner in self.__scanners if self.__scan_target_path_pair_ids is None or
                     scanner.path_pair_id in self.__scan_target_path_pair_ids]
@@ -153,6 +155,15 @@ class MultiPathLocalScanner(IScanner):
         try:
             for scanner, files, err in scan_results:
                 if err is not None:
+                    recoverable_error_count += 1
+                    try:
+                        child_failure_origin = getattr(err, "failure_origin", None)
+                        if recoverable_error_count == 1 and isinstance(child_failure_origin, dict):
+                            failure_origin = dict(child_failure_origin)
+                        else:
+                            failure_origin = None
+                    except Exception:
+                        failure_origin = None
                     error_message = "Failed to scan local path for pair '{}': {}".format(
                         scanner.path_pair_name, str(err)
                     )
@@ -172,6 +183,7 @@ class MultiPathLocalScanner(IScanner):
                 "Local scan completed with recoverable errors: {}".format("; ".join(recoverable_errors)),
                 recoverable=True,
                 files=all_files,
+                failure_origin=failure_origin if recoverable_error_count == 1 else None,
             )
         return all_files
 

@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from .scanner_process import IScanner, ScannerError, ScanProgressCallback
 from common import overrides, Localization, Constants
+from common.breadcrumb_trace import opaque_trace_correlation
 from common.performance_diagnostics import (
     DURATION_LOCAL_SCAN_AGGREGATION,
     DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
@@ -19,6 +20,7 @@ from common.managed_extract import (
     read_managed_extract_marker,
     resolve_managed_extract_file_id,
 )
+from model import ModelFile
 from system import SystemScanner, SystemFile, SystemScannerError
 
 
@@ -108,6 +110,70 @@ class LocalScanner(IScanner):
             # failure handling or publication authority.
             return
 
+    def __failure_origin(self, site: str, recoverable: bool, *,
+                         error: Optional[BaseException] = None,
+                         scanner: Optional[SystemScanner] = None,
+                         root_name: Optional[str] = None) -> Optional[dict[str, object]]:
+        """Build finite source facts only on an admitted trace/log failure path."""
+        try:
+            trace = self.__breadcrumb_trace
+            gate = getattr(trace, "is_effectively_enabled", None)
+            if not callable(gate) or not bool(gate("scanner_process", "info")):
+                return None
+
+            error_number: Optional[int] = None
+            exception_class: Optional[str] = None
+            if site in ("missing_final_root", "missing_staging_root", "invalid_scan_path"):
+                exception_class = "scanner_error"
+            if error is not None:
+                source_error: BaseException = error
+                if isinstance(error, SystemScannerError) and error.__cause__ is not None:
+                    source_error = error.__cause__
+                if isinstance(source_error, PermissionError):
+                    exception_class = "permission_error"
+                elif isinstance(source_error, SystemScannerError):
+                    exception_class = "system_scanner_error"
+                elif isinstance(source_error, OSError):
+                    exception_class = "os_error"
+                elif isinstance(source_error, ScannerError):
+                    exception_class = "scanner_error"
+                else:
+                    exception_class = "unknown"
+                candidate_errno = getattr(source_error, "errno", None)
+                if type(candidate_errno) is int and 0 <= candidate_errno <= 65535:
+                    error_number = candidate_errno
+
+            if scanner is not None:
+                first_error = scanner.first_scan_error
+                if isinstance(first_error, tuple) and len(first_error) == 3:
+                    scanner_class, scanner_errno, scanner_root = first_error
+                    if scanner_class in ("permission_error", "system_scanner_error", "os_error"):
+                        exception_class = scanner_class
+                    if type(scanner_errno) is int and 0 <= scanner_errno <= 65535:
+                        error_number = scanner_errno
+                    if root_name is None and type(scanner_root) is str:
+                        root_name = scanner_root
+
+            root_ref = None
+            if type(root_name) is str and root_name and type(self.__path_pair_id) is str:
+                root_ref = opaque_trace_correlation(
+                    "scan-root|" + ModelFile.build_file_id(root_name, self.__path_pair_id),
+                )
+            pair_ref = None
+            if type(self.__path_pair_id) is str and self.__path_pair_id:
+                pair_ref = opaque_trace_correlation("scan-pair|" + self.__path_pair_id)
+            return {
+                "failure_site": site,
+                "failure_recoverable": recoverable,
+                "failure_errno": error_number,
+                "failure_exception": exception_class,
+                "failure_root_ref": root_ref,
+                "failure_pair_ref": pair_ref,
+            }
+        except Exception:
+            # Diagnostic construction never changes the existing failure path.
+            return None
+
     @property
     def path_pair_id(self) -> Optional[str]:
         return self.__path_pair_id
@@ -148,7 +214,10 @@ class LocalScanner(IScanner):
     def scan(self) -> List[SystemFile]:
         self.__managed_extract_file_ids = set()
         if not self.__is_valid_scan_path(self.__local_path):
-            raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
+            raise ScannerError(
+                Localization.Error.LOCAL_SERVER_SCAN, recoverable=False,
+                failure_origin=self.__failure_origin("invalid_scan_path", False),
+            )
         if self.__progress_callback is not None:
             return self.__scan_progressively()
         try:
@@ -156,15 +225,30 @@ class LocalScanner(IScanner):
             try:
                 result = self.__scanner.scan()
                 if self.__scanner.scan_had_errors:
-                    raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
+                    raise ScannerError(
+                        Localization.Error.LOCAL_SERVER_SCAN, recoverable=True,
+                        failure_origin=self.__failure_origin(
+                            "scan_had_errors", True, scanner=self.__scanner,
+                        ),
+                    )
             finally:
                 self.__finish_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, filesystem_started)
-        except SystemScannerError:
+        except SystemScannerError as error:
             self.logger.exception("Caught SystemScannerError")
-            raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
-        except OSError:
+            raise ScannerError(
+                Localization.Error.LOCAL_SERVER_SCAN, recoverable=False,
+                failure_origin=self.__failure_origin(
+                    "system_scanner_error", False, error=error,
+                ),
+            )
+        except OSError as error:
             self.logger.exception("Caught local filesystem error")
-            raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
+            raise ScannerError(
+                Localization.Error.LOCAL_SERVER_SCAN, recoverable=True,
+                failure_origin=self.__failure_origin(
+                    "filesystem_error", True, error=error,
+                ),
+            )
 
         if self.__managed_extract_folders_enabled:
             managed_extract_started = self.__begin_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT)
@@ -186,13 +270,28 @@ class LocalScanner(IScanner):
             try:
                 staging_result = self.__staging_scanner.scan()
                 if self.__staging_scanner.scan_had_errors:
-                    raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
-            except SystemScannerError:
+                    raise ScannerError(
+                        Localization.Error.LOCAL_SERVER_SCAN, recoverable=True,
+                        failure_origin=self.__failure_origin(
+                            "scan_had_errors", True, scanner=self.__staging_scanner,
+                        ),
+                    )
+            except SystemScannerError as error:
                 self.logger.exception("Caught SystemScannerError")
-                raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
-            except OSError:
+                raise ScannerError(
+                    Localization.Error.LOCAL_SERVER_SCAN, recoverable=False,
+                    failure_origin=self.__failure_origin(
+                        "system_scanner_error", False, error=error,
+                    ),
+                )
+            except OSError as error:
                 self.logger.exception("Caught local staging filesystem error")
-                raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
+                raise ScannerError(
+                    Localization.Error.LOCAL_SERVER_SCAN, recoverable=True,
+                    failure_origin=self.__failure_origin(
+                        "filesystem_error", True, error=error,
+                    ),
+                )
             finally:
                 self.__finish_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, filesystem_started)
 
@@ -282,7 +381,12 @@ class LocalScanner(IScanner):
                         # check before managed-extract pruning, where None is
                         # a legitimate result for a successfully scanned root.
                         self.__record_missing_root("final")
-                        raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
+                        raise ScannerError(
+                            Localization.Error.LOCAL_SERVER_SCAN, recoverable=True,
+                            failure_origin=self.__failure_origin(
+                                "missing_final_root", True, root_name=root_name,
+                            ),
+                        )
                     if result is not None and self.__managed_extract_folders_enabled:
                         managed_extract_started = self.__begin_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT)
                         try:
@@ -302,7 +406,12 @@ class LocalScanner(IScanner):
                         # Final roots.  A vanished root must not be published
                         # as a complete authoritative absence.
                         self.__record_missing_root("staging")
-                        raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
+                        raise ScannerError(
+                            Localization.Error.LOCAL_SERVER_SCAN, recoverable=True,
+                            failure_origin=self.__failure_origin(
+                                "missing_staging_root", True, root_name=root_name,
+                            ),
+                        )
                     if staging_result is not None:
                         if self.__managed_extract_folders_enabled and self.__staging_path is not None:
                             managed_extract_started = self.__begin_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT)
@@ -336,19 +445,35 @@ class LocalScanner(IScanner):
                         self.__finish_stage(DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION, progress_started)
             if self.__scanner.scan_had_errors or (
                     self.__staging_scanner is not None and self.__staging_scanner.scan_had_errors):
-                raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
+                source_scanner = self.__scanner if self.__scanner.scan_had_errors else self.__staging_scanner
+                raise ScannerError(
+                    Localization.Error.LOCAL_SERVER_SCAN, recoverable=True,
+                    failure_origin=self.__failure_origin(
+                        "scan_had_errors", True, scanner=source_scanner,
+                    ),
+                )
             progress_started = self.__begin_stage(DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION)
             try:
                 self.__progress_callback([], self.__path_pair_id, self.__path_pair_name, None, True)
             finally:
                 self.__finish_stage(DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION, progress_started)
             return aggregate_results
-        except SystemScannerError:
+        except SystemScannerError as error:
             self.logger.exception("Caught SystemScannerError")
-            raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
-        except OSError:
+            raise ScannerError(
+                Localization.Error.LOCAL_SERVER_SCAN, recoverable=False,
+                failure_origin=self.__failure_origin(
+                    "system_scanner_error", False, error=error,
+                ),
+            )
+        except OSError as error:
             self.logger.exception("Caught local filesystem error")
-            raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
+            raise ScannerError(
+                Localization.Error.LOCAL_SERVER_SCAN, recoverable=True,
+                failure_origin=self.__failure_origin(
+                    "filesystem_error", True, error=error,
+                ),
+            )
 
     def pop_managed_extract_file_ids(self) -> List[str]:
         managed_extract_file_ids = sorted(self.__managed_extract_file_ids)

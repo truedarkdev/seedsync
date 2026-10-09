@@ -56,10 +56,47 @@ class ScannerError(AppError):
     def __init__(self,
                  message: str,
                  recoverable: bool = False,
-                 files: Optional[List[SystemFile]] = None):
+                 files: Optional[List[SystemFile]] = None,
+                 failure_origin: Optional[dict[str, object]] = None):
         super().__init__(message)
         self.recoverable = recoverable
         self.files = files
+        # LocalScanner supplies only a fixed, path-free diagnostic projection.
+        # Keep it transient on the failure object; it is never scan authority.
+        self.failure_origin = failure_origin
+
+
+_SCAN_FAILURE_SITES = frozenset({
+    "missing_final_root", "missing_staging_root", "scan_had_errors",
+    "system_scanner_error", "filesystem_error", "invalid_scan_path",
+})
+_SCAN_FAILURE_CLASSES = frozenset({
+    "permission_error", "system_scanner_error", "os_error", "scanner_error", "unknown",
+})
+
+
+def _scan_failure_origin_fields(error: ScannerError) -> dict[str, object]:
+    """Return only the fixed finite origin facts attached by LocalScanner."""
+    origin = getattr(error, "failure_origin", None)
+    if not isinstance(origin, dict):
+        return {}
+    site = origin.get("failure_site")
+    recoverable = origin.get("failure_recoverable")
+    error_number = origin.get("failure_errno")
+    exception_class = origin.get("failure_exception")
+    root_ref = origin.get("failure_root_ref")
+    pair_ref = origin.get("failure_pair_ref")
+    return {
+        "failure_site": site if type(site) is str and site in _SCAN_FAILURE_SITES else "unknown",
+        "failure_recoverable": recoverable if type(recoverable) is bool else None,
+        "failure_errno": error_number if type(error_number) is int and 0 <= error_number <= 65535 else None,
+        "failure_exception": exception_class if type(exception_class) is str and
+        exception_class in _SCAN_FAILURE_CLASSES else None,
+        "failure_root_ref": root_ref if type(root_ref) is str and len(root_ref) == 16 and
+        all(character in "0123456789abcdef" for character in root_ref) else None,
+        "failure_pair_ref": pair_ref if type(pair_ref) is str and len(pair_ref) == 16 and
+        all(character in "0123456789abcdef" for character in pair_ref) else None,
+    }
 
 
 class IScanner(ABC):
@@ -260,7 +297,8 @@ class ScannerResult:
                  root_scan_outcomes_by_pair: Optional[
                      dict[str | None, dict[str, tuple[bool, bool]]]
                  ] = None,
-                 scan_started_at: Optional[datetime] = None):
+                 scan_started_at: Optional[datetime] = None,
+                 failure_origin: Optional[dict[str, object]] = None):
         self.timestamp = timestamp
         self.files = files
         self.malformed_status_only_file_ids = [] if malformed_status_only_file_ids is None else malformed_status_only_file_ids
@@ -292,6 +330,7 @@ class ScannerResult:
         self.root_scan_outcomes_by_pair = {} if root_scan_outcomes_by_pair is None \
             else root_scan_outcomes_by_pair
         self.scan_started_at = scan_started_at
+        self.failure_origin = failure_origin
 
 
 class _ScannerQueueReleaseMarker:
@@ -690,7 +729,8 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                 _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_failed",
                                         lambda: {"failed": True, "generation": generation,
                                                  "session_digest": trace_session_digest(session_token),
-                                                 "monotonic_ms": int(time.monotonic_ns() / 1_000_000)}, "failure")
+                                                 "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
+                                                 **_scan_failure_origin_fields(error)}, "failure")
                 raise
             files = error.files if error.files is not None else []
             malformed = scanner.pop_malformed_status_only_file_ids()
@@ -723,6 +763,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                     pair_id: dict(outcomes) for pair_id, outcomes in root_scan_outcomes_by_pair.items()
                 },
                 scan_started_at=scan_started_at,
+                failure_origin=_scan_failure_origin_fields(error) or None,
             )
             outcome = ("recoverable", str(error))
             _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_failed",
@@ -730,7 +771,8 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                                              "targeted": scan_target_path_pair_ids is not None,
                                              "generation": generation,
                                              "session_digest": trace_session_digest(session_token),
-                                             "monotonic_ms": int(time.monotonic_ns() / 1_000_000)}, "failure")
+                                             "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
+                                             **_scan_failure_origin_fields(error)}, "failure")
         if result_via_control:
             # A spawn child must not leave a multiprocessing.Queue feeder
             # thread behind.  Send the authoritative aggregate over the
@@ -1179,6 +1221,7 @@ class ScannerProcess:
                     "scanner_side": _scanner_side(self.__scanner),
                     "session_digest": trace_session_digest(self.__session_token),
                     "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
+                    **_scan_failure_origin_fields(error),
                 }, event_type="failure", flow_id=flow_id)
                 raise
             files = error.files if error.files is not None else []
@@ -1186,7 +1229,18 @@ class ScannerProcess:
             managed = self.__scanner.pop_managed_extract_file_ids()
             error_message = str(error)
             if error_message != self.__last_recoverable_error_message:
-                self.logger.warning("Recoverable scanner error; returning failed result: {}".format(error_message))
+                origin_fields = _scan_failure_origin_fields(error)
+                if origin_fields:
+                    self.logger.warning(
+                        "Recoverable scanner error; returning failed result "
+                        "(site=%s class=%s errno=%s pair=%s root=%s run=%s generation=%s)",
+                        origin_fields["failure_site"], origin_fields["failure_exception"],
+                        origin_fields["failure_errno"], origin_fields["failure_pair_ref"],
+                        origin_fields["failure_root_ref"], trace_session_digest(self.__session_token),
+                        generation,
+                    )
+                else:
+                    self.logger.warning("Recoverable scanner error; returning failed result: {}".format(error_message))
                 self.__last_recoverable_error_message = error_message
             failed_ids = _failed_scan_path_pair_ids(self.__scanner, scan_target_path_pair_ids)
             result = ScannerResult(timestamp_start, [] if progress_emitted else files, malformed, managed,
@@ -1202,7 +1256,8 @@ class ScannerProcess:
                                        pair_id: dict(outcomes)
                                        for pair_id, outcomes in root_scan_outcomes_by_pair.items()
                                    },
-                                   scan_started_at=scan_started_at)
+                                   scan_started_at=scan_started_at,
+                                   failure_origin=_scan_failure_origin_fields(error) or None)
             self.__record_breadcrumb("scan_failed", lambda: {
                 "file_count": len(files), "failed": True,
                 "scanner_side": _scanner_side(self.__scanner),
@@ -1210,6 +1265,7 @@ class ScannerProcess:
                 "generation": generation,
                 "session_digest": trace_session_digest(self.__session_token),
                 "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
+                **_scan_failure_origin_fields(error),
             }, event_type="failure", flow_id=flow_id)
         finally:
             self.__inline_scan_active.clear()

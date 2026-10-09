@@ -225,6 +225,7 @@ class SystemScanner:
         self.__scan_had_errors = False
         self.__scan_root_errors: set[str] = set()
         self.__active_root_name: str | None = None
+        self.__first_scan_error: tuple[str, int | None, str | None] | None = None
         self.__breadcrumb_trace: object = None
         self.__scan_role = "system"
 
@@ -269,6 +270,7 @@ class SystemScanner:
         self.__scan_had_errors = False
         self.__scan_root_errors.clear()
         self.__active_root_name = None
+        self.__first_scan_error = None
         if not os.path.exists(self.path_to_scan):
             raise SystemScannerError("Path does not exist: {}".format(self.path_to_scan))
         elif not os.path.isdir(self.path_to_scan):
@@ -283,6 +285,12 @@ class SystemScanner:
     def reset_scan_errors(self) -> None:
         self.__scan_had_errors = False
         self.__scan_root_errors.clear()
+        self.__first_scan_error = None
+
+    @property
+    def first_scan_error(self) -> tuple[str, int | None, str | None] | None:
+        """Return the first bounded scanner error facts without rescanning."""
+        return self.__first_scan_error
 
     def scan_root_had_errors(self, root_name: str) -> bool:
         """Whether recursive enumeration of one top-level root was incomplete."""
@@ -544,6 +552,14 @@ class SystemScanner:
         except PermissionError as error:
             first_error = not self.__scan_had_errors
             self.__scan_had_errors = True
+            if first_error and _breadcrumb_effectively_enabled(
+                    self.__breadcrumb_trace, "scanner_process", "info"):
+                error_number = error.errno
+                self.__first_scan_error = (
+                    "permission_error",
+                    error_number if type(error_number) is int and 0 <= error_number <= 65535 else None,
+                    self.__active_root_name if type(self.__active_root_name) is str else None,
+                )
             if self.__active_root_name is not None:
                 self.__scan_root_errors.add(self.__active_root_name)
             if first_error:
