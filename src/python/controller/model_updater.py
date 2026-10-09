@@ -3844,6 +3844,19 @@ class _ProgressiveScanAccumulator:
             for generation in (self.__active_generation.get(pair_id),)
             if isinstance(self.__session_token, str) and type(generation) is int
         }
+        # ``failed`` and ``generation`` describe the whole drain.  Keep the
+        # exact current failed generation for each pair alongside that
+        # aggregate so a newer incomplete event for one pair cannot make an
+        # older failure look fresh to Queue.  __failed_pairs is already
+        # session-scoped and drops failures when that pair advances.
+        result._scan_failure_tokens_by_pair = {
+            path_pair_id: (self.__session_token, generation)
+            for generation, path_pair_id in self.__failed_pairs
+            if path_pair_id in published_incomplete
+            and self.__active_generation.get(path_pair_id) == generation
+            and isinstance(self.__session_token, str)
+            and type(generation) is int and 0 <= generation <= 2**63 - 1
+        }
         return result
 
     def snapshot(self) -> dict[tuple[Optional[str], str], SystemFile]:

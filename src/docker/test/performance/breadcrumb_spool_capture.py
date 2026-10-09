@@ -186,6 +186,8 @@ _QUEUE_SCAN_FAILURE_SIDES = frozenset({"local", "remote", "unknown"})
 _QUEUE_SCAN_FAILURE_KINDS = frozenset({"failed", "unknown"})
 _QUEUE_SCAN_FAILURE_SCOPES = frozenset({"targeted", "non_targeted", "unknown"})
 _QUEUE_SCAN_GENERATION_RELATIONS = frozenset({"newer", "equal", "older", "unknown"})
+_QUEUE_FAILURE_GENERATION_SOURCES = frozenset({"pair", "aggregate_compatibility", "unknown"})
+_QUEUE_FAILURE_IGNORED_REASONS = frozenset({"missing", "invalid", "older", "equal", "session_mismatch"})
 _QUEUE_FRESH_ROOT_RESULTS = frozenset({"accepted", "rejected", "unknown"})
 _QUEUE_FRESH_ROOT_REASONS = frozenset({
     "accepted", "root_shape", "remote_not_ready", "builder_reader_unavailable",
@@ -200,9 +202,12 @@ _QUEUE_SCAN_FAILURE_INTEGER_MAX = 2**63 - 1
 _QUEUE_NESTED_DIAGNOSTIC_FIELDS = {
     "scan_failure": (
         {"side": _QUEUE_SCAN_FAILURE_SIDES, "kind": _QUEUE_SCAN_FAILURE_KINDS,
-         "scope": _QUEUE_SCAN_FAILURE_SCOPES, "generation_vs_baseline": _QUEUE_SCAN_GENERATION_RELATIONS},
+         "scope": _QUEUE_SCAN_FAILURE_SCOPES, "generation_vs_baseline": _QUEUE_SCAN_GENERATION_RELATIONS,
+         "failure_generation_source": _QUEUE_FAILURE_GENERATION_SOURCES,
+         "failure_generation_vs_baseline": _QUEUE_SCAN_GENERATION_RELATIONS,
+         "failure_ignored_reason": _QUEUE_FAILURE_IGNORED_REASONS},
         ("target_covered", "terminal", "recoverable", "run_matches_baseline"),
-        ("result_generation",),
+        ("result_generation", "failure_generation", "baseline_generation"),
     ),
     "fresh_root_proof": (
         {"result": _QUEUE_FRESH_ROOT_RESULTS, "reason": _QUEUE_FRESH_ROOT_REASONS,
@@ -906,6 +911,10 @@ def _scan_failure_origin_facts(source: Mapping[str, object]) -> dict[str, object
             reference if reference is None or isinstance(reference, str)
             and _OPAQUE_TOKEN.fullmatch(reference) else None
         )
+    run_ref = source.get("failure_run_ref")
+    result["failure_run_ref"] = (
+        run_ref if run_ref is None or isinstance(run_ref, str) and _SCAN_SESSION_DIGEST.fullmatch(run_ref) else None
+    )
     return result
 
 

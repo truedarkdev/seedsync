@@ -54,7 +54,7 @@ from common.performance_diagnostics import (
     PerformanceDiagnosticsCollector,
 )
 from common.exclude_patterns import ExactPathExclusion
-from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation
+from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation, trace_session_digest
 from common.path_pair import PathPair
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from lftp.lftp import _incoming_recovery_child_record, _record_lftp_sidecar_breadcrumb
@@ -18901,10 +18901,13 @@ class TestController(unittest.TestCase):
         self.assertEqual(
             {"side": "local", "kind": "failed", "scope": "non_targeted", "target_covered": True,
              "terminal": False, "recoverable": True, "result_generation": 1,
-             "run_matches_baseline": True, "generation_vs_baseline": "newer"},
+             "run_matches_baseline": True, "generation_vs_baseline": "newer",
+             "failure_generation_source": "aggregate_compatibility", "failure_generation": 1,
+             "failure_generation_vs_baseline": "newer"},
             {key: scan_failures[0][key] for key in (
                 "side", "kind", "scope", "target_covered", "terminal", "recoverable",
                 "result_generation", "run_matches_baseline", "generation_vs_baseline",
+                "failure_generation_source", "failure_generation", "failure_generation_vs_baseline",
             )},
         )
         self.assertEqual("scan_had_errors", scan_failures[0]["failure_site"])
@@ -18915,8 +18918,207 @@ class TestController(unittest.TestCase):
         self.assertEqual(opaque_trace_correlation("scan-pair|pair-a"), scan_failures[0]["failure_pair_ref"])
         self.assertTrue(scan_failures[1]["terminal"])
         self.assertFalse(scan_failures[1]["recoverable"])
+        self.assertEqual("aggregate_compatibility", scan_failures[1]["failure_generation_source"])
+        self.assertEqual(2, scan_failures[1]["failure_generation"])
         self.assertEqual("unknown", scan_failures[2]["kind"])
         self.assertTrue(scan_failures[2]["terminal"])
+        self.assertEqual("unknown", scan_failures[2]["failure_generation_source"])
+        self.assertIsNone(scan_failures[2]["failure_generation"])
+
+    def test_accumulated_queue_failure_uses_exact_pair_generation_not_drain_max(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=16,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        pair_id = "pair-a"
+        file_id = ModelFile.build_file_id("selected", pair_id)
+        intent = DeferredQueueIntent(
+            Controller.Command(Controller.Command.Action.QUEUE, file_id), file_id, pair_id,
+            phase="initial_rescan", rescan_requested=True,
+            rescan_generations=(("local-session", 12), ("remote-session", 0)),
+        )
+        self.controller._Controller__deferred_queue_intents_map()[file_id] = intent
+
+        accumulator = _ProgressiveScanAccumulator()
+        root_a = SystemFile("root-a", 5)
+        root_a.path_pair_id = pair_id
+        root_b = SystemFile("root-b", 7)
+        root_b.path_pair_id = "pair-b"
+        accumulator.apply([ScannerResult(
+            datetime.now(), [root_a, root_b], scanned_path_pair_ids={pair_id, "pair-b"}, generation=11,
+            is_progress=True, completed_path_pair_ids={pair_id, "pair-b"},
+            is_full_snapshot=True, full_snapshot_path_pair_ids={pair_id, "pair-b"},
+            root_names={"root-a", "root-b"},
+            session_token="local-session",
+        )], {pair_id, "pair-b"})
+        stale_failure = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={pair_id}, generation=12,
+            is_progress=True, failed=True, unknown_path_pair_ids={pair_id},
+            recoverable_failure_path_pair_ids={pair_id}, session_token="local-session",
+        )
+        newer_other_pair_progress = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=13,
+            is_progress=True, unknown_path_pair_ids={"pair-b"}, session_token="local-session",
+        )
+        mixed = accumulator.apply([stale_failure, newer_other_pair_progress], {pair_id, "pair-b"})
+        mixed.failure_origin = {
+            "failure_site": "scan_had_errors", "failure_recoverable": True, "failure_errno": 13,
+            "failure_exception": "permission_error", "failure_root_ref": "0123456789abcdef",
+            "failure_pair_ref": "fedcba9876543210",
+        }
+        self.assertTrue(mixed.failed)
+        self.assertEqual(13, mixed.generation)
+        self.assertEqual({pair_id: ("local-session", 12)}, mixed._scan_failure_tokens_by_pair)
+        self.assertEqual({pair_id, "pair-b"}, mixed.unknown_path_pair_ids)
+        self.assertEqual({(pair_id, "root-a"), ("pair-b", "root-b")}, set(accumulator.snapshot()))
+
+        # The pair's failure is equal to the Queue baseline, so the newer
+        # unrelated pair generation cannot make it fresh.
+        self.controller._record_path_pair_scan_tokens(mixed, None)
+        self.assertIsNone(intent.rescan_failure_reason)
+        ignored = next(
+            entry["details"]["scan_failure"]
+            for entry in trace.snapshot(category_prefix="queue.readiness")["entries"]
+            if entry["message"] == "queue_rescan_readiness" and
+            isinstance(entry.get("details"), dict) and "scan_failure" in entry["details"]
+        )
+        self.assertEqual("equal", ignored["failure_ignored_reason"])
+        self.assertEqual("pair", ignored["failure_generation_source"])
+        self.assertEqual(12, ignored["failure_generation"])
+        self.assertEqual(12, ignored["baseline_generation"])
+        self.assertEqual(13, ignored["result_generation"])
+        self.assertEqual(trace_session_digest("local-session"), ignored["failure_run_ref"])
+
+        same_pair = _ProgressiveScanAccumulator()
+        retained = SystemFile("retained", 9)
+        retained.path_pair_id = pair_id
+        same_pair.apply([ScannerResult(
+            datetime.now(), [retained], scanned_path_pair_ids={pair_id}, generation=11,
+            is_progress=True, completed_path_pair_ids={pair_id}, is_full_snapshot=True,
+            full_snapshot_path_pair_ids={pair_id}, root_names={"retained"},
+            session_token="local-session",
+        )], {pair_id})
+        progressed_same_pair = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={pair_id}, generation=13,
+            is_progress=True, unknown_path_pair_ids={pair_id}, session_token="local-session",
+        )
+        same_pair_mixed = same_pair.apply([stale_failure, progressed_same_pair], {pair_id})
+        self.assertTrue(same_pair_mixed.failed)
+        self.assertEqual(13, same_pair_mixed.generation)
+        self.assertEqual({}, same_pair_mixed._scan_failure_tokens_by_pair)
+        self.assertEqual({(pair_id, "retained")}, set(same_pair.snapshot()))
+        self.controller._record_path_pair_scan_tokens(same_pair_mixed, None)
+        self.assertIsNone(intent.rescan_failure_reason)
+        missing = [
+            entry["details"]["scan_failure"]
+            for entry in trace.snapshot(category_prefix="queue.readiness")["entries"]
+            if entry["message"] == "queue_rescan_readiness" and
+            isinstance(entry.get("details"), dict) and "scan_failure" in entry["details"]
+        ][-1]
+        self.assertEqual("missing", missing["failure_ignored_reason"])
+        self.assertEqual("pair", missing["failure_generation_source"])
+        self.assertIsNone(missing["failure_generation"])
+        self.assertEqual(13, missing["result_generation"])
+        self.assertEqual(12, missing["baseline_generation"])
+        self.assertIsNone(missing["run_matches_baseline"])
+        self.assertIsNone(missing["failure_run_ref"])
+
+        # An exact token older than the requested baseline is ignored and
+        # diagnosed separately from the newer aggregate display generation.
+        intent.rescan_generations = (("local-session", 13), ("remote-session", 0))
+        self.controller._record_path_pair_scan_tokens(mixed, None)
+        older = [
+            entry["details"]["scan_failure"]
+            for entry in trace.snapshot(category_prefix="queue.readiness")["entries"]
+            if entry["message"] == "queue_rescan_readiness" and
+            isinstance(entry.get("details"), dict) and "scan_failure" in entry["details"]
+        ][-1]
+        self.assertEqual("older", older["failure_ignored_reason"])
+        self.assertEqual("older", older["failure_generation_vs_baseline"])
+        self.assertEqual(12, older["failure_generation"])
+        self.assertEqual(13, older["baseline_generation"])
+        self.assertEqual(trace_session_digest("local-session"), older["failure_run_ref"])
+
+        # The same per-pair failure is still actionable against an older
+        # baseline; diagnostics retain both the aggregate and exact token.
+        intent.rescan_generations = (("local-session", 11), ("remote-session", 0))
+        self.controller._record_path_pair_scan_tokens(mixed, None)
+        self.assertEqual("initial_local_scan_recoverable_failed", intent.rescan_failure_reason)
+        scan_failure = next(
+            entry["details"]["scan_failure"]
+            for entry in trace.snapshot(category_prefix="queue.readiness")["entries"]
+            if entry["message"] == "queue_rescan_readiness" and
+            isinstance(entry.get("details"), dict) and "scan_failure" in entry["details"] and
+            entry["details"]["scan_failure"]["kind"] == "failed"
+        )
+        self.assertEqual(13, scan_failure["result_generation"])
+        self.assertEqual("pair", scan_failure["failure_generation_source"])
+        self.assertEqual(12, scan_failure["failure_generation"])
+        self.assertEqual("newer", scan_failure["failure_generation_vs_baseline"])
+        self.assertEqual(trace_session_digest("local-session"), scan_failure["failure_run_ref"])
+        warning = self.controller.logger.warning.call_args.args
+        self.assertEqual(
+            "local:{}:12".format(trace_session_digest("local-session")), warning[1],
+        )
+        self.assertEqual(12, warning[2])
+
+        # An exact token from a different scanner session never matches the
+        # original Queue baseline, even if its generation is numerically newer.
+        intent.rescan_failure_reason = None
+        intent.rescan_generations = (("local-session", 12), ("remote-session", 0))
+        other_session = _ProgressiveScanAccumulator().apply([ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={pair_id}, generation=13,
+            is_progress=True, failed=True, unknown_path_pair_ids={pair_id},
+            recoverable_failure_path_pair_ids={pair_id}, session_token="other-session",
+        )])
+        self.assertEqual({pair_id: ("other-session", 13)}, other_session._scan_failure_tokens_by_pair)
+        self.controller._record_path_pair_scan_tokens(other_session, None)
+        self.assertIsNone(intent.rescan_failure_reason)
+        session_mismatch = [
+            entry["details"]["scan_failure"]
+            for entry in trace.snapshot(category_prefix="queue.readiness")["entries"]
+            if entry["message"] == "queue_rescan_readiness" and
+            isinstance(entry.get("details"), dict) and "scan_failure" in entry["details"]
+        ][-1]
+        self.assertEqual("session_mismatch", session_mismatch["failure_ignored_reason"])
+        self.assertEqual("unknown", session_mismatch["failure_generation_vs_baseline"])
+        self.assertEqual(trace_session_digest("other-session"), session_mismatch["failure_run_ref"])
+
+        # Present but malformed accumulator metadata fails closed instead of
+        # being treated as a legacy aggregate token.
+        malformed_metadata = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={pair_id}, generation=14,
+            is_progress=True, failed=True, unknown_path_pair_ids={pair_id},
+            recoverable_failure_path_pair_ids={pair_id}, session_token="local-session",
+        )
+        malformed_metadata._scan_failure_tokens_by_pair = []
+        self.controller._record_path_pair_scan_tokens(malformed_metadata, None)
+        self.assertIsNone(intent.rescan_failure_reason)
+        invalid = [
+            entry["details"]["scan_failure"]
+            for entry in trace.snapshot(category_prefix="queue.readiness")["entries"]
+            if entry["message"] == "queue_rescan_readiness" and
+            isinstance(entry.get("details"), dict) and "scan_failure" in entry["details"]
+        ][-1]
+        self.assertEqual("invalid", invalid["failure_ignored_reason"])
+        self.assertEqual("unknown", invalid["failure_generation_source"])
+        self.assertIsNone(invalid["failure_generation"])
+        self.assertIsNone(invalid["run_matches_baseline"])
+        self.assertIsNone(invalid["failure_run_ref"])
+
+        # Separating the failure and newer progress into different drains must
+        # also leave the old failure token non-fresh.
+        separate = _ProgressiveScanAccumulator()
+        old_drain = separate.apply([stale_failure])
+        self.assertEqual({pair_id: ("local-session", 12)}, old_drain._scan_failure_tokens_by_pair)
+        self.controller._record_path_pair_scan_tokens(old_drain, None)
+        later_drain = separate.apply([progressed_same_pair])
+        self.assertFalse(later_drain.failed)
+        self.assertEqual({}, later_drain._scan_failure_tokens_by_pair)
+        self.controller._record_path_pair_scan_tokens(later_drain, None)
+        self.assertIsNone(intent.rescan_failure_reason)
 
     def test_final_local_scan_rejection_logs_bounded_proof_facts(self):
         trace = BreadcrumbTraceCollector(
@@ -18985,6 +19187,18 @@ class TestController(unittest.TestCase):
         self.assertIn(4, warning_args)
         self.assertNotIn("pair-final-reject", repr(warning_args))
         self.assertNotIn("selected", repr(warning_args))
+
+        # A fresh selected-root proof still permits the existing recoverable
+        # escape into ordinary collision preflight.
+        intent.rescan_failure_reason = "initial_local_scan_recoverable_failed"
+        self.controller._Controller__has_fresh_local_root_scan_proof = lambda *_args: True
+        self.controller._Controller__queue_scoped_rescan_ready = lambda _intent, _file, **kwargs: \
+            kwargs.get("allow_recoverable_local_root_proof") is True
+        self.controller._Controller__record_authority_handoff_breadcrumb = lambda *_args, **_kwargs: None
+        self.controller._Controller__prepare_deferred_queue_retries()
+        self.assertIs(command, self.controller._Controller__command_queue.get_nowait())
+        self.assertEqual("collision", intent.phase)
+        self.assertFalse(intent.rescan_requested)
 
     def test_process_commands_queue_defers_manual_directory_until_path_pair_reconciles(self):
         file = ModelFile("release", True)

@@ -809,6 +809,10 @@ def test_queue_readiness_scan_diagnostics_sanitize_exact_decimal_and_unknowns():
                 "side": "local", "kind": "failed", "scope": "targeted", "target_covered": True,
                 "terminal": False, "recoverable": True, "result_generation": wide,
                 "run_matches_baseline": True, "generation_vs_baseline": "newer",
+                "failure_generation_source": "pair", "failure_generation": wide,
+                "failure_generation_vs_baseline": "newer",
+                "failure_ignored_reason": "session_mismatch", "baseline_generation": str(int(wide) - 1),
+                "failure_run_ref": "012345abcdef",
                 "path": "/private/path", "session": "private-session",
             },
             "fresh_root_proof": {
@@ -824,6 +828,12 @@ def test_queue_readiness_scan_diagnostics_sanitize_exact_decimal_and_unknowns():
     })
     readiness = safe["queue_readiness"]
     assert readiness["scan_failure"]["result_generation"] == wide
+    assert readiness["scan_failure"]["failure_generation_source"] == "pair"
+    assert readiness["scan_failure"]["failure_generation"] == wide
+    assert readiness["scan_failure"]["failure_generation_vs_baseline"] == "newer"
+    assert readiness["scan_failure"]["failure_ignored_reason"] == "session_mismatch"
+    assert readiness["scan_failure"]["baseline_generation"] == str(int(wide) - 1)
+    assert readiness["scan_failure"]["failure_run_ref"] == "012345abcdef"
     assert readiness["fresh_root_proof"]["process_generation"] == wide
     assert readiness["fresh_root_proof"]["root_generation"] == wide
     assert "/private/path" not in json.dumps(safe) and "private-session" not in json.dumps(safe)
@@ -831,7 +841,11 @@ def test_queue_readiness_scan_diagnostics_sanitize_exact_decimal_and_unknowns():
     malformed = observer._sanitize_capture_projection({
         "queue_readiness": {
             "schema": "queue_readiness.v1", "event": "queue_rescan_readiness",
-            "scan_failure": {"side": "local", "terminal": 1, "result_generation": "01"},
+            "scan_failure": {"side": "local", "terminal": 1, "result_generation": "01",
+                             "failure_generation_source": "not-allowed",
+                             "failure_generation": True, "failure_generation_vs_baseline": "bad",
+                             "failure_ignored_reason": "private", "baseline_generation": True,
+                             "failure_run_ref": "/private/session"},
             "fresh_root_proof": {"result": "accepted", "root_shape_ok": "true",
                                  "root_generation": str(2**63)},
         },
@@ -839,6 +853,12 @@ def test_queue_readiness_scan_diagnostics_sanitize_exact_decimal_and_unknowns():
     assert malformed["scan_failure"]["side"] == "local"
     assert malformed["scan_failure"]["terminal"] is None
     assert malformed["scan_failure"]["result_generation"] is None
+    assert malformed["scan_failure"]["failure_generation_source"] == "unknown"
+    assert malformed["scan_failure"]["failure_generation"] is None
+    assert malformed["scan_failure"]["failure_generation_vs_baseline"] == "unknown"
+    assert malformed["scan_failure"]["failure_ignored_reason"] == "unknown"
+    assert malformed["scan_failure"]["baseline_generation"] is None
+    assert malformed["scan_failure"]["failure_run_ref"] is None
     assert malformed["fresh_root_proof"]["root_shape_ok"] is None
     assert malformed["fresh_root_proof"]["root_generation"] is None
 

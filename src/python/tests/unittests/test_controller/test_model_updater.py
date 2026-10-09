@@ -3559,6 +3559,30 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual({("pair", "recovered.bin")}, set(accumulator.snapshot()))
         self.assertEqual(set(), accumulator.incomplete_pairs())
 
+    def test_progressive_accumulator_failure_token_tracks_current_pair_generation_and_session(self):
+        accumulator = _ProgressiveScanAccumulator()
+        failed = accumulator.apply([ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=12,
+            is_progress=True, failed=True, unknown_path_pair_ids={"pair-a"},
+            recoverable_failure_path_pair_ids={"pair-a"}, session_token="session-one",
+        )])
+        self.assertEqual({"pair-a": ("session-one", 12)}, failed._scan_failure_tokens_by_pair)
+
+        progressed = accumulator.apply([ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=13,
+            is_progress=True, unknown_path_pair_ids={"pair-a"}, session_token="session-one",
+        )])
+        self.assertFalse(progressed.failed)
+        self.assertEqual({}, progressed._scan_failure_tokens_by_pair)
+
+        accumulator.set_session_token("session-two")
+        current_failure = accumulator.apply([ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, generation=1,
+            is_progress=True, failed=True, unknown_path_pair_ids={"pair-a"},
+            recoverable_failure_path_pair_ids={"pair-a"}, session_token="session-two",
+        )])
+        self.assertEqual({"pair-a": ("session-two", 1)}, current_failure._scan_failure_tokens_by_pair)
+
     @staticmethod
     def _local_full_snapshot(files, generation, pair_id="pair"):
         for file in files:

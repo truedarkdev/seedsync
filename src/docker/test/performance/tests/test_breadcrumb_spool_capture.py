@@ -1036,8 +1036,8 @@ def test_scan_failure_origin_facts_are_finite_and_preserve_unknown_root() -> Non
     })["scanner_process_event"]
     assert [safe_malformed[field] for field in (
         "failure_site", "failure_recoverable", "failure_errno", "failure_exception",
-        "failure_root_ref", "failure_pair_ref",
-    )] == [None] * 6
+        "failure_root_ref", "failure_pair_ref", "failure_run_ref",
+    )] == [None] * 7
 
     queue_details = {
         "schema": "queue_readiness.v1", "phase": "rescan_unknown", "outcome": "failed",
@@ -1046,6 +1046,9 @@ def test_scan_failure_origin_facts_are_finite_and_preserve_unknown_root() -> Non
             "side": "local", "kind": "failed", "scope": "targeted", "target_covered": True,
             "terminal": False, "recoverable": False, "result_generation": generation,
             "run_matches_baseline": True, "generation_vs_baseline": "newer",
+            "failure_generation_source": "pair", "failure_generation": generation - 1,
+            "failure_generation_vs_baseline": "equal",
+            "failure_ignored_reason": "equal", "baseline_generation": generation - 1,
             "failure_site": "scan_had_errors", "failure_recoverable": True,
             "failure_errno": 13, "failure_exception": "permission_error",
             "failure_root_ref": None, "failure_pair_ref": "0123456789abcdef",
@@ -1059,6 +1062,11 @@ def test_scan_failure_origin_facts_are_finite_and_preserve_unknown_root() -> Non
     assert scan_failure["kind"] == "failed" and scan_failure["side"] == "local"
     assert scan_failure["recoverable"] is False
     assert scan_failure["result_generation"] == str(generation)
+    assert scan_failure["failure_generation_source"] == "pair"
+    assert scan_failure["failure_generation"] == str(generation - 1)
+    assert scan_failure["failure_generation_vs_baseline"] == "equal"
+    assert scan_failure["failure_ignored_reason"] == "equal"
+    assert scan_failure["baseline_generation"] == str(generation - 1)
     assert scan_failure["failure_site"] == "scan_had_errors"
     assert scan_failure["failure_recoverable"] is True
     assert scan_failure["failure_errno"] == 13
@@ -1084,8 +1092,8 @@ def test_scan_failure_origin_facts_are_finite_and_preserve_unknown_root() -> Non
     })["queue_readiness"]["scan_failure"]
     assert [safe_malformed_queue[field] for field in (
         "failure_site", "failure_recoverable", "failure_errno", "failure_exception",
-        "failure_root_ref", "failure_pair_ref",
-    )] == [None] * 6
+        "failure_root_ref", "failure_pair_ref", "failure_run_ref",
+    )] == [None] * 7
 
     started, irrelevant = capture._projection({
         **row, "message": "scan_started", "details": {"scanner_side": "local", "generation": generation},
@@ -1319,6 +1327,9 @@ def test_queue_readiness_nested_scan_diagnostics_keep_exact_finite_values() -> N
             "side": "local", "kind": "failed", "scope": "targeted", "target_covered": True,
             "terminal": False, "recoverable": True, "result_generation": wide,
             "run_matches_baseline": True, "generation_vs_baseline": "newer",
+            "failure_generation_source": "pair", "failure_generation": wide - 2,
+            "failure_generation_vs_baseline": "older",
+            "failure_ignored_reason": "older", "baseline_generation": wide - 3,
             "session_token": "do-not-copy", "path": "/private/path",
         },
         "fresh_root_proof": {
@@ -1334,6 +1345,9 @@ def test_queue_readiness_nested_scan_diagnostics_keep_exact_finite_values() -> N
     facts = capture._queue_readiness_facts("queue_rescan_readiness", details)
     assert facts is not None
     assert facts["scan_failure"]["result_generation"] == str(wide)
+    assert facts["scan_failure"]["failure_generation"] == str(wide - 2)
+    assert facts["scan_failure"]["failure_ignored_reason"] == "older"
+    assert facts["scan_failure"]["baseline_generation"] == str(wide - 3)
     assert facts["fresh_root_proof"]["process_generation"] == str(wide)
     assert facts["fresh_root_proof"]["root_generation"] == str(wide)
     text = json.dumps(facts)
@@ -1341,6 +1355,9 @@ def test_queue_readiness_nested_scan_diagnostics_keep_exact_finite_values() -> N
 
     finalized_projection = observer._sanitize_capture_projection({"queue_readiness": facts})
     assert finalized_projection["queue_readiness"]["scan_failure"]["result_generation"] == str(wide)
+    assert finalized_projection["queue_readiness"]["scan_failure"]["failure_generation"] == str(wide - 2)
+    assert finalized_projection["queue_readiness"]["scan_failure"]["failure_ignored_reason"] == "older"
+    assert finalized_projection["queue_readiness"]["scan_failure"]["baseline_generation"] == str(wide - 3)
     assert finalized_projection["queue_readiness"]["fresh_root_proof"]["root_generation"] == str(wide)
 
     malformed = capture._queue_readiness_facts("queue_rescan_readiness", {
@@ -1355,8 +1372,12 @@ def test_queue_readiness_nested_scan_diagnostics_keep_exact_finite_values() -> N
         "side": "unknown", "kind": "unknown", "scope": "unknown", "target_covered": None,
         "terminal": None, "recoverable": None, "result_generation": None,
         "run_matches_baseline": None, "generation_vs_baseline": "unknown",
+        "failure_generation_source": "unknown", "failure_generation": None,
+        "failure_generation_vs_baseline": "unknown",
+        "failure_ignored_reason": "unknown", "baseline_generation": None,
         "failure_site": None, "failure_recoverable": None, "failure_errno": None,
         "failure_exception": None, "failure_root_ref": None, "failure_pair_ref": None,
+        "failure_run_ref": None,
     }
     assert malformed_final["queue_readiness"]["fresh_root_proof"]["result"] == "unknown"
     assert malformed_final["queue_readiness"]["fresh_root_proof"]["root_shape_ok"] is None
@@ -1430,15 +1451,32 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         )
         producer._Controller__deferred_queue_intents = {failed_file_id: failed_intent}
         producer._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
-        Controller._record_path_pair_scan_tokens(
-            producer,
-            ScannerResult(
-                datetime.now(), [], scanned_path_pair_ids={pair_id}, failed=True,
-                generation=1, session_token="private-local-session", is_targeted_scan=True,
-                recoverable_failure_path_pair_ids={pair_id}, terminal_failure_path_pair_ids=set(),
-            ),
-            None,
+        failed_result = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={pair_id}, failed=True,
+            generation=1, session_token="private-local-session", is_targeted_scan=True,
+            recoverable_failure_path_pair_ids={pair_id}, terminal_failure_path_pair_ids=set(),
         )
+        failed_result._scan_failure_tokens_by_pair = {pair_id: ("private-local-session", 1)}
+        Controller._record_path_pair_scan_tokens(producer, failed_result, None)
+
+        ignored_pair_id = "private-ignored-pair"
+        ignored_file_id = ModelFile.build_file_id("private-ignored-root", ignored_pair_id)
+        ignored_intent = DeferredQueueIntent(
+            Controller.Command(Controller.Command.Action.QUEUE, ignored_file_id),
+            ignored_file_id, ignored_pair_id, phase="initial_rescan", rescan_requested=True,
+            rescan_generations=(("private-ignored-session", 12), ("private-remote-session", 0)),
+        )
+        ignored_result = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={ignored_pair_id}, failed=True,
+            generation=13, session_token="private-ignored-session", is_targeted_scan=True,
+            unknown_path_pair_ids={ignored_pair_id}, recoverable_failure_path_pair_ids={ignored_pair_id},
+            terminal_failure_path_pair_ids=set(),
+        )
+        ignored_result._scan_failure_tokens_by_pair = {
+            ignored_pair_id: ("private-ignored-session", 11),
+        }
+        producer._Controller__deferred_queue_intents = {ignored_file_id: ignored_intent}
+        Controller._record_path_pair_scan_tokens(producer, ignored_result, None)
         proof_pair_id = "private-proof-pair"
         proof_file_id = ModelFile.build_file_id("private-proof-root", proof_pair_id)
         proof_file = ModelFile("private-proof-root", True)
@@ -1476,7 +1514,7 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         Controller._Controller__prepare_deferred_queue_retries(producer)
         assert collector.wait_for_ingress(2.0)
         assert collector.flush_durable(2.0)
-        assert reader.poll() == len(readiness_rows) + 2
+        assert reader.poll() == len(readiness_rows) + 3
     finally:
         reader.close()
         collector.close(timeout=2.0)
@@ -1491,14 +1529,27 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     assert readiness[2]["phase"] == "rescan_request" and readiness[2]["reason"] == "scoped_rescan_requested"
     assert readiness[3]["decision_boundary"] == "scan_authority"
     assert readiness[3]["local_reconciled"] is False and readiness[3]["publication_id"] == 7
-    scan_failure = readiness[-2]["scan_failure"]
+    scan_failure = readiness[-3]["scan_failure"]
     assert scan_failure == {
         "side": "local", "kind": "failed", "scope": "targeted", "target_covered": True,
         "terminal": False, "recoverable": True, "result_generation": "1",
         "run_matches_baseline": True, "generation_vs_baseline": "newer",
+        "failure_generation_source": "pair", "failure_generation": "1",
+        "failure_generation_vs_baseline": "newer",
+        "failure_ignored_reason": "unknown", "baseline_generation": None,
         "failure_site": None, "failure_recoverable": None, "failure_errno": None,
         "failure_exception": None, "failure_root_ref": None, "failure_pair_ref": None,
+        "failure_run_ref": trace_session_digest("private-local-session"),
     }
+    ignored_failure = readiness[-2]["scan_failure"]
+    assert ignored_failure["kind"] == "unknown"
+    assert ignored_failure["failure_generation_source"] == "pair"
+    assert ignored_failure["failure_generation"] == "11"
+    assert ignored_failure["failure_generation_vs_baseline"] == "older"
+    assert ignored_failure["failure_ignored_reason"] == "older"
+    assert ignored_failure["baseline_generation"] == "12"
+    assert ignored_failure["result_generation"] == "13"
+    assert ignored_failure["failure_run_ref"] == trace_session_digest("private-ignored-session")
     fresh_root_proof = readiness[-1]["fresh_root_proof"]
     assert fresh_root_proof["result"] == "rejected"
     assert fresh_root_proof["reason"] == "builder_proof_mismatch"
@@ -1508,11 +1559,14 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     persisted = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
     finalized = [row for row in persisted if row.get("message") in
                  ({event for event, _ in readiness_rows} | {"queue_rescan_readiness"})]
-    assert len(finalized) == len(readiness_rows) + 2
+    assert len(finalized) == len(readiness_rows) + 3
     assert all("metadata" not in row and isinstance(row.get("details"), dict) for row in finalized)
     assert "private-scan-pair" not in artifact_text
     assert "private-scan-root" not in artifact_text
     assert "private-local-session" not in artifact_text
+    assert "private-ignored-pair" not in artifact_text
+    assert "private-ignored-root" not in artifact_text
+    assert "private-ignored-session" not in artifact_text
     assert "private-proof-session" not in artifact_text
     assert "private-proof-root" not in artifact_text
 

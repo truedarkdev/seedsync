@@ -3714,13 +3714,20 @@ class Controller:
                 "initial_local_scan_recoverable_unknown",
             }
 
-            def record_failure(intent: DeferredQueueIntent, reason: str, outcome: str) -> None:
-                previous = intent.rescan_failure_reason
-                if previous is not None and (
-                        previous not in recoverable_local_reasons or reason in recoverable_local_reasons
-                ):
-                    return
-                intent.rescan_failure_reason = reason
+            def record_failure(
+                    intent: DeferredQueueIntent, reason: str, outcome: str,
+                    failure_token: Optional[tuple[object, object]] = None,
+                    failure_generation_source: str = "unknown",
+                    ignored_reason: Optional[str] = None,
+                    baseline_generation_for_diagnostics: Optional[int] = None,
+            ) -> None:
+                if ignored_reason is None:
+                    previous = intent.rescan_failure_reason
+                    if previous is not None and (
+                            previous not in recoverable_local_reasons or reason in recoverable_local_reasons
+                    ):
+                        return
+                    intent.rescan_failure_reason = reason
                 readiness_diagnostics_enabled = False
                 try:
                     readiness_diagnostics_enabled = self.queue_http_wait_trace_enabled()
@@ -3734,8 +3741,9 @@ class Controller:
                     "schema": "queue_readiness.v1",
                     "phase": "rescan_unknown",
                     "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
-                    "outcome": outcome,
-                    "reason": self.__external_initial_rescan_failure_reason(reason),
+                    "outcome": "unknown" if ignored_reason is not None else outcome,
+                    "reason": "initial_{}_scan_unknown".format(side) if ignored_reason is not None else
+                    self.__external_initial_rescan_failure_reason(reason),
                     "ready": False,
                 }
                 try:
@@ -3771,6 +3779,37 @@ class Controller:
                                 "equal" if result_generation == baseline_generation else "older"
                             )
 
+                        failure_session = failure_token[0] if isinstance(failure_token, tuple) and \
+                            len(failure_token) == 2 else None
+                        failure_generation = failure_token[1] if isinstance(failure_token, tuple) and \
+                            len(failure_token) == 2 else None
+                        failure_run_session = (
+                            failure_session if type(failure_session) is str and failure_session else None
+                        )
+                        if failure_run_session is None and ignored_reason is None and failure_token is None:
+                            failure_run_session = result_session if type(result_session) is str and result_session else None
+                        failure_run_ref = trace_session_digest(failure_run_session) \
+                            if failure_run_session is not None else None
+                        failure_run_matches = (
+                            failure_session == baseline_session
+                            if type(failure_session) is str and failure_session and
+                            type(baseline_session) is str and baseline_session else None
+                        )
+                        failure_generation_relation = "unknown"
+                        if failure_run_matches is True and type(failure_generation) is int and \
+                                0 <= failure_generation <= 2**63 - 1 and \
+                                type(baseline_generation) is int and 0 <= baseline_generation <= 2**63 - 1:
+                            failure_generation_relation = (
+                                "newer" if failure_generation > baseline_generation else
+                                "equal" if failure_generation == baseline_generation else "older"
+                            )
+                        if ignored_reason in ("missing", "invalid"):
+                            # The aggregate session may not own this exact
+                            # failed pair, so leave the failure/run join unknown.
+                            run_matches = None
+                            generation_relation = "unknown"
+                            failure_run_ref = None
+
                         def membership(values: object) -> Optional[bool]:
                             if not isinstance(values, (set, frozenset, list, tuple)):
                                 return None
@@ -3782,7 +3821,7 @@ class Controller:
                         targeted = getattr(result, "is_targeted_scan", None)
                         scan_failure: dict[str, object] = {
                             "side": side if side in ("local", "remote") else "unknown",
-                            "kind": failure_kind,
+                            "kind": "unknown" if ignored_reason is not None else failure_kind,
                             "scope": "targeted" if targeted is True else
                             "non_targeted" if targeted is False else "unknown",
                             "target_covered": True,
@@ -3792,20 +3831,48 @@ class Controller:
                             0 <= result_generation <= 2**63 - 1 else None,
                             "run_matches_baseline": run_matches,
                             "generation_vs_baseline": generation_relation,
+                            "failure_generation_source": (
+                                failure_generation_source if failure_generation_source in
+                                ("pair", "aggregate_compatibility", "unknown") else "unknown"
+                            ),
+                            "failure_generation": failure_generation if type(failure_generation) is int and
+                            0 <= failure_generation <= 2**63 - 1 else None,
+                            "failure_generation_vs_baseline": failure_generation_relation,
+                            "failure_run_ref": failure_run_ref,
                         }
+                        if ignored_reason is not None:
+                            scan_failure["failure_ignored_reason"] = ignored_reason
+                            scan_failure["baseline_generation"] = baseline_generation if \
+                                type(baseline_generation) is int and 0 <= baseline_generation <= 2**63 - 1 else None
                         scan_failure.update(failure_origin)
                         details["scan_failure"] = scan_failure
                 except Exception:
                     # Optional facts must not alter failure classification or notification.
                     pass
-                if failure_origin:
+                if failure_origin and ignored_reason is None:
                     try:
+                        warning_correlation = scan_correlation
+                        warning_generation: object = result_generation
+                        if failure_generation_source == "pair":
+                            failure_session = failure_token[0] if isinstance(failure_token, tuple) and \
+                                len(failure_token) == 2 else None
+                            failure_generation = failure_token[1] if isinstance(failure_token, tuple) and \
+                                len(failure_token) == 2 else None
+                            if type(failure_session) is str and failure_session and \
+                                    type(failure_generation) is int and 0 <= failure_generation <= 2**63 - 1:
+                                warning_correlation = "local:{}:{}".format(
+                                    trace_session_digest(failure_session), failure_generation,
+                                )
+                                warning_generation = failure_generation
+                            else:
+                                warning_correlation = "unknown"
+                                warning_generation = "unknown"
                         self.logger.warning(
                             "Deferred Queue selected scan failure corr=%s generation=%s site=%s "
                             "recoverable=%s errno=%s class=%s pair=%s root=%s",
-                            scan_correlation,
-                            result_generation if type(result_generation) is int and
-                            0 <= result_generation <= 2**63 - 1 else "unknown",
+                            warning_correlation,
+                            warning_generation if type(warning_generation) is int and
+                            0 <= warning_generation <= 2**63 - 1 else "unknown",
                             failure_origin["failure_site"],
                             failure_origin["failure_recoverable"],
                             failure_origin["failure_errno"],
@@ -3817,6 +3884,28 @@ class Controller:
                         # The selected-scan failure mirror is diagnostic-only.
                         pass
                 self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", details)
+
+            def record_ignored_failure_token(
+                    intent: DeferredQueueIntent, baseline: tuple[object, object],
+                    failure_token: Optional[tuple[object, object]],
+                    failure_generation_source: str, ignored_reason: str,
+            ) -> None:
+                """Record why an aggregate failure token did not qualify this intent."""
+                try:
+                    if not self.queue_http_wait_trace_enabled():
+                        return
+                    record_failure(
+                        intent,
+                        "initial_{}_scan_unknown".format(side),
+                        "unknown",
+                        failure_token,
+                        failure_generation_source,
+                        ignored_reason,
+                        baseline[1] if type(baseline[1]) is int else None,
+                    )
+                except Exception:
+                    # Optional rejection facts never change Queue classification.
+                    pass
 
             def mark_initial_rescan_failure(
                     affected_pair_ids: set[object], reason: str,
@@ -3887,6 +3976,18 @@ class Controller:
                     failure_reason = "initial_{}_scan_failed".format(side)
                     recoverable_ids = getattr(result, "recoverable_failure_path_pair_ids", None)
                     terminal_ids = getattr(result, "terminal_failure_path_pair_ids", None)
+                    try:
+                        result_attributes = vars(result)
+                        has_failure_tokens = "_scan_failure_tokens_by_pair" in result_attributes
+                        failure_tokens = result_attributes.get("_scan_failure_tokens_by_pair")
+                    except TypeError:
+                        has_failure_tokens = False
+                        failure_tokens = None
+                    except Exception:
+                        # An unreadable optional authority map cannot safely
+                        # fall back to the aggregate compatibility token.
+                        has_failure_tokens = True
+                        failure_tokens = None
                     for intent in self.__deferred_queue_intents_map().values():
                         if intent.phase != "initial_rescan":
                             continue
@@ -3904,10 +4005,60 @@ class Controller:
                                 len(generations[side_index]) != 2:
                             continue
                         baseline = generations[side_index]
-                        if type(baseline[0]) is not str or type(baseline[1]) is not int or \
-                                type(result_session) is not str or result_session != baseline[0] or \
-                                type(result_generation) is not int or result_generation <= baseline[1]:
+                        if type(baseline[0]) is not str or type(baseline[1]) is not int:
                             continue
+                        if has_failure_tokens:
+                            failure_generation_source = "pair" if isinstance(failure_tokens, dict) else "unknown"
+                            if not isinstance(failure_tokens, dict):
+                                failure_token = None
+                                ignored_reason = "invalid"
+                            elif intent.path_pair_id not in failure_tokens:
+                                # An accumulator-produced map is authoritative even
+                                # when it has no entry for this pair. Never replace
+                                # missing exact failure evidence with the drain's
+                                # maximum display generation.
+                                failure_token = None
+                                ignored_reason = "missing"
+                            else:
+                                failure_token = failure_tokens[intent.path_pair_id]
+                                if not isinstance(failure_token, tuple) or len(failure_token) != 2 or \
+                                        type(failure_token[1]) is not int or not \
+                                        0 <= failure_token[1] <= 2**63 - 1:
+                                    ignored_reason = "invalid"
+                                elif type(failure_token[0]) is not str or not failure_token[0]:
+                                    ignored_reason = "invalid"
+                                elif failure_token[0] != baseline[0]:
+                                    ignored_reason = "session_mismatch"
+                                elif failure_token[1] < baseline[1]:
+                                    ignored_reason = "older"
+                                elif failure_token[1] == baseline[1]:
+                                    ignored_reason = "equal"
+                                else:
+                                    ignored_reason = None
+                        else:
+                            # Raw/legacy ScannerResult producers predate the
+                            # per-pair accumulator metadata; keep their existing
+                            # aggregate freshness behavior for compatibility.
+                            failure_session, failure_generation = result_session, result_generation
+                            failure_generation_source = "aggregate_compatibility"
+                            failure_token = (failure_session, failure_generation)
+                            if type(failure_session) is not str or not failure_session or \
+                                    type(failure_generation) is not int:
+                                ignored_reason = "invalid"
+                            elif failure_session != baseline[0]:
+                                ignored_reason = "session_mismatch"
+                            elif failure_generation < baseline[1]:
+                                ignored_reason = "older"
+                            elif failure_generation == baseline[1]:
+                                ignored_reason = "equal"
+                            else:
+                                ignored_reason = None
+                        if ignored_reason is not None:
+                            record_ignored_failure_token(
+                                intent, baseline, failure_token, failure_generation_source, ignored_reason,
+                            )
+                            continue
+                        failure_session, failure_generation = failure_token
                         intent_failure_reason = failure_reason
                         if side == "local":
                             terminal = isinstance(terminal_ids, (set, frozenset, list, tuple)) and \
@@ -3915,7 +4066,10 @@ class Controller:
                             if not terminal and isinstance(recoverable_ids, (set, frozenset, list, tuple)) and \
                                     intent.path_pair_id in recoverable_ids:
                                 intent_failure_reason = "initial_local_scan_recoverable_failed"
-                        record_failure(intent, intent_failure_reason, "failed")
+                        record_failure(
+                            intent, intent_failure_reason, "failed",
+                            (failure_session, failure_generation), failure_generation_source,
+                        )
                 return
             result_unknown_ids = getattr(result, "unknown_path_pair_ids", set())
             unknown_pair_ids = result_unknown_ids if isinstance(result_unknown_ids, (set, frozenset, list, tuple)) \

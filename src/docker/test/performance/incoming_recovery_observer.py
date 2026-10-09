@@ -602,6 +602,8 @@ _CAPTURE_SCAN_FAILURE_SIDES = {"local", "remote", "unknown"}
 _CAPTURE_SCAN_FAILURE_KINDS = {"failed", "unknown"}
 _CAPTURE_SCAN_FAILURE_SCOPES = {"targeted", "non_targeted", "unknown"}
 _CAPTURE_SCAN_GENERATION_RELATIONS = {"newer", "equal", "older", "unknown"}
+_CAPTURE_FAILURE_GENERATION_SOURCES = {"pair", "aggregate_compatibility", "unknown"}
+_CAPTURE_FAILURE_IGNORED_REASONS = {"missing", "invalid", "older", "equal", "session_mismatch"}
 _CAPTURE_FRESH_ROOT_RESULTS = {"accepted", "rejected", "unknown"}
 _CAPTURE_FRESH_ROOT_REASONS = {
     "accepted", "root_shape", "remote_not_ready", "builder_reader_unavailable",
@@ -617,9 +619,12 @@ _CAPTURE_NESTED_DIAGNOSTIC_FIELDS = {
     "scan_failure": (
         {"side": _CAPTURE_SCAN_FAILURE_SIDES, "kind": _CAPTURE_SCAN_FAILURE_KINDS,
          "scope": _CAPTURE_SCAN_FAILURE_SCOPES,
-         "generation_vs_baseline": _CAPTURE_SCAN_GENERATION_RELATIONS},
+         "generation_vs_baseline": _CAPTURE_SCAN_GENERATION_RELATIONS,
+         "failure_generation_source": _CAPTURE_FAILURE_GENERATION_SOURCES,
+         "failure_generation_vs_baseline": _CAPTURE_SCAN_GENERATION_RELATIONS,
+         "failure_ignored_reason": _CAPTURE_FAILURE_IGNORED_REASONS},
         ("target_covered", "terminal", "recoverable", "run_matches_baseline"),
-        ("result_generation",),
+        ("result_generation", "failure_generation", "baseline_generation"),
     ),
     "fresh_root_proof": (
         {"result": _CAPTURE_FRESH_ROOT_RESULTS, "reason": _CAPTURE_FRESH_ROOT_REASONS,
@@ -1035,6 +1040,11 @@ def _sanitize_scan_failure_origin(value: Mapping[str, object]) -> dict[str, obje
             reference if reference is None or isinstance(reference, str)
             and _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(reference) else None
         )
+    run_ref = value.get("failure_run_ref")
+    result["failure_run_ref"] = (
+        run_ref if run_ref is None or isinstance(run_ref, str) and _CAPTURE_SCAN_SESSION_DIGEST.fullmatch(run_ref)
+        else None
+    )
     return result
 
 
