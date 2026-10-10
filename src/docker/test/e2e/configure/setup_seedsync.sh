@@ -41,6 +41,49 @@ wait_for_app_ready() {
   fi
 }
 
+wait_for_app_restart() {
+  local end=$((SECONDS+STARTUP_TIMEOUT))
+  local shutdown_seen='False'
+  local curl_exit remaining request_timeout
+  echo "E2E Configure restart phase=waiting-for-shutdown seconds=${SECONDS}"
+  while [ ${SECONDS} -lt ${end} ]; do
+    remaining=$((end-SECONDS))
+    request_timeout=${CONFIGURE_CURL_TIMEOUT}
+    if [ "${remaining}" -lt "${request_timeout}" ]; then
+      request_timeout=${remaining}
+    fi
+    if curl --fail --silent --show-error --max-time "${request_timeout}" \
+      --header "@${AUTHORIZATION_HEADER_FILE}" \
+      "${base_url}/server/status" >/dev/null 2>&1; then
+      curl_exit=0
+    else
+      curl_exit=$?
+    fi
+    case "${curl_exit}" in
+      0)
+        if [[ "${shutdown_seen}" == 'True' ]]; then
+          echo "E2E Configure restart phase=available-after-shutdown seconds=${SECONDS}"
+          return
+        fi
+        ;;
+      7|52|56)
+        if [[ "${shutdown_seen}" == 'False' ]]; then
+          shutdown_seen='True'
+          echo "E2E Configure restart phase=shutdown-observed curl_exit=${curl_exit} seconds=${SECONDS}"
+        fi
+        ;;
+      28) ;; # A slow response alone does not establish shutdown.
+      *)
+        echo "E2E Configure restart phase=probe-failed curl_exit=${curl_exit} seconds=${SECONDS}"
+        exit 1
+        ;;
+    esac
+    sleep 0.1
+  done
+  echo "E2E Configure restart phase=timeout shutdown_seen=${shutdown_seen} seconds=${SECONDS}"
+  exit 1
+}
+
 call_api() {
   local url="$1"
   local method="${2:-GET}"
@@ -178,7 +221,7 @@ chmod 700 "${api_key_dir}"
 chmod 600 "${settings_path}"
 call_api "${base_url}/server/command/restart" POST
 
-wait_for_app_ready "Seedsync app is up (after configuring)"
+wait_for_app_restart
 
 echo
 echo "Done configuring SeedSync app"

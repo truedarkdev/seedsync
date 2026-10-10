@@ -47,7 +47,7 @@ export class DashboardPage extends App {
     private async isActionContainerVisible(row): Promise<boolean> {
         const actions = row.element(by.css(".actions"));
         try {
-            return await actions.isPresent();
+            return await actions.isDisplayed();
         } catch {
             return false;
         }

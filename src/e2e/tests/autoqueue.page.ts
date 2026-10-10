@@ -8,6 +8,25 @@ import {loadAngularRoute} from "./route-bootstrap";
 type WebdriverPromise<T> = webdriverPromise.Promise<T>;
 
 export class AutoQueuePage extends App {
+    private getAutoQueueSectionToggle() {
+        return element(by.css("#heading-autoqueue button"));
+    }
+
+    private getAutoQueueSection() {
+        return element(by.css("#collapse-autoqueue"));
+    }
+
+    private async isAutoQueueSectionDisplayed(): Promise<boolean> {
+        try {
+            return await this.getAutoQueueSection().isDisplayed();
+        } catch (error) {
+            if (this.isTransientDomReadError(error)) {
+                return false;
+            }
+            throw error;
+        }
+    }
+
     private getPatternInput() {
         return element(by.css("#add-pattern input"));
     }
@@ -17,8 +36,37 @@ export class AutoQueuePage extends App {
     }
 
     private async waitForPatternInputReady(): Promise<void> {
-        const input = this.getPatternInput();
-        await browser.wait(ExpectedConditions.elementToBeClickable(input), 10000);
+        await browser.wait(async () => {
+            try {
+                const input = this.getPatternInput();
+                return await input.isDisplayed() && await input.isEnabled();
+            } catch (error) {
+                if (this.isTransientDomReadError(error)) {
+                    return false;
+                }
+                throw error;
+            }
+        }, 10000);
+        await browser.wait(ExpectedConditions.elementToBeClickable(this.getPatternInput()), 10000);
+    }
+
+    private async openAutoQueueSettings(): Promise<void> {
+        await browser.wait(ExpectedConditions.elementToBeClickable(this.getAutoQueueSectionToggle()), 10000);
+
+        if (!await this.isAutoQueueSectionDisplayed()) {
+            try {
+                await this.getAutoQueueSectionToggle().click();
+            } catch (error) {
+                if (!this.isTransientDomReadError(error)) {
+                    throw error;
+                }
+                if (!await this.isAutoQueueSectionDisplayed()) {
+                    await this.getAutoQueueSectionToggle().click();
+                }
+            }
+        }
+
+        await browser.wait(() => this.isAutoQueueSectionDisplayed(), 10000);
     }
 
     private async waitForPatternActionReady(button): Promise<void> {
@@ -26,14 +74,19 @@ export class AutoQueuePage extends App {
             try {
                 return await button.isDisplayed() &&
                     (await button.getAttribute("aria-disabled")) !== "true";
-            } catch {
-                return false;
+            } catch (error) {
+                if (this.isTransientDomReadError(error)) {
+                    return false;
+                }
+                throw error;
             }
         }, 10000);
     }
 
     async navigateTo(): Promise<void> {
-        await loadAngularRoute(() => browser.get(Urls.APP_BASE_URL + "autoqueue"), "#add-pattern input");
+        await loadAngularRoute(() => browser.get(Urls.APP_BASE_URL + "autoqueue"), "#heading-autoqueue button");
+        await this.getTopTitle("Settings");
+        await this.openAutoQueueSettings();
         await this.waitForPatternInputReady();
     }
 

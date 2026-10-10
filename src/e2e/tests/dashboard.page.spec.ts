@@ -14,15 +14,15 @@ describe('Testing dashboard page', () => {
 
     it('should have a list of files', async () => {
         let golden = [
-                new File("clients.jpg", '', "0 B of 36.5 KB"),
-                new File("documentation.png", '', "0 B of 8.88 KB"),
-                new File("illusion.jpg", '', "0 B of 81.5 KB"),
-                new File("testing.gif", '', "0 B of 8.95 MB"),
-                new File("áßç déÀ.mp4", '', "0 B of 840 KB"),
-                new File("crispycat", '', "0 B of 1.53 MB"),
-                new File("goose", '', "0 B of 2.78 MB"),
-                new File("joke", '', "0 B of 168 KB"),
-                new File("üæÒ", '', "0 B of 70.8 KB"),
+                new File("áßç déÀ.mp4", 'Remote Only', "0 B of 840 KB"),
+                new File("clients.jpg", 'Remote Only', "0 B of 36.5 KB"),
+                new File("crispycat", 'Remote Only', "0 B of 1.53 MB"),
+                new File("documentation.png", 'Remote Only', "0 B of 8.88 KB"),
+                new File("goose", 'Remote Only', "0 B of 2.78 MB"),
+                new File("illusion.jpg", 'Remote Only', "0 B of 81.5 KB"),
+                new File("joke", 'Remote Only', "0 B of 168 KB"),
+                new File("testing.gif", 'Remote Only', "0 B of 8.95 MB"),
+                new File("üæÒ", 'Remote Only', "0 B of 70.8 KB"),
             ];
         expect(await page.getFiles()).toEqual(golden);
     });
@@ -84,7 +84,7 @@ describe('Testing dashboard page', () => {
     });
 
     it('should have Queue action enabled for Default state', async () => {
-        const defaultStateIndex = await page.findFileIndexByStatus("");
+        const defaultStateIndex = await page.findFileIndexByStatus("Remote Only");
         if (defaultStateIndex < 0) {
             pending("No default-state dashboard row is available in the current dashboard fixture");
             return;
@@ -101,7 +101,7 @@ describe('Testing dashboard page', () => {
     });
 
     it('should have Stop action disabled for Default state', async () => {
-        const defaultStateIndex = await page.findFileIndexByStatus("");
+        const defaultStateIndex = await page.findFileIndexByStatus("Remote Only");
         if (defaultStateIndex < 0) {
             pending("No default-state dashboard row is available in the current dashboard fixture");
             return;
