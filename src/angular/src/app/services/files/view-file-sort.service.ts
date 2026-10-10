@@ -294,7 +294,6 @@ const compareStatusLegacy = (a: ViewFile, b: ViewFile): number => {
         // then attention states, next actions, finished work, and archive.
         const statusPriorities = {
             [ViewFile.Status.MOVE_FAILED]: -1,
-            [ViewFile.Status.MOVE_SUCCEEDED]: 7,
             [ViewFile.Status.CORRUPT]: 0,
             [ViewFile.Status.EXTRACTING]: 1,
             [ViewFile.Status.VALIDATING]: 2,
@@ -330,7 +329,6 @@ const compareStatusImproved = (a: ViewFile, b: ViewFile): number => {
             [ViewFile.Status.STOPPED]: 6,
             [ViewFile.Status.QUEUED]: 7,
             [ViewFile.Status.DEFAULT]: 8,
-            [ViewFile.Status.MOVE_SUCCEEDED]: 9,
             [ViewFile.Status.EXTRACTED]: 9,
             [ViewFile.Status.VALIDATED]: 9,
             [ViewFile.Status.DOWNLOADED]: 9,

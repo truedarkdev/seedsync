@@ -239,7 +239,7 @@ describe("Testing view file sort service", () => {
         // Available/default rows precede finished rows.
         expect(sortComparator(
             new ViewFile({
-                status: ViewFile.Status.MOVE_SUCCEEDED,
+                status: ViewFile.Status.DOWNLOADED,
                 name: "known",
                 downloadedTimestamp: new Date(1000)
             }),
@@ -572,7 +572,7 @@ describe("Testing view file sort service", () => {
         const corrupt = new ViewFile({name: "corrupt", status: ViewFile.Status.CORRUPT});
         const downloadedA = new ViewFile({name: "a", status: ViewFile.Status.DOWNLOADED, downloadedTimestamp: new Date(1000)});
         const downloadedB = new ViewFile({name: "b", status: ViewFile.Status.DOWNLOADED, downloadedTimestamp: new Date(2000)});
-        const moved = new ViewFile({name: "moved", status: ViewFile.Status.MOVE_SUCCEEDED, downloadedTimestamp: new Date(3000)});
+        const downloadedC = new ViewFile({name: "downloaded-c", status: ViewFile.Status.DOWNLOADED, downloadedTimestamp: new Date(3000)});
         const visiblyLocal = new ViewFile({
             name: "local",
             status: ViewFile.Status.MOVE_FAILED,
@@ -583,9 +583,9 @@ describe("Testing view file sort service", () => {
         expect(sortComparator(downloadedA, corrupt)).toBeGreaterThan(0);
         expect(sortComparator(corrupt, failed)).toBeGreaterThan(0);
         expect(sortComparator(failed, visiblyLocal)).toBeLessThan(0);
-        expect(sortComparator(visiblyLocal, moved)).toBeGreaterThan(0);
+        expect(sortComparator(visiblyLocal, downloadedC)).toBeGreaterThan(0);
         expect(sortComparator(downloadedB, downloadedA)).toBeLessThan(0);
-        expect(sortComparator(moved, downloadedB)).toBeLessThan(0);
+        expect(sortComparator(downloadedC, downloadedB)).toBeLessThan(0);
     }));
 
     it("sorts Smart Status into the approved groups and keeps Downloaded Newest global", fakeAsync(() => {
@@ -598,7 +598,7 @@ describe("Testing view file sort service", () => {
             new ViewFile({name: "deleted", status: ViewFile.Status.DELETED, downloadedTimestamp: new Date(8000)}),
             new ViewFile({name: "local-only", status: ViewFile.Status.DEFAULT, isLocalOnly: true, downloadedTimestamp: new Date(9000)}),
             new ViewFile({name: "default", status: ViewFile.Status.DEFAULT, downloadedTimestamp: new Date(0)}),
-            new ViewFile({name: "moved-missing-b", status: ViewFile.Status.MOVE_SUCCEEDED}),
+            new ViewFile({name: "downloaded-missing-b", status: ViewFile.Status.DOWNLOADED}),
             new ViewFile({name: "downloaded-new", status: ViewFile.Status.DOWNLOADED, downloadedTimestamp: new Date(3000)}),
             new ViewFile({name: "validated-equal-z", status: ViewFile.Status.VALIDATED, downloadedTimestamp: new Date(2000)}),
             new ViewFile({name: "extracted-equal-a", status: ViewFile.Status.EXTRACTED, downloadedTimestamp: new Date(2000)}),
@@ -611,7 +611,7 @@ describe("Testing view file sort service", () => {
             new ViewFile({name: "queued", status: ViewFile.Status.QUEUED, downloadedTimestamp: new Date(1000)}),
             new ViewFile({name: "stopped", status: ViewFile.Status.STOPPED, downloadedTimestamp: new Date(1000)}),
             new ViewFile({name: "downloaded-missing-a", status: ViewFile.Status.DOWNLOADED}),
-            new ViewFile({name: "moved-missing-a", status: ViewFile.Status.MOVE_SUCCEEDED}),
+            new ViewFile({name: "downloaded-missing-c", status: ViewFile.Status.DOWNLOADED}),
         ];
 
         expect(files.sort(sortComparator).map(file => file.name)).toEqual([
@@ -628,8 +628,8 @@ describe("Testing view file sort service", () => {
             "extracted-equal-a",
             "validated-equal-z",
             "downloaded-missing-a",
-            "moved-missing-a",
-            "moved-missing-b",
+            "downloaded-missing-b",
+            "downloaded-missing-c",
             "local-only",
             "deleted",
         ]);

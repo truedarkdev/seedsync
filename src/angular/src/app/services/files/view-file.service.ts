@@ -605,16 +605,8 @@ export class ViewFileService {
             }
         }
 
-        // Final-move success is a presentation refinement of ordinary
-        // downloaded state. More-specific terminal states keep precedence.
-        if (status === ViewFile.Status.DOWNLOADED
-            && modelFile.state === ModelFile.State.DOWNLOADED
-            && modelFile.final_move_succeeded === true) {
-            status = ViewFile.Status.MOVE_SUCCEEDED;
-        }
         if (modelFile.explicitly_stopped === true
-            && [ModelFile.State.DEFAULT, ModelFile.State.DOWNLOADED].includes(modelFile.state)
-            && modelFile.final_move_succeeded !== true) {
+            && [ModelFile.State.DEFAULT, ModelFile.State.DOWNLOADED].includes(modelFile.state)) {
             status = ViewFile.Status.STOPPED;
         }
         if (modelFile.final_move_pending === true
@@ -637,14 +629,12 @@ export class ViewFileService {
         const isExtractable: boolean = [ViewFile.Status.DEFAULT,
                                     ViewFile.Status.STOPPED,
                                     ViewFile.Status.DOWNLOADED,
-                                    ViewFile.Status.MOVE_SUCCEEDED,
                                     ViewFile.Status.EXTRACTED,
                                     ViewFile.Status.VALIDATED].includes(status)
                                     && localPresent;
         const isLocallyDeletable: boolean = [ViewFile.Status.DEFAULT,
                                     ViewFile.Status.STOPPED,
                                     ViewFile.Status.DOWNLOADED,
-                                    ViewFile.Status.MOVE_SUCCEEDED,
                                     ViewFile.Status.EXTRACTED,
                                     ViewFile.Status.VALIDATED,
                                     ViewFile.Status.CORRUPT,
@@ -653,14 +643,12 @@ export class ViewFileService {
         const isRemotelyDeletable: boolean = [ViewFile.Status.DEFAULT,
                                     ViewFile.Status.STOPPED,
                                     ViewFile.Status.DOWNLOADED,
-                                    ViewFile.Status.MOVE_SUCCEEDED,
                                     ViewFile.Status.EXTRACTED,
                                     ViewFile.Status.DELETED,
                                     ViewFile.Status.VALIDATED,
                                     ViewFile.Status.CORRUPT].includes(status)
                                     && remotePresent;
         const isValidatable: boolean = [ViewFile.Status.DOWNLOADED,
-                                    ViewFile.Status.MOVE_SUCCEEDED,
                                     ViewFile.Status.EXTRACTED,
                                     ViewFile.Status.VALIDATED,
                                     ViewFile.Status.CORRUPT].includes(status)

@@ -285,26 +285,27 @@ describe("Testing file component", () => {
             .toBe("assets/icons/move-failed.png");
     });
 
-    it("should render approved final move status icons", () => {
-        fixture.componentInstance.file = createViewFile({status: ViewFile.Status.MOVE_SUCCEEDED});
+    it("should render the moving status icon and label", async () => {
+        fixture.componentInstance.file = createViewFile({status: ViewFile.Status.MOVING});
         fixture.componentInstance.options = of(null) as any;
         fixture.detectChanges();
-        expect(fixture.debugElement.query(By.css("img#move-succeeded")).attributes["src"])
-            .toBe("assets/icons/move-succeeded.png");
+
         const status = fixture.debugElement.query(By.css(".status"));
-        expect(status.nativeElement.textContent).toContain("Moved to destination");
-        expect(status.nativeElement.textContent).not.toContain("Move succeeded");
-        const style = getComputedStyle(
-            fixture.debugElement.query(By.css("img#move-succeeded")).nativeElement
-        );
+        const icon = status.query(By.css("img#moving-files")).nativeElement as HTMLImageElement;
+        expect(icon.getAttribute("src")).toBe("assets/icons/moving-files.png");
+        const assetResponse = await fetch(icon.src);
+        expect(assetResponse.ok).toBeTrue();
+        expect(assetResponse.headers.get("content-type")).toContain("image/png");
+        const style = getComputedStyle(icon);
         expect(style.width).toBe("72px");
         expect(style.height).toBe("72px");
         expect(style.flexShrink).toBe("0");
-        expect(
-            fixture.debugElement.query(By.css("img#move-succeeded")).nativeElement.getBoundingClientRect().width
-        ).toBe(72);
+        expect(icon.getBoundingClientRect().width).toBe(72);
         expect(style.marginTop).toBe("-16px");
         expect(style.marginBottom).toBe("-12px");
+        expect(status.queryAll(By.css(".text")).map(text => text.nativeElement.textContent.trim()))
+            .toEqual(["Moving files"]);
+        expect(status.query(By.css("img#move-succeeded"))).toBeNull();
     });
 
     it("should preserve the final move failure label and icon", () => {
@@ -355,7 +356,7 @@ describe("Testing file component", () => {
     it("should replace historical local-only status icons and text with Local Only", () => {
         [
             ViewFile.Status.MOVE_FAILED,
-            ViewFile.Status.MOVE_SUCCEEDED,
+            ViewFile.Status.MOVING,
             ViewFile.Status.DELETED,
             ViewFile.Status.EXTRACTED
         ].forEach(statusValue => {

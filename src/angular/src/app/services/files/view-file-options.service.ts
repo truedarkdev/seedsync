@@ -31,8 +31,12 @@ export class ViewFileOptionsService {
             storedSortMethod == null ?
                 ViewFileOptions.SortMethod.SMART_STATUS :
                 storedSortMethod;
-        const selectedStatusFilter: ViewFile.Status =
+        const storedStatusFilter: ViewFile.Status =
             this._storage.get(StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER) || null;
+        const selectedStatusFilter = ViewFileOptionsService.normalizeStatusFilter(storedStatusFilter);
+        if (storedStatusFilter !== selectedStatusFilter) {
+            this._storage.set(StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER, selectedStatusFilter);
+        }
         const nameFilter: string =
             this._storage.get(StorageKeys.VIEW_OPTION_NAME_FILTER) || null;
         const storedPinFilter: boolean =
@@ -77,12 +81,19 @@ export class ViewFileOptionsService {
 
     public setSelectedStatusFilter(status: ViewFile.Status) {
         const options = this._options.getValue();
-        if (options.selectedStatusFilter !== status) {
-            const newOptions = new ViewFileOptions(options.set("selectedStatusFilter", status));
+        const normalizedStatus = ViewFileOptionsService.normalizeStatusFilter(status);
+        if (options.selectedStatusFilter !== normalizedStatus) {
+            const newOptions = new ViewFileOptions(options.set("selectedStatusFilter", normalizedStatus));
             this._options.next(newOptions);
-            this._storage.set(StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER, status);
+            this._storage.set(StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER, normalizedStatus);
             this._logger.debug("ViewOption selectedStatusFilter set to: " + newOptions.selectedStatusFilter);
+        } else if (status !== normalizedStatus) {
+            this._storage.set(StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER, normalizedStatus);
         }
+    }
+
+    private static normalizeStatusFilter(status: ViewFile.Status): ViewFile.Status {
+        return status === ViewFile.Status.MOVE_SUCCEEDED ? ViewFile.Status.DOWNLOADED : status;
     }
 
     public setNameFilter(name: string) {

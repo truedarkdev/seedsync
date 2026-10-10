@@ -155,18 +155,18 @@ describe("Testing file options component", () => {
             new ViewFile({status: ViewFile.Status.DOWNLOADED, isLocalOnly: false}),
             new ViewFile({status: ViewFile.Status.DOWNLOADED, isLocalOnly: true}),
             new ViewFile({status: ViewFile.Status.MOVE_FAILED}),
-            new ViewFile({status: ViewFile.Status.MOVE_SUCCEEDED})
+            new ViewFile({status: ViewFile.Status.DOWNLOADED, isLocalOnly: false})
         ]));
 
         expect(component.getStatusCount(ViewFile.Status.QUEUED)).toBe(2);
         expect(component.getStatusCount(ViewFile.Status.DOWNLOADING)).toBe(2);
-        expect(component.getStatusCount(ViewFile.Status.DOWNLOADED)).toBe(1);
+        expect(component.getStatusCount(ViewFile.Status.DOWNLOADED)).toBe(2);
         expect(component.getStatusCount(ViewFile.Status.MOVE_FAILED)).toBe(1);
-        expect(component.getStatusCount(ViewFile.Status.MOVE_SUCCEEDED)).toBe(1);
+        expect(component.getStatusCount(ViewFile.Status.MOVE_SUCCEEDED)).toBe(0);
         const moveIcons = fixture.nativeElement.querySelectorAll(
             '#filter-status img.move-succeeded, #filter-status img.move-failed'
         );
-        expect(moveIcons.length).toBe(2);
+        expect(moveIcons.length).toBe(1);
         expect(getComputedStyle(moveIcons[0]).width).toBe("40px");
         expect(getComputedStyle(moveIcons[0]).height).toBe("40px");
         expect(getComputedStyle(moveIcons[0]).flexShrink).toBe("0");

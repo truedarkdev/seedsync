@@ -1988,6 +1988,7 @@ class TestModelApi(unittest.TestCase):
         downloaded = self._file("downloaded", "pair-a")
         downloaded.state = ModelFile.State.DOWNLOADED
         downloaded.remote_has_transferable_content = True
+        self.assertFalse(downloaded.complete_local_coverage)
         self.assertEqual("downloaded", Controller._model_record_visible_state(downloaded))
 
         stopped = self._file("stopped-downloaded", "pair-a")
@@ -2001,7 +2002,7 @@ class TestModelApi(unittest.TestCase):
         moved.remote_has_transferable_content = True
         moved.explicitly_stopped = True
         moved.final_move_succeeded = True
-        self.assertEqual("move_succeeded", Controller._model_record_visible_state(moved))
+        self.assertEqual("stopped", Controller._model_record_visible_state(moved))
 
         extracted = self._file("extracted", "pair-a")
         extracted.state = ModelFile.State.EXTRACTED
@@ -2033,6 +2034,7 @@ class TestModelApi(unittest.TestCase):
         downloaded = self._file("downloaded", "pair-a")
         downloaded.state = ModelFile.State.DOWNLOADED
         downloaded.complete_local_coverage = True
+        downloaded.final_move_succeeded = True
         complete_default = self._file("complete-default", "pair-a")
         complete_default.remote_size = 100
         complete_default.transferred_size = 100
@@ -2075,6 +2077,7 @@ class TestModelApi(unittest.TestCase):
         summary = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
         self.assertEqual(2, summary["active_count"])
         self.assertEqual(3, summary["completed_count"])
+        self.assertNotIn("move_succeeded", summary["visible_state_counts"])
         self.assertEqual(2, summary["visible_state_counts"]["downloaded"])
         self.assertEqual(1, summary["visible_state_counts"]["moving"])
         self.assertEqual(3, summary["visible_state_counts"]["stopped"])

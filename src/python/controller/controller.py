@@ -5232,15 +5232,15 @@ class Controller:
             and ((progress_transferred or 0) > 0 or (file.download_progress or 0) > 0)
         )
         if file.state in (ModelFile.State.DEFAULT, ModelFile.State.DOWNLOADED) and \
-                file.explicitly_stopped and not file.final_move_succeeded:
+                file.explicitly_stopped:
             return "stopped"
         if file.state == ModelFile.State.DEFAULT:
             if has_complete_progress:
                 return "downloaded"
             if has_retained_progress:
                 return "stopped"
-        if file.state == ModelFile.State.DOWNLOADED and file.final_move_succeeded:
-            return "move_succeeded"
+        if file.state == ModelFile.State.DOWNLOADED:
+            return "downloaded"
         return file.state.name.lower()
 
     @staticmethod
@@ -5734,7 +5734,7 @@ class Controller:
                             )
                 elif file.state == ModelFile.State.QUEUED:
                     summary["queued_count"] = int(summary["queued_count"]) + 1
-                elif visible_state in {"downloaded", "move_succeeded", "extracted"}:
+                elif visible_state in {"downloaded", "extracted"}:
                     summary["completed_count"] = int(summary["completed_count"]) + 1
             summary = {
                 "model_version": self.__model.version,

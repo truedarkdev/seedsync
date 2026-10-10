@@ -20,11 +20,11 @@
             <img src="assets/icons/downloading.svg" id="downloading"
                  *ngIf="file.visibleStatus === ViewFile.Status.DOWNLOADING"
                  alt="" aria-hidden="true" />
+            <img src="assets/icons/moving-files.png" id="moving-files"
+                 *ngIf="file.visibleStatus === ViewFile.Status.MOVING"
+                 alt="" aria-hidden="true" />
             <img src="assets/icons/downloaded.svg" id="downloaded"
                  *ngIf="file.visibleStatus === ViewFile.Status.DOWNLOADED"
-                 alt="" aria-hidden="true" />
-            <img src="assets/icons/move-succeeded.png" id="move-succeeded"
-                 *ngIf="file.visibleStatus === ViewFile.Status.MOVE_SUCCEEDED"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/stopped.svg" id="stopped"
                  *ngIf="file.visibleStatus === ViewFile.Status.STOPPED"
@@ -54,12 +54,12 @@
             <span *ngIf="file.visibleStatus != ViewFile.Status.DEFAULT &&
                          file.visibleStatus != ViewFile.Status.LOCAL_ONLY &&
                          file.visibleStatus != ViewFile.Status.MOVE_FAILED &&
-                         file.visibleStatus != ViewFile.Status.MOVE_SUCCEEDED"
+                         file.visibleStatus != ViewFile.Status.MOVING"
                   class="text">{{file.visibleStatus | capitalize}}</span>
+            <span *ngIf="file.visibleStatus === ViewFile.Status.MOVING"
+                  class="text">Moving files</span>
             <span *ngIf="file.visibleStatus === ViewFile.Status.MOVE_FAILED"
                   class="text move-failed-text">Final move failed</span>
-            <span *ngIf="file.visibleStatus === ViewFile.Status.MOVE_SUCCEEDED"
-                  class="text">Moved to destination</span>
             <span *ngIf="file.visibleStatus === ViewFile.Status.LOCAL_ONLY"
                   class="text">Local Only</span>
             <span *ngIf="file.visibleStatus === ViewFile.Status.DEFAULT && file.remoteHasTransferableContent"

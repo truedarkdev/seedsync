@@ -213,6 +213,28 @@ describe("Testing view file options service", () => {
         expect(selectedStatusFilter).toBe(ViewFile.Status.EXTRACTED);
     }));
 
+    it("migrates the retired final-move filter to Downloaded on load", fakeAsync(() => {
+        spyOn(storageService, "get").and.callFake(key => {
+            if (key === StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER) {
+                return ViewFile.Status.MOVE_SUCCEEDED;
+            }
+        });
+        spyOn(storageService, "set");
+        viewOptionsService = createViewOptionsService();
+
+        let selectedStatusFilter = null;
+        viewOptionsService.options.subscribe(options => {
+            selectedStatusFilter = options.selectedStatusFilter;
+        });
+        tick();
+
+        expect(selectedStatusFilter).toBe(ViewFile.Status.DOWNLOADED);
+        expect(storageService.set).toHaveBeenCalledWith(
+            StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER,
+            ViewFile.Status.DOWNLOADED
+        );
+    }));
+
     it("should forward updates to selectedStatusFilter", fakeAsync(() => {
         let count = 0;
         let selectedStatusFilter = null;
@@ -259,6 +281,12 @@ describe("Testing view file options service", () => {
         expect(storageService.set).toHaveBeenCalledWith(
             StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER,
             null
+        );
+
+        viewOptionsService.setSelectedStatusFilter(ViewFile.Status.MOVE_SUCCEEDED);
+        expect(storageService.set).toHaveBeenCalledWith(
+            StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER,
+            ViewFile.Status.DOWNLOADED
         );
     }));
 

@@ -115,7 +115,7 @@ $file-layout-desktop-min-width: 900px;
     // The approved move-state bitmaps include transparent optical padding.
     // Give their square canvases enough room for the visible folder silhouette
     // to match the established status-icon family without scaling its geometry.
-    img#move-succeeded, img#move-failed {
+    img#move-succeeded, img#move-failed, img#moving-files {
         flex: 0 0 72px;
         width: 72px;
         height: 72px;

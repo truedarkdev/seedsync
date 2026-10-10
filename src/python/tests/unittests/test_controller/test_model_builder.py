@@ -9111,6 +9111,10 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DEFAULT, release_children["active.bin"].state)
         self.assertEqual(ModelFile.State.DOWNLOADED, finished.state)
         self.assertTrue(finished.final_move_succeeded)
+        self.assertFalse(finished.complete_local_coverage)
+        self.assertFalse(finished.local_present)
+        self.assertTrue(finished.remote_present)
+        self.assertEqual("downloaded", Controller._model_record_visible_state(finished))
         self.assertEqual(1_786_400_000.0, finished.downloaded_timestamp.timestamp())
 
         # A fresh builder receives the same ControllerPersist-owned overlays
@@ -9135,6 +9139,49 @@ class TestModelBuilder(unittest.TestCase):
         rebuilt_finished = rebuilt_nested.get_children()[0]
         self.assertEqual(ModelFile.State.DOWNLOADED, rebuilt_finished.state)
         self.assertTrue(rebuilt_finished.final_move_succeeded)
+
+    def test_new_remote_leaf_after_completed_root_keeps_root_queueable(self):
+        path_pair_id = "pair-a"
+        root_id = ModelFile.build_file_id("release", path_pair_id)
+        old_leaf_id = ModelFile.build_file_id(os.path.join("release", "finished.bin"), path_pair_id)
+
+        remote_root = SystemFile("release", 10, True)
+        remote_root.add_child(SystemFile("finished.bin", 10, False))
+        remote_root.path_pair_id = path_pair_id
+        local_root = SystemFile("release", 10, True)
+        local_root.add_child(SystemFile("finished.bin", 10, False))
+        local_root.path_pair_id = path_pair_id
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_downloaded_files({root_id, old_leaf_id})
+        self.model_builder.set_final_move_succeeded_files({root_id, old_leaf_id})
+
+        completed = self.model_builder.build_model().get_file(root_id)
+        self.assertEqual(ModelFile.State.DOWNLOADED, completed.state)
+        self.assertTrue(completed.final_move_succeeded)
+
+        # A later remote scan adds one leaf while the previous final files and
+        # success markers remain. The actual builder should expose the new
+        # incomplete root as retained progress, not preserve terminal state.
+        updated_remote = SystemFile("release", 20, True)
+        updated_remote.add_child(SystemFile("finished.bin", 10, False))
+        updated_remote.add_child(SystemFile("new.bin", 10, False))
+        updated_remote.path_pair_id = path_pair_id
+        self.model_builder.set_remote_files([updated_remote])
+        self.model_builder.set_local_files([local_root])
+
+        rebuilt = self.model_builder.build_model()
+        rebuilt_root = rebuilt.get_file(root_id)
+        new_leaf_id = ModelFile.build_file_id(os.path.join("release", "new.bin"), path_pair_id)
+        rebuilt_children = {child.file_id: child for child in rebuilt_root.get_children()}
+        new_leaf = rebuilt_children[new_leaf_id]
+        self.assertEqual(ModelFile.State.DEFAULT, rebuilt_root.state)
+        self.assertFalse(rebuilt_root.complete_local_coverage)
+        self.assertTrue(rebuilt_root.final_move_succeeded)
+        self.assertEqual(10, rebuilt_root.transferred_size)
+        self.assertEqual("stopped", Controller._model_record_visible_state(rebuilt_root))
+        self.assertEqual(ModelFile.State.DEFAULT, new_leaf.state)
+        self.assertFalse(new_leaf.local_present)
 
     def test_finalized_regular_child_status_precedence_clears_on_next_build(self):
         """A live child status must yield to persisted final state after it clears."""

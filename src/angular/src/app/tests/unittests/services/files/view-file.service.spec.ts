@@ -228,11 +228,12 @@ describe("Testing view file service", () => {
         expect(file.isLocallyDeletable).toBe(false);
     }));
 
-    it("should refine only ordinary downloaded state to final move succeeded", fakeAsync(() => {
+    it("keeps final move success as persisted evidence, not a terminal presentation", fakeAsync(() => {
         mockModelService._files.next(Immutable.Map<string, ModelFile>()
             .set("downloaded", new ModelFile({
                 file_id: "downloaded", name: "downloaded", state: ModelFile.State.DOWNLOADED,
-                final_move_succeeded: true, local_size: 100, remote_size: 100
+                final_move_succeeded: true, complete_local_coverage: true,
+                local_size: 100, remote_size: 100, remote_has_transferable_content: true
             }))
             .set("validated", new ModelFile({
                 file_id: "validated", name: "validated", state: ModelFile.State.VALIDATED,
@@ -245,10 +246,43 @@ describe("Testing view file service", () => {
         tick();
 
         expect(files.find(file => file.fileId === "downloaded").status)
-            .toBe(ViewFile.Status.MOVE_SUCCEEDED);
+            .toBe(ViewFile.Status.DOWNLOADED);
         expect(files.find(file => file.fileId === "validated").status)
             .toBe(ViewFile.Status.VALIDATED);
         expect(files.find(file => file.fileId === "downloaded").isMoveRetryable).toBe(false);
+    }));
+
+    it("queues retained progress for a new remote leaf after final-move success", fakeAsync(() => {
+        mockModelService._files.next(Immutable.Map<string, ModelFile>().set("stale-success", new ModelFile({
+            file_id: "stale-success", name: "stale-success", state: ModelFile.State.DEFAULT,
+            final_move_succeeded: true, complete_local_coverage: false,
+            local_present: true, remote_present: true, remote_has_transferable_content: true,
+            local_size: 90, remote_size: 120, transferred_size: 90
+        })));
+        tick();
+
+        let file: ViewFile = null;
+        viewService.files.subscribe(files => file = files.get(0));
+        tick();
+
+        expect(file.status).toBe(ViewFile.Status.STOPPED);
+        expect(file.isQueueable).toBe(true);
+    }));
+
+    it("preserves authoritative downloaded state when coverage is temporarily unknown", fakeAsync(() => {
+        mockModelService._files.next(Immutable.Map<string, ModelFile>().set("downloaded-unknown", new ModelFile({
+            file_id: "downloaded-unknown", name: "downloaded-unknown", state: ModelFile.State.DOWNLOADED,
+            final_move_succeeded: true, complete_local_coverage: false,
+            remote_present: true, remote_has_transferable_content: true,
+            local_present: false, remote_size: 120, transferred_size: 90
+        })));
+        tick();
+
+        let file: ViewFile = null;
+        viewService.files.subscribe(files => file = files.get(0));
+        tick();
+
+        expect(file.status).toBe(ViewFile.Status.DOWNLOADED);
     }));
 
     it("should prefer transferred size for active downloads", fakeAsync(() => {
@@ -471,6 +505,7 @@ describe("Testing view file service", () => {
 
         // Next state - DOWNLOADED
         modelFile = new ModelFile(modelFile.set("state", ModelFile.State.DOWNLOADED));
+        modelFile = new ModelFile(modelFile.set("complete_local_coverage", true));
         model = model.set(modelFile.name, modelFile);
         mockModelService._files.next(model);
         tick();
@@ -479,6 +514,7 @@ describe("Testing view file service", () => {
         // Next state - STOPPED
         // local size and remote size > 0
         modelFile = new ModelFile(modelFile.set("state", ModelFile.State.DEFAULT));
+        modelFile = new ModelFile(modelFile.set("complete_local_coverage", false));
         modelFile = new ModelFile(modelFile.set("local_size", 50));
         modelFile = new ModelFile(modelFile.set("remote_size", 50));
         modelFile = new ModelFile(modelFile.set("remote_present", true));
@@ -718,7 +754,8 @@ describe("Testing view file service", () => {
             local_size: 24,
             remote_size: null,
             transferred_size: 5,
-            state: ModelFile.State.DOWNLOADED
+            state: ModelFile.State.DOWNLOADED,
+            complete_local_coverage: true
         }));
         mockModelService._files.next(model);
         tick();
@@ -883,6 +920,7 @@ describe("Testing view file service", () => {
                 state: testVector[0],
                 local_size: testVector[1],
                 remote_size: testVector[2],
+                complete_local_coverage: testVector[0] === ModelFile.State.DOWNLOADED,
             }));
             mockModelService._files.next(model);
             tick();
@@ -943,6 +981,7 @@ describe("Testing view file service", () => {
                 state: testVector[0],
                 local_size: testVector[1],
                 remote_size: testVector[2],
+                complete_local_coverage: testVector[0] === ModelFile.State.DOWNLOADED,
                 is_stoppable: testVector[3],
             }));
             mockModelService._files.next(model);
@@ -1036,6 +1075,7 @@ describe("Testing view file service", () => {
                 state: testVector[0],
                 local_size: testVector[1],
                 remote_size: testVector[2],
+                complete_local_coverage: testVector[0] === ModelFile.State.DOWNLOADED,
             }));
             mockModelService._files.next(model);
             tick();
@@ -1535,6 +1575,7 @@ describe("Testing view file service", () => {
                 state: testVector[0],
                 local_size: testVector[1],
                 remote_size: testVector[2],
+                complete_local_coverage: testVector[0] === ModelFile.State.DOWNLOADED,
             }));
             mockModelService._files.next(model);
             tick();
@@ -1593,6 +1634,7 @@ describe("Testing view file service", () => {
                 state: testVector[0],
                 local_size: testVector[1],
                 remote_size: testVector[2],
+                complete_local_coverage: testVector[0] === ModelFile.State.DOWNLOADED,
             }));
             mockModelService._files.next(model);
             tick();
@@ -2178,6 +2220,7 @@ describe("Testing view file service", () => {
             {
                 state: ModelFile.State.DOWNLOADED,
                 transferred_size: 100, remote_size: 100,
+                complete_local_coverage: true,
                 expected: ViewFile.Status.DOWNLOADED,
             },
             {
@@ -2192,7 +2235,7 @@ describe("Testing view file service", () => {
                 transferred_size: 100, remote_size: 100,
                 explicitly_stopped: true, final_move_succeeded: true,
                 complete_local_coverage: true,
-                expected: ViewFile.Status.MOVE_SUCCEEDED,
+                expected: ViewFile.Status.STOPPED,
             },
             {
                 state: ModelFile.State.DEFAULT,
