@@ -3,7 +3,16 @@ ARG SCANFS_PLATFORM=linux/amd64
 
 # Creates environment to build python binaries
 FROM python:3.12-slim-bullseye AS seedsync_build_pyinstaller_env
-RUN apt-get update && apt-get install -y \
+RUN set -eux; \
+    sources=/etc/apt/sources.list; \
+    grep -Fqx 'deb http://deb.debian.org/debian bullseye main' "$sources"; \
+    grep -Fqx 'deb http://deb.debian.org/debian bullseye-updates main' "$sources"; \
+    test "$(grep -Ec '^deb[[:space:]]+http://deb\.debian\.org/debian-security[[:space:]]+bullseye-security([[:space:]]|$)' "$sources")" -eq 1; \
+    sed -i -E '/^deb[[:space:]]+http:\/\/deb\.debian\.org\/debian-security[[:space:]]+bullseye-security([[:space:]]|$)/ s|http://deb.debian.org/debian-security|https://archive.debian.org/debian-security|' "$sources"; \
+    test "$(grep -Ec '^deb[[:space:]]+https://archive\.debian\.org/debian-security[[:space:]]+bullseye-security([[:space:]]|$)' "$sources")" -eq 1; \
+    grep -Fqx 'deb http://deb.debian.org/debian bullseye main' "$sources"; \
+    grep -Fqx 'deb http://deb.debian.org/debian bullseye-updates main' "$sources"; \
+    apt-get update && apt-get install -y \
     binutils \
     build-essential \
     curl \
@@ -41,7 +50,16 @@ RUN pyinstaller /python/seedsync.py \
 
 # Creates environment to build scanfs binaries
 FROM --platform=${SCANFS_PLATFORM} python:3.12-slim-bullseye AS seedsync_build_scanfs_env
-RUN apt-get update && apt-get install -y \
+RUN set -eux; \
+    sources=/etc/apt/sources.list; \
+    grep -Fqx 'deb http://deb.debian.org/debian bullseye main' "$sources"; \
+    grep -Fqx 'deb http://deb.debian.org/debian bullseye-updates main' "$sources"; \
+    test "$(grep -Ec '^deb[[:space:]]+http://deb\.debian\.org/debian-security[[:space:]]+bullseye-security([[:space:]]|$)' "$sources")" -eq 1; \
+    sed -i -E '/^deb[[:space:]]+http:\/\/deb\.debian\.org\/debian-security[[:space:]]+bullseye-security([[:space:]]|$)/ s|http://deb.debian.org/debian-security|https://archive.debian.org/debian-security|' "$sources"; \
+    test "$(grep -Ec '^deb[[:space:]]+https://archive\.debian\.org/debian-security[[:space:]]+bullseye-security([[:space:]]|$)' "$sources")" -eq 1; \
+    grep -Fqx 'deb http://deb.debian.org/debian bullseye main' "$sources"; \
+    grep -Fqx 'deb http://deb.debian.org/debian bullseye-updates main' "$sources"; \
+    apt-get update && apt-get install -y \
     binutils \
     build-essential \
     curl \
