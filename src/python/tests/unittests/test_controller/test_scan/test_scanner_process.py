@@ -1256,19 +1256,63 @@ class TestScannerProcess(unittest.TestCase):
             breadcrumb_trace=collector.create_emitter(),
         )
         self.addCleanup(process.close_queues)
+        emitter = process._ScannerProcess__breadcrumb_trace
+        original_record = emitter.record
+        scan_started_dispositions = []
+
+        def capture_scan_started_disposition(source, message, details=None, **metadata):
+            disposition = original_record(source, message, details, **metadata)
+            if message == "scan_started":
+                scan_started_dispositions.append(disposition)
+            return disposition
+
+        emitter.record = capture_scan_started_disposition
         process.run_init()
         process.prioritize_scan("private-pair-id")
         process._ScannerProcess__run_inline_scan()
         process._ScannerProcess__run_inline_scan()
-        entries = collector.snapshot()["entries"]
+        self.assertEqual(["enqueued", "enqueued"], scan_started_dispositions)
+
+        deadline = time.monotonic() + 1
+        snapshot = collector.snapshot()
+        entries = snapshot["entries"]
         started_entries = [entry for entry in entries if entry["message"] == "scan_started"]
+        published_entries = [
+            entry for entry in entries if entry["message"] == "scan_result_published"
+        ]
+        while (
+                len(started_entries) < 2 or len(published_entries) < 2
+        ) and time.monotonic() < deadline:
+            time.sleep(0.001)
+            snapshot = collector.snapshot()
+            entries = snapshot["entries"]
+            started_entries = [entry for entry in entries if entry["message"] == "scan_started"]
+            published_entries = [
+                entry for entry in entries if entry["message"] == "scan_result_published"
+            ]
+
+        self.assertEqual(2, len(started_entries))
+        self.assertEqual(2, len(published_entries))
         started = started_entries[0]
-        published = next(entry for entry in entries if entry["message"] == "scan_result_published")
+        published = published_entries[0]
         expected = opaque_trace_correlation("scan-pair|private-pair-id")
         self.assertEqual([expected], started["details"]["requested_members"])
         self.assertEqual([expected], published["details"]["scanned_members"])
+        self.assertEqual(started["corr_id"], published["corr_id"])
         self.assertLessEqual(started["details"]["monotonic_ms"], published["details"]["monotonic_ms"])
         self.assertEqual(["full"], started_entries[1]["details"]["requested_members"])
+        self.assertEqual(started_entries[1]["corr_id"], published_entries[1]["corr_id"])
+        self.assertLessEqual(
+            started_entries[1]["details"]["monotonic_ms"],
+            published_entries[1]["details"]["monotonic_ms"],
+        )
+        self.assertNotIn("private-pair-id", repr(entries))
+        ingress = collector.ingress_snapshot()
+        self.assertEqual(0, ingress["critical_rejected_count"])
+        self.assertEqual(0, ingress["normal_rejected_count"])
+        self.assertEqual(0, ingress["reservation_unknown"])
+        self.assertEqual(0, snapshot["accounting"]["dropped_count"])
+        self.assertEqual(0, snapshot["accounting"]["evicted_count"])
 
     def test_force_start_and_published_result_join_after_persistence_for_local_and_remote(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=32)
