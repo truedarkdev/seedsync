@@ -3538,13 +3538,18 @@ class ModelBuilder:
         return verified and saw_leaf
 
     @staticmethod
-    def __has_staging_ambiguity_descendant(system_file: SystemFile) -> bool:
-        """Reject staged, sidecar-backed, or colliding content under a final-only node."""
+    def __has_staging_ambiguity_descendant(
+            system_file: SystemFile, *, include_status_sidecar: bool = True,
+    ) -> bool:
+        """Find staged or colliding content, optionally including ready sidecars."""
         if system_file.is_staging or system_file.has_staging_origin is True or \
-                system_file.has_staging_collision or system_file.status_sidecar_ready:
+                system_file.has_staging_collision or \
+                (include_status_sidecar and system_file.status_sidecar_ready):
             return True
         return any(
-            ModelBuilder.__has_staging_ambiguity_descendant(child)
+            ModelBuilder.__has_staging_ambiguity_descendant(
+                child, include_status_sidecar=include_status_sidecar,
+            )
             for child in system_file.iter_children()
         )
 
@@ -7686,9 +7691,23 @@ class ModelBuilder:
         }
 
         built_root_files: List[_BuiltRootFile] = []
+        candidate_local_source_origins: dict[str, str] = {}
         for file_id in all_file_ids:
             remote = remote_files.get(file_id, None)
             local = effective_local_files.get(file_id, None)
+            if not isinstance(local, SystemFile):
+                candidate_local_source_origins[file_id] = "unknown"
+            elif local.is_staging or local.has_staging_origin is True or \
+                    file_id in self.__cached_unresolved_staging_collision_file_ids or \
+                    self.__has_staging_ambiguity_descendant(
+                        local, include_status_sidecar=False,
+                    ):
+                candidate_local_source_origins[file_id] = "staging"
+            else:
+                # ``has_staging_origin is None`` is normal for a scanned final
+                # tree. Classify from the effective source tree instead of
+                # treating an absent provenance hint as proof of staging.
+                candidate_local_source_origins[file_id] = "final"
             input_facts = self.__input_witness_root(input_witness, file_id, remote, local) if input_witness is not None and \
                 input_witness["root_rows_sampled"] < input_witness["root_row_limit"] and \
                 (not input_witness["priority_roots"] or file_id in input_witness["priority_roots"]) else None
@@ -7950,6 +7969,9 @@ class ModelBuilder:
 
         self.__sweep_recent_live_transfer_snapshots(seen_file_ids)
         model.set_tree_file_count(len(seen_file_ids))
+        # Keep this source fact only on the temporary candidate consumed by
+        # ModelUpdater. ModelFile/API and persisted records remain unchanged.
+        model._model_builder_candidate_local_source_origins = candidate_local_source_origins
         self.__cached_model = model
         self.__cached_model_local_scan_authority = local_scan_authority
         self.__invalidation_reasons.clear()

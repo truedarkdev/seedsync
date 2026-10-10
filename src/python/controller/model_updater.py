@@ -11429,6 +11429,25 @@ class ModelUpdater(_ControllerCoreAccess):
                 return value[0] if isinstance(value, list) and len(value) == 2 and \
                     isinstance(value[0], str) and isinstance(value[1], str) else None
 
+            def candidate_local_source_origin(file_id: str, candidate_file: ModelFile) -> str:
+                """Read source origin from this exact rendered candidate only."""
+                source_model = new_model
+                if authoritative_pair_build is not None and \
+                        candidate_pair_id(file_id) == authoritative_pair_build.path_pair_id:
+                    source_model = authoritative_pair_build.model
+                if source_model is None:
+                    return "unknown"
+                try:
+                    if source_model.get_file(file_id) is not candidate_file:
+                        return "unknown"
+                except ModelError:
+                    return "unknown"
+                origins = getattr(source_model, "_model_builder_candidate_local_source_origins", None)
+                if not isinstance(origins, dict):
+                    return "unknown"
+                origin = origins.get(file_id)
+                return origin if origin in {"final", "staging", "unknown"} else "unknown"
+
             def candidate_complete_local_coverage(file_id: str) -> bool:
                 if authoritative_pair_build is not None and \
                         candidate_pair_id(file_id) == authoritative_pair_build.path_pair_id:
@@ -12575,7 +12594,8 @@ class ModelUpdater(_ControllerCoreAccess):
                             controller._Controller__pending_completion_file_names and \
                             not new_file.explicitly_stopped and \
                             not new_file.final_move_succeeded and \
-                            new_file.file_id not in persist.final_move_succeeded_file_names:
+                            new_file.file_id not in persist.final_move_succeeded_file_names and \
+                            candidate_local_source_origin(new_file.file_id, new_file) != "final":
                         candidate_is_terminal = new_file.state in (
                             ModelFile.State.DOWNLOADED,
                             ModelFile.State.EXTRACTED,

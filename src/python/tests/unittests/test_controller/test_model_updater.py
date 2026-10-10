@@ -12460,8 +12460,10 @@ class TestModelUpdater(unittest.TestCase):
         model_builder.build_model.assert_not_called()
         next_poll = controller._Controller__next_lftp_status_poll_at
         self.assertIsNotNone(next_poll)
-        self.assertGreater(next_poll, datetime.now())
-        self.assertLessEqual(next_poll - datetime.now(), timedelta(milliseconds=100))
+        poll_finished_at = controller._Controller__lftp_status_cache_expires_at - timedelta(
+            seconds=controller._Controller__lftp_status_cache_max_age_seconds,
+        )
+        self.assertEqual(timedelta(milliseconds=100), next_poll - poll_finished_at)
 
     def test_active_lftp_status_updates_existing_root_without_full_build(self):
         builder = ModelBuilder()
@@ -21996,3 +21998,56 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(1010, complete[4]["transferred"], complete)
         self.assertEqual("downloaded", half[5]["visible"], half)
         self.assertEqual("downloaded", complete[5]["visible"], complete)
+
+    def test_candidate_local_source_origin_is_private_and_handles_mixed_roots(self):
+        pair_id = "origin-pair"
+
+        def root(name, *, staging=False, staged_child=False, child_origin=None):
+            value = SystemFile(name, 10, True, is_staging=staging)
+            value.path_pair_id = pair_id
+            child = SystemFile(
+                "payload.bin", 10, False, is_staging=staged_child,
+                has_staging_origin=child_origin,
+            )
+            child.path_pair_id = pair_id
+            value.add_child(child)
+            return value
+
+        final_local = root("final")
+        # A native final scan can legitimately omit the staging-origin bit.
+        self.assertIsNone(final_local.has_staging_origin)
+        final_local.children[0].status_sidecar_ready = True
+        mixed_local = root("mixed", staged_child=True)
+        origin_local = root("origin", child_origin=True)
+        final_remote = root("final")
+        mixed_remote = root("mixed")
+        origin_remote = root("origin")
+        remote_only = root("remote-only")
+
+        builder = ModelBuilder()
+        builder.set_local_files([final_local, mixed_local, origin_local])
+        builder.set_remote_files([final_remote, mixed_remote, origin_remote, remote_only])
+        candidate = builder.build_model()
+        origins = candidate._model_builder_candidate_local_source_origins
+        final_id = ModelFile.build_file_id("final", pair_id)
+        mixed_id = ModelFile.build_file_id("mixed", pair_id)
+        origin_id = ModelFile.build_file_id("origin", pair_id)
+        remote_only_id = ModelFile.build_file_id("remote-only", pair_id)
+        self.assertEqual("final", origins[final_id])
+        self.assertEqual("staging", origins[mixed_id])
+        self.assertEqual("staging", origins[origin_id])
+        self.assertEqual("unknown", origins[remote_only_id])
+        self.assertFalse(hasattr(candidate.get_file(final_id), "_model_builder_candidate_local_source_origins"))
+
+        with patch.object(builder, "_ModelBuilder__pair_delta_is_globally_safe", return_value=True):
+            pair = builder.build_authoritative_pair_roots(
+                pair_id, [final_local, mixed_local, origin_local],
+                [final_remote, mixed_remote, origin_remote, remote_only], set(),
+            )
+        self.assertIsNotNone(pair)
+        self.assertEqual(
+            "final",
+            pair.model._model_builder_candidate_local_source_origins[final_id],
+        )
+        serialized = SerializeModel().model(list(candidate.iter_files()))
+        self.assertNotIn("_model_builder_candidate_local_source_origins", serialized)
