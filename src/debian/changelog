@@ -1,3 +1,19 @@
+seedsync (0.9.6) stable; urgency=low
+
+  * Show authorized final moves as Moving files while they run, then retain the
+    completed Downloaded status; keep new remote files available to Queue
+  * Improve Queue recovery around current Path Pair scans and partial local
+    results while preserving verified completed files
+  * Keep Dashboard progress and completion state consistent across scans,
+    finalization, and model updates
+  * Reduce repeated model identity work during active progress updates
+  * Make Delete Local safer for selected files and directories, including
+    staged content and concurrent source changes
+  * Add bounded optional diagnostics for Queue readiness, scan authority,
+    transfer progress, and finalization
+
+ -- Johan Rosén <johan.rosen.91@gmail.com>  Sat, 10 Oct 2026 10:51:58 +0200
+
 seedsync (0.9.5) stable; urgency=low
 
   * Fixed Queue recovery after restart so incomplete LFTP temporary files are
