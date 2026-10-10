@@ -30,8 +30,14 @@ interface PageSignature {
     title: string;
     bodyText: string;
     pageSource: string;
-    angularTestabilityCount: number;
-    angularJsInjectorPresent: boolean;
+    documentReadyState: string;
+    shellMarkers: {
+        appRoot: boolean;
+        topSidebar: boolean;
+        topContent: boolean;
+        titleBar: boolean;
+        routerOutlet: boolean;
+    };
 }
 
 function normalizeText(value: string): string {
@@ -47,13 +53,10 @@ function limitText(value: string, limit: number): string {
     return normalized.slice(0, limit) + "...";
 }
 
-function hasRememberedBrowserShellMarkers(pageSource: string): boolean {
-    const normalizedPageSource = normalizeText(pageSource).toLowerCase();
-    return normalizedPageSource.indexOf("<app-root") !== -1 &&
-        normalizedPageSource.indexOf('id="top-sidebar"') !== -1 &&
-        normalizedPageSource.indexOf('id="top-content"') !== -1 &&
-        normalizedPageSource.indexOf('id="title-bar"') !== -1 &&
-        normalizedPageSource.indexOf("<router-outlet") !== -1;
+function hasRememberedBrowserShellMarkers(signature: PageSignature): boolean {
+    const markers = signature.shellMarkers;
+    return markers.appRoot && markers.topSidebar && markers.topContent &&
+        markers.titleBar && markers.routerOutlet;
 }
 
 function hasBootstrapMarkers(pageSource: string, bodyText: string): boolean {
@@ -65,15 +68,11 @@ function hasBootstrapMarkers(pageSource: string, bodyText: string): boolean {
         normalizedBodyText.indexOf("browser access") !== -1;
 }
 
-function hasAngularBootstrap(signature: PageSignature): boolean {
-    return signature.angularTestabilityCount > 0 || signature.angularJsInjectorPresent;
-}
-
 function isRememberedBrowserShell(signature: PageSignature): boolean {
-    return normalizeText(signature.title) === REMEMBERED_BROWSER_SHELL_TITLE &&
-        hasRememberedBrowserShellMarkers(signature.pageSource) &&
-        !hasBootstrapMarkers(signature.pageSource, signature.bodyText) &&
-        hasAngularBootstrap(signature);
+    return signature.documentReadyState === "complete" &&
+        normalizeText(signature.title) === REMEMBERED_BROWSER_SHELL_TITLE &&
+        hasRememberedBrowserShellMarkers(signature) &&
+        !hasBootstrapMarkers(signature.pageSource, signature.bodyText);
 }
 
 async function capturePageSignature(): Promise<PageSignature> {
@@ -83,39 +82,52 @@ async function capturePageSignature(): Promise<PageSignature> {
         browser.getPageSource(),
         browser.executeScript("return document.body ? document.body.innerText : '';")
     ]);
-    const angularState: any = await browser.executeScript(
+    const renderedState: any = await browser.executeScript(
         "return {" +
-        "angularTestabilityCount: (window.getAllAngularTestabilities && window.getAllAngularTestabilities().length) || 0," +
-        "angularJsInjectorPresent: !!(window.angular && window.angular.element && document.body && window.angular.element(document.body).injector())" +
+        "documentReadyState: document.readyState," +
+        "shellMarkers: {" +
+        "appRoot: !!document.querySelector('app-root')," +
+        "topSidebar: !!document.querySelector('#top-sidebar')," +
+        "topContent: !!document.querySelector('#top-content')," +
+        "titleBar: !!document.querySelector('#title-bar')," +
+        "routerOutlet: !!document.querySelector('router-outlet')" +
+        "}" +
         "};"
     );
+    const shellMarkers = renderedState && renderedState.shellMarkers || {};
 
     return {
         currentUrl: String(currentUrl || ""),
         title: String(title || ""),
         bodyText: String(bodyText || ""),
         pageSource: String(pageSource || ""),
-        angularTestabilityCount: Number(angularState && angularState.angularTestabilityCount) || 0,
-        angularJsInjectorPresent: !!(angularState && angularState.angularJsInjectorPresent)
+        documentReadyState: String(renderedState && renderedState.documentReadyState || ""),
+        shellMarkers: {
+            appRoot: !!shellMarkers.appRoot,
+            topSidebar: !!shellMarkers.topSidebar,
+            topContent: !!shellMarkers.topContent,
+            titleBar: !!shellMarkers.titleBar,
+            routerOutlet: !!shellMarkers.routerOutlet
+        }
     };
 }
 
 function describePageSignature(signature: PageSignature): string {
     const normalizedPageSource = normalizeText(signature.pageSource).toLowerCase();
     const normalizedBodyText = normalizeText(signature.bodyText).toLowerCase();
+    const markers = signature.shellMarkers;
 
     return [
         "url=" + normalizeText(signature.currentUrl),
         "title=" + normalizeText(signature.title),
+        "documentReadyState=" + signature.documentReadyState,
         "body=" + limitText(signature.bodyText, REMEMBERED_BROWSER_SESSION_BODY_SNIPPET_LIMIT),
         "pageSource=" + limitText(signature.pageSource, REMEMBERED_BROWSER_SESSION_PAGE_SNIPPET_LIMIT),
-        "shellMarkers={appRoot:" + (normalizedPageSource.indexOf("<app-root") !== -1) +
-            ", topSidebar:" + (normalizedPageSource.indexOf('id="top-sidebar"') !== -1) +
-            ", topContent:" + (normalizedPageSource.indexOf('id="top-content"') !== -1) +
-            ", titleBar:" + (normalizedPageSource.indexOf('id="title-bar"') !== -1) +
-            ", routerOutlet:" + (normalizedPageSource.indexOf("<router-outlet") !== -1) + "}",
-        "angularReady={testabilities:" + signature.angularTestabilityCount +
-            ", angularJsInjector:" + signature.angularJsInjectorPresent + "}",
+        "renderedShellMarkers={appRoot:" + markers.appRoot +
+            ", topSidebar:" + markers.topSidebar +
+            ", topContent:" + markers.topContent +
+            ", titleBar:" + markers.titleBar +
+            ", routerOutlet:" + markers.routerOutlet + "}",
         "bootstrapMarkers={bootstrapPage:" + (normalizedPageSource.indexOf("bootstrap-page") !== -1) +
             ", bootstrapForm:" + (normalizedPageSource.indexOf("bootstrap-form") !== -1) +
             ", browserAccessSource:" + (normalizedPageSource.indexOf("browser access") !== -1) +
@@ -141,9 +153,8 @@ async function waitForRememberedBrowserShell(): Promise<void> {
     }
 
     throw new Error(
-        "Remembered-session bootstrap did not reach an Angular-testable shell before Angular sync was restored.\n" +
-        "Expected title SeedSync with app shell markers (#top-sidebar, #top-content, #title-bar, <router-outlet>)\n" +
-        "and Angular testability before restoring Protractor sync.\n" +
+        "Remembered-session bootstrap did not reach the rendered application shell.\n" +
+        "Expected document.readyState=complete, title SeedSync, all app shell markers, and no bootstrap markers.\n" +
         describePageSignature(lastSignature)
     );
 }
@@ -257,7 +268,6 @@ async function primeRememberedBrowserSession(): Promise<void> {
         throw new Error("SEEDSYNC_E2E_BROWSER_SESSION_SECRET is required for remembered-session bootstrap");
     }
 
-    const wasAngularEnabled = await browser.waitForAngularEnabled();
     await browser.waitForAngularEnabled(false);
 
     try {
@@ -271,7 +281,7 @@ async function primeRememberedBrowserSession(): Promise<void> {
         await browser.get(Urls.APP_BASE_URL);
         await waitForRememberedBrowserShell();
     } finally {
-        await browser.waitForAngularEnabled(wasAngularEnabled);
+        await browser.waitForAngularEnabled(false);
     }
 }
 

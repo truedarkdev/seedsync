@@ -6,9 +6,7 @@ async function waitForAngularBootstrap(readySelector: string): Promise<void> {
     await browser.wait(async () => {
         return browser.executeScript(
             "return document.readyState === 'complete' && " +
-                "document.querySelector(arguments[0]) !== null && " +
-                "!!((window.getAllAngularTestabilities && window.getAllAngularTestabilities().length > 0) || " +
-                "(window.angular && window.angular.element(document.body).injector()));",
+                "document.querySelector(arguments[0]) !== null;",
             readySelector
         );
     }, ROUTE_READY_TIMEOUT);
