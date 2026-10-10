@@ -321,7 +321,7 @@ const compareStatusImproved = (a: ViewFile, b: ViewFile): number => {
     if (aStatus !== bStatus) {
         const statusPriorities = {
             [ViewFile.Status.DOWNLOADING]: 1,
-            [ViewFile.Status.MOVING]: 1,
+            [ViewFile.Status.MOVING]: 9,
             [ViewFile.Status.EXTRACTING]: 2,
             [ViewFile.Status.VALIDATING]: 3,
             [ViewFile.Status.MOVE_FAILED]: 4,

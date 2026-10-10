@@ -616,7 +616,6 @@ describe("Testing view file sort service", () => {
 
         expect(files.sort(sortComparator).map(file => file.name)).toEqual([
             "downloading",
-            "moving",
             "extracting",
             "validating",
             "move-failed",
@@ -627,12 +626,30 @@ describe("Testing view file sort service", () => {
             "downloaded-new",
             "extracted-equal-a",
             "validated-equal-z",
+            "moving",
             "downloaded-missing-a",
             "downloaded-missing-b",
             "downloaded-missing-c",
             "local-only",
             "deleted",
         ]);
+        const tiedMoving = new ViewFile({
+            name: "same-name",
+            status: ViewFile.Status.MOVING,
+            downloadedTimestamp: new Date(2000)
+        });
+        const tiedDownloaded = new ViewFile({
+            name: "same-name",
+            status: ViewFile.Status.DOWNLOADED,
+            downloadedTimestamp: new Date(2000)
+        });
+        expect(sortComparator(tiedMoving, tiedDownloaded)).toBe(0);
+        expect(sortComparator(tiedDownloaded, tiedMoving)).toBe(0);
+
+        const remoteOnly = new ViewFile({name: "remote-only", status: ViewFile.Status.DEFAULT});
+        const moving = new ViewFile({name: "moving", status: ViewFile.Status.MOVING});
+        expect(sortComparator(moving, remoteOnly)).toBeGreaterThan(0);
+        expect(sortComparator(remoteOnly, moving)).toBeLessThan(0);
         expect(sortComparator(
             new ViewFile({
                 name: "same-name",
