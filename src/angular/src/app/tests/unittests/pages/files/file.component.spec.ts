@@ -297,12 +297,12 @@ describe("Testing file component", () => {
         expect(assetResponse.ok).toBeTrue();
         expect(assetResponse.headers.get("content-type")).toContain("image/png");
         const style = getComputedStyle(icon);
-        expect(style.width).toBe("72px");
-        expect(style.height).toBe("72px");
-        expect(style.flexShrink).toBe("0");
-        expect(icon.getBoundingClientRect().width).toBe(72);
-        expect(style.marginTop).toBe("-16px");
-        expect(style.marginBottom).toBe("-12px");
+        expect(style.width).toBe("45px");
+        expect(style.height).toBe("45px");
+        expect(style.flexShrink).toBe("1");
+        expect(icon.getBoundingClientRect().width).toBe(45);
+        expect(style.marginTop).toBe("0px");
+        expect(style.marginBottom).toBe("0px");
         expect(status.queryAll(By.css(".text")).map(text => text.nativeElement.textContent.trim()))
             .toEqual(["Moving files"]);
         expect(status.query(By.css("img#move-succeeded"))).toBeNull();
