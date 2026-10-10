@@ -57,6 +57,7 @@ LFTP_STATUS_POLL_TRACE_CATEGORY = "transfer.lftp.status"
 _PREPARSE_STDERR_REMAINING = 256
 _PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 3
 _PRIVATE_STATUS_FRAME_CAPTURE_MAX_BYTES = 64 * 1024
+_PRIVATE_STATUS_FRAME_CAPTURE_MAX_JOB_REFS = 16
 LFTP_STATUS_POLL_TRACE_SCHEMA = "lftp.status_poll.v1"
 LFTP_STATUS_POLL_TRACE_PHASES = frozenset({
     "submitted", "jobs_read", "prompt_ready", "prompt_timeout", "process_eof", "command_error",
@@ -416,6 +417,60 @@ def _safe_lftp_status_poll_correlation(value: object) -> Optional[str]:
     return value
 
 
+def _lftp_private_status_frame_capture_enabled(correlation: object, trace: object) -> bool:
+    """Check all private-frame opt-ins before collecting optional status facts."""
+    capture_dir = os.environ.get("SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR")
+    return bool(
+        capture_dir and _PRIVATE_STATUS_FRAME_CAPTURE_REMAINING > 0 and
+        _safe_lftp_status_poll_correlation(correlation) is not None and
+        _breadcrumb_effectively_enabled(trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug")
+    )
+
+
+def _lftp_private_status_frame_job_facts(
+        statuses: object, parse_outcome: object, poll_healthy: object,
+) -> dict[str, object]:
+    """Return a bounded, path-free summary of an actual parsed status list."""
+    if not isinstance(statuses, list):
+        return {}
+    outcome = parse_outcome if isinstance(parse_outcome, str) and \
+        parse_outcome in LFTP_STATUS_PARSE_OUTCOMES else "not_attempted"
+    healthy = poll_healthy if type(poll_healthy) is bool else None
+    job_refs = []
+    for status in statuses[:_PRIVATE_STATUS_FRAME_CAPTURE_MAX_JOB_REFS]:
+        job_correlation = "unknown"
+        job_type = "unknown"
+        job_state = "unknown"
+        try:
+            candidate_correlation = getattr(status, "job_correlation", None)
+            if isinstance(candidate_correlation, str) and re.fullmatch(
+                    r"lftp-job:[0-9a-f]{16}", candidate_correlation):
+                job_correlation = candidate_correlation
+            candidate_type = getattr(getattr(status, "type", None), "value", None)
+            if candidate_type in {"get", "mirror", "pget"}:
+                job_type = candidate_type
+            candidate_state = getattr(status, "state", None)
+            if candidate_state == LftpJobStatus.State.QUEUED:
+                job_state = "queued"
+            elif candidate_state == LftpJobStatus.State.RUNNING:
+                job_state = "running"
+        except Exception:
+            # A malformed optional diagnostic value must not affect parsing.
+            pass
+        job_refs.append({
+            "job_correlation": job_correlation,
+            "job_type": job_type,
+            "job_state": job_state,
+        })
+    return {
+        "parse_outcome": outcome,
+        "poll_healthy": healthy,
+        "status_count_bucket": _lftp_trace_count_bucket(len(statuses)),
+        "job_refs": job_refs,
+        "job_refs_omitted": len(statuses) > len(job_refs),
+    }
+
+
 def _lftp_trace_count_bucket(value: object) -> str:
     if not isinstance(value, int) or value < 0:
         return "unknown"
@@ -733,7 +788,8 @@ def _record_lftp_preparse_stderr(correlation: object, output: object, process_al
 
 def _lftp_private_status_frame_capture(
         correlation: object, output: object, process_alive: object, trace: object,
-        boundary: dict[str, object],
+        boundary: dict[str, object], *, parsed_statuses: object = None,
+        parse_outcome: object = None, poll_healthy: object = None,
 ) -> bool:
     """Atomically publish a few parser inputs in an explicitly mounted private directory.
 
@@ -742,14 +798,13 @@ def _lftp_private_status_frame_capture(
     paired JSON manifest holds only bounded structural framing facts.
     """
     global _PRIVATE_STATUS_FRAME_CAPTURE_REMAINING
-    capture_dir = os.environ.get("SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR")
-    if not capture_dir or _PRIVATE_STATUS_FRAME_CAPTURE_REMAINING <= 0:
-        return False
-    safe_correlation = _safe_lftp_status_poll_correlation(correlation)
-    if safe_correlation is None or not _breadcrumb_effectively_enabled(
-            trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug"):
-        return False
     try:
+        capture_dir = os.environ.get("SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR")
+        if not _lftp_private_status_frame_capture_enabled(correlation, trace):
+            return False
+        safe_correlation = _safe_lftp_status_poll_correlation(correlation)
+        if safe_correlation is None:
+            return False
         if not os.path.isdir(capture_dir):
             return False
         output_bytes = ("" if output is None else str(output)).encode("utf-8", "surrogateescape")
@@ -770,6 +825,9 @@ def _lftp_private_status_frame_capture(
             "sha256": hashlib.sha256(output_bytes).hexdigest(),
             "boundary": boundary,
         }
+        manifest.update(_lftp_private_status_frame_job_facts(
+            parsed_statuses, parse_outcome, poll_healthy,
+        ))
         os.mkdir(temporary_path, 0o700)
         raw_fd = os.open(os.path.join(temporary_path, "frame.bin"),
                          os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -797,7 +855,7 @@ def _lftp_private_status_frame_capture(
         os.replace(temporary_path, capture_path)
         _PRIVATE_STATUS_FRAME_CAPTURE_REMAINING -= 1
         return True
-    except (OSError, TypeError, UnicodeError, ValueError):
+    except Exception:
         # Capture must never change polling, parsing, or transfer behavior.
         return False
 
@@ -3209,21 +3267,38 @@ class Lftp:
                 },
             )
 
-        def capture_private_frame(output: object, process_alive: object) -> None:
-            process = getattr(self, "_Lftp__process", None)
-            before, retained = _lftp_status_boundary_values(process)
-            retained_length = _incoming_recovery_buffer_length(retained)
-            _lftp_private_status_frame_capture(
-                safe_trace_poll_correlation, output, process_alive,
-                getattr(self, "_Lftp__breadcrumb_trace", None),
-                {
-                    "pexpect_version": str(getattr(pexpect, "__version__", "unknown")),
-                    "command_timed_out": self.__last_command_timed_out is True,
-                    "before_byte_count": _lftp_boundary_byte_count(before),
-                    "after_byte_count": _lftp_boundary_byte_count(getattr(process, "after", None)),
-                    "buffer_byte_count": retained_length if retained_length is not None else -1,
-                },
-            )
+        def capture_private_frame(
+                output: object, process_alive: object, parsed_statuses: object = None,
+        ) -> None:
+            try:
+                trace = getattr(self, "_Lftp__breadcrumb_trace", None)
+                # The healthy success path is new and must remain inert unless all
+                # private capture gates pass. Parser-error callers keep their existing
+                # best-effort boundary collection behavior.
+                if parsed_statuses is not None and not _lftp_private_status_frame_capture_enabled(
+                        safe_trace_poll_correlation, trace):
+                    return
+                process = getattr(self, "_Lftp__process", None)
+                before, retained = _lftp_status_boundary_values(process)
+                retained_length = _incoming_recovery_buffer_length(retained)
+                _lftp_private_status_frame_capture(
+                    safe_trace_poll_correlation, output, process_alive, trace,
+                    {
+                        "pexpect_version": str(getattr(pexpect, "__version__", "unknown")),
+                        "command_timed_out": self.__last_command_timed_out is True,
+                        "before_byte_count": _lftp_boundary_byte_count(before),
+                        "after_byte_count": _lftp_boundary_byte_count(getattr(process, "after", None)),
+                        "buffer_byte_count": retained_length if retained_length is not None else -1,
+                    },
+                    parsed_statuses=parsed_statuses,
+                    parse_outcome=(self.last_status_parse_outcome
+                                   if parsed_statuses is not None else None),
+                    poll_healthy=(self.__last_status_poll_healthy
+                                  if parsed_statuses is not None else None),
+                )
+            except Exception:
+                # Optional frame collection must never affect status ownership.
+                return
         try:
             status_command_kwargs: dict[str, object] = {
                 "timeout_seconds": 0,
@@ -3318,6 +3393,8 @@ class Lftp:
             raise
         if statuses is not None:
             self.__annotate_status_path_pairs(statuses)
+            if self.__last_status_poll_healthy is True and statuses:
+                capture_private_frame(out, preparse_process_alive, statuses)
         if not statuses and getattr(self, "_Lftp__status_poll_needs_connection_grace", False) and not self.__pending_error:
             self.__status_poll_needs_connection_grace = False
             used_connection_grace = True
@@ -3372,6 +3449,8 @@ class Lftp:
                 raise
             if statuses is not None:
                 self.__annotate_status_path_pairs(statuses)
+                if self.__last_status_poll_healthy is True and statuses:
+                    capture_private_frame(out, preparse_process_alive, statuses)
         if isinstance(statuses, list) and not statuses and self.__last_status_poll_healthy is True and \
                 self.__last_status_poll_failure_reason is None:
             _record_lftp_empty_status_terminal_observation(

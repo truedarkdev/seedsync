@@ -645,6 +645,13 @@ class TestLftp(unittest.TestCase):
             policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
         )
         original_remaining = lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING
+        statuses = [
+            LftpJobStatus(
+                job_id=job_id, job_type=LftpJobStatus.Type.PGET,
+                state=LftpJobStatus.State.RUNNING, name="private-job-name", flags="-c",
+            )
+            for job_id in range(1, lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_MAX_JOB_REFS + 2)
+        ]
         output = "private-status-" + ("x" * lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_MAX_BYTES)
         try:
             with tempfile.TemporaryDirectory() as capture_dir, \
@@ -656,6 +663,7 @@ class TestLftp(unittest.TestCase):
                     "lftp-poll:0123456789abcdef", output, True, trace,
                     {"pexpect_version": "test", "before_byte_count": 1,
                      "after_byte_count": 2, "buffer_byte_count": 3},
+                    parsed_statuses=statuses, parse_outcome="complete_success", poll_healthy=True,
                 )
                 captures = list(Path(capture_dir).iterdir())
                 self.assertEqual(1, len(captures))
@@ -668,8 +676,21 @@ class TestLftp(unittest.TestCase):
                 self.assertTrue(manifest["truncated"])
                 self.assertEqual(hashlib.sha256(output.encode("utf-8")).hexdigest(), manifest["sha256"])
                 self.assertEqual("test", manifest["boundary"]["pexpect_version"])
-                self.assertEqual(0o600, stat.S_IMODE(raw_path.stat().st_mode))
-                self.assertEqual(0o600, stat.S_IMODE(manifest_path.stat().st_mode))
+                self.assertEqual("complete_success", manifest["parse_outcome"])
+                self.assertTrue(manifest["poll_healthy"])
+                self.assertEqual("17-64", manifest["status_count_bucket"])
+                self.assertEqual(lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_MAX_JOB_REFS, len(manifest["job_refs"]))
+                self.assertTrue(manifest["job_refs_omitted"])
+                self.assertTrue(all(
+                    re.fullmatch(r"lftp-job:[0-9a-f]{16}", row["job_correlation"])
+                    for row in manifest["job_refs"]
+                ))
+                self.assertTrue(all(row["job_type"] == "pget" for row in manifest["job_refs"]))
+                self.assertTrue(all(row["job_state"] == "running" for row in manifest["job_refs"]))
+                self.assertNotIn("private-job-name", json.dumps(manifest))
+                if os.name != "nt":
+                    self.assertEqual(0o600, stat.S_IMODE(raw_path.stat().st_mode))
+                    self.assertEqual(0o600, stat.S_IMODE(manifest_path.stat().st_mode))
         finally:
             lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = original_remaining
 
@@ -696,16 +717,232 @@ class TestLftp(unittest.TestCase):
 
     def test_status_success_does_not_consume_private_frame_capture(self):
         lftp = self._build_status_poll_test_lftp()
-        lftp._Lftp__run_command = MagicMock(return_value="ordinary status output")
+        lftp._Lftp__job_status_parser = LftpJobStatusParser()
+        lftp._Lftp__run_command = MagicMock(return_value=(
+            "jobs -v\n"
+            "[0] queue (sftp://private-user@private-host)\n"
+            "sftp://private-user@private-host/remote\n"
+            "Queue is running.\n"
+            "Commands queued:\n"
+            "1. pget -c /remote/sample.bin -o /local/sample.bin\n"
+        ))
         trace = BreadcrumbTraceCollector(
             lambda: True, max_entries=8,
             policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
         )
         lftp.set_breadcrumb_trace(trace)
 
-        with patch("lftp.lftp._lftp_private_status_frame_capture") as capture:
-            self.assertEqual([], lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef"))
+        with patch.dict(os.environ, {}, clear=True), \
+                patch("lftp.lftp._lftp_private_status_frame_capture") as capture, \
+                patch("lftp.lftp._lftp_private_status_frame_job_facts") as facts:
+            statuses = lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef")
+        self.assertTrue(statuses)
+        self.assertTrue(lftp.last_status_poll_healthy)
         capture.assert_not_called()
+        facts.assert_not_called()
+
+    def test_empty_healthy_status_does_not_consume_private_frame_capture(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__job_status_parser = LftpJobStatusParser()
+        lftp._Lftp__run_command = MagicMock(return_value="")
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+        original_remaining = lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING
+        try:
+            with tempfile.TemporaryDirectory() as capture_dir, \
+                    patch.dict(os.environ, {
+                        "SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": capture_dir,
+                    }, clear=True):
+                lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 3
+                statuses = lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef")
+                self.assertEqual([], statuses)
+                self.assertTrue(lftp.last_status_poll_healthy)
+                self.assertEqual("blank_empty", lftp.last_status_parse_outcome)
+                self.assertEqual([], list(Path(capture_dir).iterdir()))
+                self.assertEqual(3, lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING)
+        finally:
+            lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = original_remaining
+
+    def test_partial_queue_empty_status_does_not_consume_private_frame_capture(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__job_status_parser = LftpJobStatusParser()
+        lftp._Lftp__run_command = MagicMock(return_value=(
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/remote\n"
+        ))
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=16,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+        original_remaining = lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING
+        try:
+            with tempfile.TemporaryDirectory() as capture_dir, \
+                    patch.dict(os.environ, {
+                        "SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": capture_dir,
+                    }, clear=True):
+                lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 3
+                statuses = lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef")
+                self.assertEqual([], statuses)
+                self.assertTrue(lftp.last_status_poll_healthy)
+                self.assertEqual("partial_queue", lftp.last_status_parse_outcome)
+                self.assertEqual([], list(Path(capture_dir).iterdir()))
+                self.assertEqual(3, lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING)
+        finally:
+            lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = original_remaining
+
+    def test_healthy_status_frame_capture_joins_actual_parser_jobs_to_pair_annotations(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__job_status_parser = LftpJobStatusParser()
+        lftp._Lftp__run_command = MagicMock(return_value=(
+            "jobs -v\n"
+            "[0] queue (sftp://private-user@private-host)\n"
+            "sftp://private-user@private-host/remote\n"
+            "Queue is running.\n"
+            "Commands queued:\n"
+            "1. pget -c /remote/sample.bin -o /local/sample.bin\n"
+        ))
+        lftp._Lftp__path_pairs_by_id = {
+            "private-pair-id": {
+                "remote_path": "/remote", "local_path": "/local", "name": "Private Pair",
+            },
+        }
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=32,
+            policy={
+                "default": "off",
+                "rules": {"transfer.lftp.status": "debug", "transfer.lftp": "info"},
+            },
+        )
+        lftp.set_breadcrumb_trace(trace)
+        original_remaining = lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING
+        try:
+            with tempfile.TemporaryDirectory() as capture_dir, \
+                    patch.dict(os.environ, {
+                        "SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": capture_dir,
+                    }, clear=True):
+                lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 3
+                statuses = lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef")
+                self.assertTrue(statuses)
+                self.assertTrue(lftp.last_status_poll_healthy)
+                self.assertEqual("complete_success", lftp.last_status_parse_outcome)
+
+                captures = list(Path(capture_dir).iterdir())
+                self.assertEqual(1, len(captures))
+                manifest_path = captures[0] / "manifest.json"
+                frame_path = captures[0] / "frame.bin"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual("lftp-poll:0123456789abcdef", manifest["correlation"])
+                self.assertEqual("complete_success", manifest["parse_outcome"])
+                self.assertIs(manifest["poll_healthy"], True)
+                self.assertFalse(manifest["job_refs_omitted"])
+                self.assertGreaterEqual(len(manifest["job_refs"]), 1)
+                self.assertEqual("pget", manifest["job_refs"][0]["job_type"])
+                self.assertEqual("queued", manifest["job_refs"][0]["job_state"])
+                self.assertLessEqual(frame_path.stat().st_size, lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_MAX_BYTES)
+                self.assertIn(b"private-user@private-host", frame_path.read_bytes())
+
+                annotations = [
+                    entry for entry in trace.snapshot()["entries"]
+                    if entry["message"] == "lftp_path_pair_annotation"
+                ]
+                self.assertTrue(annotations)
+                captured_refs = {
+                    row["job_correlation"] for row in manifest["job_refs"]
+                    if row["job_correlation"] != "unknown"
+                }
+                annotation_refs = {entry["corr_id"] for entry in annotations}
+                self.assertTrue(captured_refs.intersection(annotation_refs))
+                self.assertNotIn("private-user", json.dumps(manifest))
+                self.assertNotIn("private-host", json.dumps(manifest))
+                self.assertNotIn("/remote", json.dumps(manifest))
+                self.assertNotIn("Private Pair", json.dumps(manifest))
+                self.assertTrue(all(
+                    row["job_type"] in {"get", "mirror", "pget"} and
+                    row["job_state"] in {"queued", "running"}
+                    for row in manifest["job_refs"]
+                ))
+        finally:
+            lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = original_remaining
+
+    def test_healthy_status_frame_capture_io_failure_preserves_status_result(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__job_status_parser = LftpJobStatusParser()
+        lftp._Lftp__run_command = MagicMock(return_value=(
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/remote\n"
+            "Queue is running.\n"
+            "[1] mirror -c /remote/sample-directory /local/staging/ -- 10/20 (50%)\n"
+        ))
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=16,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+        original_remaining = lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING
+        try:
+            with tempfile.TemporaryDirectory() as capture_dir, \
+                    patch.dict(os.environ, {
+                        "SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": capture_dir,
+                    }, clear=True), \
+                    patch("lftp.lftp.os.mkdir", side_effect=OSError("private capture unavailable")):
+                lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 3
+                statuses = lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef")
+                self.assertTrue(statuses)
+                self.assertTrue(lftp.last_status_poll_healthy)
+                self.assertEqual("complete_success", lftp.last_status_parse_outcome)
+                self.assertEqual([], list(Path(capture_dir).iterdir()))
+        finally:
+            lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = original_remaining
+
+    def test_connection_grace_status_frame_capture_records_both_healthy_parse_boundaries(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__job_status_parser = LftpJobStatusParser()
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/remote\n"
+            "Queue is running.\n"
+            "[1] mirror -c /remote/sample-directory /local/staging/ -- 10/20 (50%)\n"
+        )
+        lftp._Lftp__run_command = MagicMock(side_effect=["", output])
+        lftp._Lftp__status_poll_needs_connection_grace = True
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=32,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}},
+        )
+        lftp.set_breadcrumb_trace(trace)
+        original_remaining = lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING
+        try:
+            with tempfile.TemporaryDirectory() as capture_dir, \
+                    patch.dict(os.environ, {
+                        "SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": capture_dir,
+                    }, clear=True):
+                lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 3
+                statuses = lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef")
+                self.assertTrue(statuses)
+                self.assertTrue(lftp.last_status_poll_healthy)
+                self.assertEqual("complete_success", lftp.last_status_parse_outcome)
+
+                manifests = [
+                    json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+                    for directory in Path(capture_dir).iterdir()
+                ]
+                self.assertEqual(1, len(manifests))
+                self.assertEqual("complete_success", manifests[0]["parse_outcome"])
+                self.assertTrue(all(
+                    manifest["correlation"] == "lftp-poll:0123456789abcdef" and
+                    manifest["poll_healthy"] is True
+                    for manifest in manifests
+                ))
+                self.assertEqual(2, lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING)
+        finally:
+            lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = original_remaining
 
     def test_status_poll_trace_failure_does_not_change_unexpected_exception_propagation(self):
         lftp = self._build_status_poll_test_lftp()
@@ -2011,6 +2248,11 @@ class TestLftp(unittest.TestCase):
             "test_private_status_frame_capture_writes_capped_atomic_private_pair",
             "test_status_captures_private_frame_on_parser_failure_before_error_reporting",
             "test_status_success_does_not_consume_private_frame_capture",
+            "test_empty_healthy_status_does_not_consume_private_frame_capture",
+            "test_partial_queue_empty_status_does_not_consume_private_frame_capture",
+            "test_healthy_status_frame_capture_joins_actual_parser_jobs_to_pair_annotations",
+            "test_healthy_status_frame_capture_io_failure_preserves_status_result",
+            "test_connection_grace_status_frame_capture_records_both_healthy_parse_boundaries",
             "test_status_poll_parser_failure_records_parser_family_and_preserves_result",
             "test_status_poll_trace_failure_does_not_change_unexpected_exception_propagation",
             "test_status_exception_families_use_only_the_approved_enum",
