@@ -29,6 +29,9 @@ class TestPerformanceDiagnosticsHandler(BaseTestWebApp):
         )
 
     def test_admin_can_read_bounded_numeric_snapshot_and_reset(self):
+        self.controller.get_performance_diagnostic_runtime_counts.return_value = {
+            "command_queue": {"known": True, "queued": 0},
+        }
         self.context.performance_diagnostics.record_sample({
             "process_cpu_percent_one_core": 10.0,
             "process_rss_bytes": 123,
@@ -45,6 +48,10 @@ class TestPerformanceDiagnosticsHandler(BaseTestWebApp):
         self.assertEqual("nosniff", response.headers["X-Content-Type-Options"])
         payload = json.loads(response.body.decode("utf-8"))
         self.assertEqual("seedsync.performance-diagnostics.v1", payload["schema"])
+        self.assertEqual(
+            {"command_queue": {"known": True, "queued": 0}},
+            payload["runtime_counts"],
+        )
         self.assertEqual(1, payload["sample_count"])
         self.assertEqual(1, payload["active_stage_counts"][DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL])
         self.assertEqual(

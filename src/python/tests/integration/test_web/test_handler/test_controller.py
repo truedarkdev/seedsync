@@ -1,5 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import os
 from threading import Event, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -8,7 +9,9 @@ from urllib.parse import quote
 from webtest import TestApp
 
 from tests.integration.test_web.test_web_app import BaseTestWebApp
-from controller import Controller, ControllerPersist
+from controller import Controller, ControllerPersist, ModelBuilder
+from controller.model_updater import _pop_scan_updates
+from controller.scan import LocalScanner, MultiPathLocalScanner, ScannerProcess, ScannerResult
 from web.handler.controller import ControllerHandler
 from model import ModelFile
 from web import WebAppBuilder
@@ -103,20 +106,34 @@ class TestControllerHandler(BaseTestWebApp):
 
         controller._Controller__model = MagicMock()
         controller._Controller__model.get_file.side_effect = lambda file_id: files[file_id]
-        controller._Controller__model_builder = MagicMock()
-        controller._Controller__model_builder.has_unresolved_staging_collision.return_value = False
-        controller._Controller__model_builder.get_terminalizable_staging_collision_file_ids.return_value = set()
-        controller._Controller__model_builder.get_remote_resume_source_identity.return_value = None
+        controller._Controller__model_builder = ModelBuilder()
+        local_path = os.path.join(self.temp_dir, "authority-local")
+        remote_path = os.path.join(self.temp_dir, "authority-remote")
+        staging_path = os.path.join(self.temp_dir, "authority-staging")
+        for root_path in (local_path, remote_path, staging_path):
+            os.makedirs(root_path, exist_ok=True)
+        for name in ("authority-success", "authority-expiry", "authority-pending"):
+            for root_path in (local_path, remote_path):
+                content_path = os.path.join(root_path, name, "content.bin")
+                os.makedirs(os.path.dirname(content_path), exist_ok=True)
+                with open(content_path, "wb") as content_file:
+                    content_file.write(b"transferable")
         controller._Controller__path_pairs_by_id = {
-            "pair-a": SimpleNamespace(remote_path="/remote", local_path="/local"),
+            "pair-a": SimpleNamespace(remote_path=remote_path, local_path=local_path),
         }
-        controller._Controller__path_pair_staging_paths = {"pair-a": "/local/incomplete"}
-        controller._Controller__local_scan_process = MagicMock()
-        controller._Controller__remote_scan_process = MagicMock()
-        controller._Controller__local_scan_process.session_token = "local-test-session"
-        controller._Controller__remote_scan_process.session_token = "remote-test-session"
-        controller._Controller__local_scan_process.generation = 0
-        controller._Controller__remote_scan_process.generation = 0
+        controller._Controller__path_pair_staging_paths = {"pair-a": staging_path}
+        local_scanner = LocalScanner(
+            local_path, use_temp_file=False, staging_path=staging_path, path_pair_id="pair-a",
+        )
+        remote_scanner = LocalScanner(remote_path, use_temp_file=False, path_pair_id="pair-a")
+        controller._Controller__local_scan_process = ScannerProcess(
+            MultiPathLocalScanner([local_scanner]), interval_in_ms=0, verbose=False,
+        )
+        controller._Controller__remote_scan_process = ScannerProcess(
+            MultiPathLocalScanner([remote_scanner]), interval_in_ms=0, verbose=False,
+        )
+        self.addCleanup(controller._Controller__local_scan_process.close_queues)
+        self.addCleanup(controller._Controller__remote_scan_process.close_queues)
         controller._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
         controller._Controller__reconciled_local_path_pair_ids = set()
         controller._Controller__reconciled_remote_path_pair_ids = set()
@@ -174,6 +191,45 @@ class TestControllerHandler(BaseTestWebApp):
             controller._Controller__reconciled_remote_path_pair_ids.clear()
             command_enqueued.clear()
 
+        def publish_targeted_scan_intake(intent):
+            local_process = controller._Controller__local_scan_process
+            remote_process = controller._Controller__remote_scan_process
+            local_baseline, remote_baseline = intent.rescan_generations
+            local_snapshot = local_process.root_scan_authority_snapshot("pair-a")
+            self.assertIsInstance(local_snapshot, tuple)
+            self.assertEqual(3, len(local_snapshot))
+            self.assertEqual(local_baseline, local_snapshot[:2])
+            self.assertIs(type(local_snapshot[2]), int)
+            self.assertGreaterEqual(local_snapshot[2], 0)
+            self.assertEqual(remote_process.session_token, remote_baseline[0])
+            self.assertEqual(remote_process.generation, remote_baseline[1])
+            local_process.run_loop()
+            remote_process.run_loop()
+            local_result = _pop_scan_updates(controller, "local", local_process)
+            remote_result = _pop_scan_updates(controller, "remote", remote_process)
+            self.assertIsInstance(local_result, ScannerResult)
+            self.assertIsInstance(remote_result, ScannerResult)
+            for process, result, baseline in (
+                    (local_process, local_result, local_baseline),
+                    (remote_process, remote_result, remote_baseline)):
+                self.assertEqual(process.session_token, result.session_token)
+                self.assertEqual({"pair-a"}, result.completed_path_pair_ids)
+                self.assertFalse(result.failed)
+                self.assertFalse(result.unknown_path_pair_ids)
+                self.assertEqual(baseline[0], result.session_token)
+                self.assertGreater(result.generation, baseline[1])
+                self.assertEqual({"pair-a"}, result.scanned_path_pair_ids)
+            controller._record_path_pair_scan_tokens(local_result, remote_result)
+            controller._record_path_pair_reconciliation(
+                local_result.completed_path_pair_ids,
+                remote_result.completed_path_pair_ids,
+            )
+            for side, result in (("local", local_result), ("remote", remote_result)):
+                self.assertEqual(
+                    (result.session_token, result.generation),
+                    controller._Controller__scan_authority_tokens[side]["pair-a"],
+                )
+
         def issue_queue_request(model_file, responses, key):
             responses[key] = test_app.post(queue_url(model_file), expect_errors=True)
 
@@ -189,16 +245,10 @@ class TestControllerHandler(BaseTestWebApp):
             success_thread.start()
             self.assertTrue(command_enqueued.wait(timeout=1.0))
             controller._Controller__process_commands()
-            self.assertEqual(120.0, controller._Controller__deferred_queue_intents[
-                success_file.file_id
-            ].rescan_deadline_monotonic)
+            success_intent = controller._Controller__deferred_queue_intents[success_file.file_id]
+            self.assertEqual(120.0, success_intent.rescan_deadline_monotonic)
             clock[0] = 96.0
-            controller._Controller__scan_authority_tokens = {
-                "local": {"pair-a": ("local-test-session", 1)},
-                "remote": {"pair-a": ("remote-test-session", 1)},
-            }
-            controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
-            controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+            publish_targeted_scan_intake(success_intent)
             controller._Controller__process_commands()
             success_thread.join(timeout=1.0)
 
@@ -247,12 +297,7 @@ class TestControllerHandler(BaseTestWebApp):
             )
 
             clock[0] = 121.0
-            controller._Controller__scan_authority_tokens = {
-                "local": {"pair-a": ("local-test-session", 1)},
-                "remote": {"pair-a": ("remote-test-session", 1)},
-            }
-            controller._Controller__reconciled_local_path_pair_ids.add("pair-a")
-            controller._Controller__reconciled_remote_path_pair_ids.add("pair-a")
+            publish_targeted_scan_intake(expiry_intent)
             controller._Controller__process_commands()
             self.assertEqual(1, controller._Controller__lftp.queue.call_count)
             self.assertFalse(expiry_callback.success)
@@ -1401,7 +1446,7 @@ class TestControllerHandler(BaseTestWebApp):
             success_response.headers["X-SeedSync-Completion-Correlation"],
         )
         self.controller.record_queue_http_wait_trace.assert_called_once_with(
-            "test1", True, True, flow_id=success_flow,
+            "test1", True, True, flow_id=success_flow, duration_ms=None,
         )
 
         failure_flow = "fractional-queue:fedcba9876543210"
@@ -1426,7 +1471,7 @@ class TestControllerHandler(BaseTestWebApp):
             failure_response.headers["X-SeedSync-Completion-Correlation"],
         )
         self.controller.record_queue_http_wait_trace.assert_called_once_with(
-            "test2", True, False, flow_id=failure_flow,
+            "test2", True, False, flow_id=failure_flow, duration_ms=None,
         )
         self.assertRegex(success_flow, r"^fractional-queue:[0-9a-f]{16}$")
         self.assertRegex(failure_flow, r"^fractional-queue:[0-9a-f]{16}$")
@@ -1443,7 +1488,7 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(Controller.Command.Action.QUEUE, command.action)
         self.assertEqual("test1", command.filename)
         self.controller.record_queue_http_wait_trace.assert_called_once_with(
-            "test1", False, None, flow_id=None,
+            "test1", False, None, flow_id=None, duration_ms=None,
         )
 
     def test_queue_response_omits_unavailable_or_injected_trace_headers(self):
@@ -1499,7 +1544,7 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(409, response.status_code)
         self.assertEqual("initial authority expired", response.text)
         self.controller.record_queue_http_wait_trace.assert_called_once_with(
-            "test1", True, False, flow_id=None,
+            "test1", True, False, flow_id=None, duration_ms=None,
         )
 
     def test_pending_queue_http_wait_does_not_block_unrelated_summary_get(self):

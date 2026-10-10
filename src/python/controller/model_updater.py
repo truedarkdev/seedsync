@@ -5065,6 +5065,7 @@ class ModelUpdater(_ControllerCoreAccess):
         self.__child_finalization_candidate_trace_signature: Optional[
             tuple[str, int, int, int, bool]
         ] = None
+        self.__publication_retry_pending = False
         breadcrumb_trace = getattr(
             getattr(self._controller, "_Controller__context", None),
             "breadcrumb_trace", None,
@@ -5074,6 +5075,42 @@ class ModelUpdater(_ControllerCoreAccess):
             self.__scan_pair_join_emitter = emitter_factory() if callable(emitter_factory) else None
         except Exception:
             self.__scan_pair_join_emitter = None
+
+    def __record_publication_retry(self, outcome: str) -> None:
+        """Record fixed, privacy-safe outcomes for failed model publication recovery."""
+        if outcome not in {"retry_admitted", "retry_rearmed", "retry_adopted"}:
+            return
+        controller = self._controller
+        try:
+            if not _controller_breadcrumb_effectively_enabled(
+                    controller, "model.candidate", "info",
+            ):
+                return
+            recorder = getattr(controller, "_Controller__record_breadcrumb", None)
+            if callable(recorder):
+                recorder(
+                    stage="model",
+                    message="model_publication_retry",
+                    details={
+                        "schema": "model_publication_retry.v1",
+                        "outcome": outcome,
+                    },
+                    event_type="state_transition",
+                    category="model.candidate",
+                    level="info",
+                    corr_id="model_update:aggregate",
+                    trace_scope="aggregate",
+                )
+        except Exception:
+            # Retry diagnostics are optional and cannot affect publication.
+            return
+
+    def __complete_publication_retry(self) -> None:
+        """Clear retry state only after a data candidate was actually adopted."""
+        if not self.__publication_retry_pending:
+            return
+        self.__publication_retry_pending = False
+        self.__record_publication_retry("retry_adopted")
 
     def __child_finalization_candidate_trace_is_enabled(self) -> bool:
         emitter = self.__scan_pair_join_emitter
@@ -8630,56 +8667,66 @@ class ModelUpdater(_ControllerCoreAccess):
                 for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
             }
 
-        def diagnostic_target_root_ids(extra_ids: object = (), *, root_proof: bool = False) -> tuple[str, ...]:
+        def diagnostic_target_root_ids(
+                extra_ids: object = (), *, root_proof: bool = False,
+                current_active_ids: Optional[Iterable[str]] = None,
+        ) -> tuple[str, ...]:
             """Prioritize roots already selected by this update's bounded work."""
-            category = "scan.root_shape" if root_proof else "scan.authority"
-            if not _controller_breadcrumb_effectively_enabled(controller, category, "info"):
-                return ()
-            selection_limit = 8
-            selected = []
-            seen = set()
+            try:
+                category = "scan.root_shape" if root_proof else "scan.authority"
+                if not _controller_breadcrumb_effectively_enabled(controller, category, "info"):
+                    return ()
+                selection_limit = 8
+                selected = []
+                seen = set()
 
-            def add(values: object) -> None:
-                if len(selected) >= selection_limit:
-                    return
-                if not isinstance(values, Iterable) or isinstance(values, (str, bytes, Mapping)):
-                    return
-                for file_id in values:
+                def add(values: object) -> None:
                     if len(selected) >= selection_limit:
                         return
-                    if isinstance(file_id, str) and file_id not in seen:
-                        seen.add(file_id)
-                        selected.append(file_id)
+                    if not isinstance(values, Iterable) or isinstance(values, (str, bytes, Mapping)):
+                        return
+                    for file_id in values:
                         if len(selected) >= selection_limit:
                             return
+                        if isinstance(file_id, str) and file_id not in seen:
+                            seen.add(file_id)
+                            selected.append(file_id)
+                            if len(selected) >= selection_limit:
+                                return
 
-            add(pending_completion_file_ids())
-            add(active_lftp_status_file_ids)
-            add(pre_poll_active_lftp_file_ids)
-            try:
+                add(pending_completion_file_ids())
+                if current_active_ids is None:
+                    current_active_ids = (
+                        status.file_id for status in post_filter_lftp_statuses
+                        if status.state in (
+                            LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING,
+                        ) and isinstance(status.file_id, str)
+                    )
+                add(current_active_ids)
+                add(pre_poll_active_lftp_file_ids)
                 deferred_intents = getattr(
                     controller, "_Controller__deferred_queue_intents", None,
                 )
                 if isinstance(deferred_intents, Mapping):
                     add(deferred_intents.keys())
+                add(extra_ids)
+                add(tuple(
+                    file_id for file_id, _pair_id in current_local_scan_root_targets()
+                ))
+                if scoped_final_pair_ids and len(selected) < selection_limit:
+                    for file in tuple(joint_local_files) + tuple(joint_remote_files):
+                        if file.path_pair_id not in scoped_final_pair_ids:
+                            continue
+                        file_id = ModelFile.build_file_id(file.name, file.path_pair_id)
+                        if file_id not in seen:
+                            seen.add(file_id)
+                            selected.append(file_id)
+                            if len(selected) >= selection_limit:
+                                break
+                return tuple(selected)
             except Exception:
-                # Optional diagnostic selection must not affect model updates.
-                pass
-            add(extra_ids)
-            add(tuple(
-                file_id for file_id, _pair_id in current_local_scan_root_targets()
-            ))
-            if scoped_final_pair_ids and len(selected) < selection_limit:
-                for file in tuple(joint_local_files) + tuple(joint_remote_files):
-                    if file.path_pair_id not in scoped_final_pair_ids:
-                        continue
-                    file_id = ModelFile.build_file_id(file.name, file.path_pair_id)
-                    if file_id not in seen:
-                        seen.add(file_id)
-                        selected.append(file_id)
-                        if len(selected) >= selection_limit:
-                            break
-            return tuple(selected)
+                # Optional selection must not change model route or eligibility.
+                return ()
 
         def pending_completion_presentation_file_ids() -> set[str]:
             # Compatibility floors recorded before this ownership record remain
@@ -10328,7 +10375,9 @@ class ModelUpdater(_ControllerCoreAccess):
                 ModelFile.build_file_id(name, path_pair_id)
                 for path_pair_id, name in progressive_joint_delta_keys
             }
-            partial_diagnostic_ids = diagnostic_target_root_ids(delta_file_ids)
+            partial_diagnostic_ids = diagnostic_target_root_ids(
+                delta_file_ids, current_active_ids=active_lftp_status_file_ids,
+            )
             partial_diagnostic_kwargs = {"diagnostic_target_root_ids": partial_diagnostic_ids} \
                 if partial_diagnostic_ids else {}
             partial_model = model_builder.build_progressive_roots(
@@ -11249,7 +11298,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     except Exception:
                         started_at = None
                     try:
-                        full_diagnostic_ids = diagnostic_target_root_ids()
+                        full_diagnostic_ids = diagnostic_target_root_ids(
+                            current_active_ids=active_lftp_status_file_ids,
+                        )
                         full_diagnostic_kwargs = {"diagnostic_target_root_ids": full_diagnostic_ids} \
                             if full_diagnostic_ids else {}
                         new_model = model_builder.build_model(
@@ -11286,12 +11337,28 @@ class ModelUpdater(_ControllerCoreAccess):
 
             def apply_model_replacement(operation: Callable[[], object]) -> object:
                 """Use the Model's one progress-provenance publication boundary."""
-                return model.apply_authoritative_root_replacement(
-                    operation, replacement_statuses_by_file_id(),
-                    lambda file_id: getattr(
-                        controller, "_Controller__transfer_lifecycle_epochs", {},
-                    ).get(file_id, 0),
-                )
+                statuses = replacement_statuses_by_file_id()
+                try:
+                    return model.apply_authoritative_root_replacement(
+                        operation, statuses,
+                        lambda file_id: getattr(
+                            controller, "_Controller__transfer_lifecycle_epochs", {},
+                        ).get(file_id, 0),
+                    )
+                except Exception:
+                    retry_was_pending = self.__publication_retry_pending
+                    try:
+                        model_builder.request_rebuild()
+                    except Exception:
+                        # Preserve the original publication exception and never
+                        # let optional recovery machinery replace it.
+                        pass
+                    else:
+                        self.__publication_retry_pending = True
+                        self.__record_publication_retry(
+                            "retry_rearmed" if retry_was_pending else "retry_admitted",
+                        )
+                    raise
 
             def publish_final_move_pending(file: ModelFile, pending: bool) -> None:
                 """Publish move entry from its candidate and exit from the live root."""
@@ -13216,6 +13283,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         applied_builder_invalidation_tokens,
                     )
                     synchronize_applied_model_overlay_generation()
+                    self.__complete_publication_retry()
                     refresh_identities = getattr(
                         controller, "_refresh_model_file_command_identities_locked", None
                     )
@@ -13473,6 +13541,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         lambda: local_root_source_adopter(local_root_sources),
                         target_ids=lambda: diagnostic_target_root_ids(
                             local_root_sources.keys(), root_proof=True,
+                            current_active_ids=active_lftp_status_file_ids,
                         ),
                         input_sources=local_root_sources if local_root_source_input_known else None,
                         input_presence="unknown" if not local_root_source_input_known else "absent",

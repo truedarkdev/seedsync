@@ -1227,7 +1227,7 @@ class TestModelUpdater(unittest.TestCase):
             logger=MagicMock(),
         )
         updater = ModelUpdater(controller)
-        updater._update_once = lambda: True
+        updater._update_once = lambda *, child_candidate_trace_enabled=False, child_candidate_events=None: True
 
         updater.update()
 
@@ -1302,7 +1302,7 @@ class TestModelUpdater(unittest.TestCase):
         work_lock = TrackingLock()
         work_updater = create_updater(work_lock, work_trace)
 
-        def fail_work():
+        def fail_work(*, child_candidate_trace_enabled=False, child_candidate_events=None):
             raise work_error
 
         work_updater._update_once = fail_work
@@ -1759,7 +1759,7 @@ class TestModelUpdater(unittest.TestCase):
             logger=MagicMock(),
         )
         updater = ModelUpdater(controller)
-        def fail_after_status_consume():
+        def fail_after_status_consume(*, child_candidate_trace_enabled=False, child_candidate_events=None):
             updater._ModelUpdater__progress_lineage_correlation = "lftp-poll:0123456789abcdef"
             raise RuntimeError("update failed")
         updater._update_once = MagicMock(side_effect=fail_after_status_consume)
@@ -1796,7 +1796,7 @@ class TestModelUpdater(unittest.TestCase):
             )
             updater = ModelUpdater(controller)
 
-            def update_once():
+            def update_once(*, child_candidate_trace_enabled=False, child_candidate_events=None):
                 trace.record_progress_lineage(
                     correlation, "status_consume",
                     {"source": "fresh_healthy", "fresh": True, "healthy": True},
@@ -1896,7 +1896,7 @@ class TestModelUpdater(unittest.TestCase):
         updater = ModelUpdater(controller)
         callback_ran = []
 
-        def update_once():
+        def update_once(*, child_candidate_trace_enabled=False, child_candidate_events=None):
             callback_ran.append(True)
             trace.record_progress_lineage(
                 correlation, "status_consume",
@@ -2791,6 +2791,7 @@ class TestModelUpdater(unittest.TestCase):
         )
         controller._Controller__path_pairs_by_id = {"private-pair": MagicMock()}
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        raw_authority_details = []
 
         def record_breadcrumb(**kwargs):
             metadata = {
@@ -2802,6 +2803,8 @@ class TestModelUpdater(unittest.TestCase):
                 metadata["category"] = kwargs["category"]
             if "level" in kwargs:
                 metadata["level"] = kwargs["level"]
+            if kwargs["message"] == "scan_authority":
+                raw_authority_details.append(dict(kwargs["details"]))
             trace.record(
                 "controller", kwargs["message"], kwargs["details"],
                 **metadata,
@@ -2810,17 +2813,27 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__record_breadcrumb = record_breadcrumb
         ModelUpdater(controller).update()
 
-        payload = trace.query_events(
-            category="scan.authority", stage="scan_authority", limit=1,
-        )
-        self.assertEqual(1, len(payload["events"]))
-        entry = payload["events"][0]
+        all_entries = trace.snapshot()["entries"]
+        authority_entries = [
+            event for event in all_entries if event.get("message") == "scan_authority"
+        ]
+        self.assertEqual(1, len(authority_entries))
+        entry = authority_entries[0]
         details = entry["details"]
         self.assertEqual("scan.authority", entry["category"])
         self.assertEqual("info", entry["level"])
         self.assertEqual("scan_authority", entry["stage"])
         self.assertEqual("diagnostic", entry["event_type"])
         self.assertEqual("aggregate", entry["trace_scope"])
+        self.assertEqual(1, len(raw_authority_details))
+        raw_details = raw_authority_details[0]
+        self.assertEqual(
+            0, raw_details["local_scan_generation"],
+        )
+        self.assertEqual(
+            0, raw_details["remote_scan_generation"],
+        )
+        self.assertEqual(dict(list(raw_details.items())[:24]), details)
         self.assertTrue(details["final"])
         self.assertTrue(details["full"])
         self.assertTrue(details["joint_final"])
@@ -2829,46 +2842,42 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(2, details["scanned_pair_count"])
         self.assertEqual(2, details["completed_pair_count"])
         self.assertEqual(0, details["unknown_pair_count"])
-        self.assertEqual(2, details["staged_bucket_count"])
-        self.assertEqual(2, details["adopted_bucket_count"])
-        self.assertFalse(details["pair_delta_allowed"])
-        self.assertFalse(details["pair_delta_fallback"])
-        self.assertEqual(0, details["unknown_overlay_before_count"])
-        self.assertEqual(0, details["unknown_overlay_current_count"])
-        self.assertEqual(0, details["unknown_overlay_after_count"])
-        self.assertEqual(0, details["raw_local_reconciliation_before_count"])
-        self.assertEqual(1, details["raw_local_reconciliation_after_count"])
-        self.assertEqual(1, details["effective_local_reconciliation_after_count"])
-        self.assertNotIn("private-remote-session", str(entry))
-        self.assertNotIn("private-local-session", str(entry))
-        self.assertNotIn("private-pair", str(entry))
-        self.assertNotIn("private-remote-root", str(entry))
-        self.assertNotIn("private-local-root", str(entry))
+        authority_snapshot = controller._Controller__scan_authority_snapshot
+        self.assertEqual(2, authority_snapshot["staged_bucket_count"])
+        self.assertEqual(2, authority_snapshot["adopted_bucket_count"])
+        self.assertFalse(authority_snapshot["pair_delta_allowed"])
+        self.assertFalse(authority_snapshot["pair_delta_fallback"])
+        self.assertEqual(0, raw_details["unknown_overlay_before_count"])
+        self.assertEqual(0, raw_details["unknown_overlay_current_count"])
+        self.assertEqual(0, raw_details["unknown_overlay_after_count"])
+        self.assertEqual(0, raw_details["raw_local_reconciliation_before_count"])
+        self.assertEqual(1, raw_details["raw_local_reconciliation_after_count"])
+        self.assertEqual(1, raw_details["effective_local_reconciliation_after_count"])
+        self.assertEqual(0, authority_snapshot["local_scan_generation"])
+        self.assertEqual(0, authority_snapshot["remote_scan_generation"])
+        self.assertNotIn("local_scan_generation", details)
+        self.assertNotIn("remote_scan_generation", details)
+        self.assertIn("local_scan_generation", authority_snapshot)
+        self.assertIn("remote_scan_generation", authority_snapshot)
+        for private_value in (
+                "private-remote-session", "private-local-session", "private-pair",
+                "private-remote-root", "private-local-root"):
+            self.assertNotIn(private_value, str(all_entries))
         self.assertNotEqual("private-remote-session", entry["corr_id"])
         self.assertEqual(
-            details,
-            controller._Controller__scan_authority_snapshot | {
-                "local_final": details["local_final"],
-                "remote_final": details["remote_final"],
-                "local_full": details["local_full"],
-                "remote_full": details["remote_full"],
-                "local_scanned_pair_count": details["local_scanned_pair_count"],
-                "remote_scanned_pair_count": details["remote_scanned_pair_count"],
-                "local_completed_pair_count": details["local_completed_pair_count"],
-                "remote_completed_pair_count": details["remote_completed_pair_count"],
-                "local_unknown_pair_count": details["local_unknown_pair_count"],
-                "remote_unknown_pair_count": details["remote_unknown_pair_count"],
-                "joint_authoritative_before": details["joint_authoritative_before"],
-                "joint_authoritative": details["joint_authoritative"],
-                "staged_pair_count": details["staged_pair_count"],
-                "adopted_pair_count": details["adopted_pair_count"],
-                "pair_delta_allowed": details["pair_delta_allowed"],
-                "pair_delta_fallback": details["pair_delta_fallback"],
-                "unknown_overlay_before_count": details["unknown_overlay_before_count"],
-                "unknown_overlay_current_count": details["unknown_overlay_current_count"],
-                "raw_local_reconciliation_before_count": details["raw_local_reconciliation_before_count"],
-            },
+            [
+                "final", "full", "local_final", "remote_final", "local_full", "remote_full",
+                "scanned_pair_count", "completed_pair_count", "unknown_pair_count",
+                "local_scanned_pair_count", "remote_scanned_pair_count",
+                "local_completed_pair_count", "remote_completed_pair_count",
+                "local_unknown_pair_count", "remote_unknown_pair_count", "joint_final",
+                "joint_authoritative_before", "joint_authoritative_after", "joint_authoritative",
+                "publication_required", "outcome", "reason", "comparison_proven_count", "delta_count",
+            ],
+            list(details),
         )
+        self.assertEqual("adopt", details["outcome"])
+        self.assertEqual("source_buckets_adopted", details["reason"])
 
     def test_scan_authority_event_matches_standing_summary_identity_and_versions(self):
         remote = ScannerResult(
@@ -5811,6 +5820,12 @@ class TestModelUpdater(unittest.TestCase):
             _Controller__should_auto_purge_local_file=MagicMock(return_value=False),
             _sync_final_move_succeeded_files_to_model=MagicMock(),
         )
+        controller._Controller__incoming_recovery_flow_recorder = (
+            Controller._Controller__incoming_recovery_flow_recorder.__get__(controller, Controller)
+        )
+        controller._record_completion_scan_join_breadcrumb = lambda file_id, message, details: (
+            Controller._record_completion_scan_join_breadcrumb(controller, file_id, message, details)
+        )
         def record_reconciliation(local_ids, remote_ids):
             if local_ids is not None:
                 controller._Controller__reconciled_local_path_pair_ids = set(local_ids)
@@ -6728,7 +6743,10 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(frozenset({"pair-a", "pair-b"}), builder.unknown_local_path_pair_ids_snapshot())
         self.assertEqual((), builder.get_trusted_final_leaf_paths(a_id))
         builder.build_model.assert_not_called()
-        rows = trace.query_events(category="scan.pair_join", limit=16)["events"]
+        rows = [
+            event for event in trace.snapshot()["entries"]
+            if event.get("message") == "scan_pair_join"
+        ]
         self.assertEqual(7, len(rows))
         final_rows = rows[-2:]
         standing = controller._Controller__scan_authority_snapshot
@@ -7273,15 +7291,45 @@ class TestModelUpdater(unittest.TestCase):
         builder.build_authoritative_pair_roots = MagicMock(
             wraps=builder.build_authoritative_pair_roots,
         )
+        builder.build_progressive_roots = MagicMock(wraps=builder.build_progressive_roots)
         builder.build_model = MagicMock(wraps=builder.build_model)
         builder.set_local_files = MagicMock(wraps=builder.set_local_files)
         builder.set_remote_files = MagicMock(wraps=builder.set_remote_files)
+        local_map_before = builder._ModelBuilder__local_files_by_pair
+        local_roots_before = {
+            pair_id: dict(roots) for pair_id, roots in local_map_before.items()
+        }
+        local_roots_by_id_before = {
+            ModelFile.build_file_id(root.name, pair_id): root
+            for pair_id, roots in local_roots_before.items()
+            for root in roots.values()
+        }
+        local_proofs_before = builder._ModelBuilder__local_root_scan_proofs
+        local_proof_values_before = dict(local_proofs_before)
+        cached_model_before = builder._ModelBuilder__cached_model
+        dirty_before = builder.has_changes()
+        model_version_before = model.version
         updater.update()
 
         builder.build_authoritative_pair_roots.assert_not_called()
+        builder.build_progressive_roots.assert_not_called()
         builder.build_model.assert_not_called()
-        builder.set_local_files.assert_not_called()
+        builder.set_local_files.assert_called_once()
         builder.set_remote_files.assert_not_called()
+        local_roots_by_id_incoming = {
+            ModelFile.build_file_id(root.name, root.path_pair_id): root
+            for root in builder.set_local_files.call_args.args[0]
+        }
+        self.assertEqual(set(local_roots_by_id_before), set(local_roots_by_id_incoming))
+        for file_id, root in local_roots_by_id_before.items():
+            self.assertIs(root, local_roots_by_id_incoming[file_id])
+        self.assertIs(local_map_before, builder._ModelBuilder__local_files_by_pair)
+        self.assertEqual(local_roots_before, builder._ModelBuilder__local_files_by_pair)
+        self.assertEqual(local_proof_values_before, builder._ModelBuilder__local_root_scan_proofs)
+        self.assertIs(cached_model_before, builder._ModelBuilder__cached_model)
+        self.assertEqual(dirty_before, builder.has_changes())
+        self.assertFalse(dirty_before)
+        self.assertEqual(model_version_before, model.version)
         self.assertTrue(controller._Controller__progressive_joint_authoritative)
         self.assertTrue(controller._Controller__last_local_reconciliation_healthy)
         self.assertTrue(controller._Controller__last_remote_reconciliation_healthy)
@@ -7470,6 +7518,10 @@ class TestModelUpdater(unittest.TestCase):
         ModelUpdater(controller).update()
 
         builder.build_authoritative_pair_roots.assert_called_once()
+        selected_diagnostic_ids = builder.build_authoritative_pair_roots.call_args.kwargs[
+            "diagnostic_target_root_ids"
+        ]
+        self.assertIn(ModelFile.build_file_id("new.bin", "pair-a"), selected_diagnostic_ids)
 
         self.assertEqual(
             {ModelFile.build_file_id("new.bin", "pair-a"), ModelFile.build_file_id("idle.bin", "pair-b")},
@@ -7514,6 +7566,133 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(1, durations[
             DURATION_MODEL_UPDATE_FINALIZATION_LIFECYCLE_DIFF_APPLICATION
         ]["count"])
+
+    def test_completed_pair_selector_off_or_failing_preserves_pair_adoption(self):
+        def run_case(selector_mode):
+            old = SystemFile("old.bin", 10, False)
+            old.path_pair_id = "pair-a"
+            idle = SystemFile("idle.bin", 20, False)
+            idle.path_pair_id = "pair-b"
+            builder = ModelBuilder()
+            builder.set_local_files([old, idle])
+            builder.set_remote_files([old, idle])
+            builder.set_unknown_local_path_pair_ids({"pair-b"})
+            old_id = ModelFile.build_file_id("old.bin", "pair-a")
+            builder.set_downloaded_timestamps({old_id: 1760000010.0})
+            live_model = builder.build_model()
+            builder.build_model = MagicMock(wraps=builder.build_model)
+            builder.build_authoritative_pair_roots = MagicMock(
+                wraps=builder.build_authoritative_pair_roots,
+            )
+            next_local = SystemFile("new.bin", 30, False)
+            next_local.path_pair_id = "pair-a"
+            next_remote = SystemFile("new.bin", 30, False)
+            next_remote.path_pair_id = "pair-a"
+            final_local = ScannerResult(
+                datetime.now(), [next_local], scanned_path_pair_ids={"pair-a"},
+                is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+            )
+            final_remote = ScannerResult(
+                datetime.now(), [next_remote], scanned_path_pair_ids={"pair-a"},
+                is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+            )
+            controller, _ = self._make_progressive_update_controller(
+                final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+            )
+            controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+            controller._Controller__model = live_model
+            Controller._refresh_model_file_command_identities_locked(controller)
+            controller._Controller__context.performance_diagnostics = PerformanceDiagnosticsCollector(
+                lambda: True,
+            )
+            identity_refresh_snapshots = []
+
+            def publish_identity_snapshot():
+                Controller._refresh_model_file_command_identities_locked(controller)
+                identity_refresh_snapshots.append(
+                    controller._Controller__model_file_command_identities,
+                )
+
+            controller._refresh_model_file_command_identities_locked = publish_identity_snapshot
+            if selector_mode == "off":
+                controller._Controller__context.breadcrumb_trace.is_effectively_enabled = (
+                    lambda category, level="info": False
+                )
+
+            selector_errors = []
+            if selector_mode == "error":
+                from controller import model_updater as updater_module
+
+                original_gate = updater_module._controller_breadcrumb_effectively_enabled
+
+                def fail_inside_selector(candidate_controller, category, level="info"):
+                    if candidate_controller is controller and \
+                            sys._getframe(1).f_code.co_name == "diagnostic_target_root_ids":
+                        selector_errors.append(category)
+                        raise RuntimeError("injected optional selector failure")
+                    return original_gate(candidate_controller, category, level)
+
+                with patch(
+                        "controller.model_updater._controller_breadcrumb_effectively_enabled",
+                        new=fail_inside_selector):
+                    ModelUpdater(controller).update()
+            else:
+                ModelUpdater(controller).update()
+
+            builder.build_authoritative_pair_roots.assert_called_once()
+            builder.build_model.assert_not_called()
+            self.assertFalse(builder.has_changes())
+            return {
+                "state": (
+                    frozenset(live_model.get_file_ids()),
+                    live_model.version,
+                    live_model.scope_version("pair-a"),
+                    live_model.scope_version("pair-b"),
+                    live_model.downloaded_timestamp_overlay_generation,
+                    live_model.get_file(ModelFile.build_file_id("new.bin", "pair-a")).remote_size,
+                    len(identity_refresh_snapshots),
+                ),
+                "diagnostic_ids": builder.build_authoritative_pair_roots.call_args.kwargs.get(
+                    "diagnostic_target_root_ids",
+                ),
+                "selector_errors": tuple(selector_errors),
+            }
+
+        enabled = run_case("on")
+        disabled = run_case("off")
+        failed = run_case("error")
+
+        self.assertEqual(enabled["state"], disabled["state"])
+        self.assertEqual(enabled["state"], failed["state"])
+        self.assertIn(ModelFile.build_file_id("new.bin", "pair-a"), enabled["diagnostic_ids"])
+        self.assertIsNone(disabled["diagnostic_ids"])
+        self.assertIsNone(failed["diagnostic_ids"])
+        self.assertTrue(failed["selector_errors"])
+
+    def test_full_build_selector_keeps_filtered_current_status_membership(self):
+        remote = SystemFile("queued.bin", 30, False)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        live_model = builder.build_model()
+        builder.request_rebuild()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        current_queued = LftpJobStatus(
+            92, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, "queued.bin", "",
+        )
+        controller._Controller__lftp.status.return_value = [current_queued]
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+
+        ModelUpdater(controller).update()
+
+        builder.build_model.assert_called_once_with(
+            diagnostic_target_root_ids=(current_queued.file_id,),
+        )
+        self.assertEqual(ModelFile.State.QUEUED, live_model.get_file("queued.bin").state)
 
     def test_targeted_progressive_final_clears_stale_inventory_when_roots_are_unchanged(self):
         """A selected pair completion publishes even when its roots match standing authority."""
@@ -7823,6 +8002,7 @@ class TestModelUpdater(unittest.TestCase):
 
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=128)
         controller._Controller__context.breadcrumb_trace = trace
+        raw_authority_details = []
 
         def record_breadcrumb(**kwargs):
             metadata = {
@@ -7833,6 +8013,8 @@ class TestModelUpdater(unittest.TestCase):
             for key in ("category", "level", "corr_id", "flow_id"):
                 if key in kwargs:
                     metadata[key] = kwargs[key]
+            if kwargs["message"] == "scan_authority":
+                raw_authority_details.append(dict(kwargs["details"]))
             trace.record(
                 "controller", kwargs["message"], kwargs.get("details"), **metadata,
             )
@@ -7844,22 +8026,32 @@ class TestModelUpdater(unittest.TestCase):
         def authority_events():
             # Query immediately after each update so this uses the real
             # collector's synchronous in-memory retrieval path.
-            return trace.query_events(
-                category="scan.authority", stage="scan_authority", limit=128,
-            )["events"]
+            return [
+                event for event in trace.snapshot()["entries"]
+                if event.get("message") == "scan_authority"
+            ]
 
         def run_update(expected_new_events):
             nonlocal authority_seen
+            raw_seen = len(raw_authority_details)
             updater.update()
             events = authority_events()
             new_events = events[authority_seen:]
+            new_raw_details = raw_authority_details[raw_seen:]
             self.assertEqual(expected_new_events, len(new_events))
+            self.assertEqual(expected_new_events, len(new_raw_details))
             standing = controller._Controller__scan_authority_snapshot
-            for event in new_events:
+            for event, raw_details in zip(new_events, new_raw_details):
                 details = event["details"]
-                for key, value in standing.items():
-                    self.assertIn(key, details)
-                    self.assertEqual(value, details[key], key)
+                self.assertEqual(dict(list(raw_details.items())[:24]), details)
+                self.assertEqual(
+                    standing["local_scan_generation"], raw_details["local_scan_generation"],
+                )
+                self.assertEqual(
+                    standing["remote_scan_generation"], raw_details["remote_scan_generation"],
+                )
+                self.assertNotIn("local_scan_generation", details)
+                self.assertNotIn("remote_scan_generation", details)
             authority_seen = len(events)
             return new_events
 
@@ -7910,35 +8102,41 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(baseline_snapshot, controller._Controller__scan_authority_snapshot)
         self.assertNotIn(stale_root_name, controller._Controller__model.get_file_names())
 
-        failed = run_update(1)[0]["details"]
+        run_update(1)
+        failed = raw_authority_details[-1]
         self.assertEqual("no_op", failed["outcome"])
         self.assertEqual("joint_not_final", failed["reason"])
         self.assertEqual(2, failed["unknown_overlay_after_count"])
 
-        recovered = run_update(1)[0]["details"]
+        run_update(1)
+        recovered = raw_authority_details[-1]
         self.assertEqual("adopt", recovered["outcome"])
         self.assertEqual("source_buckets_adopted", recovered["reason"])
         self.assertEqual(0, recovered["unknown_overlay_after_count"])
         self.assertTrue(recovered["joint_authoritative_after"])
 
         self.assertEqual([], run_update(0))
-        no_op = run_update(1)[0]["details"]
+        run_update(1)
+        no_op = raw_authority_details[-1]
         self.assertEqual("no_op", no_op["outcome"])
         self.assertEqual("comparison_proven_noop", no_op["reason"])
         self.assertEqual(2, no_op["local_noop_count"])
 
-        pair_a_final = run_update(1)[0]["details"]
+        run_update(1)
+        pair_a_final = raw_authority_details[-1]
         self.assertEqual("adopt", pair_a_final["outcome"])
         self.assertEqual("pair_delta_adopted", pair_a_final["reason"])
         self.assertTrue(pair_a_final["pair_delta_allowed"])
         self.assertFalse(pair_a_final["pair_delta_fallback"])
         self.assertEqual(0, pair_a_final["unknown_overlay_after_count"])
 
-        failed_again = run_update(1)[0]["details"]
+        run_update(1)
+        failed_again = raw_authority_details[-1]
         self.assertEqual("no_op", failed_again["outcome"])
         self.assertEqual(1, failed_again["unknown_overlay_after_count"])
 
-        pair_b_final = run_update(1)[0]["details"]
+        run_update(1)
+        pair_b_final = raw_authority_details[-1]
         self.assertEqual("adopt", pair_b_final["outcome"])
         self.assertEqual("pair_delta_adopted", pair_b_final["reason"])
         self.assertTrue(pair_b_final["pair_delta_allowed"])
@@ -8469,7 +8667,10 @@ class TestModelUpdater(unittest.TestCase):
 
         ModelUpdater(controller).update()
 
-        rows = trace.query_events(category="scan.pair_join", limit=8)["events"]
+        rows = [
+            event for event in trace.snapshot()["entries"]
+            if event.get("message") == "scan_pair_join"
+        ]
         self.assertEqual(1, len(rows))
         self.assertEqual("source_buckets_adopted_after_pair_fallback", rows[0]["details"]["reason"])
         self.assertEqual(
@@ -8514,10 +8715,36 @@ class TestModelUpdater(unittest.TestCase):
         )
         controller._Controller__path_pairs_by_id = {"pair-a": MagicMock()}
         controller._Controller__context.performance_diagnostics = PerformanceDiagnosticsCollector(lambda: True)
-        live_model.add_file = MagicMock(side_effect=RuntimeError("candidate lifecycle failure"))
+        trace = BreadcrumbTraceCollector(
+            lambda: True, max_entries=8,
+            policy={"default": "off", "rules": {"model.candidate": "info"}},
+        )
+        self.addCleanup(trace.close)
+        controller._Controller__context.breadcrumb_trace = trace
+        recorder_mock = controller._Controller__record_breadcrumb
 
-        with self.assertRaisesRegex(RuntimeError, "candidate lifecycle failure"):
-            ModelUpdater(controller).update()
+        def record_breadcrumb(**kwargs):
+            recorder_mock(**kwargs)
+            trace.record(
+                "model_updater", kwargs["message"], kwargs["details"],
+                stage=kwargs["stage"], event_type=kwargs["event_type"],
+                category=kwargs["category"], level=kwargs["level"],
+                corr_id=kwargs["corr_id"], trace_scope=kwargs["trace_scope"],
+            )
+            if kwargs["message"] == "model_publication_retry":
+                raise RuntimeError("optional breadcrumb failure")
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+        publication_error = RuntimeError("candidate lifecycle failure")
+        live_model.add_file = MagicMock(side_effect=publication_error)
+        updater = ModelUpdater(controller)
+        controller._Controller__updater = updater
+
+        with patch.object(builder, "request_rebuild", wraps=builder.request_rebuild) as request_rebuild:
+            with self.assertRaises(RuntimeError) as raised:
+                updater.update()
+            self.assertIs(publication_error, raised.exception)
+            request_rebuild.assert_called()
 
         new_id = ModelFile.build_file_id("new.bin", "pair-a")
         self.assertIn(new_id, builder._ModelBuilder__local_files_by_pair["pair-a"])
@@ -8526,7 +8753,7 @@ class TestModelUpdater(unittest.TestCase):
         counters = controller._Controller__context.performance_diagnostics.snapshot()["counters"]
         self.assertEqual(1, counters[COUNTER_CANDIDATE_LIFECYCLE_FALLBACK])
         lifecycle_calls = [
-            call for call in controller._Controller__record_breadcrumb.call_args_list
+            call for call in recorder_mock.call_args_list
             if call.kwargs.get("message") == "candidate_lifecycle_fallback"
         ]
         self.assertEqual(1, len(lifecycle_calls))
@@ -8534,6 +8761,51 @@ class TestModelUpdater(unittest.TestCase):
             CANDIDATE_LIFECYCLE_FALLBACK_REASON_EXCEPTION,
             lifecycle_calls[0].kwargs["details"]["reason"],
         )
+
+        del live_model.add_file
+        no_scan_results = {"local": [], "remote": [], "active": []}
+        for side, process in (
+                ("local", controller._Controller__local_scan_process),
+                ("remote", controller._Controller__remote_scan_process),
+                ("active", controller._Controller__active_scan_process),
+        ):
+            def pop_no_scan(side=side):
+                no_scan_results[side].append(None)
+                return None
+            process.pop_latest_result.side_effect = pop_no_scan
+        with patch.object(builder, "request_rebuild", wraps=builder.request_rebuild) as request_rebuild:
+            updater.update()
+            request_rebuild.assert_not_called()
+        self.assertEqual({side: [None] for side in no_scan_results}, no_scan_results)
+        self.assertIs(controller._Controller__updater, updater)
+        self.assertIn(new_id, live_model.get_file_ids())
+        self.assertIn(new_id, controller._Controller__model.get_file_ids())
+        self.assertFalse(builder.has_changes())
+
+        retry_events = [
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("message") == "model_publication_retry"
+        ]
+        self.assertEqual(["retry_admitted", "retry_adopted"], [
+            entry["details"]["outcome"] for entry in retry_events
+        ])
+        self.assertTrue(all(
+            list(entry["details"]) == ["schema", "outcome"] and
+            entry["details"]["schema"] == "model_publication_retry.v1" and
+            entry["category"] == "model.candidate"
+            for entry in retry_events
+        ))
+        self.assertNotIn("candidate lifecycle failure", json.dumps(retry_events))
+        self.assertNotIn(new_id, json.dumps(retry_events))
+
+        intake_error = RuntimeError("unrelated scan intake failure")
+        controller._Controller__remote_scan_process.pop_latest_result.side_effect = intake_error
+        with patch.object(builder, "request_rebuild", wraps=builder.request_rebuild) as request_rebuild:
+            with self.assertRaises(RuntimeError) as raised:
+                updater.update()
+            self.assertIs(intake_error, raised.exception)
+            request_rebuild.assert_not_called()
+        self.assertFalse(builder.has_changes())
 
     def test_pair_candidate_waits_for_startup_recovery(self):
         old = SystemFile("old.bin", 10, False)
@@ -9740,8 +10012,29 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__prev_downloading_file_names = {
             ("active-{}".format(index), None, None) for index in range(5)
         }
+        pending_before = set(controller._Controller__pending_completion_file_names)
+        current_active_statuses = [
+            LftpJobStatus(
+                index + 1,
+                LftpJobStatus.Type.GET,
+                LftpJobStatus.State.RUNNING,
+                "active-{}".format(index),
+                "",
+            )
+            for index in range(5)
+        ]
+        controller._Controller__lftp.status.return_value = current_active_statuses
 
         ModelUpdater(controller).update()
+
+        self.assertEqual(pending_before, controller._Controller__pending_completion_file_names)
+        self.assertEqual(
+            {
+                (status.name, status.path_pair_id, status.path_pair_name)
+                for status in current_active_statuses
+            },
+            controller._Controller__prev_downloading_file_names,
+        )
 
         model_builder.build_progressive_roots.assert_called_once()
         build_args, build_kwargs = model_builder.build_progressive_roots.call_args
@@ -9892,7 +10185,9 @@ class TestModelUpdater(unittest.TestCase):
         model_builder.build_progressive_roots.assert_called_once()
         partial_model.get_file.assert_called_once_with(live_id)
         model_builder.request_rebuild.assert_called_once_with()
-        model_builder.build_model.assert_called_once_with()
+        model_builder.build_model.assert_called_once_with(
+            diagnostic_target_root_ids=('["pair-a","identity-root"]',),
+        )
         update_file.assert_not_called()
         self.assertNotEqual(live_id, pairless_candidate.file_id)
 
@@ -9915,7 +10210,20 @@ class TestModelUpdater(unittest.TestCase):
 
         model_builder.build_progressive_roots.assert_called_once()
         model_builder.request_rebuild.assert_not_called()
-        update_file.assert_called_once_with(candidate)
+        update_file.assert_called_once_with(
+            candidate,
+            structural_job_identity=None,
+            publication_context={
+                "schema": "model_route_floor_context.v1",
+                "route": "progressive_root",
+                "pending": False,
+                "floor_present": False,
+                "floor_identity_match": None,
+                "publication_present": False,
+                "publication_identity_match": None,
+                "floor_disposition": "not_called",
+            },
+        )
         self.assertEqual(live_id, candidate.file_id)
         self.assertEqual(99, live_model.get_file(live_id).remote_size)
 
@@ -10020,7 +10328,9 @@ class TestModelUpdater(unittest.TestCase):
         ModelUpdater(controller).update()
 
         model_builder.build_progressive_roots.assert_not_called()
-        model_builder.build_model.assert_called_once_with()
+        model_builder.build_model.assert_called_once_with(
+            diagnostic_target_root_ids=("root",),
+        )
 
     def test_progressive_startup_publishes_each_root_wave_before_one_final_build(self):
         def result(files, *, final=False):
@@ -10114,7 +10424,11 @@ class TestModelUpdater(unittest.TestCase):
             expected_first_names | {"second.bin"},
             {row[1] for row in identity_refresh_snapshots[-1]},
         )
-        builder.build_model.assert_called_once_with()
+        builder.build_model.assert_called_once()
+        self.assertCountEqual(
+            {"first.bin", "second.bin"},
+            builder.build_model.call_args.kwargs["diagnostic_target_root_ids"],
+        )
 
     def test_progressive_scanner_session_change_reopens_initial_publication_window(self):
         process = object.__new__(ScannerProcess)
@@ -10155,7 +10469,19 @@ class TestModelUpdater(unittest.TestCase):
         self.assertTrue(entries)
         details = entries[-1]["details"]
         self.assertEqual("local", details["scanner_side"])
-        self.assertIn("accumulator_authoritative_root_count", details)
+        self.assertEqual(
+            [
+                "scanner_side", "session_digest", "event_count", "full_event_count",
+                "distinct_generation_count", "min_generation", "max_generation",
+                "input_top_level_file_count", "distinct_pair_name_count",
+                "duplicate_pair_name_count", "pair_id_mismatch_count", "targeted",
+                "generation", "final", "full", "progress", "failed",
+                "scanned_pair_count", "completed_pair_count", "unknown_pair_count",
+                "root_count", "file_count", "handoff_root_present", "fence",
+            ],
+            list(details),
+        )
+        self.assertNotIn("accumulator_authoritative_root_count", details)
         self.assertEqual(1, details["event_count"])
         self.assertEqual(1, details["full_event_count"])
         self.assertEqual(1, details["distinct_generation_count"])
@@ -11118,8 +11444,19 @@ class TestModelUpdater(unittest.TestCase):
 
         linked = trace.snapshot(flow_id=second_correlation)["entries"]
         linked_messages = {entry["message"] for entry in linked}
-        self.assertIn("lftp_status_poll", linked_messages)
-        self.assertIn("completion_pending_registered", linked_messages)
+        expected_linked_messages = {
+            "lftp_status_poll",
+            "lftp_status_membership_transition",
+            "completion_pending_registered",
+            "status_consumed",
+            "updater_finished",
+            "completion_progress_floor_capture",
+            "completion_live_snapshot_eviction",
+            "completion_gate_candidate",
+            "completion_gate_decision",
+            "pending_completion_move_decision",
+        }
+        self.assertEqual(expected_linked_messages, linked_messages)
         completion = next(
             entry for entry in linked if entry["message"] == "completion_pending_registered"
         )
@@ -11130,19 +11467,54 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(second_correlation, membership["flow_id"])
         self.assertIn("|x=removed", membership["details"]["transitions"][0])
         self.assertIn("|f=0|", membership["details"]["transitions"][0])
-        self.assertTrue(all(
-            entry["details"].get("poll_correlation") == second_correlation
-            for entry in linked
-            if entry["message"] != "lftp_status_poll"
-        ))
+        by_message = {entry["message"]: entry for entry in linked}
+        expected_corr_ids = {
+            "lftp_status_poll": "lftp:" + opaque_trace_correlation("lftp-status-aggregate"),
+            "lftp_status_membership_transition": "lftp:" + opaque_trace_correlation(
+                "lftp-status-aggregate",
+            ),
+            "completion_pending_registered": "completion:" + opaque_trace_correlation(
+                running.file_id,
+            ),
+            "status_consumed": second_correlation,
+            "updater_finished": second_correlation,
+        }
+        for message in expected_corr_ids:
+            self.assertEqual(second_correlation, by_message[message]["flow_id"], message)
+            self.assertEqual(expected_corr_ids[message], by_message[message]["corr_id"], message)
+        span_messages = {"status_consumed", "updater_finished"}
+        for entry in linked:
+            self.assertEqual(second_correlation, entry["flow_id"])
+            if entry["message"] not in span_messages:
+                self.assertEqual(second_correlation, entry["details"]["poll_correlation"])
+        self.assertEqual(
+            second_correlation,
+            by_message["lftp_status_poll"]["details"]["poll_correlation"],
+        )
+        self.assertEqual(second_correlation, membership["details"]["poll_correlation"])
+        self.assertEqual(
+            {"source": "fresh_healthy", "fresh": True, "healthy": True},
+            by_message["status_consumed"]["details"],
+        )
+        self.assertEqual(
+            {"outcome", "model_version"},
+            set(by_message["updater_finished"]["details"]),
+        )
+        self.assertEqual("success", by_message["updater_finished"]["details"]["outcome"])
         # The token is consumed by the fresh-snapshot intake and cannot leak
         # into a later cached/no-poll updater tick.
         self.assertIsNone(controller._take_lftp_status_poll_correlation())
-        before_cached = len(trace.snapshot()["entries"])
+        before_cached = trace.snapshot()["version"]
         controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(minutes=1)
         controller._Controller__lftp_idle_status_authoritative = True
         updater.update()
-        cached_entries = trace.snapshot()["entries"][before_cached:]
+        cached_snapshot = trace.snapshot(since_version=before_cached)
+        self.assertEqual(bool(cached_snapshot["gaps"]), cached_snapshot["gap"])
+        self.assertTrue(all(
+            gap["to_version"] <= before_cached for gap in cached_snapshot["gaps"]
+        ))
+        self.assertEqual(0, cached_snapshot["accounting"]["dropped_count"])
+        cached_entries = cached_snapshot["entries"]
         cached_status = next(
             entry for entry in cached_entries if entry["message"] == "lftp_status_poll"
         )
@@ -11570,7 +11942,9 @@ class TestModelUpdater(unittest.TestCase):
         self.assertIsNone(model.active_progress_overlay(file_id))
         self.assertNotIn(file_id, builder._ModelBuilder__recent_live_transfer_snapshots)
         self.assertNotIn(file_id, builder._ModelBuilder__retained_stopped_transfer_snapshots)
-        builder.build_model.assert_called_once_with()
+        builder.build_model.assert_called_once_with(
+            diagnostic_target_root_ids=("active.bin",),
+        )
         self.assertEqual(40, model.get_file(file_id).transferred_size)
 
     def test_late_older_counterless_status_preserves_newer_overlay(self):
@@ -11687,7 +12061,9 @@ class TestModelUpdater(unittest.TestCase):
         # Duplicate raw roots are never safe to preserve, even when every
         # duplicate happens to carry an older identity.
         self.assertIsNone(model.active_progress_overlay("active.bin"))
-        builder.build_model.assert_called_once_with()
+        builder.build_model.assert_called_once_with(
+            diagnostic_target_root_ids=("active.bin",),
+        )
 
     def test_late_older_counterless_type_mismatch_does_not_preserve_overlay(self):
         controller, builder, model = self._make_late_older_multi_root_fixture()
@@ -11809,7 +12185,9 @@ class TestModelUpdater(unittest.TestCase):
         # active-only scan has no usable transfer counter, so it must remain
         # counterless rather than selecting duplicate_b's 27.
         self.assertIsNone(model.get_file("active.bin").transferred_size)
-        builder.build_model.assert_called_once_with()
+        builder.build_model.assert_called_once_with(
+            diagnostic_target_root_ids=("active.bin",),
+        )
         self.assertFalse(builder.has_changes())
 
     def test_conflicting_duplicate_statuses_clear_prior_overlay_and_use_scanned_base(self):
@@ -11872,7 +12250,9 @@ class TestModelUpdater(unittest.TestCase):
         # no usable transfer counter after the status rejection.
         self.assertIsNone(model.active_progress_overlay("active.bin"))
         self.assertIsNone(model.get_file("active.bin").transferred_size)
-        builder.build_model.assert_called_once_with()
+        builder.build_model.assert_called_once_with(
+            diagnostic_target_root_ids=("active.bin",),
+        )
 
     def test_lftp_poll_lineage_reader_is_skipped_when_diagnostics_are_disabled(self):
         trace = BreadcrumbTraceCollector(
@@ -13530,7 +13910,9 @@ class TestModelUpdater(unittest.TestCase):
 
         updater.update()
 
-        builder.build_model.assert_called_once_with()
+        builder.build_model.assert_called_once_with(
+            diagnostic_target_root_ids=("root",),
+        )
         self.assertEqual(1, live_model.downloaded_timestamp_overlay_generation)
         self.assertEqual(25, live_model.get_file("root").transferred_size)
 
@@ -13543,7 +13925,9 @@ class TestModelUpdater(unittest.TestCase):
 
         updater.update()
 
-        builder.build_model.assert_called_once_with()
+        builder.build_model.assert_called_once_with(
+            diagnostic_target_root_ids=("root",),
+        )
         self.assertEqual(50, live_model.get_file("root").transferred_size)
 
     def test_progressive_active_timestamp_overlay_rejection_forces_one_full_build(self):
@@ -13587,12 +13971,16 @@ class TestModelUpdater(unittest.TestCase):
         updater = ModelUpdater(controller)
         updater.update()
 
-        builder.build_model.assert_called_once_with()
+        builder.build_model.assert_called_once_with(
+            diagnostic_target_root_ids=('["pair-a","first.bin"]',),
+        )
         self.assertEqual(1760000010.0, live_model.get_file(first_id).downloaded_timestamp.timestamp())
         self.assertEqual(1760000020.0, live_model.get_file(second_id).downloaded_timestamp.timestamp())
 
         updater.update()
-        builder.build_model.assert_called_once_with()
+        builder.build_model.assert_called_once_with(
+            diagnostic_target_root_ids=('["pair-a","first.bin"]',),
+        )
 
     def test_active_scan_and_fresh_lftp_progress_share_bounded_root_delta(self):
         builder = ModelBuilder()
@@ -13648,11 +14036,12 @@ class TestModelUpdater(unittest.TestCase):
         builder.build_model.assert_not_called()
 
     def test_running_to_queued_pending_completion_uses_full_reconciliation(self):
+        private_file_name = "private-transfer-name"
         builder = ModelBuilder()
-        builder.set_remote_files([SystemFile("root", 100, False)])
-        builder.set_local_files([SystemFile("root", 20, False, is_staging=True)])
+        builder.set_remote_files([SystemFile(private_file_name, 100, False)])
+        builder.set_local_files([SystemFile(private_file_name, 20, False, is_staging=True)])
         running = LftpJobStatus(
-            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "",
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, private_file_name, "",
         )
         running.total_transfer_state = LftpJobStatus.TransferState(65, 100, 65, 10, 4)
         builder.set_lftp_statuses([running])
@@ -13664,9 +14053,9 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__is_explicitly_stopped = MagicMock(return_value=False)
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
         controller._Controller__context.breadcrumb_trace = trace
-        controller._Controller__prev_downloading_file_names = {("root", None, None)}
+        controller._Controller__prev_downloading_file_names = {(private_file_name, None, None)}
         queued = LftpJobStatus(
-            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, "root", "",
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, private_file_name, "",
         )
         controller._Controller__lftp.status.return_value = [queued]
         original_build = builder.build_model
@@ -13685,7 +14074,7 @@ class TestModelUpdater(unittest.TestCase):
         self.assertTrue(candidate["details"]["candidate_present"])
         self.assertTrue(candidate["details"]["live_present"])
         self.assertIn("complete_local_coverage", candidate["details"])
-        self.assertNotIn("root", str(entries))
+        self.assertNotIn(private_file_name, str(entries))
 
     def test_v092_lftp_finish_exact_staged_directory_without_model_diff_finalizes(self):
         """Reproduce the v0.9.2 no-diff completion handoff.
@@ -14822,19 +15211,22 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__pending_completion_progress_floors = {file_id: (99, 99)}
         controller._Controller__pending_completion_progress_floor_identities = {file_id: identity}
         controller._Controller__pending_completion_progress_floor_overlay_ids = {file_id}
+        retired_at = datetime.now()
         controller._Controller__pending_completion_publications = {
             file_id: _PendingCompletionPublication(
                 ActiveProgressOverlay(99, 99, None, None), identity,
-                datetime.now() - timedelta(seconds=1),
+                retired_at,
             ),
         }
         controller._Controller__lftp.status.return_value = []
         controller._Controller__lftp.last_status_poll_healthy = True
         stale_sidecar = SystemFile("pending.bin", 93, False, is_staging=True, mtime_ns=1)
         stale_sidecar.status_sidecar_ready = True
+        stale_scan_started_at = retired_at - timedelta(seconds=1)
         controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
-            datetime.now() - timedelta(seconds=2), [stale_sidecar],
+            stale_scan_started_at, [stale_sidecar],
             scanned_path_pair_ids={None}, is_scan_final=True,
+            scan_started_at=stale_scan_started_at,
         )
         controller._Controller__move_from_staging = MagicMock()
         trace = BreadcrumbTraceCollector(
@@ -14890,18 +15282,21 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__pending_completion_progress_floors = {file_id: (99, 99)}
         controller._Controller__pending_completion_progress_floor_identities = {file_id: identity}
         controller._Controller__pending_completion_progress_floor_overlay_ids = {file_id}
+        retired_at = datetime.now()
         controller._Controller__pending_completion_publications = {
             file_id: _PendingCompletionPublication(
                 ActiveProgressOverlay(99, 99, None, None), identity,
-                datetime.now() - timedelta(seconds=1),
+                retired_at,
             ),
         }
         controller._Controller__lftp.status.return_value = []
         controller._Controller__lftp.last_status_poll_healthy = True
         staged = SystemFile("pending.bin", 93, False, is_staging=True, mtime_ns=1)
         staged.status_sidecar_ready = True
+        fresh_scan_started_at = retired_at + timedelta(seconds=1)
         controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
-            datetime.now(), [staged], scanned_path_pair_ids={None}, is_scan_final=True,
+            fresh_scan_started_at, [staged], scanned_path_pair_ids={None}, is_scan_final=True,
+            scan_started_at=fresh_scan_started_at,
         )
         controller._Controller__move_from_staging = MagicMock()
         trace = BreadcrumbTraceCollector(
@@ -15004,13 +15399,21 @@ class TestModelUpdater(unittest.TestCase):
             "local_scan_session": "current-session",
             "local_scan_generation": 23,
             "reconciled_remote_path_pair_ids": frozenset({path_pair_id}),
+            "diagnostic_target_root_ids": (
+                ModelFile.build_file_id("pending.bin", path_pair_id),
+            ),
         }
         builder.build_model.assert_called_once_with(**authority)
+        gate_authority = {
+            "local_scan_session": "current-session",
+            "local_scan_generation": 23,
+            "reconciled_remote_path_pair_ids": frozenset({path_pair_id}),
+        }
         self.assertTrue(any(call.args == (ModelFile.build_file_id("pending.bin", path_pair_id),)
-                            and call.kwargs == authority
+                            and call.kwargs == gate_authority
                             for call in builder.has_complete_local_coverage.call_args_list))
         self.assertTrue(any(call.args == (ModelFile.build_file_id("pending.bin", path_pair_id),)
-                            and call.kwargs == authority
+                            and call.kwargs == gate_authority
                             for call in builder.has_verified_complete_staging_remote_identity.call_args_list))
         controller._Controller__move_from_staging.assert_called_once_with("pending.bin", path_pair_id)
         self.assertEqual(set(), controller._Controller__pending_completion_file_names)
@@ -15975,8 +16378,15 @@ class TestModelUpdater(unittest.TestCase):
             "schema", "decision", "reason", "local_root_proof_shape",
             "local_root_proof_inputs_known", "local_root_proof_checker_available",
             "local_root_proof_result", "local_root_scan_start_relation",
-            "local_root_proof_checks",
+            "local_root_proof_checks", "local_scan_alignment",
         }, set(event["details"]))
+        self.assertEqual({
+            "process_generation", "effective_work_floor", "builder_proof_generation",
+            "accumulator_root_generation", "accumulator_root_present",
+            "root_run_matches_process", "builder_source_matches_accumulator",
+            "root_start_known", "publication_retired_known", "root_vs_work_floor",
+            "root_start_vs_retired", "request_baseline_known", "root_start_vs_request",
+        }, set(event["details"]["local_scan_alignment"]))
         self.assertEqual("directory_root", event["details"]["local_root_proof_shape"])
         self.assertTrue(event["details"]["local_root_proof_inputs_known"])
         self.assertTrue(event["details"]["local_root_proof_checker_available"])
@@ -16224,14 +16634,14 @@ class TestModelUpdater(unittest.TestCase):
         original_build_model = builder.build_model
         lose_idle_authority_once = True
 
-        def build_after_idle_authority_is_lost():
+        def build_after_idle_authority_is_lost(*, diagnostic_target_root_ids=None):
             nonlocal lose_idle_authority_once
             # The pre-build check sees the previous idle observation, but the
             # lifecycle candidate must use the later authoritative state.
             if lose_idle_authority_once:
                 controller._Controller__lftp_idle_status_authoritative = False
                 lose_idle_authority_once = False
-            return original_build_model()
+            return original_build_model(diagnostic_target_root_ids=diagnostic_target_root_ids)
 
         with patch.object(builder, "request_rebuild", wraps=builder.request_rebuild) as request_rebuild, \
                 patch.object(builder, "build_model", side_effect=build_after_idle_authority_is_lost), \
@@ -17394,16 +17804,31 @@ class TestModelUpdater(unittest.TestCase):
         ModelUpdater(controller).update()
 
         entries = trace.snapshot()["entries"]
+        relevant_entries = [
+            entry for entry in entries
+            if entry["message"] in {
+                "pending_completion_authority_wake", "completion_gate_build_deferred",
+            }
+        ]
         self.assertEqual(
             ["pending_completion_authority_wake", "completion_gate_build_deferred"],
-            [entry["message"] for entry in entries],
+            [entry["message"] for entry in relevant_entries],
         )
         self.assertEqual(
-            {"schema": "pending_completion_authority_wake.v1", "decision": "blocked",
-             "reason": "local_scope_unreconciled"}, entries[0]["details"],
+            {
+                "schema": "pending_completion_authority_wake.v1",
+                "decision": "blocked",
+                "reason": "local_scope_unreconciled",
+                "local_root_proof_shape": "unknown",
+                "local_root_proof_inputs_known": "unknown",
+                "local_root_proof_checker_available": "unknown",
+                "local_root_proof_result": "unknown",
+                "local_root_scan_start_relation": "unknown",
+            },
+            relevant_entries[0]["details"],
         )
         self.assertEqual(
-            {"build_ran": False, "reason": "no_model_build"}, entries[1]["details"],
+            {"build_ran": False, "reason": "no_model_build"}, relevant_entries[1]["details"],
         )
         self.assertNotIn("private-root", str(entries))
 
@@ -17490,7 +17915,7 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__stop_resume_trace_cycle_id = 0
         updater = ModelUpdater(controller)
 
-        def fail_after_poll():
+        def fail_after_poll(*, child_candidate_trace_enabled=False, child_candidate_events=None):
             updater._ModelUpdater__progress_lineage_correlation = correlation
             raise RuntimeError("expected updater failure")
 
@@ -19516,7 +19941,7 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__prev_downloading_file_names = {(file_name, None, None)}
         trace = BreadcrumbTraceCollector(
             lambda: True,
-            max_entries=8,
+            max_entries=24,
             policy={"default": "off", "rules": {"completion.gate": "info"}},
         )
         controller._Controller__context.breadcrumb_trace = trace
@@ -19560,6 +19985,20 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotIn(file_id, controller._Controller__persist.stopped_file_names)
         controller._Controller__lftp.queue.assert_not_called()
         self.assertEqual("default", Controller._model_record_visible_state(retired))
+        retained = trace.snapshot()
+        self.assertEqual(0, retained["accounting"]["evicted_count"])
+        self.assertEqual(0, retained["accounting"]["dropped_count"])
+        self.assertEqual(0, retained["accounting"]["policy_dropped_count"])
+        self.assertEqual(0, retained["accounting"]["oversized_dropped_count"])
+        self.assertFalse(retained["gap"])
+        self.assertTrue(any(
+            entry["message"] == "completion_pending_registered"
+            for entry in retained["entries"]
+        ))
+        serialized = str(retained["entries"])
+        self.assertNotIn(file_name, serialized)
+        self.assertNotIn(target, serialized)
+        self.assertNotIn(target + ".lftp-pget-status", serialized)
 
     def test_unhealthy_parser_membership_does_not_retire_a_running_partial(self):
         """A damaged status frame is not evidence that a ModelUpdater job ended."""
@@ -19893,9 +20332,11 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("overlay", event["details"]["capture_source"])
         self.assertEqual("snapshot_lookup_succeeded", event["details"]["retired_identity_resolution"])
         self.assertEqual("fresh_healthy", event["details"]["poll_source"])
+        self.assertEqual(LftpJobStatus.Type.PGET.value, event["details"]["retired_job_type"])
         self.assertEqual("lftp-poll:0123456789abcdef", event["flow_id"])
         self.assertNotIn("release", json.dumps(event))
-        self.assertNotIn(LftpJobStatus.Type.PGET.value, json.dumps(event))
+        self.assertNotIn("command", event["details"])
+        self.assertNotIn("argv", event["details"])
         self.assertEqual((93, 930), controller._Controller__pending_completion_progress_floors[file_id])
         self.assertIn(file_id, controller._Controller__pending_completion_progress_floor_overlay_ids)
         self.assertEqual(
@@ -20009,9 +20450,11 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("returned_valid_shape", event["details"]["published_lookup"])
         self.assertEqual("eligible", event["details"]["published_candidate"])
         self.assertEqual("matching", event["details"]["published_identity_relation"])
+        self.assertEqual(LftpJobStatus.Type.PGET.value, event["details"]["retired_job_type"])
         self.assertEqual("lftp-poll:fedcba9876543210", event["flow_id"])
         self.assertNotIn("release", json.dumps(event))
-        self.assertNotIn(LftpJobStatus.Type.PGET.value, json.dumps(event))
+        self.assertNotIn("command", event["details"])
+        self.assertNotIn("argv", event["details"])
         trace.close()
 
         self.assertEqual(

@@ -6319,7 +6319,12 @@ class BreadcrumbTraceCollector:
                         self.__sanitize_value(item, key, depth + 1, _node_budget),
                     )
                 else:
-                    sanitized_list.append("<truncated>")
+                    try:
+                        next(iterator)
+                    except StopIteration:
+                        pass
+                    else:
+                        sanitized_list.append("<truncated>")
             except Exception:
                 sanitized_list.append("<truncated>")
             return sanitized_list

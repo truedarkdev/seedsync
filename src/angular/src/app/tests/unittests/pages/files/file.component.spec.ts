@@ -296,6 +296,10 @@ describe("Testing file component", () => {
         const assetResponse = await fetch(icon.src);
         expect(assetResponse.ok).toBeTrue();
         expect(assetResponse.headers.get("content-type")).toContain("image/png");
+        await icon.decode();
+        expect(icon.complete).toBeTrue();
+        expect(icon.naturalWidth).toBeGreaterThan(0);
+        expect(icon.naturalHeight).toBeGreaterThan(0);
         const style = getComputedStyle(icon);
         expect(style.width).toBe("45px");
         expect(style.height).toBe("45px");

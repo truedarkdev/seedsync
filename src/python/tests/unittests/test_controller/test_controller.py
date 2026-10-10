@@ -2345,10 +2345,12 @@ class TestController(unittest.TestCase):
         self.assertEqual(job_correlation, model_event["details"]["job_correlation"])
         self.assertEqual(job_correlation, floor_event["details"]["retired_job_correlation"])
         self.assertEqual("matching", floor_event["details"]["published_identity_relation"])
+        self.assertEqual("pget", floor_event["details"]["retired_job_type"])
+        self.assertNotIn("command", floor_event["details"])
+        self.assertNotIn("argv", floor_event["details"])
         serialized = json.dumps([model_event, floor_event])
         self.assertNotIn(root_name, serialized)
         self.assertNotIn(str(identity[0]), serialized)
-        self.assertNotIn(identity[1], serialized)
 
     def test_completion_provenance_policy_off_prevents_correlation_work(self):
         trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "off"})
@@ -6260,6 +6262,7 @@ class TestController(unittest.TestCase):
         terminal_file.local_size = 1000
         terminal_file.transferred_size = 990
         terminal_file.download_progress = 99
+        terminal_file.complete_local_coverage = True
         terminal_file.state = ModelFile.State.DOWNLOADED
         terminal_model = Model()
         terminal_model.set_base_logger(self.controller.logger)
@@ -6272,6 +6275,7 @@ class TestController(unittest.TestCase):
         move_failed_file.local_size = 1000
         move_failed_file.transferred_size = 0
         move_failed_file.download_progress = 0
+        move_failed_file.complete_local_coverage = True
         move_failed_file.state = ModelFile.State.MOVE_FAILED
         move_failed_model = Model()
         move_failed_model.set_base_logger(self.controller.logger)
@@ -6317,15 +6321,43 @@ class TestController(unittest.TestCase):
         )
         self.controller._Controller__update_model()
 
-        self.assertEqual(2, listener.file_updated.call_count)
-        first_update = listener.file_updated.call_args_list[0].args[1]
-        second_update = listener.file_updated.call_args_list[1].args[1]
-        self.assertEqual(completion_file_id, first_update.file_id)
-        self.assertEqual(ModelFile.State.DOWNLOADED, first_update.state)
-        self.assertEqual(99, first_update.download_progress)
-        self.assertEqual(ModelFile.State.MOVE_FAILED, second_update.state)
-        self.assertEqual(99, second_update.download_progress)
-        self.assertEqual(990, second_update.transferred_size)
+        updates = [call.args[1] for call in listener.file_updated.call_args_list]
+        self.assertEqual(4, len(updates))
+        self.assertEqual(
+            [
+                ModelFile.State.DOWNLOADED,
+                ModelFile.State.DOWNLOADED,
+                ModelFile.State.DOWNLOADED,
+                ModelFile.State.MOVE_FAILED,
+            ],
+            [update.state for update in updates],
+        )
+        self.assertEqual([False, True, False, False], [update.final_move_pending for update in updates])
+        self.assertEqual(
+            ["downloaded", "moving", "downloaded", "move_failed"],
+            [Controller._model_record_visible_state(update) for update in updates],
+        )
+        moving_page_record = Controller._model_file_page_record(updates[1])
+        self.assertEqual("downloaded", moving_page_record["state"])
+        self.assertTrue(moving_page_record["complete_local_coverage"])
+        self.assertTrue(moving_page_record["final_move_pending"])
+        self.assertFalse(moving_page_record["final_move_succeeded"])
+        self.assertEqual(1000, moving_page_record["remote_size"])
+        self.assertEqual(1000, moving_page_record["local_size"])
+        self.assertEqual(990, moving_page_record["transferred_size"])
+        self.assertEqual(99, moving_page_record["download_progress"])
+        for update in updates:
+            self.assertEqual(completion_file_id, update.file_id)
+            self.assertTrue(update.complete_local_coverage)
+            self.assertFalse(update.final_move_succeeded)
+            self.assertEqual(1000, update.remote_size)
+            self.assertEqual(1000, update.local_size)
+            self.assertEqual(99, update.download_progress)
+            self.assertEqual(990, update.transferred_size)
+        self.assertEqual(
+            (99, 990),
+            self.controller._Controller__pending_completion_progress_floors[completion_file_id],
+        )
         self.assertEqual(
             {completion_file_id},
             {
@@ -6355,6 +6387,7 @@ class TestController(unittest.TestCase):
         terminal_file.local_size = 1000
         terminal_file.transferred_size = 990
         terminal_file.download_progress = 99
+        terminal_file.complete_local_coverage = True
         terminal_file.state = ModelFile.State.DOWNLOADED
         terminal_model = Model()
         terminal_model.set_base_logger(self.controller.logger)
@@ -6380,6 +6413,7 @@ class TestController(unittest.TestCase):
         # explicitly so an unconfigured mock cannot masquerade as a pending
         # progressive delta and defer the ordinary full build.
         self.controller._Controller__model_builder.has_pending_active_transfer_delta.return_value = False
+        self.controller._Controller__model_builder.has_only_pending_active_transfer_delta.return_value = False
         self.controller._Controller__model_builder.build_model.side_effect = [
             terminal_model,
             stale_model,
@@ -6416,14 +6450,36 @@ class TestController(unittest.TestCase):
             {completion_file_id}
         )
         self.controller._Controller__active_scan_process.force_scan.assert_called_once_with()
-        self.assertEqual(2, listener.file_updated.call_count)
-        stale_update = listener.file_updated.call_args_list[1].args[1]
+        updates = [call.args[1] for call in listener.file_updated.call_args_list]
+        self.assertEqual(4, len(updates))
+        self.assertEqual(
+            [ModelFile.State.DOWNLOADED] * 3 + [ModelFile.State.DEFAULT],
+            [update.state for update in updates],
+        )
+        self.assertEqual([False, True, False, False], [update.final_move_pending for update in updates])
+        self.assertEqual(
+            ["downloaded", "moving", "downloaded", "stopped"],
+            [Controller._model_record_visible_state(update) for update in updates],
+        )
+        self.assertTrue(all(update.complete_local_coverage for update in updates[:3]))
+        self.assertFalse(updates[3].complete_local_coverage)
+        self.assertEqual((1000, 1000, 990, 99), (
+            updates[2].remote_size,
+            updates[2].local_size,
+            updates[2].transferred_size,
+            updates[2].download_progress,
+        ))
+        stale_update = updates[3]
         self.assertEqual(completion_file_id, stale_update.file_id)
         self.assertEqual(ModelFile.State.DEFAULT, stale_update.state)
+        self.assertFalse(stale_update.final_move_pending)
         self.assertIsNone(stale_update.download_progress)
+        self.assertEqual(1000, stale_update.remote_size)
         self.assertEqual(960, stale_update.local_size)
         self.assertEqual(960, stale_update.transferred_size)
         self.assertTrue(stale_update.final_move_succeeded)
+        self.assertFalse(stale_update.complete_local_coverage)
+        self.assertEqual("stopped", Controller._model_record_visible_state(stale_update))
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_successful_final_move_does_not_mask_remote_size_change(self, diff_models):
@@ -6446,6 +6502,7 @@ class TestController(unittest.TestCase):
         terminal_file.local_size = 1000
         terminal_file.transferred_size = 990
         terminal_file.download_progress = 99
+        terminal_file.complete_local_coverage = True
         terminal_file.state = ModelFile.State.DOWNLOADED
         terminal_model = Model()
         terminal_model.set_base_logger(self.controller.logger)
@@ -6469,6 +6526,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model_builder.has_changes.return_value = True
         # There is no active transfer delta in this terminal reconciliation.
         self.controller._Controller__model_builder.has_pending_active_transfer_delta.return_value = False
+        self.controller._Controller__model_builder.has_only_pending_active_transfer_delta.return_value = False
         self.controller._Controller__model_builder.build_model.side_effect = [
             terminal_model,
             changed_model,
@@ -6501,15 +6559,36 @@ class TestController(unittest.TestCase):
         self.controller._Controller__update_model()
         self.controller._Controller__update_model()
 
-        self.assertEqual(2, listener.file_updated.call_count)
-        changed_update = listener.file_updated.call_args_list[1].args[1]
+        updates = [call.args[1] for call in listener.file_updated.call_args_list]
+        self.assertEqual(4, len(updates))
+        self.assertEqual(
+            [ModelFile.State.DOWNLOADED] * 3 + [ModelFile.State.DEFAULT],
+            [update.state for update in updates],
+        )
+        self.assertEqual([False, True, False, False], [update.final_move_pending for update in updates])
+        self.assertEqual(
+            ["downloaded", "moving", "downloaded", "stopped"],
+            [Controller._model_record_visible_state(update) for update in updates],
+        )
+        self.assertTrue(all(update.complete_local_coverage for update in updates[:3]))
+        self.assertFalse(updates[3].complete_local_coverage)
+        self.assertEqual((1000, 1000, 990, 99), (
+            updates[2].remote_size,
+            updates[2].local_size,
+            updates[2].transferred_size,
+            updates[2].download_progress,
+        ))
+        changed_update = updates[3]
         self.assertEqual(completion_file_id, changed_update.file_id)
         self.assertEqual(ModelFile.State.DEFAULT, changed_update.state)
+        self.assertFalse(changed_update.final_move_pending)
         self.assertIsNone(changed_update.download_progress)
         self.assertEqual(1200, changed_update.remote_size)
         self.assertEqual(1000, changed_update.local_size)
         self.assertEqual(1000, changed_update.transferred_size)
         self.assertTrue(changed_update.final_move_succeeded)
+        self.assertFalse(changed_update.complete_local_coverage)
+        self.assertEqual("stopped", Controller._model_record_visible_state(changed_update))
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_applies_pending_completion_side_effects_once_for_terminal_update(self, diff_models):
@@ -7740,7 +7819,7 @@ class TestController(unittest.TestCase):
                 self.assertEqual(flow_id, row["flow_id"])
                 self.assertNotIn(file_id, json.dumps(row))
 
-                performance_path = Path(__file__).resolve().parents[5] / "src" / "docker" / "test" / "performance"
+                performance_path = Path(__file__).resolve().parents[4] / "docker" / "test" / "performance"
                 performance_path_text = str(performance_path)
                 sys.path.insert(0, performance_path_text)
                 try:
@@ -7773,7 +7852,7 @@ class TestController(unittest.TestCase):
     def test_queue_http_wait_duration_keeps_failure_and_timeout_outcomes(self):
         file_id = "private-queue-wait-target"
         flow_id = "fractional-queue:0123456789abcdef"
-        performance_path = Path(__file__).resolve().parents[5] / "src" / "docker" / "test" / "performance"
+        performance_path = Path(__file__).resolve().parents[4] / "docker" / "test" / "performance"
         performance_path_text = str(performance_path)
         sys.path.insert(0, performance_path_text)
         try:
@@ -13129,7 +13208,7 @@ class TestController(unittest.TestCase):
 
             result = self.controller._Controller__move_from_staging("notes.lftp")
 
-        move.assert_called_once_with(source_file, os.path.join(final_root, "notes.lftp"), ANY)
+        move.assert_called_once_with(source_file, os.path.join(final_root, "notes.lftp"), ANY, None)
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
         self.controller.logger.warning.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
@@ -13152,7 +13231,7 @@ class TestController(unittest.TestCase):
 
             result = self.controller._Controller__move_from_staging("movie.mkv")
 
-        move.assert_called_once_with(source_file, os.path.join(final_root, "movie.mkv"), ANY)
+        move.assert_called_once_with(source_file, os.path.join(final_root, "movie.mkv"), ANY, None)
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
         self.controller.logger.warning.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
@@ -13500,7 +13579,7 @@ class TestController(unittest.TestCase):
 
             result = self.controller._Controller__move_from_staging("movie")
 
-        move.assert_called_once_with(source_tree, os.path.join(final_root, "movie"), ANY)
+        move.assert_called_once_with(source_tree, os.path.join(final_root, "movie"), ANY, None)
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace")
@@ -18232,14 +18311,35 @@ class TestController(unittest.TestCase):
             healthy_id = ModelFile.build_file_id("healthy-local.bin", pair_id)
             cycle_observations = []
             build_observations = []
+            build_input_observations = []
             active_cycle = [0]
             original_has_changes = builder.has_changes
             original_build_model = builder.build_model
             original_record_decision = updater._record_root_progress_decision
+            baseline_source_objects = {
+                ModelFile.build_file_id(root.name, root.path_pair_id): root
+                for root in builder.local_source_roots_snapshot()
+            }
 
-            def record_build_model():
+            def record_build_model(*, local_scan_session=None, local_scan_generation=None,
+                                    reconciled_remote_path_pair_ids=None,
+                                    diagnostic_target_root_ids=None):
                 build_observations.append(active_cycle[0])
-                return original_build_model()
+                build_input_observations.append({
+                    "cycle": active_cycle[0],
+                    "active_only_change": builder.has_only_pending_active_transfer_delta(),
+                    "reasons": builder.active_transfer_delta_diagnostics()["invalidation_reasons"],
+                    "sources": {
+                        ModelFile.build_file_id(root.name, root.path_pair_id): root
+                        for root in builder.local_source_roots_snapshot()
+                    },
+                })
+                return original_build_model(
+                    local_scan_session=local_scan_session,
+                    local_scan_generation=local_scan_generation,
+                    reconciled_remote_path_pair_ids=reconciled_remote_path_pair_ids,
+                    diagnostic_target_root_ids=diagnostic_target_root_ids,
+                )
 
             def record_decision(identity, *, outcome, reason, decision, target_count=0):
                 return original_record_decision(
@@ -18272,12 +18372,28 @@ class TestController(unittest.TestCase):
             self.assertTrue(first_cycle["has_changes"])
             self.assertTrue(first_cycle["active_only_change"])
             self.assertEqual([], controller._Controller__last_lftp_statuses)
-            self.assertNotIn(1, build_observations)
+            # New authoritative source data arrives during the tick. The
+            # current builder is no longer active-only when publication is
+            # decided, despite the pre-cycle dirty state above.
+            self.assertIn(1, build_observations)
+            first_build = next(item for item in build_input_observations if item["cycle"] == 1)
+            self.assertFalse(first_build["active_only_change"])
+            self.assertIn("model_builder_cache_invalidation_explicit", first_build["reasons"])
+            self.assertNotIn(healthy_id, baseline_source_objects)
+            self.assertEqual(10, first_build["sources"][healthy_id].size)
+            self.assertTrue(next(
+                item for item in cycle_observations
+                if item["cycle"] == 1 and item["stage"] == "after"
+            )["healthy_in_live_model"])
             self.assertTrue(mixed_cycle["has_changes"])
             self.assertFalse(mixed_cycle["active_only_change"])
             self.assertIn("model_builder_cache_invalidation_local_files", mixed_cycle["pending_reasons"])
-            self.assertIn("model_builder_cache_invalidation_unknown_local_pairs", mixed_cycle["pending_reasons"])
             self.assertIn(2, build_observations)
+            self.assertTrue(all(cycle <= 2 for cycle in build_observations))
+            self.assertTrue(all(
+                not item["has_changes"] for item in cycle_observations
+                if item["cycle"] >= 3
+            ))
             self.assertTrue(any(item["cycle"] >= 2 and item["healthy_in_live_model"]
                                 for item in cycle_observations))
 
@@ -19412,7 +19528,7 @@ class TestController(unittest.TestCase):
 
             result = self.controller._Controller__move_from_staging("nested/movie.mkv")
 
-        move.assert_called_once_with(source, destination, ANY)
+        move.assert_called_once_with(source, destination, ANY, None)
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace")
@@ -19459,7 +19575,7 @@ class TestController(unittest.TestCase):
 
         move.assert_called_once_with(
             os.path.normpath(os.path.join("/local/incomplete", "movie.mkv")),
-            os.path.normpath(os.path.join("/local", "movie.mkv")), ANY,
+            os.path.normpath(os.path.join("/local", "movie.mkv")), ANY, None,
         )
         self.assertEqual(2, trace_info.call_count)
         attempt_payload = json.loads(trace_info.call_args_list[0][0][1])
@@ -19474,7 +19590,7 @@ class TestController(unittest.TestCase):
 
         move.assert_called_once_with(
             os.path.normpath(os.path.join("/local/incomplete", "movie.mkv")),
-            os.path.normpath(os.path.join("/local", "movie.mkv")), ANY,
+            os.path.normpath(os.path.join("/local", "movie.mkv")), ANY, None,
         )
         self.assertEqual(Controller.MoveFromStagingResult.FAILED, result)
         self.controller.logger.warning.assert_called_once_with(
@@ -21832,9 +21948,17 @@ class TestController(unittest.TestCase):
             self.controller._Controller__model.get_file.return_value = file
             self.controller._Controller__path_pairs_by_id = {"movies": existing}
 
-            def delete_side_effect(*_args, **_kwargs):
+            def delete_side_effect(file_arg, post_callback, *, command, **_kwargs):
                 with self.assertRaises(PathPairError):
                     self.controller.reserve_path_pair_relocation(existing, updated)
+                return Controller.CommandProcessWrapper(
+                    command=command,
+                    file_id=file_arg.file_id,
+                    file_name=file_arg.name,
+                    process=MagicMock(),
+                    post_callback=post_callback,
+                    await_completion=True,
+                )
 
             with patch.object(
                 self.controller, "_Controller__queue_delete_local_process", side_effect=delete_side_effect

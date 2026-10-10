@@ -11,6 +11,10 @@ seedsync (0.9.6) stable; urgency=low
     staged content and concurrent source changes
   * Add bounded optional diagnostics for Queue readiness, scan authority,
     transfer progress, and finalization
+  * Retry interrupted model publication from retained sources without waiting
+    for another scan
+  * Keep optional diagnostics isolated from model routing and report bounded
+    list truncation accurately
 
  -- Johan Rosén <johan.rosen.91@gmail.com>  Sat, 10 Oct 2026 10:51:58 +0200
 

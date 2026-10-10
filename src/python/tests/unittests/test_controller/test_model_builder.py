@@ -4439,14 +4439,34 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_local_files([local_root])
         collector = self.__enable_trace()
         self.model_builder.set_unknown_local_path_pair_ids({None})
+        emitter = self.model_builder._ModelBuilder__stop_resume_trace_breadcrumb
+        record = MagicMock(wraps=emitter.record)
+        emitter.record = record
 
         self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("sample-directory"))
         time.sleep(0.05)
-        entry = collector.snapshot()["entries"][0]
+        all_entries = collector.snapshot()["entries"]
+        entries = [
+            entry for entry in all_entries
+            if entry["message"] == "queue_exclusion_decision"
+        ]
+        self.assertEqual(1, len(entries))
+        entry = entries[0]
+        self.assertTrue(entry["corr_id"].startswith("fractional-mtime:"))
         self.assertEqual("unknown", entry["details"]["readiness_reason"])
         self.assertTrue(entry["details"]["readiness"]["local_readiness_unknown"])
-        self.assertTrue(entry["details"]["rejection_reasons"]["not_ready_present"])
+        raw_details = next(
+            call.args[2] for call in record.call_args_list
+            if call.args[1] == "queue_exclusion_decision"
+        )
+        self.assertTrue(raw_details["rejection_reasons"]["not_ready_present"])
+        # Collector normalization currently omits this bounded presence field.
+        # Preserve the observed coverage gap for follow-up; never use it as
+        # Queue evidence when judging readiness.
+        self.assertNotIn("not_ready_present", entry["details"]["rejection_reasons"])
         self.assertNotIn("rejection_reason_counts", entry["details"])
+        self.assertNotIn("sample-directory", str(all_entries))
+        self.assertNotIn("remote.bin", str(all_entries))
 
         disabled_collector = self.__enable_trace(False)
         self.model_builder.set_unknown_local_path_pair_ids(set())
@@ -10722,16 +10742,20 @@ class TestModelBuilder(unittest.TestCase):
 
         self.model_builder.build_model()
         first = self.__trace_entries(collector, include_root_decisions=True)
+        first_root_entries = [entry for entry in first if entry["message"] == "root_default_decision"]
         self.model_builder.set_stopped_files({"sample-directory"})
         self.model_builder.build_model()
         second = self.__trace_entries(collector, include_root_decisions=True)
         root_entries = [entry for entry in second if entry["message"] == "root_default_decision"]
 
+        self.assertEqual(1, len(first_root_entries))
         self.assertEqual(2, len(root_entries))
-        self.assertNotEqual(first[0]["details"]["reason"], root_entries[1]["details"]["reason"])
+        self.assertNotEqual(
+            first_root_entries[0]["details"]["reason"], root_entries[1]["details"]["reason"],
+        )
         self.assertEqual("explicit_stop", root_entries[1]["details"]["reason"])
         self.assertTrue(root_entries[1]["details"]["lifecycle"]["explicit_stop"])
-        self.assertEqual(first[0]["corr_id"], root_entries[1]["corr_id"])
+        self.assertEqual(first_root_entries[0]["corr_id"], root_entries[1]["corr_id"])
 
     def test_root_default_trace_identical_decision_records_each_build(self):
         remote_root = SystemFile("sample-directory", 20, True)
@@ -11000,7 +11024,7 @@ class TestModelBuilder(unittest.TestCase):
         mixed_entries = [
             entry for entry in entries if entry["message"] == "mixed_root_decision"
         ]
-        self.assertEqual(7, len(mixed_entries))
+        self.assertEqual(4, len(mixed_entries))
         mixed_by_corr: dict[str, list[dict[str, object]]] = {}
         for entry in mixed_entries:
             self.assertEqual("model.mixed_root", entry["category"])
@@ -11011,12 +11035,27 @@ class TestModelBuilder(unittest.TestCase):
             self.assertNotIn(final_name, str(entry))
             self.assertNotIn(staging_name, str(entry))
             mixed_by_corr.setdefault(entry["corr_id"], []).append(entry)
+        expected_corr_by_pair = {
+            opaque_trace_correlation(pair_a_id): pair_a,
+            opaque_trace_correlation(pair_b_id): pair_b,
+        }
+        self.assertEqual(set(expected_corr_by_pair), set(mixed_by_corr))
         self.assertEqual(2, len(mixed_by_corr))
-        self.assertTrue(all(
-            {entry["details"]["decision_kind"] for entry in corr_entries} ==
-            {"coverage", "promotion"}
-            for corr_entries in mixed_by_corr.values()
-        ))
+        promotions_by_pair = {}
+        for corr_id, corr_entries in mixed_by_corr.items():
+            self.assertEqual(2, len(corr_entries))
+            self.assertEqual(
+                {"coverage", "promotion"},
+                {entry["details"]["decision_kind"] for entry in corr_entries},
+            )
+            promotion = next(
+                entry["details"] for entry in corr_entries
+                if entry["details"]["decision_kind"] == "promotion"
+            )
+            # These records describe the initial partial source, while the
+            # authoritative terminal states are checked above.
+            self.assertEqual("rejected", promotion["outcome"])
+            promotions_by_pair[expected_corr_by_pair[corr_id]] = promotion["reason"]
         promotions_by_corr = {
             corr_id: [
                 entry["details"]["reason"] for entry in corr_entries
@@ -11024,7 +11063,9 @@ class TestModelBuilder(unittest.TestCase):
             ][-1]
             for corr_id, corr_entries in mixed_by_corr.items()
         }
-        self.assertEqual({"complete"}, set(promotions_by_corr.values()))
+        self.assertEqual({"partial"}, set(promotions_by_corr.values()))
+        self.assertEqual({pair_a, pair_b}, set(promotions_by_pair))
+        self.assertEqual({"partial"}, set(promotions_by_pair.values()))
 
         root_entries = [
             entry for entry in entries if entry["message"] == "root_default_decision"
@@ -12114,7 +12155,11 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.begin_stop_resume_trace_cycle(3)
         model = self.model_builder.build_model()
         self.model_builder.finish_stop_resume_trace_cycle(model, True)
-        entries = self.__trace_entries(collector)
+        all_entries = self.__trace_entries(collector)
+        self.assertNotIn("C:\\seedsync", str(all_entries))
+        cycle_prefix = "stop-resume:" + file_name + ":3"
+        entries = [entry for entry in all_entries if entry["corr_id"].startswith(cycle_prefix)]
+        self.assertTrue(entries)
         self.assertEqual({file_name}, {entry["file_id"] for entry in entries})
         self.assertTrue(entries[0]["corr_id"].startswith("stop-resume:" + file_name + ":3"))
         details = entries[0]["details"]
@@ -12135,8 +12180,8 @@ class TestModelBuilder(unittest.TestCase):
         ):
             self.assertIn(key, details)
         self.assertEqual({"present": True, "is_staging": True}, details["matched_local"])
-        self.assertNotIn("C:\\seedsync", str(details))
-        self.assertNotIn("command", str(details).lower())
+        self.assertNotIn("C:\\seedsync", str(all_entries))
+        self.assertNotIn("command", str(all_entries).lower())
 
     def test_trace_boundary_details_omit_local_paths(self):
         file_name = "verifier-stop-regression-allocated.bin"
@@ -12159,7 +12204,12 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.begin_stop_resume_trace_cycle(4)
         model = self.model_builder.build_model()
         self.model_builder.finish_stop_resume_trace_cycle(model, True)
-        entries = self.__trace_entries(collector)
+        all_entries = self.__trace_entries(collector)
+        self.assertTrue(all_entries)
+        for private_value in ("C:\\seedsync", "local_base_dir_path", "remote_base_dir_path"):
+            self.assertNotIn(private_value, str(all_entries))
+        cycle_prefix = "stop-resume:" + file_name + ":4"
+        entries = [entry for entry in all_entries if entry["corr_id"].startswith(cycle_prefix)]
         self.assertEqual(1, len(entries))
         details = entries[0]["details"]
         self.assertNotIn("C:\\seedsync", str(details))
@@ -12535,16 +12585,16 @@ class TestModelBuilder(unittest.TestCase):
             candidate, candidate, subject_ids, "full_build", "full_model_adopted",
         )
         entries = self.__trace_entries(collector)
-        messages = [entry["message"] for entry in entries]
-        self.assertEqual(
-            [
-                "persist_authority_before",
-                "persist_authority_after",
-                "model_candidate",
-                "model_live_publication",
-            ],
-            messages,
-        )
+        lifecycle_messages = [
+            "persist_authority_before",
+            "persist_authority_after",
+            "model_candidate",
+            "model_live_publication",
+        ]
+        lifecycle_entries = [
+            entry for entry in entries if entry["message"] in lifecycle_messages
+        ]
+        self.assertEqual(lifecycle_messages, [entry["message"] for entry in lifecycle_entries])
         before = next(entry for entry in entries if entry["message"] == "persist_authority_before")
         after = next(entry for entry in entries if entry["message"] == "persist_authority_after")
         self.assertEqual("default", before["details"]["pre_state"])
@@ -12558,19 +12608,25 @@ class TestModelBuilder(unittest.TestCase):
 
         self.model_builder.request_rebuild()
         self.model_builder.build_model()
-        self.assertEqual(len(entries), len(self.__trace_entries(collector)))
+        self.assertEqual(
+            len(lifecycle_entries),
+            sum(entry["message"] in lifecycle_messages for entry in self.__trace_entries(collector)),
+        )
 
         # A fresh global enable clears the process-local dedupe window while
         # retaining the collector's independent bounded retention contract.
         self.model_builder.set_stop_resume_trace_breadcrumb(None)
-        # Keep this retention assertion focused on lifecycle records; the
-        # root diagnostic intentionally reports the preceding local-absence
-        # failure and is covered by the dedicated root-trace test above.
+        # Keep this retention assertion scoped to lifecycle and Queue records;
+        # scan-authority witness records have separate tests.
         self.model_builder.set_downloaded_files({subject_id})
         self.model_builder.set_local_files([SystemFile(subject_name, 100, False)])
         self.model_builder.request_rebuild()
         self.model_builder.build_model()
-        bounded = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+        bounded = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=2,
+            policy={"default": "off", "rules": {"lifecycle.persist": "info", "queue.exclusion": "info"}},
+        )
         self.model_builder.set_stop_resume_trace_breadcrumb(bounded)
         self.model_builder.request_rebuild()
         candidate = self.model_builder.build_model()

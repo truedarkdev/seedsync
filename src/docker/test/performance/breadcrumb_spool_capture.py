@@ -248,6 +248,8 @@ _MODEL_FINALIZATION_STAGES = frozenset({
 _MODEL_FINALIZATION_DURATION_MAX_MS = 86_400_000
 _MODEL_FINALIZATION_DURATION_KEYS = ("wall_ms", "thread_cpu_ms", "lock_wait_ms", "lock_hold_ms")
 _MODEL_FINALIZATION_BOUNDARY_MAX_NS = 2**63 - 1
+_MODEL_PUBLICATION_RETRY_SCHEMA = "model_publication_retry.v1"
+_MODEL_PUBLICATION_RETRY_OUTCOMES = frozenset({"retry_admitted", "retry_rearmed", "retry_adopted"})
 _MODEL_PROGRESS_LINEAGE_SCHEMA = "model_progress_lineage_summary.v1"
 _MODEL_PROGRESS_LINEAGE_MAX_VERSION_RANGES = 8
 _MODEL_PROGRESS_LINEAGE_SOURCES = frozenset({
@@ -1141,6 +1143,17 @@ def _model_finalization_facts(details: Mapping[str, object]) -> dict[str, object
     return result
 
 
+def _model_publication_retry_facts(details: Mapping[str, object]) -> dict[str, str]:
+    """Project only the updater's fixed publication-retry vocabulary."""
+    schema_known = details.get("schema") == _MODEL_PUBLICATION_RETRY_SCHEMA
+    outcome = details.get("outcome")
+    return {
+        "schema": _MODEL_PUBLICATION_RETRY_SCHEMA if schema_known else "unknown",
+        "outcome": outcome if schema_known and isinstance(outcome, str)
+        and outcome in _MODEL_PUBLICATION_RETRY_OUTCOMES else "unknown",
+    }
+
+
 def _model_progress_lineage_facts(details: Mapping[str, object]) -> dict[str, object] | None:
     """Project the fixed durable updater-lineage summary vocabulary."""
     if details.get("schema") != _MODEL_PROGRESS_LINEAGE_SCHEMA:
@@ -1778,6 +1791,11 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     model_page_snapshot = _model_page_snapshot_facts(details) if category == "model_page_snapshot" else None
     model_finalization = _model_finalization_facts(details) if category == "model.finalization" else None
     model_progress_lineage = _model_progress_lineage_facts(details) if category == "model.progress" else None
+    model_publication_retry = (
+        _model_publication_retry_facts(details)
+        if source == "controller" and category == "model.candidate" and event_type == "state_transition"
+        and stage == "model" and level == "info" and message == "model_publication_retry" else None
+    )
     command_admission_timing = (
         _command_admission_timing_facts(details)
         if source == "controller" and category == "controller" and stage == "command" else None
@@ -1802,6 +1820,11 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     if category == "model.finalization" and model_finalization is None:
         return None, True
     if details.get("schema") == _MODEL_PROGRESS_LINEAGE_SCHEMA and model_progress_lineage is None:
+        return None, True
+    if details.get("schema") == _MODEL_PUBLICATION_RETRY_SCHEMA and (
+        source != "controller" or category != "model.candidate" or event_type != "state_transition"
+        or stage != "model" or level != "info" or message != "model_publication_retry"
+    ):
         return None, True
     if details.get("schema") == _MODEL_INPUT_ARBITRATION_SCHEMA and (
         category != "scan.authority" or row.get("message", metadata.get("message")) != "input_arbitration_witness"
@@ -1859,6 +1882,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["model_finalization"] = model_finalization
     if model_progress_lineage is not None:
         result["model_progress_lineage"] = model_progress_lineage
+    if model_publication_retry is not None:
+        result["model_publication_retry"] = model_publication_retry
     if command_admission_timing is not None:
         result["command_admission_timing"] = command_admission_timing
     if input_arbitration is not None:

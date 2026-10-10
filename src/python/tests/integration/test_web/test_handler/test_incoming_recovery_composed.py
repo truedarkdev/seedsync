@@ -82,6 +82,7 @@ class _LocalIncomingController:
 
     def record_queue_http_wait_trace(
             self, file_id: str, completed: bool, success: bool | None,
+            flow_id: str | None = None, duration_ms: object = None,
     ) -> None:
         self.http_waits.append((file_id, completed, success))
 

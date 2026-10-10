@@ -662,6 +662,10 @@ _CAPTURE_MODEL_FINALIZATION_DURATION_MAX_MS = 86_400_000
 _CAPTURE_MODEL_FINALIZATION_DURATION_KEYS = ("wall_ms", "thread_cpu_ms", "lock_wait_ms", "lock_hold_ms")
 _CAPTURE_MODEL_FINALIZATION_BOUNDARY_MAX_NS = 2**63 - 1
 _CAPTURE_MODEL_FINALIZATION_BOUNDARY_TEXT = re.compile(r"^(?:0|[1-9][0-9]{0,18})$")
+_CAPTURE_MODEL_PUBLICATION_RETRY_SCHEMA = "model_publication_retry.v1"
+_CAPTURE_MODEL_PUBLICATION_RETRY_OUTCOMES = {
+    "retry_admitted", "retry_rearmed", "retry_adopted",
+}
 _CAPTURE_PROGRESS_LINEAGE_SCHEMA = "model_progress_lineage_summary.v1"
 _CAPTURE_PROGRESS_LINEAGE_MAX_VERSION_RANGES = 8
 _CAPTURE_PROGRESS_LINEAGE_SOURCES = {
@@ -1701,6 +1705,17 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
             else None
         )
         result["model_finalization"] = safe_finalization
+    publication_retry = value.get("model_publication_retry")
+    if (result.get("source") == "controller" and result.get("category") == "model.candidate"
+            and result.get("event_type") == "state_transition" and result.get("stage") == "model"
+            and isinstance(publication_retry, Mapping)):
+        schema_known = publication_retry.get("schema") == _CAPTURE_MODEL_PUBLICATION_RETRY_SCHEMA
+        outcome = publication_retry.get("outcome")
+        result["model_publication_retry"] = {
+            "schema": _CAPTURE_MODEL_PUBLICATION_RETRY_SCHEMA if schema_known else "unknown",
+            "outcome": outcome if schema_known and isinstance(outcome, str)
+            and outcome in _CAPTURE_MODEL_PUBLICATION_RETRY_OUTCOMES else "unknown",
+        }
     lineage = value.get("model_progress_lineage")
     if isinstance(lineage, Mapping):
         safe_lineage = _sanitize_progress_lineage(lineage)

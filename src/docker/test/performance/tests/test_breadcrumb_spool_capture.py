@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import sys
 import threading
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 from datetime import datetime, timedelta
 from queue import Queue
@@ -49,6 +49,7 @@ try:
         _record_lftp_status_breadcrumb,
         _record_lftp_status_membership_transition, _record_lifecycle_scan_breadcrumb,
     )
+    from tests.unittests.test_controller import test_model_updater as _model_updater_fixture_module
 except ImportError:
     BreadcrumbTraceCollector = None
     ModelFile = None
@@ -67,6 +68,7 @@ except ImportError:
     ScannerResult = None
     _ensure_progressive_scan_state = None
     _ProgressiveScanAccumulator = None
+    _model_updater_fixture_module = None
     LftpJobStatus = None
 
 
@@ -2969,3 +2971,170 @@ def test_poll_drains_beyond_single_eight_kib_chunk_with_budget_receipt(tmp_path:
         reader.close()
     assert projection["source_bytes"] > 8192
     assert projection["source_bytes"] <= 64 * 1024
+
+
+def test_model_publication_retry_reaches_finalized_reader_and_json_sink(tmp_path: Path) -> None:
+    assert BreadcrumbTraceCollector is not None
+    assert ModelUpdater is not None and _model_updater_fixture_module is not None
+    _ModelUpdaterTestFixture = _model_updater_fixture_module.TestModelUpdater
+    assert Path(capture.__file__).resolve() == (ROOT / "breadcrumb_spool_capture.py").resolve()
+    assert Path(observer.__file__).resolve() == (ROOT / "incoming_recovery_observer.py").resolve()
+    updater_module = sys.modules[ModelUpdater.__module__]
+    fixture_module = sys.modules[_ModelUpdaterTestFixture.__module__]
+    assert Path(updater_module.__file__).resolve() == Path("/src/controller/model_updater.py")
+    assert Path(fixture_module.__file__).resolve() == Path("/src/tests/unittests/test_controller/test_model_updater.py")
+    spool = tmp_path / "publication-retry-spool"
+    spool.mkdir()
+    artifact = tmp_path / "publication-retry-capture.jsonl"
+    collector = BreadcrumbTraceCollector(
+        lambda: True,
+        max_entries=32,
+        policy={"default": "off", "rules": {"model.candidate": "info"}},
+        durable_enabled=True,
+        durable_path=str(spool),
+        durable_enabled_getter=lambda: True,
+    )
+
+    old = SystemFile("private-old-root", 10, False)
+    old.path_pair_id = "private-pair"
+    builder = ModelBuilder()
+    builder.set_local_files([old])
+    builder.set_remote_files([old])
+    live_model = builder.build_model()
+    next_local = SystemFile("private-new-root", 30, False)
+    next_local.path_pair_id = "private-pair"
+    next_remote = SystemFile("private-new-root", 30, False)
+    next_remote.path_pair_id = "private-pair"
+    final_local = ScannerResult(
+        datetime.now(), [next_local], scanned_path_pair_ids={"private-pair"},
+        is_progress=True, completed_path_pair_ids={"private-pair"}, is_scan_final=True,
+        is_full_snapshot=True, full_snapshot_path_pair_ids={"private-pair"},
+    )
+    final_remote = ScannerResult(
+        datetime.now(), [next_remote], scanned_path_pair_ids={"private-pair"},
+        is_progress=True, completed_path_pair_ids={"private-pair"}, is_scan_final=True,
+        is_full_snapshot=True, full_snapshot_path_pair_ids={"private-pair"},
+    )
+    controller, _ = _ModelUpdaterTestFixture()._make_progressive_update_controller(
+        final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+    )
+    controller._Controller__path_pairs_by_id = {"private-pair": MagicMock()}
+    controller._Controller__context.breadcrumb_trace = collector
+    controller._Controller__record_breadcrumb = Controller._Controller__record_breadcrumb.__get__(
+        controller, Controller,
+    )
+    updater = ModelUpdater(controller)
+    controller._Controller__updater = updater
+
+    try:
+        assert collector.record(
+            "controller", "capture_boundary_probe", {}, category="model.candidate",
+            event_type="diagnostic", stage="model", level="info",
+        ) in {"retained", "enqueued"}
+        assert collector.wait_for_ingress(2.0)
+        assert collector.flush_durable(2.0)
+        assert collector.durable_snapshot()["session_boundary_written"] is True
+        reader = _reader(spool, artifact)
+        try:
+            reader.start()
+            publication_error = RuntimeError("private publication exception")
+
+            def fail_publication(*_args: object, **_kwargs: object) -> None:
+                raise publication_error
+
+            live_model.add_file = fail_publication
+            with pytest.raises(RuntimeError) as first_failure:
+                updater.update()
+            assert first_failure.value is publication_error
+
+            for side in ("local", "remote", "active"):
+                process = getattr(controller, "_Controller__{}_scan_process".format(side))
+                process.pop_latest_result.return_value = None
+            with pytest.raises(RuntimeError) as retry_failure:
+                updater.update()
+            assert retry_failure.value is publication_error
+
+            del live_model.add_file
+            updater.update()
+            assert not builder.has_changes()
+            assert collector.flush_durable(2.0)
+            assert reader.poll() >= 3
+        finally:
+            reader.close()
+    finally:
+        collector.close(timeout=2.0)
+
+    finalized = [
+        json.loads(line)
+        for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    producer_rows = [row for row in finalized if row.get("message") == "model_publication_retry"]
+    expected_outcomes = ["retry_admitted", "retry_rearmed", "retry_adopted"]
+    assert [row["details"].get("outcome") for row in producer_rows] == expected_outcomes
+    assert all(
+        row.get("source") == "controller" and row.get("category") == "model.candidate"
+        and row.get("event_type") == "state_transition" and row.get("stage") == "model"
+        and row.get("level") == "info" and row["details"] == {
+            "schema": "model_publication_retry.v1", "outcome": outcome,
+        }
+        for row, outcome in zip(producer_rows, expected_outcomes)
+    )
+
+    captured = [
+        envelope for envelope in _artifacts(artifact)
+        if envelope.get("capture", {}).get("state") == "record"
+        and "model_publication_retry" in envelope["capture"].get("projection", {})
+    ]
+    assert len(captured) == len(producer_rows) == 3
+    for raw, envelope, outcome in zip(producer_rows, captured, expected_outcomes):
+        projection = envelope["capture"]["projection"]
+        assert envelope["capture"]["created_ns"] == raw["created_ns"]
+        assert projection["category"] == raw["category"]
+        assert projection["corr_hash"] == capture._hash(raw["corr_id"])
+        assert projection["model_publication_retry"] == {
+            "schema": "model_publication_retry.v1", "outcome": outcome,
+        }
+
+    artifact_text = artifact.read_text(encoding="utf-8")
+    for private in ("private-old-root", "private-new-root", "private-pair", "private publication exception"):
+        assert private not in artifact_text
+
+
+@pytest.mark.parametrize(
+    "schema,outcome",
+    [
+        ("private.schema", "retry_admitted"),
+        ("model_publication_retry.v1", "private-outcome"),
+        ("model_publication_retry.v1", True),
+    ],
+)
+def test_model_publication_retry_projection_guards_unknown_fields(schema: object, outcome: object) -> None:
+    projected, unsupported = capture._projection({
+        "source": "controller", "message": "model_publication_retry",
+        "category": "model.candidate", "event_type": "state_transition",
+        "stage": "model", "level": "info", "corr_id": "model_update:aggregate",
+        "details": {
+            "schema": schema, "outcome": outcome,
+            "private_path": "/private/root", "private_label": "private-name",
+        },
+    })
+    assert not unsupported and projected is not None
+    known_schema = schema == "model_publication_retry.v1"
+    known_outcome = (
+        isinstance(outcome, str)
+        and outcome in {"retry_admitted", "retry_rearmed", "retry_adopted"}
+    )
+    assert projected["model_publication_retry"] == {
+        "schema": "model_publication_retry.v1" if known_schema else "unknown",
+        "outcome": outcome if known_schema and known_outcome else "unknown",
+    }
+    sanitized = observer._sanitize_capture_projection(projected)
+    assert sanitized["model_publication_retry"] == projected["model_publication_retry"]
+    assert "private_path" not in json.dumps(sanitized) and "private-name" not in json.dumps(sanitized)
+    wrong_context, rejected = capture._projection({
+        "source": "model_updater", "message": "model_publication_retry",
+        "category": "model.candidate", "event_type": "state_transition",
+        "stage": "model", "level": "info",
+        "details": {"schema": "model_publication_retry.v1", "outcome": "retry_admitted"},
+    })
+    assert wrong_context is None and rejected

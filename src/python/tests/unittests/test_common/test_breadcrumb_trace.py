@@ -1,6 +1,7 @@
 # Copyright 2026, SeedSync Contributors, All rights reserved.
 
 from collections import deque
+import json
 import queue
 import time
 import unittest
@@ -51,6 +52,46 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual([], snapshot["entries"])
         self.assertFalse(snapshot["window_reset"])
         self.assertEqual(0, snapshot["version"])
+
+    def test_export_sanitizes_list_limit_and_only_marks_real_truncation(self):
+        class RaisingList(list):
+            def __iter__(self):
+                for index in range(16):
+                    yield index
+                raise RuntimeError("password=must-not-escape")
+
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        records = (
+            ("exact_limit", {
+                "items": list(range(16)),
+                "command": ["lftp", "--password=command-secret"],
+                "api_token": "token-secret",
+            }),
+            ("overflow", {"items": list(range(17))}),
+            ("empty", {"items": []}),
+            ("iterator_error", {"items": RaisingList()}),
+        )
+        for message, details in records:
+            self.assertEqual("retained", collector.record("worker", message, details))
+
+        envelope = collector.export_events()
+        events = {event["message"]: event for event in envelope["events"]}
+        self.assertEqual(4, envelope["export_event_count"])
+        self.assertEqual(list(range(16)), events["exact_limit"]["details"]["items"])
+        self.assertEqual(
+            list(range(16)) + ["<truncated>"],
+            events["overflow"]["details"]["items"],
+        )
+        self.assertEqual([], events["empty"]["details"]["items"])
+        self.assertEqual(
+            list(range(16)) + ["<truncated>"],
+            events["iterator_error"]["details"]["items"],
+        )
+        self.assertEqual("<redacted>", events["exact_limit"]["details"]["command"])
+        self.assertEqual("<redacted>", events["exact_limit"]["details"]["api_token"])
+        serialized = json.dumps(envelope, sort_keys=True)
+        for secret in ("command-secret", "token-secret", "must-not-escape"):
+            self.assertNotIn(secret, serialized)
 
     def test_progress_lineage_summary_projects_span_and_preserves_ranges(self):
         collector = BreadcrumbTraceCollector(
