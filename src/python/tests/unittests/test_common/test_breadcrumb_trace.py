@@ -7,6 +7,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+import pytest
+
 from common.breadcrumb_trace import (
     DEFAULT_BREADCRUMB_MEMORY_BUDGET_BYTES,
     BreadcrumbTraceCollector,
@@ -1737,6 +1739,7 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual(1100, snapshot["entry_count"])
         self.assertLessEqual(snapshot["retained_bytes"], DEFAULT_BREADCRUMB_MEMORY_BUDGET_BYTES)
 
+    @pytest.mark.timeout(300)
     def test_live_budget_workload_reports_bounded_multi_eviction_and_policy_drop(self):
         bulk_details = {
             "operation": "inspect_status",
@@ -1783,8 +1786,22 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
                 level="info", event_type="diagnostic",
             )
         fill_elapsed = time.perf_counter() - fill_started
+        print(
+            "breadcrumb_collector_benchmark boundary=fill elapsed_s={:.6f} "
+            "entry_count={}".format(fill_elapsed, bulk_count + 2),
+            flush=True,
+        )
 
+        before_snapshot_started = time.perf_counter()
         before = collector.snapshot()
+        before_snapshot_elapsed = time.perf_counter() - before_snapshot_started
+        print(
+            "breadcrumb_collector_benchmark boundary=before_snapshot "
+            "elapsed_s={:.6f} entry_count={} retained_bytes={}".format(
+                before_snapshot_elapsed, before["entry_count"], before["retained_bytes"],
+            ),
+            flush=True,
+        )
         self.assertIsNone(before["max_entries"])
         self.assertEqual(DEFAULT_BREADCRUMB_MEMORY_BUDGET_BYTES, before["memory_budget_bytes"])
         self.assertEqual(0, before["accounting"]["evicted_count"])
@@ -1814,8 +1831,24 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
                 )
         final_elapsed = time.perf_counter() - final_started
         final_elapsed_ns = time.perf_counter_ns() - final_started_ns
+        print(
+            "breadcrumb_collector_benchmark boundary=final_admission "
+            "elapsed_ns={} retained={}".format(
+                final_elapsed_ns, int(result == "retained"),
+            ),
+            flush=True,
+        )
 
+        after_snapshot_started = time.perf_counter()
         after = collector.snapshot()
+        after_snapshot_elapsed = time.perf_counter() - after_snapshot_started
+        print(
+            "breadcrumb_collector_benchmark boundary=after_snapshot "
+            "elapsed_s={:.6f} entry_count={} retained_bytes={}".format(
+                after_snapshot_elapsed, after["entry_count"], after["retained_bytes"],
+            ),
+            flush=True,
+        )
         evicted_count = (
             after["accounting"]["evicted_count"]
             - before["accounting"]["evicted_count"]
@@ -1866,7 +1899,17 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
                     category="scan.status", level="info", event_type="diagnostic",
                 ),
             )
+        policy_snapshot_started = time.perf_counter()
         policy_snapshot = policy_collector.snapshot()
+        policy_snapshot_elapsed = time.perf_counter() - policy_snapshot_started
+        print(
+            "breadcrumb_collector_benchmark boundary=policy_snapshot "
+            "elapsed_s={:.6f} entry_count={} policy_dropped_count={}".format(
+                policy_snapshot_elapsed, policy_snapshot["entry_count"],
+                policy_snapshot["accounting"]["policy_dropped_count"],
+            ),
+            flush=True,
+        )
         self.assertEqual(1, policy_snapshot["accounting"]["policy_dropped_count"])
         self.assertEqual([], policy_snapshot["entries"])
 
