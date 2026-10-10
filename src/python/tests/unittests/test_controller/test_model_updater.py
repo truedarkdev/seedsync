@@ -16839,6 +16839,167 @@ class TestModelUpdater(unittest.TestCase):
             for file in post_entry_files if not file.final_move_pending
         ))
 
+    def test_pending_completion_diff_publishes_moving_before_terminal_candidate(self):
+        controller = self._make_v092_pending_completion_controller(complete=False)
+        model = controller._Controller__model
+        builder = controller._Controller__model_builder
+        file_id = ModelFile.build_file_id("pending.bin", None)
+        live_file = model.get_file(file_id)
+        self.assertFalse(live_file.complete_local_coverage)
+        self.assertFalse(controller._Controller__pending_completion_file_names)
+        builder.set_local_files([
+            SystemFile("pending.bin", 10, False, is_staging=True, mtime_ns=1),
+        ])
+        builder.request_rebuild()
+
+        copy_started = Event()
+        allow_copy_to_finish = Event()
+        listener = MagicMock()
+        model.add_listener(listener)
+
+        def blocked_move(_name, _path_pair_id, automatic_move_boundary=None):
+            self.assertIsNotNone(automatic_move_boundary)
+            self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+            moving = model.get_file(file_id)
+            self.assertTrue(moving.final_move_pending)
+            self.assertEqual("moving", Controller._model_record_visible_state(moving))
+            self.assertIsNone(moving.downloading_speed)
+            self.assertIsNone(moving.eta)
+
+            def wait_for_copy():
+                copy_started.set()
+                if not allow_copy_to_finish.wait(5):
+                    raise TimeoutError("test copy was not released")
+
+            automatic_move_boundary.copy_private(wait_for_copy)
+            return Controller.MoveFromStagingResult.COMPLETED
+
+        blocked_move.__qualname__ = "Controller.__move_from_staging"
+        controller._Controller__move_from_staging = blocked_move
+        worker_errors = []
+
+        def update_model():
+            try:
+                ModelUpdater(controller).update()
+            except BaseException as error:
+                worker_errors.append(error)
+
+        worker = Thread(target=update_model)
+        worker.start()
+        try:
+            self.assertTrue(copy_started.wait(5), "automatic copy did not reach its unlocked phase")
+            events = [
+                call.args[1]
+                for call in listener.file_updated.call_args_list
+                if call.args[1].file_id == file_id
+            ]
+            self.assertTrue(events)
+            visible_states = [Controller._model_record_visible_state(file) for file in events]
+            self.assertEqual("moving", visible_states[0])
+            self.assertNotIn("downloaded", visible_states[:-1])
+            first_moving = events[0]
+            serialized = SerializeModel().update_event(SerializeModel.UpdateEvent(
+                SerializeModel.UpdateEvent.Change.UPDATED,
+                live_file,
+                first_moving,
+            ))
+            payload = json.loads(serialized.split("data: ", 1)[1].splitlines()[0])
+            self.assertTrue(payload["new_file"]["final_move_pending"])
+            self.assertTrue(payload["new_file"]["complete_local_coverage"])
+            self.assertEqual(1, controller._reserve_move_attempt.call_count)
+            self.assertEqual("moving", Controller._model_record_visible_state(model.get_file(file_id)))
+        finally:
+            allow_copy_to_finish.set()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive(), "model update did not finish after releasing the copy")
+        self.assertEqual([], worker_errors)
+        final_file = model.get_file(file_id)
+        self.assertFalse(final_file.final_move_pending)
+        self.assertEqual("downloaded", Controller._model_record_visible_state(final_file))
+        self.assertEqual(1, controller._release_move_attempt.call_count)
+        self.assertFalse(controller._Controller__pending_completion_file_names)
+
+    def test_pending_completion_diff_waits_for_authority_before_terminal_publication(self):
+        controller = self._make_v092_pending_completion_controller(complete=False)
+        model = controller._Controller__model
+        builder = controller._Controller__model_builder
+        file_id = ModelFile.build_file_id("pending.bin", None)
+        controller._Controller__reconciled_remote_path_pair_ids.clear()
+        builder.set_local_files([
+            SystemFile("pending.bin", 10, False, is_staging=True, mtime_ns=1),
+        ])
+        builder.request_rebuild()
+        listener = MagicMock()
+        model.add_listener(listener)
+
+        ModelUpdater(controller).update()
+
+        current = model.get_file(file_id)
+        self.assertFalse(current.complete_local_coverage)
+        self.assertNotEqual("downloaded", Controller._model_record_visible_state(current))
+        self.assertFalse(controller._Controller__move_from_staging.called)
+        self.assertIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+        self.assertFalse(any(
+            Controller._model_record_visible_state(call.args[1]) == "downloaded"
+            for call in listener.file_updated.call_args_list
+            if call.args[1].file_id == file_id
+        ))
+
+        # The skipped diff must remain available to the ordinary pending-root
+        # path on a quiet cycle after reconciliation becomes authoritative.
+        controller._Controller__reconciled_remote_path_pair_ids.add(None)
+        ModelUpdater(controller).update()
+        self.assertEqual(1, controller._Controller__move_from_staging.call_count)
+        self.assertEqual("downloaded", Controller._model_record_visible_state(model.get_file(file_id)))
+
+    def test_pending_completion_prepublication_listener_failure_releases_move_reservation(self):
+        controller = self._make_v092_pending_completion_controller(complete=False)
+        model = controller._Controller__model
+        builder = controller._Controller__model_builder
+        file_id = ModelFile.build_file_id("pending.bin", None)
+        unrelated_id = ModelFile.build_file_id("unrelated.bin", None)
+        model.remove_file(file_id)
+        unrelated_builder = ModelBuilder()
+        unrelated_builder.set_remote_files([SystemFile("unrelated.bin", 10, False, mtime_ns=1)])
+        unrelated_builder.set_local_files([SystemFile("unrelated.bin", 1, False, mtime_ns=1)])
+        model.add_file(unrelated_builder.build_model().get_file(unrelated_id))
+        builder.set_remote_files([
+            SystemFile("pending.bin", 10, False, mtime_ns=1),
+            SystemFile("unrelated.bin", 10, False, mtime_ns=1),
+        ])
+        builder.set_local_files([
+            SystemFile("pending.bin", 10, False, is_staging=True, mtime_ns=1),
+            SystemFile("unrelated.bin", 2, False, mtime_ns=2),
+        ])
+        builder.request_rebuild()
+
+        listener = MagicMock()
+        moving_additions = []
+
+        def observe_moving_addition(new_file):
+            if new_file.file_id == file_id:
+                self.assertTrue(new_file.final_move_pending)
+                moving_additions.append(new_file)
+
+        def fail_unrelated_update(_old_file, new_file):
+            if new_file.file_id == unrelated_id:
+                raise RuntimeError("unrelated update listener failed")
+
+        listener.file_added.side_effect = observe_moving_addition
+        listener.file_updated.side_effect = fail_unrelated_update
+        model.add_listener(listener)
+
+        with self.assertRaisesRegex(RuntimeError, "unrelated update listener failed"):
+            ModelUpdater(controller).update()
+
+        self.assertEqual(1, len(moving_additions))
+        self.assertEqual(1, controller._Controller__move_from_staging.call_count)
+        self.assertEqual(1, controller._reserve_move_attempt.call_count)
+        self.assertEqual(1, controller._release_move_attempt.call_count)
+        self.assertFalse(model.get_file(file_id).final_move_pending)
+        self.assertNotIn(("pending.bin", None, None), controller._Controller__pending_completion_file_names)
+
     def test_v092_pending_completion_clear_preserves_current_stop_during_copy(self):
         controller = self._make_v092_pending_completion_controller()
         model = controller._Controller__model

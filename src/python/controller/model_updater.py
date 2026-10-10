@@ -11335,10 +11335,12 @@ class ModelUpdater(_ControllerCoreAccess):
                     ):
                         setter(generation)
 
-            def apply_model_replacement(operation: Callable[[], object]) -> object:
+            def apply_model_replacement(
+                    operation: Callable[[], object], *, reservation_file: Optional[ModelFile] = None,
+            ) -> object:
                 """Use the Model's one progress-provenance publication boundary."""
-                statuses = replacement_statuses_by_file_id()
                 try:
+                    statuses = replacement_statuses_by_file_id()
                     return model.apply_authoritative_root_replacement(
                         operation, statuses,
                         lambda file_id: getattr(
@@ -11358,6 +11360,8 @@ class ModelUpdater(_ControllerCoreAccess):
                         self.__record_publication_retry(
                             "retry_rearmed" if retry_was_pending else "retry_admitted",
                         )
+                    if reservation_file is not None:
+                        release_pre_reserved_move(reservation_file)
                     raise
 
             def publish_final_move_pending(file: ModelFile, pending: bool) -> None:
@@ -11969,6 +11973,48 @@ class ModelUpdater(_ControllerCoreAccess):
                     ).discard(file.file_id)
                     self._clear_pending_completion_progress_floor(controller, file.file_id)
 
+                pre_reserved_move_file_ids: set[str] = set()
+                pre_admitted_completion_file_ids: set[str] = set()
+                prepublication_deferred_file_ids: set[str] = set()
+
+                def record_prepublication_completion_deferred(
+                        file: ModelFile, reason: str,
+                ) -> None:
+                    prepublication_deferred_file_ids.add(file.file_id)
+                    if completion_trace_enabled:
+                        try:
+                            self._record_completion_gate_breadcrumb(
+                                file.file_id,
+                                "completion_gate_decision",
+                                {
+                                    "completion_proved": False,
+                                    "decision": "deferred",
+                                    "reason": reason,
+                                    "physical_proof": "missing",
+                                    "exact_final_file_proof": False,
+                                    "pending_transition": "retained",
+                                    "explicit_stop": False,
+                                    "terminal_outcome": "deferred",
+                                },
+                                poll_correlation=lftp_status_poll_correlation,
+                            )
+                        except Exception:
+                            # Optional trace output cannot change model publication.
+                            pass
+
+                def release_pre_reserved_move(file: ModelFile) -> None:
+                    """Release a pre-publication admission if its move is cancelled."""
+                    if file.file_id not in pre_reserved_move_file_ids:
+                        return
+                    pre_reserved_move_file_ids.discard(file.file_id)
+                    pre_admitted_completion_file_ids.discard(file.file_id)
+                    release_move = getattr(controller, "_release_move_attempt", None)
+                    try:
+                        publish_final_move_pending(file, False)
+                    finally:
+                        if callable(release_move):
+                            release_move(file.file_id)
+
                 def run_reserved_automatic_move(
                         file: ModelFile, trace_completion_gate: bool = False,
                         trace_pending_decision: bool = False,
@@ -11981,6 +12027,8 @@ class ModelUpdater(_ControllerCoreAccess):
                     # Production Controllers always expose all three methods.
                     if not callable(reserve_move) or not callable(release_move) or \
                             not callable(move_from_staging):
+                        if file.file_id in pre_reserved_move_file_ids:
+                            release_pre_reserved_move(file)
                         if trace_completion_gate:
                             self._record_completion_gate_breadcrumb(
                                 file.file_id, "completion_gate_move_deferred",
@@ -11993,7 +12041,8 @@ class ModelUpdater(_ControllerCoreAccess):
                                 "move_reservation",
                             )
                         return None
-                    if not reserve_move(file.file_id):
+                    already_reserved = file.file_id in pre_reserved_move_file_ids
+                    if not already_reserved and not reserve_move(file.file_id):
                         if trace_completion_gate:
                             self._record_completion_gate_breadcrumb(
                                 file.file_id, "completion_gate_move_deferred",
@@ -12006,9 +12055,12 @@ class ModelUpdater(_ControllerCoreAccess):
                                 "move_reservation",
                             )
                         return None
+                    pre_reserved_move_file_ids.discard(file.file_id)
+                    pre_admitted_completion_file_ids.discard(file.file_id)
                     keep_reservation = False
                     try:
-                        publish_final_move_pending(file, True)
+                        if not already_reserved:
+                            publish_final_move_pending(file, True)
                         if trace_completion_gate:
                             self._record_completion_gate_breadcrumb(
                                 file.file_id, "completion_gate_move_attempted",
@@ -12511,25 +12563,92 @@ class ModelUpdater(_ControllerCoreAccess):
                                 pending_completion_publication_file_ids(),
                             )
 
+                    # A pending completion may arrive as a terminal model diff
+                    # before the normal completion block below.  Admit and
+                    # reserve that exact root before listeners can observe it;
+                    # otherwise its complete candidate would briefly publish as
+                    # Downloaded while the staging move is still pending.
+                    if diff.change in (ModelDiff.Change.ADDED, ModelDiff.Change.UPDATED) and \
+                            isinstance(new_file, ModelFile) and new_file.parent is None and \
+                            candidate_lifecycle_allows(new_file.file_id) and \
+                            (new_file.name, new_file.path_pair_id, new_file.path_pair_name) in \
+                            controller._Controller__pending_completion_file_names and \
+                            not new_file.explicitly_stopped and \
+                            not new_file.final_move_succeeded and \
+                            new_file.file_id not in persist.final_move_succeeded_file_names:
+                        candidate_is_terminal = new_file.state in (
+                            ModelFile.State.DOWNLOADED,
+                            ModelFile.State.EXTRACTED,
+                            ModelFile.State.DELETED,
+                        ) or (
+                            new_file.state == ModelFile.State.DEFAULT and
+                            new_file.complete_local_coverage is True
+                        )
+                        if candidate_is_terminal:
+                            if controller._Controller__is_explicitly_stopped(
+                                    new_file.full_path, new_file.path_pair_id,
+                            ):
+                                pass
+                            elif not pending_completion_move_authorized(
+                                    new_file.file_id,
+                                    trace_pending_decision=completion_trace_enabled,
+                            ):
+                                record_prepublication_completion_deferred(
+                                    new_file, "completion_authority_missing",
+                                )
+                                continue
+                            else:
+                                failure_count = persist.move_failure_counts.get(new_file.file_id, 0)
+                                retry_due = controller._Controller__move_retry_due.get(new_file.file_id)
+                                if failure_count >= controller._Controller__MAX_MOVE_FAILURES or (
+                                        retry_due is not None and datetime.now() < retry_due):
+                                    record_prepublication_completion_deferred(
+                                        new_file, "retry_or_failure_limit",
+                                    )
+                                    continue
+                                reserve_move = getattr(controller, "_reserve_move_attempt", None)
+                                release_move = getattr(controller, "_release_move_attempt", None)
+                                move_from_staging = getattr(
+                                    controller, "_Controller__move_from_staging", None,
+                                )
+                                if not callable(reserve_move) or not callable(release_move) or \
+                                        not callable(move_from_staging):
+                                    record_prepublication_completion_deferred(
+                                        new_file, "move_boundary_unavailable",
+                                    )
+                                    continue
+                                if not reserve_move(new_file.file_id):
+                                    record_prepublication_completion_deferred(
+                                        new_file, "move_reservation_unavailable",
+                                    )
+                                    continue
+                                pre_reserved_move_file_ids.add(new_file.file_id)
+                                pre_admitted_completion_file_ids.add(new_file.file_id)
+                                new_file.final_move_pending = True
+
                     if diff.change == ModelDiff.Change.ADDED:
                         assert new_file is not None
                         apply_model_replacement(lambda: model.add_file(
                             new_file, structural_job_identity=structural_identity_for(new_file),
-                        ))
+                        ), reservation_file=new_file)
                     elif diff.change == ModelDiff.Change.REMOVED:
                         assert old_file is not None
                         apply_model_replacement(lambda: model.remove_file(old_file.file_id))
                     elif diff.change == ModelDiff.Change.UPDATED:
                         assert new_file is not None
-                        structural_identity = structural_identity_for(new_file)
-                        publication_context = publication_route_floor_context(
-                            new_file, "full_diff", structural_identity, floor_disposition,
-                        )
+                        try:
+                            structural_identity = structural_identity_for(new_file)
+                            publication_context = publication_route_floor_context(
+                                new_file, "full_diff", structural_identity, floor_disposition,
+                            )
+                        except Exception:
+                            release_pre_reserved_move(new_file)
+                            raise
                         apply_model_replacement(lambda: model.update_file(
                             new_file,
                             structural_job_identity=structural_identity,
                             publication_context=publication_context,
-                        ))
+                        ), reservation_file=new_file)
 
                     if publication_probe_candidate and publication_read_ready and \
                             isinstance(new_file, ModelFile):
@@ -12665,15 +12784,32 @@ class ModelUpdater(_ControllerCoreAccess):
 
                     completion_proved = False
                     completion_reason = "not_pending"
-                    completion_candidate = new_file is not None and old_file is not None and \
-                        new_file.file_id in pending_completion_file_ids()
-                    explicitly_stopped = completion_candidate and controller._Controller__is_explicitly_stopped(
-                        new_file.full_path,
-                        new_file.path_pair_id,
-                    )
+                    completion_candidate = new_file is not None and \
+                        new_file.file_id in pending_completion_file_ids() and \
+                        (old_file is not None or new_file.file_id in pre_admitted_completion_file_ids)
+                    try:
+                        explicitly_stopped = completion_candidate and \
+                            controller._Controller__is_explicitly_stopped(
+                                new_file.full_path,
+                                new_file.path_pair_id,
+                            )
+                    except Exception:
+                        if new_file is not None:
+                            release_pre_reserved_move(new_file)
+                        raise
                     if completion_candidate and explicitly_stopped:
+                        release_pre_reserved_move(new_file)
                         discard_pending_completion_file(new_file.file_id)
                         completion_reason = "explicitly_stopped"
+                    elif completion_candidate and new_file.file_id in pre_admitted_completion_file_ids:
+                        completion_proved = True
+                        completion_reason = (
+                            "terminal_state" if new_file.state in (
+                                ModelFile.State.DOWNLOADED,
+                                ModelFile.State.EXTRACTED,
+                                ModelFile.State.DELETED,
+                            ) else "complete_local_coverage"
+                        )
                     elif completion_candidate:
                         if new_file.state == ModelFile.State.DEFAULT and new_file.local_size is None:
                             discard_pending_completion_file(new_file.file_id)
@@ -12696,7 +12832,8 @@ class ModelUpdater(_ControllerCoreAccess):
                         elif completion_reason == "not_pending":
                             completion_reason = "completion_evidence_missing"
 
-                        if completion_proved and not pending_completion_move_authorized(new_file.file_id):
+                        if completion_proved and new_file.file_id not in pre_admitted_completion_file_ids and \
+                                not pending_completion_move_authorized(new_file.file_id):
                             completion_proved = False
                             completion_reason = "completion_authority_missing"
 
@@ -12724,11 +12861,17 @@ class ModelUpdater(_ControllerCoreAccess):
                         )
 
                     if completion_proved and new_file is not None:
-                        failure_count = persist.move_failure_counts.get(new_file.file_id, 0)
-                        retry_due = controller._Controller__move_retry_due.get(new_file.file_id)
-                        if failure_count >= controller._Controller__MAX_MOVE_FAILURES or (
-                            retry_due is not None and datetime.now() < retry_due
-                        ):
+                        try:
+                            failure_count = persist.move_failure_counts.get(new_file.file_id, 0)
+                            retry_due = controller._Controller__move_retry_due.get(new_file.file_id)
+                            retry_blocked = failure_count >= controller._Controller__MAX_MOVE_FAILURES or (
+                                retry_due is not None and datetime.now() < retry_due
+                            )
+                        except Exception:
+                            release_pre_reserved_move(new_file)
+                            raise
+                        if retry_blocked:
+                            release_pre_reserved_move(new_file)
                             if completion_trace_enabled:
                                 self._record_completion_gate_breadcrumb(
                                     new_file.file_id, "completion_gate_move_deferred",
@@ -12833,6 +12976,8 @@ class ModelUpdater(_ControllerCoreAccess):
                 # identity instead of relying on incidental scan changes.
                 for file_name, path_pair_id, _ in list(controller._Controller__pending_completion_file_names):
                     file_id = ModelFile.build_file_id(file_name, path_pair_id)
+                    if file_id in prepublication_deferred_file_ids:
+                        continue
                     if not candidate_lifecycle_allows(file_id):
                         failure_count = persist.move_failure_counts.get(file_id, 0)
                         # A pending LFTP completion is authoritative work in
@@ -12900,9 +13045,8 @@ class ModelUpdater(_ControllerCoreAccess):
                     # active-only branch or collision since the last attempt.
                     # Leave pending/retry state intact until coverage is
                     # proven again.
-                    if not pending_completion_move_authorized(
-                            file_id, trace_pending_decision=True,
-                    ):
+                    if file_id not in pre_admitted_completion_file_ids and \
+                            not pending_completion_move_authorized(file_id, trace_pending_decision=True):
                         continue
                     move_result = run_reserved_automatic_move(
                         pending_file, trace_pending_decision=True,
