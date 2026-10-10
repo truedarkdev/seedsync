@@ -1317,17 +1317,49 @@ class TestScannerProcess(unittest.TestCase):
     def test_force_start_and_published_result_join_after_persistence_for_local_and_remote(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=32)
         expected = opaque_trace_correlation("scan-pair|request-result-pair")
+        lifecycle_messages = {"force_scan", "scan_started", "scan_result_published"}
+        admitted = []
         for scanner_type, expected_side in ((LocalPairScanner, "local"), (RemotePairScanner, "remote")):
+            emitter = collector.create_emitter()
+            original_record = emitter.record
+
+            def capture_disposition(source, message, details=None, _record=original_record, **metadata):
+                disposition = _record(source, message, details, **metadata)
+                if message in lifecycle_messages:
+                    admitted.append((details["scanner_side"], message, disposition))
+                return disposition
+
+            emitter.record = capture_disposition
             process = ScannerProcess(
                 scanner=scanner_type(), interval_in_ms=0, verbose=False,
-                breadcrumb_trace=collector.create_emitter(),
+                breadcrumb_trace=emitter,
             )
             self.addCleanup(process.close_queues)
             process.run_init()
             process.force_scan("request-result-pair")
             process._ScannerProcess__run_inline_scan()
 
-        entries = collector.snapshot()["entries"]
+        expected_records = {
+            (side, message) for side in ("local", "remote") for message in lifecycle_messages
+        }
+        self.assertEqual(6, len(admitted))
+        self.assertEqual(expected_records, {(side, message) for side, message, _ in admitted})
+        self.assertTrue(all(disposition == "enqueued" for _, _, disposition in admitted))
+        deadline = time.monotonic() + 1
+        while True:
+            snapshot = collector.snapshot()
+            entries = snapshot["entries"]
+            retained = [
+                entry for entry in entries if entry["message"] in lifecycle_messages
+            ]
+            retained_records = {
+                (entry["details"].get("scanner_side"), entry["message"]) for entry in retained
+            }
+            if expected_records <= retained_records or time.monotonic() >= deadline:
+                break
+            time.sleep(0.001)
+        self.assertEqual(expected_records, retained_records)
+        self.assertEqual(6, len(retained))
         for expected_side in ("local", "remote"):
             side_entries = [
                 entry for entry in entries
@@ -1353,6 +1385,13 @@ class TestScannerProcess(unittest.TestCase):
             self.assertTrue(result_details["final"])
             self.assertTrue(result_details["queue_published"])
             self.assertNotIn("request-result-pair", repr(side_entries))
+        self.assertNotIn("request-result-pair", repr(entries))
+        ingress = collector.ingress_snapshot()
+        self.assertEqual(0, ingress["critical_rejected_count"])
+        self.assertEqual(0, ingress["normal_rejected_count"])
+        self.assertEqual(0, ingress["reservation_unknown"])
+        self.assertEqual(0, snapshot["accounting"]["dropped_count"])
+        self.assertEqual(0, snapshot["accounting"]["evicted_count"])
 
     def test_force_scan_coalesces_requests_during_active_scan(self):
         started = threading.Event()
