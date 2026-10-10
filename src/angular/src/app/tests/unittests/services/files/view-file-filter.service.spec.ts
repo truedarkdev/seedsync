@@ -265,6 +265,20 @@ describe("Testing view file filter service", () => {
         }))).toBe(false);
     }));
 
+    it("keeps Moving rows in the existing Downloading filter", fakeAsync(() => {
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            selectedStatusFilter: ViewFile.Status.DOWNLOADING,
+        }));
+        tick();
+
+        expect(filterCriteria.meetsCriteria(new ViewFile({
+            status: ViewFile.Status.MOVING,
+        }))).toBe(true);
+        expect(filterCriteria.meetsCriteria(new ViewFile({
+            status: ViewFile.Status.DOWNLOADED,
+        }))).toBe(false);
+    }));
+
     it("correctly filters by name AND status", fakeAsync(() => {
         viewFileOptionsService._options.next(new ViewFileOptions({
             selectedStatusFilter: ViewFile.Status.DEFAULT,

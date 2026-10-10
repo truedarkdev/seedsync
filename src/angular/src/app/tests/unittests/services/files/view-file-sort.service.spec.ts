@@ -607,6 +607,7 @@ describe("Testing view file sort service", () => {
             new ViewFile({name: "extracting", status: ViewFile.Status.EXTRACTING, downloadedTimestamp: new Date(1000)}),
             new ViewFile({name: "validating", status: ViewFile.Status.VALIDATING, downloadedTimestamp: new Date(1000)}),
             new ViewFile({name: "downloading", status: ViewFile.Status.DOWNLOADING, downloadedTimestamp: new Date(1000)}),
+            new ViewFile({name: "moving", status: ViewFile.Status.MOVING, downloadedTimestamp: new Date(1000)}),
             new ViewFile({name: "queued", status: ViewFile.Status.QUEUED, downloadedTimestamp: new Date(1000)}),
             new ViewFile({name: "stopped", status: ViewFile.Status.STOPPED, downloadedTimestamp: new Date(1000)}),
             new ViewFile({name: "downloaded-missing-a", status: ViewFile.Status.DOWNLOADED}),
@@ -615,6 +616,7 @@ describe("Testing view file sort service", () => {
 
         expect(files.sort(sortComparator).map(file => file.name)).toEqual([
             "downloading",
+            "moving",
             "extracting",
             "validating",
             "move-failed",

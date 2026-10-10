@@ -9,6 +9,7 @@ delegates the model refresh boundary.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import time
@@ -11292,6 +11293,36 @@ class ModelUpdater(_ControllerCoreAccess):
                     ).get(file_id, 0),
                 )
 
+            def publish_final_move_pending(file: ModelFile, pending: bool) -> None:
+                """Publish move entry from its candidate and exit from the live root."""
+                try:
+                    current = model.get_file(file.file_id)
+                    if pending:
+                        if current is file and current.final_move_pending:
+                            return
+                        # Entry publishes the candidate whose physical proof
+                        # admitted this move. The live root may still be an
+                        # older partial snapshot on the quiet completion path.
+                        phase_source = file
+                    else:
+                        # Copy may have released the model lock. Clear only the
+                        # phase on the root that is current now, preserving any
+                        # Stop/reset or newer lifecycle publication made while
+                        # the physical copy was in flight.
+                        if not current.final_move_pending:
+                            return
+                        phase_source = current
+                    replacement = copy.deepcopy(phase_source)
+                    replacement.final_move_pending = pending
+                    apply_model_replacement(lambda: model.update_file(replacement))
+                except Exception:
+                    # Presentation must not change move authorization or its
+                    # result. Keep the in-memory phase truthful if publication fails.
+                    try:
+                        model.get_file(file.file_id).final_move_pending = pending
+                    except Exception:
+                        pass
+
             def clear_overlays_for_replacement() -> None:
                 """Clear/rebase only after the replacement restore decision."""
                 nonlocal deferred_rejected_overlay_clear
@@ -11908,7 +11939,9 @@ class ModelUpdater(_ControllerCoreAccess):
                                 "move_reservation",
                             )
                         return None
+                    keep_reservation = False
                     try:
+                        publish_final_move_pending(file, True)
                         if trace_completion_gate:
                             self._record_completion_gate_breadcrumb(
                                 file.file_id, "completion_gate_move_attempted",
@@ -11943,9 +11976,18 @@ class ModelUpdater(_ControllerCoreAccess):
                                 },
                                 poll_correlation=lftp_status_poll_correlation,
                             )
+                        keep_reservation = move_result is not None
                         return move_result
                     finally:
-                        release_move(file.file_id)
+                        if not keep_reservation:
+                            publish_final_move_pending(file, False)
+                            release_move(file.file_id)
+
+                def finish_reserved_automatic_move(file: ModelFile) -> None:
+                    try:
+                        publish_final_move_pending(file, False)
+                    finally:
+                        controller._release_move_attempt(file.file_id)
 
                 terminalized_collision_file_ids: set[str] = set()
 
@@ -12636,26 +12678,29 @@ class ModelUpdater(_ControllerCoreAccess):
                         )
                         if move_result is None:
                             continue
-                        attempted_move_file_ids.add(new_file.file_id)
-                        if move_result in (
-                            controller.MoveFromStagingResult.FAILED,
-                            controller.MoveFromStagingResult.CONFLICT,
-                            controller.MoveFromStagingResult.DEFERRED,
-                        ):
-                            keep_completion_pending_after_failed_staging_move(
-                                new_file,
-                                move_result in (
-                                    controller.MoveFromStagingResult.FAILED,
-                                    controller.MoveFromStagingResult.CONFLICT,
-                                ),
-                            )
-                        else:
-                            publish_completed_download(
-                                new_file,
-                                move_result == controller.MoveFromStagingResult.COMPLETED or
-                                new_file.file_id in persist.final_move_succeeded_file_names,
-                                move_result == controller.MoveFromStagingResult.COMPLETED,
-                            )
+                        try:
+                            attempted_move_file_ids.add(new_file.file_id)
+                            if move_result in (
+                                controller.MoveFromStagingResult.FAILED,
+                                controller.MoveFromStagingResult.CONFLICT,
+                                controller.MoveFromStagingResult.DEFERRED,
+                            ):
+                                keep_completion_pending_after_failed_staging_move(
+                                    new_file,
+                                    move_result in (
+                                        controller.MoveFromStagingResult.FAILED,
+                                        controller.MoveFromStagingResult.CONFLICT,
+                                    ),
+                                )
+                            else:
+                                publish_completed_download(
+                                    new_file,
+                                    move_result == controller.MoveFromStagingResult.COMPLETED or
+                                    new_file.file_id in persist.final_move_succeeded_file_names,
+                                    move_result == controller.MoveFromStagingResult.COMPLETED,
+                                )
+                        finally:
+                            finish_reserved_automatic_move(new_file)
 
                     # Detect if a file was just downloaded through a direct state transition.
                     # Pending-completion files are handled above so disappearance does not
@@ -12692,26 +12737,29 @@ class ModelUpdater(_ControllerCoreAccess):
                         move_result = run_reserved_automatic_move(new_file)
                         if move_result is None:
                             continue
-                        attempted_move_file_ids.add(new_file.file_id)
-                        if move_result in (
-                            controller.MoveFromStagingResult.FAILED,
-                            controller.MoveFromStagingResult.CONFLICT,
-                            controller.MoveFromStagingResult.DEFERRED,
-                        ):
-                            keep_completion_pending_after_failed_staging_move(
-                                new_file,
-                                move_result in (
-                                    controller.MoveFromStagingResult.FAILED,
-                                    controller.MoveFromStagingResult.CONFLICT,
-                                ),
-                            )
-                        else:
-                            publish_completed_download(
-                                new_file,
-                                move_result == controller.MoveFromStagingResult.COMPLETED or
-                                new_file.file_id in persist.final_move_succeeded_file_names,
-                                move_result == controller.MoveFromStagingResult.COMPLETED,
-                            )
+                        try:
+                            attempted_move_file_ids.add(new_file.file_id)
+                            if move_result in (
+                                controller.MoveFromStagingResult.FAILED,
+                                controller.MoveFromStagingResult.CONFLICT,
+                                controller.MoveFromStagingResult.DEFERRED,
+                            ):
+                                keep_completion_pending_after_failed_staging_move(
+                                    new_file,
+                                    move_result in (
+                                        controller.MoveFromStagingResult.FAILED,
+                                        controller.MoveFromStagingResult.CONFLICT,
+                                    ),
+                                )
+                            else:
+                                publish_completed_download(
+                                    new_file,
+                                    move_result == controller.MoveFromStagingResult.COMPLETED or
+                                    new_file.file_id in persist.final_move_succeeded_file_names,
+                                    move_result == controller.MoveFromStagingResult.COMPLETED,
+                                )
+                        finally:
+                            finish_reserved_automatic_move(new_file)
 
                 # A pending file often has no subsequent model diff. Drive its
                 # initial attempt and retry budget from the durable pending
@@ -12794,30 +12842,33 @@ class ModelUpdater(_ControllerCoreAccess):
                     )
                     if move_result is None:
                         continue
-                    if move_result in (
-                        controller.MoveFromStagingResult.COMPLETED,
-                        controller.MoveFromStagingResult.ALREADY_COMPLETED,
-                    ):
-                        publish_completed_download(
-                            pending_file,
-                            move_result == controller.MoveFromStagingResult.COMPLETED or
-                            pending_file.file_id in persist.final_move_succeeded_file_names,
-                            move_result == controller.MoveFromStagingResult.COMPLETED,
-                        )
-                    elif move_result == controller.MoveFromStagingResult.NO_MOVE_APPLICABLE:
-                        # A terminal same-path completion has no staging
-                        # source left to resume. Retain bindings on deferred
-                        # or failed moves, but never let this terminal case
-                        # authorize a future unrelated partial.
-                        persist.resume_source_identities.pop(pending_file.file_id, None)
-                        publish_completed_download(pending_file, False)
-                    elif move_result in (
-                        controller.MoveFromStagingResult.FAILED,
-                        controller.MoveFromStagingResult.CONFLICT,
-                    ):
-                        keep_completion_pending_after_failed_staging_move(pending_file, True)
-                    else:
-                        keep_completion_pending_after_failed_staging_move(pending_file, False)
+                    try:
+                        if move_result in (
+                            controller.MoveFromStagingResult.COMPLETED,
+                            controller.MoveFromStagingResult.ALREADY_COMPLETED,
+                        ):
+                            publish_completed_download(
+                                pending_file,
+                                move_result == controller.MoveFromStagingResult.COMPLETED or
+                                pending_file.file_id in persist.final_move_succeeded_file_names,
+                                move_result == controller.MoveFromStagingResult.COMPLETED,
+                            )
+                        elif move_result == controller.MoveFromStagingResult.NO_MOVE_APPLICABLE:
+                            # A terminal same-path completion has no staging
+                            # source left to resume. Retain bindings on deferred
+                            # or failed moves, but never let this terminal case
+                            # authorize a future unrelated partial.
+                            persist.resume_source_identities.pop(pending_file.file_id, None)
+                            publish_completed_download(pending_file, False)
+                        elif move_result in (
+                            controller.MoveFromStagingResult.FAILED,
+                            controller.MoveFromStagingResult.CONFLICT,
+                        ):
+                            keep_completion_pending_after_failed_staging_move(pending_file, True)
+                        else:
+                            keep_completion_pending_after_failed_staging_move(pending_file, False)
+                    finally:
+                        finish_reserved_automatic_move(pending_file)
 
                 for diff in model_diff:
                     new_file = getattr(diff, "new_file", None)

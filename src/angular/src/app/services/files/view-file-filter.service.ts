@@ -24,7 +24,9 @@ class StatusFilterCriteria implements ViewFileFilterCriteria {
     }
 
     meetsCriteria(viewFile: ViewFile): boolean {
-        return this._status == null || this._status === viewFile.visibleStatus;
+        return this._status == null || this._status === viewFile.visibleStatus ||
+            (this._status === ViewFile.Status.DOWNLOADING &&
+                viewFile.visibleStatus === ViewFile.Status.MOVING);
     }
 }
 

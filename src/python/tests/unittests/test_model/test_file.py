@@ -30,6 +30,22 @@ class TestModelFile(unittest.TestCase):
         file.transferred_size = None
         self.assertIsNone(file._ModelFile__runtime)
 
+    def test_final_move_pending_is_a_transient_boolean(self):
+        file = ModelFile("test", False)
+        self.assertFalse(file.final_move_pending)
+        self.assertIsNone(file._ModelFile__runtime)
+
+        file.final_move_pending = True
+        self.assertTrue(file.final_move_pending)
+        copied = copy.deepcopy(file)
+        self.assertTrue(copied.final_move_pending)
+        self.assertEqual(file, copied)
+
+        copied.final_move_pending = False
+        self.assertFalse(copied.final_move_pending)
+        with self.assertRaises(TypeError):
+            file.final_move_pending = 1
+
     def test_sparse_runtime_preserves_legacy_unchecked_extractable_values(self):
         file = ModelFile("test", False)
         file.is_extractable = 0

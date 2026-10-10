@@ -145,11 +145,13 @@ describe("Testing file options component", () => {
 
         expect(queuedButton).toBeDefined();
         expect(queuedButton!.disabled).toBe(true);
+        expect(statusButtons.some(button => (button.textContent || "").includes("Moving"))).toBe(false);
 
         viewFileService.emitFiles(Immutable.List([
             new ViewFile({status: ViewFile.Status.QUEUED}),
             new ViewFile({status: ViewFile.Status.QUEUED}),
             new ViewFile({status: ViewFile.Status.DOWNLOADING}),
+            new ViewFile({status: ViewFile.Status.MOVING}),
             new ViewFile({status: ViewFile.Status.DOWNLOADED, isLocalOnly: false}),
             new ViewFile({status: ViewFile.Status.DOWNLOADED, isLocalOnly: true}),
             new ViewFile({status: ViewFile.Status.MOVE_FAILED}),
@@ -157,7 +159,7 @@ describe("Testing file options component", () => {
         ]));
 
         expect(component.getStatusCount(ViewFile.Status.QUEUED)).toBe(2);
-        expect(component.getStatusCount(ViewFile.Status.DOWNLOADING)).toBe(1);
+        expect(component.getStatusCount(ViewFile.Status.DOWNLOADING)).toBe(2);
         expect(component.getStatusCount(ViewFile.Status.DOWNLOADED)).toBe(1);
         expect(component.getStatusCount(ViewFile.Status.MOVE_FAILED)).toBe(1);
         expect(component.getStatusCount(ViewFile.Status.MOVE_SUCCEEDED)).toBe(1);

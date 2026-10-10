@@ -5166,6 +5166,7 @@ class Controller:
             "validation_error": file.validation_error,
             "corrupt_chunks": file.corrupt_chunks,
             "final_move_succeeded": file.final_move_succeeded,
+            "final_move_pending": file.final_move_pending,
             # Keep the established object shape without smuggling the tree
             # through a page response.
             "children": [],
@@ -5204,8 +5205,17 @@ class Controller:
 
     @staticmethod
     def _model_record_visible_state(file: ModelFile) -> str:
+        if file.final_move_pending and file.complete_local_coverage and \
+                not file.explicitly_stopped and not file.final_move_succeeded and \
+                file.state in {
+                    ModelFile.State.DEFAULT,
+                    ModelFile.State.DOWNLOADING,
+                    ModelFile.State.DOWNLOADED,
+                }:
+            return "moving"
         if file.local_present and not file.remote_has_transferable_content:
-            return "local_only"
+            if not (file.final_move_pending and file.complete_local_coverage):
+                return "local_only"
         has_display_union = file.display_size_total is not None and \
             file.display_transferred_size is not None
         has_complete_display_union = file.display_size_total is not None and \
@@ -5707,20 +5717,21 @@ class Controller:
                 visible_state_counts = cast(dict[str, int], summary["visible_state_counts"])
                 visible_state = self._model_record_visible_state(file)
                 visible_state_counts[visible_state] = visible_state_counts.get(visible_state, 0) + 1
-                if file.state == ModelFile.State.DOWNLOADING:
+                if file.state == ModelFile.State.DOWNLOADING or visible_state == "moving":
                     summary["active_count"] = int(summary["active_count"]) + 1
-                    speed = presentation["downloading_speed"]
-                    summary["downloading_speed"] = int(summary["downloading_speed"]) + (speed if isinstance(speed, int) else 0)
-                    if file.remote_size is not None:
-                        summary["remaining_bytes"] = int(summary["remaining_bytes"]) + max(
-                            0, file.remote_size - (presentation["transferred_size"] or 0)
-                        )
-                    eta = presentation["eta"]
-                    if isinstance(eta, int):
-                        current_eta = summary["active_eta_seconds_max"]
-                        summary["active_eta_seconds_max"] = max(
-                            current_eta if isinstance(current_eta, int) else 0, eta
-                        )
+                    if file.state == ModelFile.State.DOWNLOADING:
+                        speed = presentation["downloading_speed"]
+                        summary["downloading_speed"] = int(summary["downloading_speed"]) + (speed if isinstance(speed, int) else 0)
+                        if file.remote_size is not None:
+                            summary["remaining_bytes"] = int(summary["remaining_bytes"]) + max(
+                                0, file.remote_size - (presentation["transferred_size"] or 0)
+                            )
+                        eta = presentation["eta"]
+                        if isinstance(eta, int):
+                            current_eta = summary["active_eta_seconds_max"]
+                            summary["active_eta_seconds_max"] = max(
+                                current_eta if isinstance(current_eta, int) else 0, eta
+                            )
                 elif file.state == ModelFile.State.QUEUED:
                     summary["queued_count"] = int(summary["queued_count"]) + 1
                 elif visible_state in {"downloaded", "move_succeeded", "extracted"}:

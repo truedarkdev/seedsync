@@ -499,6 +499,7 @@ export class ViewFileService {
         // metadata for that exact row.  Do not let the Local Only fallback
         // hide an active Queue or Downloading status.
         const isLocalOnly: boolean = localPresent && !remoteHasTransferableContent &&
+            !(modelFile.final_move_pending === true && modelFile.complete_local_coverage === true) &&
             ![ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING].includes(modelFile.state);
         if (isLocalOnly) {
             transferredSize = localSize;
@@ -616,6 +617,13 @@ export class ViewFileService {
             && modelFile.final_move_succeeded !== true) {
             status = ViewFile.Status.STOPPED;
         }
+        if (modelFile.final_move_pending === true
+            && modelFile.complete_local_coverage === true
+            && modelFile.final_move_succeeded !== true
+            && modelFile.explicitly_stopped !== true
+            && [ViewFile.Status.DOWNLOADED, ViewFile.Status.DOWNLOADING].includes(status)) {
+            status = ViewFile.Status.MOVING;
+        }
 
         const isQueueable: boolean = [ViewFile.Status.DEFAULT,
                                     ViewFile.Status.STOPPED,
@@ -623,7 +631,8 @@ export class ViewFileService {
                                     ViewFile.Status.CORRUPT].includes(status)
                                     && remoteHasTransferableContent;
         const isStoppable: boolean = [ViewFile.Status.QUEUED,
-                                    ViewFile.Status.DOWNLOADING].includes(status)
+                                    ViewFile.Status.DOWNLOADING,
+                                    ViewFile.Status.MOVING].includes(status)
                                     && modelFile.is_stoppable;
         const isExtractable: boolean = [ViewFile.Status.DEFAULT,
                                     ViewFile.Status.STOPPED,

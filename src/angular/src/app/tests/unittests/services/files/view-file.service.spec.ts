@@ -951,6 +951,40 @@ describe("Testing view file service", () => {
         expect(count).toBe(testVectors.length);
     }));
 
+    it("keeps the backend-authorized Stop action available while moving", fakeAsync(() => {
+        const files = Immutable.Map<string, ModelFile>()
+            .set("moving-stoppable", new ModelFile({
+                file_id: "moving-stoppable",
+                name: "moving-stoppable",
+                state: ModelFile.State.DOWNLOADING,
+                local_size: 10,
+                remote_size: 10,
+                complete_local_coverage: true,
+                final_move_pending: true,
+                is_stoppable: true,
+            }))
+            .set("moving-not-stoppable", new ModelFile({
+                file_id: "moving-not-stoppable",
+                name: "moving-not-stoppable",
+                state: ModelFile.State.DOWNLOADING,
+                local_size: 10,
+                remote_size: 10,
+                complete_local_coverage: true,
+                final_move_pending: true,
+                is_stoppable: false,
+            }));
+        mockModelService._files.next(files);
+
+        let movingById = new Map<string, ViewFile>();
+        viewService.files.subscribe(list => movingById = getViewFilesById(list));
+        tick();
+
+        expect(movingById.get("moving-stoppable").status).toBe(ViewFile.Status.MOVING);
+        expect(movingById.get("moving-stoppable").isStoppable).toBe(true);
+        expect(movingById.get("moving-not-stoppable").status).toBe(ViewFile.Status.MOVING);
+        expect(movingById.get("moving-not-stoppable").isStoppable).toBe(false);
+    }));
+
     it("should should correctly set ViewFile isExtractable", fakeAsync(() => {
         // Test and expected result vectors
         // test - [ModelFile.State, local size, remote size]
@@ -2195,5 +2229,62 @@ describe("Testing view file service", () => {
                 expect(latest.percentDownloaded).toBe(vector.expectedPercent);
             }
         }
+    }));
+
+    it("shows an authorized final move as Moving without overriding stop or failure", fakeAsync(() => {
+        let latest: ViewFile = null;
+        const subscription = viewService.files.subscribe(files => latest = files.get(0));
+        const vectors = [
+            {
+                state: ModelFile.State.DOWNLOADED,
+                complete_local_coverage: true,
+                final_move_pending: true,
+                expected: ViewFile.Status.MOVING,
+            },
+            {
+                state: ModelFile.State.DOWNLOADING,
+                complete_local_coverage: true,
+                final_move_pending: true,
+                expected: ViewFile.Status.MOVING,
+            },
+            {
+                state: ModelFile.State.DOWNLOADED,
+                complete_local_coverage: true,
+                final_move_pending: true,
+                explicitly_stopped: true,
+                expected: ViewFile.Status.STOPPED,
+            },
+            {
+                state: ModelFile.State.MOVE_FAILED,
+                complete_local_coverage: true,
+                final_move_pending: true,
+                expected: ViewFile.Status.MOVE_FAILED,
+            },
+            {
+                state: ModelFile.State.DEFAULT,
+                complete_local_coverage: false,
+                final_move_pending: true,
+                transferred_size: 25,
+                remote_size: 100,
+                expected: ViewFile.Status.STOPPED,
+            },
+        ];
+
+        for (let index = 0; index < vectors.length; index++) {
+            const vector = vectors[index];
+            const modelFile = new ModelFile(Object.assign({
+                file_id: "moving",
+                name: "moving",
+                local_present: true,
+                remote_present: true,
+                remote_has_transferable_content: true,
+                local_size: vector.transferred_size || 100,
+                remote_size: vector.remote_size || 100,
+            }, vector));
+            mockModelService._files.next(Immutable.Map<string, ModelFile>().set(modelFile.file_id, modelFile));
+            tick();
+            expect(latest.visibleStatus).toBe(vector.expected);
+        }
+        subscription.unsubscribe();
     }));
 });

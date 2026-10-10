@@ -157,6 +157,7 @@ class ModelFile:
             self.validation_error,
             self.corrupt_chunks,
             self.final_move_succeeded,
+            self.final_move_pending,
             self.__path_pair_id,
             self.__path_pair_name,
         )
@@ -193,6 +194,7 @@ class ModelFile:
             "_ModelFile__validation_error": self.validation_error,
             "_ModelFile__corrupt_chunks": self.corrupt_chunks,
             "_ModelFile__final_move_succeeded": self.final_move_succeeded,
+            "_ModelFile__final_move_pending": self.final_move_pending,
             "_ModelFile__update_timestamp": self.update_timestamp,
             "_ModelFile__children": self.__children or [],
             "_ModelFile__parent": self.__parent,
@@ -501,6 +503,17 @@ class ModelFile:
         if type(value) is not bool:
             raise TypeError
         self.__set_runtime("final_move_succeeded", value, False)
+
+    @property
+    def final_move_pending(self) -> bool:
+        """Whether an authorized automatic final move is currently in flight."""
+        return bool(self.__runtime_value("final_move_pending", False))
+
+    @final_move_pending.setter
+    def final_move_pending(self, value: bool):
+        if type(value) is not bool:
+            raise TypeError
+        self.__set_runtime("final_move_pending", value, False)
 
     @property
     def full_path(self) -> str:

@@ -299,6 +299,7 @@ const compareStatusLegacy = (a: ViewFile, b: ViewFile): number => {
             [ViewFile.Status.EXTRACTING]: 1,
             [ViewFile.Status.VALIDATING]: 2,
             [ViewFile.Status.DOWNLOADING]: 3,
+            [ViewFile.Status.MOVING]: 3,
             [ViewFile.Status.QUEUED]: 4,
             [ViewFile.Status.EXTRACTED]: 5,
             [ViewFile.Status.VALIDATED]: 6,
@@ -321,6 +322,7 @@ const compareStatusImproved = (a: ViewFile, b: ViewFile): number => {
     if (aStatus !== bStatus) {
         const statusPriorities = {
             [ViewFile.Status.DOWNLOADING]: 1,
+            [ViewFile.Status.MOVING]: 1,
             [ViewFile.Status.EXTRACTING]: 2,
             [ViewFile.Status.VALIDATING]: 3,
             [ViewFile.Status.MOVE_FAILED]: 4,

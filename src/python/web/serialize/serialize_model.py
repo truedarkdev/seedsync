@@ -128,6 +128,7 @@ class SerializeModel(Serialize):
     __KEY_FILE_VALIDATION_ERROR = "validation_error"
     __KEY_FILE_CORRUPT_CHUNKS = "corrupt_chunks"
     __KEY_FILE_FINAL_MOVE_SUCCEEDED = "final_move_succeeded"
+    __KEY_FILE_FINAL_MOVE_PENDING = "final_move_pending"
     __KEY_FILE_CHILDREN = "children"
 
     @staticmethod
@@ -175,6 +176,7 @@ class SerializeModel(Serialize):
         json_dict[SerializeModel.__KEY_FILE_VALIDATION_ERROR] = model_file.validation_error
         json_dict[SerializeModel.__KEY_FILE_CORRUPT_CHUNKS] = model_file.corrupt_chunks
         json_dict[SerializeModel.__KEY_FILE_FINAL_MOVE_SUCCEEDED] = model_file.final_move_succeeded
+        json_dict[SerializeModel.__KEY_FILE_FINAL_MOVE_PENDING] = model_file.final_move_pending
         if progress_presentation_provider is not None:
             try:
                 presentation = progress_presentation_provider(model_file)

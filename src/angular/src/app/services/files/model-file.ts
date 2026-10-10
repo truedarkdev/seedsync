@@ -37,6 +37,7 @@ interface IModelFile {
     corrupt_chunks: number[];
     is_stoppable: boolean;
     final_move_succeeded: boolean;
+    final_move_pending: boolean;
 }
 
 // Boiler plate code to set up an immutable class
@@ -72,7 +73,8 @@ const DefaultModelFile: IModelFile = {
     validation_error: null,
     corrupt_chunks: null,
     is_stoppable: null,
-    final_move_succeeded: false
+    final_move_succeeded: false,
+    final_move_pending: false
 };
 const ModelFileRecord = Record(DefaultModelFile);
 
@@ -115,6 +117,7 @@ export class ModelFile extends ModelFileRecord implements IModelFile {
     corrupt_chunks: number[];
     is_stoppable: boolean;
     final_move_succeeded: boolean;
+    final_move_pending: boolean;
 
     constructor(props) {
         const source = props != null && typeof props.toObject === "function" ? props.toObject() : props;

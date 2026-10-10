@@ -1826,6 +1826,46 @@ class TestModelApi(unittest.TestCase):
         ))
         self.assertFalse(record["explicitly_stopped"])
         self.assertFalse(record["complete_local_coverage"])
+        self.assertFalse(record["final_move_pending"])
+
+    def test_final_move_pending_is_visible_only_for_complete_eligible_roots(self):
+        moving_default = self._file("moving-default", "pair-a")
+        moving_default.remote_has_transferable_content = True
+        moving_default.complete_local_coverage = True
+        moving_default.final_move_pending = True
+        self.assertEqual("moving", Controller._model_record_visible_state(moving_default))
+
+        moving_downloaded = self._file("moving-downloaded", "pair-a")
+        moving_downloaded.state = ModelFile.State.DOWNLOADED
+        moving_downloaded.complete_local_coverage = True
+        moving_downloaded.final_move_pending = True
+        self.assertEqual("moving", Controller._model_record_visible_state(moving_downloaded))
+
+        moving_downloading = self._file("moving-downloading", "pair-a")
+        moving_downloading.state = ModelFile.State.DOWNLOADING
+        moving_downloading.complete_local_coverage = True
+        moving_downloading.final_move_pending = True
+        self.assertEqual("moving", Controller._model_record_visible_state(moving_downloading))
+
+        stopped = self._file("stopped-moving", "pair-a")
+        stopped.state = ModelFile.State.DOWNLOADED
+        stopped.complete_local_coverage = True
+        stopped.explicitly_stopped = True
+        stopped.final_move_pending = True
+        self.assertEqual("stopped", Controller._model_record_visible_state(stopped))
+
+        failed = self._file("failed-moving", "pair-a")
+        failed.state = ModelFile.State.MOVE_FAILED
+        failed.complete_local_coverage = True
+        failed.final_move_pending = True
+        self.assertEqual("move_failed", Controller._model_record_visible_state(failed))
+
+        partial = self._file("partial-moving", "pair-a")
+        partial.remote_size = 100
+        partial.transferred_size = 90
+        partial.complete_local_coverage = False
+        partial.final_move_pending = True
+        self.assertEqual("stopped", Controller._model_record_visible_state(partial))
 
     def test_scoped_page_resolves_immutable_active_progress_overlay(self):
         file = self._file("sample", "pair-a")
@@ -2000,6 +2040,10 @@ class TestModelApi(unittest.TestCase):
         complete_default.display_transferred_size = 100
         complete_default.remote_has_transferable_content = True
         complete_default.complete_local_coverage = True
+        moving = self._file("moving", "pair-a")
+        moving.state = ModelFile.State.DOWNLOADED
+        moving.complete_local_coverage = True
+        moving.final_move_pending = True
         stopped_complete = self._file("stopped-complete", "pair-a")
         stopped_complete.remote_size = 100
         stopped_complete.transferred_size = 100
@@ -2024,14 +2068,15 @@ class TestModelApi(unittest.TestCase):
         stopped.remote_has_transferable_content = True
         local_only = self._file("local", "pair-a")
         local_only.local_present = True
-        for file in (downloading, extracting, downloaded, complete_default, stopped_complete,
+        for file in (downloading, extracting, downloaded, complete_default, moving, stopped_complete,
                      unproven_complete,
                      extracted, validated, stopped, local_only):
             self.model.add_file(file)
         summary = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
-        self.assertEqual(1, summary["active_count"])
+        self.assertEqual(2, summary["active_count"])
         self.assertEqual(3, summary["completed_count"])
         self.assertEqual(2, summary["visible_state_counts"]["downloaded"])
+        self.assertEqual(1, summary["visible_state_counts"]["moving"])
         self.assertEqual(3, summary["visible_state_counts"]["stopped"])
         self.assertEqual(1, summary["visible_state_counts"]["local_only"])
 

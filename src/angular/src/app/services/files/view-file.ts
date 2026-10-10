@@ -140,6 +140,7 @@ export module ViewFile {
         DEFAULT         = <any> "default",
         QUEUED          = <any> "queued",
         DOWNLOADING     = <any> "downloading",
+        MOVING          = <any> "moving",
         DOWNLOADED      = <any> "downloaded",
         STOPPED         = <any> "stopped",
         DELETED         = <any> "deleted",

@@ -51,6 +51,18 @@ class TestSerializeModel(unittest.TestCase):
         self.assertEqual("downloaded", data[0]["state"])
         self.assertIs(True, data[0]["final_move_succeeded"])
 
+    def test_final_move_pending_is_serialized_without_changing_download_state(self):
+        file = ModelFile("movie.mkv", False)
+        file.state = ModelFile.State.DOWNLOADED
+        file.complete_local_coverage = True
+        file.final_move_pending = True
+
+        data = json.loads(parse_stream(SerializeModel().model([file]))["data"])[0]
+
+        self.assertEqual("downloaded", data["state"])
+        self.assertIs(True, data["final_move_pending"])
+        self.assertIs(False, data["final_move_succeeded"])
+
     def test_downloaded_timestamp_serializes_as_epoch_string_or_null(self):
         first = ModelFile("first.mkv", False)
         second = ModelFile("second.mkv", False)
