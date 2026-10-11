@@ -277,7 +277,17 @@ _MODEL_INPUT_ARBITRATION_SELECTION_REASONS = frozenset({
     "local_retained_over_active_staging", "active_selected", "local_selected",
     "absent", "unknown",
 })
-_MODEL_INPUT_ARBITRATION_SPLIT_PROVENANCE = frozenset({"split_candidate_local"})
+_MODEL_INPUT_ARBITRATION_SPLIT_PROVENANCE = frozenset({
+    "split_candidate_local", "split_candidate_local_staging", "cached_effective_input",
+})
+_STAGING_COLLISION_ADMISSION_SCHEMA = "staging_collision_admission.v1"
+_STAGING_COLLISION_ADMISSION_SITES = frozenset({"cached_rebuild_gate", "candidate_park_gate"})
+_STAGING_COLLISION_ADMISSION_DISPOSITIONS = frozenset({
+    "skip_status_unhealthy", "skip_status_not_fresh", "skip_live_owner", "skip_max_failures",
+    "skip_model_missing", "skip_terminal_state", "skip_not_lifecycle_candidate",
+    "skip_not_terminalizable", "skip_explicit_stop", "skip_collision_comparison",
+    "rebuild_requested", "parked",
+})
 _COMPLETION_SCAN_JOIN_SCHEMA = "completion_scan_join.v1"
 _COMMAND_ADMISSION_TIMING_SCHEMA = "command_admission_timing.v1"
 _COMMAND_ADMISSION_TIMING_FIELDS = (
@@ -602,7 +612,34 @@ def _lftp_status_membership_facts(details: Mapping[str, object], message: object
     return result
 
 
-def _completion_gate_facts(details: Mapping[str, object], message: object = None) -> dict[str, object] | None:
+def _completion_gate_facts(details: Mapping[str, object], message: object = None,
+                           source: object = None, stage: object = None) -> dict[str, object] | None:
+    if message == "staging_collision_admission":
+        if source != "model_updater" or stage != "completion_gate":
+            return None
+        schema_known = details.get("schema") == _STAGING_COLLISION_ADMISSION_SCHEMA
+        result = {
+            "boundary": "completion_gate",
+            "message": message,
+            "schema": _STAGING_COLLISION_ADMISSION_SCHEMA if schema_known else "unknown",
+        }
+        site = details.get("site")
+        result["site"] = site if schema_known and isinstance(site, str) and site in _STAGING_COLLISION_ADMISSION_SITES else "unknown"
+        disposition = details.get("disposition")
+        result["disposition"] = disposition if schema_known and isinstance(disposition, str) and \
+            disposition in _STAGING_COLLISION_ADMISSION_DISPOSITIONS else "unknown"
+        source = details.get("status_source")
+        result["status_source"] = source if schema_known and isinstance(source, str) and \
+            source in _MODEL_PROGRESS_LINEAGE_SOURCES else "unknown"
+        for key in (
+            "status_healthy", "status_fresh", "local_reconciled", "remote_reconciled",
+            "candidate_member", "lifecycle_allowed", "terminalizable_member", "live_owner",
+            "explicit_stop", "comparison_active", "max_failures",
+        ):
+            value = details.get(key)
+            result[key] = value if schema_known and type(value) is bool else None
+        return result
+
     if message == _CONFIRMED_LOCAL_DELETE_MESSAGE:
         schema_known = details.get("schema") == _CONFIRMED_LOCAL_DELETE_SCHEMA
         result: dict[str, object] = {
@@ -1326,6 +1363,18 @@ def _input_arbitration_facts(row: Mapping[str, object], metadata: Mapping[str, o
             return "unknown"
         return value if int(value) <= 2**63 - 1 else "unknown"
 
+    def decimal_size(key: str, source: Mapping[str, object]) -> str | None:
+        if key not in source:
+            return "unknown"
+        value = source[key]
+        if value is None:
+            return None
+        if type(value) is int and 0 <= value <= 2**63 - 1:
+            return str(value)
+        if isinstance(value, str) and _DECIMAL_IDENTITY.fullmatch(value) and int(value) <= 2**63 - 1:
+            return value
+        return "unknown"
+
     corr_id = row.get("corr_id", metadata.get("corr_id"))
     flow_id = row.get("flow_id", metadata.get("flow_id"))
     trace_scope = row.get("trace_scope", metadata.get("trace_scope"))
@@ -1380,11 +1429,42 @@ def _input_arbitration_facts(row: Mapping[str, object], metadata: Mapping[str, o
         raw_key = nested_key if split_candidate is not details else output_key
         result[output_key] = boolean(raw_key, split_candidate)
     for output_key, nested_key in (("split_candidate_local_size", "local_size"),
-                                   ("split_candidate_remote_size", "remote_size")):
+                                   ("split_candidate_remote_size", "remote_size"),
+                                   ("split_candidate_active_size", "active_size")):
         raw_key = nested_key if split_candidate is not details else output_key
-        result[output_key] = integer(raw_key, split_candidate)
+        result[output_key] = decimal_size(raw_key, split_candidate)
     for output_key, nested_key in (("split_candidate_local_mtime_ns", "local_mtime_ns"),
                                    ("split_candidate_remote_mtime_ns", "remote_mtime_ns")):
+        raw_key = nested_key if split_candidate is not details else output_key
+        result[output_key] = decimal_identity(output_key, split_candidate, raw_key)
+    for output_key, nested_key in (
+        ("split_candidate_local_object_ref", "local_object_ref"),
+        ("split_candidate_active_object_ref", "active_object_ref"),
+    ):
+        raw_key = nested_key if split_candidate is not details else output_key
+        value = split_candidate.get(raw_key)
+        result[output_key] = value if isinstance(value, str) and _OPAQUE_TOKEN.fullmatch(value) else (
+            None if value is None else "unknown"
+        )
+    for output_key, nested_key in (
+        ("split_candidate_local_is_staging", "local_is_staging"),
+        ("split_candidate_local_has_staging_origin", "local_has_staging_origin"),
+        ("split_candidate_local_has_staging_collision", "local_has_staging_collision"),
+        ("split_candidate_active_present", "active_present"),
+        ("split_candidate_active_is_staging", "active_is_staging"),
+        ("split_candidate_active_has_staging_origin", "active_has_staging_origin"),
+        ("split_candidate_active_has_staging_collision", "active_has_staging_collision"),
+        ("split_candidate_active_matches_remote_identity", "active_matches_remote_identity"),
+    ):
+        raw_key = nested_key if split_candidate is not details else output_key
+        result[output_key] = boolean(raw_key, split_candidate)
+    collision_scope_key = "local_collision_scope" if split_candidate is not details else "split_candidate_local_collision_scope"
+    collision_scope = split_candidate.get(collision_scope_key)
+    result["split_candidate_local_collision_scope"] = (
+        collision_scope if isinstance(collision_scope, str) and collision_scope in {"leaf", "ancestor", "none", "unknown"}
+        else "unknown"
+    )
+    for output_key, nested_key in (("split_candidate_active_mtime_ns", "active_mtime_ns"),):
         raw_key = nested_key if split_candidate is not details else output_key
         result[output_key] = decimal_identity(output_key, split_candidate, raw_key)
     provenance_key = "provenance" if split_candidate is not details else "split_candidate_provenance"
@@ -1815,7 +1895,7 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         _lftp_status_membership_facts(details, message)
         if category == "transfer.lftp.membership" else None
     )
-    gate = _completion_gate_facts(details, message) if category == "completion.gate" else None
+    gate = _completion_gate_facts(details, message, source, stage) if category == "completion.gate" else None
     proof_transition = (
         _local_root_proof_transition_facts(details, message)
         if category == "scan.root_shape" else None

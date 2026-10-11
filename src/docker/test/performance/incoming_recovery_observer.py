@@ -773,7 +773,17 @@ _CAPTURE_INPUT_ARBITRATION_SELECTION_REASONS = {
     "local_retained_over_active_staging", "active_selected", "local_selected",
     "absent", "unknown",
 }
-_CAPTURE_INPUT_ARBITRATION_SPLIT_PROVENANCE = {"split_candidate_local"}
+_CAPTURE_INPUT_ARBITRATION_SPLIT_PROVENANCE = {
+    "split_candidate_local", "split_candidate_local_staging", "cached_effective_input",
+}
+_CAPTURE_STAGING_COLLISION_ADMISSION_SCHEMA = "staging_collision_admission.v1"
+_CAPTURE_STAGING_COLLISION_ADMISSION_SITES = {"cached_rebuild_gate", "candidate_park_gate"}
+_CAPTURE_STAGING_COLLISION_ADMISSION_DISPOSITIONS = {
+    "skip_status_unhealthy", "skip_status_not_fresh", "skip_live_owner", "skip_max_failures",
+    "skip_model_missing", "skip_terminal_state", "skip_not_lifecycle_candidate",
+    "skip_not_terminalizable", "skip_explicit_stop", "skip_collision_comparison",
+    "rebuild_requested", "parked",
+}
 _CAPTURE_INPUT_ARBITRATION_OPAQUE = re.compile(r"^[0-9a-f]{16}$")
 _CAPTURE_INPUT_ARBITRATION_DECIMAL_IDENTITY = re.compile(r"^(?:0|[1-9][0-9]{0,18})$")
 _CAPTURE_COMPLETION_SCAN_JOIN_SCHEMA = "completion_scan_join.v1"
@@ -929,14 +939,46 @@ def _sanitize_input_arbitration(value: Mapping[str, object]) -> Mapping[str, obj
     ):
         raw_key = nested_key if split_candidate is not value else output_key
         result[output_key] = boolean(raw_key, split_candidate)
-    for output_key, nested_key in (("split_candidate_local_size", "local_size"),
-                                   ("split_candidate_remote_size", "remote_size")):
-        raw_key = nested_key if split_candidate is not value else output_key
-        result[output_key] = integer(raw_key, split_candidate)
     for output_key, nested_key in (("split_candidate_local_mtime_ns", "local_mtime_ns"),
                                    ("split_candidate_remote_mtime_ns", "remote_mtime_ns")):
         raw_key = nested_key if split_candidate is not value else output_key
         result[output_key] = decimal_identity(output_key, split_candidate, raw_key)
+    for output_key, nested_key in (("split_candidate_local_size", "local_size"),
+                                   ("split_candidate_remote_size", "remote_size"),
+                                   ("split_candidate_active_size", "active_size")):
+        raw_key = nested_key if split_candidate is not value else output_key
+        result[output_key] = decimal_identity(output_key, split_candidate, raw_key)
+    for output_key, nested_key in (
+        ("split_candidate_local_object_ref", "local_object_ref"),
+        ("split_candidate_active_object_ref", "active_object_ref"),
+    ):
+        raw_key = nested_key if split_candidate is not value else output_key
+        item = split_candidate.get(raw_key)
+        result[output_key] = item if isinstance(item, str) and _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(item) else (
+            None if item is None else "unknown"
+        )
+    for output_key, nested_key in (
+        ("split_candidate_local_is_staging", "local_is_staging"),
+        ("split_candidate_local_has_staging_origin", "local_has_staging_origin"),
+        ("split_candidate_local_has_staging_collision", "local_has_staging_collision"),
+        ("split_candidate_active_present", "active_present"),
+        ("split_candidate_active_is_staging", "active_is_staging"),
+        ("split_candidate_active_has_staging_origin", "active_has_staging_origin"),
+        ("split_candidate_active_has_staging_collision", "active_has_staging_collision"),
+        ("split_candidate_active_matches_remote_identity", "active_matches_remote_identity"),
+    ):
+        raw_key = nested_key if split_candidate is not value else output_key
+        result[output_key] = boolean(raw_key, split_candidate)
+    collision_scope_key = "local_collision_scope" if split_candidate is not value else "split_candidate_local_collision_scope"
+    collision_scope = split_candidate.get(collision_scope_key)
+    result["split_candidate_local_collision_scope"] = (
+        collision_scope if isinstance(collision_scope, str) and collision_scope in {"leaf", "ancestor", "none", "unknown"}
+        else "unknown"
+    )
+    raw_key = "active_mtime_ns" if split_candidate is not value else "split_candidate_active_mtime_ns"
+    result["split_candidate_active_mtime_ns"] = decimal_identity(
+        "split_candidate_active_mtime_ns", split_candidate, raw_key,
+    )
     provenance_key = "provenance" if split_candidate is not value else "split_candidate_provenance"
     if provenance_key not in split_candidate:
         result["split_candidate_provenance"] = "unknown"
@@ -1436,7 +1478,25 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
             safe_gate["scan_pair_ref"] = pair_ref if pair_ref == "full" or isinstance(pair_ref, str) and \
                 _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(pair_ref) else "unknown"
         message = gate.get("message")
-        if isinstance(message, str) and message in {
+        if message == "staging_collision_admission":
+            collision_schema_known = gate.get("schema") == _CAPTURE_STAGING_COLLISION_ADMISSION_SCHEMA
+            safe_gate["message"] = message
+            safe_gate["schema"] = _CAPTURE_STAGING_COLLISION_ADMISSION_SCHEMA if collision_schema_known else "unknown"
+            for key, allowed in (
+                ("site", _CAPTURE_STAGING_COLLISION_ADMISSION_SITES),
+                ("disposition", _CAPTURE_STAGING_COLLISION_ADMISSION_DISPOSITIONS),
+                ("status_source", _CAPTURE_PROGRESS_LINEAGE_SOURCES | {"unknown"}),
+            ):
+                item = gate.get(key)
+                safe_gate[key] = item if collision_schema_known and isinstance(item, str) and item in allowed else "unknown"
+            for key in (
+                "status_healthy", "status_fresh", "local_reconciled", "remote_reconciled",
+                "candidate_member", "lifecycle_allowed", "terminalizable_member", "live_owner",
+                "explicit_stop", "comparison_active", "max_failures",
+            ):
+                item = gate.get(key)
+                safe_gate[key] = item if collision_schema_known and type(item) is bool else None
+        elif isinstance(message, str) and message in {
             _CAPTURE_CONFIRMED_LOCAL_DELETE_MESSAGE, _CAPTURE_CONFIRMED_DELETE_FENCE_MESSAGE,
         }:
             confirmed_delete = message == _CAPTURE_CONFIRMED_LOCAL_DELETE_MESSAGE

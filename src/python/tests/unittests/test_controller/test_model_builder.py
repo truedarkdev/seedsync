@@ -388,10 +388,17 @@ class TestModelBuilder(unittest.TestCase):
                 self.assertEqual({
                     "local_present", "local_size", "local_mtime_ns", "local_mtime_known",
                     "remote_size", "remote_mtime_ns", "remote_mtime_known", "strict_verified",
-                    "portable_queue_exclusion_match", "provenance",
+                    "portable_queue_exclusion_match", "provenance", "local_object_ref",
+                    "local_is_staging", "local_has_staging_origin", "local_has_staging_collision",
+                    "local_collision_scope",
                 }, set(details))
-                self.assertEqual(100, details["local_size"])
-                self.assertEqual(100, details["remote_size"])
+                self.assertRegex(details["local_object_ref"], r"^[0-9a-f]{16}$")
+                self.assertIs(details["local_is_staging"], False)
+                self.assertIsNone(details["local_has_staging_origin"])
+                self.assertIs(details["local_has_staging_collision"], False)
+                self.assertEqual("unknown", details["local_collision_scope"])
+                self.assertEqual("100", details["local_size"])
+                self.assertEqual("100", details["remote_size"])
                 self.assertEqual(strict_expected, details["strict_verified"])
                 self.assertEqual(portable_expected, details["portable_queue_exclusion_match"])
                 self.assertEqual("split_candidate_local", details["provenance"])

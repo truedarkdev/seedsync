@@ -2968,14 +2968,22 @@ def test_finalized_split_arbitration_preserves_selection_guards_and_wide_mtimes(
     remote_root.add_child(SystemFile("payload.iso", 2_981_865_472, False, mtime_ns=epoch_ns + 24_000_000_000))
     remote_checksum = SystemFile("checksums.txt", 1_072, False, mtime_ns=epoch_ns + 500_000_000)
     remote_root.add_child(remote_checksum)
+    remote_collision = SystemFile("collision.bin", 512, False, mtime_ns=epoch_ns + 5_000_000_000)
+    remote_root.add_child(remote_collision)
     local_root = SystemFile("mixed-root", 35_759_708_487, True, mtime_ns=epoch_ns)
     local_root.add_child(SystemFile("payload.iso", 2_981_865_472, False, is_staging=True,
                                     mtime_ns=epoch_ns + 24_000_000_000))
     local_checksum = SystemFile("checksums.txt", 1_072, False, mtime_ns=epoch_ns)
+    local_collision = SystemFile("collision.bin", 512, False, mtime_ns=epoch_ns + 5_000_000_000)
+    local_collision.has_staging_collision = True
     local_root.add_child(local_checksum)
+    local_root.add_child(local_collision)
     active_root = SystemFile("mixed-root", 2_981_865_472, True)
     active_root.add_child(SystemFile("payload.iso", 2_981_865_472, False,
                                      mtime_ns=epoch_ns + 24_000_000_000))
+    active_collision = SystemFile("collision.bin", 512, False, is_staging=True,
+                                  mtime_ns=epoch_ns + 6_000_000_000)
+    active_root.add_child(active_collision)
     builder.set_remote_files([remote_root])
     builder.set_local_files([local_root])
     builder.set_active_files([active_root])
@@ -2986,17 +2994,19 @@ def test_finalized_split_arbitration_preserves_selection_guards_and_wide_mtimes(
         initial = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
         assert any(row.get("message") == "input_arbitration_witness" for row in initial)
         reader.start()
-        model = builder.build_model()
+        model = builder.build_model(
+            diagnostic_target_root_ids=[ModelFile.build_file_id("mixed-root", None)],
+        )
         assert model.get_file("mixed-root") is not None
         assert collector.flush_durable(2.0)
-        assert reader.poll() == 4
+        assert reader.poll() == 6
     finally:
         reader.close()
         collector.close(timeout=2.0)
 
     durable = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
     finalized = [row for row in durable if row.get("message") == "input_arbitration_witness"]
-    assert len(finalized) == 7
+    assert len(finalized) == 10
     assert all(row.get("category") == "scan.authority"
                and row.get("stage") == "model_builder_input_arbitration"
                and row.get("event_type") == "diagnostic"
@@ -3004,12 +3014,12 @@ def test_finalized_split_arbitration_preserves_selection_guards_and_wide_mtimes(
                and re.fullmatch(r"input-arbitration:[0-9a-f]{16}", row["corr_id"]) for row in finalized)
     projections = [item["capture"]["projection"] for item in _artifacts(artifact)
                    if item["capture"].get("state") == "record"]
-    assert len(projections) == 4
+    assert len(projections) == 6
     assert all(item["category"] == "scan.authority" and item["event_type"] == "diagnostic"
                and item["stage"] == "model_builder_input_arbitration" for item in projections)
     phases = [item["input_arbitration"]["phase"] for item in projections]
-    assert phases.count("root_fill") == 1 and phases.count("remote_leaf_fill") == 2
-    assert phases.count("summary") == 1
+    assert phases.count("root_fill") == 1 and phases.count("remote_leaf_fill") == 3
+    assert phases.count("summary") == 1 and phases.count("root_source") == 1
     build_tokens = {item["input_arbitration"]["build_token"] for item in projections}
     assert len(build_tokens) == 1 and "unknown" not in build_tokens
     root_ids = {item["input_arbitration"]["root_id"] for item in projections
@@ -3022,7 +3032,7 @@ def test_finalized_split_arbitration_preserves_selection_guards_and_wide_mtimes(
     split_leaf = next(leaf for leaf in leaf_facts
                       if leaf["split_candidate_provenance"] == "split_candidate_local")
     for leaf in leaf_facts:
-        if leaf is split_leaf:
+        if leaf["split_candidate_provenance"] == "split_candidate_local":
             continue
         for key in ("input_scope", "selection", "local_proof_generation",
                     "local_proof_generation_known", "active_generation_known"):
@@ -3036,14 +3046,14 @@ def test_finalized_split_arbitration_preserves_selection_guards_and_wide_mtimes(
                 if item.get("input_arbitration", {}).get("phase") == "root_fill")
     assert root["selection"] == "split" and root["selection_reason"] == "split_merge"
     assert root["local_staging_descendant"] is True
-    assert root["local_staging_collision_descendant"] is False
+    assert root["local_staging_collision_descendant"] is True
     assert root["split_has_verified_leaf"] is False
     assert root["local_candidate_eligible"] is None and root["local_size_ge_active"] is None
     assert root["remote_indicates_newer"] is None
     checksum = next(item["input_arbitration"] for item in projections
-                    if item.get("input_arbitration", {}).get("split_candidate_remote_size") == 1_072)
+                    if item.get("input_arbitration", {}).get("split_candidate_remote_size") == "1072")
     assert checksum["split_candidate_local_present"] is True
-    assert checksum["split_candidate_local_size"] == checksum["split_candidate_remote_size"] == 1_072
+    assert checksum["split_candidate_local_size"] == checksum["split_candidate_remote_size"] == "1072"
     assert checksum["split_candidate_local_mtime_ns"] == str(epoch_ns)
     assert checksum["split_candidate_remote_mtime_ns"] == str(epoch_ns + 500_000_000)
     assert int(checksum["split_candidate_local_mtime_ns"]) > 2**53
@@ -3052,9 +3062,84 @@ def test_finalized_split_arbitration_preserves_selection_guards_and_wide_mtimes(
     assert checksum["split_candidate_strict_verified"] is False
     assert checksum["split_candidate_portable_queue_exclusion_match"] is True
     assert checksum["split_candidate_provenance"] == "split_candidate_local"
-    assert len({item["version"] for item in finalized}) == 7
+    collision = next(item["input_arbitration"] for item in projections
+                     if item.get("input_arbitration", {}).get("split_candidate_local_has_staging_collision") is True)
+    assert collision["split_candidate_active_present"] is True
+    assert collision["split_candidate_active_is_staging"] is True
+    assert collision["split_candidate_active_has_staging_collision"] == "unknown"
+    assert collision["split_candidate_active_matches_remote_identity"] is False
+    assert collision["split_candidate_local_size"] == collision["split_candidate_active_size"] == "512"
+    assert collision["split_candidate_active_mtime_ns"] == str(epoch_ns + 6_000_000_000)
+    assert re.fullmatch(r"[0-9a-f]{16}", collision["split_candidate_local_object_ref"])
+    assert re.fullmatch(r"[0-9a-f]{16}", collision["split_candidate_active_object_ref"])
+    assert collision["split_candidate_local_object_ref"] != collision["split_candidate_active_object_ref"]
+    assert collision["split_candidate_local_collision_scope"] == "leaf"
+    assert [item["version"] for item in finalized] == list(range(1, 11))
     versions = [item["numbers"]["version"] for item in projections]
-    assert versions == sorted(versions) and len(set(versions)) == 4
+    assert versions == [5, 6, 7, 8, 9, 10]
+
+
+@pytest.mark.skipif(BreadcrumbTraceCollector is None, reason="production breadcrumb collector is unavailable")
+def test_finalized_cached_collision_input_survives_without_active_root(tmp_path: Path) -> None:
+    spool = tmp_path / "cached-collision-spool"
+    spool.mkdir()
+    artifact = tmp_path / "cached-collision-capture.jsonl"
+    collector = BreadcrumbTraceCollector(
+        lambda: True, max_entries=64,
+        policy={"default": "off", "rules": {"scan.authority": "info"}},
+        durable_enabled=True, durable_path=str(spool),
+    )
+    reader = _reader(spool, artifact)
+    baseline = ModelBuilder()
+    baseline_remote = SystemFile("baseline-root", 8, True)
+    baseline_remote.add_child(SystemFile("baseline-leaf", 8, False))
+    baseline_local = SystemFile("baseline-root", 8, True)
+    baseline_local.add_child(SystemFile("baseline-leaf", 8, False))
+    baseline.set_remote_files([baseline_remote])
+    baseline.set_local_files([baseline_local])
+    baseline.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+    builder = ModelBuilder()
+    source_mtime_ns = 1_790_873_610_000_000_000
+    remote_root = SystemFile("cached-root", 512, True)
+    remote_root.add_child(SystemFile("collision.bin", 512, False, mtime_ns=source_mtime_ns))
+    local_root = SystemFile("cached-root", 512, True)
+    local_leaf = SystemFile(
+        "collision.bin", 512, False, is_staging=True, mtime_ns=source_mtime_ns,
+    )
+    local_leaf.has_staging_collision = True
+    local_root.add_child(local_leaf)
+    builder.set_remote_files([remote_root])
+    builder.set_local_files([local_root])
+    builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+    cached_root_id = ModelFile.build_file_id("cached-root", None)
+    try:
+        assert baseline.build_model().get_file("baseline-root") is not None
+        assert collector.flush_durable(2.0)
+        reader.start()
+        model = builder.build_model(diagnostic_target_root_ids=[cached_root_id])
+        assert model.get_file("cached-root") is not None
+        assert collector.flush_durable(2.0)
+        assert reader.poll() > 0
+    finally:
+        reader.close()
+        collector.close(timeout=2.0)
+    durable = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
+    finalized = [row for row in durable if row.get("message") == "input_arbitration_witness"]
+    candidate = next(row for row in finalized
+                     if isinstance(row.get("details", {}).get("split_candidate"), dict)
+                     and row["details"]["split_candidate"].get("provenance") == "cached_effective_input")
+    assert candidate["details"]["split_candidate"]["local_has_staging_collision"] is True
+    assert "collision.bin" not in json.dumps(candidate)
+    projections = [item["capture"]["projection"] for item in _artifacts(artifact)
+                   if item["capture"].get("state") == "record"]
+    leaf = next(item["input_arbitration"] for item in projections
+                if item.get("input_arbitration", {}).get("split_candidate_provenance") == "cached_effective_input")
+    assert leaf["split_candidate_local_is_staging"] is True
+    assert leaf["split_candidate_local_has_staging_collision"] is True
+    assert leaf["split_candidate_local_collision_scope"] == "leaf"
+    assert leaf["split_candidate_active_present"] == "unknown"
+    assert leaf["split_candidate_local_size"] == leaf["split_candidate_remote_size"] == "512"
+    assert re.fullmatch(r"[0-9a-f]{16}", leaf["split_candidate_local_object_ref"])
 
 
 @pytest.mark.skipif(BreadcrumbTraceCollector is None, reason="production breadcrumb collector is unavailable")

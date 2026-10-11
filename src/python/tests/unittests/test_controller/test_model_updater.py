@@ -9503,6 +9503,34 @@ class TestModelUpdater(unittest.TestCase):
         if collision_mode == "normal":
             self.assertTrue(collision_rows)
             self.assertIn("rebuild_requested", {row["details"]["disposition"] for row in collision_rows})
+            capture, observer, restore_capture_modules = _load_breadcrumb_spool_capture_modules()
+            try:
+                admission = next(row for row in collision_rows
+                                 if row["details"].get("disposition") == "rebuild_requested")
+                projection, rejected = capture._projection(admission)
+                self.assertFalse(rejected)
+                self.assertIsNotNone(projection)
+                self.assertEqual("cached_rebuild_gate", projection["completion_gate"]["site"])
+                self.assertEqual("rebuild_requested", projection["completion_gate"]["disposition"])
+                self.assertIs(projection["completion_gate"]["max_failures"], False)
+                artifact_path = os.path.join(collision_trace_path.name, "collision-observer.jsonl")
+                sink = observer.JsonArtifactSink(artifact_path)
+                sink.persist({
+                    "schema": "incoming-recovery-observer-sample.v1",
+                    "event": "capture",
+                    "outcome": "success",
+                    "capture": {
+                        "state": "record", "source": "model_updater", "projection": projection,
+                    },
+                })
+                with open(artifact_path, encoding="utf-8") as handle:
+                    safe = json.loads(handle.readline())["capture"]["projection"]["completion_gate"]
+                self.assertEqual("staging_collision_admission.v1", safe["schema"])
+                self.assertEqual("cached_rebuild_gate", safe["site"])
+                self.assertEqual("rebuild_requested", safe["disposition"])
+                self.assertIs(safe["max_failures"], False)
+            finally:
+                restore_capture_modules()
         else:
             self.assertFalse(collision_rows)
         self.assertLessEqual(len(collision_rows), 16)

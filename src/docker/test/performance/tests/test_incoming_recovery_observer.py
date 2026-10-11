@@ -714,7 +714,7 @@ def test_finalized_nested_input_witness_reaches_capture_and_json_sink(tmp_path):
     assert root["local_size_ge_active"] is None
     assert root["local_staging_descendant"] is True
     assert root["remote_indicates_newer"] is None
-    checksum = next(item for item in facts if item["split_candidate_remote_size"] == 1_072)
+    checksum = next(item for item in facts if item["split_candidate_remote_size"] == "1072")
     assert checksum["split_candidate_local_mtime_ns"] == str(epoch_ns)
     assert checksum["split_candidate_remote_mtime_ns"] == str(epoch_ns + 500_000_000)
     assert int(checksum["split_candidate_local_mtime_ns"]) > 2**53

@@ -5082,7 +5082,10 @@ class ModelBuilder:
     @staticmethod
     def __merge_active_split_root(existing_file: SystemFile,
                                   active_file: SystemFile,
-                                  remote_file: Optional[SystemFile]) -> SystemFile:
+                                  remote_file: Optional[SystemFile],
+                                  split_leaf_observer: Optional[Callable[
+                                      [SystemFile, SystemFile, SystemFile, bool], None
+                                  ]] = None) -> SystemFile:
         """Overlay fresh staging state without hiding verified final leaves."""
         if existing_file.is_dir != active_file.is_dir:
             if remote_file is not None and existing_file.is_dir == remote_file.is_dir:
@@ -5114,6 +5117,7 @@ class ModelBuilder:
                     existing_child,
                     active_child,
                     remote_children.get(existing_child.name),
+                    split_leaf_observer,
                 ))
             merged_children.extend(active_children.values())
             merged_children.sort(key=lambda child: child.name)
@@ -5136,9 +5140,13 @@ class ModelBuilder:
             # The final copy always wins.  It is safe to reconcile only when
             # the staging duplicate independently carries the same portable
             # source identity; otherwise retain a terminal collision marker.
-            merged.has_staging_collision = not ModelBuilder.__leaf_matches_remote_identity(
-                remote_file, active_file
-            )
+            active_matches_remote = ModelBuilder.__leaf_matches_remote_identity(remote_file, active_file)
+            merged.has_staging_collision = not active_matches_remote
+            if split_leaf_observer is not None:
+                try:
+                    split_leaf_observer(remote_file, existing_file, active_file, active_matches_remote)
+                except Exception:
+                    pass
             if active_file.is_staging or active_file.has_staging_origin is True:
                 merged.has_staging_origin = True
             return merged
@@ -5248,7 +5256,9 @@ class ModelBuilder:
 
     @staticmethod
     def __effective_local_tree_covers_remote_leaves_allowing_collision(
-            remote_file: Optional[SystemFile], local_file: Optional[SystemFile]) -> bool:
+            remote_file: Optional[SystemFile], local_file: Optional[SystemFile],
+            leaf_observer: Optional[Callable[[SystemFile, SystemFile, bool], None]] = None,
+            ancestor_has_collision: bool = False) -> bool:
         """Prove every remote leaf is locally complete without trusting extras.
 
         Terminal collision handling intentionally allows collision metadata on
@@ -5259,6 +5269,14 @@ class ModelBuilder:
         if remote_file is None or local_file is None or remote_file.is_dir != local_file.is_dir:
             return False
         if not remote_file.is_dir:
+            if leaf_observer is not None:
+                try:
+                    leaf_observer(
+                        remote_file, local_file,
+                        ancestor_has_collision or local_file.has_staging_collision,
+                    )
+                except Exception:
+                    pass
             return local_file.size >= remote_file.size
 
         remote_children = {child.name: child for child in remote_file.iter_children()}
@@ -5273,6 +5291,8 @@ class ModelBuilder:
             ModelBuilder.__effective_local_tree_covers_remote_leaves_allowing_collision(
                 remote_child,
                 local_children.get(remote_child.name),
+                leaf_observer,
+                ancestor_has_collision or local_file.has_staging_collision,
             )
             for remote_child in remote_children.values()
         )
@@ -5331,6 +5351,7 @@ class ModelBuilder:
                                 file_id, session_token, generation, expected_source=existing_file,
                             )
                     leaf_observer = None
+                    merge_leaf_observer = None
                     if input_witness is not None and file_id in input_witness.get("priority_roots", ()):
                         def capture_split_leaf(
                                 remote_leaf: SystemFile, local_leaf: SystemFile, strict_verified: bool,
@@ -5338,19 +5359,20 @@ class ModelBuilder:
                             try:
                                 split_leaf_facts = input_witness.setdefault("split_leaf_facts", {})
                                 remote_key = id(remote_leaf)
-                                if local_leaf.is_staging or remote_key in split_leaf_facts or \
+                                if (local_leaf.is_staging and not local_leaf.has_staging_collision) or \
+                                        remote_key in split_leaf_facts or \
                                         len(split_leaf_facts) >= 8:
                                     return
                                 local_mtime_ns = local_leaf.mtime_ns
                                 remote_mtime_ns = remote_leaf.mtime_ns
                                 split_leaf_facts[remote_key] = {
                                     "local_present": True,
-                                    "local_size": local_leaf.size
+                                    "local_size": str(local_leaf.size)
                                         if type(local_leaf.size) is int else None,
                                     "local_mtime_ns": str(local_mtime_ns)
                                         if type(local_mtime_ns) is int else None,
                                     "local_mtime_known": type(local_mtime_ns) is int,
-                                    "remote_size": remote_leaf.size
+                                    "remote_size": str(remote_leaf.size)
                                         if type(remote_leaf.size) is int else None,
                                     "remote_mtime_ns": str(remote_mtime_ns)
                                         if type(remote_mtime_ns) is int else None,
@@ -5360,12 +5382,57 @@ class ModelBuilder:
                                         ModelBuilder.__leaf_matches_remote_queue_exclusion_identity(
                                             remote_leaf, local_leaf,
                                         ),
-                                    "provenance": "split_candidate_local",
+                                    "provenance": "split_candidate_local_staging"
+                                        if local_leaf.is_staging else "split_candidate_local",
+                                    "local_object_ref": opaque_trace_correlation(
+                                        "system-root-object|{}".format(id(local_leaf))
+                                    ),
+                                    "local_is_staging": local_leaf.is_staging,
+                                    "local_has_staging_origin": local_leaf.has_staging_origin
+                                        if type(local_leaf.has_staging_origin) is bool else None,
+                                    "local_has_staging_collision": local_leaf.has_staging_collision,
+                                    "local_collision_scope": "leaf"
+                                        if local_leaf.has_staging_collision else "unknown",
                                 }
                             except Exception:
                                 pass
 
                         leaf_observer = capture_split_leaf
+
+                        def capture_merged_split_leaf(
+                                remote_leaf: SystemFile, local_leaf: SystemFile, active_leaf: SystemFile,
+                                active_matches_remote: bool,
+                        ) -> None:
+                            try:
+                                split_leaf_facts = input_witness.setdefault("split_leaf_facts", {})
+                                remote_key = id(remote_leaf)
+                                prior_facts = split_leaf_facts.get(remote_key)
+                                if not isinstance(prior_facts, dict):
+                                    return
+                                facts = dict(prior_facts)
+                                facts.update({
+                                    "active_present": True,
+                                    "active_matches_remote_identity": active_matches_remote,
+                                })
+                                active_mtime_ns = active_leaf.mtime_ns
+                                facts.update({
+                                    "active_object_ref": opaque_trace_correlation(
+                                        "system-root-object|{}".format(id(active_leaf))
+                                    ),
+                                    "active_size": str(active_leaf.size)
+                                        if type(active_leaf.size) is int else None,
+                                    "active_mtime_ns": str(active_mtime_ns)
+                                        if type(active_mtime_ns) is int else None,
+                                    "active_is_staging": active_leaf.is_staging,
+                                    "active_has_staging_origin": active_leaf.has_staging_origin
+                                        if type(active_leaf.has_staging_origin) is bool else None,
+                                    "active_has_staging_collision": active_leaf.has_staging_collision,
+                                })
+                                split_leaf_facts[remote_key] = facts
+                            except Exception:
+                                pass
+
+                        merge_leaf_observer = capture_merged_split_leaf
                     queue_leaf_observer = None
                     if known_path_pair:
                         def capture_queue_trusted_split_leaf(
@@ -5391,7 +5458,7 @@ class ModelBuilder:
                             split_has_verified_leaf=verified_split_leaf,
                         )
                         effective_local_files[file_id] = self.__merge_active_split_root(
-                            existing_file, active_file, remote_file
+                            existing_file, active_file, remote_file, merge_leaf_observer
                         )
                         continue
                     split_collision_descendant = self.__has_staging_collision_descendant(existing_file)
@@ -5405,7 +5472,7 @@ class ModelBuilder:
                             split_has_verified_leaf=verified_split_leaf,
                         )
                         effective_local_files[file_id] = self.__merge_active_split_root(
-                            existing_file, active_file, remote_file
+                            existing_file, active_file, remote_file, merge_leaf_observer
                         )
                         continue
                     if split_collision_descendant:
@@ -5416,7 +5483,7 @@ class ModelBuilder:
                             split_has_verified_leaf=verified_split_leaf,
                         )
                         effective_local_files[file_id] = self.__merge_active_split_root(
-                            existing_file, active_file, remote_file
+                            existing_file, active_file, remote_file, merge_leaf_observer
                         )
                         continue
             if existing_file is not None and getattr(existing_file, "is_staging", False):
@@ -7702,14 +7769,56 @@ class ModelBuilder:
             for file_id, local_file in effective_local_files.items()
             if self.__has_staging_collision_descendant(local_file)
         }
-        self.__cached_terminalizable_staging_collision_file_ids = {
-            file_id
-            for file_id in self.__cached_unresolved_staging_collision_file_ids
+        self.__cached_terminalizable_staging_collision_file_ids = set()
+        for file_id in self.__cached_unresolved_staging_collision_file_ids:
+            leaf_observer = None
+            if input_witness is not None and file_id in input_witness.get("priority_roots", ()):
+                def capture_cached_collision_leaf(
+                        remote_leaf: SystemFile, local_leaf: SystemFile, collision_path: bool,
+                ) -> None:
+                    if not collision_path:
+                        return
+                    try:
+                        split_leaf_facts = input_witness.setdefault("split_leaf_facts", {})
+                        remote_key = id(remote_leaf)
+                        # Preserve the original pre-merge source row if the
+                        # active comparison already captured this remote leaf.
+                        if isinstance(split_leaf_facts.get(remote_key), dict) or len(split_leaf_facts) >= 8:
+                            return
+                        facts = {}
+                        remote_mtime_ns = remote_leaf.mtime_ns
+                        local_mtime_ns = local_leaf.mtime_ns
+                        facts.update({
+                            "local_present": True,
+                            "local_size": str(local_leaf.size)
+                                if type(local_leaf.size) is int else None,
+                            "local_mtime_ns": str(local_mtime_ns)
+                                if type(local_mtime_ns) is int else None,
+                            "local_mtime_known": type(local_mtime_ns) is int,
+                            "remote_size": str(remote_leaf.size)
+                                if type(remote_leaf.size) is int else None,
+                            "remote_mtime_ns": str(remote_mtime_ns)
+                                if type(remote_mtime_ns) is int else None,
+                            "remote_mtime_known": type(remote_mtime_ns) is int,
+                            "strict_verified": facts.get("strict_verified"),
+                            "portable_queue_exclusion_match": facts.get("portable_queue_exclusion_match"),
+                            "provenance": "cached_effective_input",
+                            "local_object_ref": opaque_trace_correlation(
+                                "system-root-object|{}".format(id(local_leaf))
+                            ),
+                            "local_is_staging": local_leaf.is_staging,
+                            "local_has_staging_origin": local_leaf.has_staging_origin
+                                if type(local_leaf.has_staging_origin) is bool else None,
+                            "local_has_staging_collision": local_leaf.has_staging_collision,
+                            "local_collision_scope": "leaf" if local_leaf.has_staging_collision else "ancestor",
+                        })
+                        split_leaf_facts[remote_key] = facts
+                    except Exception:
+                        pass
+                leaf_observer = capture_cached_collision_leaf
             if self.__effective_local_tree_covers_remote_leaves_allowing_collision(
-                self.__remote_file(file_id),
-                effective_local_files.get(file_id),
-            )
-        }
+                    self.__remote_file(file_id), effective_local_files.get(file_id), leaf_observer):
+                self.__cached_terminalizable_staging_collision_file_ids.add(file_id)
         remote_files = self.__remote_files()
         all_file_ids: set[str] = set(effective_local_files).union(remote_files)
         source_file_ids: set[str] = set(effective_local_files).union(remote_files)
