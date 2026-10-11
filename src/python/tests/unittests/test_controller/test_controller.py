@@ -14885,6 +14885,213 @@ class TestController(unittest.TestCase):
             self.assertNotIn("sample-directory", str(entry))
             self.assertNotIn("path-pair-a", str(entry))
 
+    def test_rejected_queue_records_terminal_reason_and_intent_settlement(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        root = ModelFile("fixture-root", True)
+        root.path_pair_id = "fixture-pair"
+        root.remote_size = 10
+        root.remote_has_transferable_content = True
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        model.add_file(root)
+        self.controller._Controller__model = model
+        self.controller._Controller__path_pairs_by_id = {
+            "fixture-pair": SimpleNamespace(remote_path="/remote", local_path="/local"),
+        }
+        self.controller._Controller__path_pair_staging_paths = {"fixture-pair": "/local/incomplete"}
+        self.controller._Controller__reconciled_local_path_pair_ids.add("fixture-pair")
+        self.controller._Controller__reconciled_remote_path_pair_ids.add("fixture-pair")
+        self.controller._Controller__model_builder.has_unresolved_staging_collision.return_value = True
+        self.controller._Controller__model_builder.get_terminalizable_staging_collision_file_ids.return_value = set()
+        self.controller._Controller__collision_compare_claim = None
+        self.controller._Controller__collision_compare_future = None
+        self.controller._Controller__has_current_local_root_scan_proof = lambda _file: True
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, root.file_id, origin="manual")
+        command.add_callback(callback)
+        intent = DeferredQueueIntent(
+            command, root.file_id, "fixture-pair", phase="rescan", scoped_rescan_attempts=1,
+        )
+        self.controller._Controller__deferred_queue_intents_map()[root.file_id] = intent
+        self.controller._Controller__queue_collision_preflight = lambda _file, _command, current: (
+            "reject", "collision_not_terminalizable", current,
+        )
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        correlation = "fractional-mtime:{}".format(opaque_trace_correlation(root.file_id))
+        entries = trace.query_events(correlation_id=correlation, category_prefix="queue.readiness")["events"]
+        decision = next(
+            entry for entry in entries
+            if entry["message"] == "queue_final_decision" and "intent_was_present" in entry["details"]
+        )
+        details = decision["details"]
+        self.assertEqual("failure", decision["event_type"])
+        self.assertEqual("info", decision["level"])
+        self.assertEqual("collision_not_terminalizable", details["reason"])
+        self.assertFalse(details["dispatch_attempted"])
+        self.assertTrue(details["intent_was_present"])
+        self.assertTrue(details["intent_retired"])
+        self.assertTrue(details["intent_settlement_succeeded"])
+        self.assertEqual("rescan", details["intent_phase"])
+        self.assertEqual(1, details["intent_scoped_rescan_attempts"])
+        self.assertFalse(details["collision_claim_present"])
+        self.assertFalse(details["collision_future_present"])
+        self.assertEqual("present", details["collision_observation"])
+        self.assertTrue(details["collision_unresolved"])
+        self.assertFalse(details["collision_terminalizable"])
+        callback_entry = next(entry for entry in entries if entry["message"] == "queue_callback")
+        self.assertEqual("failure", callback_entry["event_type"])
+        self.assertEqual("failure", callback_entry["details"]["outcome"])
+        self.assertNotIn(root.file_id, self.controller._Controller__deferred_queue_intents_map())
+        callback.on_failure.assert_called_once()
+        self.controller._Controller__lftp.queue.assert_not_called()
+
+    def test_rejected_queue_route_is_equivalent_when_diagnostics_off_or_record_raises(self):
+        outcomes = {}
+        for mode in ("off", "on", "record_fault"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                if mode == "record_fault":
+                    trace = BreadcrumbTraceCollector(
+                        lambda: True,
+                        policy={"default": "info", "rules": {"queue.readiness": "info"}},
+                        max_entries=32,
+                    )
+                    original_record = trace.record
+                    faults = []
+
+                    def record(*args, **kwargs):
+                        if kwargs.get("category") == "queue.readiness":
+                            faults.append(kwargs.get("category"))
+                            raise RuntimeError("injected emitter fault")
+                        return original_record(*args, **kwargs)
+
+                    trace.record = record
+                else:
+                    trace = BreadcrumbTraceCollector(
+                        lambda: True,
+                        policy={"default": "off"} if mode == "off" else
+                                {"default": "info", "rules": {"queue.readiness": "info"}},
+                        max_entries=32,
+                    )
+                self.controller._Controller__context.breadcrumb_trace = trace
+                root = ModelFile("fixture-root", True)
+                root.path_pair_id = "fixture-pair"
+                root.remote_size = 10
+                root.remote_has_transferable_content = True
+                model = Model()
+                model.set_base_logger(self.controller.logger)
+                model.add_file(root)
+                self.controller._Controller__model = model
+                self.controller._Controller__path_pairs_by_id = {
+                    "fixture-pair": SimpleNamespace(remote_path="/remote", local_path="/local"),
+                }
+                self.controller._Controller__path_pair_staging_paths = {"fixture-pair": "/local/incomplete"}
+                self.controller._Controller__reconciled_local_path_pair_ids.add("fixture-pair")
+                self.controller._Controller__reconciled_remote_path_pair_ids.add("fixture-pair")
+                self.controller._Controller__model_builder.has_unresolved_staging_collision.return_value = True
+                self.controller._Controller__model_builder.get_terminalizable_staging_collision_file_ids.return_value = set()
+                self.controller._Controller__collision_compare_claim = None
+                self.controller._Controller__collision_compare_future = None
+                self.controller._Controller__has_current_local_root_scan_proof = lambda _file: True
+                callback = MagicMock()
+                command = Controller.Command(Controller.Command.Action.QUEUE, root.file_id, origin="manual")
+                command.add_callback(callback)
+                intent = DeferredQueueIntent(
+                    command, root.file_id, "fixture-pair", phase="rescan", scoped_rescan_attempts=1,
+                )
+                self.controller._Controller__deferred_queue_intents_map()[root.file_id] = intent
+                self.controller._Controller__queue_collision_preflight = lambda _file, _command, current: (
+                    "reject", "collision_not_terminalizable", current,
+                )
+
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+
+                outcomes[mode] = (
+                    callback.on_failure.call_count,
+                    root.file_id in self.controller._Controller__deferred_queue_intents_map(),
+                    self.controller._Controller__lftp.queue.call_count,
+                    self.controller._Controller__command_queue.empty(),
+                )
+                self.assertEqual((1, False, 0, True), outcomes[mode])
+                if mode == "record_fault":
+                    self.assertTrue(faults)
+                elif mode == "on":
+                    correlation = "fractional-mtime:{}".format(opaque_trace_correlation(root.file_id))
+                    entries = trace.query_events(
+                        correlation_id=correlation, category_prefix="queue.readiness",
+                    )["events"]
+                    decision = next(
+                        entry for entry in entries
+                        if entry["message"] == "queue_final_decision"
+                        and "intent_was_present" in entry["details"]
+                    )
+                    self.assertEqual("failure", decision["event_type"])
+                    self.assertTrue(decision["details"]["intent_retired"])
+                else:
+                    self.assertEqual([], trace.query_events(category_prefix="queue.readiness")["events"])
+                if hasattr(trace, "close"):
+                    trace.close()
+        self.assertEqual(outcomes["on"], outcomes["off"])
+        self.assertEqual(outcomes["on"], outcomes["record_fault"])
+
+    @unittest.skipIf(os.name == "nt", "Windows durable file acknowledgement is buffered/unverified")
+    def test_terminal_queue_and_selected_scan_failure_are_finalized_critical_records(self):
+        with tempfile.TemporaryDirectory() as path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "off", "rules": {
+                    "queue.readiness": "info", "queue.authority": "info",
+                }},
+                durable_enabled=True,
+                durable_path=path,
+            )
+            self.controller._Controller__context.breadcrumb_trace = trace
+            self.controller._Controller__record_queue_readiness_trace(
+                "opaque-selected-file",
+                "queue_final_decision",
+                {"schema": "queue_readiness.v1", "phase": "final_decision",
+                 "outcome": "rejected", "reason": "collision_not_terminalizable",
+                 "dispatch_attempted": False},
+            )
+            self.assertTrue(self.controller._record_authority_handoff_breadcrumb(
+                "opaque-selected-file",
+                event="scan_intake",
+                side="local",
+                outcome="failed",
+                scan_facts={
+                    "scan_final": True,
+                    "result_failed": True,
+                    "selected_failed": True,
+                    "failed_root_is_selected": None,
+                    "selected_recoverable": True,
+                    "selected_terminal": False,
+                    "record_disposition": "pair_unknown",
+                },
+            ))
+            self.assertTrue(trace.flush_durable(2.0))
+            with open(os.path.join(path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+            finalized = [record for record in records if record.get("message") in (
+                "queue_final_decision", "queue_authority_handoff",
+            )]
+            self.assertEqual(2, len(finalized))
+            self.assertEqual(["failure", "failure"], [record["event_type"] for record in finalized])
+            self.assertEqual(["info", "info"], [record["level"] for record in finalized])
+            decision = next(record for record in finalized if record["message"] == "queue_final_decision")
+            self.assertEqual("collision_not_terminalizable", decision["details"]["reason"])
+            intake = next(record for record in finalized if record["message"] == "queue_authority_handoff")
+            self.assertIsNone(intake["details"]["failed_root_is_selected"])
+            self.assertNotIn("opaque-selected-file", json.dumps(finalized))
+            self.assertNotIn("failure_root_ref", json.dumps(finalized))
+            health = trace.durable_snapshot()
+            self.assertEqual(0, health["upstream_critical_ingress_rejected"])
+            trace.close()
+
     def test_manual_directory_scan_deferral_records_bounded_readiness_cause(self):
         trace = BreadcrumbTraceCollector(
             lambda: True,

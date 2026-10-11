@@ -39,7 +39,10 @@ for _common_root in _COMMON_ROOTS:
         sys.path.insert(0, str(_common_root))
         break
 try:
-    from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation, trace_session_digest
+    from common.breadcrumb_trace import (
+        BREADCRUMB_INGRESS_NORMAL_CAPACITY, BreadcrumbTraceCollector,
+        opaque_trace_correlation, trace_session_digest,
+    )
     from model import Model, ModelFile
     from system import SystemFile
     from controller import Controller, ModelBuilder
@@ -53,6 +56,7 @@ try:
     )
     from controller.scan.scanner_process import _record_root_shape_breadcrumb
     from tests.unittests.test_controller import test_model_updater as _model_updater_fixture_module
+    from tests.unittests.test_controller.test_controller import TestController as _ControllerFixture
 except ImportError:
     BreadcrumbTraceCollector = None
     ModelFile = None
@@ -74,6 +78,7 @@ except ImportError:
     _ensure_progressive_scan_state = None
     _ProgressiveScanAccumulator = None
     _model_updater_fixture_module = None
+    _ControllerFixture = None
     LftpJobStatus = None
 
 
@@ -93,6 +98,8 @@ def _health(path: Path, *, session: str = "session-1", lost: int = 0, rotation_c
         "writer_failures": 0,
         "flush_failures": 0,
         "partial_write_failures": 0,
+        "upstream_critical_ingress_rejected": 0,
+        "upstream_normal_ingress_rejected": 0,
         "health_publish_failures": 0,
         "retention_prune_failures": 0,
         "rotation_count": rotation_count,
@@ -912,6 +919,193 @@ def test_queue_readiness_source_projection_is_finite_and_redacted(tmp_path: Path
         "outcome": "failure", "origin": "manual", "reason": "unknown", "callback_index": 0,
         "callback_count": 1, "error_code": 503,
     }
+
+
+def test_terminal_failure_queue_fields_survive_finite_capture_projections() -> None:
+    details = {
+        "schema": "queue_readiness.v1", "phase": "final_decision", "origin": "manual",
+        "outcome": "rejected", "reason": "collision_not_terminalizable",
+        "dispatch_attempted": False, "intent_was_present": True, "intent_retired": False,
+        "intent_settlement_succeeded": False, "intent_phase": "rescan",
+        "intent_scoped_rescan_attempts": 1, "collision_claim_present": True,
+        "collision_future_present": False, "private_path": "/must/not/escape",
+    }
+    readiness = capture._queue_readiness_facts("queue_final_decision", details)
+    assert readiness is not None
+    finalized = observer._sanitize_capture_projection({"queue_readiness": readiness})["queue_readiness"]
+    assert finalized["outcome"] == "rejected"
+    assert finalized["reason"] == "collision_not_terminalizable"
+    assert finalized["intent_retired"] is False
+    assert finalized["intent_settlement_succeeded"] is False
+    assert finalized["intent_phase"] == "rescan"
+    assert finalized["intent_scoped_rescan_attempts"] == 1
+    assert finalized["collision_claim_present"] is True
+    assert "/must/not/escape" not in json.dumps(finalized)
+
+    row = {
+        "message": "queue_authority_handoff", "source": "controller",
+        "category": "queue.authority", "event_type": "failure",
+        "stage": "queue_authority_handoff",
+    }
+    authority_details = {
+        "schema": "queue_authority_scan_intake.v1", "event": "scan_intake",
+        "side": "local", "outcome": "failed", "scan_final": True,
+        "result_failed": True, "selected_failed": True,
+        "failed_root_is_selected": None, "record_disposition": "pair_unknown",
+    }
+    intake = capture._queue_authority_handoff_facts(
+        row, authority_details, row["source"], row["category"], row["event_type"], row["stage"],
+    )
+    assert intake is not None and intake["failed_root_is_selected"] is None
+    safe_intake = observer._sanitize_capture_projection({"queue_authority_handoff": intake})[
+        "queue_authority_handoff"
+    ]
+    assert safe_intake == intake
+    authority_details["selected_failed"] = False
+    assert capture._queue_authority_handoff_facts(
+        row, authority_details, row["source"], row["category"], row["event_type"], row["stage"],
+    ) is None
+
+
+def test_actual_rejected_queue_terminal_window_survives_saturation_and_sink(tmp_path: Path) -> None:
+    if Controller is None or BreadcrumbTraceCollector is None or _ControllerFixture is None:
+        pytest.skip("production Controller and durable reader fixture are unavailable")
+    spool, artifact = _prepare(tmp_path)
+    collector = BreadcrumbTraceCollector(
+        lambda: True, max_entries=4096,
+        policy={"default": "off", "rules": {
+            "queue.readiness": "info", "controller": "info", "model.progress": "info",
+        }},
+        durable_enabled=True, durable_path=str(spool),
+    )
+    reader = _reader(spool, artifact, max_records=4096, max_output_bytes=4 * 1024 * 1024)
+    fixture = _ControllerFixture()
+    fixture.setUp()
+    controller = fixture.controller
+    controller._Controller__context.breadcrumb_trace = collector
+    root = ModelFile("fixture-root", True)
+    root.path_pair_id = "fixture-pair"
+    root.remote_size = 10
+    root.remote_has_transferable_content = True
+    model = Model()
+    model.set_base_logger(controller.logger)
+    model.add_file(root)
+    controller._Controller__model = model
+    controller._Controller__path_pairs_by_id = {
+        "fixture-pair": SimpleNamespace(remote_path="/remote", local_path="/local"),
+    }
+    controller._Controller__path_pair_staging_paths = {"fixture-pair": "/local/incomplete"}
+    controller._Controller__reconciled_local_path_pair_ids.add("fixture-pair")
+    controller._Controller__reconciled_remote_path_pair_ids.add("fixture-pair")
+    controller._Controller__model_builder.has_unresolved_staging_collision.return_value = True
+    controller._Controller__model_builder.get_terminalizable_staging_collision_file_ids.return_value = set()
+    controller._Controller__collision_compare_claim = None
+    controller._Controller__collision_compare_future = None
+    controller._Controller__has_current_local_root_scan_proof = lambda _file: True
+    callback = MagicMock()
+    command = Controller.Command(Controller.Command.Action.QUEUE, root.file_id, origin="manual")
+    command.add_callback(callback)
+    intent = DeferredQueueIntent(
+        command, root.file_id, "fixture-pair", phase="rescan", scoped_rescan_attempts=1,
+    )
+    controller._Controller__deferred_queue_intents_map()[root.file_id] = intent
+    controller._Controller__queue_collision_preflight = lambda _file, _command, current: (
+        "reject", "collision_not_terminalizable", current,
+    )
+    try:
+        assert collector.record(
+            "controller", "durable_boundary_probe", {}, category="controller",
+            event_type="diagnostic", stage="queue_readiness_test_boundary", level="info",
+        ) in {"retained", "enqueued"}
+        assert collector.wait_for_ingress(2.0) and collector.flush_durable(2.0)
+        baseline_bytes = (spool / "breadcrumbs.jsonl").stat().st_size
+        reader.start()
+
+        # This exercises the actual admission producer before normal-lane
+        # saturation; processing then emits the retained rejection and
+        # callback at the production Queue callsite.
+        controller.queue_command(command)
+        emitter = collector.create_emitter()
+        for index in range(BREADCRUMB_INGRESS_NORMAL_CAPACITY + 400):
+            emitter.record("scanner", "progress-{}".format(index), category="model.progress")
+        controller._Controller__process_commands()
+        assert callback.on_failure.call_count == 1
+        assert root.file_id not in controller._Controller__deferred_queue_intents_map()
+        controller._Controller__lftp.queue.assert_not_called()
+        assert collector.ingress_snapshot()["normal_rejected_count"] > 0
+        assert collector.wait_for_ingress(10.0)
+        durable_deadline = time.monotonic() + 30.0
+        health = collector.durable_snapshot()
+        while time.monotonic() < durable_deadline and not (
+                health.get("written") == health.get("accepted") and
+                health.get("critical_pending") == 0 and health.get("normal_pending") == 0 and
+                health.get("writing") is False):
+            time.sleep(0.01)
+            health = collector.durable_snapshot()
+        assert health.get("written") == health.get("accepted")
+        assert health.get("lost") == health.get("critical_lost") + health.get("normal_lost")
+        assert health.get("critical_lost") == 0
+        assert health.get("upstream_normal_ingress_rejected", 0) > 0
+        assert health.get("critical_pending") == health.get("normal_pending") == 0
+        expected_bytes = (spool / "breadcrumbs.jsonl").stat().st_size - baseline_bytes
+        deadline = time.monotonic() + 15.0
+        while reader._source_bytes < expected_bytes and time.monotonic() < deadline:
+            reader.poll()
+        assert reader._source_bytes == expected_bytes, (
+            "finalized reader byte drain incomplete: {} of {}".format(reader._source_bytes, expected_bytes)
+        )
+    finally:
+        reader.close()
+        collector.close(timeout=2.0)
+
+    records = [item for item in _artifacts(artifact) if item.get("capture", {}).get("state") == "record"]
+    projections = [item["capture"]["projection"] for item in records]
+    readiness = [item["queue_readiness"] for item in projections if "queue_readiness" in item]
+    admitted = next(item for item in readiness if item["event"] == "queue_admission")
+    terminal = next(
+        item for item in readiness if item["event"] == "queue_final_decision"
+        and item.get("outcome") == "rejected" and "intent_was_present" in item
+    )
+    callback_row = next(
+        item for item in readiness if item["event"] == "queue_callback" and item.get("outcome") == "failure"
+    )
+    assert admitted["phase"] == "admission"
+    assert terminal["reason"] == "collision_not_terminalizable"
+    assert terminal["intent_was_present"] is True
+    assert terminal["intent_retired"] is True
+    assert terminal["intent_settlement_succeeded"] is True
+    assert callback_row["outcome"] == "failure"
+    raw_rows = [
+        json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    raw_terminal = next(
+        row for row in raw_rows if row.get("message") == "queue_final_decision"
+        and row.get("details", {}).get("reason") == "collision_not_terminalizable"
+    )
+    raw_callback = next(row for row in raw_rows if row.get("message") == "queue_callback")
+    assert raw_terminal["event_type"] == raw_callback["event_type"] == "failure"
+    boundary_index = next(
+        index for index, row in enumerate(raw_rows) if row.get("message") == "durable_boundary_probe"
+    )
+    source_versions = [
+        row["version"] for row in raw_rows[boundary_index + 1:]
+        if type(row.get("version")) is int
+    ]
+    captured_versions = [
+        item["capture"]["projection"].get("numbers", {}).get("version") for item in records
+        if type(item["capture"]["projection"].get("numbers", {}).get("version")) is int
+    ]
+    assert captured_versions == source_versions
+    assert observer._sanitize_capture_projection({"queue_readiness": terminal})["queue_readiness"] == terminal
+    safe_capture = observer._sanitize_capture(records[-1]["capture"])
+    assert safe_capture["health_normal_ingress_rejected"] > 0
+    assert safe_capture["health_critical_ingress_rejected"] == 0
+    assert safe_capture["health_lost"] == (
+        safe_capture["health_critical_lost"] + safe_capture["health_normal_lost"]
+    )
+    serialized = artifact.read_text(encoding="utf-8")
+    assert "fixture-root" not in serialized and "fixture-pair" not in serialized
 
 
 def test_scanner_process_projection_keeps_force_baseline_separate_from_run() -> None:
@@ -1992,10 +2186,18 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     assert observer._sanitize_capture_projection({"queue_authority_handoff": retained_intake})[
         "queue_authority_handoff"
     ] == retained_intake
-    assert [item["event"] for item in readiness[:len(readiness_rows)]] == [row[0] for row in readiness_rows]
-    assert readiness[2]["phase"] == "rescan_request" and readiness[2]["reason"] == "scoped_rescan_requested"
-    assert readiness[3]["decision_boundary"] == "scan_authority"
-    assert readiness[3]["local_reconciled"] is False and readiness[3]["publication_id"] == 7
+    # The finalized spool merges critical and normal ingress lanes. Keep the
+    # reader's returned order intact, while asserting that every production
+    # boundary was retained without assuming producer call order.
+    assert {item["event"] for item in readiness} >= {row[0] for row in readiness_rows}
+    rescan_request = next(item for item in readiness if item["phase"] == "rescan_request")
+    assert rescan_request["reason"] == "scoped_rescan_requested"
+    scan_authority_decision = next(
+        item for item in readiness
+        if item["event"] == "queue_final_decision" and item.get("decision_boundary") == "scan_authority"
+    )
+    assert scan_authority_decision["local_reconciled"] is False
+    assert scan_authority_decision["publication_id"] == 7
     scan_failure = next(item["scan_failure"] for item in readiness if "scan_failure" in item)
     assert scan_failure == {
         "side": "local", "kind": "failed", "scope": "targeted", "target_covered": True,

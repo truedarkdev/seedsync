@@ -593,7 +593,9 @@ _CAPTURE_READINESS_REASONS = {
 _CAPTURE_READINESS_BOOLEANS = {"ready"}
 _CAPTURE_READINESS_BOOLEAN_FIELDS = {
     "accepted", "already_active", "already_dispatched", "collision_terminalizable", "collision_unresolved",
+    "collision_claim_present", "collision_future_present",
     "dispatch_attempted", "exclusions_present", "explicit_stop", "is_dir", "local_reconciled",
+    "intent_retired", "intent_settlement_succeeded", "intent_was_present",
     "local_root_scan_proof_current", "operation_sequence_present", "path_pair_scope_configured",
     "queue_depth_known", "remote_available", "remote_reconciled", "retry_after_ambiguity",
     "stop_boundary", "transferable_remote_content", "unknown_local_overlay",
@@ -604,6 +606,7 @@ _CAPTURE_READINESS_EXTRA_ENUMS = {
     "collision_observation": {"absent", "not_applicable", "present", "unknown"},
     "dispatch_mode": {"async", "sync"},
     "local_scope_basis": {"pair", "selected_root"},
+    "intent_phase": {"collision", "initial_rescan", "none", "rescan"},
 }
 _CAPTURE_SCAN_FAILURE_SIDES = {"local", "remote", "unknown"}
 _CAPTURE_SCAN_FAILURE_KINDS = {"failed", "unknown"}
@@ -1777,7 +1780,7 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
             if key in readiness:
                 item = readiness[key]
                 safe_readiness[key] = item if isinstance(item, str) and item in allowed else "unknown"
-        for key in ("callback_index", "callback_count", "error_code", "queue_depth"):
+        for key in ("callback_index", "callback_count", "error_code", "queue_depth", "intent_scoped_rescan_attempts"):
             item = readiness.get(key)
             if type(item) is int and 0 <= item <= 2**63 - 1:
                 safe_readiness[key] = item
@@ -2091,7 +2094,7 @@ def _sanitize_capture(value: object) -> Mapping[str, object]:
         item = value.get(key)
         if item in values:
             result[key] = item
-    for key in ("utc_ms", "created_ms", "created_ns", "monotonic_ms", "cursor_start", "cursor_end", "bytes_read", "records", "lost", "rotation_count", "health_lost", "health_unknown", "health_unresolved", "irrelevant", "unsupported", "discarded"):
+    for key in ("utc_ms", "created_ms", "created_ns", "monotonic_ms", "cursor_start", "cursor_end", "bytes_read", "records", "lost", "rotation_count", "health_lost", "health_critical_lost", "health_normal_lost", "health_unknown", "health_unresolved", "health_critical_ingress_rejected", "health_normal_ingress_rejected", "irrelevant", "unsupported", "discarded"):
         item = value.get(key)
         if type(item) is int and 0 <= item <= 2 ** 63 - 1:
             result[key] = item

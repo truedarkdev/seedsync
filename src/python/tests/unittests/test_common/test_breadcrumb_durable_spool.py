@@ -62,6 +62,10 @@ class TestBreadcrumbDurableSpool(unittest.TestCase):
         self.assertFalse(is_critical_breadcrumb(
             "controller", "ready", category="queue.readiness",
         ))
+        self.assertTrue(is_critical_breadcrumb(
+            "controller", "queue_final_decision", category="queue.readiness",
+            event_type="failure", level="info",
+        ))
         self.assertFalse(is_critical_breadcrumb(
             "lftp", "poll", category="transfer.lftp.status",
         ))
@@ -185,6 +189,13 @@ class TestBreadcrumbDurableSpool(unittest.TestCase):
         self.assertEqual(
             "enqueued",
             emitter.record("controller", "queue_boundary", category="queue.lifecycle"),
+        )
+        self.assertEqual(
+            "enqueued",
+            emitter.record(
+                "controller", "queue_final_decision", {"outcome": "rejected"},
+                category="queue.readiness", event_type="failure", level="info",
+            ),
         )
         self.assertGreater(collector.ingress_snapshot()["critical_pending"], 0)
         collector.close()

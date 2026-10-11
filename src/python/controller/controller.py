@@ -7340,12 +7340,14 @@ class Controller:
         try:
             if callable(details):
                 details = details()
+            outcome = details.get("outcome") if isinstance(details, dict) else None
+            event_type = "failure" if outcome in ("rejected", "failed", "failure") else "diagnostic"
             breadcrumb_trace.record(
                 "controller",
                 event,
                 details,
                 stage="queue_readiness",
-                event_type="diagnostic",
+                event_type=event_type,
                 category="queue.readiness",
                 level="info",
                 corr_id="fractional-mtime:{}".format(opaque_trace_correlation(file_id)),
@@ -7404,13 +7406,19 @@ class Controller:
                 "record_disposition": scan_facts.get("record_disposition")
                 if scan_facts.get("record_disposition") in _AUTHORITY_HANDOFF_INTAKE_DISPOSITIONS else "unknown",
             })
+        selected_final_failure = (
+            isinstance(scan_facts, Mapping) and
+            scan_facts.get("scan_final") is True and
+            scan_facts.get("result_failed") is True and
+            scan_facts.get("selected_failed") is True
+        )
         try:
             result = breadcrumb_trace.record(
                 "controller",
                 "queue_authority_handoff",
                 details,
                 stage="queue_authority_handoff",
-                event_type="state_transition",
+                event_type="failure" if selected_final_failure else "state_transition",
                 category=_AUTHORITY_HANDOFF_TRACE_CATEGORY,
                 level="info",
                 corr_id="fractional-mtime:{}".format(opaque_trace_correlation(file_id)),
@@ -13188,7 +13196,26 @@ class Controller:
                         })
                         continue
                     if preflight_outcome == "reject":
-                        self.__retire_deferred_queue_intent(file.file_id, preflight_reason)
+                        intent_map = self.__deferred_queue_intents_map()
+                        intent_was_present = file.file_id in intent_map
+                        intent_phase = deferred_queue_intent.phase if deferred_queue_intent is not None and \
+                            deferred_queue_intent.phase in ("initial_rescan", "rescan", "collision") else "none"
+                        intent_attempts = deferred_queue_intent.scoped_rescan_attempts \
+                            if deferred_queue_intent is not None and \
+                            type(deferred_queue_intent.scoped_rescan_attempts) is int and \
+                            0 <= deferred_queue_intent.scoped_rescan_attempts <= 1_000_000 else None
+                        collision_claim_present = (
+                            self._Controller__collision_compare_claim is not None
+                            if hasattr(self, "_Controller__collision_compare_claim") else None
+                        )
+                        collision_future_present = (
+                            self._Controller__collision_compare_future is not None
+                            if hasattr(self, "_Controller__collision_compare_future") else None
+                        )
+                        intent_settlement_succeeded = self.__retire_deferred_queue_intent(
+                            file.file_id, preflight_reason,
+                        )
+                        intent_retired = intent_was_present and intent_settlement_succeeded
                         self.__record_queue_readiness_trace(file.file_id, "queue_final_decision", {
                             "schema": "queue_readiness.v1",
                             "phase": "final_decision",
@@ -13196,6 +13223,20 @@ class Controller:
                             "outcome": "rejected",
                             "reason": preflight_reason,
                             "dispatch_attempted": False,
+                            "intent_was_present": intent_was_present,
+                            "intent_retired": intent_retired,
+                            "intent_settlement_succeeded": intent_settlement_succeeded,
+                            "intent_phase": intent_phase,
+                            "intent_scoped_rescan_attempts": intent_attempts,
+                            "collision_claim_present": collision_claim_present,
+                            "collision_future_present": collision_future_present,
+                            "collision_observation": collision_observation
+                            if collision_observation in ("absent", "not_applicable", "present", "unknown")
+                            else "unknown",
+                            "collision_unresolved": collision_observed
+                            if collision_observation != "unknown" else None,
+                            "collision_terminalizable": collision_terminalizable
+                            if collision_observation != "unknown" else None,
                         })
                         _notify_failure(command, "Queue preflight is not safe", 409, file)
                         continue

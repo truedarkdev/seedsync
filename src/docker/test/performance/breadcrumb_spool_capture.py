@@ -75,6 +75,7 @@ _NUMERIC_KEYS = frozenset(
 _HEALTH_COUNTERS = (
     "lost", "critical_lost", "normal_lost", "unknown", "unresolved", "writer_failures", "flush_failures",
     "partial_write_failures", "health_publish_failures", "retention_prune_failures",
+    "upstream_critical_ingress_rejected", "upstream_normal_ingress_rejected",
 )
 
 _QUEUE_LIFECYCLE_EVENTS = frozenset({
@@ -177,7 +178,9 @@ _QUEUE_READINESS_REASONS = frozenset({
 _QUEUE_READINESS_BOOLEANS = frozenset({"ready"})
 _QUEUE_READINESS_BOOLEAN_FIELDS = frozenset({
     "accepted", "already_active", "already_dispatched", "collision_terminalizable", "collision_unresolved",
+    "collision_claim_present", "collision_future_present",
     "dispatch_attempted", "exclusions_present", "explicit_stop", "is_dir", "local_reconciled",
+    "intent_retired", "intent_settlement_succeeded", "intent_was_present",
     "local_root_scan_proof_current", "operation_sequence_present", "path_pair_scope_configured",
     "queue_depth_known", "remote_available", "remote_reconciled", "retry_after_ambiguity",
     "stop_boundary", "transferable_remote_content", "unknown_local_overlay",
@@ -188,6 +191,7 @@ _QUEUE_READINESS_EXTRA_ENUMS = {
     "collision_observation": frozenset({"absent", "not_applicable", "present", "unknown"}),
     "dispatch_mode": frozenset({"async", "sync"}),
     "local_scope_basis": frozenset({"pair", "selected_root"}),
+    "intent_phase": frozenset({"collision", "initial_rescan", "none", "rescan"}),
 }
 _QUEUE_SCAN_FAILURE_SIDES = frozenset({"local", "remote", "unknown"})
 _QUEUE_SCAN_FAILURE_KINDS = frozenset({"failed", "unknown"})
@@ -520,6 +524,24 @@ def _deltas(current: Mapping[str, object], baseline: Mapping[str, int]) -> dict[
         old = baseline.get(key, 0)
         values[key] = now - old if now >= old else -1
     return values
+
+
+def _has_unaccounted_health_loss(deltas: Mapping[str, int]) -> bool:
+    """Reject unknown/critical health loss while allowing explicit normal-only loss."""
+    if any(value < 0 for value in deltas.values()):
+        return True
+    lost = deltas["lost"]
+    critical_lost = deltas["critical_lost"]
+    normal_lost = deltas["normal_lost"]
+    normal_only_loss = lost == normal_lost > 0 and critical_lost == 0
+    if lost != critical_lost + normal_lost and not normal_only_loss:
+        return True
+    if critical_lost > 0 or deltas["upstream_critical_ingress_rejected"] > 0:
+        return True
+    return any(deltas[key] > 0 for key in (
+        "unknown", "unresolved", "writer_failures", "flush_failures", "partial_write_failures",
+        "health_publish_failures", "retention_prune_failures",
+    ))
 
 
 def _numeric_values(row: Mapping[str, object], metadata: Mapping[str, object], details: Mapping[str, object]) -> dict[str, int | float]:
@@ -1151,7 +1173,7 @@ def _queue_readiness_facts(message: object, details: Mapping[str, object]) -> di
         value = details.get(key)
         if key in details:
             result[key] = value if type(value) is bool else None
-    for key in ("callback_index", "callback_count", "error_code", "queue_depth"):
+    for key in ("callback_index", "callback_count", "error_code", "queue_depth", "intent_scoped_rescan_attempts"):
         value = details.get(key)
         if type(value) is int and 0 <= value <= 2**63 - 1:
             result[key] = value
@@ -1178,10 +1200,14 @@ def _queue_authority_handoff_facts(
         source: str, category: str, event_type: str, stage: str,
 ) -> dict[str, object] | None:
     if not (source == "controller" and category == "queue.authority" and
-            event_type == "state_transition" and stage == "queue_authority_handoff" and
+            event_type in {"state_transition", "failure"} and stage == "queue_authority_handoff" and
             row.get("message") == "queue_authority_handoff" and
             details.get("schema") == _QUEUE_AUTHORITY_INTAKE_SCHEMA and
             details.get("event") == "scan_intake"):
+        return None
+    if event_type == "failure" and not (
+            details.get("scan_final") is True and details.get("result_failed") is True and
+            details.get("selected_failed") is True):
         return None
     side = details.get("side")
     outcome = details.get("outcome")
@@ -2373,8 +2399,12 @@ class BreadcrumbSpoolCapture:
             "records": max(0, int(records)),
             "lost": max(0, delta.get("lost", 0)),
             "health_lost": max(0, delta.get("lost", 0)),
+            "health_critical_lost": max(0, delta.get("critical_lost", 0)),
+            "health_normal_lost": max(0, delta.get("normal_lost", 0)),
             "health_unknown": max(0, delta.get("unknown", 0)),
             "health_unresolved": max(0, delta.get("unresolved", 0)),
+            "health_critical_ingress_rejected": max(0, delta.get("upstream_critical_ingress_rejected", 0)),
+            "health_normal_ingress_rejected": max(0, delta.get("upstream_normal_ingress_rejected", 0)),
             "session_hash": _hash(self._session),
             "rotation_count": _counter(current_health.get("rotation_count")),
         }
@@ -2645,8 +2675,7 @@ class BreadcrumbSpoolCapture:
             self._loss("session", h0)
             raise ObserverCaptureError("spool session changed")
         deltas = _deltas(h0, self._health_baseline)
-        monitored = {"lost", "unknown", "unresolved", "writer_failures", "flush_failures", "partial_write_failures", "health_publish_failures", "retention_prune_failures"}
-        if any(value < 0 for value in deltas.values()) or any(value > 0 for key, value in deltas.items() if key in monitored):
+        if _has_unaccounted_health_loss(deltas):
             self._loss("health", h0)
             raise ObserverCaptureError("spool health reports new loss")
         self._last_health = dict(h0)
@@ -2693,7 +2722,7 @@ class BreadcrumbSpoolCapture:
             self._loss("marker" if marker_after else "session", h1, bytes_read=total)
             raise ObserverCaptureError("spool changed while reading")
         post_deltas = _deltas(h1, self._health_baseline)
-        if any(value < 0 for value in post_deltas.values()) or any(value > 0 for key, value in post_deltas.items() if key in monitored):
+        if _has_unaccounted_health_loss(post_deltas):
             self._loss("health", h1, bytes_read=total)
             raise ObserverCaptureError("spool health reports new loss")
         self._last_health = dict(h1)
@@ -2757,8 +2786,7 @@ class BreadcrumbSpoolCapture:
             self.close()
             raise ObserverCaptureError("spool session changed while stopping")
         deltas = _deltas(final_health, self._health_baseline)
-        monitored = {"lost", "unknown", "unresolved", "writer_failures", "flush_failures", "partial_write_failures", "health_publish_failures", "retention_prune_failures"}
-        if any(value < 0 for value in deltas.values()) or any(value > 0 for key, value in deltas.items() if key in monitored):
+        if _has_unaccounted_health_loss(deltas):
             self._loss("health", final_health)
             self.close()
             raise ObserverCaptureError("spool health reports new loss while stopping")
