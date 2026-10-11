@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple, cast
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, cast
 from threading import Condition, Event, Lock, RLock
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError
 from queue import Empty, Queue
@@ -161,6 +161,11 @@ _QUEUE_LIFECYCLE_BOUNDARIES = {
 
 _AUTHORITY_HANDOFF_TRACE_CATEGORY = "queue.authority"
 _AUTHORITY_HANDOFF_MAX_INTENTS = 16
+_AUTHORITY_HANDOFF_INTAKE_DISPOSITIONS = frozenset({
+    "aggregate_incomplete", "failed_ignored", "failed_recorded", "failed_scope_empty", "unknown_ignored",
+    "invalid_result", "out_of_scope", "pair_token_invalid", "pair_unknown",
+    "token_not_fresh", "token_recorded", "unknown_recorded",
+})
 
 
 def _queue_lifecycle_project(event: object, fields: object) -> Optional[dict[str, object]]:
@@ -864,6 +869,9 @@ class DeferredQueueIntent:
     # Diagnostic-only rate limit for retained Queue wait snapshots. It never
     # participates in retry/admission decisions and is not persisted.
     diagnostic_last_wait_monotonic: Optional[float] = field(default=None, repr=False, compare=False)
+    # Diagnostic-only deduplication/throttle for scan-result intake. These
+    # values never participate in Queue authority or survive persistence.
+    diagnostic_last_scan_record: object = field(default=None, repr=False, compare=False)
 @dataclass
 class _LftpOperation:
     action: str
@@ -3728,6 +3736,164 @@ class Controller:
             if result is None:
                 return
 
+            # Snapshot the bounded set before any result-shape early return.
+            # This is observation-only: the original authority branches below
+            # continue to enumerate and mutate the same controller state.
+            selected_intents: list[DeferredQueueIntent] = []
+            handoff_recorder = None
+            try:
+                if _authority_handoff_trace_enabled(self):
+                    handoff_recorder = getattr(self, "_record_authority_handoff_breadcrumb", None)
+                    deferred = getattr(self, "_Controller__deferred_queue_intents", None)
+                    values = deferred.values() if isinstance(deferred, dict) else ()
+                    for index, intent in enumerate(values):
+                        if index >= _AUTHORITY_HANDOFF_MAX_INTENTS:
+                            break
+                        if isinstance(intent, DeferredQueueIntent) and \
+                                type(intent.phase) is str and intent.phase in ("initial_rescan", "rescan") and \
+                                type(intent.file_id) is str:
+                            selected_intents.append(intent)
+            except Exception:
+                # Optional selection cannot alter scan-token processing.
+                selected_intents = []
+                handoff_recorder = None
+
+            emitted_intent_ids: set[int] = set()
+
+            def emit_scan_intake(
+                    intent: DeferredQueueIntent, disposition: str,
+                    pair_token: Optional[tuple[object, object]] = None,
+                    marker_state: Optional[str] = None,
+                    selected_failure_scope: Optional[bool] = None,
+            ) -> None:
+                if not any(intent is selected for selected in selected_intents) or id(intent) in emitted_intent_ids or \
+                        not callable(handoff_recorder):
+                    return
+                try:
+                    attrs = vars(result)
+                    failed = getattr(result, "failed", None)
+                    aggregate_session = getattr(result, "session_token", None)
+                    aggregate_generation = getattr(result, "generation", None)
+                    baseline = None
+                    generations = intent.rescan_generations
+                    side_index = 0 if side == "local" else 1
+                    if isinstance(generations, tuple) and len(generations) == 2 and \
+                            isinstance(generations[side_index], tuple) and len(generations[side_index]) == 2:
+                        baseline = generations[side_index]
+                    baseline_session = baseline[0] if baseline is not None else None
+                    baseline_generation = baseline[1] if baseline is not None else None
+
+                    token_map_name = "_scan_failure_tokens_by_pair" if bool(failed) else \
+                        "_scan_authority_tokens_by_pair"
+                    token_map_present = token_map_name in attrs
+                    token_map = attrs.get(token_map_name)
+                    effective_token = pair_token
+                    if marker_state is None:
+                        marker_state = "unknown"
+                        if not token_map_present:
+                            marker_state = "absent"
+                            effective_token = (aggregate_session, aggregate_generation)
+                        elif isinstance(token_map, dict):
+                            if intent.path_pair_id not in token_map:
+                                marker_state = "absent"
+                            else:
+                                candidate = token_map.get(intent.path_pair_id)
+                                if isinstance(candidate, tuple) and len(candidate) == 2 and \
+                                        type(candidate[0]) is str and bool(candidate[0]) and \
+                                        type(candidate[1]) is int and 0 <= candidate[1] <= 2**63 - 1:
+                                    marker_state = "valid"
+                                    effective_token = candidate
+                                else:
+                                    marker_state = "invalid"
+                        else:
+                            marker_state = "invalid"
+                            # The successful legacy path uses aggregate fields
+                            # when no per-pair map is available; failure paths
+                            # deliberately do not fall back when the map exists.
+                            if not bool(failed):
+                                effective_token = (aggregate_session, aggregate_generation)
+                    elif marker_state == "absent" and not token_map_present:
+                        effective_token = (aggregate_session, aggregate_generation)
+
+                    token_session = effective_token[0] if isinstance(effective_token, tuple) and \
+                        len(effective_token) == 2 else None
+                    token_generation = effective_token[1] if isinstance(effective_token, tuple) and \
+                        len(effective_token) == 2 else None
+                    run_match = token_session == baseline_session if \
+                        type(token_session) is str and token_session and \
+                        type(baseline_session) is str and baseline_session else None
+                    generation_relation = "unknown"
+                    if run_match is True and type(token_generation) is int and \
+                            0 <= token_generation <= 2**63 - 1 and \
+                            type(baseline_generation) is int and 0 <= baseline_generation <= 2**63 - 1:
+                        generation_relation = "newer" if token_generation > baseline_generation else \
+                            "equal" if token_generation == baseline_generation else "older"
+
+                    def member(attribute: str) -> Optional[bool]:
+                        try:
+                            values = getattr(result, attribute, None)
+                            if not isinstance(values, (set, frozenset, list, tuple)):
+                                return None
+                            return intent.path_pair_id in values
+                        except Exception:
+                            return None
+
+                    failed_membership = selected_failure_scope \
+                        if type(selected_failure_scope) is bool else None
+                    final_value = getattr(result, "is_scan_final", None)
+                    facts = {
+                        "schema": "queue_authority_scan_intake.v1",
+                        "scan_final": final_value if type(final_value) is bool else None,
+                        "result_failed": failed if type(failed) is bool else None,
+                        "selected_scanned": member("scanned_path_pair_ids"),
+                        "selected_completed": member("completed_path_pair_ids"),
+                        "selected_unknown": member("unknown_path_pair_ids"),
+                        "selected_failed": failed_membership,
+                        "selected_recoverable": member("recoverable_failure_path_pair_ids"),
+                        "selected_terminal": member("terminal_failure_path_pair_ids"),
+                        "pair_marker_state": marker_state if marker_state in ("absent", "invalid", "valid", "unknown") else "unknown",
+                        "run_match": run_match if type(run_match) is bool else None,
+                        "generation_relation": generation_relation,
+                        "record_disposition": disposition if disposition in _AUTHORITY_HANDOFF_INTAKE_DISPOSITIONS else "unknown",
+                    }
+                    signature = (
+                        side, intent.phase, disposition, tuple(facts.values()),
+                        trace_session_digest(token_session) if type(token_session) is str and token_session else None,
+                        token_generation,
+                    )
+                    now = time.monotonic()
+                    last_record = intent.diagnostic_last_scan_record
+                    if type(now) not in (int, float) or not math.isfinite(float(now)):
+                        return
+                    if isinstance(last_record, tuple) and len(last_record) == 2 and \
+                            last_record[1] == signature and type(last_record[0]) in (int, float) and \
+                            math.isfinite(float(last_record[0])) and now >= last_record[0] and \
+                            now - last_record[0] < 10.0:
+                        emitted_intent_ids.add(id(intent))
+                        return
+                    recorded = handoff_recorder(
+                        intent.file_id, event="scan_intake", side=side,
+                        outcome="failed" if failed is True else "unknown" if failed is None else "observed",
+                        fresh=False if run_match is False else
+                        generation_relation == "newer" if run_match is True and generation_relation != "unknown" else None,
+                        scan_facts=facts,
+                    )
+                    if recorded is True:
+                        intent.diagnostic_last_scan_record = (float(now), signature)
+                        emitted_intent_ids.add(id(intent))
+                except Exception:
+                    # Optional fact preparation/throttling/emission is fail-isolated.
+                    return
+
+            def emit_all_scan_intake(
+                    disposition: str, selected_failure_scope: Optional[bool] = None,
+            ) -> None:
+                for selected_intent in selected_intents:
+                    emit_scan_intake(
+                        selected_intent, disposition,
+                        selected_failure_scope=selected_failure_scope,
+                    )
+
             recoverable_local_reasons = {
                 "initial_local_scan_recoverable_failed",
                 "initial_local_scan_recoverable_unknown",
@@ -3938,14 +4104,18 @@ class Controller:
                     type(result_generation) is int
                 for intent in self.__deferred_queue_intents_map().values():
                     if intent.phase != "initial_rescan":
+                        emit_scan_intake(intent, "out_of_scope")
                         continue
                     if type(intent.path_pair_id) is str:
                         if intent.path_pair_id not in affected_pair_ids:
+                            emit_scan_intake(intent, "out_of_scope")
                             continue
                     elif intent.path_pair_id is None:
                         if None not in affected_pair_ids:
+                            emit_scan_intake(intent, "out_of_scope")
                             continue
                     else:
+                        emit_scan_intake(intent, "invalid_result")
                         continue
                     generations = intent.rescan_generations
                     baseline = generations[side_index] if isinstance(generations, tuple) and \
@@ -3953,10 +4123,12 @@ class Controller:
                         len(generations[side_index]) == 2 else None
                     if not isinstance(baseline, tuple) or type(baseline[0]) is not str or \
                             type(baseline[1]) is not int:
+                        emit_scan_intake(intent, "invalid_result")
                         continue
                     if require_fresh_token:
                         if not has_result_token or result_session != baseline[0] or \
                                 result_generation <= baseline[1]:
+                            emit_scan_intake(intent, "token_not_fresh")
                             continue
                     failure_reason = reason
                     recoverable_ids = getattr(result, "recoverable_failure_path_pair_ids", None)
@@ -3967,7 +4139,13 @@ class Controller:
                         if not terminal and isinstance(recoverable_ids, (set, frozenset, list, tuple)) and \
                                 intent.path_pair_id in recoverable_ids:
                             failure_reason = "initial_local_scan_recoverable_unknown"
+                    previous_reason = intent.rescan_failure_reason
                     record_failure(intent, failure_reason, "unknown")
+                    failure_recorded = previous_reason is None or (
+                        previous_reason in recoverable_local_reasons and
+                        failure_reason not in recoverable_local_reasons
+                    )
+                    emit_scan_intake(intent, "unknown_recorded" if failure_recorded else "unknown_ignored")
 
             if bool(getattr(result, "failed", False)):
                 failure_scope: set[object] = set()
@@ -3988,6 +4166,8 @@ class Controller:
                 unscoped_full_failure = failure_scope == {None} and not bool(
                     getattr(result, "is_targeted_scan", False)
                 )
+                if not failed_pair_ids and not unscoped_full_failure:
+                    emit_all_scan_intake("failed_scope_empty", selected_failure_scope=False)
                 if failed_pair_ids or unscoped_full_failure:
                     result_session = getattr(result, "session_token", None)
                     result_generation = getattr(result, "generation", None)
@@ -4008,23 +4188,32 @@ class Controller:
                         has_failure_tokens = True
                         failure_tokens = None
                     for intent in self.__deferred_queue_intents_map().values():
+                        selected_failure_scope = intent.path_pair_id in failed_pair_ids \
+                            if type(intent.path_pair_id) is str else \
+                            unscoped_full_failure if intent.path_pair_id is None else False
                         if intent.phase != "initial_rescan":
+                            emit_scan_intake(intent, "out_of_scope", selected_failure_scope=selected_failure_scope)
                             continue
                         if type(intent.path_pair_id) is str:
                             if intent.path_pair_id not in failed_pair_ids:
+                                emit_scan_intake(intent, "out_of_scope", selected_failure_scope=selected_failure_scope)
                                 continue
                         elif intent.path_pair_id is None:
                             if not unscoped_full_failure:
+                                emit_scan_intake(intent, "out_of_scope", selected_failure_scope=selected_failure_scope)
                                 continue
                         else:
+                            emit_scan_intake(intent, "invalid_result", selected_failure_scope=selected_failure_scope)
                             continue
                         generations = intent.rescan_generations
                         if not isinstance(generations, tuple) or len(generations) != 2 or \
                                 not isinstance(generations[side_index], tuple) or \
                                 len(generations[side_index]) != 2:
+                            emit_scan_intake(intent, "invalid_result", selected_failure_scope=selected_failure_scope)
                             continue
                         baseline = generations[side_index]
                         if type(baseline[0]) is not str or type(baseline[1]) is not int:
+                            emit_scan_intake(intent, "invalid_result", selected_failure_scope=selected_failure_scope)
                             continue
                         if has_failure_tokens:
                             failure_generation_source = "pair" if isinstance(failure_tokens, dict) else "unknown"
@@ -4073,6 +4262,7 @@ class Controller:
                             else:
                                 ignored_reason = None
                         if ignored_reason is not None:
+                            emit_scan_intake(intent, "failed_ignored", selected_failure_scope=selected_failure_scope)
                             record_ignored_failure_token(
                                 intent, baseline, failure_token, failure_generation_source, ignored_reason,
                             )
@@ -4085,9 +4275,18 @@ class Controller:
                             if not terminal and isinstance(recoverable_ids, (set, frozenset, list, tuple)) and \
                                     intent.path_pair_id in recoverable_ids:
                                 intent_failure_reason = "initial_local_scan_recoverable_failed"
+                        previous_reason = intent.rescan_failure_reason
                         record_failure(
                             intent, intent_failure_reason, "failed",
                             (failure_session, failure_generation), failure_generation_source,
+                        )
+                        failure_recorded = previous_reason is None or (
+                            previous_reason in recoverable_local_reasons and
+                            intent_failure_reason not in recoverable_local_reasons
+                        )
+                        emit_scan_intake(
+                            intent, "failed_recorded" if failure_recorded else "failed_ignored",
+                            selected_failure_scope=selected_failure_scope,
                         )
                 return
             result_unknown_ids = getattr(result, "unknown_path_pair_ids", set())
@@ -4102,6 +4301,7 @@ class Controller:
             # completed pair; discarding the whole aggregate here stranded a
             # deferred Queue behind unrelated local work.
             if not is_scan_final and not has_per_pair_tokens:
+                emit_all_scan_intake("aggregate_incomplete")
                 return
             # A final aggregate can truthfully terminalize the affected
             # unknown pair.  A partial aggregate also carries unrelated
@@ -4124,6 +4324,7 @@ class Controller:
                     affected_pair_ids.update(raw_scanned)
                 if isinstance(raw_completed, (set, frozenset, list, tuple)):
                     affected_pair_ids.update(raw_completed)
+                emit_all_scan_intake("invalid_result")
                 return
             raw_completed = getattr(result, "completed_path_pair_ids", set())
             completed = raw_completed if isinstance(raw_completed, set) else set()
@@ -4135,21 +4336,6 @@ class Controller:
                 side_tokens = {}
                 tokens[side] = side_tokens
 
-            authority_trace_enabled = _authority_handoff_trace_enabled(self)
-            handoff_recorder = getattr(
-                self, "_record_authority_handoff_breadcrumb", None,
-            ) if authority_trace_enabled else None
-            selected_intents: list[DeferredQueueIntent] = []
-            if callable(handoff_recorder):
-                deferred_intents = getattr(self, "_Controller__deferred_queue_intents", None)
-                deferred_values = deferred_intents.values() if isinstance(deferred_intents, dict) else ()
-                for index, intent in enumerate(deferred_values):
-                    if index >= _AUTHORITY_HANDOFF_MAX_INTENTS:
-                        break
-                    if isinstance(intent, DeferredQueueIntent) and \
-                            type(intent.phase) is str and intent.phase in ("initial_rescan", "rescan") and \
-                            type(intent.file_id) is str:
-                        selected_intents.append(intent)
             for pair_id in covered_pair_ids:
                 if pair_id in unknown_pair_ids:
                     continue
@@ -4158,6 +4344,9 @@ class Controller:
                         pair_token = per_pair_tokens.get(pair_id)
                         if not isinstance(pair_token, tuple) or len(pair_token) != 2 or \
                                 type(pair_token[0]) is not str or type(pair_token[1]) is not int:
+                            for intent in selected_intents:
+                                if intent.path_pair_id == pair_id:
+                                    emit_scan_intake(intent, "pair_token_invalid", marker_state="invalid")
                             # An aggregate with explicit per-pair evidence
                             # must not fall back to its newest drain-wide
                             # generation for an untouched pair.
@@ -4174,7 +4363,11 @@ class Controller:
                 side_index = 0 if side == "local" else 1
                 for intent in selected_intents:
                     pair_id = intent.path_pair_id
-                    if pair_id not in covered_pair_ids or pair_id in unknown_pair_ids:
+                    if pair_id in unknown_pair_ids:
+                        emit_scan_intake(intent, "pair_unknown")
+                        continue
+                    if pair_id not in covered_pair_ids:
+                        emit_scan_intake(intent, "out_of_scope")
                         continue
                     token = side_tokens.get(pair_id)
                     baselines = intent.rescan_generations
@@ -4183,7 +4376,9 @@ class Controller:
                     if not isinstance(token, tuple) or len(token) != 2 or \
                             not isinstance(baseline, tuple) or len(baseline) != 2 or \
                             token[0] != baseline[0] or token[1] <= baseline[1]:
+                        emit_scan_intake(intent, "token_not_fresh")
                         continue
+                    emit_scan_intake(intent, "token_recorded", token, "valid" if has_per_pair_tokens else "absent")
                     handoff_recorder(
                         intent.file_id,
                         event="token_receipt",
@@ -7154,16 +7349,17 @@ class Controller:
             outcome: str = "unknown",
             fresh: object = None,
             covered: object = None,
-    ) -> None:
+            scan_facts: Optional[Mapping[str, object]] = None,
+    ) -> bool:
         """Record one fixed, identity-free Queue authority boundary."""
         if not isinstance(file_id, str):
-            return
+            return False
         context = getattr(self, "_Controller__context", None)
         breadcrumb_trace = getattr(context, "breadcrumb_trace", None)
         if not _breadcrumb_effectively_enabled(
                 breadcrumb_trace, _AUTHORITY_HANDOFF_TRACE_CATEGORY, "info",
         ):
-            return
+            return False
         details = {
             "event": event,
             "side": side,
@@ -7171,8 +7367,27 @@ class Controller:
             "fresh": fresh if type(fresh) is bool else None,
             "covered": covered if type(covered) is bool else None,
         }
+        if scan_facts is not None:
+            details["schema"] = "queue_authority_scan_intake.v1"
+            details.update({
+                "scan_final": scan_facts.get("scan_final") if type(scan_facts.get("scan_final")) is bool else None,
+                "result_failed": scan_facts.get("result_failed") if type(scan_facts.get("result_failed")) is bool else None,
+                "selected_scanned": scan_facts.get("selected_scanned") if type(scan_facts.get("selected_scanned")) is bool else None,
+                "selected_completed": scan_facts.get("selected_completed") if type(scan_facts.get("selected_completed")) is bool else None,
+                "selected_unknown": scan_facts.get("selected_unknown") if type(scan_facts.get("selected_unknown")) is bool else None,
+                "selected_failed": scan_facts.get("selected_failed") if type(scan_facts.get("selected_failed")) is bool else None,
+                "selected_recoverable": scan_facts.get("selected_recoverable") if type(scan_facts.get("selected_recoverable")) is bool else None,
+                "selected_terminal": scan_facts.get("selected_terminal") if type(scan_facts.get("selected_terminal")) is bool else None,
+                "pair_marker_state": scan_facts.get("pair_marker_state")
+                if scan_facts.get("pair_marker_state") in ("absent", "invalid", "valid", "unknown") else "unknown",
+                "run_match": scan_facts.get("run_match") if type(scan_facts.get("run_match")) is bool else None,
+                "generation_relation": scan_facts.get("generation_relation")
+                if scan_facts.get("generation_relation") in ("newer", "equal", "older", "unknown") else "unknown",
+                "record_disposition": scan_facts.get("record_disposition")
+                if scan_facts.get("record_disposition") in _AUTHORITY_HANDOFF_INTAKE_DISPOSITIONS else "unknown",
+            })
         try:
-            breadcrumb_trace.record(
+            result = breadcrumb_trace.record(
                 "controller",
                 "queue_authority_handoff",
                 details,
@@ -7183,11 +7398,13 @@ class Controller:
                 corr_id="fractional-mtime:{}".format(opaque_trace_correlation(file_id)),
                 trace_scope="flow",
             )
+            return result in {"retained", "enqueued"}
         except Exception:
             logger = getattr(self, "logger", None)
             debug = getattr(logger, "debug", None)
             if callable(debug):
                 debug("Ignoring Queue authority handoff breadcrumb failure", exc_info=True)
+            return False
 
     def __record_queue_callback_trace(
             self, command: "Controller.Command", callback_index: int,

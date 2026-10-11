@@ -1446,7 +1446,7 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     spool, artifact = _prepare(tmp_path)
     collector = BreadcrumbTraceCollector(
         lambda: True, max_entries=64,
-        policy={"default": "off", "rules": {"queue.readiness": "info", "controller": "info"}},
+        policy={"default": "off", "rules": {"queue.readiness": "info", "queue.authority": "info", "controller": "info"}},
         durable_enabled=True, durable_path=str(spool),
     )
     reader = _reader(spool, artifact, max_records=256)
@@ -1490,6 +1490,7 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         durable_state = collector.durable_snapshot()
         assert durable_state["session_boundary_written"] is True
         assert durable_state["written"] >= 1
+        baseline_written = durable_state["written"]
         reader.start()
         for message, details in readiness_rows:
             assert Controller._Controller__record_queue_readiness_trace(
@@ -1533,6 +1534,99 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         }
         producer._Controller__deferred_queue_intents = {ignored_file_id: ignored_intent}
         Controller._record_path_pair_scan_tokens(producer, ignored_result, None)
+
+        mismatch_pair_id = "private-mismatch-pair"
+        mismatch_file_id = ModelFile.build_file_id("private-mismatch-root", mismatch_pair_id)
+        mismatch_intent = DeferredQueueIntent(
+            Controller.Command(Controller.Command.Action.QUEUE, mismatch_file_id),
+            mismatch_file_id, mismatch_pair_id, phase="initial_rescan", rescan_requested=True,
+            rescan_generations=(("private-mismatch-baseline", 20), ("private-remote-session", 0)),
+        )
+        mismatch_result = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={mismatch_pair_id}, failed=True,
+            generation=21, session_token="private-mismatch-result", is_targeted_scan=True,
+            recoverable_failure_path_pair_ids={mismatch_pair_id}, terminal_failure_path_pair_ids=set(),
+        )
+        mismatch_result._scan_failure_tokens_by_pair = {
+            mismatch_pair_id: ("private-mismatch-other", 21),
+        }
+        producer._Controller__deferred_queue_intents = {mismatch_file_id: mismatch_intent}
+        Controller._record_path_pair_scan_tokens(producer, mismatch_result, None)
+
+        incomplete_pair_id = "private-incomplete-pair"
+        incomplete_file_id = ModelFile.build_file_id("private-incomplete-root", incomplete_pair_id)
+        incomplete_intent = DeferredQueueIntent(
+            Controller.Command(Controller.Command.Action.QUEUE, incomplete_file_id),
+            incomplete_file_id, incomplete_pair_id, phase="initial_rescan", rescan_requested=True,
+            rescan_generations=(("private-incomplete-session", 2), ("private-remote-session", 0)),
+        )
+        incomplete_result = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids=set(), completed_path_pair_ids=set(), failed=False,
+            generation=3, session_token="private-incomplete-session", is_scan_final=False,
+            recoverable_failure_path_pair_ids={incomplete_pair_id},
+        )
+        producer._Controller__deferred_queue_intents = {incomplete_file_id: incomplete_intent}
+        Controller._record_path_pair_scan_tokens(producer, incomplete_result, None)
+
+        unknown_pair_id = "private-unknown-pair"
+        unknown_file_id = ModelFile.build_file_id("private-unknown-root", unknown_pair_id)
+        unknown_intent = DeferredQueueIntent(
+            Controller.Command(Controller.Command.Action.QUEUE, unknown_file_id),
+            unknown_file_id, unknown_pair_id, phase="initial_rescan", rescan_requested=True,
+            rescan_generations=(("private-unknown-session", 5), ("private-remote-session", 0)),
+        )
+        out_of_scope_file_id = ModelFile.build_file_id("private-rescan-root", unknown_pair_id)
+        out_of_scope_intent = DeferredQueueIntent(
+            Controller.Command(Controller.Command.Action.QUEUE, out_of_scope_file_id),
+            out_of_scope_file_id, unknown_pair_id, phase="rescan", rescan_requested=True,
+            rescan_generations=(("private-unknown-session", 5), ("private-remote-session", 0)),
+        )
+        unknown_result = ScannerResult(
+            datetime.now(), [], failed=False, generation=6, session_token="private-unknown-session",
+            is_scan_final=True, unknown_path_pair_ids={unknown_pair_id},
+        )
+        producer._Controller__deferred_queue_intents = {
+            unknown_file_id: unknown_intent, out_of_scope_file_id: out_of_scope_intent,
+        }
+        Controller._record_path_pair_scan_tokens(producer, unknown_result, None)
+        assert unknown_intent.rescan_failure_reason is not None
+        assert out_of_scope_intent.rescan_failure_reason is None
+        Controller._record_path_pair_scan_tokens(producer, unknown_result, None)
+
+        invalid_pair_id = "private-invalid-pair"
+        invalid_file_id = ModelFile.build_file_id("private-invalid-root", invalid_pair_id)
+        invalid_intent = DeferredQueueIntent(
+            Controller.Command(Controller.Command.Action.QUEUE, invalid_file_id),
+            invalid_file_id, invalid_pair_id, phase="initial_rescan", rescan_requested=True,
+            rescan_generations=(("private-invalid-session", 8), ("private-remote-session", 0)),
+        )
+        invalid_result = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={invalid_pair_id},
+            completed_path_pair_ids={invalid_pair_id}, failed=False, generation=9,
+            session_token="private-invalid-session", is_scan_final=False,
+        )
+        invalid_result._scan_authority_tokens_by_pair = {invalid_pair_id: ("private-invalid-session", True)}
+        producer._Controller__deferred_queue_intents = {invalid_file_id: invalid_intent}
+        Controller._record_path_pair_scan_tokens(producer, invalid_result, None)
+
+        recorded_pair_id = "private-recorded-pair"
+        recorded_file_id = ModelFile.build_file_id("private-recorded-root", recorded_pair_id)
+        recorded_intent = DeferredQueueIntent(
+            Controller.Command(Controller.Command.Action.QUEUE, recorded_file_id),
+            recorded_file_id, recorded_pair_id, phase="initial_rescan", rescan_requested=True,
+            rescan_generations=(("private-recorded-session", 10), ("private-remote-session", 0)),
+        )
+        recorded_result = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={recorded_pair_id},
+            completed_path_pair_ids={recorded_pair_id}, failed=False, generation=11,
+            session_token="private-recorded-session", is_scan_final=False,
+        )
+        recorded_result._scan_authority_tokens_by_pair = {
+            recorded_pair_id: ("private-recorded-session", 11),
+        }
+        producer._Controller__deferred_queue_intents = {recorded_file_id: recorded_intent}
+        Controller._record_path_pair_scan_tokens(producer, recorded_result, None)
+
         proof_pair_id = "private-proof-pair"
         proof_file_id = ModelFile.build_file_id("private-proof-root", proof_pair_id)
         proof_file = ModelFile("private-proof-root", True)
@@ -1601,7 +1695,8 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         assert pending_file_id in producer._Controller__deferred_queue_intents
         assert collector.wait_for_ingress(2.0)
         assert collector.flush_durable(2.0)
-        assert reader.poll() == len(readiness_rows) + 4
+        after_written = collector.durable_snapshot()["written"]
+        assert reader.poll() == after_written - baseline_written
     finally:
         reader.close()
         collector.close(timeout=2.0)
@@ -1612,6 +1707,31 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     records = [item for item in _artifacts(artifact) if item["capture"].get("state") == "record"]
     projections = [item["capture"]["projection"] for item in records]
     readiness = [item["queue_readiness"] for item in projections if "queue_readiness" in item]
+    intake = [item["queue_authority_handoff"] for item in projections if "queue_authority_handoff" in item]
+    intake = [item for item in intake if item["event"] == "scan_intake"]
+    assert [item["record_disposition"] for item in intake] == [
+        "failed_recorded", "failed_ignored", "failed_ignored", "aggregate_incomplete",
+        "unknown_recorded", "out_of_scope", "unknown_ignored", "pair_token_invalid", "token_recorded",
+    ]
+    assert intake[0]["pair_marker_state"] == "valid" and intake[0]["generation_relation"] == "newer"
+    assert intake[1]["generation_relation"] == "older"
+    assert intake[2]["run_match"] is False and intake[2]["generation_relation"] == "unknown"
+    assert intake[3]["scan_final"] is False and intake[3]["generation_relation"] == "newer"
+    assert intake[3]["result_failed"] is False and intake[3]["selected_recoverable"] is True
+    assert intake[3]["selected_failed"] is None
+    assert intake[4]["selected_unknown"] is True and intake[4]["pair_marker_state"] == "absent"
+    assert intake[4]["generation_relation"] == "newer"
+    assert intake[5]["selected_unknown"] is True
+    assert intake[6]["selected_unknown"] is True
+    assert intake[4]["record_disposition"] == "unknown_recorded"
+    assert intake[6]["record_disposition"] == "unknown_ignored"
+    assert intake[7]["pair_marker_state"] == "invalid" and intake[7]["selected_completed"] is True
+    assert intake[8]["pair_marker_state"] == "valid" and intake[8]["selected_completed"] is True
+    assert intake[8]["generation_relation"] == "newer"
+    retained_intake = intake[7]
+    assert observer._sanitize_capture_projection({"queue_authority_handoff": retained_intake})[
+        "queue_authority_handoff"
+    ] == retained_intake
     assert [item["event"] for item in readiness[:len(readiness_rows)]] == [row[0] for row in readiness_rows]
     assert readiness[2]["phase"] == "rescan_request" and readiness[2]["reason"] == "scoped_rescan_requested"
     assert readiness[3]["decision_boundary"] == "scan_authority"
@@ -1664,9 +1784,16 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     assert observer._sanitize_capture_projection(retained_projection)["queue_readiness"]["deferred_intent"] == retained_wait
     persisted = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
     finalized = [row for row in persisted if row.get("message") in
-                 ({event for event, _ in readiness_rows} | {"queue_rescan_readiness"})]
-    assert len(finalized) == len(readiness_rows) + 4
+                 ({event for event, _ in readiness_rows} | {"queue_rescan_readiness", "queue_authority_handoff"})]
+    assert len(finalized) >= len(readiness_rows) + len(intake)
     assert all("metadata" not in row and isinstance(row.get("details"), dict) for row in finalized)
+    durable_intake = [row["details"] for row in persisted
+                      if row.get("message") == "queue_authority_handoff" and
+                      row.get("details", {}).get("event") == "scan_intake"]
+    assert [row["record_disposition"] for row in durable_intake] == [
+        "failed_recorded", "failed_ignored", "failed_ignored", "aggregate_incomplete",
+        "unknown_recorded", "out_of_scope", "unknown_ignored", "pair_token_invalid", "token_recorded",
+    ]
     assert "private-scan-pair" not in artifact_text
     assert "private-scan-root" not in artifact_text
     assert "private-local-session" not in artifact_text
@@ -1675,6 +1802,24 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     assert "private-ignored-session" not in artifact_text
     assert "private-proof-session" not in artifact_text
     assert "private-proof-root" not in artifact_text
+    assert "private-mismatch-pair" not in artifact_text
+    assert "private-mismatch-root" not in artifact_text
+    assert "private-mismatch-baseline" not in artifact_text
+    assert "private-mismatch-result" not in artifact_text
+    assert "private-mismatch-other" not in artifact_text
+    assert "private-unknown-pair" not in artifact_text
+    assert "private-unknown-root" not in artifact_text
+    assert "private-unknown-session" not in artifact_text
+    assert "private-invalid-pair" not in artifact_text
+    assert "private-invalid-root" not in artifact_text
+    assert "private-invalid-session" not in artifact_text
+    assert "private-recorded-pair" not in artifact_text
+    assert "private-recorded-root" not in artifact_text
+    assert "private-recorded-session" not in artifact_text
+    assert "private-incomplete-pair" not in artifact_text
+    assert "private-incomplete-root" not in artifact_text
+    assert "private-incomplete-session" not in artifact_text
+    assert "private-rescan-root" not in artifact_text
 
 
 def test_model_page_snapshot_source_projection_is_finite_and_redacted(tmp_path: Path) -> None:

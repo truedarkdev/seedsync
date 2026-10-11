@@ -138,6 +138,12 @@ _LFTP_STATUS_FUTURE_STATES = frozenset({"none", "pending", "done", "unknown"})
 _LFTP_STATUS_COUNT_MAX = 128
 _LFTP_STATUS_MEMBERSHIP_COUNT_MAX = 2048
 _QUEUE_READINESS_SCHEMAS = frozenset({"queue_readiness.v1", "queue_readiness.v2"})
+_QUEUE_AUTHORITY_INTAKE_SCHEMA = "queue_authority_scan_intake.v1"
+_QUEUE_AUTHORITY_INTAKE_DISPOSITIONS = frozenset({
+    "aggregate_incomplete", "failed_ignored", "failed_recorded", "failed_scope_empty", "unknown_ignored",
+    "invalid_result", "out_of_scope", "pair_token_invalid", "pair_unknown",
+    "token_not_fresh", "token_recorded", "unknown_recorded",
+})
 _QUEUE_READINESS_EVENTS = frozenset({
     "queue_admission", "queue_callback", "queue_dispatch_boundary", "queue_final_decision",
     "queue_http_wait", "queue_model_boundary", "queue_preflight_outcome", "queue_rescan_readiness",
@@ -1166,6 +1172,40 @@ def _queue_readiness_facts(message: object, details: Mapping[str, object]) -> di
     return result
 
 
+def _queue_authority_handoff_facts(
+        row: Mapping[str, object], details: Mapping[str, object],
+        source: str, category: str, event_type: str, stage: str,
+) -> dict[str, object] | None:
+    if not (source == "controller" and category == "queue.authority" and
+            event_type == "state_transition" and stage == "queue_authority_handoff" and
+            row.get("message") == "queue_authority_handoff" and
+            details.get("schema") == _QUEUE_AUTHORITY_INTAKE_SCHEMA and
+            details.get("event") == "scan_intake"):
+        return None
+    side = details.get("side")
+    outcome = details.get("outcome")
+    facts: dict[str, object] = {
+        "schema": _QUEUE_AUTHORITY_INTAKE_SCHEMA,
+        "event": "scan_intake",
+        "side": side if isinstance(side, str) and side in {"local", "remote"} else "unknown",
+        "outcome": outcome if isinstance(outcome, str) and outcome in {"failed", "observed", "unknown"} else "unknown",
+        "fresh": details.get("fresh") if type(details.get("fresh")) is bool else None,
+        "covered": details.get("covered") if type(details.get("covered")) is bool else None,
+    }
+    for key in (
+        "scan_final", "result_failed", "selected_scanned", "selected_completed", "selected_unknown",
+        "selected_failed", "selected_recoverable", "selected_terminal", "run_match",
+    ):
+        facts[key] = details.get(key) if type(details.get(key)) is bool else None
+    marker = details.get("pair_marker_state")
+    facts["pair_marker_state"] = marker if isinstance(marker, str) and marker in {"absent", "invalid", "valid", "unknown"} else "unknown"
+    relation = details.get("generation_relation")
+    facts["generation_relation"] = relation if isinstance(relation, str) and relation in _QUEUE_SCAN_GENERATION_RELATIONS else "unknown"
+    disposition = details.get("record_disposition")
+    facts["record_disposition"] = disposition if isinstance(disposition, str) and disposition in _QUEUE_AUTHORITY_INTAKE_DISPOSITIONS else "unknown"
+    return facts
+
+
 def _model_page_snapshot_facts(details: Mapping[str, object]) -> dict[str, object] | None:
     """Project the maintained model-page diagnostic's finite source fields."""
     outcome = details.get("outcome")
@@ -1942,6 +1982,9 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     command = _lftp_command_facts(details) if category == "transfer.lftp.command" else None
     delete_local = _delete_local_command_facts(row, metadata, details)
     readiness = _queue_readiness_facts(row.get("message"), details) if category == "queue.readiness" else None
+    authority_handoff = _queue_authority_handoff_facts(
+        row, details, source, category, event_type, stage,
+    )
     model_page_snapshot = _model_page_snapshot_facts(details) if category == "model_page_snapshot" else None
     model_finalization = _model_finalization_facts(details) if category == "model.finalization" else None
     model_progress_lineage = _model_progress_lineage_facts(details) if category == "model.progress" else None
@@ -1990,6 +2033,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     if category == "final_move.publication" and isinstance(message, str) and message in _FINAL_MOVE_PUBLICATION_MESSAGES and final_move is None:
         return None, True
     if category == "queue.readiness" and readiness is None:
+        return None, True
+    if details.get("schema") == _QUEUE_AUTHORITY_INTAKE_SCHEMA and authority_handoff is None:
         return None, True
     if category == "model_page_snapshot" and model_page_snapshot is None:
         return None, True
@@ -2053,6 +2098,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result.update(delete_local)
     if readiness is not None:
         result["queue_readiness"] = readiness
+    if authority_handoff is not None:
+        result["queue_authority_handoff"] = authority_handoff
     if model_page_snapshot is not None:
         result["model_page_snapshot"] = model_page_snapshot
     if model_finalization is not None:

@@ -554,6 +554,12 @@ _CAPTURE_LIFECYCLE_BOOLS = {
     "pre_send_drain_job_or_progress", "pre_send_drain_prompt_or_echo",
 }
 _CAPTURE_READINESS_SCHEMAS = {"queue_readiness.v1", "queue_readiness.v2"}
+_CAPTURE_AUTHORITY_INTAKE_SCHEMA = "queue_authority_scan_intake.v1"
+_CAPTURE_AUTHORITY_INTAKE_DISPOSITIONS = {
+    "aggregate_incomplete", "failed_ignored", "failed_recorded", "failed_scope_empty", "unknown_ignored",
+    "invalid_result", "out_of_scope", "pair_token_invalid", "pair_unknown",
+    "token_not_fresh", "token_recorded", "unknown_recorded",
+}
 _CAPTURE_READINESS_EVENTS = {
     "queue_admission", "queue_callback", "queue_dispatch_boundary", "queue_final_decision",
     "queue_http_wait", "queue_model_boundary", "queue_preflight_outcome", "queue_rescan_readiness",
@@ -1787,6 +1793,30 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
                     facts["root_proof_gate"] = _queue_root_proof_gate_facts(nested.get("root_proof_gate"))
                 safe_readiness[key] = facts
         result["queue_readiness"] = safe_readiness
+    authority_handoff = value.get("queue_authority_handoff")
+    if isinstance(authority_handoff, Mapping) and \
+            authority_handoff.get("schema") == _CAPTURE_AUTHORITY_INTAKE_SCHEMA and \
+            authority_handoff.get("event") == "scan_intake":
+        safe_authority: dict[str, object] = {
+            "schema": _CAPTURE_AUTHORITY_INTAKE_SCHEMA,
+            "event": "scan_intake",
+        }
+        for key, allowed in (
+            ("side", {"local", "remote", "unknown"}),
+            ("outcome", {"failed", "observed", "unknown"}),
+            ("pair_marker_state", {"absent", "invalid", "valid", "unknown"}),
+            ("generation_relation", {"newer", "equal", "older", "unknown"}),
+            ("record_disposition", _CAPTURE_AUTHORITY_INTAKE_DISPOSITIONS),
+        ):
+            item = authority_handoff.get(key)
+            safe_authority[key] = item if isinstance(item, str) and item in allowed else "unknown"
+        for key in (
+            "fresh", "covered", "scan_final", "result_failed", "selected_scanned", "selected_completed",
+            "selected_unknown", "selected_failed", "selected_recoverable", "selected_terminal", "run_match",
+        ):
+            item = authority_handoff.get(key)
+            safe_authority[key] = item if type(item) is bool else None
+        result["queue_authority_handoff"] = safe_authority
     model_page_snapshot = value.get("model_page_snapshot")
     if isinstance(model_page_snapshot, Mapping):
         safe_snapshot: dict[str, object] = {}

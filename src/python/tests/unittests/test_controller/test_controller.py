@@ -23589,18 +23589,25 @@ class TestController(unittest.TestCase):
         )["events"]
         self.assertEqual(
             [
-                "token_receipt", "token_receipt", "readiness", "publication",
+                "scan_intake", "token_receipt", "scan_intake", "token_receipt",
+                "readiness", "publication",
             ],
             [event["details"]["event"] for event in events],
         )
         local_token = events[0]["details"]
         self.assertEqual("local", local_token["side"])
-        self.assertTrue(local_token["fresh"])
-        self.assertRegex(events[0]["corr_id"], r"^fractional-mtime:[0-9a-f]{16}$")
-        remote_token = events[1]["details"]
+        self.assertEqual("token_recorded", local_token["record_disposition"])
+        self.assertTrue(local_token["run_match"])
+        self.assertEqual("newer", local_token["generation_relation"])
+        self.assertTrue(events[1]["details"]["fresh"])
+        self.assertRegex(events[1]["corr_id"], r"^fractional-mtime:[0-9a-f]{16}$")
+        remote_token = events[2]["details"]
         self.assertEqual("remote", remote_token["side"])
-        self.assertTrue(remote_token["fresh"])
-        self.assertTrue(events[3]["details"]["covered"])
+        self.assertEqual("token_recorded", remote_token["record_disposition"])
+        self.assertTrue(remote_token["run_match"])
+        self.assertEqual("newer", remote_token["generation_relation"])
+        self.assertTrue(events[3]["details"]["fresh"])
+        self.assertTrue(events[5]["details"]["covered"])
         serialized = str(events)
         self.assertNotIn("pair-private", serialized)
         self.assertNotIn("root-private", serialized)
@@ -23640,11 +23647,45 @@ class TestController(unittest.TestCase):
         events = trace.query_events(
             category="queue.authority", stage="queue_authority_handoff", limit=8,
         )["events"]
-        self.assertEqual([], events)
+        self.assertEqual(["scan_intake"], [event["details"]["event"] for event in events])
+        self.assertEqual("token_not_fresh", events[0]["details"]["record_disposition"])
+        self.assertTrue(events[0]["details"]["run_match"])
+        self.assertEqual("equal", events[0]["details"]["generation_relation"])
+        self.assertFalse(events[0]["details"]["fresh"])
         self.assertEqual(
             ("local-session", 4),
             self.controller._Controller__scan_authority_tokens["local"]["pair-private"],
         )
+
+    def test_authority_handoff_emission_failure_preserves_token_admission(self):
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=8,
+            policy={"default": "off", "rules": {"queue.authority": "info"}},
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
+        file_id = '["pair-private", "root-private"]'
+        self.controller._Controller__deferred_queue_intents = {
+            file_id: DeferredQueueIntent(
+                Controller.Command(Controller.Command.Action.QUEUE, file_id), file_id, "pair-private",
+                phase="initial_rescan", rescan_requested=True,
+                rescan_generations=(("local-session", 1), ("remote-session", 1)),
+            ),
+        }
+        with patch.object(trace, "record", side_effect=RuntimeError("diagnostic sink unavailable")):
+            self.controller._record_path_pair_scan_tokens(
+                SimpleNamespace(
+                    failed=False, unknown_path_pair_ids=set(), is_scan_final=True,
+                    scanned_path_pair_ids={"pair-private"}, completed_path_pair_ids=set(),
+                    session_token="local-session", generation=2,
+                ),
+                None,
+            )
+        self.assertEqual(
+            ("local-session", 2),
+            self.controller._Controller__scan_authority_tokens["local"]["pair-private"],
+        )
+        self.assertEqual([], trace.query_events(category="queue.authority")["events"])
 
     def test_authority_handoff_publication_requires_exact_pair_coverage(self):
         trace = BreadcrumbTraceCollector(
@@ -23751,4 +23792,6 @@ class TestController(unittest.TestCase):
             category="queue.authority", stage="queue_authority_handoff", limit=32,
         )["events"]
         self.assertEqual(1, intents.values_calls)
-        self.assertEqual(16, len(events))
+        self.assertEqual(32, len(events))
+        self.assertEqual(16, sum(event["details"]["event"] == "scan_intake" for event in events))
+        self.assertEqual(16, sum(event["details"]["event"] == "token_receipt" for event in events))
