@@ -319,13 +319,17 @@ def test_scan_join_and_root_source_projection_are_bounded_and_preserve_unknowns(
             "scan_source_root_object_digest": "0123456789abcdef",
             "accepted_root_object_digest": "fedcba9876543210", "source_pair_scanned": True,
             "source_pair_completed": False, "source_pair_unknown": None, "source_pair_targeted": True,
-            "target_pair_covered": None, "private_path": "/private/drop",
+            "target_pair_covered": None, "root_scan_outcome": "incomplete",
+            "root_outcome_coverage": "complete", "root_final_complete": False,
+            "root_staging_complete": True, "private_path": "/private/drop",
         },
     }
     safe = observer._sanitize_capture_projection(value)
     assert safe["category"] == "scan.adoption" and safe["stage"] == "scan_adoption"
     assert safe["scan_join"]["scan_source_root_object_digest"] == "0123456789abcdef"
     assert safe["scan_join"]["source_pair_unknown"] is None
+    assert safe["scan_join"]["root_scan_outcome"] == "incomplete"
+    assert safe["scan_join"]["root_final_complete"] is False
     assert "private_path" not in json.dumps(safe)
 
     finalized_scan = {
@@ -336,6 +340,7 @@ def test_scan_join_and_root_source_projection_are_bounded_and_preserve_unknowns(
         "details": {"schema": "completion_scan_join.v1", "p": {
             "m": "legacy", "so": "0123456789abcdef", "ao": "fedcba9876543210",
             "sp": True, "cp": False, "up": None, "tp": True, "tc": None,
+            "ro": "incomplete", "rc": "complete", "rf": False, "rs": True,
         }},
     }
     projected_scan, irrelevant = capture._projection(finalized_scan)
@@ -343,6 +348,8 @@ def test_scan_join_and_root_source_projection_are_bounded_and_preserve_unknowns(
     assert projected_scan["numbers"]["version"] == 7
     assert projected_scan["scan_join"]["local_scan_mode"] == "legacy"
     assert projected_scan["scan_join"]["target_pair_covered"] is None
+    assert projected_scan["scan_join"]["root_scan_outcome"] == "incomplete"
+    assert projected_scan["scan_join"]["root_final_complete"] is False
     malformed = dict(value)
     malformed["scan_join"] = {
         **value["scan_join"], "scan_source_root_object_digest": "/secret/path",

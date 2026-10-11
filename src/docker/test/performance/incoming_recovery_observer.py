@@ -1056,6 +1056,17 @@ def _sanitize_scan_join(value: Mapping[str, object]) -> Mapping[str, object] | N
     ):
         item = value.get(key, "unknown")
         result[key] = item if item is None or type(item) is bool else "unknown"
+    outcome = value.get("root_scan_outcome")
+    result["root_scan_outcome"] = outcome if isinstance(outcome, str) and outcome in {
+        "complete", "incomplete", "missing", "unknown",
+    } else "unknown"
+    coverage = value.get("root_outcome_coverage")
+    result["root_outcome_coverage"] = coverage if isinstance(coverage, str) and coverage in {
+        "complete", "omitted", "unknown",
+    } else "unknown"
+    for key in ("root_final_complete", "root_staging_complete"):
+        item = value.get(key)
+        result[key] = item if item is None or type(item) is bool else "unknown"
     root_ref = value.get("selected_root_ref")
     result["selected_root_ref"] = root_ref if isinstance(root_ref, str) and \
         _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(root_ref) else None

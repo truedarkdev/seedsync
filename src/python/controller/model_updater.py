@@ -134,6 +134,7 @@ _ACTIVE_DELTA_REJECTION_CORRELATION_COUNT_LIMIT = 128
 _SCAN_ADOPTION_TRACE_CATEGORY = "scan.adoption"
 _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT = 16
 _SCAN_STATUS_PUBLICATION_JOIN_LIMIT = 4
+_SELECTED_ROOT_OUTCOME_DIAGNOSTIC_LIMIT = 8
 
 
 def _record_selected_root_scan_join(
@@ -213,6 +214,11 @@ def _record_selected_root_scan_join(
                             if not scan_targets:
                                 break
             scan_pair_tokens = getattr(scan, "_scan_authority_tokens_by_pair", None)
+            if not isinstance(scan_pair_tokens, dict):
+                scan_pair_tokens = {}
+            failure_pair_tokens = getattr(scan, "_scan_failure_tokens_by_pair", None)
+            if isinstance(failure_pair_tokens, dict):
+                scan_pair_tokens = {**failure_pair_tokens, **scan_pair_tokens}
             scan_session = getattr(scan, "session_token", None)
             scan_generation = getattr(scan, "generation", None)
             scan_final = getattr(scan, "is_scan_final", None)
@@ -220,6 +226,10 @@ def _record_selected_root_scan_join(
             scanned_pairs = getattr(scan, "scanned_path_pair_ids", None)
             completed_pairs = getattr(scan, "completed_path_pair_ids", None)
             unknown_pairs = getattr(scan, "unknown_path_pair_ids", None)
+            diagnostic_outcomes = getattr(scan, "diagnostic_root_scan_outcomes_by_pair", None)
+            diagnostic_outcomes_omitted = getattr(
+                scan, "diagnostic_root_scan_outcomes_omitted_by_pair", set(),
+            )
 
             def pair_member(values: object, pair_id: Optional[str]) -> Optional[bool]:
                 if isinstance(values, (set, frozenset)):
@@ -250,6 +260,24 @@ def _record_selected_root_scan_join(
                 source_scanned = pair_member(scanned_pairs, pair_id) if coverage_comparable else None
                 source_completed = pair_member(completed_pairs, pair_id) if coverage_comparable else None
                 source_unknown = pair_member(unknown_pairs, pair_id) if coverage_comparable else None
+                root_outcome = None
+                root_final_complete = None
+                root_staging_complete = None
+                outcome_map = diagnostic_outcomes.get(pair_id) if isinstance(diagnostic_outcomes, dict) else None
+                # The diagnostic map is keyed by opaque selected file id so
+                # no path or leaf name crosses the breadcrumb boundary.
+                outcome = outcome_map.get(file_id) if isinstance(outcome_map, dict) else None
+                outcome_omitted = pair_id in diagnostic_outcomes_omitted
+                if outcome_omitted:
+                    root_outcome = "unknown"
+                elif isinstance(outcome, tuple) and len(outcome) == 2 and \
+                        all(type(value) is bool for value in outcome):
+                    root_final_complete, root_staging_complete = outcome
+                    root_outcome = "complete" if outcome == (True, True) else "incomplete"
+                elif isinstance(outcome_map, dict) and file_id not in outcome_map:
+                    root_outcome = "missing"
+                else:
+                    root_outcome = "unknown"
                 final_known = type(scan_final) is bool and coverage_comparable
                 if source_completed is True:
                     target_covered = True
@@ -281,6 +309,11 @@ def _record_selected_root_scan_join(
                         "up": source_unknown,
                         "tp": targeted_scan if type(targeted_scan) is bool else None,
                         "tc": target_covered,
+                        "ro": root_outcome,
+                        "rf": root_final_complete,
+                        "rs": root_staging_complete,
+                        "rc": "omitted" if outcome_omitted
+                        else "complete" if isinstance(outcome_map, dict) else "unknown",
                     },
                 }
                 controller._record_completion_scan_join_breadcrumb(
@@ -3331,6 +3364,7 @@ class _ProgressiveScanAccumulator:
             ),
             root_scan_outcomes_by_pair=getattr(event, "root_scan_outcomes_by_pair", None),
             scan_started_at=getattr(event, "scan_started_at", None),
+            failure_origin=getattr(event, "failure_origin", None),
         )
 
     @staticmethod
@@ -3600,6 +3634,9 @@ class _ProgressiveScanAccumulator:
         error_message: Optional[str] = None
         completed: set[Optional[str]] = set()
         touched: set[Optional[str]] = set()
+        diagnostic_root_outcomes: dict[Optional[str], dict[str, tuple[bool, bool]]] = {}
+        diagnostic_root_outcomes_omitted: set[Optional[str]] = set()
+        failure_origin_candidates: list[tuple[Optional[str], int, dict[str, object]]] = []
         for event in accepted:
             event_stale_rejected = False
             malformed.extend(event.malformed_status_only_file_ids)
@@ -3760,11 +3797,42 @@ class _ProgressiveScanAccumulator:
                     self.__failed_pairs.discard((generation, pair_id))
                     self.__authoritative_by_pair.pop(pair_id, None)
                     self.__root_scan_outcomes_by_pair.pop(pair_id, None)
+                    if root_shape_trace_enabled:
+                        diagnostic_root_outcomes[pair_id] = {}
+                    diagnostic_root_outcomes_omitted.discard(pair_id)
                     for root_name in protected_root_names:
                         previous_file = previous.get(root_name)
                         if previous_file is not None:
                             self.__authoritative_by_pair.setdefault(pair_id, {})[root_name] = previous_file
                 touched.add(pair_id)
+                raw_diagnostic_outcomes = getattr(event, "root_scan_outcomes_by_pair", {}) \
+                    if root_shape_trace_enabled else {}
+                event_diagnostic_outcomes = raw_diagnostic_outcomes.get(pair_id) \
+                    if isinstance(raw_diagnostic_outcomes, dict) else None
+                if isinstance(event_diagnostic_outcomes, dict):
+                    bounded_outcomes = diagnostic_root_outcomes.setdefault(pair_id, {})
+                    for root_name, outcome in event_diagnostic_outcomes.items():
+                        if not isinstance(root_name, str) or not root_name or \
+                                not isinstance(outcome, tuple) or len(outcome) != 2 or \
+                                any(type(value) is not bool for value in outcome):
+                            continue
+                        file_id = ModelFile.build_file_id(root_name, pair_id)
+                        retained_outcome_count = sum(
+                            len(outcomes) for outcomes in diagnostic_root_outcomes.values()
+                        )
+                        if file_id not in bounded_outcomes and \
+                                retained_outcome_count >= _SELECTED_ROOT_OUTCOME_DIAGNOSTIC_LIMIT:
+                            diagnostic_root_outcomes_omitted.add(pair_id)
+                            continue
+                        bounded_outcomes[file_id] = outcome
+                if event.failed:
+                    origin = getattr(event, "failure_origin", None)
+                    raw_failure_ids = set(getattr(event, "recoverable_failure_path_pair_ids", set()) or set())
+                    raw_failure_ids.update(getattr(event, "terminal_failure_path_pair_ids", set()) or set())
+                    if isinstance(origin, dict) and len(ids) == 1 and pair_id in raw_failure_ids and \
+                            type(getattr(event, "session_token", None)) is str and \
+                            getattr(event, "session_token", None) == self.__session_token:
+                        failure_origin_candidates.append((pair_id, generation, dict(origin)))
                 outcome_maps = getattr(event, "root_scan_outcomes_by_pair", {})
                 pair_outcomes = outcome_maps.get(pair_id) if isinstance(outcome_maps, dict) else None
                 if isinstance(pair_outcomes, dict) and pair_outcomes:
@@ -4072,6 +4140,17 @@ class _ProgressiveScanAccumulator:
                 bool(getattr(event, "is_targeted_scan", False)) for event in accepted
             ),
         )
+        result.failure_origin = (failure_origin_candidates[0][2]
+                                 if len(failure_origin_candidates) == 1 and
+                                 self.__active_generation.get(failure_origin_candidates[0][0]) ==
+                                 failure_origin_candidates[0][1] and
+                                 (terminal_failure_path_pair_ids.union(
+                                     self.__recoverable_incomplete_pairs.intersection(published_incomplete)
+                                 ) == {failure_origin_candidates[0][0]}) else None)
+        # Keep a bounded current-drain diagnostic view separate from the
+        # accumulator's authoritative root map and its admission rules.
+        result.diagnostic_root_scan_outcomes_by_pair = diagnostic_root_outcomes
+        result.diagnostic_root_scan_outcomes_omitted_by_pair = diagnostic_root_outcomes_omitted
         # ``generation`` is an aggregate display value for compatibility,
         # but a mixed drain may complete pairs from different generations.
         # Keep the exact authority token for each completed pair on this
@@ -8007,8 +8086,42 @@ class ModelUpdater(_ControllerCoreAccess):
                 local_scan_root_targets_cache = ()
                 return local_scan_root_targets_cache
             result = latest_local_scan
-            if result is None or bool(getattr(result, "failed", False)):
+            if result is None:
                 local_scan_root_targets_cache = ()
+                return local_scan_root_targets_cache
+            if bool(getattr(result, "failed", False)):
+                # Failed aggregate results intentionally have no completed
+                # scanned-pair set. Select only a deferred Queue intent whose
+                # exact local failure token is fresh against its captured
+                # session/generation baseline; this is diagnostic identity,
+                # not scan or Queue authority.
+                intents = getattr(controller, "_Controller__deferred_queue_intents", None)
+                failure_tokens = getattr(result, "_scan_failure_tokens_by_pair", None)
+                session = getattr(result, "session_token", None)
+                selected_failed: list[tuple[str, Optional[str]]] = []
+                if isinstance(intents, Mapping) and isinstance(failure_tokens, dict):
+                    for intent in intents.values():
+                        if getattr(intent, "phase", None) not in ("initial_rescan", "rescan"):
+                            continue
+                        file_id = getattr(intent, "file_id", None)
+                        pair_id = getattr(intent, "path_pair_id", None)
+                        baselines = getattr(intent, "rescan_generations", None)
+                        token = failure_tokens.get(pair_id) if isinstance(pair_id, str) else None
+                        if not isinstance(file_id, str) or not file_id or \
+                                not isinstance(baselines, tuple) or len(baselines) != 2 or \
+                                not isinstance(baselines[0], tuple) or len(baselines[0]) != 2 or \
+                                type(baselines[0][0]) is not str or \
+                                type(baselines[0][1]) is not int or \
+                                not 0 <= baselines[0][1] <= 2**63 - 1 or \
+                                not isinstance(token, tuple) or len(token) != 2 or \
+                                token[0] != session or token[0] != baselines[0][0] or \
+                                type(token[1]) is not int or not 0 <= token[1] <= 2**63 - 1 or \
+                                token[1] <= baselines[0][1]:
+                            continue
+                        selected_failed.append((file_id, pair_id))
+                        if len(selected_failed) >= _SCAN_ADOPTION_TRACE_ROOT_SAMPLE_LIMIT:
+                            break
+                local_scan_root_targets_cache = tuple(selected_failed)
                 return local_scan_root_targets_cache
             raw_scanned_ids = getattr(result, "scanned_path_pair_ids", None)
             if not isinstance(raw_scanned_ids, (set, frozenset)):
@@ -13953,8 +14066,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 # Failed source adoption must not publish Queue proof or fail
                 # the ordinary model-update cycle.
                 controller.logger.debug("Ignoring local root source adoption failure", exc_info=True)
-            if progressive_mode and local_root_source_adoption_succeeded and \
-                    latest_local_scan is not None and not local_scan_failed:
+            if progressive_mode and local_root_source_adoption_succeeded and latest_local_scan is not None:
                 _record_selected_root_scan_join(
                     controller, latest_local_scan, side="local",
                     pending_targets=controller._Controller__pending_completion_file_names,

@@ -3256,6 +3256,7 @@ def test_finalized_scan_adoption_and_root_source_reach_json_sink_with_unknowns(t
     scan_details = {"p": {
         "m": "progressive", "so": "0123456789abcdef", "ao": "fedcba9876543210",
         "sp": True, "cp": False, "up": None, "tp": True, "tc": None,
+        "ro": "incomplete", "rc": "complete", "rf": False, "rs": True,
         "private_path": "/private/drop",
     }}
     try:
@@ -3305,7 +3306,9 @@ def test_finalized_scan_adoption_and_root_source_reach_json_sink_with_unknowns(t
         "scan_source_root_object_digest": "0123456789abcdef",
         "accepted_root_object_digest": "fedcba9876543210", "source_pair_scanned": True,
         "source_pair_completed": False, "source_pair_unknown": None, "source_pair_targeted": True,
-        "target_pair_covered": None,
+        "target_pair_covered": None, "root_scan_outcome": "incomplete",
+        "root_outcome_coverage": "complete", "root_final_complete": False,
+        "root_staging_complete": True,
     }
     expected.update({key: None for key in (
         "selected_root_ref", "root_in_scan_result", "root_in_setter_input", "root_is_staging",

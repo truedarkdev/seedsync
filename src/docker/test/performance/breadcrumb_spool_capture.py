@@ -1634,6 +1634,16 @@ def _completion_scan_join_facts(details: Mapping[str, object], message: object) 
         "source_pair_targeted": boolean("tp", "source_pair_targeted"),
         "target_pair_covered": boolean("tc", "target_pair_covered"),
     }
+    outcome = payload.get("ro", payload.get("root_scan_outcome"))
+    result["root_scan_outcome"] = outcome if isinstance(outcome, str) and outcome in {
+        "complete", "incomplete", "missing", "unknown",
+    } else "unknown"
+    coverage = payload.get("rc", payload.get("root_outcome_coverage"))
+    result["root_outcome_coverage"] = coverage if isinstance(coverage, str) and coverage in {
+        "complete", "omitted", "unknown",
+    } else "unknown"
+    for compact, canonical in (("rf", "root_final_complete"), ("rs", "root_staging_complete")):
+        result[canonical] = boolean(compact, canonical)
     if active:
         selected_root_ref = payload.get("selected_root_ref")
         result["selected_root_ref"] = (

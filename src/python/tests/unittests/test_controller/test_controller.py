@@ -19401,7 +19401,7 @@ class TestController(unittest.TestCase):
             self.controller._Controller__context.breadcrumb_trace = trace
             self.controller._Controller__deferred_queue_intents = {file_id: intent}
             self.controller._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
-            result = ScannerResult(
+            raw_result = ScannerResult(
                 datetime.now(), [], scanned_path_pair_ids={pair_id}, failed=True,
                 generation=1, session_token="local-test-session",
                 recoverable_failure_path_pair_ids={pair_id}, terminal_failure_path_pair_ids=set(),
@@ -19412,7 +19412,8 @@ class TestController(unittest.TestCase):
                     "failure_pair_ref": opaque_trace_correlation("scan-pair|" + pair_id),
                 },
             )
-            result._scan_failure_tokens_by_pair = {pair_id: ("local-test-session", 1)}
+            result = _ProgressiveScanAccumulator().apply([raw_result], {pair_id})
+            self.assertIsNotNone(result)
             self.controller._record_path_pair_scan_tokens(result, None)
             states.append((
                 intent.rescan_failure_reason,

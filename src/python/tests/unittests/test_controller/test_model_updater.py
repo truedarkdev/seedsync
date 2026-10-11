@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
 from controller import Controller, ControllerPersist, ModelBuilder
-from controller.controller import _LftpOperation, PendingQueueDispatch
+from controller.controller import DeferredQueueIntent, _LftpOperation, PendingQueueDispatch
 from controller.extract import ExtractCompletedResult
 from controller.persist_keys import KEY_SEP
 from controller.model_updater import (
@@ -2639,6 +2639,14 @@ class TestModelUpdater(unittest.TestCase):
         self.assertTrue(os.path.isfile(durable_path))
         with open(durable_path, encoding="utf-8") as handle:
             rows = [json.loads(line) for line in handle if line.strip()]
+        retained_path = os.environ.get("SEEDSYNC_COMPLETION_FINALIZED_ROWS_PATH")
+        if retained_path:
+            # Preserve the complete finalized stream before any assertions can
+            # fail. File order is retained as emitted; independent ingress
+            # lanes do not establish cross-lane producer order.
+            with open(retained_path, "a", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row, separators=(",", ":")) + "\n")
         event_rows = [row for row in rows if isinstance(row.get("message"), str)]
         expected_ids = {
             opaque_trace_correlation(ModelFile.build_file_id(root.name, "scoped-pair"))
@@ -2728,7 +2736,29 @@ class TestModelUpdater(unittest.TestCase):
             self.assertEqual("model_input_arbitration.v1", source_row["details"]["schema"])
             self.assertEqual("scan.authority", scan_row["category"])
             self.assertEqual("scan.authority", source_row["category"])
-            self.assertLess(event_rows.index(scan_row), event_rows.index(source_row))
+            # Finalized storage merges independent ingress lanes, so its row
+            # positions cannot establish producer order. Compare the emitter
+            # timestamp only when the exact root object, scan generation, and
+            # local session join; ties or absent fields leave order unknown.
+            source_tick = source_row["details"].get("local_scan_tick")
+            source_generation = source_tick.get("g") if isinstance(source_tick, dict) else None
+            source_session = source_tick.get("s") if isinstance(source_tick, dict) else None
+            scan_generation = scan_row["details"].get("scan_generation")
+            scan_session = scan_row["details"].get("local_scan_digest")
+            source_created_ns = source_row.get("created_ns")
+            scan_created_ns = scan_row.get("created_ns")
+            same_scan = (
+                type(scan_generation) is int and scan_generation == source_generation and
+                isinstance(scan_session, str) and scan_session == source_session and
+                scan_row["details"]["p"].get("ao") == source_row["details"]["p"].get("lo")
+            )
+            distinct_emitter_times = (
+                type(source_created_ns) is int and type(scan_created_ns) is int and
+                source_created_ns > 0 and scan_created_ns > 0 and
+                source_created_ns != scan_created_ns
+            )
+            if same_scan and distinct_emitter_times:
+                self.assertLess(source_created_ns, scan_created_ns)
         root_fill_ids = {
             row.get("details", {}).get("root_id")
             for row in event_rows if row.get("message") == "input_arbitration_witness" and
@@ -2741,11 +2771,58 @@ class TestModelUpdater(unittest.TestCase):
             opaque_trace_correlation(ModelFile.build_file_id("outside-root", "other-pair"))
             for row in event_rows
         ))
-        retained_path = os.environ.get("SEEDSYNC_COMPLETION_FINALIZED_ROWS_PATH")
-        if retained_path:
-            with open(retained_path, "a", encoding="utf-8") as handle:
-                for row in event_rows:
-                    handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+        # A failed selected Queue rescan has no pending-completion entry and
+        # no completed scanned-pair set. The current exact failure token must
+        # still select its root for the same finalized scan/proof join.
+        selected_name = roots[0].name
+        selected_file_id = ModelFile.build_file_id(selected_name, "scoped-pair")
+        controller._Controller__deferred_queue_intents = {
+            selected_file_id: DeferredQueueIntent(
+                Controller.Command(Controller.Command.Action.QUEUE, selected_file_id),
+                selected_file_id, "scoped-pair", phase="rescan", rescan_requested=True,
+                rescan_generations=((local_process.session_token, 1), (remote_process.session_token, 0)),
+            ),
+        }
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        origin = {
+            "failure_site": "scan_had_errors", "failure_recoverable": True,
+            "failure_errno": 13, "failure_exception": "permission_error",
+            "failure_root_ref": opaque_trace_correlation("scan-root|" + selected_file_id),
+            "failure_pair_ref": _scan_pair_trace_token("scoped-pair"),
+        }
+        local_process._ScannerProcess__publish_result(ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"scoped-pair"}, failed=True,
+            generation=2, is_progress=True, unknown_path_pair_ids={"scoped-pair"},
+            recoverable_failure_path_pair_ids={"scoped-pair"},
+            session_token=local_process.session_token, failure_origin=origin,
+            root_scan_outcomes_by_pair={"scoped-pair": {selected_name: (False, True)}},
+        ))
+        ModelUpdater(controller).update()
+        failure_flushed = trace.flush_durable(2.0)
+        if os.name == "nt" and not failure_flushed:
+            failure_health = trace.durable_snapshot()
+            self.assertEqual("windows_acl_unverified", failure_health.get("path_safety"), failure_health)
+            self.assertEqual(failure_health.get("accepted"), failure_health.get("written"), failure_health)
+            self.assertEqual(0, failure_health.get("lost"), failure_health)
+        else:
+            self.assertTrue(failure_flushed, trace.durable_snapshot())
+        with open(durable_path, encoding="utf-8") as handle:
+            after_failure = [json.loads(line) for line in handle if line.strip()]
+        selected_corr = "completion:" + opaque_trace_correlation(selected_file_id)
+        selected_failure_rows = [
+            row for row in after_failure
+            if row.get("message") == "scan_root_adopted" and row.get("corr_id") == selected_corr
+        ]
+        self.assertGreaterEqual(len(selected_failure_rows), 2)
+        selected_failure_join = selected_failure_rows[-1]
+        self.assertEqual("incomplete", selected_failure_join["details"]["p"]["ro"])
+        self.assertFalse(selected_failure_join["details"]["p"]["rf"])
+        self.assertTrue(selected_failure_join["details"]["p"]["rs"])
+        self.assertTrue(any(
+            row.get("message") == "local_root_proof_transition" and
+            row.get("details", {}).get("root_corr") == selected_corr
+            for row in after_failure
+        ))
 
     def test_nonfull_completion_marker_does_not_complete_or_mark_pair_full(self):
         accumulator = _ProgressiveScanAccumulator()
@@ -8357,6 +8434,97 @@ class TestModelUpdater(unittest.TestCase):
         restarted.apply([accepted_root], {"pair-a"})
         restarted.set_session_token("replacement-session")
         self.assertEqual({}, restarted.current_root_scan_proofs())
+
+    def test_progressive_failure_origin_and_selected_outcome_are_current_and_unambiguous(self):
+        origin = {
+            "failure_site": "scan_had_errors", "failure_recoverable": True,
+            "failure_errno": 13, "failure_exception": "permission_error",
+            "failure_root_ref": "0123456789abcdef", "failure_pair_ref": "fedcba9876543210",
+        }
+        failed = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, failed=True,
+            generation=7, is_progress=True, unknown_path_pair_ids={"pair-a"},
+            recoverable_failure_path_pair_ids={"pair-a"}, session_token="current-session",
+            failure_origin=origin,
+            root_scan_outcomes_by_pair={"pair-a": {"selected": (False, True)}},
+        )
+        accumulator = _ProgressiveScanAccumulator()
+        result = accumulator.apply([failed], {"pair-a"}, root_shape_trace_enabled=True)
+        selected_id = ModelFile.build_file_id("selected", "pair-a")
+        self.assertIsNotNone(result)
+        self.assertEqual(origin, result.failure_origin)
+        self.assertEqual({selected_id: (False, True)},
+                         result.diagnostic_root_scan_outcomes_by_pair["pair-a"])
+        self.assertEqual({}, accumulator.current_root_scan_sources())
+        disabled_accumulator = _ProgressiveScanAccumulator()
+        disabled_result = disabled_accumulator.apply([failed], {"pair-a"})
+        self.assertEqual({}, disabled_result.diagnostic_root_scan_outcomes_by_pair)
+        self.assertEqual(result.failure_origin, disabled_result.failure_origin)
+        self.assertEqual(accumulator.authority_for_pairs({"pair-a"}),
+                         disabled_accumulator.authority_for_pairs({"pair-a"}))
+        joins = []
+        trace = SimpleNamespace(is_effectively_enabled=lambda _category, _level="info": True)
+        join_controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace),
+            _record_completion_scan_join_breadcrumb=lambda file_id, message, details:
+                joins.append((file_id, message, details)),
+        )
+        _record_selected_root_scan_join(
+            join_controller, result, side="local", pending_targets={("selected", "pair-a")},
+            local_scan_mode="progressive", accepted_local_roots={},
+            selected_root_targets=[(selected_id, "pair-a")],
+        )
+        self.assertEqual(1, len(joins))
+        self.assertEqual("incomplete", joins[0][2]["p"]["ro"])
+        self.assertFalse(joins[0][2]["p"]["rf"])
+        self.assertTrue(joins[0][2]["p"]["rs"])
+        self.assertEqual("complete", joins[0][2]["p"]["rc"])
+        omitted_result = copy(result)
+        omitted_result.diagnostic_root_scan_outcomes_omitted_by_pair = {"pair-a"}
+        _record_selected_root_scan_join(
+            join_controller, omitted_result, side="local", pending_targets=set(),
+            local_scan_mode="progressive", accepted_local_roots={},
+            selected_root_targets=[(selected_id, "pair-a")],
+        )
+        self.assertEqual("unknown", joins[-1][2]["p"]["ro"])
+        self.assertIsNone(joins[-1][2]["p"]["rf"])
+        self.assertEqual("omitted", joins[-1][2]["p"]["rc"])
+
+        # A later generation supersedes the old diagnostic origin; a mixed
+        # multi-pair failure keeps origin attribution unknown.
+        newer = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, failed=True,
+            generation=8, is_progress=True, unknown_path_pair_ids={"pair-a"},
+            recoverable_failure_path_pair_ids={"pair-a"}, session_token="current-session",
+        )
+        next_result = accumulator.apply([newer], {"pair-a"})
+        self.assertIsNone(next_result.failure_origin)
+
+        multi = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a", "pair-b"}, failed=True,
+            generation=9, is_progress=True, unknown_path_pair_ids={"pair-a", "pair-b"},
+            recoverable_failure_path_pair_ids={"pair-a", "pair-b"}, session_token="current-session",
+            failure_origin=origin,
+        )
+        multi_result = _ProgressiveScanAccumulator().apply([multi], {"pair-a", "pair-b"})
+        self.assertIsNone(multi_result.failure_origin)
+
+        repeated_origin = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, failed=True,
+            generation=10, is_progress=True, unknown_path_pair_ids={"pair-a"},
+            recoverable_failure_path_pair_ids={"pair-a"}, session_token="current-session",
+            failure_origin=origin,
+        )
+        repeated = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-a"}, failed=True,
+            generation=10, is_progress=True, unknown_path_pair_ids={"pair-a"},
+            recoverable_failure_path_pair_ids={"pair-a"}, session_token="current-session",
+            failure_origin={**origin, "failure_errno": 5},
+        )
+        repeated_result = _ProgressiveScanAccumulator().apply(
+            [repeated_origin, repeated], {"pair-a"},
+        )
+        self.assertIsNone(repeated_result.failure_origin)
 
     def test_root_scan_start_is_retained_per_exact_accepted_root(self):
         accumulator = _ProgressiveScanAccumulator()
