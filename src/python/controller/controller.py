@@ -861,6 +861,9 @@ class DeferredQueueIntent:
     # results. Consume one short grace tick before terminalizing so a result
     # that arrived by the deadline can become authoritative in that phase.
     rescan_deadline_grace_consumed: bool = False
+    # Diagnostic-only rate limit for retained Queue wait snapshots. It never
+    # participates in retry/admission decisions and is not persisted.
+    diagnostic_last_wait_monotonic: Optional[float] = field(default=None, repr=False, compare=False)
 @dataclass
 class _LftpOperation:
     action: str
@@ -11575,9 +11578,39 @@ class Controller:
     def __queue_scoped_rescan_ready(
             self, intent: DeferredQueueIntent, file: Optional[ModelFile] = None,
             *, allow_recoverable_local_root_proof: bool = False,
+            diagnostic: Optional[dict[str, object]] = None,
     ) -> bool:
-        if not intent.rescan_requested:
+        proof_state = "not_checked"
+
+        def reject(reason: str, *, side: Optional[str] = None,
+                   baseline: Optional[tuple[str, int]] = None,
+                   acknowledged: object = None, pair_ready: Optional[bool] = None) -> bool:
+            if isinstance(diagnostic, dict):
+                try:
+                    diagnostic["reason"] = reason
+                    diagnostic["proof"] = proof_state
+                    if side is not None:
+                        state = "missing" if acknowledged is None else "invalid"
+                        ack_generation = None
+                        if isinstance(acknowledged, tuple) and len(acknowledged) == 2 and \
+                                type(acknowledged[0]) is str and type(acknowledged[1]) is int:
+                            if baseline is not None and acknowledged[0] != baseline[0]:
+                                state = "run_mismatch"
+                            elif baseline is not None:
+                                state = "newer" if acknowledged[1] > baseline[1] else \
+                                    "equal" if acknowledged[1] == baseline[1] else "older"
+                            ack_generation = acknowledged[1]
+                        diagnostic[side + "_ack_state"] = state
+                        diagnostic[side + "_ack_generation"] = ack_generation
+                    if pair_ready is not None:
+                        diagnostic["pair_ready"] = pair_ready
+                except Exception:
+                    # Optional observation cannot change the readiness result.
+                    pass
             return False
+
+        if not intent.rescan_requested:
+            return reject("not_requested")
         generations = intent.rescan_generations
         if not isinstance(generations, tuple) or len(generations) != 2 or \
                 any(
@@ -11585,10 +11618,17 @@ class Controller:
                     type(token[0]) is not str or type(token[1]) is not int
                     for token in generations
                 ):
-            return False
+            return reject("fence_unknown")
+        if isinstance(diagnostic, dict):
+            try:
+                diagnostic["fence_known"] = True
+                diagnostic["local_base"] = generations[0][1]
+                diagnostic["remote_base"] = generations[1][1]
+            except Exception:
+                pass
         scan_tokens = getattr(self, "_Controller__scan_authority_tokens", None)
         if not isinstance(scan_tokens, dict):
-            return False
+            return reject("token_store_unknown")
         local_root_proof_fresh = False
         if allow_recoverable_local_root_proof and \
                 getattr(intent.command, "origin", "manual") == "manual":
@@ -11599,6 +11639,7 @@ class Controller:
                     file = None
             if isinstance(file, ModelFile):
                 local_root_proof_fresh = self.__has_fresh_local_root_scan_proof(file, intent)
+                proof_state = "fresh" if local_root_proof_fresh else "rejected"
         for side, baseline in zip(("local", "remote"), generations):
             side_tokens = scan_tokens.get(side)
             acknowledged = side_tokens.get(intent.path_pair_id) \
@@ -11611,12 +11652,26 @@ class Controller:
                         current_session != baseline[0] or type(current_generation) is not int or \
                         current_generation < baseline[1] or not isinstance(acknowledged, tuple) or \
                         len(acknowledged) != 2 or acknowledged[0] != current_session:
-                    return False
+                    return reject("remote_process_mismatch", side=side, baseline=baseline,
+                                  acknowledged=acknowledged)
             token_is_fresh = isinstance(acknowledged, tuple) and len(acknowledged) == 2 and \
                 type(acknowledged[0]) is str and type(acknowledged[1]) is int and \
                 acknowledged[0] == baseline[0] and acknowledged[1] > baseline[1]
             if not token_is_fresh and not (side == "local" and local_root_proof_fresh):
-                return False
+                if side == "remote" and acknowledged is None:
+                    reason = "remote_ack_missing"
+                elif acknowledged is None:
+                    reason = "local_ack_missing"
+                elif not isinstance(acknowledged, tuple) or len(acknowledged) != 2 or \
+                        type(acknowledged[0]) is not str or type(acknowledged[1]) is not int:
+                    reason = side + "_ack_invalid"
+                elif acknowledged[0] != baseline[0]:
+                    reason = side + "_run_mismatch"
+                else:
+                    relation = "newer" if acknowledged[1] > baseline[1] else \
+                        "equal" if acknowledged[1] == baseline[1] else "older"
+                    reason = side + "_ack_" + relation
+                return reject(reason, side=side, baseline=baseline, acknowledged=acknowledged)
         try:
             ready = self.is_path_pair_reconciled(intent.path_pair_id)
         except Exception:
@@ -11626,6 +11681,8 @@ class Controller:
                 self, "_Controller__reconciled_remote_path_pair_ids", set(),
             )
             ready = isinstance(remote_reconciled, set) and intent.path_pair_id in remote_reconciled
+        if not ready:
+            return reject("pair_unreconciled", pair_ready=False)
         if ready:
             self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", {
                 "schema": "queue_readiness.v1",
@@ -11644,6 +11701,94 @@ class Controller:
                 outcome="ready",
             )
         return ready
+
+    def __record_deferred_queue_wait(
+            self, intent: DeferredQueueIntent, observation: Mapping[str, object],
+    ) -> None:
+        """Emit a bounded snapshot of an intent that remains deferred."""
+        try:
+            if not self.queue_http_wait_trace_enabled():
+                return
+        except Exception:
+            return
+        try:
+            now = time.monotonic()
+            last = intent.diagnostic_last_wait_monotonic
+            if type(now) not in (int, float) or not math.isfinite(float(now)):
+                return
+            if type(last) in (int, float) and math.isfinite(float(last)) and \
+                    now >= last and now - last < 10.0:
+                return
+            intent.diagnostic_last_wait_monotonic = float(now)
+        except Exception:
+            # Without a trustworthy throttle clock, omit diagnostics rather
+            # than risk flooding the durable trace or changing Queue behavior.
+            return
+        try:
+            claim = getattr(self, "_Controller__collision_compare_claim", None)
+            claim_state = "unknown" if claim is not None and not isinstance(claim, tuple) else \
+                "global_present" if claim is not None else "global_absent"
+            callbacks = getattr(intent.command, "callbacks", None)
+            callback_count = len(callbacks) if isinstance(callbacks, list) and len(callbacks) <= 2**31 - 1 else None
+            failure_reason = intent.rescan_failure_reason
+            allowed_failures = {
+                "initial_local_scan_failed", "initial_local_scan_unknown",
+                "initial_local_scan_session_changed", "initial_local_scan_generation_reset",
+                "initial_remote_scan_failed", "initial_remote_scan_unknown",
+                "initial_remote_scan_session_changed", "initial_remote_scan_generation_reset",
+            }
+            if failure_reason is not None:
+                failure_reason = self.__external_initial_rescan_failure_reason(failure_reason)
+            failure_reason = failure_reason if failure_reason in allowed_failures else "none"
+            phase = intent.phase if intent.phase in {"collision", "rescan", "initial_rescan"} else "unknown"
+            reason = observation.get("reason")
+            allowed_reasons = {
+                "not_requested", "fence_unknown", "token_store_unknown", "remote_process_mismatch",
+                "local_ack_missing", "local_ack_invalid", "local_run_mismatch", "local_ack_newer",
+                "local_ack_equal", "local_ack_older", "remote_ack_missing", "remote_ack_invalid",
+                "remote_run_mismatch", "remote_ack_newer", "remote_ack_equal", "remote_ack_older",
+                "pair_unreconciled", "comparison_pending",
+            }
+            reason = reason if isinstance(reason, str) and reason in allowed_reasons else "unknown"
+            generations = intent.rescan_generations
+            fence_known = isinstance(generations, tuple) and len(generations) == 2 and all(
+                isinstance(item, tuple) and len(item) == 2 and type(item[0]) is str and
+                type(item[1]) is int and 0 <= item[1] <= 2**63 - 1 for item in generations
+            )
+            facts = {
+                "phase": phase,
+                "reason": reason,
+                "decision": "waiting",
+                "rescan_requested": intent.rescan_requested if type(intent.rescan_requested) is bool else None,
+                "fence_known": observation.get("fence_known") if type(observation.get("fence_known")) is bool else fence_known,
+                "local_base": observation.get("local_base"),
+                "remote_base": observation.get("remote_base"),
+                "local_ack_state": observation.get("local_ack_state", "unknown"),
+                "remote_ack_state": observation.get("remote_ack_state", "unknown"),
+                "local_ack_generation": observation.get("local_ack_generation"),
+                "remote_ack_generation": observation.get("remote_ack_generation"),
+                "proof": observation.get("proof", "unknown"),
+                "pair_ready": observation.get("pair_ready"),
+                "claim_state": claim_state,
+                "callback_count": callback_count,
+                "retry_count": intent.scoped_rescan_attempts
+                if type(intent.scoped_rescan_attempts) is int and 0 <= intent.scoped_rescan_attempts <= 2**31 - 1
+                else None,
+                "failure": failure_reason,
+                "stop_requested": intent.stop_requested if type(intent.stop_requested) is bool else None,
+                "grace_consumed": intent.rescan_deadline_grace_consumed
+                if type(intent.rescan_deadline_grace_consumed) is bool else None,
+            }
+            details = {
+                "schema": "queue_readiness.v2", "phase": "retained_intent_wait",
+                "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
+                "outcome": "pending", "reason": "deferred_intent_waiting", "ready": False,
+                "deferred_intent": facts,
+            }
+            self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", details)
+        except Exception:
+            # Snapshot preparation and emission are strictly diagnostic-only.
+            pass
 
     def __cancel_deferred_queue_intent(
             self, file_id: str, reason: str, error_code: int = 409,
@@ -11942,9 +12087,33 @@ class Controller:
             if intent.phase == "collision":
                 future = getattr(self, "_Controller__collision_compare_future", None)
                 if future is not None and not future.done():
+                    readiness_diagnostics_enabled = False
+                    try:
+                        readiness_diagnostics_enabled = self.queue_http_wait_trace_enabled()
+                    except Exception:
+                        pass
+                    if readiness_diagnostics_enabled:
+                        self.__record_deferred_queue_wait(intent, {
+                            "reason": "comparison_pending", "proof": "unknown",
+                        })
                     continue
             elif intent.phase in ("rescan", "initial_rescan"):
-                if not self.__queue_scoped_rescan_ready(intent):
+                if intent.phase == "initial_rescan":
+                    retained_trace_enabled = readiness_diagnostics_enabled
+                else:
+                    retained_trace_enabled = False
+                    try:
+                        retained_trace_enabled = self.queue_http_wait_trace_enabled()
+                    except Exception:
+                        pass
+                readiness_observation: Optional[dict[str, object]] = (
+                    {} if retained_trace_enabled else None
+                )
+                if not self.__queue_scoped_rescan_ready(
+                        intent, diagnostic=readiness_observation,
+                ):
+                    if readiness_observation is not None:
+                        self.__record_deferred_queue_wait(intent, readiness_observation)
                     continue
                 ready_phase = intent.phase
                 if intent.phase == "initial_rescan":

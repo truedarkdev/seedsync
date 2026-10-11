@@ -14911,11 +14911,15 @@ class TestController(unittest.TestCase):
             "publication_id": 7,
             "model_version": 11,
         }
+        self.controller._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
         callback = MagicMock()
 
         command = Controller.Command(Controller.Command.Action.QUEUE, root.file_id, origin="manual")
         command.add_callback(callback)
         self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+        # The first turn records the rescan request while creating the intent;
+        # the next Controller turn observes that intent still waiting.
         self.controller._Controller__process_commands()
 
         correlation = "fractional-mtime:{}".format(opaque_trace_correlation(root.file_id))
@@ -14924,7 +14928,7 @@ class TestController(unittest.TestCase):
         self.assertEqual(
             [
                 "queue_admission", "queue_model_boundary",
-                "queue_final_decision", "queue_rescan_readiness",
+                "queue_final_decision", "queue_rescan_readiness", "queue_rescan_readiness",
             ],
             [entry["message"] for entry in entries],
         )
@@ -14944,6 +14948,14 @@ class TestController(unittest.TestCase):
         self.assertTrue(details["path_pair_scope_configured"])
         self.assertEqual(7, details["publication_id"])
         self.assertEqual(11, details["model_version"])
+        retained_wait = next(
+            entry for entry in entries
+            if entry["message"] == "queue_rescan_readiness"
+            and entry["details"].get("phase") == "retained_intent_wait"
+        )
+        self.assertEqual("deferred_intent_waiting", retained_wait["details"]["reason"])
+        self.assertEqual("initial_rescan", retained_wait["details"]["deferred_intent"]["phase"])
+        self.assertEqual("local_ack_missing", retained_wait["details"]["deferred_intent"]["reason"])
         self.assertEqual({correlation}, {entry["corr_id"] for entry in entries})
         self.assertIsNone(decision["file_id"])
         self.assertIsNone(decision["path_pair_id"])
@@ -14989,6 +15001,9 @@ class TestController(unittest.TestCase):
         callback.on_failure.assert_not_called()
         self.assertIn(root.file_id, self.controller._Controller__deferred_queue_intents)
         self.controller._Controller__lftp.queue.assert_not_called()
+        self.assertIsNone(
+            self.controller._Controller__deferred_queue_intents[root.file_id].diagnostic_last_wait_monotonic,
+        )
 
     def _seed_manual_directory_scan_readiness_fixture(self, path_pair_id="pair-a"):
         file = ModelFile("sample-directory", True)
@@ -15806,6 +15821,12 @@ class TestController(unittest.TestCase):
 
     def test_manual_directory_queue_stale_scan_failure_does_not_retire_intent(self):
         file = self._seed_manual_directory_scan_readiness_fixture()
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            policy={"default": "off", "rules": {"queue.readiness": "info"}},
+            max_entries=32,
+        )
+        self.controller._Controller__context.breadcrumb_trace = trace
         callback = MagicMock()
         command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
         command.add_callback(callback)
@@ -15823,6 +15844,52 @@ class TestController(unittest.TestCase):
         self.controller._Controller__process_commands()
 
         self.assertIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_failure.assert_not_called()
+        correlation = "fractional-mtime:{}".format(opaque_trace_correlation(file.file_id))
+        wait_rows = [
+            entry for entry in trace.query_events(correlation_id=correlation)["events"]
+            if entry["message"] == "queue_rescan_readiness"
+            and entry["details"].get("phase") == "retained_intent_wait"
+        ]
+        self.assertEqual(1, len(wait_rows))
+        facts = wait_rows[0]["details"]["deferred_intent"]
+        self.assertEqual("initial_rescan", facts["phase"])
+        self.assertEqual("local_ack_missing", facts["reason"])
+        self.assertEqual("waiting", facts["decision"])
+        self.assertTrue(facts["rescan_requested"])
+        self.assertTrue(facts["fence_known"])
+        self.assertEqual("missing", facts["local_ack_state"])
+        self.assertEqual(1, facts["callback_count"])
+        self.assertEqual(0, facts["retry_count"])
+        self.assertEqual("global_absent", facts["claim_state"])
+        self.assertNotIn("sample-directory", str(wait_rows))
+        self.assertNotIn("pair-a", str(wait_rows))
+        self.assertIsNotNone(
+            self.controller._Controller__deferred_queue_intents[file.file_id].diagnostic_last_wait_monotonic,
+        )
+        self.controller._Controller__process_commands()
+        self.assertEqual(1, len([
+            entry for entry in trace.query_events(correlation_id=correlation)["events"]
+            if entry["message"] == "queue_rescan_readiness"
+            and entry["details"].get("phase") == "retained_intent_wait"
+        ]))
+
+        original_record = trace.record
+        failed_emissions = []
+
+        def fail_retained_wait(source, message, details, **kwargs):
+            if message == "queue_rescan_readiness" and details.get("phase") == "retained_intent_wait":
+                failed_emissions.append(True)
+                raise OSError("diagnostic sink unavailable")
+            return original_record(source, message, details, **kwargs)
+
+        trace.record = fail_retained_wait
+        self.controller._Controller__deferred_queue_intents[file.file_id].diagnostic_last_wait_monotonic = None
+        self.controller._Controller__process_commands()
+        self.assertEqual([True], failed_emissions)
+        self.assertIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+        self.assertEqual("initial_rescan", self.controller._Controller__deferred_queue_intents[file.file_id].phase)
         self.controller._Controller__lftp.queue.assert_not_called()
         callback.on_failure.assert_not_called()
 

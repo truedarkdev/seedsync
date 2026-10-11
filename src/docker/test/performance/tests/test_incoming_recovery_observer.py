@@ -813,6 +813,17 @@ def test_queue_readiness_scan_diagnostics_sanitize_exact_decimal_and_unknowns():
             "schema": "queue_readiness.v1", "event": "queue_rescan_readiness",
             "phase": "rescan_unknown", "origin": "manual", "outcome": "failed",
             "reason": "initial_local_scan_failed",
+            "deferred_intent": {
+                "phase": "initial_rescan", "reason": "local_ack_missing", "decision": "waiting",
+                "rescan_requested": True, "fence_known": True,
+                "local_base": wide, "remote_base": str(int(wide) + 1),
+                "local_ack_state": "missing", "remote_ack_state": "newer",
+                "local_ack_generation": None, "remote_ack_generation": str(int(wide) + 2),
+                "proof": "not_checked", "pair_ready": None,
+                "claim_state": "global_absent", "callback_count": 1, "retry_count": 2,
+                "failure": "none", "stop_requested": False, "grace_consumed": False,
+                "path": "/private/path", "token_value": "private-token",
+            },
             "scan_failure": {
                 "side": "local", "kind": "failed", "scope": "targeted", "target_covered": True,
                 "terminal": False, "recoverable": True, "result_generation": wide,
@@ -848,6 +859,13 @@ def test_queue_readiness_scan_diagnostics_sanitize_exact_decimal_and_unknowns():
     assert readiness["scan_failure"]["failure_ignored_reason"] == "session_mismatch"
     assert readiness["scan_failure"]["baseline_generation"] == str(int(wide) - 1)
     assert readiness["scan_failure"]["failure_run_ref"] == "012345abcdef"
+    deferred_intent = readiness["deferred_intent"]
+    assert deferred_intent["local_base"] == wide
+    assert deferred_intent["remote_base"] == str(int(wide) + 1)
+    assert deferred_intent["remote_ack_generation"] == str(int(wide) + 2)
+    assert deferred_intent["claim_state"] == "global_absent"
+    assert "private-token" not in json.dumps(safe)
+    assert "/private/path" not in json.dumps(safe)
     assert readiness["fresh_root_proof"]["process_generation"] == wide
     assert readiness["fresh_root_proof"]["root_generation"] == wide
     assert readiness["fresh_root_proof"]["root_proof_gate"] == {
@@ -861,6 +879,15 @@ def test_queue_readiness_scan_diagnostics_sanitize_exact_decimal_and_unknowns():
     malformed = observer._sanitize_capture_projection({
         "queue_readiness": {
             "schema": "queue_readiness.v1", "event": "queue_rescan_readiness",
+            "deferred_intent": {
+                "phase": "bad", "reason": "bad", "decision": "bad",
+                "rescan_requested": 1, "fence_known": "true", "local_base": True,
+                "remote_base": wide, "local_ack_state": "bad", "remote_ack_state": "bad",
+                "local_ack_generation": 2**63, "remote_ack_generation": wide,
+                "proof": "bad", "pair_ready": "true", "claim_state": "bad",
+                "callback_count": True, "retry_count": 2**63,
+                "failure": "private-failure", "stop_requested": 1, "grace_consumed": "false",
+            },
             "scan_failure": {"side": "local", "terminal": 1, "result_generation": "01",
                              "failure_generation_source": "not-allowed",
                              "failure_generation": True, "failure_generation_vs_baseline": "bad",
@@ -889,6 +916,14 @@ def test_queue_readiness_scan_diagnostics_sanitize_exact_decimal_and_unknowns():
         "confirmed_delete_generation": None, "source_root_present": None,
         "source_root_matches": None,
     }
+    malformed_intent = malformed["deferred_intent"]
+    assert malformed_intent["phase"] == "unknown"
+    assert malformed_intent["reason"] == "unknown"
+    assert malformed_intent["local_base"] is None
+    assert malformed_intent["remote_base"] == wide
+    assert malformed_intent["local_ack_generation"] is None
+    assert malformed_intent["callback_count"] is None
+    assert malformed_intent["failure"] == "unknown"
 
 
 def test_completion_move_projection_sanitizer_preserves_finite_facts():

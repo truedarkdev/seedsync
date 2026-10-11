@@ -1047,6 +1047,17 @@ def test_scan_failure_origin_facts_are_finite_and_preserve_unknown_root() -> Non
     queue_details = {
         "schema": "queue_readiness.v1", "phase": "rescan_unknown", "outcome": "failed",
         "origin": "manual", "reason": "initial_local_scan_failed",
+        "deferred_intent": {
+            "phase": "initial_rescan", "reason": "local_ack_missing", "decision": "waiting",
+            "rescan_requested": True, "fence_known": True,
+            "local_base": 2**53 + 19, "remote_base": 4,
+            "local_ack_state": "missing", "remote_ack_state": "newer",
+            "local_ack_generation": None, "remote_ack_generation": 5,
+            "proof": "not_checked", "pair_ready": None,
+            "claim_state": "global_absent", "callback_count": 1, "retry_count": 2,
+            "failure": "none", "stop_requested": False, "grace_consumed": False,
+            "private_name": "do-not-copy",
+        },
         "scan_failure": {
             "side": "local", "kind": "failed", "scope": "targeted", "target_covered": True,
             "terminal": False, "recoverable": False, "result_generation": generation,
@@ -1078,11 +1089,24 @@ def test_scan_failure_origin_facts_are_finite_and_preserve_unknown_root() -> Non
     assert scan_failure["failure_exception"] == "permission_error"
     assert scan_failure["failure_root_ref"] is None
     assert scan_failure["failure_pair_ref"] == "0123456789abcdef"
+    deferred_intent = queue_projection["queue_readiness"]["deferred_intent"]
+    assert deferred_intent["phase"] == "initial_rescan"
+    assert deferred_intent["reason"] == "local_ack_missing"
+    assert deferred_intent["decision"] == "waiting"
+    assert deferred_intent["local_base"] == str(2**53 + 19)
+    assert deferred_intent["remote_ack_generation"] == "5"
+    assert deferred_intent["claim_state"] == "global_absent"
+    assert "do-not-copy" not in json.dumps(queue_projection)
     queue_serialized = json.dumps(queue_projection)
     assert "/private/root" not in queue_serialized and "do-not-copy" not in queue_serialized
 
     malformed_queue_details = {
         **queue_details,
+        "deferred_intent": {
+            **queue_details["deferred_intent"], "phase": "private-phase",
+            "reason": "private-reason", "local_base": True, "callback_count": 2**63,
+            "rescan_requested": 1,
+        },
         "scan_failure": {
             **queue_details["scan_failure"],
             "failure_site": "private-site", "failure_recoverable": 1,
@@ -1099,6 +1123,12 @@ def test_scan_failure_origin_facts_are_finite_and_preserve_unknown_root() -> Non
         "failure_site", "failure_recoverable", "failure_errno", "failure_exception",
         "failure_root_ref", "failure_pair_ref", "failure_run_ref",
     )] == [None] * 7
+    malformed_intent = safe_malformed_queue["deferred_intent"]
+    assert malformed_intent["phase"] == "unknown"
+    assert malformed_intent["reason"] == "unknown"
+    assert malformed_intent["local_base"] is None
+    assert malformed_intent["callback_count"] is None
+    assert malformed_intent["rescan_requested"] is None
 
     started, irrelevant = capture._projection({
         **row, "message": "scan_started", "details": {"scanner_side": "local", "generation": generation},
@@ -1541,9 +1571,37 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         )
         producer._Controller__retire_deferred_queue_intent = lambda *_args, **_kwargs: True
         Controller._Controller__prepare_deferred_queue_retries(producer)
+
+        pending_pair_id = "private-pending-pair"
+        pending_file_id = ModelFile.build_file_id("private-pending-root", pending_pair_id)
+        pending_file = ModelFile("private-pending-root", True)
+        pending_file.path_pair_id = pending_pair_id
+        pending_command = Controller.Command(Controller.Command.Action.QUEUE, pending_file_id)
+        pending_command.add_callback(SimpleNamespace())
+        pending_intent = DeferredQueueIntent(
+            pending_command, pending_file_id, pending_pair_id, phase="initial_rescan",
+            rescan_requested=True,
+            rescan_generations=(("private-pending-local", 2), ("private-pending-remote", 4)),
+        )
+        producer._Controller__deferred_queue_intents = {pending_file_id: pending_intent}
+        producer._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
+        producer._Controller__command_queue = Queue()
+        producer._Controller__model = SimpleNamespace(get_file=lambda _file_id: pending_file)
+        producer._Controller__persist = SimpleNamespace(stopped_file_names=set())
+        producer._Controller__local_scan_process = SimpleNamespace(
+            session_token="private-pending-local", generation=2,
+        )
+        producer._Controller__remote_scan_process = SimpleNamespace(
+            session_token="private-pending-remote", generation=4,
+        )
+        producer._Controller__reconciled_local_path_pair_ids = set()
+        producer._Controller__reconciled_remote_path_pair_ids = set()
+        producer._Controller__collision_compare_claim = None
+        Controller._Controller__prepare_deferred_queue_retries(producer)
+        assert pending_file_id in producer._Controller__deferred_queue_intents
         assert collector.wait_for_ingress(2.0)
         assert collector.flush_durable(2.0)
-        assert reader.poll() == len(readiness_rows) + 3
+        assert reader.poll() == len(readiness_rows) + 4
     finally:
         reader.close()
         collector.close(timeout=2.0)
@@ -1558,7 +1616,7 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     assert readiness[2]["phase"] == "rescan_request" and readiness[2]["reason"] == "scoped_rescan_requested"
     assert readiness[3]["decision_boundary"] == "scan_authority"
     assert readiness[3]["local_reconciled"] is False and readiness[3]["publication_id"] == 7
-    scan_failure = readiness[-3]["scan_failure"]
+    scan_failure = next(item["scan_failure"] for item in readiness if "scan_failure" in item)
     assert scan_failure == {
         "side": "local", "kind": "failed", "scope": "targeted", "target_covered": True,
         "terminal": False, "recoverable": True, "result_generation": "1",
@@ -1570,7 +1628,10 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         "failure_exception": None, "failure_root_ref": None, "failure_pair_ref": None,
         "failure_run_ref": trace_session_digest("private-local-session"),
     }
-    ignored_failure = readiness[-2]["scan_failure"]
+    ignored_failure = next(
+        item["scan_failure"] for item in readiness
+        if "scan_failure" in item and item["scan_failure"]["failure_generation"] == "11"
+    )
     assert ignored_failure["kind"] == "unknown"
     assert ignored_failure["failure_generation_source"] == "pair"
     assert ignored_failure["failure_generation"] == "11"
@@ -1579,7 +1640,7 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     assert ignored_failure["baseline_generation"] == "12"
     assert ignored_failure["result_generation"] == "13"
     assert ignored_failure["failure_run_ref"] == trace_session_digest("private-ignored-session")
-    fresh_root_proof = readiness[-1]["fresh_root_proof"]
+    fresh_root_proof = next(item["fresh_root_proof"] for item in readiness if "fresh_root_proof" in item)
     assert fresh_root_proof["result"] == "rejected"
     assert fresh_root_proof["reason"] == "source_absent"
     assert fresh_root_proof["root_proof_gate"] == {
@@ -1588,10 +1649,23 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         "confirmed_delete_generation": None, "source_root_present": False,
         "source_root_matches": False,
     }
+    retained_wait = next(item["deferred_intent"] for item in readiness if "deferred_intent" in item)
+    assert retained_wait["phase"] == "initial_rescan"
+    assert retained_wait["reason"] == "local_ack_missing"
+    assert retained_wait["decision"] == "waiting"
+    assert retained_wait["local_base"] == "2"
+    assert retained_wait["remote_base"] == "4"
+    assert retained_wait["local_ack_state"] == "missing"
+    assert retained_wait["callback_count"] == "1"
+    assert retained_wait["claim_state"] == "global_absent"
+    assert "private-pending" not in json.dumps(retained_wait)
+    retained_projection = next(item for item in projections
+                               if "deferred_intent" in item.get("queue_readiness", {}))
+    assert observer._sanitize_capture_projection(retained_projection)["queue_readiness"]["deferred_intent"] == retained_wait
     persisted = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
     finalized = [row for row in persisted if row.get("message") in
                  ({event for event, _ in readiness_rows} | {"queue_rescan_readiness"})]
-    assert len(finalized) == len(readiness_rows) + 3
+    assert len(finalized) == len(readiness_rows) + 4
     assert all("metadata" not in row and isinstance(row.get("details"), dict) for row in finalized)
     assert "private-scan-pair" not in artifact_text
     assert "private-scan-root" not in artifact_text

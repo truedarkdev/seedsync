@@ -145,7 +145,7 @@ _QUEUE_READINESS_EVENTS = frozenset({
 _QUEUE_READINESS_PHASES = frozenset({
     "admission", "dispatch_boundary", "entry", "final_decision", "model_boundary", "preflight",
     "rescan_deadline", "rescan_deadline_grace", "rescan_ready", "rescan_request", "rescan_unknown",
-    "wait_return", "unknown",
+    "retained_intent_wait", "wait_return", "unknown",
 })
 _QUEUE_READINESS_OUTCOMES = frozenset({
     "accepted", "clear", "deferred", "dispatched", "failed", "failure", "pending", "ready",
@@ -162,6 +162,7 @@ _QUEUE_READINESS_REASONS = frozenset({
     "initial_local_scan_failed", "initial_local_scan_unknown", "initial_remote_scan_failed",
     "initial_remote_scan_unknown", "initial_local_scan_session_changed", "initial_remote_scan_session_changed",
     "initial_local_scan_generation_reset", "initial_remote_scan_generation_reset",
+    "deferred_intent_waiting",
     "collision_initial_local_scan_failed", "collision_initial_local_scan_unknown",
     "collision_initial_remote_scan_failed", "collision_initial_remote_scan_unknown",
     "collision_initial_local_scan_session_changed", "collision_initial_remote_scan_session_changed",
@@ -228,6 +229,29 @@ _QUEUE_NESTED_DIAGNOSTIC_FIELDS = {
         ("root_shape_ok", "remote_ready", "overlay_unknown", "source_present",
          "run_matches_current", "builder_proof_matches_source", "run_matches_baseline"),
         ("process_generation", "effective_work_floor", "root_generation"),
+    ),
+    "deferred_intent": (
+        {"phase": frozenset({"collision", "rescan", "initial_rescan", "unknown"}),
+         "reason": frozenset({
+             "not_requested", "fence_unknown", "token_store_unknown", "remote_process_mismatch",
+             "local_ack_missing", "local_ack_invalid", "local_run_mismatch", "local_ack_newer",
+             "local_ack_equal", "local_ack_older", "remote_ack_missing", "remote_ack_invalid",
+             "remote_run_mismatch", "remote_ack_newer", "remote_ack_equal", "remote_ack_older",
+             "pair_unreconciled", "comparison_pending", "unknown",
+         }),
+         "decision": frozenset({"waiting", "unknown"}),
+         "local_ack_state": frozenset({"missing", "invalid", "run_mismatch", "newer", "equal", "older", "unknown"}),
+         "remote_ack_state": frozenset({"missing", "invalid", "run_mismatch", "newer", "equal", "older", "unknown"}),
+         "proof": frozenset({"not_checked", "fresh", "rejected", "unknown"}),
+         "claim_state": frozenset({"global_absent", "global_present", "unknown"}),
+         "failure": frozenset({
+             "none", "initial_local_scan_failed", "initial_local_scan_unknown",
+             "initial_local_scan_session_changed", "initial_local_scan_generation_reset",
+             "initial_remote_scan_failed", "initial_remote_scan_unknown",
+             "initial_remote_scan_session_changed", "initial_remote_scan_generation_reset",
+         })},
+        ("rescan_requested", "fence_known", "pair_ready", "stop_requested", "grace_consumed"),
+        ("local_base", "remote_base", "local_ack_generation", "remote_ack_generation", "callback_count", "retry_count"),
     ),
 }
 _MODEL_PAGE_SNAPSHOT_OUTCOMES = frozenset({"success", "error"})
