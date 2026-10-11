@@ -1195,7 +1195,7 @@ def _queue_authority_handoff_facts(
     }
     for key in (
         "scan_final", "result_failed", "selected_scanned", "selected_completed", "selected_unknown",
-        "selected_failed", "selected_recoverable", "selected_terminal", "run_match",
+        "selected_failed", "failed_root_is_selected", "selected_recoverable", "selected_terminal", "run_match",
     ):
         facts[key] = details.get(key) if type(details.get(key)) is bool else None
     marker = details.get("pair_marker_state")

@@ -1816,7 +1816,8 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
             safe_authority[key] = item if isinstance(item, str) and item in allowed else "unknown"
         for key in (
             "fresh", "covered", "scan_final", "result_failed", "selected_scanned", "selected_completed",
-            "selected_unknown", "selected_failed", "selected_recoverable", "selected_terminal", "run_match",
+            "selected_unknown", "selected_failed", "failed_root_is_selected", "selected_recoverable",
+            "selected_terminal", "run_match",
         ):
             item = authority_handoff.get(key)
             safe_authority[key] = item if type(item) is bool else None

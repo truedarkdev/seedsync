@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import sys
 import threading
+import time
 from collections import Counter
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
@@ -1715,6 +1716,12 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
             datetime.now(), [], scanned_path_pair_ids={pair_id}, failed=True,
             generation=1, session_token="private-local-session", is_targeted_scan=True,
             recoverable_failure_path_pair_ids={pair_id}, terminal_failure_path_pair_ids=set(),
+            failure_origin={
+                "failure_site": "scan_had_errors", "failure_recoverable": True,
+                "failure_errno": 13, "failure_exception": "permission_error",
+                "failure_root_ref": opaque_trace_correlation("scan-root|" + failed_file_id),
+                "failure_pair_ref": opaque_trace_correlation("scan-pair|" + pair_id),
+            },
         )
         failed_result._scan_failure_tokens_by_pair = {pair_id: ("private-local-session", 1)}
         Controller._record_path_pair_scan_tokens(producer, failed_result, None)
@@ -1731,6 +1738,12 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
             generation=13, session_token="private-ignored-session", is_targeted_scan=True,
             unknown_path_pair_ids={ignored_pair_id}, recoverable_failure_path_pair_ids={ignored_pair_id},
             terminal_failure_path_pair_ids=set(),
+            failure_origin={
+                "failure_site": "scan_had_errors", "failure_recoverable": True,
+                "failure_errno": 13, "failure_exception": "permission_error",
+                "failure_root_ref": None,
+                "failure_pair_ref": opaque_trace_correlation("scan-pair|" + ignored_pair_id),
+            },
         )
         ignored_result._scan_failure_tokens_by_pair = {
             ignored_pair_id: ("private-ignored-session", 11),
@@ -1749,6 +1762,14 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
             datetime.now(), [], scanned_path_pair_ids={mismatch_pair_id}, failed=True,
             generation=21, session_token="private-mismatch-result", is_targeted_scan=True,
             recoverable_failure_path_pair_ids={mismatch_pair_id}, terminal_failure_path_pair_ids=set(),
+            failure_origin={
+                "failure_site": "scan_had_errors", "failure_recoverable": True,
+                "failure_errno": 13, "failure_exception": "permission_error",
+                "failure_root_ref": opaque_trace_correlation(
+                    "scan-root|" + ModelFile.build_file_id("different-root", mismatch_pair_id),
+                ),
+                "failure_pair_ref": opaque_trace_correlation("scan-pair|" + mismatch_pair_id),
+            },
         )
         mismatch_result._scan_failure_tokens_by_pair = {
             mismatch_pair_id: ("private-mismatch-other", 21),
@@ -1767,6 +1788,12 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
             datetime.now(), [], scanned_path_pair_ids=set(), completed_path_pair_ids=set(), failed=False,
             generation=3, session_token="private-incomplete-session", is_scan_final=False,
             recoverable_failure_path_pair_ids={incomplete_pair_id},
+            failure_origin={
+                "failure_site": "scan_had_errors", "failure_recoverable": True,
+                "failure_errno": 13, "failure_exception": "permission_error",
+                "failure_root_ref": opaque_trace_correlation("scan-root|" + incomplete_file_id),
+                "failure_pair_ref": opaque_trace_correlation("scan-pair|" + incomplete_pair_id),
+            },
         )
         producer._Controller__deferred_queue_intents = {incomplete_file_id: incomplete_intent}
         Controller._record_path_pair_scan_tokens(producer, incomplete_result, None)
@@ -1862,12 +1889,21 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         proof_accumulator = _ProgressiveScanAccumulator()
         proof_accumulator.apply([proof_scan], {proof_pair_id})
         producer._Controller__progressive_local_scan_state = proof_accumulator
+        producer._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
         producer._Controller__model_builder = SimpleNamespace(
             unknown_local_path_pair_ids_snapshot=lambda: frozenset({proof_pair_id}),
             has_current_local_root_scan_proof=lambda *_args, **_kwargs: False,
         )
-        producer._Controller__retire_deferred_queue_intent = lambda *_args, **_kwargs: True
+        producer._Controller__retire_deferred_queue_intent = lambda *_args, **_kwargs: False
         Controller._Controller__prepare_deferred_queue_retries(producer)
+        assert proof_file_id in producer._Controller__deferred_queue_intents
+        # Exercise the actual ordinary-rescan retained-wait branch as well as
+        # the initial-rescan proof path above. The same live source is
+        # inspected, but its diagnostic result cannot change the intent.
+        proof_intent.phase = "rescan"
+        proof_intent.diagnostic_last_wait_monotonic = None
+        Controller._Controller__prepare_deferred_queue_retries(producer)
+        assert proof_file_id in producer._Controller__deferred_queue_intents
 
         pending_pair_id = "private-pending-pair"
         pending_file_id = ModelFile.build_file_id("private-pending-root", pending_pair_id)
@@ -1899,7 +1935,22 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         assert collector.wait_for_ingress(2.0)
         assert collector.flush_durable(2.0)
         after_written = collector.durable_snapshot()["written"]
-        assert reader.poll() == after_written - baseline_written
+        expected_records = after_written - baseline_written
+        poll_counts = []
+        actual_records = 0
+        drain_deadline = time.monotonic() + 5.0
+        while actual_records < expected_records and len(poll_counts) < 20 and \
+                time.monotonic() < drain_deadline:
+            count = reader.poll()
+            poll_counts.append(count)
+            actual_records += count
+            if actual_records < expected_records and count == 0:
+                time.sleep(0.01)
+        assert actual_records == expected_records, (
+            "durable reader drain incomplete: actual={} expected={} per_poll={}".format(
+                actual_records, expected_records, poll_counts,
+            )
+        )
     finally:
         reader.close()
         collector.close(timeout=2.0)
@@ -1917,11 +1968,14 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         "unknown_recorded", "out_of_scope", "unknown_ignored", "pair_token_invalid", "token_recorded",
     ]
     assert intake[0]["pair_marker_state"] == "valid" and intake[0]["generation_relation"] == "newer"
+    assert intake[0]["failed_root_is_selected"] is True
     assert intake[1]["generation_relation"] == "older"
+    assert intake[1]["failed_root_is_selected"] is None
     assert intake[2]["run_match"] is False and intake[2]["generation_relation"] == "unknown"
     assert intake[3]["scan_final"] is False and intake[3]["generation_relation"] == "newer"
     assert intake[3]["result_failed"] is False and intake[3]["selected_recoverable"] is True
     assert intake[3]["selected_failed"] is None
+    assert intake[3]["failed_root_is_selected"] is True
     assert intake[4]["selected_unknown"] is True and intake[4]["pair_marker_state"] == "absent"
     assert intake[4]["generation_relation"] == "newer"
     assert intake[5]["selected_unknown"] is True
@@ -1931,6 +1985,9 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     assert intake[7]["pair_marker_state"] == "invalid" and intake[7]["selected_completed"] is True
     assert intake[8]["pair_marker_state"] == "valid" and intake[8]["selected_completed"] is True
     assert intake[8]["generation_relation"] == "newer"
+    mismatch_intake = next(item for item in intake if item["record_disposition"] == "failed_ignored"
+                           and item["run_match"] is False)
+    assert mismatch_intake["failed_root_is_selected"] is False
     retained_intake = intake[7]
     assert observer._sanitize_capture_projection({"queue_authority_handoff": retained_intake})[
         "queue_authority_handoff"
@@ -1947,8 +2004,10 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         "failure_generation_source": "pair", "failure_generation": "1",
         "failure_generation_vs_baseline": "newer",
         "failure_ignored_reason": "unknown", "baseline_generation": None,
-        "failure_site": None, "failure_recoverable": None, "failure_errno": None,
-        "failure_exception": None, "failure_root_ref": None, "failure_pair_ref": None,
+        "failure_site": "scan_had_errors", "failure_recoverable": True, "failure_errno": 13,
+        "failure_exception": "permission_error",
+        "failure_root_ref": opaque_trace_correlation("scan-root|" + failed_file_id),
+        "failure_pair_ref": opaque_trace_correlation("scan-pair|" + pair_id),
         "failure_run_ref": trace_session_digest("private-local-session"),
     }
     ignored_failure = next(
@@ -1972,7 +2031,34 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         "confirmed_delete_generation": None, "source_root_present": False,
         "source_root_matches": False,
     }
-    retained_wait = next(item["deferred_intent"] for item in readiness if "deferred_intent" in item)
+    proof_retained_wait = next(
+        item for item in readiness
+        if item.get("phase") == "retained_intent_wait" and "fresh_root_proof" in item and
+        item.get("deferred_intent", {}).get("remote_base") == "0"
+    )
+    assert proof_retained_wait["fresh_root_proof"]["result"] == "rejected"
+    assert proof_retained_wait["fresh_root_proof"]["reason"] == "source_absent"
+    ordinary_proof_retained_wait = next(
+        item for item in readiness
+        if item.get("phase") == "retained_intent_wait" and "fresh_root_proof" in item and
+        item.get("deferred_intent", {}).get("phase") == "rescan" and
+        item.get("deferred_intent", {}).get("remote_base") == "0"
+    )
+    assert ordinary_proof_retained_wait["fresh_root_proof"]["result"] == "rejected"
+    assert ordinary_proof_retained_wait["fresh_root_proof"]["reason"] == "source_absent"
+    proof_retained_projection = next(
+        item for item in projections
+        if item.get("queue_readiness", {}).get("phase") == "retained_intent_wait" and
+        "fresh_root_proof" in item.get("queue_readiness", {}) and
+        item["queue_readiness"].get("deferred_intent", {}).get("remote_base") == "0"
+    )
+    assert observer._sanitize_capture_projection(proof_retained_projection)["queue_readiness"][
+        "fresh_root_proof"
+    ] == proof_retained_wait["fresh_root_proof"]
+    retained_wait = next(
+        item["deferred_intent"] for item in readiness
+        if "deferred_intent" in item and item["deferred_intent"].get("remote_base") == "4"
+    )
     assert retained_wait["phase"] == "initial_rescan"
     assert retained_wait["reason"] == "local_ack_missing"
     assert retained_wait["decision"] == "waiting"
@@ -1982,8 +2068,13 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     assert retained_wait["callback_count"] == "1"
     assert retained_wait["claim_state"] == "global_absent"
     assert "private-pending" not in json.dumps(retained_wait)
-    retained_projection = next(item for item in projections
-                               if "deferred_intent" in item.get("queue_readiness", {}))
+    retained_projections = [
+        item for item in projections
+        if item.get("queue_readiness", {}).get("phase") == "retained_intent_wait" and
+        item.get("queue_readiness", {}).get("deferred_intent", {}).get("remote_base") == "4"
+    ]
+    assert len(retained_projections) == 1
+    retained_projection = retained_projections[0]
     assert observer._sanitize_capture_projection(retained_projection)["queue_readiness"]["deferred_intent"] == retained_wait
     persisted = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
     finalized = [row for row in persisted if row.get("message") in

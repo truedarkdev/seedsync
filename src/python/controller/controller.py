@@ -284,7 +284,9 @@ _LOCAL_SCAN_FAILURE_CLASSES = frozenset({
 })
 
 
-def _selected_scan_failure_origin(result: object, path_pair_id: object) -> dict[str, object]:
+def _selected_scan_failure_origin(
+        result: object, path_pair_id: object, selected_root_file_id: object = None,
+) -> dict[str, object]:
     """Project LocalScanner origin only onto the exact same selected pair."""
     try:
         if type(path_pair_id) is not str or not path_pair_id:
@@ -317,7 +319,7 @@ def _selected_scan_failure_origin(result: object, path_pair_id: object) -> dict[
         root_ref = origin.get("failure_root_ref")
         error_number = origin.get("failure_errno")
         recoverable = origin.get("failure_recoverable")
-        return {
+        facts = {
             "failure_site": site if type(site) is str and site in _LOCAL_SCAN_FAILURE_SITES else "unknown",
             "failure_recoverable": recoverable if type(recoverable) is bool else None,
             "failure_errno": error_number if type(error_number) is int and 0 <= error_number <= 65535 else None,
@@ -326,6 +328,12 @@ def _selected_scan_failure_origin(result: object, path_pair_id: object) -> dict[
             "failure_root_ref": digest(root_ref),
             "failure_pair_ref": pair_ref,
         }
+        if type(selected_root_file_id) is str and selected_root_file_id:
+            selected_root_ref = opaque_trace_correlation("scan-root|" + selected_root_file_id)
+            facts["failed_root_is_selected"] = (
+                root_ref == selected_root_ref if digest(root_ref) is not None else None
+            )
+        return facts
     except Exception:
         # Diagnostic projection cannot change failed-result or Queue handling.
         return {}
@@ -3838,6 +3846,13 @@ class Controller:
                         except Exception:
                             return None
 
+                    failed_root_is_selected = None
+                    if side == "local":
+                        failure_facts = _selected_scan_failure_origin(
+                            result, intent.path_pair_id, intent.file_id,
+                        )
+                        candidate = failure_facts.get("failed_root_is_selected")
+                        failed_root_is_selected = candidate if type(candidate) is bool else None
                     failed_membership = selected_failure_scope \
                         if type(selected_failure_scope) is bool else None
                     final_value = getattr(result, "is_scan_final", None)
@@ -3849,6 +3864,7 @@ class Controller:
                         "selected_completed": member("completed_path_pair_ids"),
                         "selected_unknown": member("unknown_path_pair_ids"),
                         "selected_failed": failed_membership,
+                        "failed_root_is_selected": failed_root_is_selected,
                         "selected_recoverable": member("recoverable_failure_path_pair_ids"),
                         "selected_terminal": member("terminal_failure_path_pair_ids"),
                         "pair_marker_state": marker_state if marker_state in ("absent", "invalid", "valid", "unknown") else "unknown",
@@ -7376,6 +7392,8 @@ class Controller:
                 "selected_completed": scan_facts.get("selected_completed") if type(scan_facts.get("selected_completed")) is bool else None,
                 "selected_unknown": scan_facts.get("selected_unknown") if type(scan_facts.get("selected_unknown")) is bool else None,
                 "selected_failed": scan_facts.get("selected_failed") if type(scan_facts.get("selected_failed")) is bool else None,
+                "failed_root_is_selected": scan_facts.get("failed_root_is_selected")
+                if type(scan_facts.get("failed_root_is_selected")) is bool else None,
                 "selected_recoverable": scan_facts.get("selected_recoverable") if type(scan_facts.get("selected_recoverable")) is bool else None,
                 "selected_terminal": scan_facts.get("selected_terminal") if type(scan_facts.get("selected_terminal")) is bool else None,
                 "pair_marker_state": scan_facts.get("pair_marker_state")
@@ -12002,6 +12020,9 @@ class Controller:
                 "outcome": "pending", "reason": "deferred_intent_waiting", "ready": False,
                 "deferred_intent": facts,
             }
+            fresh_root_proof = observation.get("fresh_root_proof")
+            if isinstance(fresh_root_proof, dict):
+                details["fresh_root_proof"] = fresh_root_proof
             self.__record_queue_readiness_trace(intent.file_id, "queue_rescan_readiness", details)
         except Exception:
             # Snapshot preparation and emission are strictly diagnostic-only.
@@ -12089,6 +12110,10 @@ class Controller:
             }
             queued_commands = {id(command) for command in self.__command_queue.queue}
         for file_id, intent in list(intents.items()):
+            # Keep optional proof facts local to this retained-intent turn.
+            # Ordinary rescan diagnostics may populate them later, while the
+            # initial-rescan path can reuse its existing proof read.
+            proof_diagnostic: Optional[dict[str, object]] = None
             if intent.stop_requested:
                 # Restoration may complete on a later turn, but this intent
                 # is terminal for Queue admission and must never re-enqueue.
@@ -12117,7 +12142,6 @@ class Controller:
             if intent.phase == "initial_rescan":
                 failure_reason = self.__initial_rescan_failure_reason(intent)
                 allow_local_root_proof = False
-                proof_diagnostic: Optional[dict[str, object]] = None
                 readiness_diagnostics_enabled = False
                 try:
                     readiness_diagnostics_enabled = self.queue_http_wait_trace_enabled()
@@ -12326,10 +12350,33 @@ class Controller:
                 readiness_observation: Optional[dict[str, object]] = (
                     {} if retained_trace_enabled else None
                 )
+                if readiness_observation is not None and isinstance(proof_diagnostic, dict):
+                    readiness_observation["fresh_root_proof"] = proof_diagnostic
                 if not self.__queue_scoped_rescan_ready(
                         intent, diagnostic=readiness_observation,
                 ):
                     if readiness_observation is not None:
+                        if intent.phase == "rescan":
+                            try:
+                                now = time.monotonic()
+                                last_wait = intent.diagnostic_last_wait_monotonic
+                                recent_wait = type(last_wait) in (int, float) and \
+                                    math.isfinite(float(last_wait)) and now >= last_wait and \
+                                    now - last_wait < 10.0
+                                if type(now) in (int, float) and math.isfinite(float(now)) and \
+                                        not recent_wait:
+                                    proof_diagnostic = {}
+                                    # This is an observation only. The
+                                    # readiness decision above remains the
+                                    # authority result.
+                                    self.__has_fresh_local_root_scan_proof(
+                                        deferred_file, intent, proof_diagnostic,
+                                    )
+                                    readiness_observation["fresh_root_proof"] = proof_diagnostic
+                            except Exception:
+                                # Optional proof observation cannot change
+                                # whether this intent remains deferred.
+                                proof_diagnostic = None
                         self.__record_deferred_queue_wait(intent, readiness_observation)
                     continue
                 ready_phase = intent.phase

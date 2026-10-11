@@ -19117,6 +19117,133 @@ class TestController(unittest.TestCase):
         self.assertEqual("unknown", scan_failures[2]["failure_generation_source"])
         self.assertIsNone(scan_failures[2]["failure_generation"])
 
+    def test_failed_root_selection_diagnostic_is_optional_at_scan_intake(self):
+        class Trace:
+            def __init__(self, enabled, fail=False):
+                self.enabled = enabled
+                self.fail = fail
+                self.rows = []
+
+            def is_effectively_enabled(self, _category, _level="info"):
+                return self.enabled
+
+            def record(self, *args, **kwargs):
+                if self.fail:
+                    raise RuntimeError("diagnostic sink unavailable")
+                self.rows.append((args, kwargs))
+                return "retained"
+
+        pair_id = "pair-a"
+        file_id = ModelFile.build_file_id("selected", pair_id)
+        states = []
+        enabled_rows = []
+        for trace in (Trace(False), Trace(True), Trace(True, fail=True)):
+            intent = DeferredQueueIntent(
+                Controller.Command(Controller.Command.Action.QUEUE, file_id),
+                file_id, pair_id, phase="initial_rescan", rescan_requested=True,
+                rescan_generations=(("local-test-session", 0), ("remote-test-session", 0)),
+            )
+            self.controller._Controller__context.breadcrumb_trace = trace
+            self.controller._Controller__deferred_queue_intents = {file_id: intent}
+            self.controller._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
+            result = ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={pair_id}, failed=True,
+                generation=1, session_token="local-test-session",
+                recoverable_failure_path_pair_ids={pair_id}, terminal_failure_path_pair_ids=set(),
+                failure_origin={
+                    "failure_site": "scan_had_errors", "failure_recoverable": True,
+                    "failure_errno": 13, "failure_exception": "permission_error",
+                    "failure_root_ref": opaque_trace_correlation("scan-root|" + file_id),
+                    "failure_pair_ref": opaque_trace_correlation("scan-pair|" + pair_id),
+                },
+            )
+            result._scan_failure_tokens_by_pair = {pair_id: ("local-test-session", 1)}
+            self.controller._record_path_pair_scan_tokens(result, None)
+            states.append((
+                intent.rescan_failure_reason,
+                copy.deepcopy(self.controller._Controller__scan_authority_tokens),
+            ))
+            if trace.enabled and not trace.fail:
+                enabled_rows = trace.rows
+
+        self.assertEqual(states[0], states[1])
+        self.assertEqual(states[0], states[2])
+        intake = [
+            args[2] for args, _kwargs in enabled_rows
+            if len(args) >= 3 and args[1] == "queue_authority_handoff" and
+            isinstance(args[2], dict) and args[2].get("event") == "scan_intake"
+        ]
+        self.assertEqual(1, len(intake))
+        self.assertIs(intake[0]["failed_root_is_selected"], True)
+
+    def test_ordinary_rescan_wait_proof_diagnostic_is_optional_and_isolated(self):
+        class Trace:
+            def __init__(self, enabled):
+                self.enabled = enabled
+                self.rows = []
+
+            def is_effectively_enabled(self, _category, _level="info"):
+                return self.enabled
+
+            def record(self, *args, **kwargs):
+                self.rows.append((args, kwargs))
+                return "retained"
+
+        pair_id = "pair-a"
+        file_id = ModelFile.build_file_id("selected", pair_id)
+        model_file = ModelFile("selected", True)
+        model_file.path_pair_id = pair_id
+        states = []
+        enabled_waits = []
+        proof_calls = []
+        for enabled, proof_fails in ((False, False), (True, False), (True, True)):
+            trace = Trace(enabled)
+            intent = DeferredQueueIntent(
+                Controller.Command(Controller.Command.Action.QUEUE, file_id),
+                file_id, pair_id, phase="rescan", rescan_requested=True,
+                rescan_generations=(("local-session", 3), ("remote-session", 4)),
+            )
+            self.controller._Controller__context.breadcrumb_trace = trace
+            self.controller._Controller__deferred_queue_intents = {file_id: intent}
+            self.controller._Controller__command_queue = Queue()
+            self.controller._Controller__model = SimpleNamespace(get_file=lambda _file_id: model_file)
+            self.controller._Controller__persist.stopped_file_names = set()
+            self.controller._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
+            self.controller._Controller__reconciled_local_path_pair_ids = set()
+            self.controller._Controller__reconciled_remote_path_pair_ids = set()
+            self.controller._Controller__collision_compare_claim = None
+
+            def proof_reader(_file, _intent, diagnostic):
+                proof_calls.append(enabled)
+                if proof_fails:
+                    raise RuntimeError("optional proof reader unavailable")
+                diagnostic.update(result="rejected", reason="source_absent")
+                return False
+
+            with patch.object(
+                    self.controller, "_Controller__has_fresh_local_root_scan_proof",
+                    side_effect=proof_reader), patch.object(
+                        self.controller, "_Controller__queue_scoped_rescan_ready", return_value=False,
+                    ):
+                Controller._Controller__prepare_deferred_queue_retries(self.controller)
+
+            states.append((intent.phase, intent.rescan_requested, intent.rescan_failure_reason,
+                           file_id in self.controller._Controller__deferred_queue_intents,
+                           self.controller._Controller__command_queue.qsize()))
+            enabled_waits.append([
+                args[2] for args, _kwargs in trace.rows
+                if len(args) >= 3 and args[1] == "queue_rescan_readiness" and
+                isinstance(args[2], dict) and args[2].get("phase") == "retained_intent_wait"
+            ])
+
+        self.assertEqual(states[0], states[1])
+        self.assertEqual(states[0], states[2])
+        self.assertEqual([True, True], proof_calls)
+        self.assertEqual([], enabled_waits[0])
+        self.assertEqual("rejected", enabled_waits[1][0]["fresh_root_proof"]["result"])
+        self.assertEqual("source_absent", enabled_waits[1][0]["fresh_root_proof"]["reason"])
+        self.assertNotIn("fresh_root_proof", enabled_waits[2][0])
+
     def test_accumulated_queue_failure_uses_exact_pair_generation_not_drain_max(self):
         trace = BreadcrumbTraceCollector(
             lambda: True,
