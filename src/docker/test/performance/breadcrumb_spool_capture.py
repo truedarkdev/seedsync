@@ -337,11 +337,12 @@ _SCAN_LIFECYCLE_COUNTERS = (
     "accumulator_authoritative_root_count", "accumulator_touched_root_count",
 )
 _SCANNER_PROCESS_MESSAGES = frozenset({
-    "force_scan", "scan_started", "scan_completed", "scan_failed",
+    "force_scan", "scan_priority_requested", "scan_started", "scan_completed", "scan_failed",
     "scan_result_published", "scan_result_dropped",
 })
 _SCANNER_PROCESS_DECISIONS = frozenset({
     "queued", "full_replaced", "coalesced_full", "coalesced_pair",
+    "coalesced_pending", "coalesced_active",
 })
 _SCANNER_PROCESS_FAILURE_SITES = frozenset({
     "missing_final_root", "missing_staging_root", "scan_had_errors",
@@ -1742,6 +1743,8 @@ def _scanner_process_facts(
         "full": exact_bool("full"),
         "progress": exact_bool("progress"),
         "failed": exact_bool("failed"),
+        "require_successor": exact_bool("require_successor"),
+        "queue_published": exact_bool("queue_published"),
         "monotonic_ms": decimal("monotonic_ms"),
         "utc": details.get("utc") if isinstance(details.get("utc"), str) and re.fullmatch(
             r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+00:00", details["utc"],

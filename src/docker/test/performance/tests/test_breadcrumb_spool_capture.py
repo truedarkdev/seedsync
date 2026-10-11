@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import sys
 import threading
+from collections import Counter
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 from datetime import datetime, timedelta
@@ -42,7 +43,7 @@ try:
     from system import SystemFile
     from controller import Controller, ModelBuilder
     from controller.controller import DeferredQueueIntent
-    from controller.scan import ScannerResult
+    from controller.scan import ScannerProcess, ScannerResult
     from lftp import LftpJobStatus
     from controller.model_updater import (
         ModelUpdater, _ModelFinalizationBreadcrumbSpan, _ProgressiveScanAccumulator, _ensure_progressive_scan_state,
@@ -68,6 +69,7 @@ except ImportError:
     ModelUpdater = None
     DeferredQueueIntent = None
     ScannerResult = None
+    ScannerProcess = None
     _ensure_progressive_scan_state = None
     _ProgressiveScanAccumulator = None
     _model_updater_fixture_module = None
@@ -979,6 +981,70 @@ def test_scanner_process_projection_keeps_force_baseline_separate_from_run() -> 
     assert run["requested_truncated"] is False
     assert "generation" not in started["numbers"]
 
+    priority, irrelevant = capture._projection({
+        "source": "scanner_process", "category": "scanner_process", "message": "scan_priority_requested",
+        "event_type": "diagnostic", "stage": "scan", "level": "info",
+        "corr_id": "local:0123456789ab:7", "details": {
+            "scanner_side": "local", "decision": "coalesced_pending",
+            "request_correlation": "fedcba9876543210", "current_generation": 7,
+            "require_successor": True,
+        },
+    })
+    assert irrelevant is False and priority is not None
+    priority_event = priority["scanner_process_event"]
+    assert priority_event["message"] == "scan_priority_requested"
+    assert priority_event["decision"] == "coalesced_pending"
+    assert priority_event["require_successor"] is True
+    safe_priority = observer._sanitize_capture_projection(priority)["scanner_process_event"]
+    assert safe_priority["decision"] == "coalesced_pending"
+    assert safe_priority["require_successor"] is True
+
+    unknown_priority, irrelevant = capture._projection({
+        "source": "scanner_process", "category": "scanner_process", "message": "scan_priority_requested",
+        "event_type": "diagnostic", "stage": "scan", "level": "info",
+        "corr_id": "local:0123456789ab:7", "details": {
+            "scanner_side": "local", "decision": "future-private-value",
+            "require_successor": 1,
+        },
+    })
+    assert irrelevant is False and unknown_priority is not None
+    unknown_event = unknown_priority["scanner_process_event"]
+    assert unknown_event["decision"] == "unknown"
+    assert unknown_event["require_successor"] == "unknown"
+    safe_unknown = observer._sanitize_capture_projection(unknown_priority)["scanner_process_event"]
+    assert safe_unknown["decision"] == "unknown"
+    assert safe_unknown["require_successor"] == "unknown"
+    missing_priority, irrelevant = capture._projection({
+        "source": "scanner_process", "category": "scanner_process", "message": "scan_priority_requested",
+        "event_type": "diagnostic", "stage": "scan", "level": "info",
+        "corr_id": "local:0123456789ab:7", "details": {"scanner_side": "local"},
+    })
+    assert irrelevant is False and missing_priority is not None
+    assert missing_priority["scanner_process_event"]["require_successor"] is None
+    assert observer._sanitize_capture_projection(missing_priority)["scanner_process_event"][
+        "require_successor"
+    ] is None
+    malformed_publication, irrelevant = capture._projection({
+        "source": "scanner_process", "category": "scanner_process", "message": "scan_result_published",
+        "event_type": "diagnostic", "stage": "scan", "level": "info",
+        "corr_id": "local:0123456789ab:7", "details": {"queue_published": 1},
+    })
+    assert irrelevant is False and malformed_publication is not None
+    assert malformed_publication["scanner_process_event"]["queue_published"] == "unknown"
+    assert observer._sanitize_capture_projection(malformed_publication)["scanner_process_event"][
+        "queue_published"
+    ] == "unknown"
+    missing_publication, irrelevant = capture._projection({
+        "source": "scanner_process", "category": "scanner_process", "message": "scan_result_published",
+        "event_type": "diagnostic", "stage": "scan", "level": "info",
+        "corr_id": "local:0123456789ab:7", "details": {},
+    })
+    assert irrelevant is False and missing_publication is not None
+    assert missing_publication["scanner_process_event"]["queue_published"] is None
+    assert observer._sanitize_capture_projection(missing_publication)["scanner_process_event"][
+        "queue_published"
+    ] is None
+
     oversized, irrelevant = capture._projection({
         "source": "scanner_process", "category": "scanner_process", "message": "scan_result_published",
         "event_type": "diagnostic", "stage": "scan", "level": "info",
@@ -990,6 +1056,143 @@ def test_scanner_process_projection_keeps_force_baseline_separate_from_run() -> 
     assert irrelevant is False and oversized is not None
     assert oversized["scanner_process_event"]["scanned_refs"] is None
     assert oversized["scanner_process_event"]["scanned_count"] == "9"
+
+
+@pytest.mark.skipif(
+    BreadcrumbTraceCollector is None or ScannerProcess is None or ScannerResult is None,
+    reason="production ScannerProcess and breadcrumb collector are unavailable",
+)
+def test_scanner_process_request_and_result_facts_reach_finalized_observer_sink(tmp_path: Path) -> None:
+    spool, artifact = _prepare(tmp_path)
+    collector = BreadcrumbTraceCollector(
+        lambda: True,
+        max_entries=32,
+        policy={"default": "off", "rules": {"scanner_process": "info"}},
+        durable_enabled=True,
+        durable_path=str(spool),
+        durable_enabled_getter=lambda: True,
+    )
+
+    class LocalProbeScanner:
+        path_pair_id = "private-selected-pair"
+
+        def scanned_path_pair_ids(self) -> set[str]:
+            return {self.path_pair_id}
+
+    process = ScannerProcess(
+        scanner=LocalProbeScanner(), interval_in_ms=0, verbose=False,
+        breadcrumb_trace=collector.create_emitter(),
+    )
+    private_session = process.session_token
+    reader = None
+    try:
+        assert collector.record(
+            "controller", "baseline", {"schema": "scanner_process_test_baseline.v1"},
+            category="scanner_process", event_type="diagnostic", stage="scan", level="info",
+        ) in {"retained", "enqueued"}
+        assert collector.flush_durable(2.0)
+        reader = _reader(spool, artifact)
+        reader.start()
+
+        process.prioritize_scan("private-selected-pair", require_successor=True)
+        process.prioritize_scan("private-selected-pair")
+        process._ScannerProcess__inline_scan_active.set()
+        process._ScannerProcess__inline_scan_target_path_pair_ids = {"private-selected-pair"}
+        process.prioritize_scan("private-selected-pair")
+        process.prioritize_scan("private-selected-pair", require_successor=True)
+
+        result = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"private-selected-pair"},
+            completed_path_pair_ids={"private-selected-pair"}, generation=7,
+            session_token=process.session_token, is_full_snapshot=False,
+            is_targeted_scan=True,
+        )
+        process._ScannerProcess__publish_result(result)
+        assert process.pop_latest_result() is result
+
+        result_queue = process._ScannerProcess__queue
+        assert result_queue is not None
+        for _ in range(result_queue.maxsize):
+            result_queue.put_nowait(ScannerResult(datetime.now(), []))
+        process._ScannerProcess__publish_result(ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"private-selected-pair"},
+            generation=8, session_token=process.session_token,
+            is_targeted_scan=True, is_progress=True, is_scan_final=False,
+        ))
+
+        assert collector.flush_durable(2.0)
+        assert reader.poll() == 6
+    finally:
+        if reader is not None:
+            reader.close()
+        process.close_queues()
+        collector.close(timeout=2.0)
+
+    rows = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
+    actual_rows = [row for row in rows if row.get("message") in {
+        "scan_priority_requested", "scan_result_published", "scan_result_dropped",
+    }]
+    assert len(actual_rows) == 6
+    assert all(
+        row["source"] == "scanner_process" and row["category"] == "scanner_process"
+        and row["stage"] == "scan" for row in actual_rows
+    )
+    semantic_versions = [row["version"] for row in actual_rows]
+    assert all(type(version) is int for version in semantic_versions)
+    assert len(set(semantic_versions)) == 6
+    producer_events = actual_rows
+
+    semantic_priorities = [entry for entry in producer_events if entry["message"] == "scan_priority_requested"]
+    assert Counter((entry["details"]["decision"], entry["details"]["require_successor"])
+                   for entry in semantic_priorities) == Counter({
+        ("queued", True): 1, ("coalesced_pending", False): 1,
+        ("coalesced_pending", True): 1, ("coalesced_active", False): 1,
+    })
+    semantic_results = [entry for entry in producer_events if entry["message"] in {
+        "scan_result_published", "scan_result_dropped",
+    }]
+    assert Counter((entry["message"], entry["details"]["queue_published"])
+                   for entry in semantic_results) == Counter({
+        ("scan_result_published", True): 1, ("scan_result_dropped", False): 1,
+    })
+    raw_text = (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8")
+    assert "private-selected-pair" not in raw_text and private_session not in raw_text
+
+    sink_rows = [item for item in _artifacts(artifact) if item.get("capture", {}).get("state") == "record"]
+    projections = [item["capture"]["projection"] for item in sink_rows]
+    scanner_events = [item["scanner_process_event"] for item in projections if "scanner_process_event" in item]
+    assert len(scanner_events) == 6
+    sink_versions = [projection["numbers"]["version"] for projection in projections
+                     if "scanner_process_event" in projection]
+    assert sink_versions == [row["version"] for row in actual_rows]
+    assert all(item["capture"]["lost"] == 0 and item["capture"]["health_lost"] == 0 for item in sink_rows)
+    assert not any(item.get("capture", {}).get("state") == "loss" for item in _artifacts(artifact))
+    canonical_projections = [observer._sanitize_capture_projection(projection) for projection in projections]
+    canonical = [projection["scanner_process_event"] for projection in canonical_projections
+                 if "scanner_process_event" in projection]
+    canonical_versions = [projection["numbers"]["version"] for projection in canonical_projections
+                          if "scanner_process_event" in projection]
+    assert canonical_versions == [row["version"] for row in actual_rows]
+    assert [event["message"] for event in canonical] == [event["message"] for event in scanner_events]
+    assert [event["decision"] for event in canonical] == [event["decision"] for event in scanner_events]
+    assert [event["require_successor"] for event in canonical] == [event["require_successor"] for event in scanner_events]
+    assert [event["queue_published"] for event in canonical] == [event["queue_published"] for event in scanner_events]
+    sink_priority = [event for event in scanner_events if event["message"] == "scan_priority_requested"]
+    assert Counter(event["decision"] for event in sink_priority) == Counter({
+        "queued": 1, "coalesced_pending": 2, "coalesced_active": 1,
+    })
+    assert Counter((event["decision"], event["require_successor"]) for event in sink_priority) == Counter({
+        ("queued", True): 1, ("coalesced_pending", False): 1,
+        ("coalesced_pending", True): 1, ("coalesced_active", False): 1,
+    })
+    sink_results = {event["message"]: event for event in scanner_events if event["message"] in {
+        "scan_result_published", "scan_result_dropped",
+    }}
+    assert {message: event["queue_published"] for message, event in sink_results.items()} == {
+        "scan_result_published": True, "scan_result_dropped": False,
+    }
+    artifact_text = artifact.read_text(encoding="utf-8")
+    assert "private-selected-pair" not in artifact_text and private_session not in artifact_text
 
 
 def test_scan_failure_origin_facts_are_finite_and_preserve_unknown_root() -> None:

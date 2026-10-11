@@ -828,11 +828,12 @@ _CAPTURE_SCAN_LIFECYCLE_COUNTERS = (
     "accumulator_authoritative_root_count", "accumulator_touched_root_count",
 )
 _CAPTURE_SCANNER_PROCESS_MESSAGES = {
-    "force_scan", "scan_started", "scan_completed", "scan_failed",
+    "force_scan", "scan_priority_requested", "scan_started", "scan_completed", "scan_failed",
     "scan_result_published", "scan_result_dropped",
 }
 _CAPTURE_SCANNER_PROCESS_DECISIONS = {
     "queued", "full_replaced", "coalesced_full", "coalesced_pair",
+    "coalesced_pending", "coalesced_active",
 }
 _CAPTURE_SCANNER_PROCESS_FAILURE_SITES = {
     "missing_final_root", "missing_staging_root", "scan_had_errors",
@@ -1208,7 +1209,10 @@ def _sanitize_scanner_process_event(value: Mapping[str, object]) -> Mapping[str,
         re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+00:00", value.get("utc")) else None,
         "monotonic_ms": decimal("monotonic_ms"),
     }
-    for key in ("targeted", "final", "full", "progress", "failed"):
+    for key in (
+        "targeted", "final", "full", "progress", "failed",
+        "require_successor", "queue_published",
+    ):
         item = value.get(key)
         result[key] = item if item is None or item == "unknown" or type(item) is bool else "unknown"
     for prefix in ("requested", "scanned", "completed", "unknown"):
