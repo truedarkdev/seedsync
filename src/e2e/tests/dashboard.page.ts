@@ -278,6 +278,10 @@ export class DashboardPage extends App {
         const row = this.getFileRow(index);
         const wasVisible = await this.isActionContainerVisible(row);
         await browser.wait(ExpectedConditions.elementToBeClickable(row), 10000);
+        await browser.executeScript(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
+            row.getWebElement()
+        );
         await row.click();
         await browser.wait(async () => {
             return (await this.isActionContainerVisible(this.getFileRow(index))) !== wasVisible;
