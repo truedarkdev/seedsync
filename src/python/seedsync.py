@@ -980,6 +980,7 @@ def _run_process_loop(seedsync_factory: Callable[[], Seedsync] = Seedsync) -> No
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     _configure_multiprocessing_start_method()
 
     if sys.hexversion < 0x030B0000 or sys.hexversion >= 0x030D0000:
