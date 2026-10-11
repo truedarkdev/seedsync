@@ -12353,7 +12353,9 @@ class Controller:
                 if readiness_observation is not None and isinstance(proof_diagnostic, dict):
                     readiness_observation["fresh_root_proof"] = proof_diagnostic
                 if not self.__queue_scoped_rescan_ready(
-                        intent, diagnostic=readiness_observation,
+                        intent,
+                        allow_recoverable_local_root_proof=intent.phase == "rescan",
+                        diagnostic=readiness_observation,
                 ):
                     if readiness_observation is not None:
                         if intent.phase == "rescan":
@@ -12447,7 +12449,10 @@ class Controller:
             # admit Queue against that unknown collision worker state.
             return "reject", "collision_claim_identity_unknown", intent
         if intent is not None and intent.phase in ("rescan", "initial_rescan"):
-            rescan_ready = self.__queue_scoped_rescan_ready(intent)
+            rescan_ready = self.__queue_scoped_rescan_ready(
+                intent,
+                allow_recoverable_local_root_proof=intent.phase == "rescan",
+            )
             if not rescan_ready:
                 return "deferred", "scoped_rescan_pending", intent
             if intent.phase == "initial_rescan":

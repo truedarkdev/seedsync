@@ -16933,6 +16933,28 @@ class TestController(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
+    def test_scoped_rescan_root_proof_fallback_is_manual_only(self):
+        file = ModelFile("selected", True)
+        file.path_pair_id = "pair-a"
+        command = Controller.Command(
+            Controller.Command.Action.QUEUE, file.file_id, origin="auto_queue",
+        )
+        intent = DeferredQueueIntent(
+            command, file.file_id, file.path_pair_id, phase="rescan",
+            rescan_requested=True,
+            rescan_generations=(("local-session", 0), ("remote-session", 0)),
+        )
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {}, "remote": {file.path_pair_id: ("remote-session", 1)},
+        }
+        proof = MagicMock(return_value=True)
+        self.controller._Controller__has_fresh_local_root_scan_proof = proof
+
+        self.assertFalse(self.controller._Controller__queue_scoped_rescan_ready(
+            intent, file, allow_recoverable_local_root_proof=True,
+        ))
+        proof.assert_not_called()
+
     def test_queue_rescan_ready_matching_claim_stays_deferred_before_dispatch(self):
         temp_dir, file, _, original, claimed, sidecar = self._seed_active_deferred_collision_claim(
             future_done=False,
@@ -16944,9 +16966,16 @@ class TestController(unittest.TestCase):
             ("local-test-session", 0), ("remote-test-session", 0),
         )
         self.controller._Controller__scan_authority_tokens = {
-            "local": {file.path_pair_id: ("local-test-session", 1)},
+            # The exact-root proof is allowed to replace only the missing
+            # local pair acknowledgement; remote authority remains fresh.
+            "local": {},
             "remote": {file.path_pair_id: ("remote-test-session", 1)},
         }
+        self.controller._Controller__local_scan_process.session_token = "local-test-session"
+        self.controller._Controller__local_scan_process.generation = 1
+        self.controller._Controller__remote_scan_process.session_token = "remote-test-session"
+        self.controller._Controller__remote_scan_process.generation = 1
+        self.controller._Controller__has_fresh_local_root_scan_proof = MagicMock(return_value=True)
         self.controller._Controller__model_builder.has_unresolved_staging_collision.return_value = False
         self.controller._Controller__is_explicitly_stopped = MagicMock(
             side_effect=[False, False],
@@ -16964,6 +16993,7 @@ class TestController(unittest.TestCase):
             retained = self.controller._Controller__deferred_queue_intents.get(file.file_id)
             self.assertIsNotNone(retained)
             self.assertEqual("collision", retained.phase)
+            self.controller._Controller__has_fresh_local_root_scan_proof.assert_called()
             self.assertIsNotNone(self.controller._Controller__collision_compare_claim)
             self.assertTrue(os.path.exists(claimed))
             self.assertTrue(os.path.exists(sidecar))
@@ -18561,6 +18591,7 @@ class TestController(unittest.TestCase):
         failure_cases = (
             ("unreadable-sibling", True, None, None, False),
             ("unreadable-sibling-deferred", True, None, None, False),
+            ("unreadable-sibling-deferred-ordinary-rescan", True, None, None, False),
             ("unreadable-sibling-deferred-local-session", False, "session", None, False),
             ("unreadable-sibling-deferred-remote-session", False, "remote-session", None, False),
             ("unreadable-sibling-changed-retained", True, None, "changed", False),
@@ -18575,6 +18606,7 @@ class TestController(unittest.TestCase):
         diagnostic_only = getattr(self, "_exact_local_flow_diagnostic_only", False)
         for blocked_root, should_dispatch, invalidate_proof, retained_mutation, fail_adoption in failure_cases:
             with self.subTest(blocked_root=blocked_root), tempfile.TemporaryDirectory() as temp_dir:
+                ordinary_rescan_case = blocked_root == "unreadable-sibling-deferred-ordinary-rescan"
                 fresh_case = TestController()
                 fresh_case.setUp()
                 controller = fresh_case.controller
@@ -18754,6 +18786,11 @@ class TestController(unittest.TestCase):
                     self.assertIsNotNone(pending_intent)
                     self.assertEqual("initial_rescan", pending_intent.phase)
                     self.assertEqual(baseline_remote, pending_intent.rescan_generations[1])
+                    if ordinary_rescan_case:
+                        # Exercise the post-cleanup ordinary rescan fence with
+                        # the same production Scanner/ModelUpdater root proof.
+                        pending_intent.phase = "rescan"
+                        pending_intent.scoped_rescan_attempts = 1
                     controller._Controller__lftp.queue.assert_not_called()
                     blocked_paths = {
                         os.path.normcase(os.path.abspath(os.path.join(final_path, "unreadable-sibling"))),
@@ -18801,6 +18838,17 @@ class TestController(unittest.TestCase):
                     fresh_remote = controller._Controller__scan_authority_tokens["remote"][pair_id]
                     self.assertEqual(remote_process.session_token, fresh_remote[0])
                     self.assertGreater(fresh_remote[1], baseline_remote[1])
+                    if ordinary_rescan_case:
+                        current_intent = controller._Controller__deferred_queue_intents[target_file_id]
+                        self.assertTrue(controller._Controller__has_fresh_local_root_scan_proof(
+                            builder.build_model().get_file(target_file_id), current_intent,
+                        ))
+                        # Preserve the accepted Scanner/Builder proof while
+                        # exercising the observed missing-ack readiness case.
+                        controller._Controller__scan_authority_tokens["local"].pop(pair_id, None)
+                        self.assertNotIn(
+                            pair_id, controller._Controller__scan_authority_tokens["local"],
+                        )
                 retained_model = builder.build_model()
                 self.assertFalse(Controller.is_path_pair_reconciled(controller, pair_id))
                 sibling_file_id = ModelFile.build_file_id("unreadable-sibling", pair_id)
