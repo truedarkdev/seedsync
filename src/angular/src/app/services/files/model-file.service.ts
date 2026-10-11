@@ -26,6 +26,12 @@ export class ModelFileService {
     private _scopeId: string | null = null;
     private _eventSource: EventSource | null = null;
     private _summarySource: EventSource | null = null;
+    private _pageExitListenersAttached = false;
+    private _intentionallyClosed = false;
+    private readonly _pageHideListener = (event: PageTransitionEvent) => {
+        if (!event.persisted) { this._shutdownForPageExit(); }
+    };
+    private readonly _beforeUnloadListener = () => this._shutdownForPageExit();
     private _summaryConsumers = 0;
     private _summaryGeneration = 0;
     private _summaryVersion = -1;
@@ -55,11 +61,12 @@ export class ModelFileService {
     }
 
     public activateScope(scopeId: string): void {
-        if (!scopeId || this._scopeId === scopeId) { return; }
+        if (!scopeId || this._scopeId === scopeId || this._intentionallyClosed) { return; }
         this.deactivateScope();
         this._scopeId = scopeId;
         this._recoveryAttempts = 0;
         this._updateVisibleStateCounts();
+        this._attachPageExitListeners();
         this._openStream(); // model-page atomically subscribes and supplies page one.
     }
 
@@ -93,8 +100,10 @@ export class ModelFileService {
     }
 
     public startSummaryStream(): void {
+        if (this._intentionallyClosed) { return; }
         this._summaryConsumers++;
         if (this._summarySource != null) { return; }
+        this._attachPageExitListeners();
         this._summaryGeneration++;
         this._summaryVersion = -1;
         const source = ModelEventSourceFactory.create("/server/model/v1/summary/stream");
@@ -330,9 +339,31 @@ export class ModelFileService {
     private _version(payload: any): number { return typeof payload?.model_version === "number" ? payload.model_version : 0; }
     private _publish(): void { this._files.next(this._records); }
 
+    private _attachPageExitListeners(): void {
+        if (this._pageExitListenersAttached || typeof window === "undefined") { return; }
+        window.addEventListener("pagehide", this._pageHideListener);
+        window.addEventListener("beforeunload", this._beforeUnloadListener);
+        this._pageExitListenersAttached = true;
+    }
+
+    /** Close model transports before the document exits; retain them for BFCache. */
+    private _shutdownForPageExit(): void {
+        if (this._intentionallyClosed) { return; }
+        this._intentionallyClosed = true;
+        this._generation++;
+        this._request?.unsubscribe();
+        this._request = null;
+        if (this._retryTimer != null) { clearTimeout(this._retryTimer); this._retryTimer = null; }
+        this._eventSource?.close();
+        this._eventSource = null;
+        this._summarySource?.close();
+        this._summarySource = null;
+        this._summaryGeneration++;
+    }
+
     private _openStream(): void {
         const scopeId = this._scopeId;
-        if (scopeId == null) { return; }
+        if (scopeId == null || this._intentionallyClosed) { return; }
         const source = ModelEventSourceFactory.create(this._streamUrl(scopeId) + "?limit=" + ModelFileService.TRANSPORT_LIMIT);
         this._eventSource = source;
         source.addEventListener("model-page", event => this._zone.run(() => {
@@ -354,7 +385,7 @@ export class ModelFileService {
         };
     }
     private _restartStream(): void {
-        if (this._scopeId == null) { return; }
+        if (this._scopeId == null || this._intentionallyClosed) { return; }
         this._generation++;
         this._request?.unsubscribe();
         this._request = null;

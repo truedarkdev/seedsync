@@ -996,6 +996,67 @@ describe("Testing model file service", () => {
         httpMock.verify();
     });
 
+    it("keeps pair and summary streams active for BFCache pagehide", () => {
+        const pairSource = new FakeEventSource();
+        const summarySource = new FakeEventSource();
+        spyOn(ModelEventSourceFactory, "create").and.returnValues(<any>pairSource, <any>summarySource);
+        const addEventListener = spyOn(window, "addEventListener");
+        let files: Immutable.Map<string, ModelFile> = null;
+        let counts: {[key: string]: number} = null;
+        modelFileService.files.subscribe(value => files = value);
+        modelFileService.visibleStateCounts.subscribe(value => counts = value);
+
+        modelFileService.activateScope("movies");
+        modelFileService.startSummaryStream();
+
+        expect(addEventListener.calls.allArgs().filter(args => args[0] === "pagehide").length).toBe(1);
+        expect(addEventListener.calls.allArgs().filter(args => args[0] === "beforeunload").length).toBe(1);
+        (<any>modelFileService)._pageHideListener(<PageTransitionEvent>{persisted: true});
+        expect(pairSource.close).not.toHaveBeenCalled();
+        expect(summarySource.close).not.toHaveBeenCalled();
+
+        pairSource.emit("model-page", JSON.stringify({records: [
+            {file_id: "root", name: "root", state: "downloading", children: []}
+        ], next_cursor: null}));
+        summarySource.emit("model-summary", JSON.stringify({model_version: 2, path_pairs: [
+            {path_pair_id: "movies", visible_state_counts: {downloading: 1}}
+        ]}));
+        expect(files.has("root")).toBe(true);
+        expect(counts).toEqual({downloading: 1});
+
+        modelFileService.deactivateScope();
+        modelFileService.stopSummaryStream();
+        httpMock.verify();
+    });
+
+    it("closes both model streams once on document exit and cancels a pending retry", fakeAsync(() => {
+        const pairSource = new FakeEventSource();
+        const summarySource = new FakeEventSource();
+        const factory = spyOn(ModelEventSourceFactory, "create").and.returnValues(<any>pairSource, <any>summarySource);
+        spyOn(window, "addEventListener");
+        modelFileService.activateScope("movies");
+        modelFileService.startSummaryStream();
+        pairSource.emit("model-page", JSON.stringify({records: [], next_cursor: "cursor"}));
+        httpMock.expectOne(req => req.params.get("cursor") === "cursor")
+            .flush({}, {status: 409, statusText: "Cursor conflict"});
+
+        (<any>modelFileService)._pageHideListener(<PageTransitionEvent>{persisted: false});
+        (<any>modelFileService)._beforeUnloadListener();
+        (<any>modelFileService)._pageHideListener(<PageTransitionEvent>{persisted: false});
+        tick(500);
+
+        expect(pairSource.close).toHaveBeenCalledTimes(1);
+        expect(summarySource.close).toHaveBeenCalledTimes(1);
+        expect(factory.calls.count()).toBe(2);
+        modelFileService.activateScope("music");
+        modelFileService.startSummaryStream();
+        expect(factory.calls.count()).toBe(2);
+        expect(modelFileService.isScoped).toBe(true);
+        expect((<any>modelFileService)._summaryConsumers).toBe(1);
+        modelFileService.stopSummaryStream();
+        httpMock.verify();
+    }));
+
     it("keeps newer summary SSE data when an older explicit refresh resolves late or after stop", () => {
         let summaries: any[] = null;
         modelFileService.summaries.subscribe(value => summaries = value);
