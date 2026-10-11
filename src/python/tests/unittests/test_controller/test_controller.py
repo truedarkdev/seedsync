@@ -33,7 +33,7 @@ from controller.scan import (
 from controller.controller import (
     ControllerError, DeferredQueueIntent, DownloadStartLifecycleEntry, PendingQueueDispatch,
     _FINAL_MOVE_REMOVE_SOURCE_METRICS, _LftpOperation, _LftpQueueResult,
-    _MoveMutationOutcome, _MoveMutationTracker,
+    _MoveMutationOutcome, _MoveMutationTracker, _selected_scan_failure_origin,
     _lftp_executor_exception_family, _lftp_executor_trace_enabled,
 )
 from controller.persist_keys import KEY_SEP, persist_key
@@ -15067,7 +15067,22 @@ class TestController(unittest.TestCase):
                     "scan_final": True,
                     "result_failed": True,
                     "selected_failed": True,
-                    "failed_root_is_selected": None,
+                    "failed_root_is_selected": _selected_scan_failure_origin(
+                        SimpleNamespace(
+                            failure_origin={
+                                "failure_site": "scan_had_errors",
+                                "failure_recoverable": True,
+                                "failure_errno": 13,
+                                "failure_exception": "permission_error",
+                                "failure_root_ref": "0123456789abcdef",
+                                "failure_pair_ref": "fedcba9876543210",
+                            },
+                            recoverable_failure_path_pair_ids={"selected-pair"},
+                            terminal_failure_path_pair_ids=set(),
+                        ),
+                        "selected-pair",
+                        ModelFile.build_file_id("selected-root", "selected-pair"),
+                    )["failed_root_is_selected"],
                     "selected_recoverable": True,
                     "selected_terminal": False,
                     "record_disposition": "pair_unknown",
@@ -19430,7 +19445,24 @@ class TestController(unittest.TestCase):
             isinstance(args[2], dict) and args[2].get("event") == "scan_intake"
         ]
         self.assertEqual(1, len(intake))
-        self.assertIs(intake[0]["failed_root_is_selected"], True)
+        self.assertIsNone(intake[0]["failed_root_is_selected"])
+
+        # The token has no namespace provenance, so neither a same-process
+        # match nor mismatch can establish the selected-root relationship.
+        raw_result.failure_origin = {
+            **raw_result.failure_origin,
+            "failure_root_ref": opaque_trace_correlation("scan-root|" + file_id),
+        }
+        matching_facts = _selected_scan_failure_origin(raw_result, pair_id, file_id)
+        raw_result.failure_origin = {
+            **raw_result.failure_origin,
+            "failure_root_ref": "0123456789abcdef",
+        }
+        mismatching_facts = _selected_scan_failure_origin(raw_result, pair_id, file_id)
+        self.assertIsNone(matching_facts["failed_root_is_selected"])
+        self.assertIsNone(mismatching_facts["failed_root_is_selected"])
+        self.assertEqual("scan_had_errors", mismatching_facts["failure_site"])
+        self.assertEqual(13, mismatching_facts["failure_errno"])
 
     def test_ordinary_rescan_wait_proof_diagnostic_is_optional_and_isolated(self):
         class Trace:

@@ -329,10 +329,11 @@ def _selected_scan_failure_origin(
             "failure_pair_ref": pair_ref,
         }
         if type(selected_root_file_id) is str and selected_root_file_id:
-            selected_root_ref = opaque_trace_correlation("scan-root|" + selected_root_file_id)
-            facts["failed_root_is_selected"] = (
-                root_ref == selected_root_ref if digest(root_ref) is not None else None
-            )
+            # ``failure_root_ref`` is produced inside the scanner worker, while
+            # this selected-root projection runs in the controller process.
+            # Opaque correlations use a process-local key, so equality here
+            # cannot establish whether the failed root was selected.
+            facts["failed_root_is_selected"] = None
         return facts
     except Exception:
         # Diagnostic projection cannot change failed-result or Queue handling.

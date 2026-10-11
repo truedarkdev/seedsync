@@ -2162,14 +2162,14 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         "unknown_recorded", "out_of_scope", "unknown_ignored", "pair_token_invalid", "token_recorded",
     ]
     assert intake[0]["pair_marker_state"] == "valid" and intake[0]["generation_relation"] == "newer"
-    assert intake[0]["failed_root_is_selected"] is True
+    assert intake[0]["failed_root_is_selected"] is None
     assert intake[1]["generation_relation"] == "older"
     assert intake[1]["failed_root_is_selected"] is None
     assert intake[2]["run_match"] is False and intake[2]["generation_relation"] == "unknown"
     assert intake[3]["scan_final"] is False and intake[3]["generation_relation"] == "newer"
     assert intake[3]["result_failed"] is False and intake[3]["selected_recoverable"] is True
     assert intake[3]["selected_failed"] is None
-    assert intake[3]["failed_root_is_selected"] is True
+    assert intake[3]["failed_root_is_selected"] is None
     assert intake[4]["selected_unknown"] is True and intake[4]["pair_marker_state"] == "absent"
     assert intake[4]["generation_relation"] == "newer"
     assert intake[5]["selected_unknown"] is True
@@ -2181,7 +2181,10 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
     assert intake[8]["generation_relation"] == "newer"
     mismatch_intake = next(item for item in intake if item["record_disposition"] == "failed_ignored"
                            and item["run_match"] is False)
-    assert mismatch_intake["failed_root_is_selected"] is False
+    assert mismatch_intake["failed_root_is_selected"] is None
+    assert observer._sanitize_capture_projection({"queue_authority_handoff": intake[0]})[
+        "queue_authority_handoff"
+    ] == intake[0]
     retained_intake = intake[7]
     assert observer._sanitize_capture_projection({"queue_authority_handoff": retained_intake})[
         "queue_authority_handoff"
@@ -2290,6 +2293,7 @@ def test_queue_readiness_boundaries_survive_actual_finalized_controller_emitter(
         "failed_recorded", "failed_ignored", "failed_ignored", "aggregate_incomplete",
         "unknown_recorded", "out_of_scope", "unknown_ignored", "pair_token_invalid", "token_recorded",
     ]
+    assert durable_intake[0]["failed_root_is_selected"] is None
     assert "private-scan-pair" not in artifact_text
     assert "private-scan-root" not in artifact_text
     assert "private-local-session" not in artifact_text
