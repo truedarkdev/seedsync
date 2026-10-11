@@ -110,6 +110,7 @@ _QUEUE_LIFECYCLE_ERROR_CLASSES = frozenset({
     "none", "eof", "exit", "signal", "timeout", "command_error",
     "parser_error", "terminal_backlog", "unhealthy_snapshot", "unknown",
 })
+_QUEUE_LIFECYCLE_JOB_TYPES = frozenset({"mirror", "pget", "get"})
 _QUEUE_LIFECYCLE_COMMAND_KINDS = frozenset({"queue", "status", "unknown"})
 _QUEUE_LIFECYCLE_COMMAND_OUTCOMES = frozenset({
     "success", "prompt_timeout", "eof", "error", "unknown",
@@ -248,6 +249,17 @@ def _queue_lifecycle_project(event: object, fields: object) -> Optional[dict[str
         value = source_fields.get(key)
         if type(value) is bool:
             projected[key] = value
+    if event == "status_membership":
+        job_type = source_fields.get("job_type")
+        if type(job_type) is str and job_type in _QUEUE_LIFECYCLE_JOB_TYPES:
+            projected["job_type"] = job_type
+        for key, prefix in (
+            ("job_correlation", "lftp-job:"),
+            ("poll_correlation", "lftp-poll:"),
+        ):
+            value = source_fields.get(key)
+            if type(value) is str and re.fullmatch(re.escape(prefix) + r"[0-9a-f]{16}", value):
+                projected[key] = value
     return projected
 
 ActiveScannerRuntime = ActiveScanner | MultiPathActiveScanner
@@ -11345,6 +11357,7 @@ class Controller:
             idle_completion_proven_file_ids: Optional[Set[str]] = None,
             diagnostic_statuses: Optional[Sequence[LftpJobStatus]] = None,
             filtered_status_file_ids: Optional[Set[str]] = None,
+            poll_correlation: Optional[str] = None,
     ) -> set[tuple[str, Optional[str], Optional[str]]]:
         """Retire acknowledged Queue intent when a fresh idle poll sees no job.
 
@@ -11360,7 +11373,9 @@ class Controller:
         ModelUpdater before malformed rows are filtered for model behavior.
         Membership is unknown when that raw evidence is unavailable or when a
         matching row was filtered; the operational ``statuses`` argument keeps
-        its existing post-filter semantics.
+        its existing post-filter semantics. ``poll_correlation`` is the
+        already-consumed opaque correlation for this exact status poll; it is
+        projected only alongside one exact, retained target row.
         """
         record_fractional_queue_trace = _record_fractional_queue_trace
         fractional_queue_flow_id = _fractional_queue_flow_id
@@ -11424,7 +11439,7 @@ class Controller:
                         membership = "ambiguous"
                         status_state = "unknown"
                         membership_reason = "unknown"
-                    membership_recorder("status_membership", {
+                    membership_fields: dict[str, object] = {
                         "phase": "status",
                         "status_health": "healthy",
                         "membership": membership,
@@ -11436,7 +11451,24 @@ class Controller:
                         ),
                         "fresh": True,
                         "healthy": True,
-                    })
+                    }
+                    if membership == "present" and status_count == 1 and status is not None:
+                        try:
+                            status_type = status.type
+                            if isinstance(status_type, LftpJobStatus.Type):
+                                membership_fields["job_type"] = status_type.value
+                            job_correlation = status.job_correlation
+                        except Exception:
+                            job_correlation = None
+                        if type(job_correlation) is str and re.fullmatch(
+                                r"lftp-job:[0-9a-f]{16}", job_correlation,
+                        ):
+                            membership_fields["job_correlation"] = job_correlation
+                        if type(poll_correlation) is str and re.fullmatch(
+                                r"lftp-poll:[0-9a-f]{16}", poll_correlation,
+                        ):
+                            membership_fields["poll_correlation"] = poll_correlation
+                    membership_recorder("status_membership", membership_fields)
             except Exception:
                 pass
             status = statuses_by_file_id.get(file_id)

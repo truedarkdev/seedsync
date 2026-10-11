@@ -15,7 +15,7 @@ from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from pathlib import Path
 from queue import Queue
 from threading import Lock, RLock
-from unittest.mock import ANY, MagicMock, mock_open, patch
+from unittest.mock import ANY, MagicMock, PropertyMock, mock_open, patch
 from types import SimpleNamespace
 
 import pexpect
@@ -257,6 +257,9 @@ class TestController(unittest.TestCase):
             "path": "/private/sentinel.bin",
             "raw_output": "private-output",
             "exception_text": "private-exception",
+            "job_type": "private-type",
+            "job_correlation": "private-job-correlation",
+            "poll_correlation": "not-a-poll-token",
         })
 
         entry = trace.snapshot()["entries"][0]
@@ -323,35 +326,61 @@ class TestController(unittest.TestCase):
         self.assertEqual("none", details["error_class"])
 
     def test_queue_lifecycle_exact_membership_uses_pending_file_flow(self):
-        trace = BreadcrumbTraceCollector(
-            lambda: True,
-            policy={"default": "info"},
-            max_entries=16,
-        )
-        self.controller._Controller__context.breadcrumb_trace = trace
-        file = ModelFile("sample", False)
-        self.controller._Controller__pending_queue_dispatches = {
-            file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
-        }
-        status = LftpJobStatus(
-            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file.name, "/remote/sample",
-        )
+        with tempfile.TemporaryDirectory() as durable_path:
+            trace = BreadcrumbTraceCollector(
+                lambda: True,
+                policy={"default": "info"},
+                max_entries=16,
+                durable_enabled=True,
+                durable_path=durable_path,
+            )
+            self.addCleanup(trace.close)
+            self.controller._Controller__context.breadcrumb_trace = trace
+            file = ModelFile("sample", False)
+            self.controller._Controller__pending_queue_dispatches = {
+                file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
+            }
+            status = LftpJobStatus(
+                1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+                file.name, "/remote/sample",
+            )
+            poll_correlation = "lftp-poll:0123456789abcdef"
 
-        self.controller._reconcile_pending_queue_dispatches_from_fresh_status(
-            [status], diagnostic_statuses=[status],
-        )
+            self.controller._reconcile_pending_queue_dispatches_from_fresh_status(
+                [status], diagnostic_statuses=[status], poll_correlation=poll_correlation,
+            )
 
-        membership = next(
-            entry for entry in trace.snapshot()["entries"]
-            if entry["details"].get("event") == "status_membership"
-        )
-        self.assertEqual(
-            self.controller._Controller__fractional_queue_flow_id(file.file_id, 1),
-            membership["flow_id"],
-        )
-        self.assertEqual("healthy", membership["details"]["status_health"])
-        self.assertEqual("present", membership["details"]["membership"])
-        self.assertEqual("1", membership["details"]["status_count_bucket"])
+            membership = next(
+                entry for entry in trace.snapshot()["entries"]
+                if entry["details"].get("event") == "status_membership"
+            )
+            self.assertEqual(
+                self.controller._Controller__fractional_queue_flow_id(file.file_id, 1),
+                membership["flow_id"],
+            )
+            self.assertEqual("healthy", membership["details"]["status_health"])
+            self.assertEqual("present", membership["details"]["membership"])
+            self.assertEqual("1", membership["details"]["status_count_bucket"])
+            self.assertEqual("get", membership["details"]["job_type"])
+            self.assertEqual(status.job_correlation, membership["details"]["job_correlation"])
+            self.assertEqual(poll_correlation, membership["details"]["poll_correlation"])
+
+            trace.close()
+            with open(os.path.join(durable_path, "breadcrumbs.jsonl"), encoding="utf-8") as handle:
+                finalized = [json.loads(line) for line in handle if line.strip()]
+            persisted = next(
+                entry for entry in finalized
+                if isinstance(entry.get("details"), dict)
+                and entry["details"].get("event") == "status_membership"
+            )
+            self.assertEqual(
+                ("get", status.job_correlation, poll_correlation),
+                tuple(persisted["details"][key] for key in (
+                    "job_type", "job_correlation", "poll_correlation",
+                )),
+            )
+            self.assertNotIn(file.file_id, json.dumps(persisted))
+            self.assertNotIn("sample", json.dumps(persisted))
 
     def test_queue_lifecycle_filtered_status_is_unknown_not_absent(self):
         trace = BreadcrumbTraceCollector(
@@ -370,6 +399,7 @@ class TestController(unittest.TestCase):
 
         self.controller._reconcile_pending_queue_dispatches_from_fresh_status(
             [], diagnostic_statuses=[status], filtered_status_file_ids={file.file_id},
+            poll_correlation="lftp-poll:0123456789abcdef",
         )
 
         membership = next(
@@ -379,6 +409,68 @@ class TestController(unittest.TestCase):
         self.assertEqual("unknown", membership["details"]["membership"])
         self.assertEqual("filtered", membership["details"]["membership_reason"])
         self.assertNotEqual("absent", membership["details"]["outcome"])
+        self.assertNotIn("job_type", membership["details"])
+        self.assertNotIn("job_correlation", membership["details"])
+        self.assertNotIn("poll_correlation", membership["details"])
+
+    def test_queue_lifecycle_ambiguous_membership_omits_job_and_poll_identity(self):
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"}, max_entries=8)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        file = ModelFile("duplicate", False)
+        self.controller._Controller__pending_queue_dispatches = {
+            file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
+        }
+        first = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING, file.name, "/remote/duplicate",
+        )
+        second = LftpJobStatus(
+            2, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, file.name, "/remote/duplicate",
+        )
+
+        self.controller._reconcile_pending_queue_dispatches_from_fresh_status(
+            [first, second], diagnostic_statuses=[first, second],
+            poll_correlation="lftp-poll:0123456789abcdef",
+        )
+
+        membership = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["details"].get("event") == "status_membership"
+        )
+        self.assertEqual("ambiguous", membership["details"]["membership"])
+        self.assertNotIn("job_type", membership["details"])
+        self.assertNotIn("job_correlation", membership["details"])
+        self.assertNotIn("poll_correlation", membership["details"])
+
+    def test_queue_lifecycle_job_correlation_failure_keeps_membership_event(self):
+        trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"}, max_entries=8)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        file = ModelFile("getter-failure", False)
+        self.controller._Controller__pending_queue_dispatches = {
+            file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 1),
+        }
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            file.name, "/remote/getter-failure",
+        )
+
+        with patch.object(
+                LftpJobStatus, "job_correlation", new_callable=PropertyMock,
+                side_effect=RuntimeError("diagnostic correlation unavailable"),
+        ):
+            self.controller._reconcile_pending_queue_dispatches_from_fresh_status(
+                [status], diagnostic_statuses=[status],
+                poll_correlation="lftp-poll:0123456789abcdef",
+            )
+
+        membership = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry["details"].get("event") == "status_membership"
+        )
+        self.assertEqual("present", membership["details"]["membership"])
+        self.assertEqual("get", membership["details"]["job_type"])
+        self.assertNotIn("job_correlation", membership["details"])
+        self.assertEqual("lftp-poll:0123456789abcdef", membership["details"]["poll_correlation"])
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
 
     def test_queue_lifecycle_ordinary_status_log_is_once_per_pending_flow(self):
         trace = BreadcrumbTraceCollector(lambda: True, policy={"default": "info"}, max_entries=16)

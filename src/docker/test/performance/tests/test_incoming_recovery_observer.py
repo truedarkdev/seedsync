@@ -426,6 +426,33 @@ def test_local_scan_tick_and_lifecycle_projection_preserve_unknowns_and_sanitize
     assert lifecycle["scan_lifecycle"]["scanned_pair_count"] == "unknown"
     assert "private_label" not in json.dumps(lifecycle)
 
+    queue_membership = observer._sanitize_capture_projection({
+        "kind": "event", "source": "controller", "category": "queue.lifecycle",
+        "event_type": "state_transition", "stage": "queue_lifecycle", "level": "info", "numbers": {},
+        "lifecycle": {
+            "schema": "queue.lifecycle.v1", "event": "status_membership", "phase": "status",
+            "boundary": "status_membership", "outcome": "present", "error_class": "none",
+            "membership": "present", "job_type": "get",
+            "job_correlation": "lftp-job:0123456789abcdef",
+            "poll_correlation": "lftp-poll:fedcba9876543210",
+            "raw_path": "/must/not/escape",
+        },
+    })["lifecycle"]
+    assert (queue_membership["job_type"], queue_membership["job_correlation"], queue_membership["poll_correlation"]) == (
+        "get", "lftp-job:0123456789abcdef", "lftp-poll:fedcba9876543210",
+    )
+    malformed_join = observer._sanitize_capture_projection({
+        "kind": "event", "source": "controller", "category": "queue.lifecycle",
+        "event_type": "state_transition", "stage": "queue_lifecycle", "level": "info", "numbers": {},
+        "lifecycle": {
+            "schema": "queue.lifecycle.v1", "event": "status_membership",
+            "job_type": "mirror /private/path", "job_correlation": "lftp-job:0123456789abcdef/private",
+            "poll_correlation": "lftp-poll:0123456789abcdeg",
+        },
+    })["lifecycle"]
+    assert not {"job_type", "job_correlation", "poll_correlation"} & malformed_join.keys()
+    assert "must/not/escape" not in json.dumps(queue_membership)
+
     malformed = observer._sanitize_capture_projection({
         **tick, "local_scan_tick": {
             "present": 1, "mode": "private-mode", "session_digest": "/path",

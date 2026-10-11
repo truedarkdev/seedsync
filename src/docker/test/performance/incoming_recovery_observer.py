@@ -531,6 +531,9 @@ _CAPTURE_LIFECYCLE_ENUMS = {
     "command_outcome": {"success", "prompt_timeout", "eof", "error", "unknown"}, "reaped": {"signal", "exit", "alive", "not_alive", "unknown"},
     "future_state": {"finalized", "pending", "unknown"},
 }
+_CAPTURE_LIFECYCLE_JOB_TYPES = {"mirror", "pget", "get"}
+_CAPTURE_LIFECYCLE_JOB_CORRELATION = re.compile(r"^lftp-job:[0-9a-f]{16}$")
+_CAPTURE_LIFECYCLE_POLL_CORRELATION = re.compile(r"^lftp-poll:[0-9a-f]{16}$")
 _CAPTURE_LFTP_STATUS_AUTHORITY_SCHEMA = "lftp_status_authority.v1"
 _CAPTURE_LFTP_STATUS_MEMBERSHIP_SCHEMA = "lftp_status_membership.v2"
 _CAPTURE_LFTP_STATUS_SOURCES = {
@@ -1502,6 +1505,17 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
             item = lifecycle.get(key)
             if type(item) is bool:
                 safe[key] = item
+        if safe.get("event") == "status_membership":
+            job_type = lifecycle.get("job_type")
+            if isinstance(job_type, str) and job_type in _CAPTURE_LIFECYCLE_JOB_TYPES:
+                safe["job_type"] = job_type
+            for key, pattern in (
+                ("job_correlation", _CAPTURE_LIFECYCLE_JOB_CORRELATION),
+                ("poll_correlation", _CAPTURE_LIFECYCLE_POLL_CORRELATION),
+            ):
+                item = lifecycle.get(key)
+                if isinstance(item, str) and pattern.fullmatch(item):
+                    safe[key] = item
         result["lifecycle"] = safe
     lftp_status_authority = _sanitize_lftp_status_authority(value.get("lftp_status_authority"))
     if lftp_status_authority is not None:

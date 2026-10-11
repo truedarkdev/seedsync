@@ -118,6 +118,9 @@ _QUEUE_LIFECYCLE_ENUMS = {
     "reaped": frozenset({"signal", "exit", "alive", "not_alive", "unknown"}),
     "future_state": frozenset({"finalized", "pending", "unknown"}),
 }
+_QUEUE_LIFECYCLE_JOB_TYPES = frozenset({"mirror", "pget", "get"})
+_QUEUE_LIFECYCLE_JOB_CORRELATION = re.compile(r"^lftp-job:[0-9a-f]{16}$")
+_QUEUE_LIFECYCLE_POLL_CORRELATION = re.compile(r"^lftp-poll:[0-9a-f]{16}$")
 _LFTP_STATUS_POLL_MESSAGE = "lftp_status_poll"
 _LFTP_STATUS_MEMBERSHIP_MESSAGE = "lftp_status_membership_transition"
 _LFTP_STATUS_AUTHORITY_SCHEMA = "lftp_status_authority.v1"
@@ -593,6 +596,17 @@ def _queue_lifecycle_facts(details: Mapping[str, object]) -> dict[str, object] |
         value = details.get(key)
         if type(value) is bool:
             facts[key] = value
+    if facts["event"] == "status_membership":
+        job_type = details.get("job_type")
+        if isinstance(job_type, str) and job_type in _QUEUE_LIFECYCLE_JOB_TYPES:
+            facts["job_type"] = job_type
+        for key, pattern in (
+            ("job_correlation", _QUEUE_LIFECYCLE_JOB_CORRELATION),
+            ("poll_correlation", _QUEUE_LIFECYCLE_POLL_CORRELATION),
+        ):
+            value = details.get(key)
+            if isinstance(value, str) and pattern.fullmatch(value):
+                facts[key] = value
     return facts
 
 

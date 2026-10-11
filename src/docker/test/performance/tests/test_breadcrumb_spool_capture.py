@@ -46,7 +46,7 @@ try:
     from model import Model, ModelFile
     from system import SystemFile
     from controller import Controller, ModelBuilder
-    from controller.controller import DeferredQueueIntent
+    from controller.controller import DeferredQueueIntent, PendingQueueDispatch
     from controller.scan import ScannerProcess, ScannerResult
     from lftp import LftpJobStatus
     from controller.model_updater import (
@@ -73,6 +73,7 @@ except ImportError:
     ModelBuilder = None
     ModelUpdater = None
     DeferredQueueIntent = None
+    PendingQueueDispatch = None
     ScannerResult = None
     ScannerProcess = None
     _ensure_progressive_scan_state = None
@@ -625,8 +626,12 @@ def test_composed_producer_rows_retain_finite_lifecycle_facts_and_hashes(tmp_pat
             identity="executor",
         ),
         _row(
-            details={"schema": "queue.lifecycle.v1", "event": "status_membership", "source": "controller", "phase": "status", "outcome": "present", "error_class": "none", "boundary": "status_membership", "membership": "present", "status_health": "healthy"},
+            details={"schema": "queue.lifecycle.v1", "event": "status_membership", "source": "controller", "phase": "status", "outcome": "present", "error_class": "none", "boundary": "status_membership", "membership": "present", "status_health": "healthy", "job_type": "get", "job_correlation": "lftp-job:0123456789abcdef", "poll_correlation": "lftp-poll:fedcba9876543210"},
             identity="status",
+        ),
+        _row(
+            details={"schema": "queue.lifecycle.v1", "event": "queue_admitted", "source": "controller", "phase": "admission", "outcome": "accepted", "error_class": "none", "boundary": "queue_admission", "job_type": "get", "job_correlation": "lftp-job:0123456789abcdef", "poll_correlation": "lftp-poll:fedcba9876543210"},
+            identity="admission-no-join",
         ),
         _row(
             category="completion.gate", event_type="diagnostic", stage="completion_gate", source="model_updater",
@@ -643,7 +648,7 @@ def test_composed_producer_rows_retain_finite_lifecycle_facts_and_hashes(tmp_pat
     try:
         reader.start()
         (spool / "breadcrumbs.jsonl").write_bytes(b"".join(rows))
-        assert reader.poll() == 5
+        assert reader.poll() == 6
     finally:
         reader.close()
     records = [item["capture"]["projection"] for item in _artifacts(artifact) if item["capture"].get("state") == "record"]
@@ -652,15 +657,89 @@ def test_composed_producer_rows_retain_finite_lifecycle_facts_and_hashes(tmp_pat
         ("queue_admitted", "accepted", "queue_admission"),
         ("executor_return", "returned", "executor"),
         ("status_membership", "present", "status_membership"),
+        ("queue_admitted", "accepted", "queue_admission"),
     ]
+    status_membership = lifecycle[2]
+    assert (status_membership["job_type"], status_membership["job_correlation"], status_membership["poll_correlation"]) == (
+        "get", "lftp-job:0123456789abcdef", "lftp-poll:fedcba9876543210",
+    )
+    assert not {"job_type", "job_correlation", "poll_correlation"} & lifecycle[3].keys()
+    assert observer._sanitize_capture_projection({"lifecycle": status_membership})["lifecycle"] == status_membership
     completion = next(item["completion_gate"] for item in records if "completion_gate" in item)
     assert completion["boundary"] == "completion_gate" and completion["terminal_outcome"] == "deferred"
     command = next(item["lftp_command"] for item in records if "lftp_command" in item)
     assert command["transfer_kind"] == "get" and command["phase"] == "submitted"
     hashes = [item["flow_hash"] for item in records]
-    assert len(set(hashes)) == 5
+    assert len(set(hashes)) == 6
     text = artifact.read_text(encoding="utf-8")
     assert all(label not in text for label in ("private-flow-label", "private-correlation-label", "private-file-label", "private-pair-label"))
+
+
+def test_actual_queue_lifecycle_status_join_survives_finalized_capture_and_observer(tmp_path: Path) -> None:
+    if Controller is None or BreadcrumbTraceCollector is None or PendingQueueDispatch is None:
+        pytest.skip("production controller breadcrumb emitter is unavailable")
+    spool, artifact = _prepare(tmp_path)
+    collector = BreadcrumbTraceCollector(
+        lambda: True, max_entries=64,
+        policy={"default": "off", "rules": {"controller": "info", "queue.lifecycle": "debug"}},
+        durable_enabled=True, durable_path=str(spool),
+    )
+    reader = _reader(spool, artifact, max_records=64)
+    producer = Controller.__new__(Controller)
+    producer._Controller__context = SimpleNamespace(breadcrumb_trace=collector)
+    producer._Controller__work_state_lock = threading.RLock()
+    file = ModelFile("join-target.bin", False)
+    producer._Controller__pending_queue_dispatches = {
+        file.file_id: PendingQueueDispatch(0.0, file.name, None, False, 7),
+    }
+    status = LftpJobStatus(
+        31, LftpJobStatus.Type.GET, LftpJobStatus.State.QUEUED, file.name, "/private/remote",
+    )
+    poll_correlation = "lftp-poll:0123456789abcdef"
+    try:
+        assert collector.record(
+            "controller", "durable_boundary_probe", {}, category="controller",
+            event_type="diagnostic", stage="queue_lifecycle_test_boundary", level="info",
+        ) in {"retained", "enqueued"}
+        assert collector.wait_for_ingress(2.0)
+        assert collector.flush_durable(2.0)
+        reader.start()
+
+        recorder = Controller._Controller__incoming_recovery_flow_recorder(
+            producer, file.file_id, 7, create=False,
+        )
+        assert recorder is not None
+        recorder("queue_admitted", {})
+        Controller._reconcile_pending_queue_dispatches_from_fresh_status(
+            producer, [status], diagnostic_statuses=[status], poll_correlation=poll_correlation,
+        )
+        recorder("executor_return", {})
+        assert collector.wait_for_ingress(2.0)
+        assert collector.flush_durable(2.0)
+        assert reader.poll() >= 3
+    finally:
+        reader.close()
+        collector.close()
+
+    captured = [item["capture"] for item in _artifacts(artifact) if item["capture"].get("state") == "record"]
+    projections = [item["projection"] for item in captured]
+    captured_lifecycle = [item for item in captured if item["projection"].get("category") == "queue.lifecycle"]
+    lifecycle_records = [item["projection"] for item in captured_lifecycle]
+    lifecycle = [item["lifecycle"] for item in lifecycle_records]
+    assert [item["event"] for item in lifecycle] == ["queue_admitted", "status_membership", "executor_return"]
+    joined = lifecycle[1]
+    assert (joined["job_type"], joined["job_correlation"], joined["poll_correlation"]) == (
+        "get", status.job_correlation, poll_correlation,
+    )
+    assert captured_lifecycle[0]["created_ns"] < captured_lifecycle[1]["created_ns"] < captured_lifecycle[2]["created_ns"]
+    expected_flow = producer._Controller__fractional_queue_flow_id(file.file_id, 7)
+    assert {item["flow_hash"] for item in lifecycle_records} == {capture._hash(expected_flow)}
+    finalized = [observer._sanitize_capture_projection(item) for item in projections]
+    finalized_lifecycle = [item["lifecycle"] for item in finalized if item.get("category") == "queue.lifecycle"]
+    assert [item["event"] for item in finalized_lifecycle] == [
+        "queue_admitted", "status_membership", "executor_return",
+    ]
+    assert finalized_lifecycle[1] == joined
 
 
 def test_pending_completion_wake_projects_bounded_local_root_proof_comparisons(tmp_path: Path) -> None:

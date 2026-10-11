@@ -6158,6 +6158,66 @@ class TestModelUpdater(unittest.TestCase):
         )
         return queue_future, controller._Controller__lftp_executor
 
+    def test_fresh_poll_correlation_reaches_unique_queue_lifecycle_membership(self):
+        controller, _, _ = self._make_v092_fast_get_controller()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "fast-get.bin", "/remote/fast-get.bin",
+        )
+        poll_correlation = "lftp-poll:0123456789abcdef"
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=16,
+            policy={"default": "off", "rules": {
+                "queue.lifecycle": "info", "completion.gate": "info",
+            }},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__lftp.status.return_value = [status]
+        controller._take_lftp_status_poll_correlation = lambda: poll_correlation
+
+        ModelUpdater(controller).update()
+
+        membership = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("category") == "queue.lifecycle"
+            and entry.get("details", {}).get("event") == "status_membership"
+        )
+        self.assertEqual("running", membership["details"]["status_state"])
+        self.assertEqual("present", membership["details"]["membership"])
+        self.assertEqual("get", membership["details"]["job_type"])
+        self.assertEqual(status.job_correlation, membership["details"]["job_correlation"])
+        self.assertEqual(poll_correlation, membership["details"]["poll_correlation"])
+
+    def test_queue_lifecycle_without_status_lineage_omits_poll_correlation(self):
+        controller, _, _ = self._make_v092_fast_get_controller()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.GET, LftpJobStatus.State.RUNNING,
+            "fast-get.bin", "/remote/fast-get.bin",
+        )
+        trace = BreadcrumbTraceCollector(
+            lambda: True,
+            max_entries=16,
+            policy={"default": "off", "rules": {"queue.lifecycle": "info"}},
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__lftp.status.return_value = [status]
+        poll_correlation_reader = MagicMock(return_value="lftp-poll:0123456789abcdef")
+        controller._take_lftp_status_poll_correlation = poll_correlation_reader
+
+        ModelUpdater(controller).update()
+
+        poll_correlation_reader.assert_not_called()
+        membership = next(
+            entry for entry in trace.snapshot()["entries"]
+            if entry.get("category") == "queue.lifecycle"
+            and entry.get("details", {}).get("event") == "status_membership"
+        )
+        self.assertEqual("present", membership["details"]["membership"])
+        self.assertEqual("get", membership["details"]["job_type"])
+        self.assertEqual(status.job_correlation, membership["details"]["job_correlation"])
+        self.assertNotIn("poll_correlation", membership["details"])
+
     def test_v092_fast_get_idle_exact_staging_finalizes_optimistic_queue(self):
         """A fast GET can finish between Queue acknowledgement and first status."""
         controller, live_model, file_id = self._make_v092_fast_get_controller(

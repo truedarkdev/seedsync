@@ -5152,6 +5152,7 @@ class _ControllerCoreAccess:
             idle_completion_proven_file_ids: Optional[set[str]] = None,
             diagnostic_statuses: Optional[list[LftpJobStatus]] = None,
             filtered_status_file_ids: Optional[set[str]] = None,
+            poll_correlation: Optional[str] = None,
     ) -> set[tuple[str, Optional[str], Optional[str]]]: ...
     def _confirm_fresh_healthy_download_starts(self, statuses: list[LftpJobStatus]) -> None: ...
     def _complete_download_start_lifecycle(self, file_id: str) -> None: ...
@@ -9140,6 +9141,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     filtered_status_file_ids=getattr(
                         controller, "_Controller__malformed_status_only_file_ids", set(),
                     ),
+                    poll_correlation=lftp_status_poll_correlation,
                 )
                 if isinstance(reconciled_dispatches, set):
                     retired_queue_dispatches = {
