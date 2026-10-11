@@ -76,12 +76,45 @@ class TestLftpJobStatusParser(unittest.TestCase):
                 ("1m", 1000000), ("1mb", 1000000), ("1M", 1000000), ("1MB", 1000000),
                 ("1MiB", 1024**2), ("1Mib", 1024**2),
                 ("1g", 1000000000), ("1gb", 1000000000), ("1G", 1000000000), ("1GB", 1000000000),
-                ("1GiB", 1024**3), ("1Gib", 1024**3)):
+                ("1GiB", 1024**3), ("1Gib", 1024**3),
+                ("1t", 1000**4), ("1tb", 1000**4), ("1T", 1000**4), ("1TB", 1000**4),
+                ("1TiB", 1024**4), ("1Tib", 1024**4)):
             with self.subTest(size=size):
                 self.assertEqual(expected, LftpJobStatusParser._mirror_size_to_bytes(size))
 
         # The generic parser remains binary for legacy chunk sizes and speeds.
         self.assertEqual(1024**2, LftpJobStatusParser._size_to_bytes("1M"))
+
+    def test_mirror_header_parses_terabyte_totals_without_swallowing_paths(self):
+        rows = (
+            ("24G", "1.2T", 24*1000**3, int(1.2*1000**4)),
+            ("24GB", "1.2TB", 24*1000**3, int(1.2*1000**4)),
+            ("24GiB", "1.2TiB", 24*1024**3, int(1.2*1024**4)),
+        )
+        for size_local, size_remote, expected_local, expected_remote in rows:
+            with self.subTest(size_remote=size_remote):
+                output = (
+                    "jobs -v\n"
+                    "[0] queue (sftp://someone:@localhost)\n"
+                    "sftp://someone:@localhost/remote\n"
+                    "Queue is running.\n"
+                    "[1] mirror -c /remote/Archive /local/ "
+                    "-- {}/{} (9%) 8.5 MiB/s\n"
+                ).format(size_local, size_remote)
+
+                statuses = LftpJobStatusParser().parse(output)
+
+                self.assertEqual(1, len(statuses))
+                status = statuses[0]
+                self.assertEqual("Archive", status.name)
+                self.assertEqual("/remote/Archive", status.remote_path)
+                self.assertEqual("/local/", status.local_path)
+                self.assertEqual(
+                    LftpJobStatus.TransferState(
+                        expected_local, expected_remote, 9, 8912896, None,
+                    ),
+                    status.total_transfer_state,
+                )
 
     def test_eta_to_seconds(self):
         self.assertEqual(100, LftpJobStatusParser._eta_to_seconds("100s"))
@@ -321,6 +354,37 @@ class TestLftpJobStatusParser(unittest.TestCase):
             LftpJobStatus.TransferState(1024, 2*1024**2, 50, 3334471, None),
             statuses[0].total_transfer_state,
         )
+
+    def test_mirror_known_options_accepts_terabyte_totals_but_not_speed_units(self):
+        def parse(speed):
+            output = (
+                "jobs -v\n"
+                "[0] queue (sftp://someone:@localhost)\n"
+                "sftp://someone:@localhost/remote\n"
+                "Queue is running.\n"
+                "[1] mirror -c --exclude sample /remote/Archive /local/staging/ "
+                "-- 24G/1.2T (20%) {}\n"
+            ).format(speed)
+            return LftpJobStatusParser().parse(output)
+
+        statuses = parse("8.5 MiB/s")
+        self.assertEqual(1, len(statuses))
+        self.assertEqual(
+            LftpJobStatus.TransferState(24*1000**3, int(1.2*1000**4), 20, 8912896, None),
+            statuses[0].total_transfer_state,
+        )
+
+        parser = LftpJobStatusParser()
+        with self.assertRaises(LftpJobStatusParserError):
+            parser.parse(
+                "jobs -v\n"
+                "[0] queue (sftp://someone:@localhost)\n"
+                "sftp://someone:@localhost/remote\n"
+                "Queue is running.\n"
+                "[1] mirror -c --exclude sample /remote/Archive /local/staging/ "
+                "-- 24G/1.2T (20%) 8.5 TiB/s\n"
+            )
+        self.assertEqual("hard_error", parser.last_parse_outcome)
 
     def test_mirror_unquoted_exclusion_preserves_escaped_space_backslash_and_quote(self):
         for exclusion in (r"sample\ pattern", r"sample\\pattern", r"sample\"pattern"):

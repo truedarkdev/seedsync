@@ -42,6 +42,10 @@ class LftpJobStatusParser:
                           "k|kb|kib|K|Kb|KB|KiB|Kib|"
                           "m|mb|mib|M|Mb|MB|MiB|Mib|"
                           "g|gb|gib|G|Gb|GB|GiB|Gib")
+    # MIRROR totals use decimal bare units, with optional IEC suffixes.
+    # Keep terabyte units out of the generic size grammar used by chunk and
+    # speed parsing, whose established behavior remains binary through G.
+    __MIRROR_SIZE_UNITS_REGEX = __SIZE_UNITS_REGEX + "|t|tb|tib|T|Tb|TB|TiB|Tib"
     __TIME_UNITS_REGEX = r"(?P<eta_d>\d*d)?(?P<eta_h>\d*h)?(?P<eta_m>\d*m)?(?P<eta_s>\d*s)?"
 
     __QUOTED_FILE_NAME_REGEX = r"`(?P<name>.*)'"
@@ -62,11 +66,12 @@ class LftpJobStatusParser:
     __MIRROR_HEADER_PREFIX_REGEX = re.compile(r"^\[(?P<id>\d+)\]\s+mirror\s+")
     __MIRROR_QUEUE_HEADER_PREFIX_REGEX = re.compile(r"^(?P<id>\d+)\.\s+mirror\s+")
     __MIRROR_PROGRESS_SUFFIX_REGEX = re.compile(
-        r"^\s+(?P<szlocal>\d+\.?\d*\s?(?:{sz})?)\/"
-        r"(?P<szremote>\d+\.?\d*\s?(?:{sz})?)\s+"
+        r"^\s+(?P<szlocal>\d+\.?\d*\s?(?:{msz})?)\/"
+        r"(?P<szremote>\d+\.?\d*\s?(?:{msz})?)\s+"
         r"\((?P<pctlocal>\d+)%\)"
         r"(?:\s+(?P<speed>\d+\.?\d*\s?(?:{sz}))\/s)?\s*$".format(
             sz=__SIZE_UNITS_REGEX,
+            msz=__MIRROR_SIZE_UNITS_REGEX,
         )
     )
 
@@ -114,7 +119,7 @@ class LftpJobStatusParser:
         """Parse MIRROR totals, whose bare units are decimal in LFTP output."""
         result = re.fullmatch(
             r"\s*(?P<number>\d+\.?\d*)\s*(?P<units>{})?\s*".format(
-                LftpJobStatusParser.__SIZE_UNITS_REGEX,
+                LftpJobStatusParser.__MIRROR_SIZE_UNITS_REGEX,
             ), size,
         )
         if result is None:
@@ -124,7 +129,7 @@ class LftpJobStatusParser:
         if unit == "b":
             multiplier = 1
         else:
-            power = "kmg".index(unit[0]) + 1
+            power = "kmgt".index(unit[0]) + 1
             base = 1024 if unit.endswith("ib") else 1000
             multiplier = base ** power
         return int(number * multiplier)
@@ -449,12 +454,15 @@ class LftpJobStatusParser:
                                  r"(?P<lq>['\"]|)(?P<remote>.+)(?P=lq)\s+"  # greedy on purpose
                                  r"(?P<rq>['\"]|)(?P<local>.+)(?P=rq)\s+"  # greedy on purpose
                                  r"--\s+"
-                                 r"(?P<szlocal>\d+\.?\d*\s?({sz})?)"  # size=0 has no units
+                                 r"(?P<szlocal>\d+\.?\d*\s?({msz})?)"  # size=0 has no units
                                  r"\/"
-                                 r"(?P<szremote>\d+\.?\d*\s?({sz})?)\s+"  # size=0 has no units
+                                 r"(?P<szremote>\d+\.?\d*\s?({msz})?)\s+"  # size=0 has no units
                                  r"\((?P<pctlocal>\d+)%\)"
                                  r"(\s+(?P<speed>\d+\.?\d*\s?({sz}))\/s)?$")\
-            .format(sz=LftpJobStatusParser.__SIZE_UNITS_REGEX)
+            .format(
+                sz=LftpJobStatusParser.__SIZE_UNITS_REGEX,
+                msz=LftpJobStatusParser.__MIRROR_SIZE_UNITS_REGEX,
+            )
         mirror_header_m = re.compile(mirror_header_pattern)
 
         # mirror header (connecting or receiving file list)

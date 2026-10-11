@@ -24,6 +24,7 @@ from controller.model_builder import _RecentLiveTransferSnapshot, _TransferState
 from controller.model_updater import ModelUpdater
 from controller.extract import ExtractStatus
 from controller.validate import ValidateStatus
+from web.serialize.serialize_model import SerializeModel
 from common.breadcrumb_trace import BreadcrumbTraceCollector, opaque_trace_correlation, trace_session_digest
 from common.performance_diagnostics import (
     COUNTER_PAIR_SAFETY_REJECT_STATUS_ONLY_NAME,
@@ -3637,6 +3638,110 @@ class TestModelBuilder(unittest.TestCase):
         with self.assertRaises(ModelError) as context:
             self.model_builder.build_model()
         self.assertTrue(str(context.exception).startswith("Mismatch in is_dir between file and extract status"))
+
+    def test_mirror_terabyte_header_preserves_canonical_downloading_publication(self):
+        pair = {
+            "id": "pair-a", "name": "Pair A",
+            "remote_path": "/remote", "local_path": "/local",
+        }
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://user:@localhost)\n"
+            "sftp://user:@localhost/remote\n"
+            "Queue is running.\n"
+            "[1] mirror -c /remote/Archive /local/ -- 24G/1.2T (2%) 8.5 MiB/s\n"
+        )
+        statuses = LftpJobStatusParser().parse(output)
+        annotator = object.__new__(Lftp)
+        annotator._Lftp__path_pairs_by_id = {pair["id"]: pair}
+        Lftp._Lftp__annotate_status_path_pairs(annotator, statuses)
+
+        remote = SystemFile("Archive", 1_200_000_000_000, True)
+        remote.add_child(SystemFile("payload.bin", 1_196_000_000_000, False))
+        remote.add_child(SystemFile("complete.bin", 4_000_000_000, False, mtime_ns=1_000_000_000))
+        local = SystemFile(
+            "Archive", 24_000_000_000, True, is_staging=True, has_staging_origin=True,
+        )
+        local_child = SystemFile(
+            "payload.bin", 20_000_000_000, False,
+            is_staging=True, has_staging_origin=True,
+        )
+        local.add_child(local_child)
+        local.add_child(SystemFile(
+            "complete.bin", 4_000_000_000, False, mtime_ns=1_000_000_000,
+            has_staging_origin=False,
+        ))
+        for root in (remote, local):
+            root.path_pair_id = pair["id"]
+            root.path_pair_name = pair["name"]
+
+        # Establish the real builder's transferable/staging admission prerequisites.
+        self.assertTrue(remote.is_dir)
+        self.assertEqual(2, len(list(remote.iter_children())))
+        self.assertTrue(ModelBuilder._ModelBuilder__has_remote_transferable_content(remote))
+        self.assertTrue(local.is_dir and local.is_staging and local.has_staging_origin)
+        self.assertTrue(local_child.is_staging and local_child.has_staging_origin)
+        self.assertFalse(local_child.status_sidecar_ready)
+        self.assertFalse(local_child.has_staging_collision)
+        self.assertLess(local_child.size, next(remote.iter_children()).size)
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+        self.model_builder.set_lftp_statuses(statuses)
+        canonical_id = ModelFile.build_file_id("Archive", pair["id"])
+        self.assertEqual(("complete.bin",),
+                         self.model_builder.get_trusted_final_leaf_paths(canonical_id))
+        self.assertEqual(4_000_000_000,
+                         ModelBuilder._ModelBuilder__trusted_final_leaf_bytes(remote, local))
+        model = self.model_builder.build_model()
+        canonical = model.get_file(canonical_id)
+        self.assertTrue(canonical.remote_present and canonical.local_present)
+        self.assertTrue(canonical.remote_has_transferable_content)
+        self.assertTrue(canonical.get_children()[0].remote_has_transferable_content)
+        self.assertGreater(canonical.transferred_size, 0)
+        self.assertFalse(canonical.complete_local_coverage)
+
+        # A T-total must attach the running job to the inventory root, rather
+        # than publishing a second status-only row whose name includes totals.
+        self.assertEqual(ModelFile.State.DOWNLOADING, canonical.state)
+        self.assertEqual("downloading", Controller._model_record_visible_state(canonical))
+        self.assertEqual({canonical_id}, model.get_file_ids())
+        sse = SerializeModel().model([model.get_file(file_id) for file_id in model.get_file_ids()])
+        self.assertIn("event: model-init\n", sse)
+        rows = json.loads(next(line[6:] for line in sse.splitlines() if line.startswith("data: ")))
+        self.assertEqual(1, len(rows))
+        row = rows[0]
+        self.assertEqual(canonical_id, row["file_id"])
+        self.assertEqual("Archive", row["name"])
+        self.assertEqual("Archive", row["full_path"])
+        self.assertEqual(pair["id"], row["path_pair_id"])
+        self.assertEqual(pair["name"], row["path_pair_name"])
+        self.assertEqual("downloading", row["state"])
+        self.assertEqual(1_200_000_000_000, row["remote_size"])
+        self.assertEqual(24_000_000_000, row["local_size"])
+        # The live mirror count is combined with the trusted completed sibling;
+        # scanner bytes can lag the current transfer status.
+        self.assertEqual(28_000_000_000, row["transferred_size"])
+        self.assertEqual(2, row["download_progress"])
+        self.assertEqual(8_912_896, row["downloading_speed"])
+        self.assertFalse(row["complete_local_coverage"])
+        self.assertEqual(2, len(row["children"]))
+        children = {child["name"]: child for child in row["children"]}
+        self.assertEqual(ModelFile.build_file_id("Archive/payload.bin", pair["id"]),
+                         children["payload.bin"]["file_id"])
+        self.assertEqual("downloaded", children["complete.bin"]["state"])
+
+        self.assertEqual(1, len(statuses))
+        status = statuses[0]
+        self.assertEqual("Archive", status.name)
+        self.assertEqual(pair["id"], status.path_pair_id)
+        self.assertEqual(pair["name"], status.path_pair_name)
+        self.assertEqual("/remote/Archive", status.remote_path)
+        self.assertEqual("/local/", status.local_path)
+        self.assertEqual(LftpJobStatus.Type.MIRROR, status.type)
+        self.assertEqual(LftpJobStatus.State.RUNNING, status.state)
+        self.assertEqual(LftpJobStatus.TransferState(
+            24_000_000_000, 1_200_000_000_000, 2, 8_912_896, None,
+        ), status.total_transfer_state)
 
     def test_build_state(self):
         # Queued
