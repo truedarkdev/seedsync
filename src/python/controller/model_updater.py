@@ -401,6 +401,8 @@ def _record_active_scan_adoption_join(
         pre_poll_targets_incomplete: bool,
         pending_targets: object, active_files: object,
         setter_succeeded: bool, poll_correlation: object,
+        raw_active_files: object = None, handoff_file_ids: object = None,
+        current_process_final_file_ids: object = None,
 ) -> None:
     """Record selected inputs and the Builder setter outcome, not model publication."""
     try:
@@ -427,7 +429,9 @@ def _record_active_scan_adoption_join(
             return
 
         roots = active_files if isinstance(active_files, (list, tuple)) else None
+        raw_roots = raw_active_files if isinstance(raw_active_files, (list, tuple)) else roots
         root_staging_by_id: dict[str, Optional[bool]] = {}
+        raw_root_ids: set[str] = set()
         if roots is not None:
             for root in roots:
                 if not isinstance(root, SystemFile):
@@ -436,11 +440,19 @@ def _record_active_scan_adoption_join(
                 if root_id in selected:
                     is_staging = getattr(root, "is_staging", None)
                     root_staging_by_id[root_id] = is_staging if type(is_staging) is bool else None
+        if raw_roots is not None:
+            for root in raw_roots:
+                if not isinstance(root, SystemFile):
+                    continue
+                root_id = ModelFile.build_file_id(root.name, getattr(root, "path_pair_id", None))
+                if root_id in selected:
+                    raw_root_ids.add(root_id)
 
         pair_tokens = getattr(scan, "_scan_authority_tokens_by_pair", None)
         session_token = getattr(scan, "session_token", None)
         generation = getattr(scan, "generation", None)
         timestamp = getattr(scan, "timestamp", None)
+        started_at = getattr(scan, "scan_started_at", None)
         scan_final = getattr(scan, "is_scan_final", None)
         scan_failed = getattr(scan, "failed", None)
         scanned_pairs = getattr(scan, "scanned_path_pair_ids", None)
@@ -450,6 +462,7 @@ def _record_active_scan_adoption_join(
         captured_utc = datetime.now(timezone.utc).isoformat()
         captured_monotonic_ns = time.monotonic_ns()
         timestamp_value = timestamp.isoformat() if isinstance(timestamp, datetime) else None
+        started_ms = int(started_at.timestamp() * 1000) if isinstance(started_at, datetime) else None
 
         def pair_member(pair_ids: object, path_pair_id: Optional[str]) -> Optional[bool]:
             if isinstance(pair_ids, (set, frozenset)):
@@ -467,6 +480,7 @@ def _record_active_scan_adoption_join(
             root_present = file_id in root_staging_by_id if roots is not None else None
             details = {
                 "scan_side": "active",
+                "selected_root_ref": opaque_trace_correlation(file_id),
                 "active_scan_digest": (
                     trace_session_digest(pair_session)
                     if isinstance(pair_session, str) and pair_session else None
@@ -477,11 +491,21 @@ def _record_active_scan_adoption_join(
                 "scan_final": scan_final if type(scan_final) is bool else None,
                 "scan_failed": scan_failed if type(scan_failed) is bool else None,
                 "scan_result_timestamp": timestamp_value,
+                "scan_started_at_ms": started_ms if type(started_ms) is int and started_ms >= 0 else None,
+                "scan_started_at_known": type(started_ms) is int and started_ms >= 0,
                 "captured_utc": captured_utc,
                 "captured_monotonic_ns": captured_monotonic_ns,
                 "poll_correlation": safe_poll,
                 "setter_succeeded": setter_succeeded,
                 "root_in_setter_input": root_present,
+                "root_in_scan_result": file_id in raw_root_ids if raw_roots is not None else None,
+                "handoff_suppressed": (
+                    file_id in handoff_file_ids if isinstance(handoff_file_ids, (set, frozenset)) else None
+                ),
+                "current_process_final_publication": (
+                    file_id in current_process_final_file_ids
+                    if isinstance(current_process_final_file_ids, (set, frozenset)) else None
+                ),
                 "root_is_staging": root_staging_by_id.get(file_id) if root_present else None,
                 "scanned_pair": pair_member(scanned_pairs, path_pair_id),
                 "completed_pair": pair_member(completed_pairs, path_pair_id),
@@ -2990,6 +3014,8 @@ class _ProgressiveScanAccumulator:
             root_present: Optional[bool] = None,
             root_final_complete: Optional[bool] = None,
             root_staging_complete: Optional[bool] = None,
+            protection_reason: Optional[str] = None,
+            root_protected: Optional[bool] = None,
     ) -> None:
         """Record bounded facts for one exact move-invalidation lifecycle phase."""
         try:
@@ -2999,20 +3025,65 @@ class _ProgressiveScanAccumulator:
             generation = getattr(event, "generation", None)
             generation = generation if type(generation) is int and 0 <= generation <= 2**63 - 1 else None
             captured_known = type(captured_generation) is int and 0 <= captured_generation <= 2**63 - 1
+            pair_id, root_name = key
+            event_session = getattr(event, "session_token", None)
+            scan_started_at = getattr(event, "scan_started_at", None)
+            scan_started_ms = int(scan_started_at.timestamp() * 1000) \
+                if isinstance(scan_started_at, datetime) else None
+            outcomes = getattr(event, "root_scan_outcomes_by_pair", None)
+            pair_outcomes = outcomes.get(pair_id) if isinstance(outcomes, dict) else None
+            outcome = pair_outcomes.get(root_name) if isinstance(pair_outcomes, dict) else None
+            full_pairs = getattr(event, "full_snapshot_path_pair_ids", None)
+            scanned_pairs = getattr(event, "scanned_path_pair_ids", None)
+            completed_pairs = getattr(event, "completed_path_pair_ids", None)
+            unknown_pairs = getattr(event, "unknown_path_pair_ids", None)
+            pair_member = lambda values: pair_id in values if isinstance(values, (set, frozenset)) else None
+            full = getattr(event, "is_full_snapshot", None)
+            targeted = getattr(event, "is_targeted_scan", None)
+            scan_final = getattr(event, "is_scan_final", None)
+            scan_failed = getattr(event, "failed", None)
+            outcome_known = isinstance(outcome, tuple) and len(outcome) == 2 and \
+                type(outcome[0]) is bool and type(outcome[1]) is bool
             self.__fence_diagnostic_recorder(pair_id, root_name, {
                 "message": "move_root_invalidation_lifecycle",
                 "schema": "move_root_invalidation_lifecycle.v1",
                 "phase": phase,
+                "protection_reason": protection_reason if protection_reason in {
+                    "move_pending", "confirmed_delete", "pre_move_generation",
+                    "scan_incomplete", "healthy_full_snapshot", "root_incomplete", "root_absent", "unknown",
+                } else None,
+                "root_protected": root_protected if type(root_protected) is bool else None,
                 "captured_generation": captured_generation if captured_known else None,
                 "event_generation": generation,
                 "completion_known": isinstance(completed_at, datetime),
+                "scan_instance_digest": (
+                    trace_session_digest(event_session)
+                    if isinstance(event_session, str) and event_session else None
+                ),
+                "scan_instance_matches_accumulator": (
+                    event_session == self.__session_token
+                    if isinstance(event_session, str) and isinstance(self.__session_token, str) else None
+                ),
+                "scan_started_at_ms": scan_started_ms if type(scan_started_ms) is int and scan_started_ms >= 0 else None,
                 "scan_started_after_completion": (
                     scan_started_after_completion
                     if type(scan_started_after_completion) is bool else None
                 ),
+                "scan_full": full if type(full) is bool else None,
+                "scan_final": scan_final if type(scan_final) is bool else None,
+                "scan_failed": scan_failed if type(scan_failed) is bool else None,
+                "scan_pair_full_snapshot": pair_member(full_pairs),
+                "scan_pair_completed": pair_member(completed_pairs),
+                "scan_pair_unknown": pair_member(unknown_pairs),
                 "root_present": root_present if type(root_present) is bool else None,
-                "root_final_complete": root_final_complete if type(root_final_complete) is bool else None,
-                "root_staging_complete": root_staging_complete if type(root_staging_complete) is bool else None,
+                "root_final_complete": (
+                    root_final_complete if type(root_final_complete) is bool else
+                    outcome[0] if outcome_known else None
+                ),
+                "root_staging_complete": (
+                    root_staging_complete if type(root_staging_complete) is bool else
+                    outcome[1] if outcome_known else None
+                ),
             })
         except Exception:
             # Optional lifecycle evidence cannot alter scan or move authority.
@@ -3614,34 +3685,55 @@ class _ProgressiveScanAccumulator:
                 for (invalid_pair_id, root_name), entries in self.__move_invalidations_by_root.items():
                     if invalid_pair_id != pair_id:
                         continue
-                    if any(
-                            status == "confirmed_delete" or status == "pending" or
-                            generation <= captured_generation or not healthy_post_move_snapshot
-                            for captured_generation, status, _ in entries.values()
-                    ):
+                    is_protected = any(
+                        status == "confirmed_delete" or status == "pending" or
+                        generation <= captured_generation or not healthy_post_move_snapshot
+                        for captured_generation, status, _ in entries.values()
+                    )
+                    if is_protected:
                         protected_root_names.add(root_name)
-                        if self.__fence_diagnostics_enabled():
-                            root = event_root_objects.get(root_name)
-                            outcome = pair_outcomes.get(root_name) if isinstance(pair_outcomes, dict) else None
-                            if isinstance(root, SystemFile) and root.name == root_name and \
-                                    self.__pair_for_file(root, event) == pair_id and \
-                                    isinstance(outcome, tuple) and len(outcome) == 2 and \
-                                    outcome[0] is True and outcome[1] is True:
+                    if self.__fence_diagnostics_enabled():
+                        try:
+                            diagnostic_entry = next((
+                                item for item in entries.values()
+                                if item[1] == "confirmed_delete" or item[1] == "pending" or
+                                generation <= item[0] or not healthy_post_move_snapshot
+                            ), None) if is_protected else next(iter(entries.values()), None)
+                            if diagnostic_entry is not None:
+                                captured_generation, status, completed_at = diagnostic_entry
+                                if status == "confirmed_delete":
+                                    protection_reason = "confirmed_delete"
+                                elif status == "pending":
+                                    protection_reason = "move_pending"
+                                elif generation <= captured_generation:
+                                    protection_reason = "pre_move_generation"
+                                elif not healthy_post_move_snapshot:
+                                    protection_reason = "scan_incomplete"
+                                else:
+                                    protection_reason = "healthy_full_snapshot"
+                                root = event_root_objects.get(root_name)
+                                outcome = pair_outcomes.get(root_name) if isinstance(pair_outcomes, dict) else None
                                 started_at = getattr(event, "scan_started_at", None)
-                                for captured_generation, status, completed_at in entries.values():
-                                    if status not in ("pending", "committed"):
-                                        continue
-                                    started_after_move = None
-                                    started_after_move = _datetime_strictly_after(started_at, completed_at)
-                                    self.__record_move_root_lifecycle(
-                                        (pair_id, root_name), "protected", captured_generation,
-                                        completed_at=completed_at, event=event,
-                                        scan_started_after_completion=started_after_move,
-                                        root_present=True,
-                                        root_final_complete=outcome[0],
-                                        root_staging_complete=outcome[1],
-                                    )
-                                    break
+                                self.__record_move_root_lifecycle(
+                                    (pair_id, root_name), "protected" if is_protected else "evaluated",
+                                    captured_generation,
+                                    completed_at=completed_at if isinstance(completed_at, datetime) else None,
+                                    event=event,
+                                    scan_started_after_completion=_datetime_strictly_after(started_at, completed_at),
+                                    root_present=isinstance(root, SystemFile),
+                                    root_final_complete=(
+                                        outcome[0] if isinstance(outcome, tuple) and len(outcome) == 2
+                                        and type(outcome[0]) is bool else None
+                                    ),
+                                    root_staging_complete=(
+                                        outcome[1] if isinstance(outcome, tuple) and len(outcome) == 2
+                                        and type(outcome[1]) is bool else None
+                                    ),
+                                    protection_reason=protection_reason,
+                                    root_protected=is_protected,
+                                )
+                        except Exception:
+                            pass
                 if root_shape_trace is not None:
                     root_shape_trace["protected_root_count"] += len(protected_root_names)
                 if generation < previous_generation:
@@ -7965,6 +8057,8 @@ class ModelUpdater(_ControllerCoreAccess):
         lifecycle_local_authority: object = None
         lifecycle_local_incomplete: object = None
         lifecycle_local_completed: object = None
+        lifecycle_remote_incomplete: object = None
+        lifecycle_remote_completed: object = None
         joint_root_shape_trace_enabled = progressive_mode and _controller_breadcrumb_effectively_enabled(
             controller, "scan.root_shape", "info",
         )
@@ -7975,43 +8069,172 @@ class ModelUpdater(_ControllerCoreAccess):
             """Emit topology-only reconciler input/output evidence after the gate."""
             if not joint_root_shape_trace_enabled:
                 return
-            def roots_from(value: object) -> list[SystemFile]:
-                if isinstance(value, dict):
-                    values = value.values()
-                elif isinstance(value, (list, tuple, set, frozenset)):
-                    values = value
-                else:
-                    values = ()
-                return [file for file in values if isinstance(file, SystemFile)]
-            local_files = roots_from(local_roots)
-            remote_files = roots_from(remote_roots)
-            raw_generations = [
-                getattr(result, "generation", 0)
-                for result in (latest_local_scan, latest_remote_scan)
-                if result is not None and type(getattr(result, "generation", 0)) is int
-            ]
-            session = next(
-                (
-                    getattr(result, "session_token", None)
-                    for result in (latest_remote_scan, latest_local_scan)
-                    if isinstance(getattr(result, "session_token", None), str)
-                ),
-                None,
-            )
-            for scanner_side, files in (("local", local_files), ("remote", remote_files)):
-                _record_root_shape_breadcrumb(
-                    getattr(getattr(controller, "_Controller__context", None), "breadcrumb_trace", None),
-                    files,
-                    phase.endswith("output"),
-                    "joint_reconciler",
-                    "model_updater",
-                    scanner_side=scanner_side,
-                    generation=max(raw_generations, default=0),
-                    session_token=session,
-                    progressive=True,
-                    phase=phase,
-                    flow_id="joint-reconciler:{}".format(scanner_side),
+            try:
+                def roots_from(value: object) -> tuple[list[SystemFile], dict]:
+                    if isinstance(value, dict):
+                        values = value.values()
+                    elif isinstance(value, (list, tuple, set, frozenset)):
+                        values = value
+                    else:
+                        values = ()
+                    files = []
+                    members = {}
+                    for file in values:
+                        if isinstance(file, SystemFile):
+                            files.append(file)
+                            members[(file.path_pair_id, file.name)] = file
+                    return files, members
+
+                local_files, local_members = roots_from(local_roots)
+                remote_files, remote_members = roots_from(remote_roots)
+                raw_generations = [
+                    getattr(result, "generation", 0)
+                    for result in (latest_local_scan, latest_remote_scan)
+                    if result is not None and type(getattr(result, "generation", 0)) is int
+                ]
+                session = next(
+                    (
+                        getattr(result, "session_token", None)
+                        for result in (latest_remote_scan, latest_local_scan)
+                        if isinstance(getattr(result, "session_token", None), str)
+                    ),
+                    None,
                 )
+
+                def decode_root(file_id: object) -> Optional[tuple[Optional[str], str]]:
+                    if not isinstance(file_id, str) or not file_id or len(file_id) > 2048:
+                        return None
+                    try:
+                        value = json.loads(file_id)
+                    except (TypeError, ValueError):
+                        value = None
+                    if isinstance(value, list) and len(value) == 2 and \
+                            isinstance(value[0], str) and isinstance(value[1], str) and value[1]:
+                        pair_id, name = value
+                    elif ModelFile.build_file_id(file_id, None) == file_id:
+                        pair_id, name = None, file_id
+                    else:
+                        return None
+                    return (pair_id, name) if ModelFile.build_file_id(name, pair_id) == file_id else None
+
+                witness_ids: list[str] = []
+                seen_ids: set[str] = set()
+                witness_omitted = False
+
+                def add_witness(file_id: object) -> None:
+                    nonlocal witness_omitted
+                    if not isinstance(file_id, str) or decode_root(file_id) is None or file_id in seen_ids:
+                        return
+                    if len(witness_ids) >= 8:
+                        witness_omitted = True
+                        return
+                    seen_ids.add(file_id)
+                    witness_ids.append(file_id)
+
+                current_ids = getattr(
+                    controller, "_Controller__current_process_final_publication_file_ids", None,
+                )
+                handoff_ids = getattr(controller, "_Controller__successful_final_move_handoff_file_ids", None)
+                pending_entries = getattr(controller, "_Controller__pending_completion_file_names", None)
+                if isinstance(pending_entries, (set, frozenset, list, tuple)):
+                    pending_ids: set[str] = set()
+                    pending_omitted = False
+                    for entry in islice(pending_entries, 9):
+                        if isinstance(entry, tuple) and len(entry) >= 2 and isinstance(entry[0], str) and \
+                                (entry[1] is None or isinstance(entry[1], str)):
+                            pending_ids.add(ModelFile.build_file_id(entry[0], entry[1]))
+                    pending_omitted = len(pending_entries) > 8
+                    for file_id in pending_ids:
+                        add_witness(file_id)
+                else:
+                    pending_ids = set()
+                    pending_omitted = True
+                for selected_ids in (current_ids, handoff_ids):
+                    if isinstance(selected_ids, (set, frozenset, list, tuple)):
+                        for file_id in islice(selected_ids, 9):
+                            add_witness(file_id)
+                        witness_omitted = witness_omitted or len(selected_ids) > 8
+                witness_rows: list[dict[str, object]] = []
+                local_authority = lifecycle_local_authority
+                local_completed = lifecycle_local_completed
+                local_incomplete = lifecycle_local_incomplete
+                remote_completed = lifecycle_remote_completed
+                remote_incomplete = lifecycle_remote_incomplete
+
+                def pair_state(completed: object, incomplete: object, pair_id: Optional[str]) -> str:
+                    if not isinstance(completed, (set, frozenset)) or not isinstance(incomplete, (set, frozenset)):
+                        return "unknown"
+                    if pair_id in incomplete:
+                        return "incomplete"
+                    return "complete" if pair_id in completed else "unknown"
+
+                for file_id in witness_ids:
+                    decoded = decode_root(file_id)
+                    if decoded is None:
+                        continue
+                    pair_id, root_name = decoded
+                    key = (pair_id, root_name)
+                    if isinstance(local_authority, dict):
+                        if key in local_authority:
+                            authority_value = local_authority[key]
+                            authority_entry = "known_none" if authority_value is None else (
+                                "present" if isinstance(authority_value, SystemFile) and
+                                authority_value.name == root_name and authority_value.path_pair_id == pair_id
+                                else "malformed"
+                            )
+                        else:
+                            local_pair = pair_state(local_completed, local_incomplete, pair_id)
+                            authority_entry = "absent_{}".format(local_pair) if local_pair in {
+                                "complete", "incomplete",
+                            } else "absent_unknown"
+                    else:
+                        authority_entry = "unknown"
+                    local_member = key in local_members
+                    witness_rows.append({
+                        "root_ref": opaque_trace_correlation(file_id),
+                        "local_input_entry": authority_entry,
+                        "local_pair": pair_state(local_completed, local_incomplete, pair_id),
+                        "remote_pair": pair_state(remote_completed, remote_incomplete, pair_id),
+                        "local_member": local_member,
+                    })
+                for scanner_side, files in (("local", local_files), ("remote", remote_files)):
+                    _record_root_shape_breadcrumb(
+                        getattr(getattr(controller, "_Controller__context", None), "breadcrumb_trace", None),
+                        files,
+                        phase.endswith("output"),
+                        "joint_reconciler",
+                        "model_updater",
+                        scanner_side=scanner_side,
+                        generation=max(raw_generations, default=0),
+                        session_token=session,
+                        progressive=True,
+                        phase=phase,
+                        flow_id="joint-reconciler:{}".format(scanner_side),
+                    )
+                for witness in witness_rows:
+                    trace = getattr(getattr(controller, "_Controller__context", None), "breadcrumb_trace", None)
+                    recorder = getattr(trace, "record", None)
+                    if callable(recorder):
+                        recorder("model_updater", "root_shape", {
+                            "schema": "scan.root_shape.v1",
+                            "scanner_side": "local",
+                            "phase": phase,
+                            "generation": max(raw_generations, default=0),
+                            "topology_sampled": False,
+                            "postmove_reconcile_phase": phase,
+                            "postmove_reconcile_omitted": witness_omitted,
+                            "selected_root_ref": witness["root_ref"],
+                            "local_input_entry": witness["local_input_entry"],
+                            "local_pair_state": witness["local_pair"],
+                            "remote_pair_state": witness["remote_pair"],
+                            "local_member": witness["local_member"],
+                        }, stage="remote_scanner_stream", event_type="diagnostic",
+                            trace_scope="aggregate", category="scan.root_shape", level="info",
+                            corr_id=witness["root_ref"],
+                            flow_id=opaque_trace_correlation("joint-reconciler:local"))
+            except Exception:
+                # The witness is optional and cannot alter reconciliation or publication.
+                return
 
         unknown_overlay_changed = False
         # The reconciler owns uncertainty.  The builder only retains its
@@ -8040,6 +8263,8 @@ class ModelUpdater(_ControllerCoreAccess):
                 remote_snapshot, remote_authority, remote_incomplete, remote_completed = side_state(
                     "remote", latest_remote_scan, scoped_final_pair_ids
                 )
+                lifecycle_remote_incomplete = remote_incomplete
+                lifecycle_remote_completed = remote_completed
                 # Keep the already-computed accumulator view by reference for
                 # the post-publication diagnostic join; do not recopy or
                 # re-enumerate Builder's retained root buckets.
@@ -9512,7 +9737,9 @@ class ModelUpdater(_ControllerCoreAccess):
         if latest_active_scan is not None:
             record_scan_result_attribution("active", latest_active_scan)
             active_scan_files = list(latest_active_scan.files)
+            raw_active_scan_files = active_scan_files
             handoff_file_ids = controller._Controller__successful_final_move_handoff_file_ids
+            handoff_suppressed_file_ids = set()
             if handoff_file_ids:
                 active_scan_root_ids = {
                     ModelFile.build_file_id(
@@ -9521,6 +9748,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     )
                     for active_file in active_scan_files
                 }
+                handoff_suppressed_file_ids = handoff_file_ids.intersection(active_scan_root_ids)
                 if not bool(getattr(latest_active_scan, "failed", False)):
                     handoff_file_ids.intersection_update(active_scan_root_ids)
                 active_scan_files = [
@@ -9541,6 +9769,11 @@ class ModelUpdater(_ControllerCoreAccess):
                         active_files=active_scan_files,
                         setter_succeeded=succeeded,
                         poll_correlation=lftp_status_poll_correlation,
+                        raw_active_files=raw_active_scan_files,
+                        handoff_file_ids=handoff_suppressed_file_ids,
+                        current_process_final_file_ids=getattr(
+                            controller, "_Controller__current_process_final_publication_file_ids", None,
+                        ),
                     )
 
                 try:
@@ -13325,6 +13558,9 @@ class ModelUpdater(_ControllerCoreAccess):
                         "local_accumulator_session": getattr(local_accumulator, "session_token", None),
                         "local_process_generation": getattr(local_process, "generation", None),
                         "pre_poll_file_ids": pre_poll_active_lftp_file_ids,
+                        "current_process_final_publication_file_ids": getattr(
+                            controller, "_Controller__current_process_final_publication_file_ids", None,
+                        ),
                     }
                 except Exception:
                     lifecycle_join_kwargs = {}

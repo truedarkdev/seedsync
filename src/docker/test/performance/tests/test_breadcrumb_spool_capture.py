@@ -49,6 +49,7 @@ try:
         _record_lftp_status_breadcrumb,
         _record_lftp_status_membership_transition, _record_lifecycle_scan_breadcrumb,
     )
+    from controller.scan.scanner_process import _record_root_shape_breadcrumb
     from tests.unittests.test_controller import test_model_updater as _model_updater_fixture_module
 except ImportError:
     BreadcrumbTraceCollector = None
@@ -58,6 +59,7 @@ except ImportError:
     trace_session_digest = None
     Controller = None
     _record_lifecycle_scan_breadcrumb = None
+    _record_root_shape_breadcrumb = None
     _ModelFinalizationBreadcrumbSpan = None
     _record_lftp_status_breadcrumb = None
     _record_lftp_status_membership_transition = None
@@ -2222,8 +2224,24 @@ def test_move_root_lifecycle_facts_reach_json_sink_from_finalized_producer(tmp_p
                 scan_started_at=move_completed_at + timedelta(seconds=1),
             )
             accumulator.apply([scan])
+            absent_move_completed_at = datetime.now()
+            absent_token = updater.begin_final_move_local_root_invalidation(
+                "private-absent-root", "private-pair", 2**53 + 18,
+            )
+            updater.finish_final_move_local_root_invalidation(
+                "private-absent-root", "private-pair", absent_token, True, absent_move_completed_at,
+            )
+            absent_scan = ScannerResult(
+                absent_move_completed_at + timedelta(seconds=2), [],
+                scanned_path_pair_ids={"private-pair"}, completed_path_pair_ids={"private-pair"},
+                is_scan_final=True, is_full_snapshot=True, full_snapshot_path_pair_ids={"private-pair"},
+                generation=2**53 + 19,
+                root_scan_outcomes_by_pair={"private-pair": {"private-absent-root": (False, False)}},
+                scan_started_at=absent_move_completed_at - timedelta(seconds=1),
+            )
+            accumulator.apply([absent_scan])
             assert collector.flush_durable(2.0)
-            assert reader.poll() >= 3
+            assert reader.poll() >= 7
         finally:
             reader.close()
     finally:
@@ -2231,13 +2249,17 @@ def test_move_root_lifecycle_facts_reach_json_sink_from_finalized_producer(tmp_p
 
     finalized = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text(encoding="utf-8").splitlines()]
     emitted = [row for row in finalized if row.get("message") == "move_root_invalidation_lifecycle"]
-    assert [row["details"]["phase"] for row in emitted] == ["created", "committed", "released"]
+    assert [row["details"]["phase"] for row in emitted] == [
+        "created", "committed", "released", "created", "committed", "evaluated", "released",
+    ]
     selected = [row for row in _artifacts(artifact) if row.get("capture", {}).get("state") == "record"
                 and row.get("capture", {}).get("projection", {}).get("completion_gate", {}).get("message") ==
                 "move_root_invalidation_lifecycle"]
     projected = [row["capture"]["projection"] for row in selected]
-    assert [row["completion_gate"]["phase"] for row in projected] == ["created", "committed", "released"]
-    assert len(emitted) == len(selected) == 3
+    assert [row["completion_gate"]["phase"] for row in projected] == [
+        "created", "committed", "released", "created", "committed", "evaluated", "released",
+    ]
+    assert len(emitted) == len(selected) == 7
     for source, sink in zip(emitted, selected):
         capture_row = sink["capture"]
         projection = capture_row["projection"]
@@ -2255,17 +2277,25 @@ def test_move_root_lifecycle_facts_reach_json_sink_from_finalized_producer(tmp_p
         assert projection["flow_hash"] == capture._hash(flow_id)
         assert projection["file_hash"] == capture._hash(file_id)
         assert projection["pair_hash"] == capture._hash(pair_id)
-    released = projected[-1]["completion_gate"]
+    released = projected[2]["completion_gate"]
     assert released["schema"] == "move_root_invalidation_lifecycle.v1"
     assert released["captured_generation"] == str(2**53 + 17)
     assert released["event_generation"] == str(2**53 + 18)
     assert released["completion_known"] is True and released["scan_started_after_completion"] is True
     assert released["root_present"] is True and released["root_final_complete"] is True
     assert released["root_staging_complete"] is True
-    safe = observer._sanitize_capture_projection(projected[-1])["completion_gate"]
-    assert safe == released
+    absent = projected[-2]["completion_gate"]
+    assert absent["captured_generation"] == str(2**53 + 18)
+    assert absent["event_generation"] == str(2**53 + 19)
+    assert absent["phase"] == "evaluated" and absent["root_protected"] is False
+    assert absent["protection_reason"] == "healthy_full_snapshot"
+    assert absent["root_present"] is False and absent["scan_started_after_completion"] is False
+    assert projected[-1]["completion_gate"]["phase"] == "released"
+    assert projected[-1]["completion_gate"]["root_present"] is False
+    safe = observer._sanitize_capture_projection(projected[-2])["completion_gate"]
+    assert safe == absent
     artifact_text = artifact.read_text(encoding="utf-8")
-    assert "private-root" not in artifact_text and "private-pair" not in artifact_text
+    assert all(label not in artifact_text for label in ("private-root", "private-absent-root", "private-pair"))
 
 
 
@@ -2555,13 +2585,20 @@ def test_finalized_scan_adoption_and_root_source_reach_json_sink_with_unknowns(t
     adoption = next(item for item in projected if item["category"] == "scan.authority"
                     and item["stage"] == "scan_authority"
                     and item.get("scan_join", {}).get("schema") == "completion_scan_join.v1")
-    assert adoption["scan_join"] == {
+    expected = {
         "schema": "completion_scan_join.v1", "local_scan_mode": "progressive",
         "scan_source_root_object_digest": "0123456789abcdef",
         "accepted_root_object_digest": "fedcba9876543210", "source_pair_scanned": True,
         "source_pair_completed": False, "source_pair_unknown": None, "source_pair_targeted": True,
         "target_pair_covered": None,
     }
+    expected.update({key: None for key in (
+        "selected_root_ref", "root_in_scan_result", "root_in_setter_input", "root_is_staging",
+        "handoff_suppressed", "current_process_final_publication", "scan_final", "scan_failed",
+        "scanned_pair", "completed_pair", "unknown_pair", "scan_started_at_known",
+        "selected_root_omissions", "active_scan_digest", "scan_generation", "scan_started_at_ms",
+    )})
+    assert adoption["scan_join"] == expected
     root = next(item for item in projected if item["category"] == "scan.authority"
                 and item.get("input_arbitration", {}).get("phase") == "root_source")
     assert root["input_arbitration"]["phase"] == "root_source"
@@ -2570,6 +2607,153 @@ def test_finalized_scan_adoption_and_root_source_reach_json_sink_with_unknowns(t
     assert root["input_arbitration"]["local_proof_session_digest"] == "8899aabbccddeeff"
     assert root["input_arbitration"]["local_proof_object_bound"] is False
     assert "private_path" not in json.dumps(projected)
+
+
+@pytest.mark.skipif(BreadcrumbTraceCollector is None or _model_updater_fixture_module is None, reason="production updater fixture is unavailable")
+def test_postmove_reconcile_flat_roots_from_updater_reach_finalized_sink(tmp_path: Path) -> None:
+    fixture = _model_updater_fixture_module.TestModelUpdater()
+    names = ["sample-{}.bin".format(index) for index in range(8)]
+    spool, artifact = _prepare(tmp_path)
+    collector = BreadcrumbTraceCollector(
+        lambda: True, max_entries=128,
+        policy={"default": "off", "rules": {"scan.root_shape": "info"}},
+        durable_enabled=True, durable_path=str(spool),
+    )
+
+    def exercise(trace):
+        local_roots = [SystemFile(name, 10, False) for name in names]
+        remote_roots = [SystemFile(name, 10, False) for name in names]
+        def result(files, instance, generation):
+            return ScannerResult(
+                datetime.now(), files, generation=generation, session_token=instance,
+                is_progress=True, is_scan_final=True, is_full_snapshot=True,
+                scanned_path_pair_ids={None}, completed_path_pair_ids={None},
+                full_snapshot_path_pair_ids={None},
+            )
+        builder = ModelBuilder()
+        controller, _ = fixture._make_progressive_update_controller(
+            None, None, authoritative=False, model_builder=builder, model=Model(),
+        )
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__current_process_final_publication_file_ids = set(names)
+        controller._Controller__remote_scan_process = fixture._progressive_process(
+            "remote-instance", [[result(remote_roots, "remote-instance", 1)], []],
+        )
+        controller._Controller__local_scan_process = fixture._progressive_process(
+            "local-instance", [[result(local_roots, "local-instance", 1)],
+                               [result(local_roots[:4], "local-instance", 2)]],
+        )
+        updater = ModelUpdater(controller)
+        updater.update()
+        if trace is collector:
+            assert collector.flush_durable(2.0)
+            reader.start()
+        updater.update()
+        return tuple((name, controller._Controller__model.get_file(name).local_size,
+                      controller._Controller__model.get_file(name).state.name)
+                     for name in names)
+
+    reader = _reader(spool, artifact)
+    try:
+        observed = exercise(collector)
+        assert collector.flush_durable(2.0)
+        assert reader.poll() > 0
+        off = SimpleNamespace(is_effectively_enabled=lambda *args, **kwargs: False)
+        fault = SimpleNamespace(is_effectively_enabled=lambda *args, **kwargs: True,
+                                record=MagicMock(side_effect=RuntimeError("trace failure")))
+        assert exercise(off) == observed == exercise(fault)
+        assert any(call.args[:2] == ("model_updater", "root_shape") for call in fault.record.call_args_list)
+    finally:
+        reader.close()
+        collector.close(timeout=2.0)
+    finalized = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text().splitlines()]
+    raw = [row for row in finalized if row.get("details", {}).get("postmove_reconcile_phase")]
+    assert len(raw) == 64
+    expected_refs = {opaque_trace_correlation(name) for name in names}
+    assert {row["details"]["selected_root_ref"] for row in raw} == expected_refs
+    assert all(len(row["details"]) <= 24 for row in raw)
+    assert all(row["details"]["postmove_reconcile_omitted"] is False for row in raw)
+    late = raw[32:]
+    assert sum(row["details"]["local_input_entry"] == "absent_complete" for row in late) == 16
+    for phase in ("reconcile_delta_input", "reconcile_delta_output", "reconcile_final_input", "reconcile_final_output"):
+        scoped = [row["details"] for row in late if row["details"]["phase"] == phase]
+        assert len(scoped) == 8
+        assert sum(row["local_member"] is False for row in scoped) == (8 if phase == "reconcile_delta_output" else 4)
+    selected = [row for row in _artifacts(artifact)
+                if row["capture"].get("state") == "record"
+                and "postmove_reconcile" in row["capture"]["projection"]]
+    assert len(selected) == len(late)
+    for source, captured in zip(late, selected):
+        sink = captured["capture"]["projection"]
+        facts = sink["postmove_reconcile"]
+        assert facts["root_ref"] == source["details"]["selected_root_ref"]
+        assert facts["local_input_entry"] == source["details"]["local_input_entry"]
+        assert facts["local_member"] == source["details"]["local_member"]
+        assert observer._sanitize_capture_projection(sink)["postmove_reconcile"] == facts
+        assert captured["capture"]["created_ns"] == source["created_ns"]
+        assert captured["capture"]["created_ms"] == source["created_ms"]
+    assert not any(name in artifact.read_text() for name in names)
+
+
+@pytest.mark.skipif(BreadcrumbTraceCollector is None or trace_session_digest is None or _record_lifecycle_scan_breadcrumb is None, reason="production breadcrumb producer is unavailable")
+def test_builder_postterminal_absence_preserves_bucket_in_finalized_sink(tmp_path: Path) -> None:
+    spool, artifact = _prepare(tmp_path)
+    collector = BreadcrumbTraceCollector(
+        lambda: True, policy={"default": "off", "rules": {"lifecycle.persist": "info"}},
+        durable_enabled=True, durable_path=str(spool),
+    )
+    builder = ModelBuilder()
+    remote = SystemFile("record.bin", 10, False)
+    remote.path_pair_id = "sample-pair"
+    builder.set_remote_files([remote])
+    candidate = builder.build_model()
+    file_id = ModelFile.build_file_id(remote.name, remote.path_pair_id)
+    assert candidate.get_file(file_id).state == ModelFile.State.DEFAULT
+    assert candidate.get_file(file_id).local_size is None
+    builder.set_downloaded_files({file_id})
+    builder.set_stop_resume_trace_breadcrumb(collector)
+    kwargs = {
+        "local_scan_snapshot": {}, "local_scan_authority": {(remote.path_pair_id, remote.name): None},
+        "local_pair_authority_tokens": {remote.path_pair_id: ("local-instance", 4)},
+        "local_completed_pair_ids": {remote.path_pair_id}, "local_incomplete_pair_ids": set(),
+        "local_process_session": "local-instance", "local_accumulator_session": "local-instance",
+        "local_process_generation": 4, "pre_poll_file_ids": set(),
+        "current_process_final_publication_file_ids": {file_id},
+    }
+    reader = _reader(spool, artifact)
+    try:
+        assert collector.record(
+            "model_builder", "publication_test_baseline", {"ready": True},
+            category="lifecycle.persist", stage="persist_authority", event_type="diagnostic", level="info",
+        ) in {"retained", "enqueued"}
+        assert collector.flush_durable(2.0)
+        reader.start()
+        subjects = builder.record_lifecycle_candidate_publication(candidate, "full_build", live=candidate, **kwargs)
+        assert subjects == {file_id}
+        builder.record_lifecycle_live_publication(candidate, candidate, subjects, "full_build", "full_model_adopted", **kwargs)
+        assert collector.flush_durable(2.0)
+        assert reader.poll() == 2
+    finally:
+        reader.close()
+        collector.close(timeout=2.0)
+    raw = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text().splitlines()]
+    raw = [row for row in raw if row.get("message") in {"model_candidate", "model_live_publication"}]
+    assert [row["message"] for row in raw] == ["model_candidate", "model_live_publication"]
+    captured = [row for row in _artifacts(artifact) if row["capture"].get("state") == "record"]
+    assert len(captured) == 2
+    for source, sink in zip(raw, captured):
+        details = source["details"]
+        assert len(details) <= 24 and "monotonic_ms" in details
+        assert details["local_flow_input_entry"] == "known_none"
+        assert details["local_flow_bucket"] == "no_member"
+        assert details["current_process_final_publication"] is True
+        assert details["candidate_state"] == "default" and details["candidate_local_size"] is None
+        facts = sink["capture"]["projection"]["lifecycle_persist"]
+        assert facts["exact_local_flow_join"]["authority_entry"] == "known_none"
+        assert facts["exact_local_flow_join"]["bucket"] == "no_member"
+        assert observer._sanitize_capture_projection(sink["capture"]["projection"])["lifecycle_persist"] == facts
+        assert sink["capture"]["created_ns"] == source["created_ns"]
+    assert remote.name not in artifact.read_text() and "local-instance" not in artifact.read_text()
 
 
 @pytest.mark.skipif(BreadcrumbTraceCollector is None or trace_session_digest is None or _record_lifecycle_scan_breadcrumb is None, reason="production breadcrumb producer is unavailable")

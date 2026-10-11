@@ -55,7 +55,7 @@ _STAGES = frozenset(
         "admission", "dispatch", "publication", "terminal", "queue_lifecycle", "queue_authority_handoff",
         "queue_readiness", "queue_exclusion", "model", "model_progress", "model_delta", "model_update",
         "model_publication", "model_summary", "model_finalization", "scan", "scan_adoption", "scan_authority",
-        "model_builder_input_arbitration",
+        "model_builder_input_arbitration", "remote_scanner_stream",
         "scan_accumulator", "extract", "controller", "controller_boundary", "persist_transaction", "lifecycle",
         "completion_gate", "final_move_publication", "finalization_child", "transfer_stop", "command",
         "lftp_executor", "lftp_sidecar_validation", "lftp_path_pair_annotation", "lftp_status_poll",
@@ -326,6 +326,9 @@ _LIFECYCLE_PERSIST_ADOPTIONS = frozenset({
 _LIFECYCLE_FLOW_INPUTS = frozenset({"member", "no_member", "unknown"})
 _LIFECYCLE_FLOW_BASES = frozenset({"accepted_current", "unknown"})
 _LIFECYCLE_FLOW_BUCKETS = frozenset({"member", "no_member", "unknown"})
+_LIFECYCLE_FLOW_AUTHORITY_ENTRIES = frozenset({
+    "present", "known_none", "absent_complete", "absent_incomplete", "absent_unknown", "malformed", "unknown",
+})
 _LIFECYCLE_FLOW_SCHEMA = "exact_local_flow_join.v1"
 _LIFECYCLE_PERSIST_FENCES = frozenset({"none"})
 _LIFECYCLE_PERSIST_BOOLEANS = (
@@ -351,7 +354,11 @@ _CONFIRMED_DELETE_FENCE_MESSAGE = "confirmed_delete_fence_disposition"
 _CONFIRMED_DELETE_FENCE_SCHEMA = "confirmed_delete_fence_disposition.v1"
 _MOVE_ROOT_LIFECYCLE_MESSAGE = "move_root_invalidation_lifecycle"
 _MOVE_ROOT_LIFECYCLE_SCHEMA = "move_root_invalidation_lifecycle.v1"
-_MOVE_ROOT_LIFECYCLE_PHASES = frozenset({"created", "committed", "cancelled", "released", "protected"})
+_MOVE_ROOT_LIFECYCLE_PHASES = frozenset({"created", "committed", "cancelled", "released", "protected", "evaluated"})
+_MOVE_ROOT_LIFECYCLE_REASONS = frozenset({
+    "move_pending", "confirmed_delete", "pre_move_generation", "scan_incomplete",
+    "healthy_full_snapshot", "root_incomplete", "root_absent", "unknown",
+})
 _CONFIRMED_DELETE_TARGET_SCOPES = frozenset({"exact_root", "nested_path"})
 _CONFIRMED_DELETE_FENCE_DECISIONS = frozenset({"released", "reset"})
 _CONFIRMED_DELETE_RELEASE_BASES = frozenset({"current_root", "healthy_full_snapshot", "session_reset"})
@@ -661,9 +668,11 @@ def _completion_gate_facts(details: Mapping[str, object], message: object = None
             phase if schema_known and isinstance(phase, str) and phase in _MOVE_ROOT_LIFECYCLE_PHASES
             else "unknown"
         )
+        reason = details.get("protection_reason")
+        result["protection_reason"] = reason if isinstance(reason, str) and reason in _MOVE_ROOT_LIFECYCLE_REASONS else None
         for key in (
             "completion_known", "scan_started_after_completion", "root_present",
-            "root_final_complete", "root_staging_complete",
+            "root_final_complete", "root_staging_complete", "root_protected",
         ):
             value = details.get(key)
             result[key] = value if schema_known and type(value) is bool else None
@@ -1416,9 +1425,11 @@ def _input_arbitration_facts(row: Mapping[str, object], metadata: Mapping[str, o
 
 
 def _completion_scan_join_facts(details: Mapping[str, object], message: object) -> dict[str, object] | None:
-    if details.get("schema") != _COMPLETION_SCAN_JOIN_SCHEMA or message != "scan_root_adopted":
+    if details.get("schema") != _COMPLETION_SCAN_JOIN_SCHEMA or message not in {
+            "scan_root_adopted", "active_scan_root_adopted"}:
         return None
-    payload = details.get("p")
+    active = message == "active_scan_root_adopted"
+    payload = details if active else details.get("p")
     payload = payload if isinstance(payload, Mapping) else {}
 
     def lookup(compact: str, canonical: str) -> str:
@@ -1441,7 +1452,7 @@ def _completion_scan_join_facts(details: Mapping[str, object], message: object) 
         return value if value is None or type(value) is bool else "unknown"
 
     mode = payload.get("m", payload.get("local_scan_mode"))
-    return {
+    result = {
         "schema": _COMPLETION_SCAN_JOIN_SCHEMA,
         "local_scan_mode": mode if isinstance(mode, str) and mode in _COMPLETION_SCAN_JOIN_MODES else "unknown",
         "scan_source_root_object_digest": opaque("so", "scan_source_root_object_digest"),
@@ -1452,6 +1463,29 @@ def _completion_scan_join_facts(details: Mapping[str, object], message: object) 
         "source_pair_targeted": boolean("tp", "source_pair_targeted"),
         "target_pair_covered": boolean("tc", "target_pair_covered"),
     }
+    if active:
+        selected_root_ref = payload.get("selected_root_ref")
+        result["selected_root_ref"] = (
+            selected_root_ref if isinstance(selected_root_ref, str)
+            and re.fullmatch(r"[0-9a-f]{16}", selected_root_ref) else None
+        )
+        for key in (
+            "root_in_scan_result", "root_in_setter_input", "root_is_staging",
+            "handoff_suppressed", "current_process_final_publication", "scan_final", "scan_failed",
+            "scanned_pair", "completed_pair", "unknown_pair", "scan_started_at_known",
+            "selected_root_omissions",
+        ):
+            value = payload.get(key)
+            result[key] = value if type(value) is bool else None
+        result["active_scan_digest"] = (
+            payload.get("active_scan_digest")
+            if isinstance(payload.get("active_scan_digest"), str)
+            and re.fullmatch(r"[0-9a-f]{12}", payload["active_scan_digest"]) else None
+        )
+        for key in ("scan_generation", "scan_started_at_ms"):
+            value = payload.get(key)
+            result[key] = str(value) if type(value) is int and 0 <= value <= 2**63 - 1 else None
+    return result
 
 
 def _local_scan_tick_facts(details: Mapping[str, object]) -> dict[str, object] | None:
@@ -1650,9 +1684,16 @@ def _lifecycle_persist_facts(
         value = details.get(key)
         return str(value) if type(value) is int and 0 <= value <= 2**63 - 1 else None
 
+    selected_root_ref = details.get("selected_root_ref")
+    result["selected_root_ref"] = selected_root_ref if isinstance(selected_root_ref, str) and \
+        _OPAQUE_TOKEN.fullmatch(selected_root_ref) else None
     result["candidate_state"] = enum("candidate_state", _LIFECYCLE_PERSIST_PUBLICATION_STATES)
     if message == "model_live_publication":
         result["live_state"] = enum("live_state", _LIFECYCLE_PERSIST_PUBLICATION_STATES)
+    for key in ("candidate_local_present", "candidate_complete_local_coverage", "current_process_final_publication"):
+        value = details.get(key)
+        result[key] = value if type(value) is bool else None
+    result["candidate_local_size"] = decimal("candidate_local_size")
     result["build_kind"] = enum("build_kind", _LIFECYCLE_PERSIST_BUILDS)
     result["adoption_kind"] = enum("adoption_kind", _LIFECYCLE_PERSIST_ADOPTIONS)
     result["candidate_version"] = decimal("candidate_version")
@@ -1664,10 +1705,19 @@ def _lifecycle_persist_facts(
         if type(details.get("local_flow_pre_poll_selected")) is bool else None,
         "input": enum("local_flow_input", _LIFECYCLE_FLOW_INPUTS),
         "basis": enum("local_flow_basis", _LIFECYCLE_FLOW_BASES),
+        "authority_entry": enum("local_flow_input_entry", _LIFECYCLE_FLOW_AUTHORITY_ENTRIES),
+        "pair_complete": details.get("local_flow_pair_complete")
+        if type(details.get("local_flow_pair_complete")) is bool else None,
+        "pair_incomplete": details.get("local_flow_pair_incomplete")
+        if type(details.get("local_flow_pair_incomplete")) is bool else None,
         "generation": decimal("local_flow_generation"),
         "bucket": enum("local_flow_bucket", _LIFECYCLE_FLOW_BUCKETS),
     }
     if message == "model_live_publication":
+        result["live_local_present"] = details.get("live_local_present") \
+            if type(details.get("live_local_present")) is bool else None
+        result["live_complete_local_coverage"] = details.get("live_complete_local_coverage") \
+            if type(details.get("live_complete_local_coverage")) is bool else None
         for key in ("scope_version", "local_size", "child_count"):
             result[key] = decimal(key)
     return result
@@ -1803,8 +1853,30 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     input_arbitration = _input_arbitration_facts(row, metadata, details)
     scan_join = (
         _completion_scan_join_facts(details, message)
-        if category == "scan.authority" and message == "scan_root_adopted" else None
+        if category == "scan.authority" and message in {"scan_root_adopted", "active_scan_root_adopted"} else None
     )
+    postmove_reconcile = None
+    if source == "model_updater" and category == "scan.root_shape" and \
+            stage == "remote_scanner_stream" and message == "root_shape" and \
+            details.get("schema") == "scan.root_shape.v1" and details.get("scanner_side") == "local":
+        phase = details.get("postmove_reconcile_phase")
+        root_ref = details.get("selected_root_ref")
+        if phase in {"reconcile_delta_input", "reconcile_delta_output", "reconcile_final_input", "reconcile_final_output"} \
+                and isinstance(root_ref, str) and re.fullmatch(r"[0-9a-f]{16}", root_ref):
+            entry = details.get("local_input_entry")
+            local_pair = details.get("local_pair_state")
+            remote_pair = details.get("remote_pair_state")
+            postmove_reconcile = {
+                "phase": phase,
+                "root_ref": root_ref,
+                "local_input_entry": entry if isinstance(entry, str)
+                and entry in _LIFECYCLE_FLOW_AUTHORITY_ENTRIES else "unknown",
+                "local_pair": local_pair if isinstance(local_pair, str) and local_pair in {"complete", "incomplete", "unknown"} else "unknown",
+                "remote_pair": remote_pair if isinstance(remote_pair, str) and remote_pair in {"complete", "incomplete", "unknown"} else "unknown",
+                "local_member": details.get("local_member") if type(details.get("local_member")) is bool else None,
+                "omitted": details.get("postmove_reconcile_omitted")
+                if type(details.get("postmove_reconcile_omitted")) is bool else None,
+            }
     has_local_scan_tick = category == "scan.adoption" or (
         category == "scan.authority" and details.get("schema") == _MODEL_INPUT_ARBITRATION_SCHEMA
         and details.get("phase") == "root_source"
@@ -1831,7 +1903,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
     ):
         return None, True
     if details.get("schema") == _COMPLETION_SCAN_JOIN_SCHEMA and (
-        category != "scan.authority" or message != "scan_root_adopted" or scan_join is None
+        category != "scan.authority" or message not in {"scan_root_adopted", "active_scan_root_adopted"}
+        or scan_join is None
     ):
         return None, True
     lifecycle_event = lifecycle.get("event") if lifecycle else None
@@ -1890,6 +1963,8 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["input_arbitration"] = input_arbitration
     if scan_join is not None:
         result["scan_join"] = scan_join
+    if postmove_reconcile is not None:
+        result["postmove_reconcile"] = postmove_reconcile
     if local_scan_tick is not None:
         result["local_scan_tick"] = local_scan_tick
     if scan_lifecycle is not None:

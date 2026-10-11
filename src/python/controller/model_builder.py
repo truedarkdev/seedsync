@@ -739,15 +739,30 @@ class ModelBuilder:
             if canonical_root_id and isinstance(local_scan_authority, dict) else None
         input_state = "unknown"
         authority_state = "unknown"
+        authority_entry = "unknown"
         input_generation = None
         pair_token = local_pair_authority_tokens.get(path_pair_id) \
             if isinstance(local_pair_authority_tokens, dict) else None
+        pair_complete = path_pair_id in local_completed_pair_ids \
+            if isinstance(local_completed_pair_ids, (set, frozenset)) else None
+        pair_incomplete = path_pair_id in local_incomplete_pair_ids \
+            if isinstance(local_incomplete_pair_ids, (set, frozenset)) else None
+        if canonical_root_id and isinstance(local_scan_authority, dict):
+            if root_key in local_scan_authority:
+                authority_entry = "known_none" if authority_source is None else (
+                    "present" if isinstance(authority_source, SystemFile) and
+                    authority_source.name == root_name and authority_source.path_pair_id == path_pair_id
+                    else "malformed"
+                )
+            elif pair_complete is True and pair_incomplete is False:
+                authority_entry = "absent_complete"
+            elif pair_incomplete is True:
+                authority_entry = "absent_incomplete"
+            else:
+                authority_entry = "absent_unknown"
         source_member = isinstance(source, SystemFile) and source.name == root_name and \
             source.path_pair_id == path_pair_id
-        pair_completed = isinstance(local_completed_pair_ids, (set, frozenset)) and \
-            path_pair_id in local_completed_pair_ids and \
-            isinstance(local_incomplete_pair_ids, (set, frozenset)) and \
-            path_pair_id not in local_incomplete_pair_ids
+        pair_completed = pair_complete is True and pair_incomplete is False
         if canonical_root_id and source_member:
             input_state = "member"
         elif canonical_root_id and pair_completed and isinstance(local_scan_snapshot, dict) and \
@@ -785,6 +800,9 @@ class ModelBuilder:
             "local_flow_pre_poll_selected": pre_poll_selected,
             "local_flow_input": input_state,
             "local_flow_basis": authority_state,
+            "local_flow_input_entry": authority_entry,
+            "local_flow_pair_complete": pair_complete,
+            "local_flow_pair_incomplete": pair_incomplete,
             "local_flow_generation": input_generation,
             "local_flow_bucket": bucket_state,
         }
@@ -796,6 +814,7 @@ class ModelBuilder:
             local_process_session: object = None, local_accumulator_session: object = None,
             local_process_generation: object = None,
             pre_poll_file_ids: object = None,
+            current_process_final_publication_file_ids: object = None,
             live: Optional[Model] = None,
     ) -> set[str]:
         """Trace global-marker subjects before a candidate reaches the live model."""
@@ -807,6 +826,7 @@ class ModelBuilder:
                 candidate_file = candidate.get_file(file_id)
             except ModelError:
                 self.__record_lifecycle_persist_breadcrumb_for_file_id("model_candidate", file_id, {
+                    "selected_root_ref": opaque_trace_correlation(file_id),
                     "candidate_state": "absent",
                     "build_kind": build_kind,
                     "adoption_kind": "pending",
@@ -827,7 +847,15 @@ class ModelBuilder:
                 })
                 continue
             self.__record_lifecycle_persist_breadcrumb("model_candidate", candidate_file, {
+                "selected_root_ref": opaque_trace_correlation(file_id),
                 "candidate_state": self.__state_category(candidate_file),
+                "candidate_local_size": self.__lifecycle_uint63(candidate_file.local_size),
+                "candidate_complete_local_coverage": candidate_file.complete_local_coverage
+                if type(candidate_file.complete_local_coverage) is bool else None,
+                "current_process_final_publication": (
+                    file_id in current_process_final_publication_file_ids
+                    if isinstance(current_process_final_publication_file_ids, (set, frozenset)) else None
+                ),
                 "build_kind": build_kind,
                 "adoption_kind": "pending",
                 "candidate_version": candidate.version,
@@ -855,6 +883,7 @@ class ModelBuilder:
             local_process_session: object = None, local_accumulator_session: object = None,
             local_process_generation: object = None,
             pre_poll_file_ids: object = None,
+            current_process_final_publication_file_ids: object = None,
     ) -> None:
         """Trace the resulting live state for the same ephemeral candidate subjects."""
         if not self.__is_stop_resume_trace_enabled("lifecycle.persist", "info"):
@@ -862,6 +891,7 @@ class ModelBuilder:
         for file_id in subject_ids:
             candidate_state = "absent"
             live_state = "absent"
+            candidate_file = None
             try:
                 candidate_file = candidate.get_file(file_id)
                 candidate_state = self.__state_category(candidate_file)
@@ -891,8 +921,26 @@ class ModelBuilder:
                 except Exception:
                     pass
             self.__record_lifecycle_persist_breadcrumb_for_file_id("model_live_publication", file_id, {
+                "selected_root_ref": opaque_trace_correlation(file_id),
                 "candidate_state": candidate_state,
                 "live_state": live_state,
+                "candidate_local_size": (
+                    self.__lifecycle_uint63(candidate_file.local_size)
+                    if isinstance(candidate_file, ModelFile) else None
+                ),
+                "candidate_complete_local_coverage": (
+                    candidate_file.complete_local_coverage
+                    if isinstance(candidate_file, ModelFile) and
+                    type(candidate_file.complete_local_coverage) is bool else None
+                ),
+                "current_process_final_publication": (
+                    file_id in current_process_final_publication_file_ids
+                    if isinstance(current_process_final_publication_file_ids, (set, frozenset)) else None
+                ),
+                "live_complete_local_coverage": (
+                    live_file.complete_local_coverage
+                    if isinstance(live_file, ModelFile) and type(live_file.complete_local_coverage) is bool else None
+                ),
                 "build_kind": build_kind,
                 "adoption_kind": adoption_kind,
                 "candidate_version": candidate.version,

@@ -535,12 +535,18 @@ def test_lifecycle_persist_projection_sanitizer_preserves_only_bounded_authority
     })["lifecycle_persist"]
     assert publication == {
         "event": "model_live_publication", "corr_ref": "0123456789abcdef",
+        "selected_root_ref": None,
         "candidate_state": "downloaded", "live_state": "downloaded",
+        "candidate_local_present": None, "candidate_local_size": None,
+        "candidate_complete_local_coverage": None, "current_process_final_publication": None,
+        "live_local_present": None, "live_complete_local_coverage": None,
         "build_kind": "full_build", "adoption_kind": "full_model_adopted",
         "candidate_version": wide, "live_version": "9",
         "exact_local_flow_join": {
             "schema": "exact_local_flow_join.v1", "pre_poll_selected": False,
-            "input": "member", "basis": "accepted_current", "generation": wide, "bucket": "member",
+            "input": "member", "basis": "accepted_current", "authority_entry": "unknown",
+            "pair_complete": None, "pair_incomplete": None,
+            "generation": wide, "bucket": "member",
         },
         "scope_version": wide, "local_size": wide, "child_count": "2",
     }
@@ -566,7 +572,9 @@ def test_lifecycle_persist_projection_sanitizer_preserves_only_bounded_authority
     assert malformed_publication["child_count"] is None
     assert malformed_publication["exact_local_flow_join"] == {
         "schema": "exact_local_flow_join.v1", "pre_poll_selected": None,
-        "input": "unknown", "basis": "accepted_current", "generation": None, "bucket": "member",
+        "input": "unknown", "basis": "accepted_current", "authority_entry": "unknown",
+        "pair_complete": None, "pair_incomplete": None,
+        "generation": None, "bucket": "member",
     }
 
     malformed = observer._sanitize_capture_projection({
@@ -1008,6 +1016,7 @@ def test_move_root_lifecycle_projection_sanitizer_preserves_only_bounded_facts()
         "corr_id": "completion:0123456789abcdef",
         "details": {
             "schema": "move_root_invalidation_lifecycle.v1", "phase": "released",
+            "protection_reason": "unknown", "root_protected": True,
             "captured_generation": 2**53 + 17, "event_generation": 2**53 + 18,
             "completion_known": True, "scan_started_after_completion": True,
             "root_present": True, "root_final_complete": True, "root_staging_complete": True,
@@ -1019,6 +1028,7 @@ def test_move_root_lifecycle_projection_sanitizer_preserves_only_bounded_facts()
     assert safe == {
         "boundary": "completion_gate", "message": "move_root_invalidation_lifecycle",
         "schema": "move_root_invalidation_lifecycle.v1", "phase": "released",
+        "protection_reason": "unknown", "root_protected": True,
         "captured_generation": str(2**53 + 17), "event_generation": str(2**53 + 18),
         "completion_known": True, "scan_started_after_completion": True,
         "root_present": True, "root_final_complete": True, "root_staging_complete": True,
@@ -1028,6 +1038,7 @@ def test_move_root_lifecycle_projection_sanitizer_preserves_only_bounded_facts()
         "completion_gate": {
             "boundary": "completion_gate", "message": "move_root_invalidation_lifecycle",
             "schema": "private-schema", "phase": "private-phase",
+            "protection_reason": "private/path", "root_protected": 1,
             "captured_generation": str(2**63), "event_generation": "01",
             "completion_known": 1, "scan_started_after_completion": "true",
             "root_present": False, "root_final_complete": True, "root_staging_complete": None,
@@ -1036,7 +1047,8 @@ def test_move_root_lifecycle_projection_sanitizer_preserves_only_bounded_facts()
     })["completion_gate"]
     assert malformed == {
         "boundary": "completion_gate", "message": "move_root_invalidation_lifecycle",
-        "schema": "unknown", "phase": "unknown", "captured_generation": "unknown",
+            "schema": "unknown", "phase": "unknown", "protection_reason": None, "root_protected": None,
+            "captured_generation": "unknown",
         "event_generation": "unknown", "completion_known": None,
         "scan_started_after_completion": None, "root_present": None,
         "root_final_complete": None, "root_staging_complete": None,

@@ -465,7 +465,7 @@ _CAPTURE_CATEGORIES = frozenset({
 _CAPTURE_STAGES = frozenset({
     "admission", "dispatch", "publication", "terminal", "queue_lifecycle", "queue_authority_handoff", "queue_readiness",
     "queue_exclusion", "model", "model_progress", "model_delta", "model_update", "model_publication", "model_summary",
-    "model_builder_input_arbitration",
+    "model_builder_input_arbitration", "remote_scanner_stream",
     "model_finalization", "model_page_snapshot", "scan", "scan_adoption", "scan_authority", "scan_accumulator", "extract", "controller",
     "controller_boundary", "persist_transaction", "lifecycle", "completion_gate", "final_move_publication",
     "finalization_child", "transfer_stop", "command", "lftp_executor", "lftp_sidecar_validation",
@@ -685,7 +685,11 @@ _CAPTURE_CONFIRMED_DELETE_FENCE_MESSAGE = "confirmed_delete_fence_disposition"
 _CAPTURE_CONFIRMED_DELETE_FENCE_SCHEMA = "confirmed_delete_fence_disposition.v1"
 _CAPTURE_MOVE_ROOT_LIFECYCLE_MESSAGE = "move_root_invalidation_lifecycle"
 _CAPTURE_MOVE_ROOT_LIFECYCLE_SCHEMA = "move_root_invalidation_lifecycle.v1"
-_CAPTURE_MOVE_ROOT_LIFECYCLE_PHASES = {"created", "committed", "cancelled", "released", "protected"}
+_CAPTURE_MOVE_ROOT_LIFECYCLE_PHASES = {"created", "committed", "cancelled", "released", "protected", "evaluated"}
+_CAPTURE_MOVE_ROOT_LIFECYCLE_REASONS = {
+    "move_pending", "confirmed_delete", "pre_move_generation", "scan_incomplete",
+    "healthy_full_snapshot", "root_incomplete", "root_absent", "unknown",
+}
 _CAPTURE_CONFIRMED_DELETE_TARGET_SCOPES = {"exact_root", "nested_path"}
 _CAPTURE_CONFIRMED_DELETE_FENCE_DECISIONS = {"released", "reset"}
 _CAPTURE_CONFIRMED_DELETE_RELEASE_BASES = {"current_root", "healthy_full_snapshot", "session_reset"}
@@ -814,6 +818,9 @@ _CAPTURE_LIFECYCLE_FLOW_SCHEMA = "exact_local_flow_join.v1"
 _CAPTURE_LIFECYCLE_FLOW_INPUTS = {"member", "no_member", "unknown"}
 _CAPTURE_LIFECYCLE_FLOW_BASES = {"accepted_current", "unknown"}
 _CAPTURE_LIFECYCLE_FLOW_BUCKETS = {"member", "no_member", "unknown"}
+_CAPTURE_LIFECYCLE_FLOW_AUTHORITY_ENTRIES = {
+    "present", "known_none", "absent_complete", "absent_incomplete", "absent_unknown", "malformed", "unknown",
+}
 _CAPTURE_LIFECYCLE_PERSIST_BOOLEANS = (
     "local_present", "remote_present", "local_size_present", "downloaded_marker_present",
     "final_move_marker_present", "unknown_local",
@@ -973,6 +980,21 @@ def _sanitize_scan_join(value: Mapping[str, object]) -> Mapping[str, object] | N
     ):
         item = value.get(key, "unknown")
         result[key] = item if item is None or type(item) is bool else "unknown"
+    root_ref = value.get("selected_root_ref")
+    result["selected_root_ref"] = root_ref if isinstance(root_ref, str) and \
+        _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(root_ref) else None
+    for key in (
+        "root_in_scan_result", "root_in_setter_input", "root_is_staging", "scan_started_at_known", "handoff_suppressed",
+        "current_process_final_publication", "scan_final", "scan_failed",
+        "scanned_pair", "completed_pair", "unknown_pair", "selected_root_omissions",
+    ):
+        item = value.get(key)
+        result[key] = item if type(item) is bool else None
+    active_digest = value.get("active_scan_digest")
+    result["active_scan_digest"] = active_digest if isinstance(active_digest, str) and \
+        _CAPTURE_SCAN_SESSION_DIGEST.fullmatch(active_digest) else None
+    for key in ("scan_generation", "scan_started_at_ms"):
+        result[key] = _queue_readiness_decimal(value.get(key))
     return result
 
 
@@ -1151,12 +1173,21 @@ def _sanitize_lifecycle_persist(value: Mapping[str, object]) -> Mapping[str, obj
         return result
 
     candidate_state = value.get("candidate_state")
+    selected_root_ref = value.get("selected_root_ref")
+    result["selected_root_ref"] = selected_root_ref if isinstance(selected_root_ref, str) and \
+        _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(selected_root_ref) else None
     result["candidate_state"] = candidate_state if isinstance(candidate_state, str) and \
         candidate_state in _CAPTURE_LIFECYCLE_PERSIST_PUBLICATION_STATES else "unknown"
     if event == "model_live_publication":
         live_state = value.get("live_state")
         result["live_state"] = live_state if isinstance(live_state, str) and \
             live_state in _CAPTURE_LIFECYCLE_PERSIST_PUBLICATION_STATES else "unknown"
+    for key in ("candidate_local_present", "candidate_complete_local_coverage", "current_process_final_publication"):
+        result[key] = value.get(key) if type(value.get(key)) is bool else None
+    result["candidate_local_size"] = _queue_readiness_decimal(value.get("candidate_local_size"))
+    if event == "model_live_publication":
+        for key in ("live_local_present", "live_complete_local_coverage"):
+            result[key] = value.get(key) if type(value.get(key)) is bool else None
     for key, allowed in (
             ("build_kind", _CAPTURE_LIFECYCLE_PERSIST_BUILDS),
             ("adoption_kind", _CAPTURE_LIFECYCLE_PERSIST_ADOPTIONS)):
@@ -1170,6 +1201,7 @@ def _sanitize_lifecycle_persist(value: Mapping[str, object]) -> Mapping[str, obj
     flow_input = flow.get("input")
     flow_basis = flow.get("basis")
     flow_bucket = flow.get("bucket")
+    flow_authority_entry = flow.get("authority_entry")
     result["exact_local_flow_join"] = {
         "schema": _CAPTURE_LIFECYCLE_FLOW_SCHEMA
         if flow.get("schema") == _CAPTURE_LIFECYCLE_FLOW_SCHEMA else "unknown",
@@ -1177,6 +1209,10 @@ def _sanitize_lifecycle_persist(value: Mapping[str, object]) -> Mapping[str, obj
         if type(flow.get("pre_poll_selected")) is bool else None,
         "input": flow_input if isinstance(flow_input, str) and flow_input in _CAPTURE_LIFECYCLE_FLOW_INPUTS else "unknown",
         "basis": flow_basis if isinstance(flow_basis, str) and flow_basis in _CAPTURE_LIFECYCLE_FLOW_BASES else "unknown",
+        "authority_entry": flow_authority_entry if isinstance(flow_authority_entry, str)
+        and flow_authority_entry in _CAPTURE_LIFECYCLE_FLOW_AUTHORITY_ENTRIES else "unknown",
+        "pair_complete": flow.get("pair_complete") if type(flow.get("pair_complete")) is bool else None,
+        "pair_incomplete": flow.get("pair_incomplete") if type(flow.get("pair_incomplete")) is bool else None,
         "generation": _queue_readiness_decimal(flow.get("generation")),
         "bucket": flow_bucket if isinstance(flow_bucket, str) and flow_bucket in _CAPTURE_LIFECYCLE_FLOW_BUCKETS else "unknown",
     }
@@ -1458,9 +1494,11 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
                 phase if schema_known and isinstance(phase, str) and phase in _CAPTURE_MOVE_ROOT_LIFECYCLE_PHASES
                 else "unknown"
             )
+            reason = gate.get("protection_reason")
+            safe_gate["protection_reason"] = reason if isinstance(reason, str) and reason in _CAPTURE_MOVE_ROOT_LIFECYCLE_REASONS else None
             for key in (
                 "completion_known", "scan_started_after_completion", "root_present",
-                "root_final_complete", "root_staging_complete",
+                "root_final_complete", "root_staging_complete", "root_protected",
             ):
                 item = gate.get(key)
                 safe_gate[key] = item if schema_known and type(item) is bool else None
@@ -1731,6 +1769,31 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
         safe_scan_join = _sanitize_scan_join(scan_join)
         if safe_scan_join is not None:
             result["scan_join"] = safe_scan_join
+    postmove_reconcile = value.get("postmove_reconcile")
+    if (result.get("source") == "model_updater" and result.get("category") == "scan.root_shape"
+            and result.get("stage") == "remote_scanner_stream"
+            and isinstance(postmove_reconcile, Mapping)):
+        phase = postmove_reconcile.get("phase")
+        root_ref = postmove_reconcile.get("root_ref")
+        if phase in {"reconcile_delta_input", "reconcile_delta_output", "reconcile_final_input", "reconcile_final_output"} \
+                and isinstance(root_ref, str) and _CAPTURE_INPUT_ARBITRATION_OPAQUE.fullmatch(root_ref):
+            entry = postmove_reconcile.get("local_input_entry")
+            local_pair = postmove_reconcile.get("local_pair")
+            remote_pair = postmove_reconcile.get("remote_pair")
+            result["postmove_reconcile"] = {
+                "phase": phase,
+                "root_ref": root_ref,
+                "local_input_entry": entry if isinstance(entry, str)
+                and entry in _CAPTURE_LIFECYCLE_FLOW_AUTHORITY_ENTRIES else "unknown",
+                "local_pair": local_pair if isinstance(local_pair, str)
+                and local_pair in {"complete", "incomplete", "unknown"} else "unknown",
+                "remote_pair": remote_pair if isinstance(remote_pair, str)
+                and remote_pair in {"complete", "incomplete", "unknown"} else "unknown",
+                "local_member": postmove_reconcile.get("local_member")
+                if type(postmove_reconcile.get("local_member")) is bool else None,
+                "omitted": postmove_reconcile.get("omitted")
+                if type(postmove_reconcile.get("omitted")) is bool else None,
+            }
     local_scan_tick = value.get("local_scan_tick")
     if isinstance(local_scan_tick, Mapping):
         result["local_scan_tick"] = _sanitize_local_scan_tick(local_scan_tick)
