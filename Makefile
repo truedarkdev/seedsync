@@ -16,6 +16,8 @@ SOURCEDIR:=$(shell realpath ./src)
 BUILDDIR:=$(shell realpath ./build)
 PYTEST_ARTIFACT_DIR:=$(ROOTDIR)/tmp/pytest
 DEFAULT_STAGING_REGISTRY:=localhost:5000
+# Pass publication inputs as data, never interpolate them into shell source.
+export STAGING_REGISTRY STAGING_VERSION STAGING_DIGEST RELEASE_REGISTRY RELEASE_VERSION
 DOCKER_IMAGE_PLATFORMS:=linux/amd64,linux/arm64,linux/arm/v7
 DEB_GLIBC_MAX:=2.31
 SCANFS_PLATFORM?=linux/amd64
@@ -60,14 +62,12 @@ deb: builddir
 docker-buildx:
 	$(DOCKER) run --rm --privileged multiarch/qemu-user-static --reset -p yes
 
-docker-image: docker-buildx
-	@if [[ -z "${STAGING_REGISTRY}" ]] ; then \
-		export STAGING_REGISTRY="${DEFAULT_STAGING_REGISTRY}"; \
-	fi;
+docker-image:
+	@export STAGING_REGISTRY="$${STAGING_REGISTRY:-${DEFAULT_STAGING_REGISTRY}}"
+	export STAGING_VERSION="$${STAGING_VERSION:-latest}"
+	bash "${SOURCEDIR}/docker/publication_tag_policy.sh" staging "$${STAGING_REGISTRY}" "$${STAGING_VERSION}"
+	$(DOCKER) run --rm --privileged multiarch/qemu-user-static --reset -p yes
 	echo "${green}STAGING_REGISTRY=$${STAGING_REGISTRY}${reset}";
-	@if [[ -z "${STAGING_VERSION}" ]] ; then \
-		export STAGING_VERSION="latest"; \
-	fi;
 	echo "${green}STAGING_VERSION=$${STAGING_VERSION}${reset}";
 
 	# final image
@@ -76,9 +76,9 @@ docker-image: docker-buildx
 		--build-arg SCANFS_PLATFORM=${SCANFS_PLATFORM} \
 		$(SEEDSYNC_ANGULAR_BUILD_CONTEXT_ARG) \
 		--target seedsync_run \
-		--tag $${STAGING_REGISTRY}/seedsync:$${STAGING_VERSION} \
-		--cache-to=type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache,mode=max \
-		--cache-from=type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache \
+		--tag "$${STAGING_REGISTRY}/seedsync:$${STAGING_VERSION}" \
+		--cache-to="type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache,mode=max" \
+		--cache-from="type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache" \
 		--platform ${DOCKER_IMAGE_PLATFORMS} \
 		--push \
 		${ROOTDIR}
@@ -93,26 +93,28 @@ docker-image-artifact-gate:
 		"${SEEDSYNC_PLATFORM}"
 
 docker-image-release:
-	@if [[ -z "${STAGING_REGISTRY}" ]] ; then \
+	@bash "${SOURCEDIR}/docker/publication_tag_policy.sh" release "$${RELEASE_REGISTRY}" "$${RELEASE_VERSION}"
+	bash "${SOURCEDIR}/docker/publication_tag_policy.sh" tag "$${RELEASE_REGISTRY}" latest
+	@if [[ -z "$${STAGING_REGISTRY}" ]] ; then \
 		echo "${red}ERROR: STAGING_REGISTRY is required${reset}"; exit 1; \
 	fi
-	@if [[ -z "${STAGING_VERSION}" ]] ; then \
+	@if [[ -z "$${STAGING_VERSION}" ]] ; then \
 		echo "${red}ERROR: STAGING_VERSION is required${reset}"; exit 1; \
 	fi
-	@if [[ -z "${STAGING_DIGEST}" ]] ; then \
+	@if [[ -z "$${STAGING_DIGEST}" ]] ; then \
 		echo "${red}ERROR: STAGING_DIGEST is required${reset}"; exit 1; \
 	fi
-	@if [[ -z "${RELEASE_REGISTRY}" ]] ; then \
+	@if [[ -z "$${RELEASE_REGISTRY}" ]] ; then \
 		echo "${red}ERROR: RELEASE_REGISTRY is required${reset}"; exit 1; \
 	fi
-	@if [[ -z "${RELEASE_VERSION}" ]] ; then \
+	@if [[ -z "$${RELEASE_VERSION}" ]] ; then \
 		echo "${red}ERROR: RELEASE_VERSION is required${reset}"; exit 1; \
 	fi
-	source_repository="${STAGING_REGISTRY}/seedsync"
-	source_image="$${source_repository}:${STAGING_VERSION}"
-	version_image="${RELEASE_REGISTRY}/seedsync:${RELEASE_VERSION}"
-	latest_image="${RELEASE_REGISTRY}/seedsync:latest"
-	source_digest="${STAGING_DIGEST}"
+	source_repository="$${STAGING_REGISTRY}/seedsync"
+	source_image="$${source_repository}:$${STAGING_VERSION}"
+	version_image="$${RELEASE_REGISTRY}/seedsync:$${RELEASE_VERSION}"
+	latest_image="$${RELEASE_REGISTRY}/seedsync:latest"
+	source_digest="$${STAGING_DIGEST}"
 	if [[ ! "$${source_digest}" =~ ^sha256:[0-9a-f]{64}$$ ]] ; then \
 		echo "${red}ERROR: STAGING_DIGEST must be a sha256 digest${reset}"; exit 1; \
 	fi

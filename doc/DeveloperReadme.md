@@ -116,6 +116,31 @@ npm install
 
 
 
+## Docker Hub publication policy
+
+Docker Hub permits only `latest`, the single testing tag `debugging`, and full
+numeric release tags `X.Y.Z` (the CI `vX.Y.Z` Git tag with its `v` stripped).
+Prereleases, `debugging-*`, staging tags and `cache` are forbidden there.
+This allowlist does not grant publication authorization; image publication
+requires separate authorization.
+
+`make docker-image` rejects Docker Hub staging before Docker setup or build,
+including implicit Hub destinations and registry aliases. Use the default
+local registry or GHCR for staging and registry cache exports.
+`make docker-image-release` requires a numeric release version before any
+Docker call and retains promotion of the tested digest to that version and
+`latest`. Reading a source image from Docker Hub remains permitted.
+There is no new testing-tag publisher: obsolete temporary publishers that
+require `debugging-*` must not be reused. Manual Docker commands and account
+access can bypass repository guards, so operators must also follow this policy.
+
+Run the no-network Make contract tests in a Linux environment with Bash, Make
+and Python 3:
+
+```bash
+python3 src/docker/test/test_publication_tag_policy.py
+```
+
 ## Python Dev Build and Run
 
 ### Build scanfs
