@@ -3677,9 +3677,7 @@ class ModelBuilder:
         return visit(remote_root, effective_root, active_root)
 
     def get_staging_collision_relative_paths(self, file_id: str) -> tuple[str, ...]:
-        """Return cached remote-relative leaves covered by collision metadata."""
-        if self.__cached_model is None or file_id not in self.__cached_unresolved_staging_collision_file_ids:
-            return ()
+        """Return current remote-relative leaves covered by collision metadata."""
         effective_root = self.__build_effective_local_files().get(file_id)
         if effective_root is None:
             return ()

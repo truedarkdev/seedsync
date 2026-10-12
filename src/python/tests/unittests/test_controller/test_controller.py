@@ -17115,6 +17115,73 @@ class TestController(unittest.TestCase):
                 future.result(timeout=5)
         return outcome
 
+    def test_incomplete_collision_batch_admits_current_snapshot_before_model_rebuild(self):
+        root, intent, builder, scanner, _, staging = self._prepare_incomplete_collision_batch()
+        expected = ("legacy/extra.bin", "nested/complete.bin")
+        self.assertIsNotNone(builder._ModelBuilder__cached_model)
+        self.assertEqual(expected, builder.get_staging_collision_relative_paths(root.file_id))
+        partial = Path(staging, "release", "nested", "partial.bin")
+        partial.write_bytes(b"part+")
+        Path(str(partial) + ".lftp-pget-status").write_text(
+            "size=8\n0.pos=5\n0.limit=8\n", encoding="utf-8")
+        builder.set_local_files(self._scan_collision_batch_fixture(scanner, generation=1))
+        self.assertIsNone(builder._ModelBuilder__cached_model)
+        self.assertTrue(builder.has_unresolved_staging_collision(root.file_id))
+        self.assertEqual(expected, builder.get_staging_collision_relative_paths(root.file_id))
+        self.assertIsNone(builder._ModelBuilder__cached_model)
+
+        outcome = self.controller._Controller__queue_collision_preflight(root, intent.command, intent)
+        self.assertEqual(("deferred", "comparison_pending"), outcome[:2])
+        self.assertIsNone(builder._ModelBuilder__cached_model)
+        self.assertEqual(root.file_id, self.controller._Controller__collision_compare_claim[6])
+        self.controller._Controller__lftp.queue.assert_not_called()
+        self.controller._Controller__collision_compare_future.result(timeout=5)
+        self.controller._Controller__deferred_queue_intents[root.file_id] = intent
+        self.controller._Controller__retire_deferred_queue_intent(root.file_id, "stop")
+        self.assertEqual(b"complete", Path(staging, "release", "legacy", "extra.bin").read_bytes())
+        self.assertEqual(b"part+", partial.read_bytes())
+        self.assertTrue(Path(str(partial) + ".lftp-pget-status").exists())
+
+    def test_collision_path_snapshot_tracks_new_cleared_and_removed_scanner_inputs(self):
+        root, _, builder, scanner, _, staging = self._prepare_incomplete_collision_batch()
+        expected = ("legacy/extra.bin", "nested/complete.bin")
+        twins = [Path(staging, "release", relative) for relative in expected]
+        for path in twins:
+            path.unlink()
+        builder.set_local_files(self._scan_collision_batch_fixture(scanner, generation=1))
+        builder.build_model()
+        self.assertIsNotNone(builder._ModelBuilder__cached_model)
+        self.assertFalse(builder.has_unresolved_staging_collision(root.file_id))
+        self.assertEqual((), builder.get_staging_collision_relative_paths(root.file_id))
+
+        for path in twins:
+            path.write_bytes(b"complete")
+            os.utime(path, ns=(1_700_000_000_000_000_000,) * 2)
+        builder.set_local_files(self._scan_collision_batch_fixture(scanner, generation=2))
+        self.assertIsNone(builder._ModelBuilder__cached_model)
+        self.assertTrue(builder.has_unresolved_staging_collision(root.file_id))
+        self.assertEqual(expected, builder.get_staging_collision_relative_paths(root.file_id))
+        self.assertIsNone(builder._ModelBuilder__cached_model)
+        builder.build_model()
+        for path in twins:
+            path.unlink()
+        builder.set_local_files(self._scan_collision_batch_fixture(scanner, generation=3))
+        self.assertIsNone(builder._ModelBuilder__cached_model)
+        self.assertFalse(builder.has_unresolved_staging_collision(root.file_id))
+        self.assertEqual((), builder.get_staging_collision_relative_paths(root.file_id))
+        self.assertIsNone(builder._ModelBuilder__cached_model)
+
+        for path in twins:
+            path.write_bytes(b"complete")
+        builder.set_local_files(self._scan_collision_batch_fixture(scanner, generation=4))
+        builder.build_model()
+        self.assertTrue(builder.has_unresolved_staging_collision(root.file_id))
+        builder.set_local_files([])
+        self.assertIsNone(builder._ModelBuilder__cached_model)
+        self.assertFalse(builder.has_unresolved_staging_collision(root.file_id))
+        self.assertEqual((), builder.get_staging_collision_relative_paths(root.file_id))
+        self.assertIsNone(builder._ModelBuilder__cached_model)
+
     def test_incomplete_nested_queue_collision_batch_preserves_partial_and_finalizes_normally(self):
         root, intent, builder, scanner, final, staging = self._prepare_incomplete_collision_batch()
         trace = BreadcrumbTraceCollector(lambda: True, max_entries=128)
