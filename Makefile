@@ -17,7 +17,7 @@ BUILDDIR:=$(shell realpath ./build)
 PYTEST_ARTIFACT_DIR:=$(ROOTDIR)/tmp/pytest
 DEFAULT_STAGING_REGISTRY:=localhost:5000
 # Pass publication inputs as data, never interpolate them into shell source.
-export STAGING_REGISTRY STAGING_VERSION STAGING_DIGEST RELEASE_REGISTRY RELEASE_VERSION
+export STAGING_REGISTRY STAGING_VERSION STAGING_DIGEST RELEASE_REGISTRY RELEASE_VERSION RELEASE_SOURCE_COMMIT
 DOCKER_IMAGE_PLATFORMS:=linux/amd64,linux/arm64,linux/arm/v7
 DEB_GLIBC_MAX:=2.31
 SCANFS_PLATFORM?=linux/amd64
@@ -95,6 +95,7 @@ docker-image-artifact-gate:
 docker-image-release:
 	@bash "${SOURCEDIR}/docker/publication_tag_policy.sh" release "$${RELEASE_REGISTRY}" "$${RELEASE_VERSION}"
 	bash "${SOURCEDIR}/docker/publication_tag_policy.sh" tag "$${RELEASE_REGISTRY}" latest
+	python3 "${SOURCEDIR}/docker/release_source_guard.py"
 	@if [[ -z "$${STAGING_REGISTRY}" ]] ; then \
 		echo "${red}ERROR: STAGING_REGISTRY is required${reset}"; exit 1; \
 	fi

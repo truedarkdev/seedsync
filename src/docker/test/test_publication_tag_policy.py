@@ -1,6 +1,7 @@
 """No-network contract checks of the actual Make publication recipes."""
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -16,6 +17,31 @@ class PublicationPolicyTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="seedsync-tag-policy-")
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
+        self.fixture = self.directory / "source"
+        self.fixture.mkdir()
+        for relative in ["Makefile", "src/docker/publication_tag_policy.sh",
+                         "src/docker/release_source_guard.py"]:
+            source = ROOT / relative
+            if source.exists():
+                destination = self.fixture / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+        self.metadata = {
+            "src/angular/package.json": '{"version": "1.2.3"}\n',
+            "src/debian/changelog": 'seedsync (1.2.3) stable; urgency=low\n',
+            "src/e2e/tests/about.page.spec.ts": 'expect(await page.getVersion()).toEqual("v1.2.3");\n',
+        }
+        for relative, content in self.metadata.items():
+            destination = self.fixture / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content, encoding="utf-8")
+        self.git("init", "-q")
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "test@example.invalid")
+        self.git("add", ".")
+        self.git("commit", "-qm", "fixture")
+        self.commit = self.git("rev-parse", "HEAD")
+        self.git("tag", "v1.2.3")
         self.log = self.directory / "docker.jsonl"
         self.stub = self.directory / "docker"
         self.stub.write_text(
@@ -31,11 +57,14 @@ class PublicationPolicyTest(unittest.TestCase):
         self.env = dict(os.environ, DOCKER_STUB_LOG=str(self.log),
                         DOCKER_STUB_DIGEST=DIGEST, TERM="dumb")
 
+    def git(self, *args):
+        return subprocess.check_output(["git", *args], cwd=self.fixture, text=True).strip()
+
     def make(self, target, **variables):
         result = subprocess.run(
             ["make", "--no-print-directory", target, f"DOCKER={self.stub}",
              "red=", "green=", "reset=", *[f"{k}={v}" for k, v in variables.items()]],
-            cwd=ROOT, env=self.env, text=True, capture_output=True,
+            cwd=self.fixture, env=self.env, text=True, capture_output=True,
         )
         calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
         return result, calls
@@ -43,7 +72,7 @@ class PublicationPolicyTest(unittest.TestCase):
     def release(self, **overrides):
         values = dict(STAGING_REGISTRY="ghcr.io/example", STAGING_VERSION="tested",
                       STAGING_DIGEST=DIGEST, RELEASE_REGISTRY="docker.io/example",
-                      RELEASE_VERSION="1.2.3")
+                      RELEASE_VERSION="1.2.3", RELEASE_SOURCE_COMMIT=self.commit)
         values.update(overrides)
         return self.make("docker-image-release", **values)
 
@@ -78,6 +107,7 @@ class PublicationPolicyTest(unittest.TestCase):
     def test_numeric_release_retains_digest_and_latest(self):
         result, calls = self.release()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"Release source verified: version=1.2.3 source={self.commit}", result.stdout)
         self.assertEqual(calls[1], ["buildx", "imagetools", "create", "--tag",
                                   "docker.io/example/seedsync:1.2.3", "--tag",
                                   "docker.io/example/seedsync:latest",
@@ -97,6 +127,55 @@ class PublicationPolicyTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][:3], ["buildx", "imagetools", "inspect"])
 
+    def assert_source_rejected(self, **overrides):
+        result, calls = self.release(**overrides)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ERROR: release source policy:", result.stderr)
+        self.assertEqual(calls, [], result.stdout + result.stderr)
+
+    def test_missing_or_wrong_source_is_rejected(self):
+        for source in ["", "a" * 40, "short"]:
+            with self.subTest(source=source):
+                self.assert_source_rejected(RELEASE_SOURCE_COMMIT=source)
+
+    def test_missing_release_tag_is_rejected(self):
+        self.git("tag", "-d", "v1.2.3")
+        self.assert_source_rejected()
+
+    def test_annotated_tag_is_supported(self):
+        self.git("tag", "-d", "v1.2.3")
+        self.git("tag", "-a", "v1.2.3", "-m", "fixture release")
+        result, calls = self.release()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls[1][0:3], ["buildx", "imagetools", "create"])
+
+    def test_head_different_from_release_tag_is_rejected(self):
+        self.git("commit", "--allow-empty", "-qm", "different source")
+        self.assert_source_rejected(RELEASE_SOURCE_COMMIT=self.git("rev-parse", "HEAD"))
+
+    def test_tracked_dirty_source_is_rejected(self):
+        (self.fixture / "src/angular/package.json").write_text('{"version":"1.2.4"}\n')
+        self.assert_source_rejected()
+
+    def test_each_committed_metadata_mismatch_is_rejected(self):
+        for relative, content in self.metadata.items():
+            with self.subTest(relative=relative):
+                path = self.fixture / relative
+                path.write_text(content.replace("1.2.3", "1.2.4"), encoding="utf-8")
+                self.git("add", ".")
+                self.git("commit", "-qm", "metadata mismatch")
+                # Recreate only the disposable fixture tag to isolate metadata checks.
+                self.git("tag", "-f", "v1.2.3")
+                self.assert_source_rejected(RELEASE_SOURCE_COMMIT=self.git("rev-parse", "HEAD"))
+                path.write_text(content, encoding="utf-8")
+                self.git("add", ".")
+                self.git("commit", "-qm", "restore metadata fixture")
+
+    def test_staged_dirty_source_is_rejected(self):
+        (self.fixture / "src/angular/package.json").write_text('{"version":"1.2.4"}\n')
+        self.git("add", ".")
+        self.assert_source_rejected()
+
     def test_shell_metacharacters_are_data(self):
         sentinel = self.directory / "injected"
         result, calls = self.release(RELEASE_VERSION=f'1.2.3"; touch {sentinel}; #')
@@ -108,7 +187,7 @@ class PublicationPolicyTest(unittest.TestCase):
         result = subprocess.run(
             ["make", "-n", "docker-image", f"DOCKER={self.stub}",
              "STAGING_REGISTRY=ghcr.io/example", "red=", "green=", "reset="],
-            cwd=ROOT, env=self.env, text=True, capture_output=True,
+            cwd=self.fixture, env=self.env, text=True, capture_output=True,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(self.log.exists())

@@ -573,45 +573,66 @@ make docker-image-artifact-gate \
   SEEDSYNC_PLATFORM=<docker platform>
 ```
 
-The amd64 Unraid acceptance lane is separate from a formal release: publish
-it only under a dedicated versioned test tag such as `<version>-unraid-test`,
-run its exact-digest gate and live Docker/Playwright checks, and leave the
-stable version and `latest` tags untouched. Formal releases are the supported
-multi-architecture CI lane (`linux/amd64`, `linux/arm64`, and `linux/arm/v7`):
-CI builds to private staging, gates and tests every platform, and then
-promotes the same tested manifest digest to the stable version and `latest`
-tags.
+The amd64 Unraid acceptance lane is separate from a formal release. With
+separate publication approval, use the single Docker Hub `debugging` tag or
+private staging, run its exact-digest gate and live Docker/Playwright checks,
+and leave version tags and `latest` untouched. A diagnostic image does not
+establish a formal release. Formal releases cover `linux/amd64`, `linux/arm64`
+and `linux/arm/v7` through the existing CI gates.
 
-1. Do all of these in one change
-   1. Version update in `src/angular/package.json`
-   2. Version update and changelog in `src/debian/changelog`.
-      Use command `LANG=C date -R` to get the date.
-   3. Update `src/e2e/tests/about.page.spec.ts`
-   4. Update Copyright date in `about-page.component.html`
-2. Tag the commit as vX.X.X
-3. Push tag to Github
+## Release checklist
 
+1. Choose the numeric `X.Y.Z` version. In one coherent candidate update
+   `src/angular/package.json`, the root `version` and `packages[""]` version in
+   `src/angular/package-lock.json`, the first entry and release content in
+   `src/debian/changelog`, and the expected version in
+   `src/e2e/tests/about.page.spec.ts`. Retain the Python packaging placeholder
+   unless evidence establishes that it supplies the runtime version.
+2. Confirm the intended source commit and branch, inspect the complete candidate,
+   and run the normal master Python and Angular unit gates against that exact
+   source **before creating a public tag**. Resolve failures first. The maintainer
+   explicitly authorizes the release through the existing CI route.
+3. Check existing tags. Never move or recreate a published release tag to repair
+   a release. Validate the exact `vX.Y.Z` grammar and bind the local tag to the
+   chosen commit. Only the maintainer may publish Git refs. After the pre-tag
+   unit gates pass, the maintainer deliberately publishes that exact verified
+   `vX.Y.Z` tag/source, authorizing CI to build, test and automatically promote
+   its same-run immutable artifact only after all supported platform gates pass.
+   This authorizes the existing CI route; it does not authorize agent or manual
+   image writes. A Git tag by itself does not establish that an image was released.
+4. Retain the same-source build receipt and immutable staging manifest digest.
+   Pass the existing package, artifact/privacy, compatibility and E2E gates
+   across every supported platform. Preserve the CI dependencies that join
+   the build output digest to all-platform testing and promotion.
+5. Existing gated CI promotes its same-run tested digest to version/`latest`
+   under that maintainer release authorization, without a separate post-build
+   approval step. Manual or agent promotion requires separate approval of the
+   concrete tested digest, source and target tags before any image write.
+   `make docker-image-release` requires an explicit full
+   `RELEASE_SOURCE_COMMIT` matching clean tracked HEAD and the local
+   `refs/tags/vX.Y.Z` commit, plus matching runtime package, first changelog and
+   About versions. It does not repair tags or metadata.
+6. Retrieve the public version and `latest` manifests and confirm the approved
+   digest, source/version evidence and all supported platform entries. Keep
+   Debian artifacts local while direct/deb publication remains disabled.
+7. If any gate, promotion or retrieval fails, report the completed and missing
+   boundaries. Do not claim the release is complete, blindly rebuild, or retag
+   an unrelated diagnostic image. Preserve receipts and investigate the first
+   missing boundary before retrying an approved action.
 
+The source guard does not prove that an arbitrary manually supplied
+`STAGING_DIGEST` was built from that source. Retained same-source build and test
+receipts are required independently. CI provides this binding through its
+same-run build output and existing all-platform artifact/E2E dependencies.
+The guard checks the canonical runtime version metadata; historical lockfile
+metadata is not an additional runtime version oracle.
 
-## Manual Method
+## Manual promotion
 
-This manual method is deprecated in favour of the Github Actions based CI.
-
-### Checklist
-
-1. Do all of these in one change
-    1. Version update in `src/angular/package.json`
-    2. Version update and changelog in `src/debian/changelog`.
-       Use command `LANG=C date -R` to get the date.
-    3. Update `src/e2e/tests/about.page.spec.ts`
-    4. Update Copyright date in `about-page.component.html`
-2. Tag the commit as vX.X.X
-3. Deploy documentation to github
-4. make clean && make
-5. Run all tests
-6. Keep the build- and E2E-tested deb artifact local; direct/deb publication is currently disabled
-7. Run the exact-digest artifact gate and live Docker/Playwright checks for the image candidate
-8. Tag and upload the image to Docker Hub (see below)
+CI is the supported release route. Manual or agent promotion requires separate
+approval of the concrete tested digest, source and target tags before any image
+write, and must satisfy the same checklist and retained evidence. The tag
+allowlist alone grants no publication permission and does not bypass gates.
 
 ### Docker image upload to Docker Hub
 
@@ -621,6 +642,7 @@ make docker-image-release \
   STAGING_VERSION=<tested image tag> \
   STAGING_DIGEST=sha256:<tested image digest> \
   RELEASE_VERSION=<version> \
+  RELEASE_SOURCE_COMMIT=<full tested source commit> \
   RELEASE_REGISTRY=<release registry namespace>
 ```
 

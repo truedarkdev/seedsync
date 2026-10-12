@@ -312,6 +312,15 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify exact release source and tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          git fetch --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          python3 src/docker/release_source_guard.py
 
       # Sets up build environment
       - name: Set up QEMU
@@ -349,12 +358,14 @@ jobs:
       - name: Promote tested image to Dockerhub
         env:
           TESTED_STAGING_DIGEST: ${{ needs.build-docker-image.outputs.staging_digest }}
+          RELEASE_SOURCE_COMMIT: ${{ github.sha }}
         run: make docker-image-release \
           STAGING_REGISTRY="${{ env.staging_registry }}" \
           STAGING_VERSION="${{ github.run_number }}" \
           STAGING_DIGEST="${TESTED_STAGING_DIGEST}" \
           RELEASE_REGISTRY="docker.io/truedarkdev" \
-          RELEASE_VERSION="${RELEASE_VERSION}"
+          RELEASE_VERSION="${RELEASE_VERSION}" \
+          RELEASE_SOURCE_COMMIT="${RELEASE_SOURCE_COMMIT}"
 
   # Deb packages remain build- and e2e-tested, but are not published until the
   # direct/deb upgrade path has its own certification evidence.
