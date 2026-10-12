@@ -9,6 +9,7 @@ import re
 import sys
 import threading
 import time
+from contextlib import ExitStack
 from collections import Counter
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
@@ -971,6 +972,133 @@ def test_time_budget_is_reported_without_claiming_loss(tmp_path: Path) -> None:
     records = _artifacts(artifact)
     assert any(item["capture"].get("reason") == "budget" for item in records)
     assert not any(item["capture"].get("state") == "loss" for item in records)
+
+
+def test_collision_batch_gates_survive_actual_finalizer_reader_and_sink(tmp_path: Path) -> None:
+    assert _ControllerFixture is not None and BreadcrumbTraceCollector is not None
+    spool, artifact = _prepare(tmp_path)
+    collector = BreadcrumbTraceCollector(lambda: True, max_entries=256,
+        policy={"default": "off", "rules": {"queue.readiness": "info", "controller": "info"}},
+        durable_enabled=True, durable_path=str(spool))
+    reader = _reader(spool, artifact, max_records=256)
+    cases = {
+        "owner": "owner_identity", "resolution": "root_resolution", "roots": "safe_roots",
+        "authority": "authority", "shape": "snapshot", "empty": "snapshot", "count": "snapshot",
+        "mount": "mount_boundary", "relative": "relative_path", "candidate": "candidate_path",
+        "missing": "source_signature", "type": "source_signature", "regular_type": "source_signature",
+        "permission": "destination_signature",
+        "temp": "temp_artifact", "identity": "source_identity", "size": "remote_signature",
+        "mtime": "remote_signature", "budget": "byte_budget", "accepted": "claim",
+    }
+    expected = []
+    try:
+        collector.record("controller", "boundary", {}, category="controller", level="info")
+        assert collector.wait_for_ingress(2.0) and collector.flush_durable(2.0)
+        reader.start()
+        for case, gate in cases.items():
+            decisions = []
+            for mode in ("enabled", "disabled", "fault"):
+                fixture = _ControllerFixture()
+                fixture.setUp()
+                try:
+                    root, intent, builder, _, _, _ = fixture._prepare_incomplete_collision_batch(
+                        type_mismatch=case == "regular_type")
+                    producer = fixture.controller
+                    producer._Controller__context.breadcrumb_trace = collector
+                    with ExitStack() as stack:
+                        def change(owner, name, **kwargs):
+                            return stack.enter_context(patch.object(owner, name, **kwargs))
+                        if mode == "disabled":
+                            change(collector, "is_effectively_enabled", return_value=False)
+                        elif mode == "fault":
+                            change(collector, "record", side_effect=RuntimeError("private-emission-detail"))
+                        if case == "owner": intent.path_pair_id = "other-pair"
+                        elif case == "resolution": change(producer, "_Controller__resolve_safe_final_move_paths", return_value=None)
+                        elif case == "roots": change(producer, "_Controller__safe_existing_directory", return_value=False)
+                        elif case == "authority": producer._Controller__reconciled_remote_path_pair_ids = set()
+                        elif case in ("shape", "empty", "count", "relative"):
+                            change(builder, "get_staging_collision_relative_paths", return_value={
+                                "shape": None, "empty": (), "count": ("leaf",) * 129, "relative": ("",),
+                            }[case])
+                        elif case == "mount": change(producer, "_Controller__reject_nested_mounts_or_reparse_points", side_effect=OSError("private-mount"))
+                        elif case == "candidate":
+                            original = producer._Controller__safe_final_move_candidate
+                            change(producer, "_Controller__safe_final_move_candidate",
+                                   side_effect=lambda base, name: None if "/" in name else original(base, name))
+                        elif case in ("missing", "type", "permission"):
+                            original = producer._Controller__collision_signature
+                            error = {"missing": FileNotFoundError, "type": NotADirectoryError, "permission": PermissionError}[case]
+                            calls = []
+                            def signature(path):
+                                calls.append(path)
+                                if case != "permission" or len(calls) == 2:
+                                    raise error("private-signature-path")
+                                return original(path)
+                            change(producer, "_Controller__collision_signature", side_effect=signature)
+                        elif case == "temp": change(producer, "_Controller__source_has_lftp_temp_artifact", return_value=True)
+                        elif case in ("identity", "size", "mtime"):
+                            change(builder, "get_queue_collision_source_identity", return_value={
+                                "identity": ("unknown", None, None), "size": ("file", 999, 1_700_000_000_000_000_000),
+                                "mtime": ("file", 8, 1),
+                            }[case])
+                        elif case == "budget": stack.enter_context(patch("controller.controller._COLLISION_COMPARE_MAX_BYTES", 1))
+                        before = len(collector.snapshot()["entries"])
+                        decision = producer._Controller__queue_collision_leaf_batch(root, intent)
+                        decisions.append(decision[:2])
+                        rows = collector.snapshot()["entries"][before:]
+                        if mode == "enabled":
+                            assert len(rows) == 1  # One summary, never one per leaf.
+                            facts = rows[0]["details"]
+                            assert facts["collision_gate"] == gate
+                            assert facts["collision_examined_count"] <= 2
+                            assert facts["collision_checked_count"] <= 2
+                            if case == "count": assert facts["collision_path_count"] == 129 and facts["collision_snapshot"] == "over_limit"
+                            if case == "shape": assert facts["collision_snapshot"] == "not_tuple"
+                            if case == "regular_type": assert facts["collision_exception"] == "not_regular"
+                            if case == "size": assert facts["collision_sizes_match"] is False and facts["collision_mtimes_match"] is True
+                            if case == "mtime": assert facts["collision_sizes_match"] is True and facts["collision_mtimes_match"] is False
+                            if case == "accepted": assert facts["collision_checked_count"] == 2 and facts["collision_total_bytes"] == 16
+                            expected.append(facts)
+                        else: assert rows == []
+                    future = getattr(producer, "_Controller__collision_compare_future", None)
+                    if future is not None: future.result(timeout=5)
+                finally:
+                    fixture.doCleanups()
+            assert decisions[0] == decisions[1] == decisions[2]
+        assert collector.wait_for_ingress(2.0) and collector.flush_durable(2.0)
+        finalized = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text().splitlines()]
+        finalized = [row for row in finalized if row.get("message") == "queue_preflight_outcome"]
+        assert len(finalized) == len(expected)
+        assert reader.poll() == len(expected)
+        captured_rows = [row["capture"] for row in _artifacts(artifact) if row["capture"].get("state") == "record"]
+        captured = [row["projection"] for row in captured_rows]
+        assert [row["numbers"]["version"] for row in captured] == [row["version"] for row in finalized]
+        assert [row["created_ms"] for row in captured_rows] == [row["created_ms"] for row in finalized]
+        assert [row["corr_hash"] for row in captured] == [capture._hash(row["corr_id"]) for row in finalized]
+        assert len({row["corr_hash"] for row in captured}) == 1  # Repeated correlations retain distinct versions/order.
+        for row, facts in zip(captured, expected):
+            assert row["queue_readiness"]["collision_gate"] == facts["collision_gate"]
+            for key in facts:
+                if key.startswith("collision_"): assert row["queue_readiness"][key] == facts[key]
+        text = artifact.read_text()
+        assert all(label not in text for label in ("release", "pair-a", "complete.bin", "private-"))
+        assert all(len(json.dumps(row)) < 4096 for row in finalized)
+    finally:
+        reader.close()
+        collector.close()
+
+
+def test_collision_gate_projection_rejects_unbounded_or_private_fields() -> None:
+    details = {"schema": "queue_readiness.v1", "collision_gate": "/private/path",
+        "collision_exception": "private exception", "collision_total_bytes": 2**63,
+        "collision_path_count": -1, "collision_checked_count": True,
+        "collision_examined_count": "999", "collision_sizes_match": 1, "private_path": "/private/path"}
+    facts = capture._queue_readiness_facts("queue_preflight_outcome", details)
+    result = observer._sanitize_capture_projection({"queue_readiness": facts})["queue_readiness"]
+    assert result["collision_gate"] == result["collision_exception"] == "unknown"
+    assert all(result[key] is None for key in ("collision_total_bytes", "collision_path_count",
+        "collision_checked_count", "collision_examined_count", "collision_sizes_match"))
+    assert "/private/path" not in json.dumps(result)
 
 
 def test_queue_readiness_source_projection_is_finite_and_redacted(tmp_path: Path) -> None:

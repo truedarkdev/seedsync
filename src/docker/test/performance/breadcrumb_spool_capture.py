@@ -189,6 +189,15 @@ _QUEUE_READINESS_BOOLEAN_FIELDS = frozenset({
     "stop_boundary", "transferable_remote_content", "unknown_local_overlay",
 })
 _QUEUE_READINESS_EXTRA_ENUMS = {
+    "collision_gate": frozenset({
+        "owner_identity", "root_resolution", "safe_roots", "authority", "snapshot", "mount_boundary",
+        "relative_path", "candidate_path", "source_signature", "destination_signature", "temp_artifact",
+        "source_identity", "remote_signature", "byte_budget", "retained_batch", "remote_token",
+        "revalidation", "scoped_rescan", "claim_owner", "settlement", "cached_conflict", "claim",
+    }),
+    "collision_snapshot": frozenset({"unknown", "not_tuple", "empty", "over_limit", "valid"}),
+    "collision_source_kind": frozenset({"unknown", "file", "absent", "directory"}),
+    "collision_exception": frozenset({"none", "missing", "type", "not_regular", "permission", "filesystem", "shape", "other"}),
     "decision_boundary": frozenset({"scan_authority"}),
     "decision": frozenset({"defer"}),
     "collision_observation": frozenset({"absent", "not_applicable", "present", "unknown"}),
@@ -1183,11 +1192,12 @@ def _queue_readiness_facts(message: object, details: Mapping[str, object]) -> di
         value = details.get(key)
         if key in details:
             result[key] = value if isinstance(value, str) and value in allowed else "unknown"
-    for key in _QUEUE_READINESS_BOOLEAN_FIELDS:
+    for key in _QUEUE_READINESS_BOOLEAN_FIELDS | {"collision_sizes_match", "collision_mtimes_match"}:
         value = details.get(key)
         if key in details:
             result[key] = value if type(value) is bool else None
-    for key in ("callback_index", "callback_count", "error_code", "queue_depth", "intent_scoped_rescan_attempts"):
+    for key in ("callback_index", "callback_count", "error_code", "queue_depth", "intent_scoped_rescan_attempts",
+                "collision_path_count", "collision_examined_count", "collision_checked_count", "collision_total_bytes"):
         value = details.get(key)
         if type(value) is int and 0 <= value <= 2**63 - 1:
             result[key] = value

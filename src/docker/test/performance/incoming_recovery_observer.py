@@ -604,6 +604,15 @@ _CAPTURE_READINESS_BOOLEAN_FIELDS = {
     "stop_boundary", "transferable_remote_content", "unknown_local_overlay",
 }
 _CAPTURE_READINESS_EXTRA_ENUMS = {
+    "collision_gate": {
+        "owner_identity", "root_resolution", "safe_roots", "authority", "snapshot", "mount_boundary",
+        "relative_path", "candidate_path", "source_signature", "destination_signature", "temp_artifact",
+        "source_identity", "remote_signature", "byte_budget", "retained_batch", "remote_token",
+        "revalidation", "scoped_rescan", "claim_owner", "settlement", "cached_conflict", "claim",
+    },
+    "collision_snapshot": {"unknown", "not_tuple", "empty", "over_limit", "valid"},
+    "collision_source_kind": {"unknown", "file", "absent", "directory"},
+    "collision_exception": {"none", "missing", "type", "not_regular", "permission", "filesystem", "shape", "other"},
     "decision_boundary": {"scan_authority"},
     "decision": {"defer"},
     "collision_observation": {"absent", "not_applicable", "present", "unknown"},
@@ -1797,7 +1806,7 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
         for key in _CAPTURE_READINESS_BOOLEANS:
             if type(readiness.get(key)) is bool:
                 safe_readiness[key] = readiness[key]
-        for key in _CAPTURE_READINESS_BOOLEAN_FIELDS:
+        for key in _CAPTURE_READINESS_BOOLEAN_FIELDS | {"collision_sizes_match", "collision_mtimes_match"}:
             if key in readiness:
                 item = readiness[key]
                 safe_readiness[key] = item if type(item) is bool else None
@@ -1805,7 +1814,8 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
             if key in readiness:
                 item = readiness[key]
                 safe_readiness[key] = item if isinstance(item, str) and item in allowed else "unknown"
-        for key in ("callback_index", "callback_count", "error_code", "queue_depth", "intent_scoped_rescan_attempts"):
+        for key in ("callback_index", "callback_count", "error_code", "queue_depth", "intent_scoped_rescan_attempts",
+                    "collision_path_count", "collision_examined_count", "collision_checked_count", "collision_total_bytes"):
             item = readiness.get(key)
             if type(item) is int and 0 <= item <= 2**63 - 1:
                 safe_readiness[key] = item
