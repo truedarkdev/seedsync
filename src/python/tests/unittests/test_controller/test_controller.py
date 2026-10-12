@@ -4,6 +4,7 @@ import errno
 import os
 import json
 import logging
+from contextlib import nullcontext
 import shutil
 import stat
 import threading
@@ -17022,6 +17023,254 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__lftp.queue.assert_not_called()
         self.assertNotIn(file.file_id, self.controller._Controller__deferred_queue_intents)
+
+    def _scan_collision_batch_fixture(self, scanner, generation=0):
+        from controller.scan.scanner_process import _run_scanner_once
+        messages = []
+        _run_scanner_once(scanner, None, {"pair-a"}, SimpleNamespace(send=messages.append, close=lambda: None),
+                          None, "fixture-scan", None, None, generation=generation,
+                          session_token="local-test-session", result_via_control=True)
+        results = [message[1] for message in messages if message[0] == "result"]
+        completed = next(result for result in reversed(results)
+                         if result.is_full_snapshot and "pair-a" in result.full_snapshot_path_pair_ids
+                         and result.files)
+        self.assertFalse(completed.failed)
+        self.assertEqual({"pair-a"}, completed.completed_path_pair_ids)
+        self.assertEqual(generation, completed.generation)
+        self.assertTrue(all(root.path_pair_id == "pair-a" for root in completed.files))
+        return completed.files
+
+    def _prepare_incomplete_collision_batch(self, *, mismatch=False, type_mismatch=False):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        final = os.path.join(directory.name, "final")
+        staging = os.path.join(directory.name, "staging")
+        for base in (final, staging):
+            os.makedirs(os.path.join(base, "release", "nested"))
+            os.makedirs(os.path.join(base, "release", "legacy"))
+        timestamp = 1_700_000_000_000_000_000
+        for base in (final, staging):
+            for relative in ("nested/complete.bin", "legacy/extra.bin"):
+                path = Path(base, "release", relative)
+                path.write_bytes(b"complete")
+                os.utime(path, ns=(timestamp, timestamp))
+        if mismatch:
+            Path(staging, "release", "nested", "complete.bin").write_bytes(b"conflict")
+            os.utime(Path(staging, "release", "nested", "complete.bin"), ns=(timestamp, timestamp))
+        if type_mismatch:
+            Path(staging, "release", "nested", "complete.bin").unlink()
+            Path(staging, "release", "nested", "complete.bin").mkdir()
+        final_only = Path(final, "release", "nested", "final-only.bin")
+        final_only.write_bytes(b"complete")
+        os.utime(final_only, ns=(timestamp, timestamp))
+        partial = Path(staging, "release", "nested", "partial.bin")
+        partial.write_bytes(b"part")
+        Path(str(partial) + ".lftp-pget-status").write_text(
+            "size=8\n0.pos=4\n0.limit=8\n", encoding="utf-8")
+        remote = SystemFile("release", 32, True)
+        nested = SystemFile("nested", 32, True)
+        for name in ("complete.bin", "partial.bin", "missing.bin", "final-only.bin"):
+            nested.add_child(SystemFile(name, 8, False, mtime_ns=timestamp + 123))
+        remote.add_child(nested)
+        remote.path_pair_id = "pair-a"
+        remote.path_pair_name = "Pair A"
+        self.controller.logger = logging.getLogger("collision-batch-test")
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_remote_files([remote])
+        scanner = MultiPathLocalScanner([LocalScanner(
+            final, use_temp_file=True, staging_path=staging,
+            path_pair_id="pair-a", path_pair_name="Pair A",
+        )])
+        builder.set_local_files(self._scan_collision_batch_fixture(scanner))
+        model = builder.build_model()
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__model = model
+        self.controller._Controller__deferred_queue_intents_map()
+        self.controller._Controller__path_pairs_by_id = {
+            "pair-a": PathPair(id="pair-a", name="Pair A", remote_path="/remote",
+                               local_path=final, enabled=True),
+        }
+        self.controller._Controller__path_pair_staging_paths = {"pair-a": staging}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {"pair-a"}
+        self.controller._Controller__reconciled_local_path_pair_ids = {"pair-a"}
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {"pair-a": ("local-test-session", 0)},
+            "remote": {"pair-a": ("remote-test-session", 0)},
+        }
+        root = model.get_file(ModelFile.build_file_id("release", "pair-a"))
+        intent = DeferredQueueIntent(Controller.Command(Controller.Command.Action.QUEUE, root.file_id),
+                                     root.file_id, "pair-a", scoped_rescan_attempts=1)
+        self.addCleanup(self.controller._Controller__shutdown_collision_compare_worker)
+        return root, intent, builder, scanner, final, staging
+
+    def _drive_incomplete_collision_batch(self, root, intent):
+        outcome = None
+        for _ in range(8):
+            outcome = self.controller._Controller__queue_collision_preflight(root, intent.command, intent)
+            if outcome[0] == "reject" or outcome[1] == "collision_equal_scoped_rescan":
+                break
+            future = getattr(self.controller, "_Controller__collision_compare_future", None)
+            if future is not None:
+                future.result(timeout=5)
+        return outcome
+
+    def test_incomplete_nested_queue_collision_batch_preserves_partial_and_finalizes_normally(self):
+        root, intent, builder, scanner, final, staging = self._prepare_incomplete_collision_batch()
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=128)
+        self.addCleanup(trace.close)
+        self.controller._Controller__context.breadcrumb_trace = trace
+        self.assertTrue(builder.has_unresolved_staging_collision(root.file_id))
+        self.assertNotIn(root.file_id, builder.get_terminalizable_staging_collision_file_ids())
+        self.assertEqual(("nested/final-only.bin",), builder.get_trusted_final_leaf_paths(root.file_id))
+        final_before = Path(final, "release", "nested", "complete.bin").read_bytes()
+        self.assertEqual("absent", builder.get_queue_collision_source_identity(
+            root.file_id, "legacy/extra.bin", frozenset({"pair-a"}))[0])
+        self.assertEqual("unknown", builder.get_queue_collision_source_identity(
+            root.file_id, "legacy/extra.bin", frozenset())[0])
+        self.assertEqual("directory", builder.get_queue_collision_source_identity(
+            root.file_id, "nested", frozenset({"pair-a"}))[0])
+        outcome = self._drive_incomplete_collision_batch(root, intent)
+        self.assertEqual(("deferred", "collision_equal_scoped_rescan"), outcome[:2])
+        self.assertEqual(2, intent.collision_leaf_index)
+        self.assertEqual(2, intent.scoped_rescan_attempts)  # No reset of the spent initial fence.
+        self.assertTrue(Path(staging, "release", "nested", "partial.bin.lftp-pget-status").exists())
+        self.assertEqual(b"part", Path(staging, "release", "nested", "partial.bin").read_bytes())
+        self.assertEqual(final_before, Path(final, "release", "nested", "complete.bin").read_bytes())
+        self.assertEqual("deferred", self.controller._Controller__queue_collision_preflight(
+            root, intent.command, intent)[0])  # No successor scan yet.
+        builder.set_local_files(self._scan_collision_batch_fixture(scanner, 1))
+        rebuilt = builder.build_model().get_file(root.file_id)
+        self.assertFalse(builder.has_unresolved_staging_collision(root.file_id))
+        self.assertEqual(("nested/complete.bin", "nested/final-only.bin"),
+                         builder.get_trusted_final_leaf_paths(root.file_id))
+        self.controller._Controller__reconciled_remote_path_pair_ids = {"pair-a"}
+        self.controller._Controller__reconciled_local_path_pair_ids = {"pair-a"}
+        self.controller._Controller__scan_authority_tokens = {
+            "local": {"pair-a": ("local-test-session", 1)},
+            "remote": {"pair-a": ("remote-test-session", 1)},
+        }
+        self.assertEqual("clear", self.controller._Controller__queue_collision_preflight(
+            rebuilt, intent.command, intent)[0])
+        self.controller._Controller__model = builder.build_model()
+        self.controller._Controller__lftp.queue.return_value = True
+        self.controller._Controller__deferred_queue_intents[root.file_id] = intent
+        callback = MagicMock()
+        intent.command.add_callback(callback)
+        self.controller.queue_command(intent.command)
+        self.controller._Controller__process_commands()
+        self.controller._Controller__lftp.queue.assert_called_once()
+        callback.on_success.assert_called_once_with()
+        callback.on_failure.assert_not_called()
+        events = trace.query_events(category_prefix="queue.")["events"]
+        self.assertIn("queue_preflight_outcome", [event["message"] for event in events])
+        self.assertIn("queue_final_decision", [event["message"] for event in events])
+        self.assertIn("queue_callback", [event["message"] for event in events])
+        self.assertEqual({"fractional-mtime:" + opaque_trace_correlation(root.file_id)},
+                         {event["corr_id"] for event in events})
+        self.assertLessEqual(len(events), 128)
+        for event in events:
+            self.assertNotIn("release", json.dumps(event))
+            self.assertNotIn("pair-a", json.dumps(event))
+            self.assertNotIn("complete.bin", json.dumps(event))
+            self.assertLess(len(json.dumps(event)), 4096)
+        self.assertFalse(rebuilt.complete_local_coverage)
+        self.assertNotEqual(ModelFile.State.DOWNLOADED, rebuilt.state)
+        # A logical full checkpoint cannot make a physically truncated leaf
+        # publishable; the ordinary move boundary still sees the live map.
+        Path(staging, "release", "nested", "partial.bin.lftp-pget-status").write_text(
+            "size=8\n0.pos=8\n0.limit=8\n", encoding="utf-8")
+        builder.set_local_files(self._scan_collision_batch_fixture(scanner, 2))
+        self.assertNotEqual(ModelFile.State.DOWNLOADED, builder.build_model().get_file(root.file_id).state)
+        self.assertEqual(Controller.MoveFromStagingResult.DEFERRED,
+                         self.controller._Controller__move_from_staging("release", "pair-a"))
+        # Component fixture transfer completion, not an actual LFTP run.
+        Path(staging, "release", "nested", "partial.bin.lftp-pget-status").unlink()
+        for name in ("partial.bin", "missing.bin"):
+            path = Path(staging, "release", "nested", name)
+            path.write_bytes(b"complete")
+            os.utime(path, ns=(1_700_000_000_000_000_000,) * 2)
+        self.assertEqual(Controller.MoveFromStagingResult.COMPLETED,
+                         self.controller._Controller__move_from_staging("release", "pair-a"))
+        builder.set_local_files(self._scan_collision_batch_fixture(scanner, 2))
+        builder.set_final_move_succeeded_files({root.file_id})
+        finished = builder.build_model().get_file(root.file_id)
+        self.assertEqual(ModelFile.State.DOWNLOADED, finished.state)
+        self.assertTrue(finished.complete_local_coverage)
+        self.assertEqual(b"complete", Path(final, "release", "legacy", "extra.bin").read_bytes())
+        self.assertFalse(Path(staging, "release").exists())
+
+    def test_incomplete_collision_batch_stop_restores_owned_claim_and_rejects_wrong_pair(self):
+        root, intent, _, _, _, staging = self._prepare_incomplete_collision_batch()
+        outcome = self.controller._Controller__queue_collision_preflight(root, intent.command, intent)
+        self.assertEqual(("deferred", "comparison_pending"), outcome[:2])
+        claim = self.controller._Controller__collision_compare_claim
+        self.assertEqual(root.file_id, claim[6])
+        wrong_intent = DeferredQueueIntent(intent.command, root.file_id, "pair-b")
+        self.assertFalse(self.controller._Controller__deferred_collision_claim_match(wrong_intent))
+        self.controller._Controller__collision_compare_future.result(timeout=5)
+        self.controller._Controller__deferred_queue_intents[root.file_id] = intent
+        self.controller._Controller__retire_deferred_queue_intent(root.file_id, "stop")
+        self.assertIsNone(self.controller._Controller__collision_compare_claim)
+        self.assertTrue(Path(claim[0]).exists())
+        self.assertFalse(Path(claim[1]).exists())
+        self.assertFalse(Path(claim[4]).exists())
+        self.assertNotIn(root.file_id, self.controller._Controller__deferred_queue_intents)
+        self.controller._Controller__process_commands()
+        self.controller._Controller__lftp.queue.assert_not_called()
+        self.assertTrue(Path(staging, "release", "nested", "partial.bin.lftp-pget-status").exists())
+
+    def test_incomplete_collision_batch_changed_proof_and_sidecar_overlap_preserve_twins(self):
+        for variant in ("changed", "sidecar", "budget"):
+            with self.subTest(variant=variant):
+                root, intent, _, _, final, staging = self._prepare_incomplete_collision_batch()
+                source = Path(staging, "release", "legacy", "extra.bin")
+                destination = Path(final, "release", "legacy", "extra.bin")
+                if variant == "sidecar":
+                    Path(str(source) + ".lftp-pget-status").write_text(
+                        "size=8\n0.pos=8\n0.limit=8\n", encoding="utf-8")
+                    outcome = self._drive_incomplete_collision_batch(root, intent)
+                elif variant == "budget":
+                    with patch("controller.controller._COLLISION_COMPARE_MAX_BYTES", 1):
+                        outcome = self._drive_incomplete_collision_batch(root, intent)
+                else:
+                    self.controller._Controller__queue_collision_preflight(root, intent.command, intent)
+                    self.controller._Controller__collision_compare_future.result(timeout=5)
+                    destination.write_bytes(b"conflict")
+                    outcome = self._drive_incomplete_collision_batch(root, intent)
+                    self.controller._Controller__cancel_matching_deferred_collision_claim(intent)
+                self.assertEqual("reject", outcome[0])
+                self.assertTrue(source.exists())
+                self.assertTrue(destination.exists())
+                self.controller._Controller__lftp.queue.assert_not_called()
+
+    def test_incomplete_collision_batch_diagnostics_do_not_select_cleanup_authority(self):
+        outcomes = []
+        for mode in ("info", "disabled", "record_fault"):
+            with self.subTest(mode=mode):
+                root, intent, _, _, final, staging = self._prepare_incomplete_collision_batch()
+                trace = BreadcrumbTraceCollector(lambda: mode != "disabled", max_entries=32)
+                self.addCleanup(trace.close)
+                self.controller._Controller__context.breadcrumb_trace = trace
+                with patch.object(trace, "record", side_effect=RuntimeError("fixture emission failure")) \
+                        if mode == "record_fault" else nullcontext():
+                    outcome = self._drive_incomplete_collision_batch(root, intent)
+                outcomes.append(outcome[:2])
+                self.assertEqual(b"complete", Path(final, "release", "nested", "complete.bin").read_bytes())
+                self.assertTrue(Path(staging, "release", "nested", "partial.bin.lftp-pget-status").exists())
+        self.assertEqual([("deferred", "collision_equal_scoped_rescan")] * 3, outcomes)
+
+    def test_incomplete_collision_batch_rejects_byte_and_type_conflicts_without_loss(self):
+        for variant in ("mismatch", "type"):
+            with self.subTest(variant=variant):
+                root, intent, _, _, final, staging = self._prepare_incomplete_collision_batch(
+                    mismatch=variant == "mismatch", type_mismatch=variant == "type")
+                before = Path(final, "release", "nested", "complete.bin").read_bytes()
+                outcome = self._drive_incomplete_collision_batch(root, intent)
+                self.assertEqual("reject", outcome[0])
+                self.assertEqual(before, Path(final, "release", "nested", "complete.bin").read_bytes())
+                self.assertTrue(Path(staging, "release", "nested", "complete.bin").exists())
+                self.controller._Controller__lftp.queue.assert_not_called()
 
     def test_queue_collision_equal_claim_waits_then_rescans_before_one_dispatch(self):
         with tempfile.TemporaryDirectory() as temp_dir:

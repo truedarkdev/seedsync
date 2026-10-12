@@ -872,6 +872,12 @@ class DeferredQueueIntent:
         tuple[tuple[str, int], tuple[str, int]]
     ] = None
     scoped_rescan_attempts: int = 0
+    # Runtime-only, root-owned comparison batch. Each entry retains the
+    # independent physical twins and source authority before any claim.
+    collision_leaf_batch: Optional[tuple] = None
+    collision_leaf_index: int = 0
+    collision_leaf_remote_token: Optional[tuple[str, int]] = None
+    collision_leaf_rescan_requested: bool = False
     stop_marker_at_defer: bool = False
     stop_requested: bool = False
     failure_notified: bool = False
@@ -9140,6 +9146,8 @@ class Controller:
     def __claim_and_compare_collision_leaf(
             self, source: str, destination: str, path_pair_id: Optional[str] = None,
             mutation_tracker: Optional[_MoveMutationTracker] = None,
+            *, expected_source_signature: Optional[tuple] = None,
+            expected_destination_signature: Optional[tuple] = None,
     ) -> str:
         if not hasattr(self, "_Controller__collision_compare_lock"):
             self.__collision_compare_lock = Lock()
@@ -9152,6 +9160,12 @@ class Controller:
         with self.__collision_compare_lock:
             if self.__collision_compare_future is not None or self.__collision_compare_claim is not None:
                 return "pending"
+            if expected_source_signature is not None and not self.__collision_stat_signatures_match(
+                    self.__collision_signature(source), expected_source_signature):
+                raise OSError(errno.EAGAIN, "collision source changed before claim")
+            if expected_destination_signature is not None and not self.__collision_stat_signatures_match(
+                    self.__collision_signature(destination), expected_destination_signature):
+                raise OSError(errno.EAGAIN, "collision destination changed before claim")
             self.__collision_claim_path_pair_id = path_pair_id
             try:
                 claimed_source = self.__claim_collision_source(source, mutation_tracker)
@@ -9161,6 +9175,15 @@ class Controller:
             try:
                 source_signature = self.__collision_signature(claimed_source)
                 destination_signature = self.__collision_signature(destination)
+                # Claim rename changes ctime. All other source identity fields
+                # must still be those authorized by the root batch snapshot.
+                if expected_source_signature is not None and \
+                        source_signature[:4] + source_signature[5:] != \
+                        expected_source_signature[:4] + expected_source_signature[5:]:
+                    raise OSError(errno.EAGAIN, "collision source changed during claim")
+                if expected_destination_signature is not None and not self.__collision_stat_signatures_match(
+                        destination_signature, expected_destination_signature):
+                    raise OSError(errno.EAGAIN, "collision destination changed during claim")
             except OSError:
                 try:
                     self.__rename_no_replace(claimed_source, source)
@@ -12467,6 +12490,144 @@ class Controller:
             stop_marker_at_defer=stop_marker,
         ), False
 
+    def __queue_collision_leaf_batch(
+            self, file: ModelFile, intent: DeferredQueueIntent,
+    ) -> tuple[str, str, Optional[DeferredQueueIntent]]:
+        """Compare duplicates without publishing an incomplete staging tree."""
+        def reject(reason: str):
+            return "reject", reason, intent
+
+        try:
+            if intent.file_id != file.file_id or intent.path_pair_id != file.path_pair_id:
+                return reject("collision_claim_identity_unknown")
+            resolved = self.__resolve_safe_final_move_paths(file.full_path, file.path_pair_id)
+            if resolved is None or file.path_pair_id is None:
+                return reject("collision_claim_identity_unknown")
+            staging_root, _, source_root, destination_root = resolved
+            if not self.__safe_existing_directory(source_root) or \
+                    not self.__safe_existing_directory(destination_root):
+                return reject("collision_not_terminalizable")
+            authority = getattr(self, "_Controller__reconciled_remote_path_pair_ids", None)
+            tokens = getattr(self, "_Controller__scan_authority_tokens", {})
+            token = tokens.get("remote", {}).get(file.path_pair_id)
+            if not isinstance(authority, set) or file.path_pair_id not in authority or \
+                    not isinstance(token, tuple) or len(token) != 2 or \
+                    type(token[0]) is not str or type(token[1]) is not int:
+                return reject("collision_authority_unknown")
+            source_identity = self.__model_builder.get_queue_collision_source_identity
+            if intent.collision_leaf_batch is None:
+                paths = self.__model_builder.get_staging_collision_relative_paths(file.file_id)
+                if not isinstance(paths, tuple) or not paths or len(paths) > _COLLISION_CLAIM_SCAN_LIMIT:
+                    return reject("collision_not_terminalizable")
+                self.__reject_nested_mounts_or_reparse_points(source_root)
+                self.__reject_nested_mounts_or_reparse_points(destination_root)
+                batch = []
+                total_bytes = 0
+                for relative in paths:
+                    if not isinstance(relative, str) or not relative:
+                        return reject("collision_claim_identity_unknown")
+                    source = self.__safe_final_move_candidate(source_root, relative)
+                    destination = self.__safe_final_move_candidate(destination_root, relative)
+                    if source is None or destination is None:
+                        return reject("collision_claim_identity_unknown")
+                    source_signature = self.__collision_signature(source)
+                    destination_signature = self.__collision_signature(destination)
+                    if self.__source_has_lftp_temp_artifact(staging_root, source, file.file_id):
+                        return reject("collision_not_terminalizable")
+                    identity = source_identity(file.file_id, relative, frozenset(authority))
+                    if identity[0] not in ("file", "absent"):
+                        return reject("collision_authority_unknown")
+                    if identity[0] == "file" and any(
+                            signature[2] != identity[1] or
+                            signature[3] // 1_000_000_000 != identity[2] // 1_000_000_000
+                            for signature in (source_signature, destination_signature)):
+                        return reject("collision_not_terminalizable")
+                    total_bytes += source_signature[2]
+                    if total_bytes > _COLLISION_COMPARE_MAX_BYTES:
+                        return reject("collision_not_terminalizable")
+                    batch.append((relative, source_signature, destination_signature, identity))
+                intent.collision_leaf_batch = tuple(batch)
+                intent.collision_leaf_remote_token = token
+                intent.phase = "collision"
+                # An earlier scan classified the incomplete root; cleanup
+                # gets its own single successor fence only after progress.
+                intent.rescan_requested = False
+                intent.rescan_generations = None
+            elif intent.collision_leaf_rescan_requested:
+                return reject("collision_authority_stale")
+            if token != intent.collision_leaf_remote_token:
+                return reject("collision_authority_stale")
+            batch = intent.collision_leaf_batch
+            # Check all remaining snapshot members before touching any one.
+            claim = getattr(self, "_Controller__collision_compare_claim", None)
+            for index, (relative, before_source, before_destination, identity) in enumerate(batch):
+                source = self.__safe_final_move_candidate(source_root, relative)
+                destination = self.__safe_final_move_candidate(destination_root, relative)
+                if source is None or destination is None or \
+                        source_identity(file.file_id, relative, frozenset(authority)) != identity or \
+                        not self.__collision_stat_signatures_match(
+                            self.__collision_signature(destination), before_destination):
+                    return reject("collision_authority_stale")
+                if index < intent.collision_leaf_index:
+                    if os.path.lexists(source):
+                        return reject("collision_authority_stale")
+                    continue
+                active_source = claim[1] if claim is not None and source == claim[0] else source
+                expected_source = claim[3][2] if claim is not None and source == claim[0] else before_source
+                if not self.__collision_stat_signatures_match(
+                        self.__collision_signature(active_source), expected_source) or \
+                        self.__source_has_lftp_temp_artifact(staging_root, source, file.file_id):
+                    return reject("collision_authority_stale")
+            if intent.collision_leaf_index == len(batch):
+                if not self.__queue_scoped_rescan(intent):
+                    return reject("scoped_rescan_request_failed")
+                intent.collision_leaf_rescan_requested = True
+                return "deferred", "collision_equal_scoped_rescan", intent
+            tracker = _MoveMutationTracker(file.file_id, getattr(self.__context, "breadcrumb_trace", None))
+            updater = getattr(self, "_Controller__updater", None)
+            begin = getattr(updater, "begin_final_move_local_root_invalidation", None)
+            finish = getattr(updater, "finish_final_move_local_root_invalidation", None)
+            root_name = file.full_path.replace("\\", "/").split("/", 1)[0]
+            generation = getattr(self.__local_scan_process, "generation", None)
+            invalidation = begin(root_name, file.path_pair_id, generation) if \
+                callable(begin) and type(generation) is int else None
+            try:
+                if claim is not None:
+                    relative = batch[intent.collision_leaf_index][0]
+                    if self.__deferred_collision_claim_match(intent) is not True or \
+                            claim[0] != self.__safe_final_move_candidate(source_root, relative) or \
+                            claim[2] != self.__safe_final_move_candidate(destination_root, relative):
+                        return reject("collision_claim_identity_unknown")
+                    outcome = self.__settle_collision_claim_for_tree(source_root, destination_root, tracker)
+                    if outcome == "equal":
+                        intent.collision_leaf_index += 1
+                    elif outcome != "pending":
+                        return reject("collision_conflict")
+                else:
+                    relative = batch[intent.collision_leaf_index][0]
+                    source = self.__safe_final_move_candidate(source_root, relative)
+                    destination = self.__safe_final_move_candidate(destination_root, relative)
+                    if self.__cached_collision_outcome(source, destination) is not None:
+                        return reject("collision_conflict")
+                    self.__claim_and_compare_collision_leaf(
+                        source, destination, file.path_pair_id, tracker,
+                        expected_source_signature=batch[intent.collision_leaf_index][1],
+                        expected_destination_signature=batch[intent.collision_leaf_index][2],
+                    )
+            finally:
+                if type(invalidation) is int and callable(finish):
+                    finish(root_name, file.path_pair_id, invalidation,
+                           tracker.outcome != _MoveMutationOutcome.NO_MUTATION)
+            self.__record_queue_readiness_trace(file.file_id, "queue_preflight_outcome", {
+                "schema": "queue_readiness.v1", "phase": "preflight",
+                "origin": "auto_queue" if getattr(intent.command, "origin", "manual") == "auto_queue" else "manual",
+                "outcome": "deferred", "reason": "comparison_pending",
+            })
+            return "deferred", "comparison_pending", intent
+        except Exception:
+            self.logger.warning("Queue leaf collision preflight failed")
+            return reject("collision_preflight_error")
+
     def __queue_collision_preflight(
             self, file: ModelFile, command: "Controller.Command",
             intent: Optional[DeferredQueueIntent],
@@ -12518,6 +12679,8 @@ class Controller:
         # model snapshot: a scan can briefly report no collision while the
         # claim is still private, and dispatching in that window would bypass
         # the required equal-cleanup/rescan boundary.
+        if intent is not None and intent.collision_leaf_batch is not None and intent.phase == "collision":
+            return self.__queue_collision_leaf_batch(file, intent)
         if intent is not None and intent.phase == "collision" and claim_match is True:
             claim = getattr(self, "_Controller__collision_compare_claim", None)
             future = getattr(self, "_Controller__collision_compare_future", None)
@@ -12574,6 +12737,26 @@ class Controller:
         except Exception:
             return "reject", "collision_authority_unknown", intent
         if not unresolved:
+            if intent is not None and intent.collision_leaf_batch is not None:
+                if not intent.collision_leaf_rescan_requested or \
+                        intent.collision_leaf_index != len(intent.collision_leaf_batch):
+                    return "reject", "collision_authority_stale", intent
+                try:
+                    resolved = self.__resolve_safe_final_move_paths(file.full_path, file.path_pair_id)
+                    if resolved is None:
+                        raise OSError(errno.EAGAIN, "collision roots changed")
+                    for relative, _, destination_signature, identity in intent.collision_leaf_batch:
+                        source = self.__safe_final_move_candidate(resolved[2], relative)
+                        destination = self.__safe_final_move_candidate(resolved[3], relative)
+                        if source is None or destination is None or os.path.lexists(source) or \
+                                not self.__collision_stat_signatures_match(
+                                    self.__collision_signature(destination), destination_signature) or \
+                                self.__model_builder.get_queue_collision_source_identity(
+                                    file.file_id, relative,
+                                    frozenset(self.__reconciled_remote_path_pair_ids)) != identity:
+                            raise OSError(errno.EAGAIN, "collision batch changed after rescan")
+                except Exception:
+                    return "reject", "collision_authority_stale", intent
             if intent is not None and intent.phase == "collision":
                 if intent.scoped_rescan_attempts >= 1:
                     return "reject", "collision_authority_stale", intent
@@ -12610,6 +12793,8 @@ class Controller:
             })
             return "deferred", "comparison_pending", intent
         if file.file_id not in terminalizable_ids:
+            if file.is_dir and intent.scoped_rescan_attempts >= 1:
+                return self.__queue_collision_leaf_batch(file, intent)
             if intent is not None and intent.scoped_rescan_attempts >= 1:
                 return "reject", "collision_not_terminalizable", intent
             if not self.__queue_scoped_rescan(intent):

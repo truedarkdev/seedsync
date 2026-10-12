@@ -3697,6 +3697,36 @@ class ModelBuilder:
         visit(effective_root, "")
         return tuple(sorted(set(paths)))
 
+    def get_queue_collision_source_identity(
+            self, file_id: str, relative_path: str,
+            reconciled_remote_path_pair_ids: frozenset[Optional[str]],
+    ) -> tuple[str, Optional[int], Optional[int]]:
+        """Distinguish source absence from unknown authority for leaf cleanup.
+
+        This is not completion or an exclusion proof. Physical staging identity
+        and the controller's byte comparison remain required independently.
+        """
+        pair_id = self.__file_id_path_pair_id(file_id)
+        if not isinstance(reconciled_remote_path_pair_ids, frozenset) or \
+                pair_id not in reconciled_remote_path_pair_ids:
+            return "unknown", None, None
+        root = self.__remote_file(file_id)
+        if root is None or not root.is_dir or not relative_path or "\\" in relative_path:
+            return "unknown", None, None
+        current = root
+        for component in relative_path.split("/"):
+            if component in ("", ".", "..") or not current.is_dir:
+                return "unknown", None, None
+            child = next((child for child in current.iter_children() if child.name == component), None)
+            if child is None:
+                return "absent", None, None
+            current = child
+        if current.is_dir:
+            return "directory", None, None
+        if type(current.mtime_ns) is not int or type(current.size) is not int:
+            return "unknown", None, None
+        return "file", current.size, current.mtime_ns
+
     def is_remote_leaf_path(self, file_id: str, relative_path: str) -> bool:
         """Whether a source-root-relative leaf is currently remote-listed."""
         remote_file = self.__remote_file(file_id)
