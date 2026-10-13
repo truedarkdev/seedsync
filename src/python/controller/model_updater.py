@@ -1749,6 +1749,23 @@ def _record_lftp_status_membership_transition(
     except Exception:
         pass
 
+def _status_input_provenance(controller: object) -> dict[str, object]:
+    """Diagnostic cache identity; evaluation polls never acquire old credit."""
+    try:
+        origin = getattr(controller, "_Controller__status_diagnostic_cache", None)
+        epoch = getattr(controller, "_Controller__progress_publication_epoch", None)
+        cached = getattr(controller, "_Controller__last_lftp_statuses", None)
+        if not isinstance(origin, dict) or origin.get("statuses") is not cached or origin.get("epoch") != epoch:
+            controller._Controller__status_diagnostic_cache = None
+            return {"input_correlation": None, "status_age_ms": None, "input_epoch": None}
+        acquired = origin.get("accepted_monotonic_ns")
+        return {"input_correlation": _safe_lftp_status_poll_correlation(origin.get("poll")),
+                "status_age_ms": max(0, (time.monotonic_ns() - acquired) // 1_000_000) if type(acquired) is int else None,
+                "input_epoch": epoch}
+    except Exception:
+        return {"input_correlation": None, "status_age_ms": None, "input_epoch": None}
+
+
 def _record_root_progress_status(
         controller: object,
         statuses: Sequence[object],
@@ -1785,6 +1802,7 @@ def _record_root_progress_status(
                 "poll_correlation": poll_correlation,
                 "epoch": getattr(controller, "_Controller__progress_publication_epoch", None),
                 "model_version": model_version,
+                **_status_input_provenance(controller),
             })
         except Exception:
             pass
@@ -8854,6 +8872,12 @@ class ModelUpdater(_ControllerCoreAccess):
                     )
                 except Exception:
                     lftp_status_poll_correlation = None
+            try:
+                diagnostic_snapshot = getattr(controller, "_Controller__status_diagnostic_snapshot", None)
+                if isinstance(diagnostic_snapshot, dict) and diagnostic_snapshot.get("statuses") is controller._Controller__last_lftp_statuses:
+                    controller._Controller__status_diagnostic_cache = dict(diagnostic_snapshot)
+            except Exception:
+                pass
             _record_lftp_poll_join_breadcrumb(
                 controller, lftp_status_poll_correlation,
                 "status_consumed",
@@ -9423,12 +9447,24 @@ class ModelUpdater(_ControllerCoreAccess):
                 numeric_setter(root_progress_tracer(getattr(controller._Controller__context, "breadcrumb_trace", None)))
         except Exception:
             pass
+        active_scan_numeric_provenance = {}
+        try:
+            if latest_active_scan is not None:
+                active_scan_numeric_provenance = {
+                    "active_generation": scan_generation(latest_active_scan),
+                    "active_produced_ms": int(latest_active_scan.timestamp.timestamp() * 1000),
+                    "active_admitted_ms": int(time.time_ns() // 1_000_000),
+                }
+        except Exception:
+            pass
         model_builder.set_stop_resume_trace_cycle_context({
             "lftp_status_source": lftp_status_source,
             "lftp_poll_correlation": lftp_status_poll_correlation,
             "lftp_status_healthy": lftp_status_poll_healthy,
             "lftp_status_fresh": lftp_status_snapshot_fresh,
             "lftp_status_count": len(lftp_statuses),
+            "input_provenance": _status_input_provenance(controller),
+            "active_scan_provenance": active_scan_numeric_provenance,
             "active_scan_arrived": latest_active_scan is not None,
             "local_scan_arrived": latest_local_scan is not None,
             "remote_scan_arrived": latest_remote_scan is not None,

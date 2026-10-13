@@ -10,6 +10,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional
 import math
 import json
 import time
+from itertools import islice
 
 # my libs
 from system import SystemFile
@@ -4598,6 +4599,7 @@ class ModelBuilder:
             previous_active_files = self.__active_files
             next_active_file_ids: set[str] = set()
             next_active_files: dict[str, SystemFile] = {}
+            numeric_active_roots = []
             for file in active_files:
                 if file.path_pair_id is None:
                     matching_pair_ids = {
@@ -4614,6 +4616,14 @@ class ModelBuilder:
                 self.__mark_active_tree_staging(file)
                 self.__collect_active_file_ids(file, next_active_file_ids)
                 next_active_files[self.__root_file_id(file.name, file.path_pair_id)] = file
+                try:
+                    tracer = getattr(self, "_ModelBuilder__numeric_progress_trace", None)
+                    digest = opaque_trace_correlation(self.__root_file_id(file.name, file.path_pair_id))
+                    if tracer is not None and tracer.numeric_subject_selected(digest):
+                        cycle = self.__stop_resume_trace_cycle_context
+                        numeric_active_roots.append((digest, file.size))
+                except Exception:
+                    pass
             if next_active_files != previous_active_files:
                 self.__active_files = next_active_files
                 self.__active_file_ids = next_active_file_ids
@@ -4654,6 +4664,17 @@ class ModelBuilder:
                         self.__direct_progress_structural_blocked_root_file_ids.update(touched_file_ids)
                     self.__direct_progress_equivalent_root_file_ids.clear()
                     self.__direct_progress_deferred_active_scan_root_file_ids.clear()
+            try:
+                tracer = getattr(self, "_ModelBuilder__numeric_progress_trace", None)
+                for digest, size in numeric_active_roots[:8]:
+                    cycle = self.__stop_resume_trace_cycle_context
+                    tracer.record_numeric(digest, "active_scan", {
+                        "active_bytes": size, "active_adopted": True,
+                        **cycle.get("active_scan_provenance", {}),
+                        **cycle.get("input_provenance", {}),
+                    })
+            except Exception:
+                pass
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_ACTIVE_FILES, started_at)
 
@@ -6566,6 +6587,18 @@ class ModelBuilder:
         """Commit only the consumed status invalidation after projection."""
         preserve_active_scan = MODEL_BUILDER_INVALIDATION_ACTIVE_FILES in self.__invalidation_reasons and \
             bool(self.__direct_progress_deferred_active_scan_root_file_ids)
+        try:
+            tracer = getattr(self, "_ModelBuilder__numeric_progress_trace", None)
+            if tracer is not None and preserve_active_scan:
+                for file_id in islice(self.__direct_progress_deferred_active_scan_root_file_ids, 8):
+                    digest = opaque_trace_correlation(file_id)
+                    if tracer.numeric_subject_selected(digest):
+                        tracer.record_numeric(digest, "builder", {
+                            "overlay_deferred": True, "builder_cache_present": self.__cached_model is not None,
+                            **self.__stop_resume_trace_cycle_context.get("input_provenance", {}),
+                        })
+        except Exception:
+            pass
         if applied_model is not None and not preserve_active_scan:
             self.__cached_model = applied_model
         if preserve_active_scan:
@@ -7733,6 +7766,9 @@ class ModelBuilder:
                         cycle = self.__stop_resume_trace_cycle_context
                         parent = model_file.parent
                         tracer.record_numeric(facts["root_id"], "builder_leaf" if leaf else "builder", {
+                            **cycle.get("input_provenance", {}),
+                            "overlay_deferred": model_file.file_id in self.__direct_progress_deferred_active_scan_root_file_ids,
+                            "builder_cache_present": self.__cached_model is not None,
                             "status_bytes": getattr(raw_transfer, "size_local", None),
                             "status_total": getattr(raw_transfer, "size_remote", None),
                             "selected_bytes": model_file.transferred_size,

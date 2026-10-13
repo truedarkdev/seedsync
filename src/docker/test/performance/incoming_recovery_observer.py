@@ -1439,7 +1439,7 @@ def _sanitize_numeric_progress(value: object) -> Optional[dict[str, object]]:
     if not isinstance(value, Mapping) or value.get("schema") != "model_numeric_progress.v1":
         return None
     phase = value.get("phase")
-    if phase not in {"status", "builder", "builder_leaf", "publication", "json", "sse"}:
+    if phase not in {"status", "builder", "builder_leaf", "publication", "json", "sse", "active_scan"}:
         return None
     raw_values = value.get("values")
     raw_values = raw_values if isinstance(raw_values, Mapping) else {}
@@ -1452,15 +1452,16 @@ def _sanitize_numeric_progress(value: object) -> Optional[dict[str, object]]:
             "status_bytes", "status_total", "selected_bytes", "local_bytes", "remote_bytes",
             "ancestor_bytes", "serialized_bytes", "serialized_total", "epoch", "model_version",
             "live_root_bytes", "live_descendant_bytes", "nonlive_descendant_bytes", "blocked_descendant_bytes",
+            "status_age_ms", "input_epoch", "active_bytes", "active_generation", "active_produced_ms", "active_admitted_ms",
         )},
     }
-    for key, pattern in (("job_digest", r"[0-9a-f]{16}"), ("poll_correlation", r"lftp-poll:[0-9a-f]{16}")):
+    for key, pattern in (("job_digest", r"[0-9a-f]{16}"), ("poll_correlation", r"lftp-poll:[0-9a-f]{16}"), ("input_correlation", r"lftp-poll:[0-9a-f]{16}")):
         item = value.get(key)
         result[key] = item if isinstance(item, str) and re.fullmatch(pattern, item) else None
     for key in ("observed_ms", "monotonic_ms", "sequence"):
         item = value.get(key)
         result[key] = item if type(item) is int and 0 <= item <= 2**63 - 1 else None
-    for key in ("status_fresh", "status_healthy", "live_credit"):
+    for key in ("status_fresh", "status_healthy", "live_credit", "overlay_deferred", "builder_cache_present", "active_adopted"):
         item = value.get(key)
         result[key] = item if type(item) is bool else None
     shape, source = value.get("record_shape"), value.get("status_source")

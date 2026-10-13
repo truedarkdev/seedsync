@@ -2189,7 +2189,7 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["model_finalization"] = model_finalization
     if model_progress_lineage is not None:
         result["model_progress_lineage"] = model_progress_lineage
-    numeric_progress = _sanitize_numeric_progress(details) if category == "model.progress" else None
+    numeric_progress = _sanitize_numeric_progress(details) if category in {"model.progress", "scan.authority"} else None
     if numeric_progress is not None:
         result["numeric_progress"] = numeric_progress
     if model_publication_retry is not None:

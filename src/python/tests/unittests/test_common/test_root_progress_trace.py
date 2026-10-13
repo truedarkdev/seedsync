@@ -16,6 +16,47 @@ from common.root_progress_trace import (
 
 
 class TestRootProgressTrace(unittest.TestCase):
+    def test_numeric_serialization_binds_adoption_to_requested_publication(self):
+        from common.breadcrumb_trace import opaque_trace_correlation
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=64, policy={"default": "info"})
+        self.addCleanup(trace.close)
+        tracer = root_progress_tracer(trace)
+        digest = opaque_trace_correlation("synthetic-root")
+        tracer.select_numeric_subject(digest)
+        with patch("common.root_progress_trace.time.monotonic", return_value=10):
+            self.assertTrue(tracer.record_numeric(digest, "active_scan", {"active_adopted": True}))
+            self.assertTrue(tracer.record_numeric(digest, "publication", {"model_version": 7}))
+        with patch("common.root_progress_trace.time.monotonic", return_value=12):
+            self.assertTrue(tracer.record_numeric(digest, "active_scan", {"active_adopted": False}))
+            self.assertTrue(tracer.record_numeric(digest, "publication", {"model_version": 8}))
+            tracer.record_numeric_payload({"records": [{"file_id": "synthetic-root"}]}, "json", 7)
+            tracer.record_numeric_payload({"records": [{"file_id": "synthetic-root"}]}, "sse", 99)
+        rows = [r["details"] for r in trace.snapshot()["entries"] if r["details"].get("phase") in {"json", "sse"}]
+        self.assertEqual([True, None], [row["active_adopted"] for row in rows])
+
+    def test_critical_numeric_category_gates_match_emission_policy(self):
+        from common.breadcrumb_trace import opaque_trace_correlation
+        digest = opaque_trace_correlation("synthetic-root")
+        for mode in ("critical_only", "disabled", "normal_only", "fault"):
+            with self.subTest(mode=mode):
+                rules = {"scan.authority": "info", "model.progress": "off"} if mode in {"critical_only", "fault"} else {"model.progress": "info"} if mode == "normal_only" else {}
+                trace = BreadcrumbTraceCollector(lambda: True, max_entries=64, policy={"default": "off", "rules": rules})
+                self.addCleanup(trace.close)
+                tracer = root_progress_tracer(trace)
+                tracer.select_numeric_subject(digest)
+                with patch.object(trace, "record", side_effect=RuntimeError("synthetic sink failure")) if mode == "fault" else patch.object(trace, "record", wraps=trace.record):
+                    active = tracer.record_numeric(digest, "active_scan", {"active_adopted": True})
+                    deferred = tracer.record_numeric(digest, "builder", {"overlay_deferred": True})
+                    normal = tracer.record_numeric(digest, "status", {"status_bytes": 12})
+                self.assertEqual(mode == "critical_only", active)
+                self.assertEqual(mode == "critical_only", deferred)
+                self.assertEqual(mode == "normal_only", normal)
+                rows = [row for row in trace.snapshot()["entries"] if row["details"].get("schema") == "model_numeric_progress.v1"]
+                if mode == "critical_only":
+                    self.assertEqual(2, len(rows))
+                    self.assertTrue(all(row["category"] == "scan.authority" and row["level"] == "info" for row in rows))
+                if mode == "disabled": self.assertEqual([], rows)
+
     def test_numeric_reset_clears_publication_and_rate_then_retains_knownness_transition(self):
         from common.breadcrumb_trace import opaque_trace_correlation
         for reset_name in ("reset", "clear"):

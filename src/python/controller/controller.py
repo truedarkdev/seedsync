@@ -1549,6 +1549,8 @@ class Controller:
         self.__pending_auto_purge_file_ids = set()
         self.__exclude_patterns = ""
         self.__last_lftp_statuses = []
+        self.__status_diagnostic_cache = None
+        self.__status_diagnostic_snapshot = None
         self.__next_lftp_status_poll_at = None
         self.__lftp_idle_status_authoritative = False
         self.__lftp_status_poll_retry_seconds = 1
@@ -1814,6 +1816,8 @@ class Controller:
         self.__malformed_status_only_file_ids = set()
         self.__pending_auto_purge_file_ids = set()
         self.__last_lftp_statuses = []
+        self.__status_diagnostic_cache = None
+        self.__status_diagnostic_snapshot = None
         self.__next_lftp_status_poll_at = None
         self.__lftp_idle_status_authoritative = False
         (
@@ -2804,6 +2808,12 @@ class Controller:
             # Read immutable diagnostic scalars inside this completion; never a later poll's state.
             try:
                 from lftp.lftp import _record_lftp_status_poll_breadcrumb, _lftp_trace_count_bucket
+                if disposition == "accepted":
+                    self.__status_diagnostic_snapshot = {
+                        "statuses": statuses, "poll": correlation,
+                        "accepted_monotonic_ns": time.monotonic_ns(),
+                        "epoch": getattr(self, "_Controller__progress_publication_epoch", None),
+                    }
                 observation = getattr(self.__lftp, "_last_status_diagnostic_input", {})
                 observation = observation if isinstance(observation, dict) else {}
                 input_known = observation.get("poll_correlation") == correlation

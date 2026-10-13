@@ -126,8 +126,17 @@ def test_numeric_progress_actual_pipeline_finalized_identity_and_credit(tmp_path
             tracer = root_progress_tracer(trace)
             builder.set_numeric_progress_trace(tracer)
             poll = "lftp-poll:0123456789abcdef"
+            controller_for_origin = web.controller
+            controller_for_origin._Controller__last_lftp_statuses = [status]
+            controller_for_origin._Controller__progress_publication_epoch = 2
+            controller_for_origin._Controller__status_diagnostic_cache = {
+                "statuses": controller_for_origin._Controller__last_lftp_statuses, "poll": poll,
+                "accepted_monotonic_ns": time.monotonic_ns() - 2_000_000_000, "epoch": 2}
+            from controller.model_updater import _status_input_provenance
+            input_provenance = _status_input_provenance(controller_for_origin)
             builder.set_stop_resume_trace_cycle_context({"lftp_poll_correlation": poll,
-                "lftp_status_source": "fresh_healthy", "lftp_status_fresh": True, "lftp_status_healthy": True})
+                "lftp_status_source": "fresh_healthy", "lftp_status_fresh": True, "lftp_status_healthy": True,
+                "input_provenance": input_provenance})
             web.controller._Controller__context.breadcrumb_trace = trace
             with ExitStack() as stack:
                 if mode == "disabled": stack.enter_context(patch.object(trace, "is_effectively_enabled", return_value=False))
@@ -135,6 +144,17 @@ def test_numeric_progress_actual_pipeline_finalized_identity_and_credit(tmp_path
                 if mode == "fault": stack.enter_context(patch.object(builder, "_ModelBuilder__record_numeric_credit", side_effect=RuntimeError("synthetic-credit")))
                 model = builder.build_model(diagnostic_target_root_ids=("sample-root",))
                 assert model.get_file("sample-root").transferred_size == 231
+                from controller.scan import ScannerResult
+                from copy import deepcopy
+                scan = ScannerResult(datetime.now(), [deepcopy(local)], generation=7, session_token="synthetic-active-session")
+                builder.set_stop_resume_trace_cycle_context({"input_provenance": input_provenance,
+                    "active_scan_provenance": {"active_generation": scan.generation,
+                    "active_produced_ms": int(scan.timestamp.timestamp() * 1000),
+                    "active_admitted_ms": int(time.time_ns() // 1_000_000)}})
+                builder.set_active_files(scan.files)
+                builder.set_stop_resume_trace_cycle_context({"lftp_poll_correlation": poll,
+                    "lftp_status_source": "fresh_healthy", "lftp_status_fresh": True,
+                    "lftp_status_healthy": True, "input_provenance": input_provenance})
                 assert model.published_file("sample-root") is not None
                 controller = web.controller
                 controller._Controller__model = model
@@ -166,6 +186,10 @@ def test_numeric_progress_actual_pipeline_finalized_identity_and_credit(tmp_path
                 assert phases["builder"]["details"]["live_credit"] is True
                 assert phases["json"]["details"]["values"]["serialized_bytes"] == "231"
                 assert phases["sse"]["details"]["poll_correlation"] == poll
+                assert phases["sse"]["details"]["input_correlation"] == poll
+                assert phases["sse"]["details"]["values"]["active_generation"] == "7"
+                assert phases["sse"]["details"]["values"]["active_bytes"] == "231"
+                assert int(phases["sse"]["details"]["values"]["status_age_ms"]) >= 2000
             # B is the failed/inflight evaluation; credit remains A's 31 bytes.
             # Unknown cached producer origin must survive final publication/serialization.
             for index, cached_source in enumerate(("cached_unhealthy", "cached_inflight", "cached_retry")):
@@ -196,10 +220,12 @@ def test_numeric_progress_actual_pipeline_finalized_identity_and_credit(tmp_path
                         and row["details"].get("status_source") == cached_source]
                     assert {"status", "publication"} <= {row["phase"] for row in cached_rows}
                     assert all(row["poll_correlation"] is None for row in cached_rows)
+                    assert all(row["input_correlation"] == poll for row in cached_rows)
                     assert all(row["values"]["status_bytes"] == "31" for row in cached_rows if row["phase"] == "status")
                     transports = [row["details"] for row in trace.snapshot()["entries"]
                         if row.get("details", {}).get("phase") in ("json", "sse")]
                     assert any(row["poll_correlation"] is None for row in transports)
+                    assert all(row["input_correlation"] == poll for row in transports)
                     assert all(row["values"]["serialized_bytes"] == "231" for row in transports)
             builder.set_stop_resume_trace_cycle_context({"lftp_poll_correlation": poll,
                 "lftp_status_source": "fresh_healthy", "lftp_status_fresh": True, "lftp_status_healthy": True})
@@ -226,9 +252,16 @@ def test_numeric_progress_actual_pipeline_finalized_identity_and_credit(tmp_path
                 assert inactive_rows[0]["details"]["values"]["live_root_bytes"] is None
         assert outputs[0] == outputs[1] == outputs[2]
         assert trace.wait_for_ingress(2) and trace.flush_durable(2)
-        reader.poll()
+        # Each registered read is byte/time bounded; consume finite continuation pages.
+        for _ in range(4):
+            if reader.poll() == 0:
+                break
         captured = [row["capture"]["projection"] for row in _artifacts(artifact)
             if row["capture"].get("state") == "record" and "numeric_progress" in row["capture"].get("projection", {})]
+        # Durable lane scheduling can reorder versions after in-memory finalization.
+        # Compare the registered reader against its actual persisted producer envelope.
+        finalized = [row for row in (json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text().splitlines())
+            if row.get("details", {}).get("schema") == "model_numeric_progress.v1"]
         assert [row["numbers"]["version"] for row in captured] == [row["version"] for row in finalized]
         assert [row["numeric_progress"] for row in captured] == [observer._sanitize_numeric_progress(row["details"]) for row in finalized]
         assert len({row["corr_hash"] for row in captured}) == 1
@@ -4735,3 +4768,70 @@ def test_status_input_snapshot_survives_finalized_reader_and_sink(tmp_path: Path
         reader.close()
         collector.close()
         fixture.doCleanups()
+
+
+def test_selected_scan_witness_retains_beginning_late_and_resets_provenance(tmp_path: Path) -> None:
+    from common.root_progress_trace import root_progress_tracer
+    from common.breadcrumb_trace import opaque_trace_correlation, is_critical_breadcrumb
+    spool, artifact = _prepare(tmp_path)
+    trace = BreadcrumbTraceCollector(lambda: True, max_entries=256, policy={"default": "info"},
+        durable_enabled=True, durable_path=str(spool))
+    reader = _reader(spool, artifact, max_records=1024)
+    tracer = root_progress_tracer(trace)
+    digest = opaque_trace_correlation("synthetic-selected-root")
+    poll_a = "lftp-poll:" + "a" * 16
+    try:
+        tracer.select_numeric_subject(digest)
+        trace.record("controller", "boundary", {}, category="controller", level="info")
+        assert trace.wait_for_ingress(2) and trace.flush_durable(2)
+        reader.start()
+        with patch("common.root_progress_trace.time.monotonic", return_value=10):
+            assert tracer.record_numeric(digest, "status", {"input_correlation": poll_a,
+                "status_age_ms": 2000, "input_epoch": 2, "status_bytes": 2**53 + 7})
+            assert tracer.record_numeric(digest, "active_scan", {"active_bytes": 2**53 + 9,
+                "active_generation": 7, "active_adopted": True})
+        for index in range(1500):
+            trace.record("background", "synthetic_normal_load", {"counter": index},
+                category="model.progress", level="info", _coalesce_key=str(index))
+        with patch("common.root_progress_trace.time.monotonic", return_value=45):
+            assert tracer.record_numeric(digest, "active_scan", {"active_bytes": 2**53 + 9,
+                "active_generation": 7, "active_adopted": True})
+            tracer.record_numeric(digest, "publication", {"model_version": 77, "selected_bytes": 2**53 + 7,
+                "poll_correlation": "lftp-poll:" + "b" * 16, "status_source": "cached_unhealthy"})
+            tracer.record_numeric_payload({"records": [{"file_id": "synthetic-selected-root", "transferred_size": 2**53 + 7}]}, "json", 77)
+        assert trace.wait_for_ingress(2)
+        clean_flush = trace.flush_durable(2)
+        health = trace.durable_snapshot()
+        if not clean_flush:
+            # Normal saturation is a measured diagnostic coverage loss, not a clean flush.
+            assert health.get("lost", 0) > 0 or trace.snapshot().get("dropped", 0) > 0
+        assert health.get("critical_pending", 0) == 0 and health.get("normal_pending", 0) == 0
+        assert not health.get("writing", False)
+        rows = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text().splitlines()]
+        scans = [r for r in rows if r.get("details", {}).get("phase") == "active_scan"]
+        assert len(scans) == 2
+        assert all(r["level"] == "info" and is_critical_breadcrumb(r["source"], r["message"], r["details"], r) for r in scans)
+        assert all(r["details"]["values"]["active_bytes"] == str(2**53 + 9) for r in scans)
+        assert all(r["details"]["input_correlation"] == poll_a for r in scans)
+        # A saturated normal lane may block reader continuation; this must be explicit, never success with silent loss.
+        try:
+            reader.poll()
+        except observer.ObserverCaptureError:
+            assert any(x["capture"].get("state") == "loss" for x in _artifacts(artifact))
+        for row in scans:
+            projection, irrelevant = capture._projection(row)
+            assert not irrelevant and projection is not None
+            sanitized = observer._sanitize_capture_projection(projection)
+            assert sanitized["numeric_progress"]["values"]["active_bytes"] == str(2**53 + 9)
+            assert sanitized["numeric_progress"]["input_correlation"] == poll_a
+        trace.reset()
+        with patch("common.root_progress_trace.time.monotonic", return_value=50):
+            tracer.record_numeric_payload({"records": [{"file_id": "synthetic-selected-root", "transferred_size": 9}]}, "sse", 77)
+        assert trace.wait_for_ingress(2)
+        reset_rows = [r["details"] for r in trace.snapshot()["entries"] if r.get("details", {}).get("phase") == "sse"]
+        assert reset_rows and reset_rows[-1]["input_correlation"] is None
+        assert reset_rows[-1]["values"]["active_generation"] is None
+        assert reset_rows[-1]["values"]["status_age_ms"] is None
+    finally:
+        reader.close()
+        trace.close()

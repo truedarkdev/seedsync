@@ -17718,6 +17718,96 @@ class TestModelUpdater(unittest.TestCase):
             event["corr_id"],
         )
 
+    def test_numeric_cache_origin_and_real_active_intake_preserve_authority(self):
+        from common.root_progress_trace import root_progress_tracer
+        from common.breadcrumb_trace import opaque_trace_correlation
+        from controller.model_updater import _status_input_provenance
+        shapes = []
+        for mode in ("disabled", "enabled", "fault"):
+            builder = ModelBuilder()
+            builder.set_remote_files([SystemFile("sample-root", 100, False)])
+            live_model = builder.build_model()
+            controller, _ = self._make_progressive_update_controller(None, local_scan=None,
+                model_builder=builder, model=live_model)
+            trace = BreadcrumbTraceCollector(lambda: mode != "disabled", max_entries=128,
+                policy={"default": "info"})
+            self.addCleanup(trace.close)
+            controller._Controller__context.breadcrumb_trace = trace
+            tracer = root_progress_tracer(trace)
+            builder.set_numeric_progress_trace(tracer)
+            builder.set_stop_resume_trace_breadcrumb(trace.create_emitter())
+            # Actual Builder bounded selector admits this incomplete root.
+            builder.build_model(diagnostic_target_root_ids=("sample-root",))
+            self.assertEqual(mode != "disabled", tracer.numeric_subject_selected(opaque_trace_correlation("sample-root")))
+            # Real public parser/Lftp -> Controller completion produces the accepted A metadata.
+            from tests.unittests.test_lftp.test_lftp import TestLftp
+            from tests.unittests.test_controller.test_controller import TestController
+            from lftp import LftpJobStatusParser
+            owner = TestController()
+            owner.setUp()
+            self.addCleanup(owner.doCleanups)
+            backend = TestLftp()._build_status_poll_test_lftp()
+            backend._Lftp__job_status_parser = LftpJobStatusParser()
+            backend._Lftp__run_command = MagicMock(return_value=(
+                "jobs -v\n[0] queue (sftp://user@example.invalid)\nsftp://user@example.invalid/remote\n"
+                "Now executing: [2] pget -c /remote/sample-root -o /local/staging/\n"
+                "[2] pget -c /remote/sample-root -o /local/staging/\n"
+                "    sftp://user@example.invalid/remote\n    `/remote/sample-root', got 25 of 100 (25%)\n"))
+            backend.set_breadcrumb_trace(trace)
+            owner.controller._Controller__lftp = backend
+            owner.controller._Controller__context.breadcrumb_trace = trace
+            owner.controller._Controller__uses_async_lftp_owner = MagicMock(return_value=False)
+            owner.controller._Controller__progress_publication_epoch = 3
+            acquired = time.monotonic_ns() - 2_000_000_000
+            with patch("controller.controller.time.monotonic_ns", return_value=acquired):
+                statuses, healthy = owner.controller._get_lftp_status_snapshot()
+            self.assertTrue(healthy)
+            self.assertEqual("sample-root", statuses[0].name)
+            self.assertEqual(25, statuses[0].total_transfer_state.size_local)
+            status = statuses[0]
+            origin = owner.controller._Controller__status_diagnostic_snapshot
+            self.assertIs(origin["statuses"], statuses)
+            poll_a = origin["poll"]
+            controller._Controller__progress_publication_epoch = 3
+            controller._Controller__status_diagnostic_snapshot = origin
+            controller._take_lftp_status_poll_correlation = lambda: poll_a
+            controller._Controller__lftp.status.return_value = statuses
+            controller._get_lftp_status_snapshot = lambda: (statuses, True)
+            controller._Controller__lftp.backend_name = "lftp"
+            controller._Controller__record_breadcrumb = lambda **kw: trace.record("controller",kw.pop("message"),kw.pop("details"),**kw)
+            with patch.object(tracer, "record_numeric", side_effect=RuntimeError("synthetic diagnostic failure")) if mode == "fault" else patch.object(tracer, "record_numeric", wraps=tracer.record_numeric):
+                updater = ModelUpdater(controller)
+                updater.update()
+                controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+                controller._Controller__lftp.last_status_poll_healthy = False
+                controller._Controller__lftp.status.return_value = []
+                controller._get_lftp_status_snapshot = lambda: ([], False)
+                controller._take_lftp_status_poll_correlation = lambda: "lftp-poll:" + "b" * 16
+                scan = ScannerResult(datetime.now(), [SystemFile("sample-root", 31, False)],
+                    generation=4, session_token="synthetic-active-session")
+                controller._Controller__active_scan_process.pop_latest_result.return_value = scan
+                updater.update()
+            shape = controller._Controller__model.get_file("sample-root")
+            shapes.append((shape.state, shape.transferred_size))
+            if mode != "disabled":
+                provenance = _status_input_provenance(controller)
+                self.assertEqual(poll_a, provenance["input_correlation"])
+                self.assertGreaterEqual(provenance["status_age_ms"], 2000)
+            if mode == "enabled":
+                rows = trace.snapshot()["entries"]
+                active = [row["details"] for row in rows if row["details"].get("phase") == "active_scan"]
+                self.assertEqual(1, len(active))
+                self.assertEqual("31", active[0]["values"]["active_bytes"])
+                self.assertEqual("4", active[0]["values"]["active_generation"])
+                self.assertTrue(active[0]["active_adopted"])
+                self.assertEqual(poll_a, active[0]["input_correlation"])
+                self.assertEqual("scan.authority", next(row["category"] for row in rows if row["details"].get("phase") == "active_scan"))
+            controller._Controller__progress_publication_epoch = 4
+            self.assertIsNone(_status_input_provenance(controller)["input_correlation"])
+            self.assertIsNone(controller._Controller__status_diagnostic_cache)
+        self.assertEqual(shapes[0], shapes[1])
+        self.assertEqual(shapes[0], shapes[2])
+
     def test_active_scan_adoption_is_persisted_from_real_updater(self):
         if os.name == "nt":
             self.skipTest("Windows durable writer acknowledgement is not verified")

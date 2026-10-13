@@ -41,8 +41,9 @@ NUMERIC_PROGRESS_FIELDS = (
     "status_bytes", "status_total", "selected_bytes", "local_bytes", "remote_bytes",
     "ancestor_bytes", "serialized_bytes", "serialized_total", "epoch", "model_version",
     "live_root_bytes", "live_descendant_bytes", "nonlive_descendant_bytes", "blocked_descendant_bytes",
+    "status_age_ms", "input_epoch", "active_bytes", "active_generation", "active_produced_ms", "active_admitted_ms",
 )
-_NUMERIC_PHASES = frozenset({"status", "builder", "builder_leaf", "publication", "json", "sse"})
+_NUMERIC_PHASES = frozenset({"status", "builder", "builder_leaf", "publication", "json", "sse", "active_scan"})
 
 
 def numeric_progress_details(details: Mapping[str, object]) -> dict[str, object]:
@@ -58,6 +59,8 @@ def numeric_progress_details(details: Mapping[str, object]) -> dict[str, object]
     poll = details.get("poll_correlation")
     valid_poll = isinstance(poll, str) and poll.startswith("lftp-poll:") and len(poll) == 26 and \
         all(char in "0123456789abcdef" for char in poll[10:])
+    origin = details.get("input_correlation")
+    valid_origin = isinstance(origin, str) and len(origin) == 26 and origin.startswith("lftp-poll:") and all(c in "0123456789abcdef" for c in origin[10:])
     shape = details.get("record_shape")
     source = details.get("status_source")
     values = details.get("values", details)
@@ -68,6 +71,10 @@ def numeric_progress_details(details: Mapping[str, object]) -> dict[str, object]
         "poll_correlation": poll if valid_poll and source not in (
             "cached_inflight", "cached_retry", "cached_error", "cached_unhealthy", "cached_idle",
         ) else None,
+        "input_correlation": origin if valid_origin else None,
+        "overlay_deferred": details.get("overlay_deferred") if type(details.get("overlay_deferred")) is bool else None,
+        "builder_cache_present": details.get("builder_cache_present") if type(details.get("builder_cache_present")) is bool else None,
+        "active_adopted": details.get("active_adopted") if type(details.get("active_adopted")) is bool else None,
         "record_shape": shape if shape in ("at", "got", "none") else "none",
         "status_source": source if source in (
             "fresh_healthy", "fresh_unhealthy", "cached_inflight", "inflight_empty", "cached_retry",
@@ -171,13 +178,14 @@ class RootProgressTrace:
         self.__last_signatures: OrderedDict[tuple[str, str], str] = OrderedDict()
         self.__generation: Optional[int] = None
         self.__numeric_subjects: OrderedDict[str, None] = OrderedDict()
-        self.__numeric_publications: OrderedDict[tuple[str, int], Optional[str]] = OrderedDict()
+        self.__numeric_publications: OrderedDict[tuple[str, int], dict[str, object]] = OrderedDict()
+        self.__numeric_inputs: OrderedDict[str, dict[str, object]] = OrderedDict()
         self.__numeric_last_emit: OrderedDict[tuple[str, str], float] = OrderedDict()
 
     def select_numeric_subject(self, digest: str) -> None:
         """Reuse only subjects admitted by the existing Builder witness selector."""
         try:
-            if not self.enabled("info") or not isinstance(digest, str) or len(digest) != 16 or \
+            if not (self.enabled("info") or self.enabled("info", category="scan.authority")) or not isinstance(digest, str) or len(digest) != 16 or \
                     any(char not in "0123456789abcdef" for char in digest):
                 return
             with self.__lock:
@@ -188,28 +196,62 @@ class RootProgressTrace:
         except Exception:
             pass
 
+    def numeric_subject_selected(self, digest: str) -> bool:
+        with self.__lock:
+            return digest in self.__numeric_subjects
+
     def record_numeric(self, digest: str, phase: str, details: Mapping[str, object]) -> bool:
         """One INFO witness per selected root/phase/second; never owns model state."""
         try:
-            if phase not in _NUMERIC_PHASES or not self.enabled("info"):
+            critical_join = phase == "active_scan" or (phase == "builder" and details.get("overlay_deferred") is True)
+            category = "scan.authority" if critical_join else ROOT_PROGRESS_TRACE_CATEGORY
+            if phase not in _NUMERIC_PHASES or not self.enabled("info", category=category):
                 return False
             with self.__lock:
                 self.__sync_generation_locked(self.__trace_object())
                 if digest not in self.__numeric_subjects:
                     return False
                 safe = numeric_progress_details(details)
+                inherited = self.__numeric_inputs.get(digest, {})
+                if "input_epoch" in details and safe["values"]["input_epoch"] != inherited.get("input_epoch"):
+                    inherited = {}
+                provenance_keys = ("status_age_ms", "input_epoch", "active_bytes", "active_generation", "active_produced_ms", "active_admitted_ms")
+                if phase in {"status", "active_scan", "builder", "builder_leaf"}:
+                    current = dict(inherited)
+                    for field in provenance_keys:
+                        if field in details:
+                            current[field] = safe["values"][field]
+                    for field in ("input_correlation", "overlay_deferred", "builder_cache_present", "active_adopted"):
+                        if field in details:
+                            current[field] = safe[field]
+                    self.__numeric_inputs[digest] = current
+                    self.__numeric_inputs.move_to_end(digest)
+                    while len(self.__numeric_inputs) > 8:
+                        self.__numeric_inputs.popitem(last=False)
+                    inherited = current
+                for field in provenance_keys:
+                    if field not in details:
+                        safe["values"][field] = inherited.get(field)
+                for field in ("input_correlation", "overlay_deferred", "builder_cache_present", "active_adopted"):
+                    if field not in details:
+                        safe[field] = inherited.get(field)
                 version = details.get("model_version")
                 key = (digest, version) if type(version) is int and version >= 0 else None
                 if phase == "publication" and key is not None:
-                    self.__numeric_publications[key] = safe["poll_correlation"]
+                    self.__numeric_publications[key] = {"poll_correlation": safe["poll_correlation"], "input_correlation": safe["input_correlation"], "overlay_deferred": safe["overlay_deferred"], "builder_cache_present": safe["builder_cache_present"], "active_adopted": safe["active_adopted"], "values": dict(safe["values"])}
                     self.__numeric_publications.move_to_end(key)
                     while len(self.__numeric_publications) > 128:
                         self.__numeric_publications.popitem(last=False)
                 elif phase in ("json", "sse"):
-                    safe["poll_correlation"] = self.__numeric_publications.get(key)
+                    publication = self.__numeric_publications.get(key, {})
+                    for field in ("poll_correlation", "input_correlation", "overlay_deferred", "builder_cache_present", "active_adopted"):
+                        safe[field] = publication.get(field)
+                    for field in provenance_keys:
+                        safe["values"][field] = publication.get("values", {}).get(field)
                 rate_key = (digest, phase)
                 now = time.monotonic()
                 if now - self.__numeric_last_emit.get(rate_key, float("-inf")) < 1:
+                    self.__health(self.__trace_object(), "tracer_deduplicated", "numeric_" + phase)
                     return False
                 self.__numeric_last_emit[rate_key] = now
                 self.__numeric_last_emit.move_to_end(rate_key)
@@ -265,17 +307,18 @@ class RootProgressTrace:
         elif self.__generation != generation:
             self.__last_signatures.clear()
             self.__numeric_publications.clear()
+            self.__numeric_inputs.clear()
             self.__numeric_last_emit.clear()
             self.__generation = generation
 
-    def enabled(self, level: str = "debug") -> bool:
+    def enabled(self, level: str = "debug", *, category: str = ROOT_PROGRESS_TRACE_CATEGORY) -> bool:
         trace = self.__trace_object()
         if trace is None:
             return False
         effective = getattr(trace, "is_effectively_enabled", None)
         if callable(effective):
             try:
-                result = effective(ROOT_PROGRESS_TRACE_CATEGORY, level)
+                result = effective(category, level)
                 return result if isinstance(result, bool) else False
             except Exception:
                 return False
@@ -342,13 +385,15 @@ class RootProgressTrace:
         trace = self.__trace_object()
         if trace is None:
             return False
-        if not self.enabled(level):
-            self.__health(trace, "trace_policy_disabled", stage)
-            return False
         try:
             job_digest = opaque_trace_correlation(identity)
             numeric = stage.startswith("numeric_") and stage[8:] in _NUMERIC_PHASES
             safe = numeric_progress_details(details) if numeric else _safe_details(details)
+            critical_join = numeric and (stage == "numeric_active_scan" or (stage == "numeric_builder" and safe["overlay_deferred"] is True))
+            category = "scan.authority" if critical_join else ROOT_PROGRESS_TRACE_CATEGORY
+            if not self.enabled(level, category=category):
+                self.__health(trace, "trace_policy_disabled", stage)
+                return False
             if numeric:
                 safe["phase"] = stage[8:]
                 mono = details.get("monotonic_ms")
@@ -365,7 +410,7 @@ class RootProgressTrace:
             # are the correlation evidence needed to explain a delayed page.
             ignored_signature_keys = {"observed_ms", "duration_ms", "monotonic_ms"}
             if numeric:
-                ignored_signature_keys.add("poll_correlation")
+                ignored_signature_keys.update({"poll_correlation", "input_correlation"})
             if stage == "status":
                 ignored_signature_keys.update({"model_version", "scope_version"})
             signature_details = {
@@ -376,6 +421,10 @@ class RootProgressTrace:
                 # Retain an unknown-to-known provenance transition without
                 # churning stable values when only the opaque poll changes.
                 signature_details["poll_known"] = safe["poll_correlation"] is not None
+                signature_details["input_known"] = safe["input_correlation"] is not None
+                critical_join = stage == "numeric_active_scan" or (stage == "numeric_builder" and safe["overlay_deferred"] is True)
+                if critical_join:
+                    signature_details["retention_window"] = int(time.monotonic() // 30)
             signature = json.dumps(signature_details, sort_keys=True, separators=(",", ":"))
             key = (job_digest, stage)
             with self.__lock:
@@ -396,7 +445,7 @@ class RootProgressTrace:
                     safe,
                     stage="root_progress_{}".format(stage),
                     event_type="diagnostic",
-                    category=ROOT_PROGRESS_TRACE_CATEGORY,
+                    category=category,
                     level=level,
                     corr_id="root-progress:{}".format(job_digest),
                     flow_id="root-progress:{}".format(job_digest),
