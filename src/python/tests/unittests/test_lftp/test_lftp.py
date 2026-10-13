@@ -766,6 +766,40 @@ class TestLftp(unittest.TestCase):
         finally:
             lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = original_remaining
 
+    def test_partial_queue_prefix_is_returned_without_authoritative_health(self):
+        prefix = LftpJobStatus(2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "sample.bin", "")
+        for grace in (False, True):
+            with self.subTest(grace=grace):
+                lftp = self._build_status_poll_test_lftp()
+                parser = LftpJobStatusParser()
+                lftp._Lftp__job_status_parser = parser
+                lftp._Lftp__run_command = MagicMock(return_value="synthetic frame")
+                lftp._Lftp__status_poll_needs_connection_grace = grace
+                def parse(_output):
+                    parser._LftpJobStatusParser__last_parse_outcome = "partial_queue"
+                    return [] if grace and parser.parse.call_count == 1 else [prefix]
+                with patch.object(parser, "parse", side_effect=parse):
+                    self.assertEqual([prefix], lftp.status())
+                self.assertFalse(lftp.last_status_poll_healthy)
+                self.assertEqual("unhealthy_snapshot", lftp.last_status_poll_failure_reason)
+                self.assertEqual("partial_queue", lftp.last_status_parse_outcome)
+
+    def test_complete_blank_poll_after_partial_queue_restores_idle_authority(self):
+        for grace in (False, True):
+            with self.subTest(grace=grace):
+                lftp = self._build_status_poll_test_lftp()
+                lftp._Lftp__job_status_parser = LftpJobStatusParser()
+                lftp._Lftp__status_poll_needs_connection_grace = grace
+                lftp._Lftp__run_command = MagicMock(return_value=(
+                    "jobs -v\n[0] queue (sftp://user@example.invalid)\nsftp://user@example.invalid/remote\n"))
+                self.assertEqual([], lftp.status())
+                self.assertFalse(lftp.last_status_poll_healthy)
+                lftp._Lftp__run_command = MagicMock(return_value="jobs -v\n")
+                self.assertEqual([], lftp.status())
+                self.assertTrue(lftp.last_status_poll_healthy)
+                self.assertEqual("blank_empty", lftp.last_status_parse_outcome)
+                self.assertIsNone(lftp.last_status_poll_failure_reason)
+
     def test_partial_queue_empty_status_does_not_consume_private_frame_capture(self):
         lftp = self._build_status_poll_test_lftp()
         lftp._Lftp__job_status_parser = LftpJobStatusParser()
@@ -788,7 +822,8 @@ class TestLftp(unittest.TestCase):
                 lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 3
                 statuses = lftp.status(trace_poll_correlation="lftp-poll:0123456789abcdef")
                 self.assertEqual([], statuses)
-                self.assertTrue(lftp.last_status_poll_healthy)
+                self.assertFalse(lftp.last_status_poll_healthy)
+                self.assertEqual("unhealthy_snapshot", lftp.last_status_poll_failure_reason)
                 self.assertEqual("partial_queue", lftp.last_status_parse_outcome)
                 self.assertEqual([], list(Path(capture_dir).iterdir()))
                 self.assertEqual(3, lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING)
@@ -2250,6 +2285,8 @@ class TestLftp(unittest.TestCase):
             "test_status_success_does_not_consume_private_frame_capture",
             "test_empty_healthy_status_does_not_consume_private_frame_capture",
             "test_partial_queue_empty_status_does_not_consume_private_frame_capture",
+            "test_partial_queue_prefix_is_returned_without_authoritative_health",
+            "test_complete_blank_poll_after_partial_queue_restores_idle_authority",
             "test_healthy_status_frame_capture_joins_actual_parser_jobs_to_pair_annotations",
             "test_healthy_status_frame_capture_io_failure_preserves_status_result",
             "test_connection_grace_status_frame_capture_records_both_healthy_parse_boundaries",

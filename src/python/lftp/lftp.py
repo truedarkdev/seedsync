@@ -3372,7 +3372,9 @@ class Lftp:
             statuses = self.__job_status_parser.parse(out)
             self.__set_status_parse_outcome(statuses)
             self.__consecutive_status_errors = 0
-            self.__last_status_poll_healthy = not timed_out
+            # Tolerated queue prefixes remain useful results, but incomplete
+            # membership cannot prove idle or retire the last running owner.
+            self.__last_status_poll_healthy = not timed_out and self.last_status_parse_outcome != "partial_queue"
             record_status_result(
                 "parse_complete", out, len(statuses), healthy=self.__last_status_poll_healthy,
             )
@@ -3428,7 +3430,8 @@ class Lftp:
                 statuses = self.__job_status_parser.parse(out)
                 self.__set_status_parse_outcome(statuses)
                 self.__consecutive_status_errors = 0
-                self.__last_status_poll_healthy = not self.__last_command_timed_out
+                self.__last_status_poll_healthy = not self.__last_command_timed_out and \
+                    self.last_status_parse_outcome != "partial_queue"
                 record_status_result(
                     "parse_complete", out, len(statuses), healthy=self.__last_status_poll_healthy,
                 )

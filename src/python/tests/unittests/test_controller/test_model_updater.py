@@ -20419,6 +20419,79 @@ class TestModelUpdater(unittest.TestCase):
         self.assertNotIn(target, serialized)
         self.assertNotIn(target + ".lftp-pget-status", serialized)
 
+    def test_partial_queue_poll_cannot_retire_running_publication(self):
+        from lftp import Lftp, LftpJobStatusParser
+        from tests.unittests.test_controller.test_controller import TestController
+        partial = "jobs -v\n[0] queue (sftp://user@example.invalid)\nsftp://user@example.invalid/remote\n"
+        running_frame = ("jobs -v\n[0] queue (sftp://user@example.invalid)\n"
+            "sftp://user@example.invalid/remote\nNow executing: [2] pget -c /remote/sample.bin -o /local/staging/\n"
+            "[2] pget -c /remote/sample.bin -o /local/staging/\n"
+            "    sftp://user@example.invalid/remote\n    `/remote/sample.bin', got 9 of 10 (90%)\n")
+        for grace in (False, True):
+            for diagnostic in ("disabled", "enabled", "fault"):
+                with self.subTest(grace=grace, diagnostic=diagnostic):
+                    trace = BreadcrumbTraceCollector(lambda: diagnostic != "disabled", max_entries=64,
+                        policy={"default": "info"})
+                    self.addCleanup(trace.close)
+                    with patch("lftp.lftp.pexpect.spawn", return_value=MagicMock()), \
+                            patch.object(Lftp, "_Lftp__setup"):
+                        backend = Lftp("example.invalid", 22, "user", None)
+                    backend._Lftp__run_command = MagicMock(return_value=running_frame)
+                    context = TestController()._make_startup_context(local_path="/local")
+                    context.breadcrumb_trace = trace
+                    with patch("controller.controller.create_transfer_backend", return_value=MagicMock()):
+                        controller = Controller(context, ControllerPersist())
+                    controller._Controller__lftp = backend
+                    controller._Controller__startup_recovery_done = True
+                    for name in ("local", "remote", "active"):
+                        process = MagicMock()
+                        process.pop_latest_result.return_value = None
+                        process.pop_latest_updates.return_value = []
+                        setattr(controller, "_Controller__" + name + "_scan_process", process)
+                    for name in ("extract", "validate"):
+                        process = MagicMock()
+                        process.pop_latest_statuses.return_value = None
+                        process.pop_completed.return_value = []
+                        process.pop_failed.return_value = []
+                        setattr(controller, "_Controller__" + name + "_process", process)
+                    builder = controller._Controller__model_builder
+                    remote = SystemFile("sample.bin", 10, False)
+                    local = SystemFile("sample.bin", 9, False, is_staging=True)
+                    local.status_sidecar_ready = True
+                    builder.set_remote_files([remote]); builder.set_local_files([local])
+                    statuses = backend.status()
+                    self.assertTrue(backend.last_status_poll_healthy)
+                    self.assertEqual(9, statuses[0].total_transfer_state.size_local)
+                    builder.set_lftp_statuses(statuses)
+                    controller._Controller__model = builder.build_model()
+                    controller._Controller__last_lftp_statuses = statuses
+                    controller._Controller__prev_downloading_file_names = {("sample.bin", None, None)}
+                    controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+                        datetime.now(), [local], is_scan_final=True,
+                    )
+                    backend._Lftp__status_poll_needs_connection_grace = grace
+                    backend._Lftp__run_command = MagicMock(return_value=partial)
+                    backend.set_breadcrumb_trace(trace)
+                    with patch.object(trace, "record", side_effect=RuntimeError("synthetic emission")) \
+                            if diagnostic == "fault" else patch.object(trace, "record", wraps=trace.record):
+                        result = backend.status(trace_poll_correlation="lftp-poll:0123456789abcdef")
+                    # Bind health to the completed poll tuple, rather than later backend metadata.
+                    snapshot = (list(result or []), backend.last_status_poll_healthy)
+                    self.assertEqual("partial_queue", backend.last_status_parse_outcome)
+                    backend._Lftp__last_status_poll_healthy = True
+                    future = Future(); future.set_result(snapshot)
+                    controller._Controller__uses_async_lftp_owner = MagicMock(return_value=True)
+                    controller._Controller__lftp_status_future = future
+                    controller._Controller__lftp_status_future_publication_epoch = controller._Controller__progress_publication_epoch
+                    controller._Controller__next_lftp_status_poll_at = None
+                    ModelUpdater(controller).update()
+                    published = controller._Controller__model.get_file("sample.bin")
+                    self.assertEqual(ModelFile.State.DOWNLOADING, published.state)
+                    self.assertEqual(9, published.transferred_size)
+                    self.assertFalse(controller._Controller__lftp_idle_status_authoritative)
+                    self.assertNotIn(("sample.bin", None, None), controller._Controller__pending_completion_file_names)
+                    self.assertFalse(snapshot[1])
+
     def test_unhealthy_parser_membership_does_not_retire_a_running_partial(self):
         """A damaged status frame is not evidence that a ModelUpdater job ended."""
         file_name = "damaged-membership.bin"
