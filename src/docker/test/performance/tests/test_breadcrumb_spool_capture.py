@@ -166,6 +166,43 @@ def test_numeric_progress_actual_pipeline_finalized_identity_and_credit(tmp_path
                 assert phases["builder"]["details"]["live_credit"] is True
                 assert phases["json"]["details"]["values"]["serialized_bytes"] == "231"
                 assert phases["sse"]["details"]["poll_correlation"] == poll
+            # B is the failed/inflight evaluation; credit remains A's 31 bytes.
+            # Unknown cached producer origin must survive final publication/serialization.
+            for index, cached_source in enumerate(("cached_unhealthy", "cached_inflight", "cached_retry")):
+                evaluation_poll = "lftp-poll:{:016x}".format(index + 100)
+                builder.set_stop_resume_trace_cycle_context({"lftp_poll_correlation": evaluation_poll,
+                    "lftp_status_source": cached_source, "lftp_status_fresh": False, "lftp_status_healthy": False})
+                with ExitStack() as stack:
+                    if mode == "disabled": stack.enter_context(patch.object(trace, "is_effectively_enabled", return_value=False))
+                    if mode == "fault": stack.enter_context(patch.object(trace, "record", side_effect=RuntimeError("synthetic-detail")))
+                    stack.enter_context(patch("common.root_progress_trace.time.monotonic", return_value=time.monotonic() + 10 + index * 2))
+                    _record_root_progress_status(controller, [status], source=cached_source, model_version=model.version,
+                        fresh=False, healthy=False, poll_correlation=evaluation_poll)
+                    ModelUpdater._record_status_publication_join(trace.create_emitter(), controller,
+                        {"publication_id": 1, "model_version": model.version}, builder,
+                        raw_statuses=[status], filtered_statuses=[status], consumed_statuses=[status],
+                        raw_status_id_counts={status.file_id: 1}, active_status_file_ids={status.file_id},
+                        malformed_status_file_ids=set(), status_source=cached_source, status_fresh=False,
+                        status_healthy=False, poll_correlation=evaluation_poll)
+                    cached_body = handler._ModelApiHandler__json_response(payload).body
+                    cached_sse = handler._ModelApiHandler__sse("scoped", "model-page", {"records": records},
+                        version=1, global_model_version=model.version, scope_id="scope")
+                    assert cached_body == body and cached_sse == sse
+                    outputs[-1] += (cached_body, cached_sse)
+                if mode == "enabled":
+                    assert trace.wait_for_ingress(2) and trace.flush_durable(2)
+                    cached_rows = [row["details"] for row in trace.snapshot()["entries"]
+                        if row.get("details", {}).get("schema") == "model_numeric_progress.v1"
+                        and row["details"].get("status_source") == cached_source]
+                    assert {"status", "publication"} <= {row["phase"] for row in cached_rows}
+                    assert all(row["poll_correlation"] is None for row in cached_rows)
+                    assert all(row["values"]["status_bytes"] == "31" for row in cached_rows if row["phase"] == "status")
+                    transports = [row["details"] for row in trace.snapshot()["entries"]
+                        if row.get("details", {}).get("phase") in ("json", "sse")]
+                    assert any(row["poll_correlation"] is None for row in transports)
+                    assert all(row["values"]["serialized_bytes"] == "231" for row in transports)
+            builder.set_stop_resume_trace_cycle_context({"lftp_poll_correlation": poll,
+                "lftp_status_source": "fresh_healthy", "lftp_status_fresh": True, "lftp_status_healthy": True})
             with ExitStack() as stack:
                 if mode == "disabled": stack.enter_context(patch.object(trace, "is_effectively_enabled", return_value=False))
                 if mode == "fault": stack.enter_context(patch.object(trace, "record", side_effect=RuntimeError("synthetic-detail")))
@@ -4634,3 +4671,67 @@ def test_model_publication_retry_projection_guards_unknown_fields(schema: object
         "details": {"schema": "model_publication_retry.v1", "outcome": "retry_admitted"},
     })
     assert wrong_context is None and rejected
+
+
+def test_status_input_snapshot_survives_finalized_reader_and_sink(tmp_path: Path) -> None:
+    from tests.unittests.test_lftp.test_lftp import TestLftp
+    from lftp import LftpJobStatusParser
+    import lftp.lftp as lftp_module
+    assert _ControllerFixture is not None and BreadcrumbTraceCollector is not None
+    spool, artifact = _prepare(tmp_path)
+    collector = BreadcrumbTraceCollector(lambda: True, max_entries=256,
+        policy={"default": "off", "rules": {"transfer.lftp.status": "info", "controller": "info"}},
+        durable_enabled=True, durable_path=str(spool))
+    fixture = _ControllerFixture()
+    fixture.setUp()
+    reader = _reader(spool, artifact, max_records=256)
+    correlation = "lftp-poll:0123456789abcdef"
+    try:
+        collector.record("controller", "boundary", {}, category="controller", level="info")
+        assert collector.wait_for_ingress(2.0) and collector.flush_durable(2.0)
+        reader.start()
+        backend = TestLftp()._build_status_poll_test_lftp()
+        backend._Lftp__job_status_parser = LftpJobStatusParser()
+        backend.set_breadcrumb_trace(collector)
+        producer = fixture.controller
+        producer._Controller__context.breadcrumb_trace = collector
+        producer._Controller__lftp = backend
+        def begin():
+            producer._Controller__lftp_status_poll_correlation = correlation
+            return correlation
+        producer._Controller__begin_lftp_status_poll_lineage = begin
+        partial = "jobs -v\n[0] queue (sftp://user@example.invalid)\nsftp://user@example.invalid/remote\n"
+        healthy = partial + "Queue is running.\nCommands queued:\n1. pget -c /remote/sample.bin -o /local/sample.bin\n"
+        for output, health in ((healthy, True), (partial, False), ("jobs -v\n", True)):
+            backend._Lftp__run_command = MagicMock(return_value=output)
+            assert producer._get_lftp_status_snapshot() is None
+            producer._Controller__lftp_status_future.result(timeout=2)
+            snapshot = producer._get_lftp_status_snapshot()
+            assert snapshot[1] is health
+        assert collector.wait_for_ingress(2.0) and collector.flush_durable(2.0)
+        finalized = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text().splitlines()]
+        produced = [row for row in finalized if row.get("details", {}).get("schema") == "lftp.status_poll.v1"]
+        assert len([row for row in produced if row["details"]["phase"] == "snapshot"]) == 3
+        assert all(row["corr_id"] == correlation for row in produced)
+        reader.poll()
+        retained = [x["capture"] for x in _artifacts(artifact) if x["capture"].get("state") == "record"]
+        projected = [x for x in retained if x["projection"].get("lftp_status_authority", {}).get("schema") == "lftp.status_poll.v1"]
+        assert [x["projection"]["numbers"]["version"] for x in projected] == [x["version"] for x in produced]
+        assert [x["created_ns"] for x in projected] == [x["created_ns"] for x in produced]
+        snapshots = [x["projection"]["lftp_status_authority"] for x in projected if x["projection"]["lftp_status_authority"]["phase"] == "snapshot"]
+        produced_snapshots = [x for x in produced if x["details"]["phase"] == "snapshot"]
+        assert [x["healthy"] for x in snapshots] == [x["details"]["healthy"] for x in produced_snapshots]
+        causal_snapshots = sorted(produced_snapshots, key=lambda x: x["created_ns"])
+        assert [x["details"]["healthy"] for x in causal_snapshots] == [True, False, True]
+        assert [x["parser_outcome"] for x in snapshots] == [x["details"]["parser_outcome"] for x in produced_snapshots]
+        assert all(x["input_phase"] == "primary" and x["snapshot_disposition"] == "accepted" for x in snapshots)
+        assert "example.invalid" not in artifact.read_text() and "/remote/sample" not in artifact.read_text()
+        assert all(len(json.dumps(row)) < 4096 for row in produced)
+        malicious = capture._lftp_status_authority_facts({"schema": "lftp.status_poll.v1", "input_phase": "/private", "healthy": 1, "status_count_bucket": "999999", "raw": "secret"}, "lftp_status_poll")
+        assert malicious["input_phase"] == "unknown" and malicious["healthy"] is None
+        assert malicious["status_count_bucket"] == "unknown" and "raw" not in malicious
+        assert observer._sanitize_capture_projection({"lftp_status_authority": malicious})["lftp_status_authority"] == malicious
+    finally:
+        reader.close()
+        collector.close()
+        fixture.doCleanups()

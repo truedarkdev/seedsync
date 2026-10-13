@@ -2800,6 +2800,30 @@ class Controller:
 
     def _get_lftp_status_snapshot(self) -> Optional[tuple[list[LftpJobStatus], bool]]:
         """Return a completed snapshot, or None while the one PTY poll is in flight."""
+        def completed_snapshot(statuses, healthy, correlation, disposition="accepted"):
+            # Read immutable diagnostic scalars inside this completion; never a later poll's state.
+            try:
+                from lftp.lftp import _record_lftp_status_poll_breadcrumb, _lftp_trace_count_bucket
+                observation = getattr(self.__lftp, "_last_status_diagnostic_input", {})
+                observation = observation if isinstance(observation, dict) else {}
+                input_known = observation.get("poll_correlation") == correlation
+                input_phase = observation.get("input_phase") if input_known else "unknown"
+                parser_outcome = observation.get("parser_outcome") if input_known else "not_attempted"
+                trace = getattr(getattr(self, "_Controller__context", None), "breadcrumb_trace", None)
+                if not _breadcrumb_effectively_enabled(trace, "transfer.lftp.status", "info" if healthy else "warning"):
+                    return (statuses, healthy)
+                signature = (healthy, _lftp_trace_count_bucket(len(statuses)), input_phase, parser_outcome, disposition)
+                if signature != getattr(self, "_Controller__status_snapshot_witness_signature", None):
+                    _record_lftp_status_poll_breadcrumb(
+                        getattr(getattr(self, "_Controller__context", None), "breadcrumb_trace", None),
+                        correlation, "snapshot", process_alive=None, status_count=len(statuses), healthy=healthy,
+                        input_phase=input_phase, parser_outcome=parser_outcome, snapshot_disposition=disposition,
+                    )
+                    self.__status_snapshot_witness_signature = signature
+            except Exception:
+                pass
+            return (statuses, healthy)
+
         begin_lineage = getattr(self, "_Controller__begin_lftp_status_poll_lineage", None)
         record_lineage = getattr(self, "_Controller__record_lftp_status_poll_lineage", None)
         if not self.__uses_async_lftp_owner():
@@ -2827,7 +2851,7 @@ class Controller:
                 # later cached tick.
                 self.__lftp_status_poll_correlation = None
                 raise
-            return (list(statuses or []), bool(getattr(self.__lftp, "last_status_poll_healthy", True)))
+            return completed_snapshot(list(statuses or []), bool(getattr(self.__lftp, "last_status_poll_healthy", True)), correlation)
         future = getattr(self, "_Controller__lftp_status_future", None)
         if future is None:
             if callable(begin_lineage):
@@ -2881,6 +2905,7 @@ class Controller:
                 submitted_epoch = getattr(self, "_Controller__progress_publication_epoch", 0)
             epoch_matches = submitted_epoch == getattr(self, "_Controller__progress_publication_epoch", 0)
         if not epoch_matches:
+            completed_snapshot([], False, completed_correlation, "epoch_rejected")
             self.__lftp_status_poll_correlation = None
             return None
         if completed_correlation != getattr(self, "_Controller__lftp_status_poll_correlation", None):
@@ -2888,7 +2913,8 @@ class Controller:
             # snapshot remains useful, but it must not consume a newer token.
             self.__lftp_status_poll_correlation = None
         try:
-            return cast(tuple[list[LftpJobStatus], bool], future.result())
+            result = cast(tuple[list[LftpJobStatus], bool], future.result())
+            return completed_snapshot(result[0], result[1], completed_correlation)
         except Exception as exc:
             # A worker-side status exception must become an unhealthy poll,
             # not an exception escaping the controller loop.  The updater

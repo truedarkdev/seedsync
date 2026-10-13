@@ -1198,12 +1198,18 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         trace = self._trace()
         with tempfile.TemporaryDirectory() as capture_dir:
             prior_remaining = lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING
-            lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 2
+            lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 3
             try:
                 with patch.dict(
                         os.environ,
                         {"SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": capture_dir},
-                ):
+                ), patch.object(lftp_mod, "_PRIVATE_STATUS_FRAME_CAPTURE_ROLES", set()), \
+                        patch.object(lftp_mod, "_PRIVATE_STATUS_FRAME_CAPTURE_PATHS", {}):
+                    self.assertTrue(lftp_mod._lftp_private_status_frame_capture(
+                        "lftp-poll:0123456789abcdef", "synthetic timeout tail", True, trace,
+                        {"command_timed_out": True}, poll_healthy=False,
+                    ))
+                    anomaly_path = lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_PATHS["anomaly"]
                     result = lftp_mod._lftp_private_status_relation_capture(
                         "lftp-poll:0123456789abcdef",
                         "lftp-poll:fedcba9876543210",
@@ -1221,12 +1227,9 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
                         trace,
                     )
                 self.assertEqual("captured", result)
-                relation_dirs = [
-                    name for name in os.listdir(capture_dir)
-                    if name.startswith("lftp-status-relation-")
-                ]
-                self.assertEqual(1, len(relation_dirs))
-                with open(os.path.join(capture_dir, relation_dirs[0], "manifest.json"), encoding="utf-8") as handle:
+                self.assertEqual(1, len(os.listdir(capture_dir)))
+                self.assertEqual(2, lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING)
+                with open(os.path.join(anomaly_path, "relation.json"), encoding="utf-8") as handle:
                     manifest = json.load(handle)
             finally:
                 lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = prior_remaining
@@ -1240,9 +1243,9 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
         self.assertTrue(manifest["fresh_read_command_echo"])
         self.assertFalse(manifest["fresh_read_prompt_match"])
         self.assertTrue(manifest["fresh_read_prompt_or_echo"])
-        self.assertEqual("available", manifest["capture_quota_state"])
+        self.assertEqual("reused_anomaly_slot", manifest["capture_quota_state"])
         self.assertEqual(2, manifest["capture_quota_remaining_before"])
-        self.assertEqual(1, manifest["capture_quota_remaining_after"])
+        self.assertEqual(2, manifest["capture_quota_remaining_after"])
         self.assertNotIn("synthetic", repr(manifest))
 
     def test_relation_capture_reports_unavailable_or_exhausted_without_claiming_persistence(self):
@@ -1256,7 +1259,7 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
                         {"SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": capture_dir},
                 ):
                     self.assertEqual(
-                        "exhausted",
+                        "unavailable",
                         lftp_mod._lftp_private_status_relation_capture(
                             "lftp-poll:0123456789abcdef",
                             "lftp-poll:fedcba9876543210",

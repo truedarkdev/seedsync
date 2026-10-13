@@ -1334,6 +1334,19 @@ def _sanitize_lifecycle_persist(value: Mapping[str, object]) -> Mapping[str, obj
 def _sanitize_lftp_status_authority(value: object) -> Mapping[str, object] | None:
     if not isinstance(value, Mapping):
         return None
+    if value.get("schema") == "lftp.status_poll.v1":
+        result = {"schema": "lftp.status_poll.v1"}
+        for key, allowed in (
+            ("phase", {"parse_complete", "parse_error", "health", "snapshot", "jobs_read", "prompt_timeout", "process_eof", "command_error"}),
+            ("input_phase", {"primary", "connection_grace", "timeout_tail"}),
+            ("parser_outcome", _CAPTURE_LFTP_STATUS_PARSER_OUTCOMES),
+            ("snapshot_disposition", {"accepted", "epoch_rejected"}),
+            ("status_count_bucket", {"0", "1", "2-4", "5-16", "17-64", "65+"}),
+        ):
+            item = value.get(key)
+            result[key] = item if isinstance(item, str) and item in allowed else None if key == "snapshot_disposition" else "unknown"
+        result["healthy"] = value.get("healthy") if type(value.get("healthy")) is bool else None
+        return result
     result: dict[str, object] = {
         "schema": _CAPTURE_LFTP_STATUS_AUTHORITY_SCHEMA
         if value.get("schema") == _CAPTURE_LFTP_STATUS_AUTHORITY_SCHEMA else "unknown",

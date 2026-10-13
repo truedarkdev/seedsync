@@ -626,6 +626,16 @@ def _queue_lifecycle_facts(details: Mapping[str, object]) -> dict[str, object] |
 
 
 def _lftp_status_authority_facts(details: Mapping[str, object], message: object) -> dict[str, object] | None:
+    if message == _LFTP_STATUS_POLL_MESSAGE and details.get("schema") == "lftp.status_poll.v1":
+        return {
+            "schema": "lftp.status_poll.v1",
+            "phase": details.get("phase") if details.get("phase") in {"parse_complete", "parse_error", "health", "snapshot", "jobs_read", "prompt_timeout", "process_eof", "command_error"} else "unknown",
+            "input_phase": details.get("input_phase") if details.get("input_phase") in {"primary", "connection_grace", "timeout_tail"} else "unknown",
+            "parser_outcome": details.get("parser_outcome") if details.get("parser_outcome") in _LFTP_STATUS_PARSER_OUTCOMES else "unknown",
+            "snapshot_disposition": details.get("snapshot_disposition") if details.get("snapshot_disposition") in {"accepted", "epoch_rejected"} else None,
+            "healthy": details.get("healthy") if type(details.get("healthy")) is bool else None,
+            "status_count_bucket": details.get("status_count_bucket") if details.get("status_count_bucket") in {"0", "1", "2-4", "5-16", "17-64", "65+"} else "unknown",
+        }
     if message != _LFTP_STATUS_POLL_MESSAGE or details.get("schema") != _LFTP_STATUS_AUTHORITY_SCHEMA:
         return None
 

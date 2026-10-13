@@ -64,7 +64,10 @@ def numeric_progress_details(details: Mapping[str, object]) -> dict[str, object]
     values = values if isinstance(values, Mapping) else {}
     return {
         "values": {key: number(values.get(key)) for key in NUMERIC_PROGRESS_FIELDS},
-        "poll_correlation": poll if valid_poll else None,
+        # A failed/current poll identifies the evaluation, not cached credit's producer.
+        "poll_correlation": poll if valid_poll and source not in (
+            "cached_inflight", "cached_retry", "cached_error", "cached_unhealthy", "cached_idle",
+        ) else None,
         "record_shape": shape if shape in ("at", "got", "none") else "none",
         "status_source": source if source in (
             "fresh_healthy", "fresh_unhealthy", "cached_inflight", "inflight_empty", "cached_retry",

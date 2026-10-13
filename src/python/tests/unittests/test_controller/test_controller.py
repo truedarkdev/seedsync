@@ -949,6 +949,36 @@ class TestController(unittest.TestCase):
             diagnostic_recorder=ANY,
         )
 
+    def test_completed_status_snapshot_witness_preserves_authority_in_three_modes(self):
+        from tests.unittests.test_lftp.test_lftp import TestLftp
+        from lftp import LftpJobStatusParser
+        partial = "jobs -v\n[0] queue (sftp://user@example.invalid)\nsftp://user@example.invalid/remote\n"
+        for mode in ("disabled", "enabled", "fault"):
+            fixture = TestController()
+            fixture.setUp()
+            try:
+                backend = TestLftp()._build_status_poll_test_lftp()
+                backend._Lftp__job_status_parser = LftpJobStatusParser()
+                backend._Lftp__run_command = MagicMock(return_value=partial)
+                trace = BreadcrumbTraceCollector(lambda: True, max_entries=64,
+                    policy={"default": "off", "rules": {"transfer.lftp.status": "info"} if mode != "disabled" else {}})
+                if mode == "fault": trace.record = MagicMock(side_effect=RuntimeError("synthetic sink failure"))
+                backend.set_breadcrumb_trace(trace)
+                fixture.controller._Controller__context.breadcrumb_trace = trace
+                fixture.controller._Controller__lftp = backend
+                self.assertIsNone(fixture.controller._get_lftp_status_snapshot())
+                fixture.controller._Controller__lftp_executor.shutdown(wait=True)
+                self.assertEqual(([], False), fixture.controller._get_lftp_status_snapshot())
+                self.assertEqual("partial_queue", backend.last_status_parse_outcome)
+                if mode == "enabled":
+                    rows = [x for x in trace.snapshot()["entries"] if x["details"].get("phase") == "snapshot"]
+                    self.assertEqual(1, len(rows))
+                    self.assertEqual("accepted", rows[0]["details"]["snapshot_disposition"])
+                    self.assertEqual("primary", rows[0]["details"]["input_phase"])
+                    self.assertEqual("partial_queue", rows[0]["details"]["parser_outcome"])
+            finally:
+                fixture.doCleanups()
+
     def test_async_lftp_status_uses_one_inflight_future_then_completed_snapshot(self):
         self.controller._Controller__lftp.backend_name = "lftp"
         started = threading.Event()
