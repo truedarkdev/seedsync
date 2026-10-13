@@ -1187,6 +1187,91 @@ def test_pending_transfer_gate_requires_exact_local_paths_and_safe_lifecycle_bef
     assert sent == []
 
 
+def test_pending_transfer_gate_can_require_exact_canonical_stopped_resume_state():
+    base = responses()
+    pair = base["/server/path-pairs"]["data"][0]
+    root = base["/server/model/v1/pairs/pair-1/roots?limit=200"]["records"][0]
+
+    def make_gate(**options):
+        return observer.QueueGate(
+            pair["id"], pair["name"], root["file_id"], root["name"], **options,
+        )
+
+    root.update({
+        "remote_present": True,
+        "remote_has_transferable_content": True,
+        "local_present": True,
+        "complete_local_coverage": False,
+        "final_move_succeeded": False,
+        "explicitly_stopped": False,
+        "is_stoppable": False,
+    })
+
+    legacy = make_gate(require_pending_transfer=True)
+    legacy.preflight(lambda path: base[path])
+
+    root["explicitly_stopped"] = True
+    resumed = make_gate(
+        require_pending_transfer=True,
+        expected_explicitly_stopped=True,
+    )
+    resumed.preflight(lambda path: base[path])
+    assert resumed.passed is True
+
+    default_mode = make_gate(require_pending_transfer=True)
+    with pytest.raises(observer.ObserverSchemaError, match="explicitly_stopped"):
+        default_mode.preflight(lambda path: base[path])
+
+    for changed in (
+        {"explicitly_stopped": False},
+        {"explicitly_stopped": None},
+        {"state": "queued"},
+        {"is_stoppable": True},
+        {"is_stoppable": None},
+    ):
+        candidate = responses()
+        candidate_root = candidate["/server/model/v1/pairs/pair-1/roots?limit=200"]["records"][0]
+        candidate_root.update({
+            "remote_present": True,
+            "remote_has_transferable_content": True,
+            "local_present": True,
+            "complete_local_coverage": False,
+            "final_move_succeeded": False,
+            "explicitly_stopped": True,
+            "is_stoppable": False,
+            **changed,
+        })
+        gate = make_gate(
+            require_pending_transfer=True,
+            expected_explicitly_stopped=True,
+        )
+        with pytest.raises(observer.ObserverSchemaError):
+            gate.preflight(lambda path: candidate[path])
+
+    missing = responses()
+    missing_root = missing["/server/model/v1/pairs/pair-1/roots?limit=200"]["records"][0]
+    missing_root.update({
+        "remote_present": True,
+        "remote_has_transferable_content": True,
+        "local_present": True,
+        "complete_local_coverage": False,
+        "final_move_succeeded": False,
+        "is_stoppable": False,
+    })
+    with pytest.raises(observer.ObserverSchemaError, match="explicitly_stopped"):
+        make_gate(
+            require_pending_transfer=True,
+            expected_explicitly_stopped=True,
+        ).preflight(lambda path: missing[path])
+
+    for invalid in (None, 0, 1, "true"):
+        with pytest.raises(observer.ObserverSchemaError, match="must be boolean"):
+            make_gate(
+                require_pending_transfer=True,
+                expected_explicitly_stopped=invalid,
+            )
+
+
 def test_fresh_download_gate_is_opt_in_and_requires_remote_only_shape():
     gate = observer.QueueGate(PAIR, "Pr0n", ROOT, "Incoming", require_remote_only=True)
     ready = responses()

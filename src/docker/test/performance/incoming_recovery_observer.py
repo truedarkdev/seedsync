@@ -3067,6 +3067,7 @@ class QueueGate:
     artifact_path: str | os.PathLike[str] | None = None
     attempt_state_path: str | os.PathLike[str] | None = None
     capture_failure: Mapping[str, object] | None = None
+    expected_explicitly_stopped: bool = False
 
     def _consume_durable_attempt(self) -> None:
         if self.attempt_state_path is None:
@@ -3094,7 +3095,9 @@ class QueueGate:
             raise ObserverCaptureError("Queue durable attempt marker persistence failed") from exc
 
     def __post_init__(self) -> None:
-        if type(self.require_pending_transfer) is not bool or type(self.require_remote_only) is not bool:
+        if (type(self.require_pending_transfer) is not bool
+                or type(self.require_remote_only) is not bool
+                or type(self.expected_explicitly_stopped) is not bool):
             raise ObserverSchemaError("Queue lifecycle mode must be boolean")
         if self.require_pending_transfer and self.require_remote_only:
             raise ObserverSchemaError("Queue lifecycle modes are mutually exclusive")
@@ -3144,12 +3147,16 @@ class QueueGate:
                     "remote_has_transferable_content": True,
                     "complete_local_coverage": False,
                     "final_move_succeeded": False,
-                    "explicitly_stopped": False,
+                    "explicitly_stopped": self.expected_explicitly_stopped,
                 }
                 expected_flags["local_present"] = not self.require_remote_only
                 for field_name, expected_value in expected_flags.items():
                     if root.get(field_name) is not expected_value:
                         raise ObserverSchemaError("target lifecycle is not queue-ready: {}".format(field_name))
+                if self.expected_explicitly_stopped and (
+                    root.get("state") != "default" or root.get("is_stoppable") is not False
+                ):
+                    raise ObserverSchemaError("target stopped state is not canonical")
             status = controller_status(get("/server/status"))
             # Keep identities only in process memory; the persisted packet is redacted.
             evidence = {"pair_id": self.target_pair_id, "root_found": True,
