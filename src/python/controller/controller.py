@@ -9103,20 +9103,83 @@ class Controller:
                 self.logger.warning("Retaining private collision claim '%s' with foreign or unsafe ownership", claim)
                 artifacts.update((claim, cast(str, sidecar)))
                 continue
-            if os.path.lexists(original):
-                self.logger.warning("Retaining private collision claim '%s': original '%s' is occupied", claim, original)
-                artifacts.update((claim, cast(str, sidecar)))
-                continue
             try:
-                self.__rename_no_replace(claim, original)
-                if mutation_tracker is not None:
-                    mutation_tracker.mutated()
+                self.__restore_collision_source(claim, original, sidecar, owner, mutation_tracker)
                 self.__sync_directory_if_supported(source_directory)
                 self.__remove_collision_claim_sidecar(sidecar, mutation_tracker)
             except OSError as error:
                 self.logger.warning("Retaining private collision claim '%s': restore failed: %s", claim, error)
                 artifacts.update((claim, cast(str, sidecar)))
         return artifacts, False
+
+    def __restore_collision_source(
+            self, claim: str, original: str, sidecar: Optional[str], owner: Optional[str],
+            mutation_tracker: Optional[_MoveMutationTracker] = None,
+            *, claim_diagnostic: Optional[Callable[..., None]] = None) -> None:
+        """Restore an owned regular claim without replacing a public name.
+
+        Rename or link changes ctime; every other identity field must survive
+        that operation. A crash after link creation leaves both names; only
+        this exact owned inode may complete that interrupted restoration.
+        There is deliberately no copy or ordinary public-rename fallback.
+        """
+        if sidecar != self.__collision_claim_sidecar_path(claim) or \
+                os.path.dirname(claim) != os.path.dirname(original) or \
+                self.__read_collision_claim_sidecar(sidecar) != (os.path.basename(original), owner):
+            raise OSError(errno.EAGAIN, "collision claim ownership changed")
+        sidecar_signature = self.__collision_signature(sidecar)
+        before = self.__collision_signature(claim)
+        if type(before[0]) is not int or type(before[1]) is not int or before[1] <= 0:
+            raise OSError(errno.EAGAIN, "collision claim identity is unavailable")
+        stable_before = before[:4] + before[5:]
+        renamed = False
+        if os.path.lexists(original):
+            # An occupied foreign inode is never touched. The same inode is
+            # the durable intermediate state of our earlier exclusive link.
+            if self.__collision_signature(original)[:2] != before[:2]:
+                raise FileExistsError(errno.EEXIST, "collision restore destination is occupied")
+        else:
+            try:
+                self.__rename_no_replace(claim, original)
+                renamed = True
+                if mutation_tracker is not None:
+                    mutation_tracker.mutated()
+            except OSError as error:
+                if not self.__is_no_replace_capability_error(error):
+                    raise
+                if not self.__collision_stat_signatures_match(self.__collision_signature(claim), before) or \
+                        not self.__collision_stat_signatures_match(
+                            self.__collision_signature(sidecar), sidecar_signature):
+                    raise OSError(errno.EAGAIN, "collision claim changed before restore fallback")
+                os.link(claim, original, follow_symlinks=False)
+                if mutation_tracker is not None:
+                    mutation_tracker.mutated()
+        current_claim = self.__collision_signature(claim) if not renamed else None
+        current_original = self.__collision_signature(original)
+        if (current_claim is not None and current_claim[:4] + current_claim[5:] != stable_before) or \
+                current_original[:4] + current_original[5:] != stable_before or \
+                not self.__collision_stat_signatures_match(
+                    self.__collision_signature(sidecar), sidecar_signature):
+            raise OSError(errno.EAGAIN, "collision claim changed during restore")
+        try:
+            if claim_diagnostic is not None:
+                claim_diagnostic("restore_sync")
+        except Exception:
+            pass
+        self.__sync_directory_if_supported(os.path.dirname(original))
+        # Keep the private name and sidecar if synchronization or identity
+        # validation fails. No public replacement is removed by this cleanup.
+        if (current_claim is not None and not self.__collision_stat_signatures_match(
+                    self.__collision_signature(claim), current_claim)) or \
+                not self.__collision_stat_signatures_match(self.__collision_signature(original), current_original) or \
+                not self.__collision_stat_signatures_match(
+                    self.__collision_signature(sidecar), sidecar_signature):
+            raise OSError(errno.EAGAIN, "collision claim changed before restore cleanup")
+        if not renamed:
+            os.unlink(claim)
+            if mutation_tracker is not None:
+                mutation_tracker.mutated()
+            self.__sync_directory_if_supported(os.path.dirname(original))
 
     def __claim_collision_source(
             self, source: str, mutation_tracker: Optional[_MoveMutationTracker] = None,
@@ -9149,13 +9212,37 @@ class Controller:
         )
         try:
             mark("claim_rename")
-            self.__rename_no_replace(source, claimed_path)
+            before = self.__collision_signature(source)
+            sidecar_signature = self.__collision_signature(sidecar_path)
+            try:
+                self.__rename_no_replace(source, claimed_path)
+            except OSError as error:
+                if not self.__is_no_replace_capability_error(error):
+                    raise
+                if type(before[0]) is not int or type(before[1]) is not int or before[1] <= 0 or \
+                        os.path.lexists(claimed_path) or \
+                        not self.__collision_stat_signatures_match(self.__collision_signature(source), before) or \
+                        not self.__collision_stat_signatures_match(
+                            self.__collision_signature(sidecar_path), sidecar_signature):
+                    raise OSError(errno.EAGAIN, "collision source changed before private claim")
+                # This nonce sibling is private, with an exclusively created
+                # ownership sidecar. As in retired-source cleanup, an external
+                # noncooperating writer can race the rename; it is not kernel
+                # no-clobber equivalence. Retain any mismatched moved object.
+                os.rename(source, claimed_path)
             if mutation_tracker is not None:
                 mutation_tracker.mutated()
             mark("claim_sync")
             self.__sync_directory_if_supported(source_parent)
+            after = self.__collision_signature(claimed_path)
+            if after[:4] + after[5:] != before[:4] + before[5:]:
+                raise OSError(errno.EAGAIN, "collision source changed during private claim")
         except Exception as error:
             mark(step, error)
+            if os.path.lexists(claimed_path):
+                # Moved data must retain its durable recovery authority even
+                # when identity validation or parent synchronization failed.
+                raise
             mark("sidecar_cleanup", cleanup="pending")
             try:
                 self.__remove_collision_claim_sidecar(sidecar_path, mutation_tracker)
@@ -9235,9 +9322,10 @@ class Controller:
                 mark(step, error)
                 try:
                     mark("restore_rename", restore="pending")
-                    self.__rename_no_replace(claimed_source, source)
-                    if mutation_tracker is not None:
-                        mutation_tracker.mutated()
+                    self.__restore_collision_source(
+                        claimed_source, source, sidecar_path, path_pair_id, mutation_tracker,
+                        claim_diagnostic=mark,
+                    )
                     mark("restore_sync")
                     self.__sync_directory_if_supported(os.path.dirname(source))
                     mark("restore_sync", restore="completed")
@@ -9311,7 +9399,9 @@ class Controller:
                 except Exception:
                     pass
             try:
-                self.__rename_no_replace(claimed_source, original_source)
+                current_claim = getattr(self, "_Controller__collision_compare_claim", None)
+                owner = current_claim[5] if current_claim is not None and len(current_claim) > 5 else None
+                self.__restore_collision_source(claimed_source, original_source, sidecar_path, owner)
                 self.__sync_directory_if_supported(os.path.dirname(original_source))
                 self.__remove_collision_claim_sidecar(sidecar_path)
                 current_claim = getattr(self, "_Controller__collision_compare_claim", None)
@@ -9378,9 +9468,10 @@ class Controller:
                 except OSError:
                     outcome = "changed"
             try:
-                self.__rename_no_replace(claimed_source, original_source)
-                if mutation_tracker is not None:
-                    mutation_tracker.mutated()
+                owner = claim[5] if len(claim) > 5 else None
+                self.__restore_collision_source(
+                    claimed_source, original_source, sidecar_path, owner, mutation_tracker,
+                )
                 self.__sync_directory_if_supported(os.path.dirname(original_source))
                 self.__remove_collision_claim_sidecar(sidecar_path, mutation_tracker)
                 restored_signature = self.__collision_signature(original_source)
@@ -9475,7 +9566,8 @@ class Controller:
         with self.__collision_compare_lock:
             try:
                 if os.path.lexists(claimed_source):
-                    self.__rename_no_replace(claimed_source, original_source)
+                    owner = claim[5] if len(claim) > 5 else None
+                    self.__restore_collision_source(claimed_source, original_source, sidecar_path, owner)
                     self.__sync_directory_if_supported(os.path.dirname(original_source))
                 if os.path.lexists(original_source) and not os.path.lexists(claimed_source):
                     self.__remove_collision_claim_sidecar(sidecar_path)

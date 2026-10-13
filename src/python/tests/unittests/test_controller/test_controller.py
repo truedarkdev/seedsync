@@ -17267,6 +17267,175 @@ class TestController(unittest.TestCase):
         self.assertEqual(b"complete", Path(final, "release", "legacy", "extra.bin").read_bytes())
         self.assertFalse(Path(staging, "release").exists())
 
+    def _unsupported_private_collision_claims(self):
+        rename = Controller._Controller__rename_no_replace
+
+        def unsupported_private(source, destination):
+            if os.path.basename(destination).startswith(".seedsync-retire-"):
+                raise OSError(errno.EINVAL, "fixture unsupported no-replace operation")
+            return rename(source, destination)
+
+        return patch.object(Controller, "_Controller__rename_no_replace", side_effect=unsupported_private)
+
+    def test_collision_compatibility_nested_batch_rescans_dispatches_and_finalizes(self):
+        # Keep the real Scanner/Builder partial-map, missing sibling, local-only
+        # overlap and successor-scan proof from the existing composed fixture.
+        with self._unsupported_private_collision_claims() as rename:
+            self.test_incomplete_nested_queue_collision_batch_preserves_partial_and_finalizes_normally()
+        self.assertGreaterEqual(rename.call_count, 2)
+
+    def test_collision_compatibility_stop_preserves_partial_and_owner_fences(self):
+        with self._unsupported_private_collision_claims():
+            self.test_incomplete_collision_batch_stop_restores_owned_claim_and_rejects_wrong_pair()
+
+    def test_collision_compatibility_conflicts_and_changed_proof_preserve_data(self):
+        with self._unsupported_private_collision_claims():
+            self.test_incomplete_collision_batch_rejects_byte_and_type_conflicts_without_loss()
+            self.test_incomplete_collision_batch_changed_proof_and_sidecar_overlap_preserve_twins()
+
+    def test_collision_compatibility_claim_retains_moved_source_and_sidecar_on_race_or_sync_failure(self):
+        for failure in ("identity", "sync"):
+            with self.subTest(failure=failure):
+                _, _, _, _, _, staging = self._prepare_incomplete_collision_batch()
+                source = Path(staging, "release", "nested", "complete.bin")
+                original = source.read_bytes()
+                rename = os.rename
+
+                def replace_then_rename(src, dst):
+                    if failure == "identity":
+                        replacement = source.with_name("replacement.bin")
+                        replacement.write_bytes(b"changed-source")
+                        os.replace(replacement, source)
+                    return rename(src, dst)
+
+                sync = self.controller._Controller__sync_directory_if_supported
+                calls = 0
+
+                def fail_claim_sync(directory):
+                    nonlocal calls
+                    calls += 1
+                    if failure == "sync" and calls == 1:
+                        raise OSError(errno.EIO, "fixture parent sync failure")
+                    return sync(directory)
+
+                with self._unsupported_private_collision_claims(), \
+                        patch("controller.controller.os.rename", side_effect=replace_then_rename), \
+                        patch.object(self.controller, "_Controller__sync_directory_if_supported",
+                                     side_effect=fail_claim_sync):
+                    with self.assertRaises(OSError) as error:
+                        self.controller._Controller__claim_collision_source(str(source))
+                self.assertEqual(errno.EAGAIN if failure == "identity" else errno.EIO, error.exception.errno)
+                claims = [path for path in source.parent.iterdir()
+                          if path.name.startswith(".seedsync-retire-") and not path.name.endswith(".json")]
+                self.assertEqual(1, len(claims))
+                self.assertFalse(source.exists())
+                self.assertEqual(b"changed-source" if failure == "identity" else original, claims[0].read_bytes())
+                self.assertEqual((source.name, None),
+                                 Controller._Controller__read_collision_claim_sidecar(str(claims[0]) + ".json"))
+
+    def test_collision_compatibility_noncapability_failure_does_not_fallback(self):
+        _, _, _, _, _, staging = self._prepare_incomplete_collision_batch()
+        source = Path(staging, "release", "nested", "complete.bin")
+        before = os.lstat(source)
+        with patch.object(Controller, "_Controller__rename_no_replace",
+                          side_effect=OSError(errno.EACCES, "fixture denied operation")), \
+                patch("controller.controller.os.rename") as ordinary:
+            with self.assertRaises(OSError) as error:
+                self.controller._Controller__claim_collision_source(str(source))
+        self.assertEqual(errno.EACCES, error.exception.errno)
+        ordinary.assert_not_called()
+        self.assertTrue(os.path.samestat(before, os.lstat(source)))
+        self.assertEqual(b"complete", source.read_bytes())
+        self.assertEqual([], [path for path in source.parent.iterdir() if path.name.startswith(".seedsync-retire-")])
+
+    def test_collision_compatibility_restore_uses_available_native_rename_when_hardlink_is_denied(self):
+        _, _, _, _, _, staging = self._prepare_incomplete_collision_batch()
+        source = Path(staging, "release", "nested", "complete.bin")
+        before = os.lstat(source)
+        with self._unsupported_private_collision_claims():
+            claimed = self.controller._Controller__claim_collision_source(str(source))
+        native = Controller._Controller__rename_no_replace
+        unavailable = False
+
+        def native_restore(src, dst):
+            nonlocal unavailable
+            try:
+                return native(src, dst)
+            except OSError as error:
+                unavailable = Controller._Controller__is_no_replace_capability_error(error)
+                raise
+
+        with patch.object(Controller, "_Controller__rename_no_replace", side_effect=native_restore), \
+                patch("controller.controller.os.link", side_effect=OSError(errno.EACCES, "fixture hardlink denied")) as link:
+            try:
+                self.controller._Controller__restore_collision_source(claimed, str(source), claimed + ".json", None)
+            except OSError:
+                if unavailable:
+                    self.skipTest("filesystem lacks native no-replace rename; fallback tested separately")
+                raise
+        link.assert_not_called()
+        self.assertEqual(b"complete", source.read_bytes())
+        self.assertTrue(os.path.samestat(before, os.lstat(source)))
+        self.assertFalse(Path(claimed).exists())
+
+    def test_collision_compatibility_restore_interruption_recovers_only_owned_same_inode(self):
+        for variant in ("interrupted", "occupied", "foreign", "changed"):
+            with self.subTest(variant=variant):
+                _, _, _, _, _, staging = self._prepare_incomplete_collision_batch()
+                source = Path(staging, "release", "nested", "complete.bin")
+                with self._unsupported_private_collision_claims():
+                    claimed = self.controller._Controller__claim_collision_source(str(source))
+                sidecar = claimed + ".json"
+                claim_stat = os.lstat(claimed)
+                if variant == "interrupted":
+                    unlink = os.unlink
+
+                    def interrupt_claim_unlink(path, *args, **kwargs):
+                        if path == claimed:
+                            raise OSError(errno.EIO, "fixture interrupted restore cleanup")
+                        return unlink(path, *args, **kwargs)
+
+                    with patch.object(Controller, "_Controller__rename_no_replace", side_effect=OSError(errno.EINVAL, "fixture unsupported rename")), \
+                            patch("controller.controller.os.unlink", side_effect=interrupt_claim_unlink):
+                        with self.assertRaises(OSError):
+                            self.controller._Controller__restore_collision_source(claimed, str(source), sidecar, None)
+                    self.assertTrue(os.path.samestat(os.lstat(source), os.lstat(claimed)))
+                    retained, overflow = self.controller._Controller__recover_collision_claims(str(source.parent), None)
+                    self.assertFalse(overflow)
+                    self.assertEqual(set(), retained)
+                    self.assertFalse(Path(claimed).exists())
+                    self.assertFalse(Path(sidecar).exists())
+                    self.assertTrue(os.path.samestat(claim_stat, os.lstat(source)))
+                    self.assertEqual(b"complete", source.read_bytes())
+                elif variant == "occupied":
+                    source.write_bytes(b"new-public-source")
+                    occupied_stat = os.lstat(source)
+                    with self.assertRaises(FileExistsError):
+                        self.controller._Controller__restore_collision_source(claimed, str(source), sidecar, None)
+                    self.assertEqual(b"new-public-source", source.read_bytes())
+                    self.assertTrue(os.path.samestat(occupied_stat, os.lstat(source)))
+                elif variant == "foreign":
+                    with self.assertRaises(OSError):
+                        self.controller._Controller__restore_collision_source(claimed, str(source), sidecar, "other-pair")
+                    self.assertFalse(source.exists())
+                else:
+                    link = os.link
+
+                    def change_after_link(src, dst, **kwargs):
+                        link(src, dst, **kwargs)
+                        Path(src).write_bytes(b"changed-claim")
+
+                    with patch.object(Controller, "_Controller__rename_no_replace", side_effect=OSError(errno.EINVAL, "fixture unsupported rename")), \
+                            patch("controller.controller.os.link", side_effect=change_after_link):
+                        with self.assertRaises(OSError) as error:
+                            self.controller._Controller__restore_collision_source(claimed, str(source), sidecar, None)
+                    self.assertEqual(errno.EAGAIN, error.exception.errno)
+                    self.assertEqual(b"changed-claim", Path(claimed).read_bytes())
+                    self.assertTrue(os.path.samestat(os.lstat(claimed), os.lstat(source)))
+                if variant != "interrupted":
+                    self.assertTrue(Path(claimed).exists())
+                    self.assertTrue(Path(sidecar).exists())
+
     def test_incomplete_collision_batch_stop_restores_owned_claim_and_rejects_wrong_pair(self):
         root, intent, _, _, _, staging = self._prepare_incomplete_collision_batch()
         outcome = self.controller._Controller__queue_collision_preflight(root, intent.command, intent)

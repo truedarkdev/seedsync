@@ -1117,7 +1117,7 @@ def test_claim_boundary_failures_survive_finalizer_reader_and_sink(tmp_path: Pat
                     producer = fixture.controller
                     producer._Controller__context.breadcrumb_trace = collector
                     primary = OSError(errno.EIO, "private-error-text", "/private/error-path")
-                    secondary = OSError(errno.EXDEV, "private-restore-text")
+                    secondary = OSError(errno.EACCES if case == "restore_rename" else errno.EXDEV, "private-restore-text")
                     in_claim = False
                     signature_calls = rename_calls = sync_calls = 0
                     caught = []
@@ -1150,12 +1150,12 @@ def test_claim_boundary_failures_survive_finalizer_reader_and_sink(tmp_path: Pat
                             if not in_claim: return original_signature(path)
                             signature_calls += 1
                             selected = {"preclaim_source": 1, "preclaim_destination": 2,
-                                "postclaim_source": 3, "postclaim_destination": 4,
-                                "restore_rename": 3, "restore_sync": 3, "cleanup_after_restore": 3}
+                                "postclaim_source": 6, "postclaim_destination": 7,
+                                "restore_rename": 6, "restore_sync": 6, "cleanup_after_restore": 6}
                             if signature_calls == selected.get(case): raise primary
                             value = original_signature(path)
-                            if signature_calls == {"postclaim_source_validation": 3,
-                                                   "postclaim_destination_validation": 4}.get(case):
+                            if signature_calls == {"postclaim_source_validation": 6,
+                                                   "postclaim_destination_validation": 7}.get(case):
                                 return value[:2] + (value[2] + 1,) + value[3:]
                             return value
                         change(producer, "_Controller__collision_signature", side_effect=signature)
@@ -1206,11 +1206,11 @@ def test_claim_boundary_failures_survive_finalizer_reader_and_sink(tmp_path: Pat
                                 assert facts["collision_claim_errno"] == (errno.EEXIST if case == "reserve" else \
                                     errno.EAGAIN if case.endswith("_validation") else errno.EIO)
                                 assert facts["collision_claim_cleanup"] == ("failed" if case.startswith("cleanup_") else \
-                                    "completed" if case in ("claim_rename", "claim_sync", "postclaim_source", "postclaim_destination",
+                                    "completed" if case in ("claim_rename", "postclaim_source", "postclaim_destination",
                                         "postclaim_source_validation", "postclaim_destination_validation") else "not_attempted")
                                 assert facts["collision_claim_restore"] == ("failed" if case.startswith("restore_") else \
                                     "completed" if case.startswith("postclaim_") or case == "cleanup_after_restore" else "not_attempted")
-                                if case.startswith("restore_"): assert facts["collision_claim_restore_errno"] == errno.EXDEV
+                                if case.startswith("restore_"): assert facts["collision_claim_restore_errno"] == secondary.errno
                                 if case.startswith("cleanup_"): assert facts["collision_claim_cleanup_errno"] == errno.EXDEV
                             expected.append(facts)
                         else: assert rows == []
