@@ -85,6 +85,136 @@ except ImportError:
     LftpJobStatus = None
 
 
+def test_numeric_progress_actual_pipeline_finalized_identity_and_credit(tmp_path: Path) -> None:
+    from common.root_progress_trace import root_progress_tracer
+    from lftp import LftpJobStatusParser
+    from controller.model_updater import _record_root_progress_status
+    from tests.unittests.test_controller.test_model_builder import TestModelBuilder
+    from tests.unittests.test_web.test_handler.test_model_api import TestModelApi
+    from web.handler.model_api import ModelApiHandler
+    from web.serialize.serialize_model import SerializeModel
+    spool, artifact = _prepare(tmp_path)
+    trace = BreadcrumbTraceCollector(lambda: True, max_entries=256,
+        policy={"default": "info"}, durable_enabled=True, durable_path=str(spool))
+    reader = _reader(spool, artifact, max_records=256)
+    trace.record("controller", "boundary", category="controller", level="info")
+    assert trace.wait_for_ingress(2) and trace.flush_durable(2)
+    reader.start()
+    fixtures = []
+    outputs = []
+    try:
+        for mode in ("enabled", "disabled", "fault"):
+            fixture = TestModelBuilder(); fixture.setUp(); fixtures.append(fixture)
+            web = TestModelApi(); web.setUp(); fixtures.append(web)
+            builder = fixture.model_builder
+            root = SystemFile("sample-root", 1000, True)
+            root.add_child(SystemFile("complete.bin", 200, False, mtime_ns=1_700_000_000_000_000_000))
+            root.add_child(SystemFile("partial.bin", 800, False))
+            local = SystemFile("sample-root", 231, True)
+            local.add_child(SystemFile("complete.bin", 200, False, mtime_ns=1_700_000_000_000_000_000))
+            partial = SystemFile("partial.bin", 31, False, is_staging=True)
+            partial.status_sidecar_ready = True
+            local.add_child(partial)
+            status = LftpJobStatusParser().parse(
+                "jobs -v\n[0] queue (sftp://user@example.invalid)\n"
+                "sftp://user@example.invalid/remote\nQueue is running.\n"
+                "[2] mirror -c /remote/sample-root /local/staging/ -- 31/700 (4%) 100B/s\n"
+            )[0]
+            assert status.name == "sample-root" and status.total_transfer_state.size_local == 31
+            builder.set_remote_files([root]); builder.set_local_files([local]); builder.set_lftp_statuses([status])
+            builder.set_stop_resume_trace_breadcrumb(trace.create_emitter())
+            tracer = root_progress_tracer(trace)
+            builder.set_numeric_progress_trace(tracer)
+            poll = "lftp-poll:0123456789abcdef"
+            builder.set_stop_resume_trace_cycle_context({"lftp_poll_correlation": poll,
+                "lftp_status_source": "fresh_healthy", "lftp_status_fresh": True, "lftp_status_healthy": True})
+            web.controller._Controller__context.breadcrumb_trace = trace
+            with ExitStack() as stack:
+                if mode == "disabled": stack.enter_context(patch.object(trace, "is_effectively_enabled", return_value=False))
+                if mode == "fault": stack.enter_context(patch.object(trace, "record", side_effect=RuntimeError("synthetic-detail")))
+                if mode == "fault": stack.enter_context(patch.object(builder, "_ModelBuilder__record_numeric_credit", side_effect=RuntimeError("synthetic-credit")))
+                model = builder.build_model(diagnostic_target_root_ids=("sample-root",))
+                assert model.get_file("sample-root").transferred_size == 231
+                assert model.published_file("sample-root") is not None
+                controller = web.controller
+                controller._Controller__model = model
+                controller._Controller__scan_authority_snapshot = {"publication_id": 1}
+                _record_root_progress_status(controller, [status], source="fresh_healthy", model_version=model.version,
+                    fresh=True, healthy=True, poll_correlation=poll)
+                ModelUpdater._record_status_publication_join(trace.create_emitter(), controller,
+                    {"publication_id": 1, "model_version": model.version}, builder,
+                    raw_statuses=[status], filtered_statuses=[status], consumed_statuses=[status],
+                    raw_status_id_counts={status.file_id: 1}, active_status_file_ids={status.file_id},
+                    malformed_status_file_ids=set(), status_source="fresh_healthy", status_fresh=True,
+                    status_healthy=True, poll_correlation=poll)
+                records = [SerializeModel._SerializeModel__model_file_to_json_dict(model.get_file("sample-root"))]
+                payload = {"records": records, "model_version": model.version, "_global_model_version": model.version}
+                handler = ModelApiHandler(controller, breadcrumb_trace=trace)
+                body = handler._ModelApiHandler__json_response(payload).body
+                sse = handler._ModelApiHandler__sse("scoped", "model-page", {"records": records},
+                    version=1, global_model_version=model.version, scope_id="scope")
+                outputs.append((body, sse))
+            if mode == "enabled":
+                assert trace.wait_for_ingress(2) and trace.flush_durable(2)
+                finalized = [row for row in trace.snapshot()["entries"]
+                    if row.get("details", {}).get("schema") == "model_numeric_progress.v1"]
+                phases = {row["details"]["phase"]: row for row in finalized}
+                assert {"status", "builder", "builder_leaf", "publication", "json", "sse"} <= phases.keys()
+                values = phases["builder"]["details"]["values"]
+                assert values["status_bytes"] == "31" and values["live_root_bytes"] == "231"
+                assert values["blocked_descendant_bytes"] == "200"
+                assert phases["builder"]["details"]["live_credit"] is True
+                assert phases["json"]["details"]["values"]["serialized_bytes"] == "231"
+                assert phases["sse"]["details"]["poll_correlation"] == poll
+            with ExitStack() as stack:
+                if mode == "disabled": stack.enter_context(patch.object(trace, "is_effectively_enabled", return_value=False))
+                if mode == "fault": stack.enter_context(patch.object(trace, "record", side_effect=RuntimeError("synthetic-detail")))
+                if mode == "fault": stack.enter_context(patch.object(builder, "_ModelBuilder__record_numeric_credit", side_effect=RuntimeError("synthetic-credit")))
+                with patch("common.root_progress_trace.time.monotonic", return_value=time.monotonic() + 2):
+                    # A fresh inactive inventory avoids inventing retirement
+                    # authority from an empty poll of a retained live job.
+                    builder.clear()
+                    builder.set_remote_files([root]); builder.set_local_files([local])
+                    inactive = builder.build_model(diagnostic_target_root_ids=("sample-root",))
+                assert inactive.get_file("sample-root").transferred_size == 200
+                outputs[-1] += (SerializeModel().model([inactive.get_file("sample-root")]),)
+            if mode == "enabled":
+                assert trace.wait_for_ingress(2) and trace.flush_durable(2)
+                finalized = [row for row in trace.snapshot()["entries"]
+                    if row.get("details", {}).get("schema") == "model_numeric_progress.v1"]
+                inactive_rows = [row for row in finalized if row["details"]["phase"] == "builder"
+                    and row["details"]["live_credit"] is False]
+                assert len(inactive_rows) == 1
+                assert inactive_rows[0]["details"]["values"]["nonlive_descendant_bytes"] == "200"
+                assert inactive_rows[0]["details"]["values"]["live_root_bytes"] is None
+        assert outputs[0] == outputs[1] == outputs[2]
+        assert trace.wait_for_ingress(2) and trace.flush_durable(2)
+        reader.poll()
+        captured = [row["capture"]["projection"] for row in _artifacts(artifact)
+            if row["capture"].get("state") == "record" and "numeric_progress" in row["capture"].get("projection", {})]
+        assert [row["numbers"]["version"] for row in captured] == [row["version"] for row in finalized]
+        assert [row["numeric_progress"] for row in captured] == [observer._sanitize_numeric_progress(row["details"]) for row in finalized]
+        assert len({row["corr_hash"] for row in captured}) == 1
+        assert all(label not in artifact.read_text() for label in ("sample-root", "complete.bin", "partial.bin", "synthetic-detail"))
+    finally:
+        reader.close(); trace.close()
+        for fixture in fixtures: fixture.doCleanups()
+
+
+def test_numeric_progress_projection_preserves_wide_values_unknown_and_bounds() -> None:
+    from common.root_progress_trace import numeric_progress_details
+    details = numeric_progress_details({"status_bytes": 2**53 + 3, "selected_bytes": None,
+        "remote_bytes": 2**63, "local_bytes": True, "serialized_bytes": 1.5,
+        "path": "/synthetic/secret", "poll_correlation": "bad", "status_source": "/bad"})
+    details.update(schema="model_numeric_progress.v1", phase="status", job_digest="a"*16,
+                   observed_ms=12, monotonic_ms=13, sequence=1, filename="synthetic-label")
+    projected = observer._sanitize_numeric_progress(details)
+    assert projected["values"]["status_bytes"] == str(2**53 + 3)
+    assert all(projected["values"][key] is None for key in ("selected_bytes", "remote_bytes", "local_bytes", "serialized_bytes"))
+    assert projected["poll_correlation"] is None and projected["status_source"] == "unknown"
+    assert "synthetic" not in json.dumps(projected)
+
+
 def _health(path: Path, *, session: str = "session-1", lost: int = 0, rotation_count: int = 0) -> None:
     payload = {
         "schema": "breadcrumb_durable_health.v1",

@@ -1538,6 +1538,7 @@ def _record_lftp_status_breadcrumb(
     _record_root_progress_status(
         controller, statuses, source=source,
         model_version=model_version if type(model_version) is int else None,
+        fresh=fresh, healthy=healthy, poll_correlation=poll_correlation,
     )
     backend = getattr(controller, "_Controller__lftp", None)
     if getattr(backend, "backend_name", "lftp") == "rclone":
@@ -1754,11 +1755,13 @@ def _record_root_progress_status(
         *,
         source: str,
         model_version: Optional[int],
+        fresh: Optional[bool] = None, healthy: Optional[bool] = None,
+        poll_correlation: Optional[str] = None,
 ) -> None:
     """Trace normalized scalar transfer progress after the complete policy gate."""
     context = getattr(controller, "_Controller__context", None)
     tracer = root_progress_tracer(getattr(context, "breadcrumb_trace", None))
-    if tracer is None or not tracer.enabled("debug"):
+    if tracer is None or not (tracer.enabled("debug") or tracer.enabled("info")):
         return
     # Status objects can carry names, paths, and raw transfer sizes.  Only
     # inspect the bounded active subset after the model.progress gate passes;
@@ -1773,6 +1776,18 @@ def _record_root_progress_status(
         state = getattr(getattr(status, "state", None), "name", None)
         status_type = getattr(getattr(status, "type", None), "name", None)
         transfer = getattr(status, "total_transfer_state", None)
+        try:
+            tracer.record_numeric(opaque_trace_correlation(getattr(status, "file_id", None)), "status", {
+                "status_bytes": getattr(transfer, "size_local", None),
+                "status_total": getattr(transfer, "size_remote", None),
+                "record_shape": getattr(status, "record_shape", None),
+                "status_source": source, "status_fresh": fresh, "status_healthy": healthy,
+                "poll_correlation": poll_correlation,
+                "epoch": getattr(controller, "_Controller__progress_publication_epoch", None),
+                "model_version": model_version,
+            })
+        except Exception:
+            pass
         percent = scalar_percent(getattr(transfer, "percent_local", None))
         details: dict[str, object] = {
             "status_source": source,
@@ -5680,6 +5695,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         status_source=status_source,
                         status_fresh=status_fresh,
                         status_healthy=status_healthy,
+                        poll_correlation=getattr(self, "_ModelUpdater__progress_lineage_correlation", None),
                     )
                 except Exception:
                     logger = getattr(controller, "logger", None)
@@ -5700,6 +5716,7 @@ class ModelUpdater(_ControllerCoreAccess):
             consumed_statuses: object, raw_status_id_counts: object,
             active_status_file_ids: object, malformed_status_file_ids: object,
             status_source: object, status_fresh: object, status_healthy: object,
+            poll_correlation: object = None,
     ) -> None:
         """Join bounded raw and consumed status prefixes to published roots."""
         def count(value: object) -> Optional[int]:
@@ -5820,6 +5837,20 @@ class ModelUpdater(_ControllerCoreAccess):
                                 model_name = getattr(model_file, "name", None)
                                 if not isinstance(model_id, str) or not isinstance(model_name, str):
                                     continue
+                                try:
+                                    tracer = root_progress_tracer(getattr(
+                                        getattr(controller, "_Controller__context", None), "breadcrumb_trace", None))
+                                    if tracer is not None:
+                                        tracer.record_numeric(opaque_trace_correlation(model_id), "publication", {
+                                            "selected_bytes": model_file.transferred_size,
+                                            "local_bytes": model_file.local_size, "remote_bytes": model_file.remote_size,
+                                            "model_version": expected_version, "poll_correlation": poll_correlation,
+                                            "status_source": status_source, "status_fresh": status_fresh,
+                                            "status_healthy": status_healthy,
+                                            "epoch": getattr(controller, "_Controller__progress_publication_epoch", None),
+                                        })
+                                except Exception:
+                                    pass
                                 row["size"] = "".join(size_code(getattr(model_file, key, None)) for key in (
                                     "remote_size", "local_size", "display_size_total",
                                 ))
@@ -9386,8 +9417,15 @@ class ModelUpdater(_ControllerCoreAccess):
                 latest_local_scan, progressive_mode=progressive_mode,
                 new_authority=bool(local_scan_new_authority),
             )
+        try:
+            numeric_setter = getattr(model_builder, "set_numeric_progress_trace", None)
+            if callable(numeric_setter):
+                numeric_setter(root_progress_tracer(getattr(controller._Controller__context, "breadcrumb_trace", None)))
+        except Exception:
+            pass
         model_builder.set_stop_resume_trace_cycle_context({
             "lftp_status_source": lftp_status_source,
+            "lftp_poll_correlation": lftp_status_poll_correlation,
             "lftp_status_healthy": lftp_status_poll_healthy,
             "lftp_status_fresh": lftp_status_snapshot_fresh,
             "lftp_status_count": len(lftp_statuses),

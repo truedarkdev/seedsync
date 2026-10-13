@@ -449,6 +449,7 @@ def _safe_body_reason(value: object) -> str:
 
 
 _CAPTURE_SOURCES = frozenset({
+    "root_progress",
     "controller", "model_updater", "model_builder", "status", "scanner", "scanner_process", "lftp", "web", "system", "unknown",
 })
 _CAPTURE_EVENTS = frozenset({
@@ -463,6 +464,8 @@ _CAPTURE_CATEGORIES = frozenset({
     "completion.gate", "transfer.lftp.command", "root.progress", "unknown",
 })
 _CAPTURE_STAGES = frozenset({
+    "root_progress_numeric_status", "root_progress_numeric_builder", "root_progress_numeric_builder_leaf",
+    "root_progress_numeric_publication", "root_progress_numeric_json", "root_progress_numeric_sse",
     "admission", "dispatch", "publication", "terminal", "queue_lifecycle", "queue_authority_handoff", "queue_readiness",
     "queue_exclusion", "model", "model_progress", "model_delta", "model_update", "model_publication", "model_summary",
     "model_builder_input_arbitration", "remote_scanner_stream",
@@ -1419,10 +1422,50 @@ def _queue_root_proof_gate_facts(value: object) -> dict[str, object]:
     return result
 
 
+def _sanitize_numeric_progress(value: object) -> Optional[dict[str, object]]:
+    if not isinstance(value, Mapping) or value.get("schema") != "model_numeric_progress.v1":
+        return None
+    phase = value.get("phase")
+    if phase not in {"status", "builder", "builder_leaf", "publication", "json", "sse"}:
+        return None
+    raw_values = value.get("values")
+    raw_values = raw_values if isinstance(raw_values, Mapping) else {}
+    def decimal(item: object) -> Optional[str]:
+        return item if isinstance(item, str) and len(item) <= 19 and \
+            re.fullmatch(r"(?:0|[1-9][0-9]{0,18})", item) and int(item) <= 2**63 - 1 else None
+    result: dict[str, object] = {
+        "schema": "model_numeric_progress.v1", "phase": phase,
+        "values": {key: decimal(raw_values.get(key)) for key in (
+            "status_bytes", "status_total", "selected_bytes", "local_bytes", "remote_bytes",
+            "ancestor_bytes", "serialized_bytes", "serialized_total", "epoch", "model_version",
+            "live_root_bytes", "live_descendant_bytes", "nonlive_descendant_bytes", "blocked_descendant_bytes",
+        )},
+    }
+    for key, pattern in (("job_digest", r"[0-9a-f]{16}"), ("poll_correlation", r"lftp-poll:[0-9a-f]{16}")):
+        item = value.get(key)
+        result[key] = item if isinstance(item, str) and re.fullmatch(pattern, item) else None
+    for key in ("observed_ms", "monotonic_ms", "sequence"):
+        item = value.get(key)
+        result[key] = item if type(item) is int and 0 <= item <= 2**63 - 1 else None
+    for key in ("status_fresh", "status_healthy", "live_credit"):
+        item = value.get(key)
+        result[key] = item if type(item) is bool else None
+    shape, source = value.get("record_shape"), value.get("status_source")
+    result["record_shape"] = shape if shape in ("at", "got", "none") else "none"
+    result["status_source"] = source if source in (
+        "fresh_healthy", "fresh_unhealthy", "cached_inflight", "inflight_empty", "cached_retry", "retry_empty",
+        "cached_error", "error_empty", "cached_unhealthy", "unhealthy_empty", "cached_idle", "unknown",
+    ) else "unknown"
+    return result
+
+
 def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         return {"kind": "unknown"}
     result: dict[str, object] = {}
+    numeric = _sanitize_numeric_progress(value.get("numeric_progress"))
+    if numeric is not None:
+        result["numeric_progress"] = numeric
     for key, allowed in (
         ("kind", _CAPTURE_KINDS), ("source", _CAPTURE_SOURCES), ("category", _CAPTURE_CATEGORIES),
         ("event_type", _CAPTURE_EVENTS), ("stage", _CAPTURE_STAGES), ("level", _CAPTURE_LEVELS),

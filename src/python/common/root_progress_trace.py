@@ -36,6 +36,45 @@ ROOT_PROGRESS_HEALTH_OUTCOMES = (
     "summary_observed",
 )
 _MAX_SUBJECTS = 128
+NUMERIC_PROGRESS_SCHEMA = "model_numeric_progress.v1"
+NUMERIC_PROGRESS_FIELDS = (
+    "status_bytes", "status_total", "selected_bytes", "local_bytes", "remote_bytes",
+    "ancestor_bytes", "serialized_bytes", "serialized_total", "epoch", "model_version",
+    "live_root_bytes", "live_descendant_bytes", "nonlive_descendant_bytes", "blocked_descendant_bytes",
+)
+_NUMERIC_PHASES = frozenset({"status", "builder", "builder_leaf", "publication", "json", "sse"})
+
+
+def numeric_progress_details(details: Mapping[str, object]) -> dict[str, object]:
+    """Finite numeric evidence; decimal strings preserve uint63 exactly."""
+    def number(value: object) -> Optional[str]:
+        if type(value) is int and 0 <= value <= 2**63 - 1:
+            return str(value)
+        if isinstance(value, str) and len(value) <= 19 and value.isascii() and value.isdigit():
+            parsed = int(value)
+            if parsed <= 2**63 - 1 and str(parsed) == value:
+                return value
+        return None
+    poll = details.get("poll_correlation")
+    valid_poll = isinstance(poll, str) and poll.startswith("lftp-poll:") and len(poll) == 26 and \
+        all(char in "0123456789abcdef" for char in poll[10:])
+    shape = details.get("record_shape")
+    source = details.get("status_source")
+    values = details.get("values", details)
+    values = values if isinstance(values, Mapping) else {}
+    return {
+        "values": {key: number(values.get(key)) for key in NUMERIC_PROGRESS_FIELDS},
+        "poll_correlation": poll if valid_poll else None,
+        "record_shape": shape if shape in ("at", "got", "none") else "none",
+        "status_source": source if source in (
+            "fresh_healthy", "fresh_unhealthy", "cached_inflight", "inflight_empty", "cached_retry",
+            "retry_empty", "cached_error", "error_empty", "cached_unhealthy", "unhealthy_empty",
+            "cached_idle", "unknown",
+        ) else "unknown",
+        "status_fresh": details.get("status_fresh") if type(details.get("status_fresh")) is bool else None,
+        "status_healthy": details.get("status_healthy") if type(details.get("status_healthy")) is bool else None,
+        "live_credit": details.get("live_credit") if type(details.get("live_credit")) is bool else None,
+    }
 _ALLOWED_DETAIL_KEYS = frozenset({
     "scope_digest", "model_version", "scope_version", "outcome", "reason",
     "status_source", "status_state", "status_type", "decision", "build_kind",
@@ -128,6 +167,79 @@ class RootProgressTrace:
         self.__next_sequence = 0
         self.__last_signatures: OrderedDict[tuple[str, str], str] = OrderedDict()
         self.__generation: Optional[int] = None
+        self.__numeric_subjects: OrderedDict[str, None] = OrderedDict()
+        self.__numeric_publications: OrderedDict[tuple[str, int], Optional[str]] = OrderedDict()
+        self.__numeric_last_emit: OrderedDict[tuple[str, str], float] = OrderedDict()
+
+    def select_numeric_subject(self, digest: str) -> None:
+        """Reuse only subjects admitted by the existing Builder witness selector."""
+        try:
+            if not self.enabled("info") or not isinstance(digest, str) or len(digest) != 16 or \
+                    any(char not in "0123456789abcdef" for char in digest):
+                return
+            with self.__lock:
+                self.__numeric_subjects[digest] = None
+                self.__numeric_subjects.move_to_end(digest)
+                while len(self.__numeric_subjects) > 8:
+                    self.__numeric_subjects.popitem(last=False)
+        except Exception:
+            pass
+
+    def record_numeric(self, digest: str, phase: str, details: Mapping[str, object]) -> bool:
+        """One INFO witness per selected root/phase/second; never owns model state."""
+        try:
+            if phase not in _NUMERIC_PHASES or not self.enabled("info"):
+                return False
+            with self.__lock:
+                self.__sync_generation_locked(self.__trace_object())
+                if digest not in self.__numeric_subjects:
+                    return False
+                safe = numeric_progress_details(details)
+                version = details.get("model_version")
+                key = (digest, version) if type(version) is int and version >= 0 else None
+                if phase == "publication" and key is not None:
+                    self.__numeric_publications[key] = safe["poll_correlation"]
+                    self.__numeric_publications.move_to_end(key)
+                    while len(self.__numeric_publications) > 128:
+                        self.__numeric_publications.popitem(last=False)
+                elif phase in ("json", "sse"):
+                    safe["poll_correlation"] = self.__numeric_publications.get(key)
+                rate_key = (digest, phase)
+                now = time.monotonic()
+                if now - self.__numeric_last_emit.get(rate_key, float("-inf")) < 1:
+                    return False
+                self.__numeric_last_emit[rate_key] = now
+                self.__numeric_last_emit.move_to_end(rate_key)
+                while len(self.__numeric_last_emit) > 128:
+                    self.__numeric_last_emit.popitem(last=False)
+            safe["phase"] = phase
+            safe["monotonic_ms"] = int(time.monotonic_ns() // 1_000_000)
+            return self.record(digest, "numeric_" + phase, safe, level="info")
+        except Exception:
+            return False
+
+    def record_numeric_payload(self, payload: object, phase: str, model_version: object) -> None:
+        """Inspect computed page records only, matching the existing selected roots."""
+        try:
+            if not self.enabled("info") or not isinstance(payload, dict):
+                return
+            records = payload.get("records")
+            if not isinstance(records, list):
+                return
+            # The producer's page is already bounded; no children are walked.
+            for row in records:
+                if not isinstance(row, dict):
+                    continue
+                identity = row.get("file_id")
+                if not isinstance(identity, str):
+                    continue
+                self.record_numeric(opaque_trace_correlation(identity), phase, {
+                    "serialized_bytes": row.get("transferred_size"),
+                    "serialized_total": row.get("remote_size"), "local_bytes": row.get("local_size"),
+                    "model_version": model_version,
+                })
+        except Exception:
+            pass
 
     def __trace_object(self) -> object:
         trace = self.__trace
@@ -149,6 +261,8 @@ class RootProgressTrace:
             self.__generation = generation
         elif self.__generation != generation:
             self.__last_signatures.clear()
+            self.__numeric_publications.clear()
+            self.__numeric_last_emit.clear()
             self.__generation = generation
 
     def enabled(self, level: str = "debug") -> bool:
@@ -230,8 +344,13 @@ class RootProgressTrace:
             return False
         try:
             job_digest = opaque_trace_correlation(identity)
-            safe = _safe_details(details)
-            safe["schema"] = ROOT_PROGRESS_TRACE_SCHEMA
+            numeric = stage.startswith("numeric_") and stage[8:] in _NUMERIC_PHASES
+            safe = numeric_progress_details(details) if numeric else _safe_details(details)
+            if numeric:
+                safe["phase"] = stage[8:]
+                mono = details.get("monotonic_ms")
+                safe["monotonic_ms"] = mono if type(mono) is int and 0 <= mono <= 2**63 - 1 else None
+            safe["schema"] = NUMERIC_PROGRESS_SCHEMA if numeric else ROOT_PROGRESS_TRACE_SCHEMA
             safe["job_digest"] = job_digest
             # Timestamp is useful for correlating a trace with logs, but is not
             # part of the dedupe signature so a stable poll does not churn.
@@ -241,13 +360,19 @@ class RootProgressTrace:
             # version-only change does not create a breadcrumb. Publication
             # and serialization boundaries must retain version changes: they
             # are the correlation evidence needed to explain a delayed page.
-            ignored_signature_keys = {"observed_ms", "duration_ms"}
+            ignored_signature_keys = {"observed_ms", "duration_ms", "monotonic_ms"}
+            if numeric:
+                ignored_signature_keys.add("poll_correlation")
             if stage == "status":
                 ignored_signature_keys.update({"model_version", "scope_version"})
             signature_details = {
                 key: value for key, value in safe.items()
                 if key not in ignored_signature_keys
             }
+            if numeric:
+                # Retain an unknown-to-known provenance transition without
+                # churning stable values when only the opaque poll changes.
+                signature_details["poll_known"] = safe["poll_correlation"] is not None
             signature = json.dumps(signature_details, sort_keys=True, separators=(",", ":"))
             key = (job_digest, stage)
             with self.__lock:

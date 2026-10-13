@@ -16,6 +16,7 @@ from system import SystemFile
 from lftp import LftpJobStatus
 from model import ActiveProgressOverlay, ModelFile, Model, ModelError
 from common.breadcrumb_trace import BreadcrumbTraceEmitter, opaque_trace_correlation, trace_session_digest
+from common.root_progress_trace import RootProgressTrace
 from common.performance_diagnostics import (
     COUNTER_PAIR_SAFETY_REJECT_CROSS_PAIR_TOUCH,
     COUNTER_PAIR_SAFETY_REJECT_DIRTY_INPUT,
@@ -5762,6 +5763,7 @@ class ModelBuilder:
         partial.__stop_resume_trace_cycle_id = self.__stop_resume_trace_cycle_id
         partial.__stop_resume_trace_cycle_context = dict(self.__stop_resume_trace_cycle_context)
         partial.__stop_resume_trace_breadcrumb = self.__stop_resume_trace_breadcrumb
+        partial.__numeric_progress_trace = getattr(self, "_ModelBuilder__numeric_progress_trace", None)
         partial.__stop_resume_trace_last_signatures = OrderedDict(self.__stop_resume_trace_last_signatures)
         partial.__stop_resume_trace_last_enabled = self.__stop_resume_trace_last_enabled
         partial.__model_publication_trace_last_enabled = self.__model_publication_trace_last_enabled
@@ -5941,6 +5943,7 @@ class ModelBuilder:
         partial.__stop_resume_trace_cycle_id = self.__stop_resume_trace_cycle_id
         partial.__stop_resume_trace_cycle_context = dict(self.__stop_resume_trace_cycle_context)
         partial.__stop_resume_trace_breadcrumb = self.__stop_resume_trace_breadcrumb
+        partial.__numeric_progress_trace = getattr(self, "_ModelBuilder__numeric_progress_trace", None)
         partial.__stop_resume_trace_last_signatures = OrderedDict(self.__stop_resume_trace_last_signatures)
         partial.__stop_resume_trace_last_enabled = self.__stop_resume_trace_last_enabled
         partial.__model_publication_trace_last_enabled = self.__model_publication_trace_last_enabled
@@ -6825,6 +6828,7 @@ class ModelBuilder:
         partial.__stop_resume_trace_cycle_id = self.__stop_resume_trace_cycle_id
         partial.__stop_resume_trace_cycle_context = dict(self.__stop_resume_trace_cycle_context)
         partial.__stop_resume_trace_breadcrumb = self.__stop_resume_trace_breadcrumb
+        partial.__numeric_progress_trace = getattr(self, "_ModelBuilder__numeric_progress_trace", None)
         partial.__stop_resume_trace_last_signatures = OrderedDict(self.__stop_resume_trace_last_signatures)
         partial.__stop_resume_trace_last_enabled = self.__stop_resume_trace_last_enabled
         partial.__model_publication_trace_last_enabled = self.__model_publication_trace_last_enabled
@@ -7601,6 +7605,9 @@ class ModelBuilder:
                              remote: Optional[SystemFile],
                              selected: Optional[SystemFile]) -> Optional[dict]:
         try:
+            tracer = getattr(self, "_ModelBuilder__numeric_progress_trace", None)
+            if tracer is not None:
+                tracer.select_numeric_subject(opaque_trace_correlation(file_id))
             local = self.__local_file(file_id)
             active = self.__active_files.get(file_id)
             selection = "absent" if selected is None else "local" if selected is local else \
@@ -7613,6 +7620,8 @@ class ModelBuilder:
             facts = {"root_id": opaque_trace_correlation(file_id), "input_scope": "root",
                      "selection": selection, "local_proof_generation": generation,
                      "local_proof_generation_known": generation is not None, "active_generation_known": False}
+            facts.update({"numeric_root_file_id": file_id, "numeric_live_descendant_bytes": 0,
+                          "numeric_nonlive_descendant_bytes": 0, "numeric_blocked_descendant_bytes": 0})
             builder_local = local
             facts["root_source"] = {
                 "lo": opaque_trace_correlation(
@@ -7716,6 +7725,31 @@ class ModelBuilder:
                 details = {"schema": "model_input_arbitration.v1"}
                 context[prefix + "_rows_sampled"] += 1
                 state = model_file.state.name.lower()
+                tracer = getattr(self, "_ModelBuilder__numeric_progress_trace", None)
+                if tracer is not None and facts is not None:
+                    try:
+                        transfer = self.__lftp_statuses.get(model_file.file_id)
+                        raw_transfer = transfer.total_transfer_state if transfer is not None else None
+                        cycle = self.__stop_resume_trace_cycle_context
+                        parent = model_file.parent
+                        tracer.record_numeric(facts["root_id"], "builder_leaf" if leaf else "builder", {
+                            "status_bytes": getattr(raw_transfer, "size_local", None),
+                            "status_total": getattr(raw_transfer, "size_remote", None),
+                            "selected_bytes": model_file.transferred_size,
+                            "local_bytes": model_file.local_size, "remote_bytes": model_file.remote_size,
+                            "ancestor_bytes": parent.transferred_size if parent is not None else None,
+                            "poll_correlation": cycle.get("lftp_poll_correlation"),
+                            "status_source": cycle.get("lftp_status_source"),
+                            "status_fresh": cycle.get("lftp_status_fresh"),
+                            "status_healthy": cycle.get("lftp_status_healthy"),
+                            "live_credit": facts.get("numeric_live_credit"),
+                            **{key: facts.get("numeric_" + key) for key in (
+                                "live_root_bytes", "live_descendant_bytes", "nonlive_descendant_bytes",
+                                "blocked_descendant_bytes",
+                            )},
+                        })
+                    except Exception:
+                        pass
                 if leaf:
                     leaf_context_fields = ("root_id",) if leaf_facts is not None else (
                         "root_id", "input_scope", "selection", "local_proof_generation",
@@ -7725,7 +7759,8 @@ class ModelBuilder:
                         key: facts[key] for key in leaf_context_fields if key in facts
                     })
                 else:
-                    details.update({key: value for key, value in facts.items() if key != "root_source"})
+                    details.update({key: value for key, value in facts.items()
+                                    if key != "root_source" and not key.startswith("numeric_")})
                 details.update({"phase": "remote_leaf_fill" if leaf else "root_fill",
                     "subject_kind": "remote_leaf" if leaf else "root",
                     "subject_id": opaque_trace_correlation(model_file.file_id),
@@ -7752,6 +7787,10 @@ class ModelBuilder:
                 event_type="diagnostic", trace_scope="flow")
         except Exception:
             pass
+
+    def set_numeric_progress_trace(self, tracer: Optional[RootProgressTrace]) -> None:
+        """Share diagnostic coalescing only; no model or transfer ownership."""
+        self.__numeric_progress_trace = tracer
 
     def build_model(
             self, *, local_scan_session: object = None, local_scan_generation: object = None,
@@ -7972,7 +8011,15 @@ class ModelBuilder:
                 status.type.value if status is not None else None,
                 file_id=file_id,
                 build_local_predicate_cache=build_local_predicate_cache,
+                numeric_credit_facts=input_facts,
             )
+            try:
+                if input_facts is not None:
+                    input_facts["numeric_live_root_bytes"] = model_file.transferred_size \
+                        if file_id in live_transferred_file_ids else None
+                    input_facts["numeric_live_credit"] = file_id in live_transferred_file_ids
+            except Exception:
+                pass
             self.__build_children(
                 model_file,
                 remote,
@@ -8528,6 +8575,7 @@ class ModelBuilder:
                     file_id=_child_file_id,
                     ancestor_file_ids=(_model_file_id,) + _ancestor_file_ids,
                     build_local_predicate_cache=build_local_predicate_cache,
+                    numeric_credit_facts=input_facts,
                 )
                 # A successful child finalization persists an exact child
                 # identity before its staging entry is retired.  The raw
@@ -8597,6 +8645,7 @@ class ModelBuilder:
         file_id: Optional[str] = None,
         ancestor_file_ids: Optional[Tuple[str, ...]] = None,
         build_local_predicate_cache: Optional[dict[tuple[object, ...], bool]] = None,
+        numeric_credit_facts: Optional[dict] = None,
     ) -> None:
         effective_file_id = file_id if file_id is not None else model_file.file_id
         # set local and remote sizes
@@ -8648,9 +8697,17 @@ class ModelBuilder:
                 transfer_state is None and getattr(local, "status_sidecar_ready", False) and
                 not model_file.explicitly_stopped
         ):
+            numeric_live = False
+            try:
+                if numeric_credit_facts is not None:
+                    numeric_live = effective_file_id in live_transferred_file_ids
+            except Exception:
+                numeric_credit_facts = None
             self.__update_transferred_size(
                 model_file, remote, local, live_transferred_file_ids,
                 ancestor_file_ids=ancestor_file_ids,
+                numeric_credit_facts=numeric_credit_facts,
+                numeric_live=numeric_live,
             )
 
         # set the is_extractable flag
@@ -8724,12 +8781,24 @@ class ModelBuilder:
         return json.dumps([model_file.path_pair_id, full_path], separators=(",", ":"))
 
     @staticmethod
+    def __record_numeric_credit(facts: Optional[dict], ancestor: str, amount: int,
+                                live: bool, blocked: bool) -> None:
+        try:
+            if facts is not None and facts.get("numeric_root_file_id") == ancestor:
+                key = "numeric_blocked_descendant_bytes" if blocked else \
+                    "numeric_live_descendant_bytes" if live else "numeric_nonlive_descendant_bytes"
+                facts[key] += amount
+        except Exception:
+            pass
+
+    @staticmethod
     def __update_transferred_size(
         model_file: ModelFile,
         remote: SystemFile,
         local: SystemFile,
         live_transferred_file_ids: Set[str],
         ancestor_file_ids: Optional[Tuple[str, ...]] = None,
+        numeric_credit_facts: Optional[dict] = None, numeric_live: bool = False,
     ) -> None:
         if model_file.is_dir:
             if model_file.transferred_size is None:
@@ -8746,18 +8815,43 @@ class ModelBuilder:
                 if ancestor_file_ids is None:
                     while _parent_file is not None:
                         if _parent_file.file_id in live_transferred_file_ids:
+                            if numeric_credit_facts is not None:
+                                try:
+                                    ModelBuilder.__record_numeric_credit(
+                                        numeric_credit_facts, _parent_file.file_id, model_file.transferred_size, numeric_live, True)
+                                except Exception:
+                                    pass
                             break
                         if _parent_file.transferred_size is None:
                             _parent_file.transferred_size = 0
                         _parent_file.transferred_size += model_file.transferred_size
+                        if numeric_credit_facts is not None:
+                            try:
+                                ModelBuilder.__record_numeric_credit(
+                                    numeric_credit_facts, _parent_file.file_id, model_file.transferred_size, numeric_live, False)
+                            except Exception:
+                                pass
                         _parent_file = _parent_file.parent
                 else:
                     for ancestor_file_id in ancestor_file_ids:
                         if _parent_file is None or ancestor_file_id in live_transferred_file_ids:
+                            if _parent_file is not None:
+                                if numeric_credit_facts is not None:
+                                    try:
+                                        ModelBuilder.__record_numeric_credit(
+                                            numeric_credit_facts, ancestor_file_id, model_file.transferred_size, numeric_live, True)
+                                    except Exception:
+                                        pass
                             break
                         if _parent_file.transferred_size is None:
                             _parent_file.transferred_size = 0
                         _parent_file.transferred_size += model_file.transferred_size
+                        if numeric_credit_facts is not None:
+                            try:
+                                ModelBuilder.__record_numeric_credit(
+                                    numeric_credit_facts, ancestor_file_id, model_file.transferred_size, numeric_live, False)
+                            except Exception:
+                                pass
                         _parent_file = _parent_file.parent
 
     @staticmethod

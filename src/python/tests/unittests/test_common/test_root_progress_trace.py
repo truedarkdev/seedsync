@@ -16,6 +16,72 @@ from common.root_progress_trace import (
 
 
 class TestRootProgressTrace(unittest.TestCase):
+    def test_numeric_reset_clears_publication_and_rate_then_retains_knownness_transition(self):
+        from common.breadcrumb_trace import opaque_trace_correlation
+        for reset_name in ("reset", "clear"):
+            with self.subTest(reset=reset_name):
+                trace = self._trace()
+                self.addCleanup(trace.close)
+                tracer = root_progress_tracer(trace)
+                subjects = [opaque_trace_correlation("synthetic-root-" + str(index)) for index in range(8)]
+                for digest in subjects:
+                    tracer.select_numeric_subject(digest)
+                digest = subjects[0]
+                payload = {"records": [{"file_id": "synthetic-root-0", "transferred_size": 123}]}
+                def publish(poll):
+                    return tracer.record_numeric(digest, "publication", {
+                        "model_version": 77, "selected_bytes": 123, "poll_correlation": poll,
+                    })
+                def emit():
+                    for phase in ("json", "sse"):
+                        tracer.record_numeric_payload(payload, phase, 77)
+                with patch("common.root_progress_trace.time.monotonic", return_value=10):
+                    self.assertTrue(publish("lftp-poll:" + "a"*16))
+                    emit()
+                    generation = trace.trace_generation()
+                    self.assertTrue(getattr(trace, reset_name)()["cleared"])
+                    self.assertGreater(trace.trace_generation(), generation)
+                    emit()  # Same time/version/bytes must no longer retain P.
+                rows = trace.snapshot(category="model.progress")["entries"]
+                self.assertEqual(["json", "sse"], [row["details"]["phase"] for row in rows])
+                self.assertEqual([None, None], [row["details"]["poll_correlation"] for row in rows])
+                with patch("common.root_progress_trace.time.monotonic", return_value=12):
+                    self.assertTrue(publish("lftp-poll:" + "b"*16))
+                    emit()
+                    emit()  # Normal rate bound still suppresses repeated calls.
+                    self.assertTrue(tracer.record_numeric(subjects[-1], "status", {"status_bytes": 1}))
+                rows = trace.snapshot(category="model.progress")["entries"]
+                transports = [row for row in rows if row["details"]["phase"] in ("json", "sse")]
+                self.assertEqual([None, None, "lftp-poll:" + "b"*16, "lftp-poll:" + "b"*16],
+                    [row["details"]["poll_correlation"] for row in transports])
+                count = len(rows)
+                with patch("common.root_progress_trace.time.monotonic", return_value=14):
+                    self.assertFalse(publish("lftp-poll:" + "c"*16))
+                    emit()  # Known-to-known nonce changes remain coalesced.
+                self.assertEqual(count, len(trace.snapshot(category="model.progress")["entries"]))
+
+    def test_numeric_selected_subject_rate_unknown_version_and_emission_failure(self):
+        from common.breadcrumb_trace import opaque_trace_correlation
+        trace = self._trace()
+        self.addCleanup(trace.close)
+        tracer = root_progress_tracer(trace)
+        digest = opaque_trace_correlation("synthetic-root")
+        self.assertFalse(tracer.record_numeric(digest, "status", {"status_bytes": 1}))
+        tracer.select_numeric_subject(digest)
+        with patch("common.root_progress_trace.time.monotonic", return_value=10):
+            for index in range(100):
+                tracer.record_numeric(digest, "status", {"status_bytes": index})
+            tracer.record_numeric(digest, "publication", {"model_version": 2, "poll_correlation": "lftp-poll:" + "a"*16})
+            tracer.record_numeric_payload({"records": [{"file_id": "synthetic-root", "transferred_size": 5}]}, "json", 1)
+        rows = trace.snapshot(category="model.progress")["entries"]
+        self.assertEqual(3, len(rows))
+        self.assertIsNone(rows[-1]["details"]["poll_correlation"])
+        with patch.object(trace, "record", side_effect=RuntimeError("synthetic-emit")), \
+                patch("common.root_progress_trace.time.monotonic", return_value=12):
+            self.assertFalse(tracer.record_numeric(digest, "status", {"status_bytes": 12}))
+        with patch.object(trace, "is_effectively_enabled", return_value=False):
+            self.assertFalse(tracer.record_numeric(digest, "status", object()))
+
     def _trace(self, enabled=True):
         return BreadcrumbTraceCollector(
             lambda: enabled,

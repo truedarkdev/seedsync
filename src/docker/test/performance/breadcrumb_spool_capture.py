@@ -19,7 +19,7 @@ import stat
 import time
 from typing import Mapping
 
-from incoming_recovery_observer import JsonArtifactSink, ObserverCaptureError
+from incoming_recovery_observer import JsonArtifactSink, ObserverCaptureError, _sanitize_numeric_progress
 
 
 _ACTIVE_NAME = "breadcrumbs.jsonl"
@@ -45,13 +45,15 @@ _CATEGORIES = frozenset(
     }
 )
 _SOURCES = frozenset(
-    {"controller", "model_updater", "model_builder", "status", "scanner", "scanner_process", "lftp", "web", "system"}
+    {"controller", "model_updater", "model_builder", "status", "scanner", "scanner_process", "lftp", "web", "system", "root_progress"}
 )
 _EVENT_TYPES = frozenset(
     {"queue", "callback", "status", "completion", "progress", "state_transition", "failure", "diagnostic", "breadcrumb"}
 )
 _STAGES = frozenset(
     {
+        "root_progress_numeric_status", "root_progress_numeric_builder", "root_progress_numeric_builder_leaf",
+        "root_progress_numeric_publication", "root_progress_numeric_json", "root_progress_numeric_sse",
         "admission", "dispatch", "publication", "terminal", "queue_lifecycle", "queue_authority_handoff",
         "queue_readiness", "queue_exclusion", "model", "model_progress", "model_delta", "model_update",
         "model_publication", "model_summary", "model_finalization", "scan", "scan_adoption", "scan_authority",
@@ -2177,6 +2179,9 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         result["model_finalization"] = model_finalization
     if model_progress_lineage is not None:
         result["model_progress_lineage"] = model_progress_lineage
+    numeric_progress = _sanitize_numeric_progress(details) if category == "model.progress" else None
+    if numeric_progress is not None:
+        result["numeric_progress"] = numeric_progress
     if model_publication_retry is not None:
         result["model_publication_retry"] = model_publication_retry
     if command_admission_timing is not None:

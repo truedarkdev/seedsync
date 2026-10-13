@@ -463,6 +463,11 @@ class ModelApiHandler(IHandler):
             return json.dumps(transport_payload)
 
         body = self.__record_duration(metric, serialize_json)
+        try:
+            if progress_trace is not None:
+                progress_trace.record_numeric_payload(payload, "json", payload_global_model_version)
+        except Exception:
+            pass
         if progress_started_ns is not None and progress_trace is not None:
             duration_ms = max(0, int((time.monotonic_ns() - progress_started_ns) / 1_000_000))
             records = payload.get("records") if isinstance(payload, dict) else None
@@ -620,6 +625,11 @@ class ModelApiHandler(IHandler):
                         )
                 except Exception:
                     pass
+            try:
+                if progress_trace is not None:
+                    progress_trace.record_numeric_payload(payload, "sse", global_model_version if scoped else version)
+            except Exception:
+                pass
             return rendered
 
         return self.__record_duration(emission_metric, publish)  # type: ignore[return-value]
