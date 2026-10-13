@@ -198,6 +198,10 @@ _QUEUE_READINESS_EXTRA_ENUMS = {
     "collision_snapshot": frozenset({"unknown", "not_tuple", "empty", "over_limit", "valid"}),
     "collision_source_kind": frozenset({"unknown", "file", "absent", "directory"}),
     "collision_exception": frozenset({"none", "missing", "type", "not_regular", "permission", "filesystem", "shape", "other"}),
+    "collision_claim_step": {"not_started", "busy", "reserve", "preclaim_source", "preclaim_destination", "sidecar_create", "claim_rename", "claim_sync", "postclaim_source", "postclaim_destination", "postclaim_source_validation", "postclaim_destination_validation", "restore_rename", "restore_sync", "sidecar_cleanup", "cache_key", "executor_create", "executor_submit", "executor_callbacks"},
+    "collision_claim_exception": {"none", "missing", "type", "permission", "filesystem", "other"},
+    "collision_claim_cleanup": {"not_attempted", "pending", "completed", "failed"},
+    "collision_claim_restore": {"not_attempted", "pending", "completed", "failed"},
     "decision_boundary": frozenset({"scan_authority"}),
     "decision": frozenset({"defer"}),
     "collision_observation": frozenset({"absent", "not_applicable", "present", "unknown"}),
@@ -1203,6 +1207,10 @@ def _queue_readiness_facts(message: object, details: Mapping[str, object]) -> di
             result[key] = value
         elif key in details:
             result[key] = None
+    for key in ("collision_claim_errno", "collision_claim_cleanup_errno", "collision_claim_restore_errno"):
+        if key in details:
+            value = details.get(key)
+            result[key] = value if type(value) is int and 0 <= value <= 65535 else None
     for key in ("publication_id", "model_version"):
         value = details.get(key)
         if key in details:

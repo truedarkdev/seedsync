@@ -9120,7 +9120,20 @@ class Controller:
 
     def __claim_collision_source(
             self, source: str, mutation_tracker: Optional[_MoveMutationTracker] = None,
+            *, claim_diagnostic: Optional[Callable[..., None]] = None,
     ) -> str:
+        step = "reserve"
+
+        def mark(value: str, error: Optional[Exception] = None, **outcomes) -> None:
+            nonlocal step
+            step = value
+            try:
+                if claim_diagnostic is not None:
+                    claim_diagnostic(value, error, **outcomes)
+            except Exception:
+                pass
+
+        mark("reserve")
         source_parent = os.path.dirname(source)
         for _ in range(16):
             claimed_path = os.path.join(source_parent, ".seedsync-retire-" + secrets.token_hex(24))
@@ -9129,17 +9142,27 @@ class Controller:
                 break
         else:
             raise OSError(errno.EEXIST, "could not reserve private collision claim", source)
+        mark("sidecar_create")
         self.__write_collision_claim_sidecar(
             sidecar_path, os.path.basename(source), getattr(self, "_Controller__collision_claim_path_pair_id", None),
             mutation_tracker,
         )
         try:
+            mark("claim_rename")
             self.__rename_no_replace(source, claimed_path)
             if mutation_tracker is not None:
                 mutation_tracker.mutated()
+            mark("claim_sync")
             self.__sync_directory_if_supported(source_parent)
-        except Exception:
-            self.__remove_collision_claim_sidecar(sidecar_path, mutation_tracker)
+        except Exception as error:
+            mark(step, error)
+            mark("sidecar_cleanup", cleanup="pending")
+            try:
+                self.__remove_collision_claim_sidecar(sidecar_path, mutation_tracker)
+            except Exception as cleanup_error:
+                mark("sidecar_cleanup", cleanup_error, cleanup="failed")
+                raise
+            mark("sidecar_cleanup", cleanup="completed")
             raise
         return claimed_path
 
@@ -9148,7 +9171,19 @@ class Controller:
             mutation_tracker: Optional[_MoveMutationTracker] = None,
             *, expected_source_signature: Optional[tuple] = None,
             expected_destination_signature: Optional[tuple] = None,
+            claim_diagnostic: Optional[Callable[..., None]] = None,
     ) -> str:
+        step = "not_started"
+
+        def mark(value: str, error: Optional[Exception] = None, **outcomes) -> None:
+            nonlocal step
+            step = value
+            try:
+                if claim_diagnostic is not None:
+                    claim_diagnostic(value, error, **outcomes)
+            except Exception:
+                pass
+
         if not hasattr(self, "_Controller__collision_compare_lock"):
             self.__collision_compare_lock = Lock()
             self.__collision_compare_executor = None
@@ -9159,44 +9194,67 @@ class Controller:
             self.__collision_compare_cancel_event = None
         with self.__collision_compare_lock:
             if self.__collision_compare_future is not None or self.__collision_compare_claim is not None:
+                mark("busy")
                 return "pending"
+            mark("preclaim_source")
             if expected_source_signature is not None and not self.__collision_stat_signatures_match(
                     self.__collision_signature(source), expected_source_signature):
                 raise OSError(errno.EAGAIN, "collision source changed before claim")
+            mark("preclaim_destination")
             if expected_destination_signature is not None and not self.__collision_stat_signatures_match(
                     self.__collision_signature(destination), expected_destination_signature):
                 raise OSError(errno.EAGAIN, "collision destination changed before claim")
             self.__collision_claim_path_pair_id = path_pair_id
             try:
-                claimed_source = self.__claim_collision_source(source, mutation_tracker)
+                if claim_diagnostic is None:
+                    claimed_source = self.__claim_collision_source(source, mutation_tracker)
+                else:
+                    claimed_source = self.__claim_collision_source(
+                        source, mutation_tracker, claim_diagnostic=claim_diagnostic,
+                    )
             finally:
                 self.__collision_claim_path_pair_id = None
             sidecar_path = self.__collision_claim_sidecar_path(claimed_source)
             try:
+                mark("postclaim_source")
                 source_signature = self.__collision_signature(claimed_source)
+                mark("postclaim_destination")
                 destination_signature = self.__collision_signature(destination)
                 # Claim rename changes ctime. All other source identity fields
                 # must still be those authorized by the root batch snapshot.
+                mark("postclaim_source_validation")
                 if expected_source_signature is not None and \
                         source_signature[:4] + source_signature[5:] != \
                         expected_source_signature[:4] + expected_source_signature[5:]:
                     raise OSError(errno.EAGAIN, "collision source changed during claim")
+                mark("postclaim_destination_validation")
                 if expected_destination_signature is not None and not self.__collision_stat_signatures_match(
                         destination_signature, expected_destination_signature):
                     raise OSError(errno.EAGAIN, "collision destination changed during claim")
-            except OSError:
+            except OSError as error:
+                mark(step, error)
                 try:
+                    mark("restore_rename", restore="pending")
                     self.__rename_no_replace(claimed_source, source)
                     if mutation_tracker is not None:
                         mutation_tracker.mutated()
+                    mark("restore_sync")
                     self.__sync_directory_if_supported(os.path.dirname(source))
+                    mark("restore_sync", restore="completed")
+                    mark("sidecar_cleanup", cleanup="pending")
                     self.__remove_collision_claim_sidecar(sidecar_path, mutation_tracker)
+                    mark("sidecar_cleanup", cleanup="completed")
                 except OSError as restore_error:
+                    if step == "sidecar_cleanup":
+                        mark(step, restore_error, cleanup="failed")
+                    else:
+                        mark(step, restore_error, restore="failed")
                     self.logger.error(
                         "Retained collision claim '%s' for '%s' versus '%s': %s",
                         claimed_source, source, destination, restore_error,
                     )
                 raise
+            mark("cache_key")
             key = self.__collision_cache_key(source, destination, source_signature, destination_signature)
             owner_file_id = mutation_tracker.file_id if mutation_tracker is not None and \
                 isinstance(mutation_tracker.file_id, str) else None
@@ -9208,13 +9266,16 @@ class Controller:
             self.__collision_compare_cancel_event = Event()
             cancel_event = self.__collision_compare_cancel_event
             compare_epoch = getattr(self, "_Controller__collision_compare_epoch", 0)
+            mark("executor_create")
             if self.__collision_compare_executor is None:
                 self.__collision_compare_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="seedsync-collision")
+            mark("executor_submit")
             self.__collision_compare_future = self.__collision_compare_executor.submit(
                 Controller.__compare_collision_leaf_job,
                 claimed_source, destination, source_signature, destination_signature,
                 cancel_event,
             )
+            mark("executor_callbacks")
             self.__collision_compare_future.add_done_callback(lambda _future: self.wake_process())
             self.__collision_compare_future.add_done_callback(
                 lambda completed_future: self.__restore_cancelled_collision_claim(
@@ -12501,6 +12562,36 @@ class Controller:
         examined = checked = total_bytes = 0
         identity = source_signature = destination_signature = None
         exception_kind = "none"
+        claim_facts: dict[str, object] = {
+            "collision_claim_step": "not_started", "collision_claim_exception": "none",
+            "collision_claim_errno": None, "collision_claim_cleanup": "not_attempted",
+            "collision_claim_restore": "not_attempted", "collision_claim_cleanup_errno": None,
+            "collision_claim_restore_errno": None,
+        }
+
+        def record_claim(step: str, error: Optional[Exception] = None,
+                         *, cleanup: Optional[str] = None, restore: Optional[str] = None) -> None:
+            # Local to this invocation. The primitive isolates this callback;
+            # no error/path text or additional filesystem observations enter it.
+            code = getattr(error, "errno", None) if error is not None else None
+            code = code if type(code) is int and 0 <= code <= 65535 else None
+            if cleanup is not None:
+                claim_facts["collision_claim_cleanup"] = cleanup
+                if error is not None:
+                    claim_facts["collision_claim_cleanup_errno"] = code
+            elif restore is not None:
+                claim_facts["collision_claim_restore"] = restore
+                if error is not None:
+                    claim_facts["collision_claim_restore_errno"] = code
+            elif claim_facts["collision_claim_exception"] == "none":
+                claim_facts["collision_claim_step"] = step
+                if error is not None:
+                    claim_facts["collision_claim_errno"] = code
+                    claim_facts["collision_claim_exception"] = \
+                        "missing" if isinstance(error, FileNotFoundError) else \
+                        "type" if isinstance(error, NotADirectoryError) else \
+                        "permission" if isinstance(error, PermissionError) else \
+                        "filesystem" if isinstance(error, OSError) else "other"
 
         def emit(outcome: str, reason: str) -> None:
             def details() -> dict[str, object]:
@@ -12531,6 +12622,7 @@ class Controller:
                     "collision_examined_count": bounded(examined), "collision_checked_count": bounded(checked),
                     "collision_total_bytes": bounded(total_bytes), "collision_sizes_match": sizes_match,
                     "collision_mtimes_match": mtimes_match,
+                    **claim_facts,
                 }
             try:
                 self.__record_queue_readiness_trace(file.file_id, "queue_preflight_outcome", details)
@@ -12683,6 +12775,7 @@ class Controller:
                         source, destination, file.path_pair_id, tracker,
                         expected_source_signature=batch[intent.collision_leaf_index][1],
                         expected_destination_signature=batch[intent.collision_leaf_index][2],
+                        claim_diagnostic=record_claim,
                     )
             finally:
                 if type(invalidation) is int and callable(finish):
@@ -12691,6 +12784,11 @@ class Controller:
             emit("deferred", "comparison_pending")
             return "deferred", "comparison_pending", intent
         except Exception as error:
+            if gate == "claim":
+                try:
+                    record_claim(cast(str, claim_facts["collision_claim_step"]), error)
+                except Exception:
+                    pass
             try:
                 exception_kind = "missing" if isinstance(error, FileNotFoundError) else \
                     "type" if isinstance(error, NotADirectoryError) else \

@@ -613,6 +613,10 @@ _CAPTURE_READINESS_EXTRA_ENUMS = {
     "collision_snapshot": {"unknown", "not_tuple", "empty", "over_limit", "valid"},
     "collision_source_kind": {"unknown", "file", "absent", "directory"},
     "collision_exception": {"none", "missing", "type", "not_regular", "permission", "filesystem", "shape", "other"},
+    "collision_claim_step": {"not_started", "busy", "reserve", "preclaim_source", "preclaim_destination", "sidecar_create", "claim_rename", "claim_sync", "postclaim_source", "postclaim_destination", "postclaim_source_validation", "postclaim_destination_validation", "restore_rename", "restore_sync", "sidecar_cleanup", "cache_key", "executor_create", "executor_submit", "executor_callbacks"},
+    "collision_claim_exception": {"none", "missing", "type", "permission", "filesystem", "other"},
+    "collision_claim_cleanup": {"not_attempted", "pending", "completed", "failed"},
+    "collision_claim_restore": {"not_attempted", "pending", "completed", "failed"},
     "decision_boundary": {"scan_authority"},
     "decision": {"defer"},
     "collision_observation": {"absent", "not_applicable", "present", "unknown"},
@@ -1821,6 +1825,10 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
                 safe_readiness[key] = item
             elif key in readiness:
                 safe_readiness[key] = None
+        for key in ("collision_claim_errno", "collision_claim_cleanup_errno", "collision_claim_restore_errno"):
+            if key in readiness:
+                item = readiness.get(key)
+                safe_readiness[key] = item if type(item) is int and 0 <= item <= 65535 else None
         for key in ("publication_id", "model_version"):
             if key in readiness:
                 item = readiness[key]

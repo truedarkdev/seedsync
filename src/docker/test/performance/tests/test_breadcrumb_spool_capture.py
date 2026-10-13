@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import errno
 import json
 import os
 from pathlib import Path
@@ -1088,17 +1089,184 @@ def test_collision_batch_gates_survive_actual_finalizer_reader_and_sink(tmp_path
         collector.close()
 
 
+def test_claim_boundary_failures_survive_finalizer_reader_and_sink(tmp_path: Path) -> None:
+    assert _ControllerFixture is not None and BreadcrumbTraceCollector is not None
+    spool, artifact = _prepare(tmp_path)
+    collector = BreadcrumbTraceCollector(lambda: True, max_entries=256,
+        policy={"default": "off", "rules": {"queue.readiness": "info", "controller": "info"}},
+        durable_enabled=True, durable_path=str(spool))
+    reader = _reader(spool, artifact, max_records=256)
+    cases = ("reserve", "preclaim_source", "preclaim_destination", "sidecar_create",
+             "claim_rename", "claim_sync", "postclaim_source", "postclaim_destination",
+             "postclaim_source_validation", "postclaim_destination_validation",
+             "restore_rename", "restore_sync", "cleanup_after_rename", "cleanup_after_restore",
+             "executor_create", "executor_submit", "executor_callbacks")
+    expected = []
+    try:
+        collector.record("controller", "boundary", {}, category="controller", level="info")
+        assert collector.wait_for_ingress(2.0) and collector.flush_durable(2.0)
+        reader.start()
+        for case in cases:
+            decisions = []
+            shapes = []
+            for mode in ("enabled", "disabled", "emission_fault", "hook_fault"):
+                fixture = _ControllerFixture()
+                fixture.setUp()
+                try:
+                    root, intent, _, _, final, staging = fixture._prepare_incomplete_collision_batch()
+                    producer = fixture.controller
+                    producer._Controller__context.breadcrumb_trace = collector
+                    primary = OSError(errno.EIO, "private-error-text", "/private/error-path")
+                    secondary = OSError(errno.EXDEV, "private-restore-text")
+                    in_claim = False
+                    signature_calls = rename_calls = sync_calls = 0
+                    caught = []
+                    before_payload = sorted(p.read_bytes() for p in Path(staging, "release").rglob("*")
+                        if p.is_file() and not p.name.endswith((".json", ".lftp-pget-status")))
+                    final_before = {str(p.relative_to(final)): p.read_bytes()
+                                    for p in Path(final).rglob("*") if p.is_file()}
+                    with ExitStack() as stack:
+                        def change(owner, name, **kwargs):
+                            return stack.enter_context(patch.object(owner, name, **kwargs))
+                        if mode == "disabled": change(collector, "is_effectively_enabled", return_value=False)
+                        if mode == "emission_fault": change(collector, "record", side_effect=RuntimeError("private-emission"))
+                        original_claim = producer._Controller__claim_and_compare_collision_leaf
+                        def run_claim(*args, **kwargs):
+                            nonlocal in_claim
+                            in_claim = True
+                            if mode == "hook_fault":
+                                def broken_hook(*args, **kwargs): raise RuntimeError("private-hook")
+                                kwargs["claim_diagnostic"] = broken_hook
+                            try:
+                                return original_claim(*args, **kwargs)
+                            except Exception as error:
+                                caught.append(error)
+                                raise
+                            finally: in_claim = False
+                        change(producer, "_Controller__claim_and_compare_collision_leaf", side_effect=run_claim)
+                        original_signature = producer._Controller__collision_signature
+                        def signature(path):
+                            nonlocal signature_calls
+                            if not in_claim: return original_signature(path)
+                            signature_calls += 1
+                            selected = {"preclaim_source": 1, "preclaim_destination": 2,
+                                "postclaim_source": 3, "postclaim_destination": 4,
+                                "restore_rename": 3, "restore_sync": 3, "cleanup_after_restore": 3}
+                            if signature_calls == selected.get(case): raise primary
+                            value = original_signature(path)
+                            if signature_calls == {"postclaim_source_validation": 3,
+                                                   "postclaim_destination_validation": 4}.get(case):
+                                return value[:2] + (value[2] + 1,) + value[3:]
+                            return value
+                        change(producer, "_Controller__collision_signature", side_effect=signature)
+                        if case == "reserve":
+                            original_exists = os.path.lexists
+                            stack.enter_context(patch("controller.controller.os.path.lexists",
+                                side_effect=lambda p: True if Path(p).name.startswith(".seedsync-retire-") else original_exists(p)))
+                        if case == "sidecar_create": change(producer, "_Controller__write_collision_claim_sidecar", side_effect=primary)
+                        original_rename = producer._Controller__rename_no_replace
+                        def rename(*args):
+                            nonlocal rename_calls
+                            rename_calls += 1
+                            if case in ("claim_rename", "cleanup_after_rename") and rename_calls == 1: raise primary
+                            if case == "restore_rename" and rename_calls == 2: raise secondary
+                            return original_rename(*args)
+                        change(producer, "_Controller__rename_no_replace", side_effect=rename)
+                        original_sync = producer._Controller__sync_directory_if_supported
+                        def sync(path):
+                            nonlocal sync_calls
+                            sync_calls += 1
+                            if case == "claim_sync" and sync_calls == 1: raise primary
+                            if case == "restore_sync" and sync_calls == 2: raise secondary
+                            return original_sync(path)
+                        change(producer, "_Controller__sync_directory_if_supported", side_effect=sync)
+                        if case in ("cleanup_after_rename", "cleanup_after_restore"):
+                            change(producer, "_Controller__remove_collision_claim_sidecar", side_effect=secondary)
+                        if case == "executor_create": stack.enter_context(patch("controller.controller.ThreadPoolExecutor", side_effect=primary))
+                        if case == "executor_submit": stack.enter_context(patch("controller.controller.ThreadPoolExecutor.submit", side_effect=primary))
+                        if case == "executor_callbacks": stack.enter_context(patch("controller.controller.Future.add_done_callback", side_effect=primary))
+                        before = len(collector.snapshot()["entries"])
+                        decision = producer._Controller__queue_collision_preflight(root, intent.command, intent)
+                        decisions.append(decision[:2])
+                        assert decision[:2] == ("reject", "collision_preflight_error")
+                        assert len(caught) == 1
+                        if case in ("reserve", "postclaim_source_validation", "postclaim_destination_validation"):
+                            assert caught[0].errno == (errno.EEXIST if case == "reserve" else errno.EAGAIN)
+                        else: assert caught[0] is (secondary if case == "cleanup_after_rename" else primary)
+                        rows = [row for row in collector.snapshot()["entries"][before:]
+                                if row["message"] == "queue_preflight_outcome"]
+                        if mode in ("enabled", "hook_fault"):
+                            assert len(rows) == 1
+                            facts = rows[0]["details"]
+                            assert facts["collision_gate"] == "claim"
+                            if mode == "enabled":
+                                step = "postclaim_source" if case in ("restore_rename", "restore_sync", "cleanup_after_restore") else \
+                                    "claim_rename" if case == "cleanup_after_rename" else case
+                                assert facts["collision_claim_step"] == step
+                                assert facts["collision_claim_errno"] == (errno.EEXIST if case == "reserve" else \
+                                    errno.EAGAIN if case.endswith("_validation") else errno.EIO)
+                                assert facts["collision_claim_cleanup"] == ("failed" if case.startswith("cleanup_") else \
+                                    "completed" if case in ("claim_rename", "claim_sync", "postclaim_source", "postclaim_destination",
+                                        "postclaim_source_validation", "postclaim_destination_validation") else "not_attempted")
+                                assert facts["collision_claim_restore"] == ("failed" if case.startswith("restore_") else \
+                                    "completed" if case.startswith("postclaim_") or case == "cleanup_after_restore" else "not_attempted")
+                                if case.startswith("restore_"): assert facts["collision_claim_restore_errno"] == errno.EXDEV
+                                if case.startswith("cleanup_"): assert facts["collision_claim_cleanup_errno"] == errno.EXDEV
+                            expected.append(facts)
+                        else: assert rows == []
+                    future = getattr(producer, "_Controller__collision_compare_future", None)
+                    if future is not None: future.result(timeout=5)
+                    after_payload = sorted(p.read_bytes() for p in Path(staging, "release").rglob("*")
+                        if p.is_file() and not p.name.endswith((".json", ".lftp-pget-status")))
+                    assert after_payload == before_payload
+                    assert final_before == {str(p.relative_to(final)): p.read_bytes()
+                                            for p in Path(final).rglob("*") if p.is_file()}
+                    assert Path(staging, "release", "nested", "partial.bin").read_bytes() == b"part"
+                    assert Path(staging, "release", "nested", "partial.bin.lftp-pget-status").exists()
+                    producer._Controller__lftp.queue.assert_not_called()
+                    shapes.append((Path(staging, "release", "legacy", "extra.bin").exists(),
+                        sum(p.is_file() for p in Path(staging, "release").rglob("*"))))
+                finally: fixture.doCleanups()
+            assert all(decision == decisions[0] for decision in decisions)
+            assert all(shape == shapes[0] for shape in shapes)
+        assert collector.wait_for_ingress(2.0) and collector.flush_durable(2.0)
+        finalized = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text().splitlines()]
+        finalized = [row for row in finalized if row.get("message") == "queue_preflight_outcome"]
+        assert len(finalized) == len(expected) and all(row["event_type"] == "failure" for row in finalized)
+        assert reader.poll() == len(expected)
+        captured = [row["capture"] for row in _artifacts(artifact) if row["capture"].get("state") == "record"]
+        assert [row["projection"]["numbers"]["version"] for row in captured] == [row["version"] for row in finalized]
+        assert [row["created_ms"] for row in captured] == [row["created_ms"] for row in finalized]
+        assert [row["projection"]["corr_hash"] for row in captured] == [capture._hash(row["corr_id"]) for row in finalized]
+        assert len({row["projection"]["corr_hash"] for row in captured}) == 1
+        for row, facts in zip(captured, expected):
+            for key in facts:
+                if key.startswith("collision_claim_"): assert row["projection"]["queue_readiness"][key] == facts[key]
+        assert all(label not in artifact.read_text() for label in ("private-", "release", "pair-a", ".seedsync-retire-"))
+        assert all(len(json.dumps(row)) < 4096 for row in finalized)
+    finally:
+        reader.close()
+        collector.close()
+
+
 def test_collision_gate_projection_rejects_unbounded_or_private_fields() -> None:
     details = {"schema": "queue_readiness.v1", "collision_gate": "/private/path",
         "collision_exception": "private exception", "collision_total_bytes": 2**63,
         "collision_path_count": -1, "collision_checked_count": True,
-        "collision_examined_count": "999", "collision_sizes_match": 1, "private_path": "/private/path"}
+        "collision_examined_count": "999", "collision_sizes_match": 1, "private_path": "/private/path",
+        "collision_claim_step": "/private/path", "collision_claim_exception": "private-error",
+        "collision_claim_cleanup": "private-error", "collision_claim_restore": "private-error",
+        "collision_claim_errno": 65536, "collision_claim_cleanup_errno": -1, "collision_claim_restore_errno": True}
     facts = capture._queue_readiness_facts("queue_preflight_outcome", details)
     result = observer._sanitize_capture_projection({"queue_readiness": facts})["queue_readiness"]
     assert result["collision_gate"] == result["collision_exception"] == "unknown"
     assert all(result[key] is None for key in ("collision_total_bytes", "collision_path_count",
         "collision_checked_count", "collision_examined_count", "collision_sizes_match"))
     assert "/private/path" not in json.dumps(result)
+    assert all(result[key] == "unknown" for key in ("collision_claim_step", "collision_claim_exception",
+        "collision_claim_cleanup", "collision_claim_restore"))
+    assert all(result[key] is None for key in ("collision_claim_errno", "collision_claim_cleanup_errno",
+        "collision_claim_restore_errno"))
 
 
 def test_queue_readiness_source_projection_is_finite_and_redacted(tmp_path: Path) -> None:
