@@ -628,6 +628,189 @@ class TestLftp(unittest.TestCase):
         finally:
             lftp_mod._PREPARSE_STDERR_REMAINING = original_remaining
 
+    def test_timed_out_pty_response_is_synchronized_before_next_status(self):
+        import pexpect
+        import sys
+        emitter_source = r'''import json, sys, time
+prompt = "lftp probe@fixture.invalid:~> "
+def output(value):
+    sys.stdout.write(value); sys.stdout.flush()
+def event(name, seq):
+    with open(sys.argv[2], "a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"event": name, "seq": seq, "time_ns": str(time.monotonic_ns())}) + "\n")
+output(prompt)
+seq = 0
+for command in sys.stdin:
+    if command.strip() != "jobs -v":
+        output(prompt); continue
+    seq += 1
+    event("received", seq)
+    if seq == 1:
+        output("x" * 32768); time.sleep(1.2)
+    elif seq == 2:
+        time.sleep(1.2 if sys.argv[1] == "successive_timeout" else 0.1)
+        output("jobs -v\n[0] queue (sftp://probe@fixture.invalid)\nsftp://probe@fixture.invalid/remote\nQueue is running.\n[1] mirror -c /remote/bundle /local/staging/ -- 10/20 (50%)\n")
+    output(prompt)
+    event("prompt_flushed", seq)
+'''
+        real_spawn = pexpect.spawn
+        for scenario in ("successive_timeout", "running_recovery"):
+            for mode in ("disabled", "enabled", "fault"):
+                with self.subTest(scenario=scenario, diagnostics=mode), tempfile.TemporaryDirectory() as directory:
+                    emitter = Path(directory, "pty_response_emitter.py")
+                    emitter.write_text(emitter_source, encoding="utf-8")
+                    events_path = Path(directory, "events.jsonl")
+                    def spawn(_filename, _args, **kwargs):
+                        return real_spawn(sys.executable, [str(emitter), scenario, str(events_path)], **kwargs)
+                    with patch.object(lftp_mod.pexpect, "spawn", side_effect=spawn):
+                        backend = Lftp("fixture.invalid", 22, "probe", None)
+                    backend._Lftp__status_poll_needs_connection_grace = False
+                    trace = BreadcrumbTraceCollector(lambda: True, max_entries=128,
+                        policy={"default": "off" if mode == "disabled" else "debug"})
+                    backend.set_breadcrumb_trace(trace)
+                    if mode == "fault":
+                        trace.record = MagicMock(side_effect=RuntimeError("synthetic diagnostic failure"))
+                    try:
+                        self.assertEqual([], backend.status("lftp-poll:0000000000000001"))
+                        self.assertFalse(backend.last_status_poll_healthy)
+                        self.assertEqual("timeout", backend.last_status_poll_failure_reason)
+                        second = backend.status("lftp-poll:0000000000000002")
+                        if scenario == "successive_timeout":
+                            self.assertEqual([], second)
+                            self.assertFalse(backend.last_status_poll_healthy)
+                            self.assertEqual("timeout", backend.last_status_poll_failure_reason)
+                        else:
+                            self.assertEqual([LftpJobStatus.State.RUNNING], [item.state for item in second])
+                            self.assertTrue(backend.last_status_poll_healthy)
+                        self.assertEqual([], backend.status("lftp-poll:0000000000000003"))
+                        self.assertTrue(backend.last_status_poll_healthy)
+                        self.assertEqual("blank_empty", backend.last_status_parse_outcome)
+                        events = [json.loads(line) for line in events_path.read_text().splitlines()]
+                        received = [row for row in events if row["event"] == "received"]
+                        flushed = [row for row in events if row["event"] == "prompt_flushed"]
+                        self.assertEqual([1, 2, 3], [row["seq"] for row in received])
+                        self.assertGreaterEqual(int(received[1]["time_ns"]), int(flushed[0]["time_ns"]))
+                        self.assertGreaterEqual(int(received[2]["time_ns"]), int(flushed[1]["time_ns"]))
+                        if mode == "fault":
+                            self.assertTrue(trace.record.called)
+                    finally:
+                        backend.force_close()
+                        trace.close()
+
+    def test_late_predecessor_errors_reject_send_without_fresh_membership(self):
+        import pexpect
+        import sys
+        emitter_source = r'''import sys, time
+prompt = "lftp probe@fixture.invalid:~> "
+def output(value):
+    sys.stdout.write(value); sys.stdout.flush()
+output(prompt)
+seq = 0
+for command in sys.stdin:
+    if command.strip() != "jobs -v":
+        output(prompt); continue
+    seq += 1
+    with open(sys.argv[2], "a", encoding="utf-8") as stream:
+        stream.write(str(seq) + "\n")
+    if seq == 1:
+        output("x" * 32768); time.sleep(1.2)
+        output("Login failed: synthetic-private-detail\n" if sys.argv[1] == "backend" else
+            "Are you sure you want to continue connecting (yes/no)?\n")
+        if sys.argv[1] == "hostkey_timeout":
+            continue
+    output(prompt)
+'''
+        real_spawn = pexpect.spawn
+        for scenario, mode in ((scenario, mode)
+                for scenario in ("backend", "hostkey_prompt", "hostkey_timeout")
+                for mode in ("disabled", "enabled", "fault")):
+            with self.subTest(scenario=scenario, diagnostics=mode), tempfile.TemporaryDirectory() as directory:
+                emitter = Path(directory, "pty_error_emitter.py")
+                emitter.write_text(emitter_source, encoding="utf-8")
+                commands = Path(directory, "commands.txt")
+                def spawn(_filename, _args, **kwargs):
+                    return real_spawn(sys.executable, [str(emitter), scenario, str(commands)], **kwargs)
+                with patch.object(lftp_mod.pexpect, "spawn", side_effect=spawn):
+                    backend = Lftp("fixture.invalid", 22, "probe", None)
+                backend._Lftp__status_poll_needs_connection_grace = False
+                trace = BreadcrumbTraceCollector(lambda: True, max_entries=128,
+                    policy={"default": "off" if mode == "disabled" else "debug"})
+                backend.set_breadcrumb_trace(trace)
+                if mode == "fault":
+                    trace.record = MagicMock(side_effect=RuntimeError("synthetic diagnostic failure"))
+                try:
+                    self.assertEqual([], backend.status("lftp-poll:0000000000000001"))
+                    self.assertFalse(backend.last_status_poll_healthy)
+                    self.assertEqual("timeout", backend.last_status_poll_failure_reason)
+                    self.assertEqual([], backend.status("lftp-poll:0000000000000002"))
+                    self.assertFalse(backend.last_status_poll_healthy)
+                    self.assertEqual("command_error", backend.last_status_poll_failure_reason)
+                    self.assertEqual("1\n", commands.read_text())
+                    self.assertEqual(scenario == "hostkey_timeout", backend._Lftp__response_pending)
+                    self.assertEqual("Lftp status terminal reported a backend error", backend._Lftp__pending_error)
+                    with self.assertRaisesRegex(LftpError, "^Lftp status terminal reported a backend error$"):
+                        backend.raise_pending_error()
+                    if mode == "fault":
+                        self.assertTrue(trace.record.called)
+                    elif mode == "enabled":
+                        self.assertTrue(trace.snapshot()["entries"])
+                finally:
+                    backend.force_close()
+                    trace.close()
+
+    def test_response_synchronization_and_new_status_share_original_budget(self):
+        from tests.unittests.test_lftp.test_lftp_status_diagnostics import TestLftpStatusDiagnostics
+        import pexpect
+        backend = TestLftpStatusDiagnostics()._build_lftp()
+        backend._Lftp__response_pending = True
+        backend._Lftp__process.expect.side_effect = [None, pexpect.exceptions.TIMEOUT("new response")]
+        with patch("lftp.lftp.time.monotonic", side_effect=[0.0, 0.75, 0.75, 1.0]):
+            self.assertEqual([], backend.status())
+        self.assertFalse(backend.last_status_poll_healthy)
+        self.assertTrue(backend._Lftp__response_pending)
+        backend._Lftp__process.send.assert_called_once_with("jobs -v\n")
+        self.assertEqual(2, backend._Lftp__process.expect.call_count)
+
+    def test_owned_response_synchronization_recovers_commands_and_reports_eof(self):
+        from tests.unittests.test_lftp.test_lftp_status_diagnostics import TestLftpStatusDiagnostics
+        import pexpect
+        for operation in ("queue", "stop"):
+            with self.subTest(operation=operation):
+                backend = TestLftpStatusDiagnostics()._build_lftp()
+                backend._Lftp__response_pending = True
+                if operation == "queue":
+                    backend.queue("sample.bin", False, allow_resume=False)
+                else:
+                    backend.kill_all()
+                self.assertEqual(1 if operation == "queue" else 2,
+                    backend._Lftp__process.sendline.call_count)
+                self.assertFalse(backend._Lftp__response_pending)
+        backend = TestLftpStatusDiagnostics()._build_lftp()
+        backend._Lftp__response_pending = True
+        backend._Lftp__process.expect.side_effect = pexpect.exceptions.EOF("closed response owner")
+        self.assertEqual([], backend.status())
+        self.assertFalse(backend.last_status_poll_healthy)
+        self.assertEqual("eof", backend.last_status_poll_failure_reason)
+        backend._Lftp__process.send.assert_not_called()
+        backend._Lftp__job_status_parser.parse.assert_not_called()
+
+    def test_queue_and_stop_do_not_send_while_previous_response_is_unresolved(self):
+        from tests.unittests.test_lftp.test_lftp_status_diagnostics import TestLftpStatusDiagnostics
+        import pexpect
+        for operation in ("queue", "stop"):
+            with self.subTest(operation=operation):
+                backend = TestLftpStatusDiagnostics()._build_lftp()
+                backend._Lftp__response_pending = True
+                backend._Lftp__process.expect.side_effect = pexpect.exceptions.TIMEOUT("owned response")
+                with self.assertRaises(LftpError):
+                    if operation == "queue":
+                        backend.queue("sample.bin", False, allow_resume=False)
+                    else:
+                        backend.kill_all()
+                backend._Lftp__process.send.assert_not_called()
+                backend._Lftp__process.sendline.assert_not_called()
+                self.assertTrue(backend._Lftp__response_pending)
+
     def test_private_status_later_timeout_is_captured_after_connection_anomaly(self):
         from tests.unittests.test_lftp.test_lftp_status_diagnostics import TestLftpStatusDiagnostics
         import pexpect
@@ -2439,6 +2622,11 @@ class TestLftp(unittest.TestCase):
             reset.start()
             self.addCleanup(reset.stop)
         unit_only_methods = {
+            "test_timed_out_pty_response_is_synchronized_before_next_status",
+            "test_queue_and_stop_do_not_send_while_previous_response_is_unresolved",
+            "test_owned_response_synchronization_recovers_commands_and_reports_eof",
+            "test_response_synchronization_and_new_status_share_original_budget",
+            "test_late_predecessor_errors_reject_send_without_fresh_membership",
             "test_private_status_later_timeout_is_captured_after_connection_anomaly",
             "test_private_status_anomaly_budget_reserves_roles_and_relations_match_predecessor",
             "test_private_status_failed_attempts_bound_retained_partial_writes",

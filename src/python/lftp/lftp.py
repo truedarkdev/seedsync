@@ -1692,6 +1692,7 @@ class Lftp:
         self.__consecutive_status_errors = 0
         self.__path_pairs_by_id: Dict[str, Dict[str, str]] = {}
         self.__last_command_timed_out = False
+        self.__response_pending = False
         self.__status_timeout_predecessor_correlation: Optional[str] = None
         self.__status_timeout_predecessor_monotonic_time_ns: Optional[int] = None
         self.__last_status_poll_healthy = True
@@ -2331,6 +2332,8 @@ class Lftp:
         restore_delayafterread = None
         out = ""
         status_poll_timeout_seconds = None
+        synchronized_response = False
+        synchronization_deadline = None
         log_command_output = self.__log_command_output and not status_poll
         command_trace_enabled = trace_command_kind in LFTP_COMMAND_TRACE_KINDS
         safe_status_poll_correlation = _safe_lftp_status_poll_correlation(trace_status_poll_correlation)
@@ -2467,7 +2470,54 @@ class Lftp:
             if restore_delayafterread is not None:
                 self.__process.delayafterread = 0
         try:
-            if require_prompt_ready:
+            if getattr(self, "_Lftp__response_pending", False):
+                # The executor still owns the old response. Consume its prompt
+                # before another send; never adopt its output as a fresh poll.
+                synchronization_deadline = time.monotonic() + STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS
+                def reject_predecessor_error() -> None:
+                    predecessor = self.__normalize_output(self.__decode_spawn_output(self.__process.before))
+                    if self.__detect_ssh_host_key_prompt(predecessor) or self.__detect_errors_from_output(predecessor):
+                        # Match the terminal-drain rejection contract, without
+                        # publishing the predecessor's private output.
+                        self.__pending_error = "Lftp status terminal reported a backend error"
+                        self.__last_command_timed_out = True
+                        self.__last_status_poll_failure_reason = "command_error"
+                        record_diagnostic_child(classification="command_error", phase="drain")
+                        record_status_trace("backend_error", failure_reason="command_error",
+                            boundary="read", boundary_state={"prior_prompt": "unknown",
+                                "send_admitted": False, "prompt_reached": not self.__response_pending,
+                                "retained_before": "unknown"})
+                        raise LftpError(self.__pending_error)
+                try:
+                    self.__process.expect(self.__expect_pattern,
+                        timeout=STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS)
+                except pexpect.exceptions.TIMEOUT as exc:
+                    reject_predecessor_error()
+                    self.__last_command_timed_out = True
+                    self.__last_status_poll_failure_reason = "timeout"
+                    record_diagnostic_child(exc, classification="timeout", phase="prompt")
+                    record_command_trace("prompt_timeout")
+                    record_status_trace("prompt_timeout", failure_reason="timeout", exception=exc,
+                        boundary_state={"prior_prompt": "unknown", "send_admitted": False,
+                            "prompt_reached": False, "retained_before": "unknown"})
+                    if status_poll:
+                        return ""
+                    raise LftpError("Lftp previous command response is still pending")
+                except pexpect.exceptions.EOF as exc:
+                    self.__last_status_poll_failure_reason = "eof"
+                    record_diagnostic_child(exc, classification="eof", phase="prompt")
+                    record_status_trace("process_eof", failure_reason="eof", exception=exc)
+                    raise LftpError("Lftp process terminated before response synchronization")
+                self.__response_pending = False
+                reject_predecessor_error()
+                synchronized_response = True
+                pty_readiness = "ready"
+                if status_poll and time.monotonic() >= synchronization_deadline:
+                    self.__last_command_timed_out = True
+                    self.__last_status_poll_failure_reason = "timeout"
+                    record_status_trace("prompt_timeout", failure_reason="timeout")
+                    return ""
+            if require_prompt_ready and not synchronized_response:
                 self.__ensure_prompt_ready("running command")
                 pty_readiness = "ready"
             if status_poll:
@@ -2514,6 +2564,7 @@ class Lftp:
                     self.__process.send(command + "\n")
                 else:
                     self.__process.sendline(command)
+                self.__response_pending = True
                 if pty_debug_enabled:
                     record_pty_trace("write")
                 record_command_trace("submitted")
@@ -2587,6 +2638,8 @@ class Lftp:
                         status_poll_loop_last_monotonic = status_poll_loop_started
                         status_poll_prompt_completed = False
                         status_poll_deadline = status_poll_loop_started + status_poll_timeout_seconds
+                        if synchronization_deadline is not None:
+                            status_poll_deadline = min(status_poll_deadline, synchronization_deadline)
                         while True:
                             structural_before = _lftp_status_structural_lengths(self.__process)
                             if status_metrics_enabled:
@@ -2600,6 +2653,7 @@ class Lftp:
                                     post_send_unknown_count += 1
                                 prompt_reached = True
                                 final_prompt_reached = True
+                                self.__response_pending = False
                                 status_poll_prompt_completed = True
                                 break
                             except pexpect.exceptions.TIMEOUT:
@@ -2710,6 +2764,7 @@ class Lftp:
                 else:
                     try:
                         self.__process.expect(self.__expect_pattern, timeout=timeout_seconds)
+                        self.__response_pending = False
                         record_pty_trace("prompt", "prompt_ready")
                         record_command_trace("prompt_ready")
                     except pexpect.exceptions.TIMEOUT as exc:
@@ -2781,6 +2836,7 @@ class Lftp:
                     connecting_grace_timeout = max(status_poll_timeout_seconds or 0, 5.0)
                     self.__process.expect(self.__expect_pattern, timeout=connecting_grace_timeout)
                     final_prompt_reached = True
+                    self.__response_pending = False
                     if status_trace_enabled:
                         status_boundary["raw_before"], status_boundary["retained"] = \
                             _lftp_status_boundary_values(self.__process)
@@ -2884,6 +2940,7 @@ class Lftp:
                 error_out = out
                 try:
                     self.__process.expect(self.__expect_pattern, timeout=timeout_seconds)
+                    self.__response_pending = False
                 except pexpect.exceptions.TIMEOUT:
                     if status_poll:
                         record_diagnostic_child(classification="timeout", phase="error_recovery")

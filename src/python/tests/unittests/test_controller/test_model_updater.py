@@ -20696,6 +20696,43 @@ class TestModelUpdater(unittest.TestCase):
                     self.assertNotIn(("sample.bin", None, None), controller._Controller__pending_completion_file_names)
                     self.assertFalse(snapshot[1])
 
+    def test_unsynchronized_lftp_response_preserves_updater_running_owner(self):
+        from tests.unittests.test_lftp.test_lftp_status_diagnostics import TestLftpStatusDiagnostics
+        import pexpect
+        name = "owned-partial.bin"
+        file_id = ModelFile.build_file_id(name, None)
+        remote = SystemFile(name, 10, False)
+        staged = SystemFile(name, 9, False, is_staging=True)
+        staged.status_sidecar_ready = True
+        running = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, name, "")
+        running.total_transfer_state = LftpJobStatus.TransferState(9, 10, 90, 1, 0)
+        builder = ModelBuilder()
+        builder.set_remote_files([remote])
+        builder.set_local_files([staged])
+        builder.set_lftp_statuses([running])
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=builder.build_model())
+        backend = TestLftpStatusDiagnostics()._build_lftp()
+        backend._Lftp__response_pending = True
+        backend._Lftp__process.expect.side_effect = pexpect.exceptions.TIMEOUT("owned response")
+        controller._Controller__lftp = backend
+        controller._Controller__last_lftp_statuses = [running]
+        controller._Controller__prev_downloading_file_names = {(name, None, None)}
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [staged], is_scan_final=True)
+        ModelUpdater(controller).update()
+        self.assertFalse(backend.last_status_poll_healthy)
+        self.assertEqual("timeout", backend.last_status_poll_failure_reason)
+        backend._Lftp__process.send.assert_not_called()
+        # The empty parse result remains explicitly untrusted, not idle authority.
+        backend._Lftp__job_status_parser.parse.assert_called_once_with("")
+        published = controller._Controller__model.get_file(file_id)
+        self.assertEqual((ModelFile.State.DOWNLOADING, 90), (published.state, published.download_progress))
+        self.assertEqual([running], controller._Controller__last_lftp_statuses)
+        self.assertFalse(controller._Controller__lftp_idle_status_authoritative)
+        self.assertNotIn((name, None, None), controller._Controller__pending_completion_file_names)
+        self.assertNotIn(file_id, controller._Controller__persist.stopped_file_names)
+
     def test_unhealthy_parser_membership_does_not_retire_a_running_partial(self):
         """A damaged status frame is not evidence that a ModelUpdater job ended."""
         file_name = "damaged-membership.bin"
