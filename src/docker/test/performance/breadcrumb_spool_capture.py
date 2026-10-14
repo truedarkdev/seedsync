@@ -625,17 +625,39 @@ def _queue_lifecycle_facts(details: Mapping[str, object]) -> dict[str, object] |
     return facts
 
 
-def _lftp_status_authority_facts(details: Mapping[str, object], message: object) -> dict[str, object] | None:
+def _lftp_status_authority_facts(details: Mapping[str, object], message: object, correlation: object = None) -> dict[str, object] | None:
     if message == _LFTP_STATUS_POLL_MESSAGE and details.get("schema") == "lftp.status_poll.v1":
-        return {
+        result = {
             "schema": "lftp.status_poll.v1",
-            "phase": details.get("phase") if details.get("phase") in {"parse_complete", "parse_error", "health", "snapshot", "jobs_read", "prompt_timeout", "process_eof", "command_error"} else "unknown",
+            "phase": details.get("phase") if details.get("phase") in {"submitted", "jobs_read", "prompt_ready", "prompt_timeout", "process_eof", "command_error", "backend_error", "terminal_backlog", "parse_started", "parse_complete", "parse_error", "health", "snapshot"} else "unknown",
             "input_phase": details.get("input_phase") if details.get("input_phase") in {"primary", "connection_grace", "timeout_tail"} else "unknown",
             "parser_outcome": details.get("parser_outcome") if details.get("parser_outcome") in _LFTP_STATUS_PARSER_OUTCOMES else "unknown",
             "snapshot_disposition": details.get("snapshot_disposition") if details.get("snapshot_disposition") in {"accepted", "epoch_rejected"} else None,
             "healthy": details.get("healthy") if type(details.get("healthy")) is bool else None,
             "status_count_bucket": details.get("status_count_bucket") if details.get("status_count_bucket") in {"0", "1", "2-4", "5-16", "17-64", "65+"} else "unknown",
         }
+        # Preserve only existing emitted framing facts; raw payload never enters this projection.
+        from incoming_recovery_observer import _sanitize_lftp_status_authority
+        for key in ("failure_reason", "prompt_outcome", "error_class", "read_buffer_byte_length_bucket",
+                    "raw_before_byte_length_bucket", "raw_before_line_count_bucket", "retained_byte_length_bucket",
+                    "retained_line_count_bucket", "normalized_byte_length_bucket", "normalized_line_count_bucket"):
+            result[key] = details.get(key)
+        result["poll_correlation"] = correlation
+        for key in ("monotonic_time_ns", "wall_time_ns"):
+            value = details.get(key)
+            result[key] = str(value) if type(value) is int and 0 <= value <= 2**63 - 1 else None
+        raw_metrics = details.get("post_send_metrics")
+        raw_metrics = raw_metrics if isinstance(raw_metrics, Mapping) else {}
+        result["post_send_metrics"] = {
+            key: str(value) if type(value) is int and 0 <= value <= 2_147_483_647 else value if key == "post_send_buffer_progress" else None
+            for key, value in raw_metrics.items() if key in {
+                "post_send_zero_timeout_expect_iterations", "post_send_productive_count", "post_send_no_progress_count",
+                "post_send_unknown_count", "post_send_sleep_requested_ns", "post_send_sleep_actual_ns",
+                "post_send_loop_elapsed_ns", "post_send_buffer_progress",
+            }
+        }
+        return _sanitize_lftp_status_authority(result)
+
     if message != _LFTP_STATUS_POLL_MESSAGE or details.get("schema") != _LFTP_STATUS_AUTHORITY_SCHEMA:
         return None
 
@@ -2035,7 +2057,7 @@ def _projection(row: Mapping[str, object]) -> tuple[dict[str, object] | None, bo
         numbers.pop("generation", None)
     lifecycle = _queue_lifecycle_facts(details) if category == "queue.lifecycle" else None
     lftp_status_authority = (
-        _lftp_status_authority_facts(details, message)
+        _lftp_status_authority_facts(details, message, row.get("corr_id", metadata.get("corr_id")))
         if category == "transfer.lftp.status" else None
     )
     lftp_status_membership = (

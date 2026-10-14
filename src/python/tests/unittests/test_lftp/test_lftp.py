@@ -628,6 +628,98 @@ class TestLftp(unittest.TestCase):
         finally:
             lftp_mod._PREPARSE_STDERR_REMAINING = original_remaining
 
+    def test_private_status_later_timeout_is_captured_after_connection_anomaly(self):
+        from tests.unittests.test_lftp.test_lftp_status_diagnostics import TestLftpStatusDiagnostics
+        import pexpect
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=64,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}})
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ,
+                {"SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": directory}, clear=True), \
+                patch.object(lftp_mod, "_PRIVATE_STATUS_FRAME_CAPTURE_REMAINING", 6):
+            backend = self._build_status_poll_test_lftp()
+            backend._Lftp__job_status_parser = LftpJobStatusParser()
+            backend._Lftp__run_command = MagicMock(return_value="jobs -v\nConnecting...\n")
+            backend.set_breadcrumb_trace(trace)
+            self.assertEqual([], backend.status("lftp-poll:0000000000000001"))
+            timeout = TestLftpStatusDiagnostics()._build_lftp()
+            timeout.set_breadcrumb_trace(trace)
+            timeout._Lftp__process.before = "synthetic-timeout-tail"
+            timeout._Lftp__process.expect.side_effect = pexpect.exceptions.TIMEOUT("timeout")
+            with patch("lftp.lftp.time.monotonic", side_effect=[0.0, 2.0]):
+                self.assertEqual([], timeout.status("lftp-poll:0000000000000002"))
+            self.assertFalse(timeout.last_status_poll_healthy)
+            self.assertEqual("timeout", timeout.last_status_poll_failure_reason)
+            manifests = [json.loads(path.read_text()) for path in Path(directory).glob("*/manifest.json")]
+            self.assertEqual(2, len(manifests))
+            by_correlation = {m["correlation"]: m for m in manifests}
+            self.assertEqual("primary", by_correlation["lftp-poll:0000000000000001"]["input_phase"])
+            self.assertEqual("timeout_tail", by_correlation["lftp-poll:0000000000000002"]["input_phase"])
+            self.assertEqual(4, lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING)
+
+    def test_private_status_anomaly_budget_reserves_roles_and_relations_match_predecessor(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=64,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}})
+        job = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "sample.bin", "")
+        correlations = ["lftp-poll:{:016x}".format(i) for i in range(8)]
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ,
+                {"SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": directory}, clear=True), \
+                patch.object(lftp_mod, "_PRIVATE_STATUS_FRAME_CAPTURE_REMAINING", 6):
+            def capture(index, healthy=False):
+                return lftp_mod._lftp_private_status_frame_capture(correlations[index], "x" * (70 * 1024), True, trace,
+                    {"command_timed_out": not healthy}, parsed_statuses=[job] if healthy else [],
+                    parse_outcome="complete_success" if healthy else "partial_queue", poll_healthy=healthy)
+            self.assertTrue(capture(0))  # Early connection anomaly.
+            self.assertFalse(capture(0))
+            self.assertTrue(capture(1))  # Later, distinct timeout remains captureable.
+            self.assertTrue(capture(2))
+            self.assertTrue(capture(3))
+            self.assertFalse(capture(4))
+            self.assertEqual(2, lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING)
+            self.assertTrue(capture(5, True))
+            self.assertTrue(capture(6, True))
+            self.assertFalse(capture(7, True))
+            directories = list(Path(directory).iterdir())
+            self.assertEqual(6, len(directories))
+            self.assertEqual(384 * 1024, sum((p / "frame.bin").stat().st_size for p in directories))
+            self.assertEqual(4, len(lftp_mod._PRIVATE_STATUS_FRAME_ANOMALY_PATHS))
+            first = Path(lftp_mod._PRIVATE_STATUS_FRAME_ANOMALY_PATHS[correlations[0]])
+            later = Path(lftp_mod._PRIVATE_STATUS_FRAME_ANOMALY_PATHS[correlations[1]])
+            self.assertEqual("captured", lftp_mod._lftp_private_status_relation_capture(correlations[1], correlations[7], 1, {}, True, trace))
+            self.assertFalse((first / "relation.json").exists())
+            relation = json.loads((later / "relation.json").read_text())
+            self.assertEqual(correlations[1], relation["predecessor_correlation"])
+            self.assertEqual(correlations[7], relation["current_correlation"])
+            self.assertEqual("unavailable", lftp_mod._lftp_private_status_relation_capture(correlations[4], correlations[7], 1, {}, True, trace))
+            self.assertEqual("exhausted", lftp_mod._lftp_private_status_relation_capture(correlations[1], correlations[7], 1, {}, True, trace))
+            self.assertEqual(0, lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING)
+
+    def test_private_status_failed_attempts_bound_retained_partial_writes(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=64,
+            policy={"default": "off", "rules": {"transfer.lftp.status": "debug"}})
+        job = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "sample.bin", "")
+        original_write = os.write
+        calls = 0
+        def partial_failure(fd, data):
+            nonlocal calls
+            calls += 1
+            if calls % 2 == 0: raise OSError("synthetic partial write failure")
+            return original_write(fd, data[:16])
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ,
+                {"SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": directory}, clear=True), \
+                patch.object(lftp_mod, "_PRIVATE_STATUS_FRAME_CAPTURE_REMAINING", 6), \
+                patch("lftp.lftp.os.write", side_effect=partial_failure):
+            for index in range(20):
+                healthy = index in (0, 6)
+                self.assertFalse(lftp_mod._lftp_private_status_frame_capture(
+                    "lftp-poll:{:016x}".format(index), "x" * (70 * 1024), True, trace, {},
+                    parsed_statuses=[job] if healthy else [], poll_healthy=healthy))
+            self.assertEqual(0, lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING)
+            self.assertEqual(6, len(list(Path(directory).iterdir())))
+            self.assertEqual(96, sum(path.stat().st_size for path in Path(directory).glob("*/frame.bin")))
+            self.assertEqual({}, lftp_mod._PRIVATE_STATUS_FRAME_ANOMALY_PATHS)
+            self.assertEqual("unavailable", lftp_mod._lftp_private_status_relation_capture(
+                "lftp-poll:0000000000000001", "lftp-poll:0000000000000007", 1, {}, True, trace))
+
     def test_private_status_transition_budget_and_exact_input_identity(self):
         healthy = ("jobs -v\n[0] queue (sftp://user@example.invalid)\n"
                    "sftp://user@example.invalid/remote\nQueue is running.\nCommands queued:\n"
@@ -663,10 +755,12 @@ class TestLftp(unittest.TestCase):
         with tempfile.TemporaryDirectory() as capture_dir, patch.dict(os.environ,
                 {"SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": capture_dir}, clear=True), \
                 patch.object(lftp_mod, "_PRIVATE_STATUS_FRAME_CAPTURE_ROLES", set()), \
+                        patch.object(lftp_mod, "_PRIVATE_STATUS_FRAME_ANOMALY_ATTEMPTS", set()), \
+                        patch.object(lftp_mod, "_PRIVATE_STATUS_FRAME_ANOMALY_PATHS", {}), \
                 patch.object(lftp_mod, "_PRIVATE_STATUS_FRAME_CAPTURE_REMAINING", 3):
             for index, (output, remaining) in enumerate(((healthy, 2), ("jobs -v\n", 1), ("jobs -v\n", 1), (healthy, 0))):
                 backend._Lftp__run_command = MagicMock(return_value=output)
-                backend.status(trace_poll_correlation="lftp-poll:{:016x}".format(index + 100))
+                backend.status(trace_poll_correlation="lftp-poll:{:016x}".format(101 if index == 2 else index + 100))
                 self.assertEqual(remaining, lftp_mod._PRIVATE_STATUS_FRAME_CAPTURE_REMAINING)
             manifests = [json.loads((d / "manifest.json").read_text()) for d in Path(capture_dir).iterdir()]
             self.assertEqual(3, len(manifests))
@@ -680,6 +774,8 @@ class TestLftp(unittest.TestCase):
                 with self.subTest(grace=grace, mode=mode), tempfile.TemporaryDirectory() as capture_dir, \
                         patch.dict(os.environ, {"SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR": capture_dir} if mode != "disabled" else {}, clear=True), \
                         patch.object(lftp_mod, "_PRIVATE_STATUS_FRAME_CAPTURE_ROLES", set()), \
+                        patch.object(lftp_mod, "_PRIVATE_STATUS_FRAME_ANOMALY_ATTEMPTS", set()), \
+                        patch.object(lftp_mod, "_PRIVATE_STATUS_FRAME_ANOMALY_PATHS", {}), \
                         patch.object(lftp_mod, "_PRIVATE_STATUS_FRAME_CAPTURE_REMAINING", 3):
                     backend = self._build_status_poll_test_lftp()
                     backend._Lftp__job_status_parser = LftpJobStatusParser()
@@ -2338,11 +2434,14 @@ class TestLftp(unittest.TestCase):
 
 
     def setUp(self):
-        for name, value in (("_PRIVATE_STATUS_FRAME_CAPTURE_ROLES", set()), ("_PRIVATE_STATUS_FRAME_CAPTURE_PATHS", {})):
+        for name, value in (("_PRIVATE_STATUS_FRAME_CAPTURE_ROLES", set()), ("_PRIVATE_STATUS_FRAME_CAPTURE_PATHS", {}), ("_PRIVATE_STATUS_FRAME_ANOMALY_PATHS", {}), ("_PRIVATE_STATUS_FRAME_ANOMALY_ATTEMPTS", set())):
             reset = patch.object(lftp_mod, name, value)
             reset.start()
             self.addCleanup(reset.stop)
         unit_only_methods = {
+            "test_private_status_later_timeout_is_captured_after_connection_anomaly",
+            "test_private_status_anomaly_budget_reserves_roles_and_relations_match_predecessor",
+            "test_private_status_failed_attempts_bound_retained_partial_writes",
             "test_private_status_transition_budget_and_exact_input_identity",
             "test_private_status_capture_three_modes_preserve_primary_and_grace_authority",
             "test_queue_uses_override_paths",

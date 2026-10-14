@@ -4835,3 +4835,61 @@ def test_selected_scan_witness_retains_beginning_late_and_resets_provenance(tmp_
     finally:
         reader.close()
         trace.close()
+
+
+def test_poll_failure_metrics_survive_finalized_reader_and_sink(tmp_path: Path) -> None:
+    import lftp.lftp as producer
+    spool, artifact = _prepare(tmp_path)
+    trace = BreadcrumbTraceCollector(lambda: True, max_entries=256,
+        policy={"default": "off", "rules": {"transfer.lftp.status": "debug", "controller": "info"}},
+        durable_enabled=True, durable_path=str(spool))
+    reader = _reader(spool, artifact, max_records=256)
+    correlation = "lftp-poll:0123456789abcdef"
+    try:
+        trace.record("controller", "boundary", {}, category="controller", level="info")
+        assert trace.wait_for_ingress(2) and trace.flush_durable(2)
+        reader.start()
+        for phase, reason in (("jobs_read", "none"), ("prompt_timeout", "timeout"), ("parse_error", "parser_error")):
+            with patch("lftp.lftp.time.monotonic_ns", return_value=2**53 + 7):
+                producer._record_lftp_status_poll_breadcrumb(trace, correlation, phase,
+                    process_alive=True, output="synthetic-private-content", raw_before="raw\nlines", retained="retained",
+                    normalized="normalized", failure_reason=reason,
+                    post_send_zero_timeout_expect_iterations=4, post_send_productive_count=2,
+                    post_send_no_progress_count=1, post_send_unknown_count=0,
+                    post_send_sleep_requested_ns=2**40, post_send_sleep_actual_ns=7,
+                    post_send_loop_elapsed_ns=11, post_send_buffer_progress="no_progress")
+        assert trace.wait_for_ingress(2) and trace.flush_durable(2)
+        finalized = [json.loads(line) for line in (spool / "breadcrumbs.jsonl").read_text().splitlines()]
+        expected = [row for row in finalized if row.get("details", {}).get("schema") == "lftp.status_poll.v1"]
+        assert len(expected) == 3
+        reader.poll()
+        records = [item["capture"] for item in _artifacts(artifact) if item["capture"].get("state") == "record"]
+        records = [item for item in records if item["projection"].get("lftp_status_authority", {}).get("schema") == "lftp.status_poll.v1"]
+        assert [item["projection"]["numbers"]["version"] for item in records] == [row["version"] for row in expected]
+        assert [item["created_ns"] for item in records] == [row["created_ns"] for row in expected]
+        for item, row in zip(records, expected):
+            facts = item["projection"]["lftp_status_authority"]
+            details = row["details"]
+            assert facts["poll_correlation"] == correlation
+            assert facts["monotonic_time_ns"] == str(2**53 + 7)
+            for field in ("failure_reason", "prompt_outcome", "error_class", "raw_before_byte_length_bucket",
+                          "raw_before_line_count_bucket", "retained_byte_length_bucket", "normalized_byte_length_bucket"):
+                assert facts[field] == details[field]
+            assert facts["post_send_metrics"]["post_send_sleep_requested_ns"] == "2147483647"
+            assert facts["post_send_metrics"]["post_send_zero_timeout_expect_iterations"] == "4"
+            assert facts["post_send_metrics"]["post_send_buffer_progress"] == "no_progress"
+        malicious = capture._lftp_status_authority_facts({"schema": "lftp.status_poll.v1",
+            "failure_reason": "/private", "prompt_outcome": "secret", "error_class": "raw error",
+            "raw_before_byte_length_bucket": "100000", "monotonic_time_ns": True,
+            "post_send_metrics": {"post_send_productive_count": "secret", "arbitrary": "private"}},
+            "lftp_status_poll", "/private")
+        assert malicious.get("poll_correlation") is None and malicious["monotonic_time_ns"] is None
+        assert malicious["failure_reason"] == malicious["prompt_outcome"] == malicious["error_class"] == "unknown"
+        assert malicious["raw_before_byte_length_bucket"] == "unknown"
+        assert malicious["post_send_metrics"]["post_send_productive_count"] is None
+        assert "arbitrary" not in malicious["post_send_metrics"]
+        assert observer._sanitize_capture_projection({"lftp_status_authority": malicious})["lftp_status_authority"] == malicious
+        assert "synthetic-private-content" not in artifact.read_text()
+    finally:
+        reader.close()
+        trace.close()

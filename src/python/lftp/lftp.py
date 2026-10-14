@@ -56,7 +56,10 @@ LFTP_STATUS_POLL_TRACE_CATEGORY = "transfer.lftp.status"
 # emitted to the container's stderr so a parser stall cannot prevent a host
 # observer from recovering the pre-parse boundary through Docker logs.
 _PREPARSE_STDERR_REMAINING = 256
-_PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 3
+_PRIVATE_STATUS_FRAME_CAPTURE_REMAINING = 6
+_PRIVATE_STATUS_FRAME_ANOMALY_LIMIT = 4
+_PRIVATE_STATUS_FRAME_ANOMALY_PATHS: dict[str, str] = {}
+_PRIVATE_STATUS_FRAME_ANOMALY_ATTEMPTS: set[str] = set()
 _PRIVATE_STATUS_FRAME_CAPTURE_ROLES: set[str] = set()
 _PRIVATE_STATUS_FRAME_CAPTURE_PATHS: dict[str, str] = {}
 _PRIVATE_STATUS_FRAME_CAPTURE_LOCK = RLock()
@@ -823,10 +826,13 @@ def _lftp_private_status_frame_capture_body(
         if poll_healthy is True and not parsed_statuses and "healthy_nonempty" not in _PRIVATE_STATUS_FRAME_CAPTURE_ROLES:
             return False
         role = ("healthy_nonempty" if healthy_nonempty and "healthy_nonempty" not in _PRIVATE_STATUS_FRAME_CAPTURE_ROLES else
+                "anomaly" if poll_healthy is True and not parsed_statuses and "anomaly_healthy_empty" in _PRIVATE_STATUS_FRAME_CAPTURE_ROLES else
                 "recovery" if poll_healthy is True and "anomaly" in _PRIVATE_STATUS_FRAME_CAPTURE_ROLES else
                 "healthy_nonempty" if healthy_nonempty else "anomaly")
-        if role in _PRIVATE_STATUS_FRAME_CAPTURE_ROLES or (
-                poll_healthy is True and not parsed_statuses and "anomaly_healthy_empty" in _PRIVATE_STATUS_FRAME_CAPTURE_ROLES):
+        if role == "anomaly":
+            if safe_correlation in _PRIVATE_STATUS_FRAME_ANOMALY_ATTEMPTS or len(_PRIVATE_STATUS_FRAME_ANOMALY_ATTEMPTS) >= _PRIVATE_STATUS_FRAME_ANOMALY_LIMIT:
+                return False
+        elif role in _PRIVATE_STATUS_FRAME_CAPTURE_ROLES:
             return False
         if not os.path.isdir(capture_dir):
             return False
@@ -875,6 +881,13 @@ def _lftp_private_status_frame_capture_body(
         manifest.update(_lftp_private_status_frame_job_facts(
             parsed_statuses, parse_outcome, poll_healthy,
         ))
+        # Count attempts before the first write: retained partial failures cannot exceed the raw cap.
+        _PRIVATE_STATUS_FRAME_CAPTURE_REMAINING -= 1
+        _PRIVATE_STATUS_FRAME_CAPTURE_ROLES.add(role)
+        if role == "anomaly":
+            _PRIVATE_STATUS_FRAME_ANOMALY_ATTEMPTS.add(safe_correlation)
+            if poll_healthy is True and not parsed_statuses:
+                _PRIVATE_STATUS_FRAME_CAPTURE_ROLES.add("anomaly_healthy_empty")
         os.mkdir(temporary_path, 0o700)
         raw_fd = os.open(os.path.join(temporary_path, "frame.bin"),
                          os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -900,11 +913,9 @@ def _lftp_private_status_frame_capture_body(
         finally:
             os.close(manifest_fd)
         os.replace(temporary_path, capture_path)
-        _PRIVATE_STATUS_FRAME_CAPTURE_REMAINING -= 1
-        _PRIVATE_STATUS_FRAME_CAPTURE_ROLES.add(role)
-        if role == "anomaly" and poll_healthy is True and not parsed_statuses:
-            _PRIVATE_STATUS_FRAME_CAPTURE_ROLES.add("anomaly_healthy_empty")
         _PRIVATE_STATUS_FRAME_CAPTURE_PATHS[role] = capture_path
+        if role == "anomaly":
+            _PRIVATE_STATUS_FRAME_ANOMALY_PATHS[safe_correlation] = capture_path
         return True
     except Exception:
         # Capture must never change polling, parsing, or transfer behavior.
@@ -931,15 +942,15 @@ def _lftp_private_status_relation_capture_body(
     capture_dir = os.environ.get("SEEDSYNC_LFTP_PRIVATE_STATUS_FRAME_CAPTURE_DIR")
     if not capture_dir:
         return "unavailable"
-    anomaly_path = _PRIVATE_STATUS_FRAME_CAPTURE_PATHS.get("anomaly")
-    if anomaly_path is None:
-        return "unavailable"
     safe_predecessor = _safe_lftp_status_poll_correlation(predecessor_correlation)
     safe_current = _safe_lftp_status_poll_correlation(current_correlation)
     if safe_predecessor is None or safe_current is None or not _breadcrumb_effectively_enabled(
             trace, LFTP_STATUS_POLL_TRACE_CATEGORY, "debug"):
         return "unavailable"
     try:
+        anomaly_path = _PRIVATE_STATUS_FRAME_ANOMALY_PATHS.get(safe_predecessor)
+        if anomaly_path is None or os.path.dirname(anomaly_path) != capture_dir or not os.path.isdir(anomaly_path):
+            return "unavailable"
         if not os.path.isdir(capture_dir):
             return "unavailable"
         now_ns = time.monotonic_ns()

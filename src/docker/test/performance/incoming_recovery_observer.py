@@ -1337,7 +1337,7 @@ def _sanitize_lftp_status_authority(value: object) -> Mapping[str, object] | Non
     if value.get("schema") == "lftp.status_poll.v1":
         result = {"schema": "lftp.status_poll.v1"}
         for key, allowed in (
-            ("phase", {"parse_complete", "parse_error", "health", "snapshot", "jobs_read", "prompt_timeout", "process_eof", "command_error"}),
+            ("phase", {"submitted", "jobs_read", "prompt_ready", "prompt_timeout", "process_eof", "command_error", "backend_error", "terminal_backlog", "parse_started", "parse_complete", "parse_error", "health", "snapshot"}),
             ("input_phase", {"primary", "connection_grace", "timeout_tail"}),
             ("parser_outcome", _CAPTURE_LFTP_STATUS_PARSER_OUTCOMES),
             ("snapshot_disposition", {"accepted", "epoch_rejected"}),
@@ -1346,6 +1346,40 @@ def _sanitize_lftp_status_authority(value: object) -> Mapping[str, object] | Non
             item = value.get(key)
             result[key] = item if isinstance(item, str) and item in allowed else None if key == "snapshot_disposition" else "unknown"
         result["healthy"] = value.get("healthy") if type(value.get("healthy")) is bool else None
+        for key, allowed in (
+            ("failure_reason", {"none", "timeout", "eof", "command_error", "parser_error", "terminal_backlog", "unhealthy_snapshot", "unknown"}),
+            ("prompt_outcome", {"not_attempted", "ready", "empty", "timeout", "eof", "error", "unknown"}),
+            ("error_class", {"none", "timeout", "eof", "command_error", "parser_error", "terminal_backlog", "unhealthy_snapshot", "unknown"}),
+        ):
+            item = value.get(key)
+            result[key] = item if isinstance(item, str) and item in allowed else "unknown"
+        byte_buckets = {"0", "1-127", "128-511", "512-2047", "2048-8191", "8192-32767", "32768+", "unknown"}
+        count_buckets = {"0", "1", "2-4", "5-16", "17-64", "65-256", "257+", "unknown"}
+        for key, allowed in (
+            ("read_buffer_byte_length_bucket", byte_buckets), ("raw_before_byte_length_bucket", byte_buckets),
+            ("raw_before_line_count_bucket", count_buckets), ("retained_byte_length_bucket", byte_buckets),
+            ("retained_line_count_bucket", count_buckets), ("normalized_byte_length_bucket", byte_buckets),
+            ("normalized_line_count_bucket", count_buckets),
+        ):
+            item = value.get(key)
+            result[key] = item if isinstance(item, str) and item in allowed else "unknown"
+        correlation = value.get("poll_correlation")
+        if isinstance(correlation, str) and re.fullmatch(r"lftp-poll:[0-9a-f]{16}", correlation):
+            result["poll_correlation"] = correlation
+        for key in ("monotonic_time_ns", "wall_time_ns"):
+            item = value.get(key)
+            result[key] = item if isinstance(item, str) and re.fullmatch(r"(?:0|[1-9][0-9]{0,18})", item) and int(item) <= 2**63 - 1 else None
+        raw_metrics = value.get("post_send_metrics")
+        raw_metrics = raw_metrics if isinstance(raw_metrics, Mapping) else {}
+        metrics = {}
+        for key in ("post_send_zero_timeout_expect_iterations", "post_send_productive_count",
+                    "post_send_no_progress_count", "post_send_unknown_count", "post_send_sleep_requested_ns",
+                    "post_send_sleep_actual_ns", "post_send_loop_elapsed_ns"):
+            item = raw_metrics.get(key)
+            metrics[key] = item if isinstance(item, str) and re.fullmatch(r"(?:0|[1-9][0-9]{0,9})", item) and int(item) <= 2_147_483_647 else None
+        progress = raw_metrics.get("post_send_buffer_progress")
+        metrics["post_send_buffer_progress"] = progress if isinstance(progress, str) and progress in {"progress", "no_progress", "unknown"} else "unknown"
+        result["post_send_metrics"] = metrics
         return result
     result: dict[str, object] = {
         "schema": _CAPTURE_LFTP_STATUS_AUTHORITY_SCHEMA
