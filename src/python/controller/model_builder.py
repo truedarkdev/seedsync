@@ -8728,10 +8728,11 @@ class ModelBuilder:
         # progress report. Once its RUNNING status has retired, presenting its
         # physical bytes as retained DEFAULT progress makes the web state look
         # like Stop even though no Stop occurred. Keep explicit Stop behavior,
-        # but otherwise wait for a live status or physical completion proof.
+        # and already-arbitrated QUEUED ownership. Queued credit remains a
+        # scanned checkpoint, without live counters or completion authority.
         if local and remote and not (
                 transfer_state is None and getattr(local, "status_sidecar_ready", False) and
-                not model_file.explicitly_stopped
+                not model_file.explicitly_stopped and model_file.state != ModelFile.State.QUEUED
         ):
             numeric_live = False
             try:
@@ -8844,6 +8845,10 @@ class ModelBuilder:
             if model_file.transferred_size is None:
                 if ModelBuilder.__is_authoritative_local_file(local):
                     model_file.transferred_size = min(local.size, remote.size)
+                elif model_file.state == ModelFile.State.QUEUED and local.status_sidecar_ready:
+                    # Parsed staged coverage is display credit for an already
+                    # queued leaf; it does not become final-file or live proof.
+                    model_file.transferred_size = ModelBuilder.__staged_remote_leaf_bytes(remote, local)
 
             if model_file.transferred_size is not None:
                 # also update all parent directories

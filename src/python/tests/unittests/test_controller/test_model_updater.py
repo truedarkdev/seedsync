@@ -20413,6 +20413,120 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(93, replacement.download_progress)
         self.assertEqual(ModelFile.State.DOWNLOADING, replacement.state)
 
+    def test_pending_queue_preserves_scanned_partial_credit_without_live_counters(self):
+        from controller.scan.local_scanner import LocalScanner
+
+        def intake(token, files):
+            result = ScannerResult(datetime.now(), files, session_token=token, generation=1,
+                scanned_path_pair_ids={None}, completed_path_pair_ids={None},
+                is_scan_final=True, is_full_snapshot=True, full_snapshot_path_pair_ids={None})
+            process = ScannerProcess(SimpleNamespace(), 0, False)
+            process._ScannerProcess__session_token = token
+            process._ScannerProcess__queue.put(result)
+            return process
+
+        for mode in ("disabled", "enabled", "fault"):
+            with self.subTest(diagnostics=mode), tempfile.TemporaryDirectory() as directory:
+                remote_path, local_path, stage_path = [os.path.join(directory, name)
+                    for name in ("remote", "local", "stage")]
+                for root in (remote_path, local_path, stage_path):
+                    os.makedirs(os.path.join(root, "bundle"))
+                for root in (remote_path, stage_path):
+                    complete = os.path.join(root, "bundle", "complete.bin")
+                    Path(complete).write_bytes(b"c" * 60)
+                    os.utime(complete, ns=(1700000000000000000, 1700000000000000000))
+                Path(remote_path, "bundle", "partial.bin").write_bytes(b"p" * 40)
+                partial = Path(stage_path, "bundle", "partial.bin.lftp")
+                partial.write_bytes(b"p" * 10)
+                Path(str(partial) + ".lftp-pget-status").write_text("size=40\n0.pos=10\n", encoding="utf-8")
+                remote = SystemScanner(remote_path).scan_single("bundle")
+                local = LocalScanner(local_path, True, staging_path=stage_path).scan()[0]
+                leaves = {leaf.name: leaf for leaf in local.children}
+                self.assertEqual({"complete.bin", "partial.bin"}, set(leaves))
+                self.assertTrue(leaves["partial.bin"].is_staging)
+                self.assertTrue(leaves["partial.bin"].status_sidecar_ready)
+                self.assertEqual(10, leaves["partial.bin"].size)
+                self.assertFalse(leaves["complete.bin"].status_sidecar_ready)
+                self.assertEqual((70, 100), (local.size, remote.size))
+                file_id = ModelFile.build_file_id("bundle", None)
+                builder = ModelBuilder()
+                builder.set_remote_files([remote])
+                builder.set_local_files([local])
+                builder.set_active_files([])
+                unowned = builder.build_model().get_file(file_id)
+                self.assertEqual((ModelFile.State.DEFAULT, 0, False),
+                    (unowned.state, unowned.transferred_size, unowned.explicitly_stopped))
+                builder.set_stopped_files({file_id})
+                model = builder.build_model()
+                stopped = model.get_file(file_id)
+                self.assertTrue(stopped.explicitly_stopped)
+                self.assertEqual(10, stopped.transferred_size)
+                controller, _ = self._make_progressive_update_controller(
+                    None, local_scan=None, model_builder=builder, model=model)
+                trace = BreadcrumbTraceCollector(lambda: True, max_entries=64,
+                    policy={"default": "off" if mode == "disabled" else "info"})
+                self.addCleanup(trace.close)
+                controller._Controller__context.breadcrumb_trace = trace
+                if mode == "fault":
+                    trace.record = MagicMock(side_effect=RuntimeError("synthetic diagnostic failure"))
+                controller._Controller__local_scan_process = intake("local-credit", [local])
+                controller._Controller__remote_scan_process = intake("remote-credit", [remote])
+                controller._finalize_staging_child = MagicMock(return_value=Controller.MoveFromStagingResult.DEFERRED)
+                controller._Controller__persist.stopped_file_names.clear()
+                controller._Controller__work_state_lock = RLock()
+                controller._Controller__pending_queue_dispatches = {file_id:
+                    PendingQueueDispatch(0.0, "bundle", None, True, 8, (100, 1700000000))}
+                for name in ("_Controller__queue_dispatch_pending", "_lftp_statuses_with_pending_dispatches",
+                             "_reconcile_pending_queue_dispatches_from_fresh_status"):
+                    setattr(controller, name, getattr(Controller, name).__get__(controller, Controller))
+                controller._Controller__is_explicitly_stopped = lambda name, pair: False
+                controller._Controller__scan_authority_tokens = {"local": {}, "remote": {}}
+                controller._record_path_pair_scan_tokens = lambda local, remote: Controller._record_path_pair_scan_tokens(controller, local, remote)
+                controller._Controller__progress_publication_epoch = 0
+                pending = controller._lftp_statuses_with_pending_dispatches([])
+                self.assertEqual(1, len(pending))
+                self.assertEqual((file_id, -8, LftpJobStatus.State.QUEUED),
+                    (pending[0].file_id, pending[0].id, pending[0].state))
+                self.assertIsNotNone(pending[0].total_transfer_state)
+                self.assertTrue(all(getattr(pending[0].total_transfer_state, field) is None
+                    for field in ("size_local", "size_remote", "percent_local", "speed", "eta")))
+                self.assertEqual([], controller._Controller__last_lftp_statuses)
+                ModelUpdater(controller).update()
+                queued = model.get_file(file_id)
+                self.assertIn(file_id, controller._Controller__pending_queue_dispatches)
+                self.assertEqual((ModelFile.State.QUEUED, 10, 100, False),
+                    (queued.state, queued.transferred_size, queued.remote_size, queued.explicitly_stopped))
+                self.assertFalse(queued.complete_local_coverage)
+                self.assertFalse(queued.final_move_succeeded)
+                self.assertIsNone(queued.downloading_speed)
+                self.assertIsNone(queued.eta)
+                self.assertEqual("queued", Controller._model_record_visible_state(queued))
+                controller._Controller__lftp.queue.assert_not_called()
+                partial_model = next(child for child in queued.iter_children() if child.name == "partial.bin")
+                self.assertEqual((ModelFile.State.QUEUED, 10),
+                    (partial_model.state, partial_model.transferred_size))
+                if mode == "fault":
+                    self.assertTrue(trace.record.called)
+                elif mode == "enabled":
+                    self.assertTrue(trace.snapshot()["entries"])
+                controller._Controller__pending_queue_dispatches.clear()
+                # Exercise a subsequent fresh empty poll after the normal cadence.
+                controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+                prior_polls = controller._Controller__lftp.status.call_count
+                ModelUpdater(controller).update()
+                self.assertGreater(controller._Controller__lftp.status.call_count, prior_polls)
+                self.assertEqual([], controller._Controller__last_lftp_statuses)
+                retired = model.get_file(file_id)
+                self.assertEqual((ModelFile.State.DEFAULT, 0, False),
+                    (retired.state, retired.transferred_size, retired.explicitly_stopped))
+                # A cold rebuild from the same physical scan has no pending owner.
+                cold = ModelBuilder()
+                cold.set_remote_files([remote])
+                cold.set_local_files([local])
+                self.assertEqual(0, cold.build_model().get_file(file_id).transferred_size)
+                cold.set_stopped_files({file_id})
+                self.assertEqual(10, cold.build_model().get_file(file_id).transferred_size)
+
     def test_fresh_empty_lftp_poll_releases_valid_partial_pget_to_resumable_default(self):
         """A sidecar-backed partial is resumable, never an inferred Stop."""
         file_name = "pending.bin"
