@@ -78,14 +78,40 @@ printf 'PASS: actual local pushes: full success, Python/Angular failure, dirty/u
 # into WSL. The fixture Makefile still supplies only cheap stub targets.
 windows_git='/mnt/c/Program Files/Git/cmd/git.exe'
 if [[ -x "$windows_git" ]] && command -v wslpath >/dev/null; then
+    # Select native normalization only for this fixture's Windows gitdir. WSL
+    # retains autocrlf=false, reproducing the two runtimes' different views.
+    native_gitdir=$(wslpath -m "$PWD/.git")
+    git config --file .git/native-config core.autocrlf input
+    git config "includeIf.gitdir/i:$native_gitdir.path" native-config
+    [[ "$(git config core.autocrlf)" == false ]]
+    [[ "$("$windows_git" -C "$(wslpath -w "$PWD")" config core.autocrlf)" == input ]]
+    printf 'one\r\ntwo\nthree\r\n' > mixed-eol
+    printf 'one\r\ntwo\r\n' > crlf-eol
+    "$windows_git" -C "$(wslpath -w "$PWD")" add mixed-eol crlf-eol
+    "$windows_git" -C "$(wslpath -w "$PWD")" -c core.hooksPath=/dev/null commit -qm 'fixture native line endings'
+    [[ "$(git diff --name-only)" == $'crlf-eol\nmixed-eol' ]]
+    [[ -z "$("$windows_git" -C "$(wslpath -w "$PWD")" status --porcelain)" ]]
     "$windows_git" -C "$(wslpath -w "$PWD")" push "$(wslpath -w "$fixture/remote.git")" HEAD:refs/heads/windows >> "$fixture/windows-push.log" 2>&1
+    printf 'genuine change\r\n' >> crlf-eol
+    before=$(wc -l < .git/gates.log)
+    if "$windows_git" -C "$(wslpath -w "$PWD")" push "$(wslpath -w "$fixture/remote.git")" HEAD:refs/heads/windows-dirty >> "$fixture/windows-push.log" 2>&1; then
+        printf 'Windows native guard accepted genuinely dirty source.\n' >&2; exit 1
+    fi
+    [[ "$(wc -l < .git/gates.log)" -eq "$before" ]]
+    printf 'one\r\ntwo\r\n' > crlf-eol
+    touch .git/dirty-during-test
+    if "$windows_git" -C "$(wslpath -w "$PWD")" push "$(wslpath -w "$fixture/remote.git")" HEAD:refs/heads/windows-post-test-dirty >> "$fixture/windows-push.log" 2>&1; then
+        printf 'Windows native guard lost the post-test source change.\n' >&2; exit 1
+    fi
+    mv .git/dirty-during-test .git/windows-post-test-dirty-tested
+    git show HEAD:source > source
     touch .git/fail-run-tests-python
     if "$windows_git" -C "$(wslpath -w "$PWD")" push "$(wslpath -w "$fixture/remote.git")" HEAD:refs/heads/windows-failure >> "$fixture/windows-push.log" 2>&1; then
         printf 'Windows dispatcher lost the suite failure.\n' >&2; exit 1
     fi
     mv .git/fail-run-tests-python .git/windows-failure-tested
     [[ "$(git --git-dir="$fixture/remote.git" for-each-ref --format='%(refname)')" == refs/heads/windows ]]
-    printf 'PASS: Windows Git -> Git Bash -> WSL actual local push and failure propagation.\n'
+    printf 'PASS: Windows native Git guards -> WSL suites: clean mixed/CRLF accepted, genuine pre/post-test dirty rejected, suite failure propagated.\n'
 else
     printf 'NOT EXERCISED: Windows Git dispatch (requires WSL with Windows Git).\n'
 fi

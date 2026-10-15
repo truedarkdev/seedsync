@@ -4,14 +4,9 @@ set -euo pipefail
 fail() { printf 'SeedSync pre-push: %s\n' "$*" >&2; exit 1; }
 root=$(git rev-parse --show-toplevel) || exit 1
 cd "$root"
-case "$(uname -s)" in
-    MINGW*|MSYS*|CYGWIN*)
-        # Disable MSYS argument rewriting; WSL accepts the native Windows cwd.
-        MSYS_NO_PATHCONV=1 wsl.exe --cd "$(cygpath -w "$root")" --exec bash \
-            ./scripts/pre-push-gate.sh
-        exit $?
-        ;;
-    Linux*) ;;
+runtime=$(uname -s)
+case "$runtime" in
+    MINGW*|MSYS*|CYGWIN*|Linux*) ;;
     *) fail 'supported runtimes are Linux or Windows Git Bash with WSL' ;;
 esac
 head=$(git rev-parse --verify HEAD)
@@ -35,7 +30,17 @@ assert_source() {
 }
 assert_source
 printf 'SeedSync pre-push: full Python and Angular suites for %s\n' "$head" >&2
-make run-tests-python </dev/null
-make run-tests-angular </dev/null
+case "$runtime" in
+    MINGW*|MSYS*|CYGWIN*)
+        # Native Git owns checkout normalization and every source guard. WSL
+        # runs only the full suites; no alternate gate entrypoint is exposed.
+        MSYS_NO_PATHCONV=1 wsl.exe --cd "$(cygpath -w "$root")" --exec bash \
+            -c 'set -e; make run-tests-python; make run-tests-angular' </dev/null
+        ;;
+    Linux*)
+        make run-tests-python </dev/null
+        make run-tests-angular </dev/null
+        ;;
+esac
 assert_source
 printf 'SeedSync pre-push: both full suites passed for %s\n' "$head" >&2
