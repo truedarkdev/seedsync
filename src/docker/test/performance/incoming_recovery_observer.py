@@ -786,6 +786,9 @@ _CAPTURE_PENDING_MOVE_RESULTS = {
     "not_attempted", "completed", "already_completed", "deferred", "failed",
     "no_move_applicable", "conflict", "unknown",
 }
+_CAPTURE_FINAL_MOVE_RETIREMENT_PHASES = {"none", "outer_source_recheck", "source_identity_check", "claim_reserve", "claim_rename", "claim_parent_sync", "claimed_identity_tree_validation", "claim_delete", "claim_final_sync", "caller_parent_sync"}
+_CAPTURE_FINAL_MOVE_RESIDUE_COUNTS = {"retirement_residue_entries", "retirement_residue_directories", "retirement_residue_files", "retirement_residue_symlinks", "retirement_residue_other"}
+_CAPTURE_FINAL_MOVE_RESIDUE_BOOLS = {"retirement_residue_unknown", "retirement_residue_truncated", "retirement_fuse_hidden_present"}
 _CAPTURE_FINAL_MOVE_MESSAGES = {"final_move_publication"}
 _CAPTURE_FINAL_MOVE_PHASES = {
     "cleanup", "copy", "copy_complete", "copy_failure", "create_temporary",
@@ -1872,6 +1875,17 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
                 safe_final_move[key] = (
                     item if item is None or (type(item) is int and 0 <= item < 2**63) else None
                 )
+            if "retirement_failure_phase" in final_move:
+                item = final_move["retirement_failure_phase"]
+                safe_final_move["retirement_failure_phase"] = item if isinstance(item, str) and item in _CAPTURE_FINAL_MOVE_RETIREMENT_PHASES else "unknown"
+            for key in _CAPTURE_FINAL_MOVE_RESIDUE_COUNTS:
+                if key in final_move:
+                    item = final_move[key]
+                    safe_final_move[key] = item if type(item) is int and 0 <= item <= 32 else None
+            for key in _CAPTURE_FINAL_MOVE_RESIDUE_BOOLS:
+                if key in final_move:
+                    item = final_move[key]
+                    safe_final_move[key] = item if type(item) is bool else None
             result["final_move_publication"] = safe_final_move
     command = value.get("lftp_command")
     if isinstance(command, Mapping):

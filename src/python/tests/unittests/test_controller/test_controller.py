@@ -23687,7 +23687,8 @@ class TestController(unittest.TestCase):
 
             def fail_claim_delete(path, *args, **kwargs):
                 if os.path.basename(path).startswith(".seedsync-retire-"):
-                    raise OSError(errno.EIO, "injected claim cleanup failure")
+                    Path(os.path.join(path, ".fuse_hidden_probe")).write_bytes(b"private")
+                    raise OSError(errno.ENOTEMPTY, "injected claim cleanup failure")
                 return original_rmtree(path, *args, **kwargs)
 
             with patch.object(
@@ -23711,7 +23712,12 @@ class TestController(unittest.TestCase):
                 if entry["details"]["phase"] == "remove_source"
             )
             details = remove_source["details"]
-            self.assertEqual("eio", details["errno_class"])
+            self.assertEqual("enotempty", details["errno_class"])
+            self.assertEqual("claim_delete", details["retirement_failure_phase"])
+            self.assertEqual(2, details["retirement_residue"]["retirement_residue_entries"])
+            self.assertTrue(details["retirement_residue"]["retirement_fuse_hidden_present"])
+            self.assertFalse(details["retirement_residue"]["retirement_residue_unknown"])
+            self.assertFalse(details["retirement_residue"]["retirement_residue_truncated"])
             for key in _FINAL_MOVE_REMOVE_SOURCE_METRICS[:-1]:
                 self.assertIs(type(details[key]), int, key)
                 self.assertGreaterEqual(details[key], 0, key)
@@ -23725,6 +23731,133 @@ class TestController(unittest.TestCase):
             if artifact_path:
                 with open(artifact_path, "wb") as handle:
                     handle.write(Path(os.path.join(spool, "breadcrumbs.jsonl")).read_bytes())
+
+    def test_retirement_subphases_survive_clock_failure_and_final_sync_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root, "source")
+            source.write_bytes(b"payload")
+            expected = os.lstat(source)
+            facts = {}
+            with patch.object(Controller, "_Controller__same_path_identity", return_value=False), \
+                    patch("controller.controller.time.perf_counter_ns", side_effect=RuntimeError("clock")):
+                with self.assertRaises(OSError) as caught:
+                    Controller._Controller__remove_published_source(
+                        str(source), expected, None, publication_metrics={}, retirement_diagnostics=facts,
+                    )
+            self.assertEqual(errno.EAGAIN, caught.exception.errno)
+            self.assertEqual("source_identity_check", facts["retirement_failure_phase"])
+            self.assertEqual(b"payload", source.read_bytes())
+            final_error = OSError(errno.EIO, "final sync failed")
+            with patch.object(Controller, "_Controller__sync_directory_if_supported", side_effect=[None, final_error]):
+                with self.assertRaises(OSError) as caught:
+                    Controller._Controller__remove_published_source(str(source), expected, None, retirement_diagnostics=facts)
+            self.assertIs(final_error, caught.exception)
+            self.assertEqual("claim_final_sync", facts["retirement_failure_phase"])
+            self.assertFalse(source.exists())
+
+    def test_native_publish_diagnostics_preserve_fast_success_and_failure(self):
+        for mode in ("off", "on", "throwing"):
+            for outcome in ("success", "collision", "permission"):
+                with self.subTest(mode=mode, outcome=outcome), tempfile.TemporaryDirectory() as root:
+                    source = Path(root, "source")
+                    destination = Path(root, "destination")
+                    source.write_bytes(b"source")
+                    trace = BreadcrumbTraceCollector(
+                        lambda: True, max_entries=32,
+                        policy={"default": "info", "rules": {"final_move.publication": "off" if mode == "off" else "info"}},
+                    )
+                    if outcome == "collision":
+                        destination.write_bytes(b"existing")
+                    with patch.object(trace, "record", side_effect=RuntimeError("sink")) if mode == "throwing" else patch.object(trace, "record", wraps=trace.record), \
+                            patch.object(Controller, "_Controller__rename_no_replace", side_effect=OSError(errno.EACCES, "private")) if outcome == "permission" else patch.object(Controller, "_Controller__rename_no_replace", wraps=Controller._Controller__rename_no_replace), \
+                            patch.object(Controller, "_Controller__copy_to_publish_temporary", side_effect=AssertionError("unexpected fallback")):
+                        if outcome == "success":
+                            Controller._Controller__publish_staging_no_replace(str(source), str(destination), _MoveMutationTracker("private", trace))
+                            self.assertFalse(source.exists())
+                            self.assertEqual(b"source", destination.read_bytes())
+                        else:
+                            with self.assertRaises(OSError) as caught:
+                                Controller._Controller__publish_staging_no_replace(str(source), str(destination), _MoveMutationTracker("private", trace))
+                            self.assertEqual(errno.EEXIST if outcome == "collision" else errno.EACCES, caught.exception.errno)
+                            self.assertEqual(b"source", source.read_bytes())
+                            if outcome == "collision":
+                                self.assertEqual(b"existing", destination.read_bytes())
+                            else:
+                                self.assertFalse(destination.exists())
+                    trace.close()
+
+    def test_retirement_residue_is_bounded_and_never_follows_symlinks(self):
+        with tempfile.TemporaryDirectory() as root:
+            claim = Path(root, "claim")
+            claim.mkdir()
+            outside = Path(root, "outside")
+            outside.mkdir()
+            Path(outside, ".fuse_hidden_private").touch()
+            os.symlink(outside, claim / "link")
+            facts = _MoveMutationTracker.retirement_residue(str(claim))
+            self.assertEqual(1, facts["retirement_residue_symlinks"])
+            self.assertEqual(0, facts["retirement_residue_files"])
+            self.assertFalse(facts["retirement_fuse_hidden_present"])
+            self.assertTrue(_MoveMutationTracker.retirement_residue(str(claim / "link"))["retirement_residue_unknown"])
+            for index in range(40):
+                Path(claim, str(index)).touch()
+            facts = _MoveMutationTracker.retirement_residue(str(claim))
+            self.assertEqual(32, facts["retirement_residue_entries"])
+            self.assertTrue(facts["retirement_residue_truncated"])
+            self.assertIsNone(facts["retirement_fuse_hidden_present"])
+            deep = Path(root, "deep")
+            deep.mkdir()
+            cursor = deep
+            for _ in range(6):
+                cursor = cursor / "child"
+                cursor.mkdir()
+            facts = _MoveMutationTracker.retirement_residue(str(deep))
+            self.assertEqual(4, facts["retirement_residue_entries"])
+            self.assertTrue(facts["retirement_residue_truncated"])
+            with patch("controller.controller.os.scandir", side_effect=OSError(errno.EIO, "private")):
+                facts = _MoveMutationTracker.retirement_residue(str(claim))
+            self.assertTrue(facts["retirement_residue_unknown"])
+            self.assertIsNone(facts["retirement_fuse_hidden_present"])
+
+    def test_retirement_failure_diagnostics_preserve_outcomes_when_disabled_or_failing(self):
+        for mode in ("off", "on", "throwing", "clock", "probe"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as root:
+                trace = BreadcrumbTraceCollector(
+                    lambda: True, max_entries=32,
+                    policy={"default": "info", "rules": {"final_move.publication": "off" if mode == "off" else "info"}},
+                )
+                source = Path(root, "staging", "private")
+                source.mkdir(parents=True)
+                (source / "payload").write_bytes(b"payload")
+                destination = Path(root, "final", "private")
+                destination.parent.mkdir()
+                failure = OSError(errno.ENOTEMPTY, "private failure")
+                original_rmtree = shutil.rmtree
+
+                def fail_claim(path, *args, **kwargs):
+                    if os.path.basename(path).startswith(".seedsync-retire-"):
+                        raise failure
+                    return original_rmtree(path, *args, **kwargs)
+
+                with patch.object(Controller, "_Controller__rename_no_replace", side_effect=OSError(errno.EINVAL, "unsupported")), \
+                        patch("controller.controller.shutil.rmtree", side_effect=fail_claim), \
+                        patch.object(trace, "record", side_effect=RuntimeError("sink")) if mode == "throwing" else patch.object(trace, "record", wraps=trace.record), \
+                        patch("controller.controller.time.perf_counter_ns", side_effect=RuntimeError("clock")) if mode == "clock" else patch("controller.controller.time.perf_counter_ns", wraps=time.perf_counter_ns), \
+                        patch.object(_MoveMutationTracker, "retirement_residue", side_effect=RuntimeError("probe")) if mode in ("off", "probe") else patch.object(_MoveMutationTracker, "retirement_residue", wraps=_MoveMutationTracker.retirement_residue) as probe:
+                    with self.assertRaises(OSError) as caught:
+                        Controller._Controller__publish_staging_no_replace(str(source), str(destination), _MoveMutationTracker("private", trace))
+                    self.assertIs(failure, caught.exception)
+                    if mode == "off":
+                        probe.assert_not_called()
+                self.assertFalse(source.exists())
+                self.assertEqual(b"payload", (destination / "payload").read_bytes())
+                claims = list(source.parent.iterdir())
+                self.assertEqual(1, len(claims))
+                self.assertEqual(b"payload", (claims[0] / "payload").read_bytes())
+                if mode in ("on", "clock", "probe"):
+                    event = next(x for x in trace.snapshot()["entries"] if x["details"].get("phase") == "remove_source")
+                    self.assertEqual("claim_delete", event["details"]["retirement_failure_phase"])
+                trace.close()
 
     def test_regular_file_copy_failures_are_classified_and_diagnostics_fail_open(self):
         for operation, error_number, target in (

@@ -471,6 +471,9 @@ _PENDING_COMPLETION_MOVE_RESULTS = frozenset({
     "not_attempted", "completed", "already_completed", "deferred", "failed",
     "no_move_applicable", "conflict", "unknown",
 })
+_FINAL_MOVE_RETIREMENT_PHASES = {"none", "outer_source_recheck", "source_identity_check", "claim_reserve", "claim_rename", "claim_parent_sync", "claimed_identity_tree_validation", "claim_delete", "claim_final_sync", "caller_parent_sync"}
+_FINAL_MOVE_RESIDUE_COUNTS = {"retirement_residue_entries", "retirement_residue_directories", "retirement_residue_files", "retirement_residue_symlinks", "retirement_residue_other"}
+_FINAL_MOVE_RESIDUE_BOOLS = {"retirement_residue_unknown", "retirement_residue_truncated", "retirement_fuse_hidden_present"}
 _FINAL_MOVE_PUBLICATION_MESSAGES = frozenset({"final_move_publication"})
 _FINAL_MOVE_PUBLICATION_PHASES = frozenset({
     "cleanup", "copy", "copy_complete", "copy_failure", "create_temporary",
@@ -1055,6 +1058,20 @@ def _final_move_publication_facts(details: Mapping[str, object], message: object
         value = details.get(key)
         if key in details:
             result[key] = value if value is None or (type(value) is int and 0 <= value < 2**63) else None
+    if "retirement_failure_phase" in details:
+        value = details.get("retirement_failure_phase")
+        result["retirement_failure_phase"] = value if isinstance(value, str) and value in _FINAL_MOVE_RETIREMENT_PHASES else "unknown"
+    residue = details.get("retirement_residue")
+    if not isinstance(residue, Mapping):
+        residue = {}
+    for key in _FINAL_MOVE_RESIDUE_COUNTS:
+        if key in residue:
+            value = residue[key]
+            result[key] = value if type(value) is int and 0 <= value <= 32 else None
+    for key in _FINAL_MOVE_RESIDUE_BOOLS:
+        if key in residue:
+            value = residue[key]
+            result[key] = value if type(value) is bool else None
     return result
 
 

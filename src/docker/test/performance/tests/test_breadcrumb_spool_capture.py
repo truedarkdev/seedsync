@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -812,6 +813,31 @@ def test_actual_finalized_remove_source_timings_survive_projection_and_sink(tmp_
     assert all(type(success[key]) is int and success[key] >= 0 for key in metric_keys)
     assert all(type(failure[key]) is int and failure[key] >= 0 for key in metric_keys - {"caller_parent_sync_ns"})
     assert failure["caller_parent_sync_ns"] is None
+    assert success["retirement_failure_phase"] == "none"
+    assert failure["retirement_failure_phase"] == "claim_delete"
+    assert failure["errno_class"] == "enotempty"
+    assert failure["retirement_residue_entries"] == 2
+    assert failure["retirement_residue_files"] == 2
+    assert failure["retirement_fuse_hidden_present"] is True
+    assert failure["retirement_residue_unknown"] is False
+    assert failure["retirement_residue_truncated"] is False
+    failure_projection = next(item for item in failure_records
+                              if item.get("final_move_publication", {}).get("phase") == "remove_source")
+    assert observer._sanitize_capture_projection(failure_projection)["final_move_publication"] == failure
+    finalized_failure_rows = [json.loads(line) for line in Path(failure_path).read_bytes().splitlines() if line]
+    producer_failure = next(row for row in finalized_failure_rows
+                            if row.get("category") == "final_move.publication"
+                            and row.get("details", {}).get("phase") == "remove_source")
+    raw_correlation = producer_failure["corr_id"]
+    assert isinstance(raw_correlation, str) and re.fullmatch(r"[0-9a-f]{16}", raw_correlation)
+    expected_correlation_hash = hashlib.sha256(raw_correlation.encode("utf-8")).hexdigest()[:16]
+    assert failure_projection["corr_hash"] == expected_correlation_hash
+    sanitized_failure = observer._sanitize_capture_projection(failure_projection)
+    assert sanitized_failure["corr_hash"] == expected_correlation_hash
+    assert "corr_id" not in failure_projection and "corr_id" not in sanitized_failure
+    assert raw_correlation not in failure_text
+    assert raw_correlation not in json.dumps(sanitized_failure)
+    assert ".fuse_hidden_probe" not in failure_text
     assert "retained-claim.bin" not in success_text + failure_text
     assert "staging" not in success_text + failure_text
 
@@ -4893,3 +4919,30 @@ def test_poll_failure_metrics_survive_finalized_reader_and_sink(tmp_path: Path) 
     finally:
         reader.close()
         trace.close()
+
+
+def test_retirement_diagnostic_projection_rejects_unbounded_or_private_fields() -> None:
+    details = {
+        "retirement_failure_phase": "/private/path",
+        "retirement_residue": {
+            "retirement_residue_entries": 33, "retirement_residue_files": True,
+            "retirement_residue_symlinks": -1, "retirement_residue_directories": 4,
+            "retirement_residue_unknown": "private", "retirement_residue_truncated": True,
+            "retirement_fuse_hidden_present": "/private/path", "private_path": "/private/path",
+        },
+    }
+    facts = capture._final_move_publication_facts(details, "final_move_publication")
+    assert facts["retirement_failure_phase"] == "unknown"
+    assert facts["retirement_residue_entries"] is None
+    assert facts["retirement_residue_files"] is None
+    assert facts["retirement_residue_symlinks"] is None
+    assert facts["retirement_residue_directories"] == 4
+    assert facts["retirement_residue_unknown"] is None
+    assert facts["retirement_residue_truncated"] is True
+    assert facts["retirement_fuse_hidden_present"] is None
+    safe = observer._sanitize_capture_projection({"final_move_publication": facts})
+    assert "/private/path" not in json.dumps(safe)
+    malicious = dict(facts, retirement_residue_entries=33, retirement_fuse_hidden_present="private")
+    safe = observer._sanitize_capture_projection({"final_move_publication": malicious})["final_move_publication"]
+    assert safe["retirement_residue_entries"] is None
+    assert safe["retirement_fuse_hidden_present"] is None
