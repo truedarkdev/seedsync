@@ -98,15 +98,17 @@ class TestExtractDispatch(unittest.TestCase):
         self.assertTrue(str(ctx.exception).startswith("File is not an archive"))
         self.mock_is_archive.assert_called_once_with(os.path.join(self.local_path, mf.name))
 
+    @pytest.mark.timeout(5)
     def test_extract_single_uses_fallback_path_when_primary_missing(self):
         fallback_path = os.path.join("fallback", "path")
-        dispatch = ExtractDispatch(
+        self.dispatch.set_base_paths(
             out_dir_path=self.out_dir_path,
             local_path=self.local_path,
-            local_path_fallback=fallback_path
+            local_path_fallback=fallback_path,
         )
-        self.addCleanup(dispatch.stop)
-        dispatch.start()
+        extraction_completed = threading.Event()
+        self.listener.extract_completed.side_effect = lambda *_args, **_kwargs: extraction_completed.set()
+        self.dispatch.add_listener(self.listener)
 
         def _is_archive(archive_path: str):
             return archive_path == os.path.join(fallback_path, "aaa")
@@ -116,9 +118,13 @@ class TestExtractDispatch(unittest.TestCase):
         mf = ModelFile("aaa", False)
         mf.local_size = 100
 
-        dispatch.extract(mf)
+        self.dispatch.extract(mf)
 
-        self._wait_for_call_count(self.mock_extract_archive, 1)
+        # Wait for task completion, with room for worker scheduling and the
+        # fixture's worker shutdown inside the five-second test budget.
+        self.assertTrue(extraction_completed.wait(timeout=4))
+        self.listener.extract_completed.assert_called_once_with("aaa", False, "aaa", None)
+        self.listener.extract_failed.assert_not_called()
         self.mock_is_archive.assert_has_calls([
             call(os.path.join(self.local_path, mf.name)),
             call(os.path.join(fallback_path, mf.name)),
