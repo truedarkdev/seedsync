@@ -786,13 +786,15 @@ _CAPTURE_PENDING_MOVE_RESULTS = {
     "not_attempted", "completed", "already_completed", "deferred", "failed",
     "no_move_applicable", "conflict", "unknown",
 }
+_CAPTURE_FINAL_MOVE_RENAME_METHODS = {"native_no_replace", "owned_directory_reservation"}
+_CAPTURE_FINAL_MOVE_RENAME_OUTCOMES = {"succeeded", "unsupported", "failed"}
 _CAPTURE_FINAL_MOVE_RETIREMENT_PHASES = {"none", "outer_source_recheck", "source_identity_check", "claim_reserve", "claim_rename", "claim_parent_sync", "claimed_identity_tree_validation", "claim_delete", "claim_final_sync", "caller_parent_sync"}
 _CAPTURE_FINAL_MOVE_RESIDUE_COUNTS = {"retirement_residue_entries", "retirement_residue_directories", "retirement_residue_files", "retirement_residue_symlinks", "retirement_residue_other"}
 _CAPTURE_FINAL_MOVE_RESIDUE_BOOLS = {"retirement_residue_unknown", "retirement_residue_truncated", "retirement_fuse_hidden_present"}
 _CAPTURE_FINAL_MOVE_MESSAGES = {"final_move_publication"}
 _CAPTURE_FINAL_MOVE_PHASES = {
     "cleanup", "copy", "copy_complete", "copy_failure", "create_temporary",
-    "fallback", "publish", "remove_source", "reserve_start", "verify",
+    "fallback", "publish", "remove_source", "rename_attempt", "reserve_start", "verify",
 }
 _CAPTURE_FINAL_MOVE_OPERATIONS = {
     "cleanup", "copy", "create_temporary", "fallback", "publish", "remove_source", "reserve", "verify",
@@ -1875,6 +1877,17 @@ def _sanitize_capture_projection(value: object) -> Mapping[str, object]:
                 safe_final_move[key] = (
                     item if item is None or (type(item) is int and 0 <= item < 2**63) else None
                 )
+            if final_move.get("phase") == "rename_attempt":
+                for key, allowed in (("rename_method", _CAPTURE_FINAL_MOVE_RENAME_METHODS),
+                                     ("rename_outcome", _CAPTURE_FINAL_MOVE_RENAME_OUTCOMES)):
+                    item = final_move.get(key)
+                    safe_final_move[key] = item if isinstance(item, str) and item in allowed else "unknown"
+                attempt = final_move.get("rename_attempt")
+                safe_final_move["rename_attempt"] = attempt if type(attempt) is int and attempt in (1, 2) else None
+                duration = final_move.get("rename_duration_ns")
+                safe_final_move["rename_duration_ns"] = duration if type(duration) is int and 0 <= duration < 2**63 else None
+                fallback = final_move.get("copy_fallback")
+                safe_final_move["copy_fallback"] = fallback if type(fallback) is bool else None
             if "retirement_failure_phase" in final_move:
                 item = final_move["retirement_failure_phase"]
                 safe_final_move["retirement_failure_phase"] = item if isinstance(item, str) and item in _CAPTURE_FINAL_MOVE_RETIREMENT_PHASES else "unknown"

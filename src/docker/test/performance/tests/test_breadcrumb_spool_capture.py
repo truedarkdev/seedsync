@@ -49,7 +49,7 @@ try:
     from model import Model, ModelFile
     from system import SystemFile
     from controller import Controller, ModelBuilder
-    from controller.controller import DeferredQueueIntent, PendingQueueDispatch
+    from controller.controller import DeferredQueueIntent, PendingQueueDispatch, _MoveMutationTracker
     from controller.scan import ScannerProcess, ScannerResult
     from lftp import LftpJobStatus
     from controller.model_updater import (
@@ -4946,3 +4946,80 @@ def test_retirement_diagnostic_projection_rejects_unbounded_or_private_fields() 
     safe = observer._sanitize_capture_projection({"final_move_publication": malicious})["final_move_publication"]
     assert safe["retirement_residue_entries"] is None
     assert safe["retirement_fuse_hidden_present"] is None
+
+
+def test_actual_finalized_directory_rename_attempts_survive_spool_and_observer(tmp_path: Path) -> None:
+    if BreadcrumbTraceCollector is None or Controller is None:
+        pytest.skip("production controller runtime unavailable")
+    for scenario in ("native", "alternate", "copy"):
+        run = tmp_path / scenario
+        run.mkdir()
+        source = run / "staging" / "private-source-tree"
+        source.mkdir(parents=True)
+        (source / "private-payload.bin").write_bytes(b"nonzero-payload" * 4096)
+        destination = run / "final" / "private-source-tree"
+        destination.parent.mkdir()
+        producer_spool = run / "producer"
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=32, durable_enabled=True, durable_path=str(producer_spool))
+        trace.sync_enabled_state()
+        original_rename = os.rename
+
+        def alternate_cross_device(src, dst, *args, **kwargs):
+            if "src_dir_fd" in kwargs:
+                raise OSError(errno.EXDEV, "injected cross-device")
+            return original_rename(src, dst, *args, **kwargs)
+
+        with ExitStack() as stack:
+            if scenario != "native":
+                stack.enter_context(patch.object(Controller, "_Controller__rename_no_replace", side_effect=OSError(errno.EINVAL, "unsupported")))
+            if scenario == "copy":
+                stack.enter_context(patch("controller.controller.os.rename", side_effect=alternate_cross_device))
+            Controller._Controller__publish_staging_no_replace(
+                str(source), str(destination), _MoveMutationTracker("private-source-tree", trace),
+            )
+        assert not source.exists()
+        assert (destination / "private-payload.bin").read_bytes() == b"nonzero-payload" * 4096
+        assert trace.flush_durable(2.0)
+        trace.close(2.0)
+        finalized_path = producer_spool / "breadcrumbs.jsonl"
+        raw_rows = [json.loads(line) for line in finalized_path.read_bytes().splitlines() if line]
+        producer_attempts = [row for row in raw_rows if row.get("details", {}).get("phase") == "rename_attempt"]
+        output, text = _roundtrip_finalized_delete_local_rows(run / "capture", str(finalized_path))
+        projections = [item["capture"]["projection"] for item in output
+                       if item.get("capture", {}).get("state") == "record"]
+        projected_attempts = [item for item in projections if item.get("final_move_publication", {}).get("phase") == "rename_attempt"]
+        expected_methods = ["native_no_replace"] if scenario == "native" else ["native_no_replace", "owned_directory_reservation"]
+        assert [row["details"]["rename_method"] for row in producer_attempts] == expected_methods
+        assert [item["final_move_publication"]["rename_method"] for item in projected_attempts] == expected_methods
+        assert len(projected_attempts) == len(producer_attempts)
+        for producer, projection in zip(producer_attempts, projected_attempts):
+            facts = projection["final_move_publication"]
+            for key in ("rename_method", "rename_attempt", "rename_outcome", "rename_duration_ns", "copy_fallback", "errno_class"):
+                assert facts[key] == producer["details"][key]
+            assert type(facts["rename_duration_ns"]) is int and 0 <= facts["rename_duration_ns"] < 2**63
+            assert projection["corr_hash"] == capture._hash(producer["corr_id"])
+            sanitized = observer._sanitize_capture_projection(projection)
+            assert sanitized["final_move_publication"] == facts
+            assert sanitized["corr_hash"] == projection["corr_hash"]
+            assert "corr_id" not in sanitized
+        last = projected_attempts[-1]["final_move_publication"]
+        assert last["rename_outcome"] == ("unsupported" if scenario == "copy" else "succeeded")
+        assert last["copy_fallback"] is (scenario == "copy")
+        assert "private-source-tree" not in text and "private-payload.bin" not in text
+        assert str(run) not in text
+        assert producer_attempts[0]["corr_id"] not in text
+
+
+def test_directory_rename_attempt_projection_rejects_unbounded_values() -> None:
+    facts = capture._final_move_publication_facts({
+        "phase": "rename_attempt", "rename_method": "/private/path", "rename_outcome": "private",
+        "rename_attempt": True, "rename_duration_ns": 2**63, "copy_fallback": "private",
+    }, "final_move_publication")
+    assert facts["rename_method"] == "unknown" and facts["rename_outcome"] == "unknown"
+    assert facts["rename_attempt"] is None and facts["rename_duration_ns"] is None and facts["copy_fallback"] is None
+    malformed = dict(facts, rename_method="private", rename_outcome="private", rename_attempt=3,
+                     rename_duration_ns=-1, copy_fallback=1)
+    safe = observer._sanitize_capture_projection({"final_move_publication": malformed})["final_move_publication"]
+    assert safe["rename_method"] == "unknown" and safe["rename_outcome"] == "unknown"
+    assert safe["rename_attempt"] is None and safe["rename_duration_ns"] is None and safe["copy_fallback"] is None
+    assert "/private/path" not in json.dumps(safe)

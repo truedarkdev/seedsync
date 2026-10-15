@@ -796,6 +796,7 @@ class _MoveMutationTracker:
             copy_metrics: Optional[dict[str, int]] = None,
             publication_metrics: Optional[dict[str, Optional[int]]] = None,
             retirement_diagnostics: Optional[dict[str, object]] = None,
+            rename_diagnostics: Optional[dict[str, object]] = None,
     ) -> None:
         """Emit fixed-schema, identity-free final publication evidence."""
         breadcrumb_trace = self.breadcrumb_trace
@@ -828,6 +829,8 @@ class _MoveMutationTracker:
                 "destination_exists": probe(destination_path),
             }
             details.update({key: value for key, value in known_bools.items() if type(value) is bool})
+            if phase == "rename_attempt" and rename_diagnostics is not None:
+                details.update(rename_diagnostics)
             if phase == "remove_source" and retirement_diagnostics is not None:
                 details.update(retirement_diagnostics)
             if phase == "copy_complete" and isinstance(copy_metrics, dict):
@@ -10259,6 +10262,155 @@ class Controller:
         os.unlink(temporary_path)
 
     @classmethod
+    def __rename_owned_directory(
+            cls, src: str, dst: str,
+            mutation_tracker: Optional[_MoveMutationTracker] = None,
+    ) -> None:
+        """Move a real directory over our empty, exclusively created directory.
+
+        POSIX rename prevents replacing a file or a nonempty directory. A
+        foreign empty directory substituted between mkdir, identity capture,
+        checks, rename or empty cleanup can still lose its metadata. This
+        accepted race is not atomic ownership or compare-and-rename. Kernel
+        type/emptiness checks still protect files and nonempty directories.
+        Keep the global no-replace primitive strict.
+        """
+        source = os.path.abspath(src)
+        destination = os.path.abspath(dst)
+        if os.path.realpath(source) != source or os.path.realpath(os.path.dirname(destination)) != os.path.dirname(destination):
+            raise OSError(errno.EAGAIN, "directory move confinement changed")
+        if os.path.commonpath([source, destination]) in (source, destination):
+            raise OSError(errno.EAGAIN, "directory move paths overlap")
+        source_stat = os.lstat(source)
+        if not stat.S_ISDIR(source_stat.st_mode) or stat.S_ISLNK(source_stat.st_mode):
+            raise OSError(errno.EAGAIN, "directory move source changed")
+        cls.__reject_nested_mounts_or_reparse_points(source)
+        source_snapshot = cls.__source_tree_snapshot(source)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        source_parent = os.path.dirname(source)
+        destination_parent = os.path.dirname(destination)
+        source_name = os.path.basename(source)
+        destination_name = os.path.basename(destination)
+        source_parent_fd = os.open(source_parent, flags)
+        destination_parent_fd: Optional[int] = None
+        reservation_fd: Optional[int] = None
+        reservation_stat: Optional[os.stat_result] = None
+        reservation_created = False
+
+        def check_reservation() -> None:
+            if destination_parent_fd is None or reservation_fd is None or reservation_stat is None:
+                raise OSError(errno.EAGAIN, "directory reservation identity unavailable")
+            if not cls.__same_path_identity(destination_parent, os.fstat(destination_parent_fd)):
+                raise OSError(errno.EAGAIN, "directory reservation confinement changed")
+            current = os.stat(destination_name, dir_fd=destination_parent_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(current.st_mode) or not os.path.samestat(current, reservation_stat) or \
+                    not os.path.samestat(os.fstat(reservation_fd), reservation_stat):
+                raise OSError(errno.EAGAIN, "directory reservation changed")
+            with os.scandir(reservation_fd) as entries:
+                if next(entries, None) is not None:
+                    raise OSError(errno.ENOTEMPTY, "directory reservation is no longer empty")
+
+        try:
+            destination_parent_fd = os.open(destination_parent, flags)
+            os.mkdir(destination_name, 0o700, dir_fd=destination_parent_fd)
+            reservation_created = True
+            if mutation_tracker is not None:
+                mutation_tracker.mutated()
+            reservation_stat = os.stat(destination_name, dir_fd=destination_parent_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(reservation_stat.st_mode):
+                raise OSError(errno.EAGAIN, "directory reservation changed")
+            reservation_fd = os.open(destination_name, flags, dir_fd=destination_parent_fd)
+            check_reservation()
+            if not cls.__same_path_identity(source_parent, os.fstat(source_parent_fd)) or \
+                    not cls.__same_path_identity(destination_parent, os.fstat(destination_parent_fd)) or \
+                    not cls.__same_path_identity(source, source_stat) or \
+                    cls.__source_tree_snapshot(source) != source_snapshot:
+                raise OSError(errno.EAGAIN, "directory move source or confinement changed")
+            check_reservation()
+            current_source = os.stat(source_name, dir_fd=source_parent_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(current_source.st_mode) or not os.path.samestat(current_source, source_stat) or \
+                    not cls.__same_path_identity(source_parent, os.fstat(source_parent_fd)):
+                raise OSError(errno.EAGAIN, "directory move source or confinement changed")
+            os.rename(source_name, destination_name,
+                      src_dir_fd=source_parent_fd, dst_dir_fd=destination_parent_fd)
+            published = os.stat(destination_name, dir_fd=destination_parent_fd, follow_symlinks=False)
+            if not os.path.samestat(published, source_stat) or \
+                    not cls.__same_path_identity(source_parent, os.fstat(source_parent_fd)) or \
+                    not cls.__same_path_identity(destination_parent, os.fstat(destination_parent_fd)):
+                raise OSError(errno.EAGAIN, "directory move identity or confinement changed")
+        except BaseException as error:
+            if reservation_created:
+                try:
+                    check_reservation()
+                    os.rmdir(destination_name, dir_fd=destination_parent_fd)
+                except (OSError, ValueError):
+                    # Preserve unknown/replaced/nonempty residue. In particular,
+                    # a capability error cannot fall through to copy over it.
+                    if isinstance(error, OSError) and cls.__is_no_replace_capability_error(error):
+                        raise OSError(errno.EAGAIN, "directory reservation could not be released") from error
+            raise
+        finally:
+            if reservation_fd is not None:
+                os.close(reservation_fd)
+            if destination_parent_fd is not None:
+                os.close(destination_parent_fd)
+            os.close(source_parent_fd)
+
+    @classmethod
+    def __rename_staging_no_replace(
+            cls, src: str, dst: str,
+            mutation_tracker: Optional[_MoveMutationTracker] = None,
+    ) -> None:
+        """Try strict native rename, then the explicitly bounded directory move."""
+        enabled = mutation_tracker is not None and mutation_tracker.publication_diagnostics_enabled()
+
+        def record(method: str, attempt: int, started: Optional[int], error: Optional[BaseException],
+                   outcome: str, copy_fallback: bool) -> None:
+            if not enabled or mutation_tracker is None:
+                return
+            duration = None
+            if started is not None:
+                try:
+                    elapsed = time.perf_counter_ns() - started
+                    if type(elapsed) is int and 0 <= elapsed < 2**63:
+                        duration = elapsed
+                except Exception:
+                    pass
+            mutation_tracker.record_publication(
+                "rename_attempt", "publish", "destination", error,
+                rename_diagnostics={"rename_method": method, "rename_attempt": attempt,
+                                    "rename_outcome": outcome, "rename_duration_ns": duration,
+                                    "copy_fallback": copy_fallback},
+            )
+
+        started = _MoveMutationTracker.start_publication_phase(enabled)
+        try:
+            cls.__rename_no_replace(src, dst)
+        except OSError as error:
+            capability = cls.__is_no_replace_capability_error(error)
+            eligible = False
+            if capability and os.name == "posix" and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW"):
+                source_stat = os.lstat(src)
+                eligible = stat.S_ISDIR(source_stat.st_mode) and not stat.S_ISLNK(source_stat.st_mode)
+            record("native_no_replace", 1, started, error,
+                   "unsupported" if capability else "failed", capability and not eligible)
+            if not eligible:
+                raise
+        else:
+            record("native_no_replace", 1, started, None, "succeeded", False)
+            return
+        started = _MoveMutationTracker.start_publication_phase(enabled)
+        try:
+            cls.__rename_owned_directory(src, dst, mutation_tracker)
+        except BaseException as error:
+            capability = isinstance(error, OSError) and cls.__is_no_replace_capability_error(error)
+            record("owned_directory_reservation", 2, started, error,
+                   "unsupported" if capability else "failed", capability)
+            raise
+        else:
+            record("owned_directory_reservation", 2, started, None, "succeeded", False)
+
+    @classmethod
     def __publish_staging_no_replace(
             cls, src: str, dst: str,
             mutation_tracker: Optional[_MoveMutationTracker] = None,
@@ -10266,15 +10418,15 @@ class Controller:
     ) -> None:
         """Publish staging content once; preserve src on collision or failure.
 
-        Native no-replace rename remains the fast path.  Filesystems such as
-        Unraid shfs can reject renameat2 flags with EINVAL; in that case a
-        complete private copy is made in the destination directory and then
-        published with exclusive primitives.  Permission, capacity, read-only,
+        Native no-replace rename remains first. A capability-limited POSIX
+        directory can move over an owned empty directory reservation; other
+        unsupported moves use a private copy and exclusive publication.
+        Permission, capacity, read-only,
         and I/O errors are intentionally not treated as capability fallbacks.
         """
         source_manifest = cls.__publication_tree_manifest(src)
         try:
-            rename_source = lambda: cls.__rename_no_replace(src, dst)
+            rename_source = lambda: cls.__rename_staging_no_replace(src, dst, mutation_tracker)
             if automatic_move_boundary is None:
                 rename_source()
             elif automatic_move_boundary.publish_no_replace(rename_source) is not True:

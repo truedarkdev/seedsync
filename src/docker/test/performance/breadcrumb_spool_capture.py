@@ -471,13 +471,15 @@ _PENDING_COMPLETION_MOVE_RESULTS = frozenset({
     "not_attempted", "completed", "already_completed", "deferred", "failed",
     "no_move_applicable", "conflict", "unknown",
 })
+_FINAL_MOVE_RENAME_METHODS = {"native_no_replace", "owned_directory_reservation"}
+_FINAL_MOVE_RENAME_OUTCOMES = {"succeeded", "unsupported", "failed"}
 _FINAL_MOVE_RETIREMENT_PHASES = {"none", "outer_source_recheck", "source_identity_check", "claim_reserve", "claim_rename", "claim_parent_sync", "claimed_identity_tree_validation", "claim_delete", "claim_final_sync", "caller_parent_sync"}
 _FINAL_MOVE_RESIDUE_COUNTS = {"retirement_residue_entries", "retirement_residue_directories", "retirement_residue_files", "retirement_residue_symlinks", "retirement_residue_other"}
 _FINAL_MOVE_RESIDUE_BOOLS = {"retirement_residue_unknown", "retirement_residue_truncated", "retirement_fuse_hidden_present"}
 _FINAL_MOVE_PUBLICATION_MESSAGES = frozenset({"final_move_publication"})
 _FINAL_MOVE_PUBLICATION_PHASES = frozenset({
     "cleanup", "copy", "copy_complete", "copy_failure", "create_temporary",
-    "fallback", "publish", "remove_source", "reserve_start", "verify",
+    "fallback", "publish", "remove_source", "rename_attempt", "reserve_start", "verify",
 })
 _FINAL_MOVE_PUBLICATION_OPERATIONS = frozenset({
     "cleanup", "copy", "create_temporary", "fallback", "publish", "remove_source", "reserve", "verify",
@@ -1058,6 +1060,17 @@ def _final_move_publication_facts(details: Mapping[str, object], message: object
         value = details.get(key)
         if key in details:
             result[key] = value if value is None or (type(value) is int and 0 <= value < 2**63) else None
+    if details.get("phase") == "rename_attempt":
+        for key, allowed in (("rename_method", _FINAL_MOVE_RENAME_METHODS),
+                             ("rename_outcome", _FINAL_MOVE_RENAME_OUTCOMES)):
+            value = details.get(key)
+            result[key] = value if isinstance(value, str) and value in allowed else "unknown"
+        attempt = details.get("rename_attempt")
+        result["rename_attempt"] = attempt if type(attempt) is int and attempt in (1, 2) else None
+        duration = details.get("rename_duration_ns")
+        result["rename_duration_ns"] = duration if type(duration) is int and 0 <= duration < 2**63 else None
+        fallback = details.get("copy_fallback")
+        result["copy_fallback"] = fallback if type(fallback) is bool else None
     if "retirement_failure_phase" in details:
         value = details.get("retirement_failure_phase")
         result["retirement_failure_phase"] = value if isinstance(value, str) and value in _FINAL_MOVE_RETIREMENT_PHASES else "unknown"
