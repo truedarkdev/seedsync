@@ -12062,6 +12062,14 @@ class ModelUpdater(_ControllerCoreAccess):
                     # move's actual result if its optional projection fails.
                     return
 
+            retirement_reader = getattr(controller, "_retirement_recovery_file_ids", None)
+            retirement_recovery_ids = retirement_reader(new_model) if callable(retirement_reader) else set()
+            retirement_discovery_unknown = retirement_recovery_ids is None
+            if retirement_discovery_unknown:
+                retirement_recovery_ids = set(new_model.get_file_ids())
+            elif not isinstance(retirement_recovery_ids, set):
+                retirement_recovery_ids = set()
+
             def pending_completion_move_authorized(
                     file_id: str, trace_pending_decision: bool = False,
             ) -> bool:
@@ -12154,6 +12162,12 @@ class ModelUpdater(_ControllerCoreAccess):
                 # but incomplete staging tree would request a rebuild on
                 # every quiet update instead of waiting for fresh scan input.
                 pending_authority_rebuild_ids.add(file_id)
+                # A journal replaces only physical staging proof. All current
+                # pair, scanner, idle and owner authority above remains required;
+                # the move itself validates exact roots/Final/claim under its
+                # ordinary reservation and mutation guard.
+                if file_id in retirement_recovery_ids:
+                    return True
                 if not candidate_verified_staging_identity(file_id):
                     if trace_pending_decision:
                         record_pending_completion_move_decision(
@@ -12509,7 +12523,9 @@ class ModelUpdater(_ControllerCoreAccess):
                                 poll_correlation=lftp_status_poll_correlation,
                             )
                         move_callable = getattr(move_from_staging, "__func__", move_from_staging)
-                        if getattr(move_callable, "__qualname__", "").endswith(
+                        if retirement_discovery_unknown:
+                            move_result = controller.MoveFromStagingResult.DEFERRED
+                        elif getattr(move_callable, "__qualname__", "").endswith(
                                 "Controller.__move_from_staging"):
                             boundary = _AutomaticMoveBoundary(
                                 self, controller, timed_model_lock, file,
@@ -12845,6 +12861,15 @@ class ModelUpdater(_ControllerCoreAccess):
                                 },
                                 poll_correlation=lftp_status_poll_correlation,
                             )
+
+                for retirement_file_id in retirement_recovery_ids:
+                    try:
+                        retirement_file = new_model.get_file(retirement_file_id)
+                    except ModelError:
+                        continue
+                    controller._Controller__pending_completion_file_names.add((
+                        retirement_file.name, retirement_file.path_pair_id, retirement_file.path_pair_name,
+                    ))
 
                 for file_id, count in persist.move_failure_counts.items():
                     if not candidate_lifecycle_allows(file_id):
@@ -13253,7 +13278,8 @@ class ModelUpdater(_ControllerCoreAccess):
                             ) else "complete_local_coverage"
                         )
                     elif completion_candidate:
-                        if new_file.state == ModelFile.State.DEFAULT and new_file.local_size is None:
+                        if new_file.state == ModelFile.State.DEFAULT and new_file.local_size is None and \
+                                new_file.file_id not in retirement_recovery_ids:
                             discard_pending_completion_file(new_file.file_id)
                             completion_reason = "discarded_missing_local"
                         if new_file.state in (
@@ -13306,8 +13332,10 @@ class ModelUpdater(_ControllerCoreAccess):
                         try:
                             failure_count = persist.move_failure_counts.get(new_file.file_id, 0)
                             retry_due = controller._Controller__move_retry_due.get(new_file.file_id)
-                            retry_blocked = failure_count >= controller._Controller__MAX_MOVE_FAILURES or (
-                                retry_due is not None and datetime.now() < retry_due
+                            retry_blocked = new_file.file_id not in retirement_recovery_ids and (
+                                failure_count >= controller._Controller__MAX_MOVE_FAILURES or (
+                                    retry_due is not None and datetime.now() < retry_due
+                                )
                             )
                         except Exception:
                             release_pre_reserved_move(new_file)
@@ -13451,14 +13479,14 @@ class ModelUpdater(_ControllerCoreAccess):
                         )
                         continue
                     failure_count = persist.move_failure_counts.get(file_id, 0)
-                    if failure_count >= controller._Controller__MAX_MOVE_FAILURES:
+                    if failure_count >= controller._Controller__MAX_MOVE_FAILURES and file_id not in retirement_recovery_ids:
                         record_pending_completion_move_decision(
                             file_id, "candidate", "skipped", "retry_limit_reached",
                             "candidate_scope",
                         )
                         continue
                     retry_due = controller._Controller__move_retry_due.get(file_id)
-                    if retry_due is not None and datetime.now() < retry_due:
+                    if retry_due is not None and datetime.now() < retry_due and file_id not in retirement_recovery_ids:
                         record_pending_completion_move_decision(
                             file_id, "candidate", "skipped", "retry_not_due",
                             "candidate_scope",

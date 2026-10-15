@@ -13341,7 +13341,7 @@ class TestController(unittest.TestCase):
 
             result = self.controller._Controller__move_from_staging("notes.lftp")
 
-        move.assert_called_once_with(source_file, os.path.join(final_root, "notes.lftp"), ANY, None)
+        move.assert_called_once_with(source_file, os.path.join(final_root, "notes.lftp"), ANY, None, retirement_journal_enabled=True, retirement_roots=(staging_root, final_root))
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
         self.controller.logger.warning.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
@@ -13364,7 +13364,7 @@ class TestController(unittest.TestCase):
 
             result = self.controller._Controller__move_from_staging("movie.mkv")
 
-        move.assert_called_once_with(source_file, os.path.join(final_root, "movie.mkv"), ANY, None)
+        move.assert_called_once_with(source_file, os.path.join(final_root, "movie.mkv"), ANY, None, retirement_journal_enabled=True, retirement_roots=(staging_root, final_root))
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
         self.controller.logger.warning.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
@@ -13712,7 +13712,7 @@ class TestController(unittest.TestCase):
 
             result = self.controller._Controller__move_from_staging("movie")
 
-        move.assert_called_once_with(source_tree, os.path.join(final_root, "movie"), ANY, None)
+        move.assert_called_once_with(source_tree, os.path.join(final_root, "movie"), ANY, None, retirement_journal_enabled=True, retirement_roots=(staging_root, final_root))
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace")
@@ -20628,7 +20628,7 @@ class TestController(unittest.TestCase):
 
             result = self.controller._Controller__move_from_staging("nested/movie.mkv")
 
-        move.assert_called_once_with(source, destination, ANY, None)
+        move.assert_called_once_with(source, destination, ANY, None, retirement_journal_enabled=True, retirement_roots=(staging_root, final_root))
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace")
@@ -20676,6 +20676,8 @@ class TestController(unittest.TestCase):
         move.assert_called_once_with(
             os.path.normpath(os.path.join("/local/incomplete", "movie.mkv")),
             os.path.normpath(os.path.join("/local", "movie.mkv")), ANY, None,
+            retirement_journal_enabled=True,
+            retirement_roots=(os.path.normpath("/local/incomplete"), os.path.normpath("/local")),
         )
         self.assertEqual(2, trace_info.call_count)
         attempt_payload = json.loads(trace_info.call_args_list[0][0][1])
@@ -20691,6 +20693,8 @@ class TestController(unittest.TestCase):
         move.assert_called_once_with(
             os.path.normpath(os.path.join("/local/incomplete", "movie.mkv")),
             os.path.normpath(os.path.join("/local", "movie.mkv")), ANY, None,
+            retirement_journal_enabled=True,
+            retirement_roots=(os.path.normpath("/local/incomplete"), os.path.normpath("/local")),
         )
         self.assertEqual(Controller.MoveFromStagingResult.FAILED, result)
         self.controller.logger.warning.assert_called_once_with(
@@ -24120,13 +24124,20 @@ class TestController(unittest.TestCase):
                         patch("controller.controller.time.perf_counter_ns", side_effect=RuntimeError("clock")) if mode == "clock" else patch("controller.controller.time.perf_counter_ns", wraps=time.perf_counter_ns), \
                         patch.object(_MoveMutationTracker, "retirement_residue", side_effect=RuntimeError("probe")) if mode in ("off", "probe") else patch.object(_MoveMutationTracker, "retirement_residue", wraps=_MoveMutationTracker.retirement_residue) as probe:
                     with self.assertRaises(OSError) as caught:
-                        Controller._Controller__publish_staging_no_replace(str(source), str(destination), _MoveMutationTracker("private", trace))
+                        Controller._Controller__publish_staging_no_replace(
+                            str(source), str(destination), _MoveMutationTracker("private", trace),
+                            retirement_journal_enabled=True,
+                            retirement_roots=(str(source.parent), str(destination.parent)),
+                        )
                     self.assertIs(failure, caught.exception)
                     if mode == "off":
                         probe.assert_not_called()
                 self.assertFalse(source.exists())
                 self.assertEqual(b"payload", (destination / "payload").read_bytes())
-                claims = list(source.parent.iterdir())
+                claims = [path for path in source.parent.iterdir()
+                          if path.name.startswith(".seedsync-retire-")]
+                journals = list(source.parent.glob(".seedsync-retirement-*.json"))
+                self.assertEqual(1, len(journals))
                 self.assertEqual(1, len(claims))
                 self.assertEqual(b"payload", (claims[0] / "payload").read_bytes())
                 if mode in ("on", "clock", "probe"):

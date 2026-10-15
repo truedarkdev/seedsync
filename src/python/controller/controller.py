@@ -8157,6 +8157,7 @@ class Controller:
             except FileNotFoundError:
                 self.__publish_staging_no_replace(
                     source_child, destination_child, mutation_tracker, automatic_move_boundary,
+                    retirement_journal_enabled=False,
                 )
                 continue
             if stat.S_ISDIR(source_stat.st_mode) and not stat.S_ISLNK(source_stat.st_mode) and \
@@ -8269,6 +8270,7 @@ class Controller:
             require_collision_proof: bool = False,
             anchored_paths: Optional[Tuple[str, str, str, str]] = None,
             automatic_move_boundary: Optional[object] = None,
+            *, retirement_journal_enabled: bool = True,
     ) -> MoveFromStagingResult:
         if anchored_paths is None:
             resolved = self.__resolve_safe_final_move_paths(name, path_pair_id)
@@ -8305,7 +8307,27 @@ class Controller:
                 "source_exists": os.path.exists(src),
                 "same_path": os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)),
             })
-        self.__cleanup_empty_retired_source_claims(os.path.dirname(src))
+        journal_path, retirement_context = None, None
+        if retirement_journal_enabled:
+            try:
+                journal_path, retirement_context = self.__retirement_binding(
+                    name, path_pair_id, src, dst, (staging_path, final_path),
+                )
+                operation = lambda: self.__settle_retirement_journal(
+                    src, dst, journal_path, retirement_context, (staging_path, final_path),
+                )
+                result_holder = []
+                if automatic_move_boundary is not None and self.__retirement_path_exists(journal_path):
+                    if automatic_move_boundary.publish_no_replace(lambda: result_holder.append(operation())) is not True:
+                        return Controller.MoveFromStagingResult.DEFERRED
+                    recovered = result_holder[0]
+                else:
+                    recovered = operation()
+            except (OSError, ValueError, TypeError, KeyError):
+                return Controller.MoveFromStagingResult.DEFERRED
+            if recovered is not None:
+                return Controller.MoveFromStagingResult.COMPLETED if recovered else Controller.MoveFromStagingResult.DEFERRED
+            self.__cleanup_empty_retired_source_claims(os.path.dirname(src))
         if not os.path.exists(src):
             if require_collision_proof:
                 if self.__completed_owned_collision_claim_matches(src, dst):
@@ -8361,6 +8383,8 @@ class Controller:
             trace_file_id,
             getattr(self.__context, "breadcrumb_trace", None),
         )
+        mutation_tracker.retirement_journal_path = journal_path
+        mutation_tracker.retirement_context = retirement_context
         try:
             # Re-resolve immediately before the mutation to narrow the window
             # for a path component to be replaced with a symlink.
@@ -8402,6 +8426,8 @@ class Controller:
             else:
                 self.__publish_staging_no_replace(
                     src, dst, mutation_tracker, automatic_move_boundary,
+                    retirement_journal_enabled=retirement_journal_enabled,
+                    retirement_roots=(staging_path, final_path),
                 )
                 # The production primitive marks at each physical mutation;
                 # retaining this successful-return mark keeps lightweight
@@ -8576,13 +8602,281 @@ class Controller:
             fallback_errors.add(eopnotsupp)
         return error.errno in fallback_errors
 
+    def __retirement_binding(
+            self, name: str, path_pair_id: Optional[str], src: str, dst: str,
+            retirement_roots: tuple[str, str]) -> tuple[str, list]:
+        config_path = getattr(self.__context.config, "file_path", None)
+        file_id = ModelFile.build_file_id(name, path_pair_id)
+        if isinstance(config_path, str) and config_path:
+            key = hashlib.sha256(file_id.encode("utf-8")).hexdigest()
+            path = os.path.join(os.path.dirname(os.path.abspath(config_path)), ".seedsync-retirement-" + key + ".json")
+        else:
+            path = self.__retirement_journal_path(src)
+        pairs = getattr(self, "_Controller__path_pairs_by_id", {})
+        pair = pairs.get(path_pair_id) if isinstance(pairs, dict) else None
+        remote = getattr(pair, "remote_path", None) if pair is not None else getattr(self, "_Controller__legacy_remote_path", None)
+        return path, [file_id, remote, os.path.realpath(src), os.path.realpath(dst),
+                      [os.path.abspath(root) for root in retirement_roots]]
+
+    def _has_retirement_journal(self, name: str, path_pair_id: Optional[str] = None) -> bool:
+        resolved = self.__resolve_safe_final_move_paths(name, path_pair_id)
+        if resolved is None:
+            return False
+        path, _context = self.__retirement_binding(name, path_pair_id, resolved[2], resolved[3], resolved[:2])
+        return self.__retirement_path_exists(path)
+
+    def _retirement_recovery_file_ids(self, model: object) -> Optional[set[str]]:
+        """Discover keyed journals independently of staging scan presence."""
+        config_path = getattr(self.__context.config, "file_path", None)
+        if not isinstance(config_path, str) or not config_path:
+            return set()
+        try:
+            with os.scandir(os.path.dirname(os.path.abspath(config_path))) as entries:
+                keys = {entry.name for entry in entries
+                        if re.fullmatch(r"\.seedsync-retirement-[0-9a-f]{64}\.json", entry.name)}
+            if not keys:
+                return set()
+            return {file_id for file_id in model.get_file_ids()
+                    if ".seedsync-retirement-" + hashlib.sha256(file_id.encode("utf-8")).hexdigest() + ".json" in keys
+                    and file_id not in self.__persist.final_move_succeeded_file_names}
+        except FileNotFoundError:
+            return set()
+        except OSError:
+            # Unknown discovery cannot authorize normal completion shortcuts.
+            return None
+
+    def __reset_settled_retirement(self, name: str, path_pair_id: Optional[str]) -> None:
+        resolved = self.__resolve_safe_final_move_paths(name, path_pair_id)
+        if resolved is None:
+            return
+        src, dst = resolved[2:]
+        path, context = self.__retirement_binding(name, path_pair_id, src, dst, resolved[:2])
+        record = self.__read_retirement_journal(src, path)
+        if record is not None and record["context"] == context and record["phase"] == "settled" and \
+                not self.__retirement_path_exists(record["claim"]):
+            os.unlink(path)
+            self.__sync_directory_if_supported(os.path.dirname(path))
+
+    @staticmethod
+    def __retirement_path_exists(path: str) -> bool:
+        """Only a positive missing-path result establishes absence."""
+        try:
+            os.lstat(path)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def __retirement_cleanup_exclusions(self, source_parent: str) -> Optional[set[str]]:
+        """Protect journal-owned claims from the independent legacy cleanup."""
+        config_path = getattr(self.__context.config, "file_path", None)
+        roots = {source_parent}
+        if isinstance(config_path, str) and config_path:
+            roots.add(os.path.dirname(os.path.abspath(config_path)))
+        excluded: set[str] = set()
+        try:
+            paths = []
+            for root in roots:
+                with os.scandir(root) as entries:
+                    for entry in entries:
+                        if re.fullmatch(r"\.seedsync-retirement-[0-9a-f]{64}\.json", entry.name):
+                            paths.append(entry.path)
+                            if len(paths) > _EMPTY_RETIRED_DIRECTORY_SCAN_LIMIT:
+                                return None
+            for path in paths:
+                record = self.__read_retirement_journal("", path)
+                if record is None:
+                    # The discovered record disappeared during classification.
+                    return None
+                claim = record["claim"]
+                if not isinstance(claim, str) or not isinstance(record["source"], str) or \
+                        re.fullmatch(r"\.seedsync-retire-[0-9a-f]{48}", os.path.basename(claim)) is None or \
+                        os.path.dirname(claim) != os.path.dirname(record["source"]):
+                    return None
+                excluded.add(os.path.normcase(os.path.abspath(claim)))
+            return excluded
+        except (OSError, ValueError, TypeError, KeyError):
+            # Unknown ownership never admits opportunistic cleanup.
+            return None
+
+    @staticmethod
+    def __retirement_journal_path(src: str) -> str:
+        # Resolve descriptor-anchored child paths while their descriptors live.
+        source = os.path.realpath(src)
+        key = hashlib.sha256(os.fsencode(os.path.basename(source))).hexdigest()
+        return os.path.join(os.path.dirname(source), ".seedsync-retirement-" + key + ".json")
+
+    @staticmethod
+    def __retirement_identity(path: str) -> list[int]:
+        value = os.lstat(path)
+        if stat.S_ISLNK(value.st_mode) or getattr(value, "st_file_attributes", 0) & \
+                getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+            raise OSError(errno.EAGAIN, "retirement path is a link", path)
+        return [value.st_dev, value.st_ino, value.st_mode]
+
+    @classmethod
+    def __retirement_roots_proof(
+            cls, src: str, dst: str, retirement_roots: Optional[tuple[str, str]],
+    ) -> dict[str, dict[str, object]]:
+        """Bind configured roots and contained no-follow leaf parents only.
+
+        The caller supplies the exact validated roots. Container-owned parents
+        above those roots are deliberately outside this persistent authority.
+        """
+        if not isinstance(retirement_roots, tuple) or len(retirement_roots) != 2 or \
+                not all(isinstance(root, str) and root for root in retirement_roots):
+            raise OSError(errno.EINVAL, "validated retirement roots are required")
+        proof: dict[str, dict[str, object]] = {}
+        for side, leaf, root in zip(("staging", "final"), (src, dst), retirement_roots):
+            configured_root = os.path.abspath(root)
+            canonical_root = os.path.realpath(configured_root)
+            leaf_parent = os.path.dirname(os.path.abspath(leaf))
+            try:
+                if os.path.normcase(os.path.commonpath([configured_root, leaf_parent])) != os.path.normcase(configured_root):
+                    raise OSError(errno.EAGAIN, "retirement parent is outside configured root", leaf)
+            except ValueError as error:
+                raise OSError(errno.EAGAIN, "retirement parent is outside configured root", leaf) from error
+            relative_parent = os.path.relpath(leaf_parent, configured_root)
+            components = [] if relative_parent == "." else relative_parent.split(os.sep)
+            parents: dict[str, list[int]] = {}
+            current = canonical_root
+            for component in [None, *components]:
+                if component is not None:
+                    if component in ("", ".", ".."):
+                        raise OSError(errno.EAGAIN, "unsafe retirement parent", leaf)
+                    current = os.path.join(current, component)
+                identity = cls.__retirement_identity(current)
+                if not stat.S_ISDIR(identity[2]):
+                    raise OSError(errno.ENOTDIR, "retirement parent is not an ordinary directory", current)
+                parents[current] = identity
+            proof[side] = {
+                "configured_path": configured_root,
+                "canonical_path": canonical_root,
+                "parents": parents,
+            }
+        return proof
+
+    @staticmethod
+    def __sync_retirement_directory(path: str) -> None:
+        """Require durable journal directory entries; unsupported is not success."""
+        directory_flag = getattr(os, "O_DIRECTORY", None)
+        if os.name != "posix" or type(directory_flag) is not int:
+            raise OSError(errno.ENOTSUP, "durable retirement directory sync unavailable", path)
+        descriptor = os.open(path, os.O_RDONLY | directory_flag)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def __write_retirement_journal(cls, path: str, record: dict) -> None:
+        # The record and its directory entry precede the destructive boundary.
+        descriptor, temporary = tempfile.mkstemp(prefix=".seedsync-retirement-write-", dir=os.path.dirname(path))
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+                json.dump(record, stream, ensure_ascii=True, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            cls.__sync_retirement_directory(os.path.dirname(path))
+        finally:
+            if os.path.lexists(temporary):
+                os.unlink(temporary)
+
+    @classmethod
+    def __read_retirement_journal(cls, src: str, journal_path: Optional[str] = None) -> Optional[dict]:
+        path = journal_path or cls.__retirement_journal_path(src)
+        try:
+            before = os.lstat(path)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 16 * 1024 * 1024:
+            raise OSError(errno.EAGAIN, "invalid retirement record", path)
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+        with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            if not cls.__collision_claim_sidecar_identity_matches(before, os.fstat(stream.fileno())):
+                raise OSError(errno.EAGAIN, "retirement record changed", path)
+            record = json.load(stream)
+        if not isinstance(record, dict) or set(record) != {
+                "version", "source", "destination", "claim", "source_identity", "final_snapshot",
+                "root_authority", "directories", "phase", "context", "source_snapshot"} or record["version"] != 2 or \
+                record["phase"] not in ("planned", "deleting", "settled"):
+            raise OSError(errno.EAGAIN, "invalid retirement record", path)
+        return record
+
+    @classmethod
+    def __settle_retirement_journal(
+            cls, src: str, dst: str, journal_path: Optional[str] = None,
+            context: Optional[list] = None,
+            retirement_roots: Optional[tuple[str, str]] = None) -> Optional[bool]:
+        """Resume only an exact publication, removing owned empty directories.
+
+        No recovery path unlinks a payload. A retained record also closes the
+        crash gap between physical retirement and completion-marker flush.
+        """
+        record = cls.__read_retirement_journal(src, journal_path)
+        if record is None:
+            return None
+        source, destination = os.path.realpath(src), os.path.realpath(dst)
+        claim = record["claim"]
+        if record["context"] != context or record["source"] != source or record["destination"] != destination or \
+                not isinstance(claim, str) or os.path.dirname(claim) != os.path.dirname(source) or \
+                re.fullmatch(r"\.seedsync-retire-[0-9a-f]{48}", os.path.basename(claim)) is None or \
+                cls.__retirement_path_exists(source) or record["root_authority"] != cls.__retirement_roots_proof(src, dst, retirement_roots) or \
+                cls.__source_tree_snapshot(destination).hex() != record["final_snapshot"]:
+            raise OSError(errno.EAGAIN, "retirement publication identity changed", source)
+        if cls.__retirement_path_exists(claim):
+            if record["phase"] != "deleting" or \
+                    cls.__retirement_identity(claim) != record["source_identity"]:
+                return False
+            cls.__sync_retirement_directory(os.path.dirname(journal_path or cls.__retirement_journal_path(source)))
+            cls.__reject_nested_mounts_or_reparse_points(claim)
+            directories = record["directories"]
+            if not isinstance(directories, dict):
+                raise OSError(errno.EAGAIN, "invalid retirement directory inventory", claim)
+            pending = [(claim, ".")]
+            owned = []
+            while pending:
+                candidate, relative = pending.pop()
+                if relative not in directories or cls.__retirement_identity(candidate) != directories[relative]:
+                    return False
+                owned.append((candidate, relative))
+                with os.scandir(candidate) as entries:
+                    for entry in entries:
+                        if not entry.is_dir(follow_symlinks=False):
+                            return False
+                        pending.append((entry.path, os.path.join(relative, entry.name)))
+            for candidate, relative in reversed(owned):
+                if cls.__retirement_identity(candidate) != directories[relative]:
+                    return False
+                # rmdir is deliberately the only payload mutation in recovery.
+                os.rmdir(candidate)
+        if record["phase"] == "planned":
+            # No durable admission to deletion: absence cannot prove retirement.
+            return False
+        cls.__sync_retirement_directory(os.path.dirname(source))
+        if cls.__retirement_path_exists(source) or cls.__retirement_path_exists(claim) or \
+                record["root_authority"] != cls.__retirement_roots_proof(src, dst, retirement_roots) or \
+                cls.__source_tree_snapshot(destination).hex() != record["final_snapshot"]:
+            return False
+        if record["phase"] != "settled":
+            record["phase"] = "settled"
+            cls.__write_retirement_journal(journal_path or cls.__retirement_journal_path(source), record)
+        else:
+            cls.__sync_retirement_directory(os.path.dirname(journal_path or cls.__retirement_journal_path(source)))
+        return True
+
     @staticmethod
     def __remove_published_source(
             src: str, expected_stat: os.stat_result, expected_snapshot: Optional[bytes],
             validate_before_delete: Optional[Callable[[str], None]] = None,
             publication_metrics: Optional[dict[str, Optional[int]]] = None,
             cleanup_private: Optional[Callable[[Callable[[], object]], object]] = None,
-            retirement_diagnostics: Optional[dict[str, object]] = None) -> None:
+            retirement_diagnostics: Optional[dict[str, object]] = None,
+            verified_destination: Optional[str] = None,
+            retirement_journal_path: Optional[str] = None,
+            retirement_context: Optional[list] = None,
+            retirement_roots: Optional[tuple[str, str]] = None,
+            expected_root_authority: Optional[dict[str, dict[str, object]]] = None) -> None:
         """Remove a source only after its replacement has been published.
 
         Claim the source into an unguessable private sibling before deletion.
@@ -8608,6 +8902,32 @@ class Controller:
                     break
             else:
                 raise OSError(errno.EEXIST, "could not reserve private source cleanup path", src)
+        retirement_record = None
+        if verified_destination is not None and (
+                stat.S_ISDIR(expected_stat.st_mode) or stat.S_ISREG(expected_stat.st_mode)):
+            current_root_authority = Controller.__retirement_roots_proof(src, verified_destination, retirement_roots)
+            if expected_root_authority is None or current_root_authority != expected_root_authority:
+                raise OSError(errno.EAGAIN, "configured retirement roots changed before claim", src)
+            source = os.path.realpath(src)
+            destination = os.path.realpath(verified_destination)
+            retirement_journal_path = retirement_journal_path or Controller.__retirement_journal_path(source)
+            if Controller.__retirement_path_exists(retirement_journal_path):
+                raise OSError(errno.EAGAIN, "retirement record already exists", source)
+            directories = {}
+            if stat.S_ISDIR(expected_stat.st_mode):
+                for parent, children, _files in os.walk(src, followlinks=False):
+                    relative = os.path.relpath(parent, src)
+                    directories[relative] = Controller.__retirement_identity(parent)
+            retirement_record = {
+                "version": 2, "source": source, "destination": destination,
+                "claim": os.path.join(os.path.dirname(source), os.path.basename(claimed_path)),
+                "source_identity": Controller.__retirement_identity(src),
+                "source_snapshot": expected_snapshot.hex() if expected_snapshot is not None else None,
+                "final_snapshot": Controller.__source_tree_snapshot(verified_destination).hex(),
+                "root_authority": current_root_authority,
+                "directories": directories, "phase": "planned", "context": retirement_context,
+            }
+            Controller.__write_retirement_journal(retirement_journal_path, retirement_record)
         with _MoveMutationTracker.retirement_phase(retirement_diagnostics, "claim_rename"):
             started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
             try:
@@ -8623,7 +8943,8 @@ class Controller:
             with _MoveMutationTracker.retirement_phase(retirement_diagnostics, "claim_parent_sync"):
                 started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
                 try:
-                    Controller.__sync_directory_if_supported(source_parent)
+                    (Controller.__sync_retirement_directory if retirement_record is not None
+                     else Controller.__sync_directory_if_supported)(source_parent)
                 finally:
                     _MoveMutationTracker.finish_publication_phase(
                         publication_metrics, "claim_parent_sync_ns", started_ns,
@@ -8645,6 +8966,16 @@ class Controller:
                     _MoveMutationTracker.finish_publication_phase(
                         publication_metrics, "claimed_identity_tree_validation_ns", started_ns,
                     )
+
+            if retirement_record is not None:
+                if Controller.__retirement_roots_proof(src, verified_destination, retirement_roots) != expected_root_authority:
+                    raise OSError(errno.EAGAIN, "configured retirement roots changed before deletion", src)
+                if Controller.__source_tree_snapshot(verified_destination).hex() != retirement_record["final_snapshot"]:
+                    raise OSError(errno.EAGAIN, "final changed before retirement", verified_destination)
+                retirement_record["phase"] = "deleting"
+                Controller.__write_retirement_journal(
+                    retirement_journal_path, retirement_record,
+                )
 
             def delete_claim() -> None:
                 started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
@@ -8670,7 +9001,8 @@ class Controller:
             with _MoveMutationTracker.retirement_phase(retirement_diagnostics, "claim_final_sync"):
                 started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
                 try:
-                    Controller.__sync_directory_if_supported(source_parent)
+                    (Controller.__sync_retirement_directory if retirement_record is not None
+                     else Controller.__sync_directory_if_supported)(source_parent)
                 finally:
                     _MoveMutationTracker.finish_publication_phase(
                         publication_metrics, "claim_final_sync_ns", started_ns,
@@ -9048,6 +9380,9 @@ class Controller:
         eligible only when it has no sidecar and its entire tree is made of
         ordinary, same-device empty directories.
         """
+        excluded_claims = self.__retirement_cleanup_exclusions(source_parent)
+        if excluded_claims is None:
+            return
         try:
             retired: list[str] = []
             with os.scandir(source_parent) as entries:
@@ -9068,6 +9403,8 @@ class Controller:
             )
             return
         for claim in retired:
+            if os.path.normcase(os.path.abspath(claim)) in excluded_claims:
+                continue
             sidecar_path = self.__collision_claim_sidecar_path(claim)
             if os.path.lexists(sidecar_path):
                 self.__record_retirement_cleanup_breadcrumb(
@@ -10415,6 +10752,8 @@ class Controller:
             cls, src: str, dst: str,
             mutation_tracker: Optional[_MoveMutationTracker] = None,
             automatic_move_boundary: Optional[object] = None,
+            *, retirement_journal_enabled: bool = False,
+            retirement_roots: Optional[tuple[str, str]] = None,
     ) -> None:
         """Publish staging content once; preserve src on collision or failure.
 
@@ -10424,6 +10763,24 @@ class Controller:
         Permission, capacity, read-only,
         and I/O errors are intentionally not treated as capability fallbacks.
         """
+        journal_path = getattr(mutation_tracker, "retirement_journal_path", None) if retirement_journal_enabled else None
+        retirement_context = getattr(mutation_tracker, "retirement_context", None) if retirement_journal_enabled else None
+        try:
+            source_kind = os.lstat(src).st_mode
+        except FileNotFoundError:
+            # Missing public staging still requires exact journal recovery.
+            source_kind = None
+        journal_eligible = retirement_journal_enabled and (
+            source_kind is None or stat.S_ISREG(source_kind) or stat.S_ISDIR(source_kind)
+        )
+        root_authority = None
+        if journal_eligible:
+            root_authority = cls.__retirement_roots_proof(src, dst, retirement_roots)
+            recovered = cls.__settle_retirement_journal(src, dst, journal_path, retirement_context, retirement_roots)
+            if recovered is not None:
+                if recovered:
+                    return
+                raise OSError(errno.EAGAIN, "source retirement remains pending", src)
         source_manifest = cls.__publication_tree_manifest(src)
         try:
             rename_source = lambda: cls.__rename_staging_no_replace(src, dst, mutation_tracker)
@@ -10661,7 +11018,15 @@ class Controller:
                     publication_metrics=publication_metrics,
                     cleanup_private=cleanup_private,
                     retirement_diagnostics=retirement_diagnostics,
+                    verified_destination=dst if journal_eligible else None,
+                    retirement_journal_path=journal_path,
+                    retirement_context=retirement_context,
+                    retirement_roots=retirement_roots,
+                    expected_root_authority=root_authority,
                 )
+                if journal_eligible and cls.__settle_retirement_journal(
+                        src, dst, journal_path, retirement_context, retirement_roots) is not True:
+                    raise OSError(errno.EAGAIN, "source retirement remains pending", src)
                 with _MoveMutationTracker.retirement_phase(retirement_diagnostics, "caller_parent_sync"):
                     started_ns = _MoveMutationTracker.start_publication_phase(publication_metrics is not None)
                     try:
@@ -10834,6 +11199,7 @@ class Controller:
                                 result = self.__move_from_staging(
                                     child_name, path_pair_id,
                                     anchored_paths=(staging_root, final_root, anchored_source, anchored_destination),
+                                    retirement_journal_enabled=False,
                                 )
                     finally:
                         os.close(source_parent_fd)
@@ -14351,6 +14717,7 @@ class Controller:
                             message="transfer_stop_queue_marker_clear",
                         )
                         if is_new_transfer_lifecycle:
+                            self.__reset_settled_retirement(file.full_path, file.path_pair_id)
                             # A genuinely new queue invalidates all final-move
                             # identity from the prior transfer lifecycle.
                             final_move_marker_before = file.file_id in self.__persist.final_move_succeeded_file_names
