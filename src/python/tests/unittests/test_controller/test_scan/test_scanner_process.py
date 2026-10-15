@@ -2041,12 +2041,15 @@ class TestScannerProcess(unittest.TestCase):
             recycle_scan_worker=True,
         )
         self.addCleanup(process.close_queues)
+        self.addCleanup(process.run_cleanup)
         old = {"pair": {"root": "old"}}
         current = {"pair": {"root": "current"}}
         process.set_accepted_root_fingerprints(old)
 
+        # One budget covers cold spawn, both generations, and result reads.
+        deadline = time.monotonic() + 8
         process.run_loop()
-        self.assertTrue(scanner.started.wait(timeout=2))
+        self.assertTrue(scanner.started.wait(timeout=max(0.0, deadline - time.monotonic())))
 
         # The first child has already crossed the admission boundary.  A
         # concurrent model update must stage for the successor, not mutate it.
@@ -2054,19 +2057,17 @@ class TestScannerProcess(unittest.TestCase):
         self.assertEqual(old, scanner.accepted)
         scanner.release.set()
 
-        deadline = time.monotonic() + 5
         while process._ScannerProcess__scan_worker is not None and time.monotonic() < deadline:
             process.run_loop()
         self.assertIsNone(process._ScannerProcess__scan_worker)
-        self.assertEqual(old, scanner.observed.get(timeout=2))
+        self.assertEqual(old, scanner.observed.get(timeout=max(0.0, deadline - time.monotonic())))
 
         process.force_scan()
         process.run_loop()
-        deadline = time.monotonic() + 5
         while process._ScannerProcess__scan_worker is not None and time.monotonic() < deadline:
             process.run_loop()
         self.assertIsNone(process._ScannerProcess__scan_worker)
-        self.assertEqual(current, scanner.observed.get(timeout=2))
+        self.assertEqual(current, scanner.observed.get(timeout=max(0.0, deadline - time.monotonic())))
 
     def test_multi_path_scanner_routes_root_fingerprints_only_to_matching_pair(self):
         first = MagicMock()
@@ -2871,13 +2872,16 @@ class TestScannerProcess(unittest.TestCase):
             recycle_scan_worker=True,
         )
         self.addCleanup(process.close_queues)
+        self.addCleanup(process.run_cleanup)
 
         process.force_scan("movies")
         time.sleep(0.05)
         process.run_loop()
 
         result = None
-        deadline = time.monotonic() + 2
+        # Allow bounded spawn startup under full-suite load, within the
+        # existing ten-second test timeout.
+        deadline = time.monotonic() + 5
         while result is None and time.monotonic() < deadline:
             process.run_loop()
             result = process.pop_latest_result()

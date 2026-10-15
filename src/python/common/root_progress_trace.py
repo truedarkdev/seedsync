@@ -388,12 +388,14 @@ class RootProgressTrace:
         try:
             job_digest = opaque_trace_correlation(identity)
             numeric = stage.startswith("numeric_") and stage[8:] in _NUMERIC_PHASES
-            safe = numeric_progress_details(details) if numeric else _safe_details(details)
+            safe = numeric_progress_details(details) if numeric else None
             critical_join = numeric and (stage == "numeric_active_scan" or (stage == "numeric_builder" and safe["overlay_deferred"] is True))
             category = "scan.authority" if critical_join else ROOT_PROGRESS_TRACE_CATEGORY
             if not self.enabled(level, category=category):
                 self.__health(trace, "trace_policy_disabled", stage)
                 return False
+            if not numeric:
+                safe = _safe_details(details)
             if numeric:
                 safe["phase"] = stage[8:]
                 mono = details.get("monotonic_ms")

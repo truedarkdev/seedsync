@@ -1408,6 +1408,7 @@ class TestController(unittest.TestCase):
             }},
             max_entries=32,
         )
+        self.addCleanup(trace.close)
         self.controller._Controller__context.breadcrumb_trace = trace
         self.controller._Controller__queue_executor_info_emitter = trace.create_emitter()
         self.controller._Controller__lftp.backend_name = "lftp"
@@ -1436,7 +1437,30 @@ class TestController(unittest.TestCase):
         ))
         self.assertTrue(cancel_future.cancel())
 
-        before_disabled = len(trace.snapshot()["entries"])
+        def settled_entries():
+            # Non-durable collectors consume ingress through snapshots. Poll
+            # boundedly for multiprocessing feeder delivery, without waiting
+            # for a background drainer that this fixture does not start.
+            deadline = time.monotonic() + 2.0
+            while True:
+                entries = trace.snapshot()["entries"]
+                if trace.wait_for_ingress(0):
+                    health = trace.ingress_snapshot()
+                    for lane in ("critical", "normal"):
+                        self.assertEqual(health[lane + "_enqueued"], health[lane + "_ack"])
+                        self.assertEqual(0, health[lane + "_pending"])
+                        self.assertEqual(0, health[lane + "_rejected_count"])
+                        self.assertEqual(0, health[lane + "_unknown"])
+                    self.assertEqual(0, health["reservation_unknown"])
+                    self.assertEqual(0, health["unresolved"])
+                    return entries
+                self.assertLess(time.monotonic(), deadline, "valid ingress did not settle")
+                time.sleep(0.01)
+
+        before_entries = settled_entries()
+        self.assertTrue(trace.is_effectively_enabled("queue.lifecycle", "info"))
+        before_disabled = len(before_entries)
+        self.assertEqual(5, before_disabled)
         self.controller._Controller__queue_executor_info_emitter = None
         disabled_future = Future()
         executor.submit.side_effect = lambda operation: submitted.append(operation) or disabled_future
@@ -1447,9 +1471,14 @@ class TestController(unittest.TestCase):
         disabled_result = submitted[-1]()
         self.assertIs(disabled_result.result, True)
         self.assertFalse(disabled_result.command_prompt_timed_out)
-        self.assertEqual(before_disabled, len(trace.snapshot()["entries"]))
+        after_entries = settled_entries()
+        self.assertTrue(trace.is_effectively_enabled("queue.lifecycle", "info"))
+        self.assertIsNone(self.controller._Controller__queue_executor_info_emitter)
+        self.assertEqual(before_disabled, len(after_entries))
+        disabled_flow = self.controller._Controller__fractional_queue_flow_id("private-disabled-id", 3)
+        self.assertEqual([], [entry for entry in after_entries if entry["flow_id"] == disabled_flow])
 
-        entries = [entry for entry in trace.snapshot()["entries"]
+        entries = [entry for entry in after_entries
                    if entry.get("message") == "queue_executor_edge"]
         error_flow = self.controller._Controller__fractional_queue_flow_id("private-error-id", 1)
         cancel_flow = self.controller._Controller__fractional_queue_flow_id("private-cancel-id", 2)
@@ -12486,7 +12515,7 @@ class TestController(unittest.TestCase):
             force_scan = self.controller._Controller__local_scan_process.force_scan
             force_scan.side_effect = lambda *args: order.append(("force_scan", args))
 
-            move.side_effect = lambda *_args: _args[-2].mutated()
+            move.side_effect = lambda *_args, **_kwargs: _args[-2].mutated()
             result = self.controller._Controller__move_from_staging("nested/movie.mkv")
 
             self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
@@ -13557,6 +13586,7 @@ class TestController(unittest.TestCase):
                         os.path.join("/proc/self/fd", str(source_fd), "complete.bin"),
                         os.path.join("/proc/self/fd", str(destination_fd), "complete.bin"),
                     ),
+                    retirement_journal_enabled=False,
                 )
             finally:
                 os.close(source_fd)
@@ -17641,10 +17671,10 @@ class TestController(unittest.TestCase):
         Path(claimed).write_bytes(b"same bytes")
         Path(destination).write_bytes(b"same bytes")
         sidecar = claimed + ".json"
-        Path(sidecar).write_text("{}", encoding="utf-8")
         pair = PathPair(
             id="pair-a", name="Pair A", remote_path="/remote", local_path=final, enabled=True,
         )
+        self.controller._Controller__write_collision_claim_sidecar(sidecar, "same.bin", pair.id)
         file = ModelFile("sample-directory", True)
         file.path_pair_id = pair.id
         file.remote_size = 10

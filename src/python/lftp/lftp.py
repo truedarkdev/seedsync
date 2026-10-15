@@ -1254,9 +1254,13 @@ def _record_lftp_status_poll_breadcrumb(
             "failure_reason": failure_reason,
             "status_count_bucket": _lftp_trace_count_bucket(status_count),
         }
-        details["snapshot_disposition"] = snapshot_disposition if snapshot_disposition in {"accepted", "epoch_rejected"} else None
-        details["input_phase"] = input_phase if input_phase in {"primary", "connection_grace", "timeout_tail"} else "unknown"
-        details["parser_outcome"] = parser_outcome if parser_outcome in LFTP_STATUS_PARSE_OUTCOMES else "not_attempted"
+        # Snapshot provenance belongs to the dedicated completion witness.
+        # Adding it to every PTY phase evicts established boundary fields from
+        # the collector's fixed 24-key envelope.
+        if phase == "snapshot":
+            details["snapshot_disposition"] = snapshot_disposition if snapshot_disposition in {"accepted", "epoch_rejected"} else None
+            details["input_phase"] = input_phase if input_phase in {"primary", "connection_grace", "timeout_tail"} else "unknown"
+            details["parser_outcome"] = parser_outcome if parser_outcome in LFTP_STATUS_PARSE_OUTCOMES else "not_attempted"
         raw_before_bytes, raw_before_lines = _lftp_trace_value_metrics(raw_before)
         retained_bytes, retained_lines = _lftp_trace_value_metrics(retained)
         normalized_value = output if normalized is None else normalized
@@ -1373,7 +1377,7 @@ def _record_lftp_status_poll_breadcrumb(
             _coalesce_key=opaque_trace_correlation(
                 "lftp.status|{}|{}|{}|{}|{}|{}|{}|{}".format(
                     safe_correlation, phase, output_class, failure_reason,
-                    details["input_phase"], details["parser_outcome"], healthy, details["snapshot_disposition"],
+                    details.get("input_phase"), details.get("parser_outcome"), healthy, details.get("snapshot_disposition"),
                 ),
             ),
             trace_scope="flow",

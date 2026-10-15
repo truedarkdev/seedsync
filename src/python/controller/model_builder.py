@@ -2733,7 +2733,8 @@ class ModelBuilder:
                                             local_file: Optional[SystemFile],
                                             previous_snapshot: Optional[_RecentLiveTransferSnapshot] = None,
                                             lftp_job_id: Optional[int] = None,
-                                            lftp_job_type: Optional[LftpJobStatus.Type] = None) -> _TransferState:
+                                            lftp_job_type: Optional[LftpJobStatus.Type] = None,
+                                            fresh_checkpoint_bytes: int = 0) -> _TransferState:
         def has_staging_descendant(candidate: Optional[SystemFile]) -> bool:
             if candidate is None:
                 return False
@@ -2741,6 +2742,7 @@ class ModelBuilder:
                 return True
             return any(has_staging_descendant(child) for child in candidate.iter_children())
 
+        raw_size_local = transfer_state.size_local
         snapshot_job_type = lftp_job_type.value if isinstance(
             lftp_job_type, LftpJobStatus.Type,
         ) else lftp_job_type
@@ -2901,10 +2903,33 @@ class ModelBuilder:
         if not has_staging_descendant(local_file):
             return transfer_state
         final_bytes = ModelBuilder.__trusted_final_leaf_bytes(remote_file, local_file)
-        checkpoint_bytes = ModelBuilder.__staged_remote_leaf_bytes(remote_file, local_file) \
+        # A scan may bootstrap a newly observed running owner, but must not
+        # resurrect coverage after that owner's explicit reset or replacement.
+        # Raw zero plus credited bytes identifies the still-resuming bootstrap
+        # across repeated builds; the current scan remains its authority.
+        resume_checkpoint = raw_size_local == 0 and (previous_snapshot is None or (
+            snapshot_identity_matches and previous_snapshot.subset_size_local == 0 and
+            previous_snapshot.size_local is not None and
+            previous_snapshot.size_local > final_bytes
+        ))
+        current_checkpoint_bytes = ModelBuilder.__staged_remote_leaf_bytes(remote_file, local_file) \
             if type(transfer_state.size_local) is int else 0
-        # Current parsed coverage and current LFTP counters cover the same
-        # staged bytes. Choose their coverage once, never retain an old total.
+        checkpoint_bytes = 0
+        if resume_checkpoint:
+            checkpoint_bytes = current_checkpoint_bytes if previous_snapshot is None else min(
+                current_checkpoint_bytes, max(0, previous_snapshot.size_local - final_bytes),
+            )
+        if raw_size_local == 0 and snapshot_identity_matches:
+            checkpoint_bytes = max(checkpoint_bytes, fresh_checkpoint_bytes)
+        if raw_size_local not in (None, 0) and snapshot_identity_matches and \
+                previous_snapshot.size_local is not None and \
+                previous_snapshot.subset_size_local is not None and \
+                previous_snapshot.size_local > previous_snapshot.subset_size_local + final_bytes:
+            # Carry only the previously credited staged coverage that the
+            # current scan still proves. Never add it to overlapping counters.
+            checkpoint_bytes = min(current_checkpoint_bytes,
+                max(0, previous_snapshot.size_local - final_bytes))
+        # Parsed coverage and current LFTP counters overlap: choose once.
         staged_bytes = max(transfer_state.size_local or 0, checkpoint_bytes)
         if final_bytes == 0 and staged_bytes == (transfer_state.size_local or 0):
             return transfer_state
@@ -3879,15 +3904,18 @@ class ModelBuilder:
                                               raw_transfer_state: Optional[_TransferState] = None,
                                               lftp_job_id: Optional[int] = None,
                                               lftp_job_type: Optional[str] = None,
-                                              merge_matching_subset_floor: bool = True) -> None:
+                                              merge_matching_subset_floor: bool = True,
+                                              resolve_root_alias: bool = True) -> None:
         subset_size_local = raw_transfer_state.size_local \
             if raw_transfer_state is not None else None
         subset_size_remote = raw_transfer_state.size_remote \
             if raw_transfer_state is not None else None
         if merge_matching_subset_floor and subset_size_local not in (None, 0):
-            _, previous = self.__resolve_recent_live_transfer_snapshot(
-                file_id, root_file_id,
-            )
+            if resolve_root_alias:
+                _, previous = self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
+            else:
+                # A nested leaf has its own counters, not its root's subset.
+                previous = self.__recent_live_transfer_snapshots.get(file_id)
             if previous is not None and previous.lftp_job_id == lftp_job_id and \
                     previous.lftp_job_type == lftp_job_type and \
                     previous.subset_size_local is not None:
@@ -4087,6 +4115,20 @@ class ModelBuilder:
             return file_id, promoted_snapshot
         return resolved_file_id, snapshot
 
+    def __resolve_transfer_checkpoint_snapshot(
+            self, file_id: str, root_file_id: str,
+            lftp_job_id: Optional[int], lftp_job_type: Optional[LftpJobStatus.Type],
+            raw_size_local: Optional[int],
+    ) -> Tuple[Optional[str], Optional[_RecentLiveTransferSnapshot]]:
+        resolved, snapshot = self.__resolve_recent_live_transfer_snapshot_for_job(
+            file_id, root_file_id, lftp_job_id, lftp_job_type,
+        )
+        if snapshot is None and raw_size_local == 0:
+            # A stopped owner can have retired its recent-live snapshot. Its
+            # retained raw counters still distinguish resume from first start.
+            return self.__resolve_retained_stopped_transfer_snapshot(file_id, root_file_id)
+        return resolved, snapshot
+
     def __resolve_recent_live_transfer_snapshot_for_job(
             self,
             file_id: str,
@@ -4117,7 +4159,18 @@ class ModelBuilder:
         if requested_pair_id is None:
             requested_pair_id = self.__file_id_path_pair_id(root_file_id or "")
 
+        requested_path, _ = self.__completion_file_path(file_id)
+        root_path, _ = self.__completion_file_path(root_file_id or file_id)
+
+        def is_nested_root_candidate(snapshot_key: str) -> bool:
+            candidate_path, _ = self.__completion_file_path(snapshot_key)
+            return requested_path == root_path and isinstance(root_path, str) and \
+                isinstance(candidate_path, str) and \
+                candidate_path.replace("\\", "/").startswith(root_path.replace("\\", "/").rstrip("/") + "/")
+
         def is_scoped_candidate(snapshot_key: str, snapshot: _RecentLiveTransferSnapshot) -> bool:
+            if is_nested_root_candidate(snapshot_key):
+                return False
             if snapshot_key != file_id and snapshot.root_file_id not in aliases:
                 return False
             snapshot_root_pair_id = self.__file_id_path_pair_id(snapshot.root_file_id)
@@ -4210,6 +4263,11 @@ class ModelBuilder:
             # wrong-pair snapshot to this canonical file id.
             return None, None
 
+        resolved_file_id, snapshot = self.__resolve_transfer_snapshot(
+            self.__recent_live_transfer_snapshots, file_id, root_file_id,
+        )
+        if resolved_file_id is not None and is_nested_root_candidate(resolved_file_id):
+            return None, None
         resolved_file_id, snapshot = self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
         if snapshot is not None and snapshot.lftp_job_id == lftp_job_id and \
                 snapshot.lftp_job_type == normalized_type and (
@@ -4529,13 +4587,17 @@ class ModelBuilder:
     @staticmethod
     def __staged_remote_leaf_bytes(
             remote_file: Optional[SystemFile],
-            local_file: Optional[SystemFile]) -> int:
+            local_file: Optional[SystemFile],
+            selected_file_ids: Optional[Set[str]] = None,
+            file_id: Optional[str] = None) -> int:
         """Count staged bytes only on remote-matching leaves."""
         if remote_file is None or local_file is None or \
                 remote_file.is_dir != local_file.is_dir or \
                 getattr(local_file, "has_staging_collision", False):
             return 0
         if not remote_file.is_dir:
+            if selected_file_ids is not None and file_id not in selected_file_ids:
+                return 0
             if not getattr(local_file, "is_staging", False) or \
                     not getattr(local_file, "status_sidecar_ready", False):
                 return 0
@@ -4545,6 +4607,11 @@ class ModelBuilder:
             ModelBuilder.__staged_remote_leaf_bytes(
                 remote_child,
                 local_children.get(remote_child.name),
+                selected_file_ids,
+                ModelFile.build_file_id(
+                    (ModelBuilder.__completion_file_path(file_id)[0] or "") + "/" + remote_child.name,
+                    ModelBuilder.__completion_file_path(file_id)[1],
+                ) if selected_file_ids is not None else None,
             )
             for remote_child in remote_file.iter_children()
         )
@@ -5582,6 +5649,71 @@ class ModelBuilder:
             effective_local_files[file_id] = active_file
         return effective_local_files
 
+    @staticmethod
+    def __changed_checkpoint_leaf_ids(previous: dict, current: dict, remote: dict) -> Set[str]:
+        changed: Set[str] = set()
+
+        def visit(remote_file, old, new, path, pair_id, old_collision=False, new_collision=False):
+            if remote_file is None:
+                return
+            old_collision = old_collision or bool(old and old.has_staging_collision)
+            new_collision = new_collision or bool(new and new.has_staging_collision)
+            if not remote_file.is_dir:
+                old_bytes = 0 if old_collision else ModelBuilder.__staged_remote_leaf_bytes(remote_file, old)
+                new_bytes = 0 if new_collision else ModelBuilder.__staged_remote_leaf_bytes(remote_file, new)
+                if new_bytes > 0 and new_bytes != old_bytes:
+                    changed.add(ModelFile.build_file_id(path, pair_id))
+                return
+            old_children = {child.name: child for child in old.iter_children()} if old and old.is_dir else {}
+            new_children = {child.name: child for child in new.iter_children()} if new and new.is_dir else {}
+            for child in remote_file.iter_children():
+                visit(child, old_children.get(child.name), new_children.get(child.name),
+                    path + "/" + child.name, pair_id, old_collision, new_collision)
+
+        for pair_id, files in current.items():
+            previous_files = previous.get(pair_id, {})
+            for file_id, source in files.items():
+                old = previous_files.get(file_id)
+                if source == old:
+                    continue
+                visit(remote.get(pair_id, {}).get(file_id), old, source, source.name, pair_id)
+        return changed
+
+    def __fresh_checkpoint_bytes(self, file_id: str, remote, local) -> int:
+        if remote is not None and not remote.is_dir:
+            admitted = any(reason == MODEL_BUILDER_INVALIDATION_LOCAL_FILES and
+                affected is not None and file_id in affected
+                for reason, affected in self.__pending_invalidation_tokens.values())
+            return self.__staged_remote_leaf_bytes(remote, local) if admitted else 0
+        selected = set().union(*(
+            affected or frozenset()
+            for reason, affected in self.__pending_invalidation_tokens.values()
+            if reason == MODEL_BUILDER_INVALIDATION_LOCAL_FILES
+        ))
+        path, pair_id = self.__completion_file_path(file_id)
+        if not selected or path is None:
+            return 0
+        selected = {candidate for candidate in selected
+            if self.__completion_file_path(candidate)[1] == pair_id and (
+                self.__completion_file_path(candidate)[0] == path or
+                (self.__completion_file_path(candidate)[0] or "").startswith(path + "/"))}
+        if not selected:
+            return 0
+        return self.__staged_remote_leaf_bytes(remote, local, selected, file_id)
+
+    def __stage_checkpoint_invalidations(self, partial: "ModelBuilder") -> None:
+        # A staged render reads the same evidence without consuming its owner.
+        partial.__pending_invalidation_tokens = {
+            token: event for token, event in self.__pending_invalidation_tokens.items()
+            if event[0] == MODEL_BUILDER_INVALIDATION_LOCAL_FILES
+        }
+        partial.__next_invalidation_token = self.__next_invalidation_token
+        changed = self.__changed_checkpoint_leaf_ids(
+            self.__local_files_by_pair, partial.__local_files_by_pair, partial.__remote_files_by_pair,
+        )
+        if changed:
+            partial.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LOCAL_FILES, affected_file_ids=changed)
+
     def set_local_files(self, local_files: List[SystemFile]) -> None:
         started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_LOCAL_FILES)
         try:
@@ -5596,7 +5728,11 @@ class ModelBuilder:
                 self.__local_files_by_pair = next_local_files
                 self.__refresh_source_name_counts()
                 self.__refresh_local_root_name_counts()
-                self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LOCAL_FILES)
+                changed_checkpoints = self.__changed_checkpoint_leaf_ids(
+                    previous_local_files, next_local_files, self.__remote_files_by_pair,
+                )
+                self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LOCAL_FILES,
+                    affected_file_ids=changed_checkpoints)
                 self.__local_root_scan_proofs = {
                     file_id: proof for file_id, proof in self.__local_root_scan_proofs.items()
                     if len(proof) == 3 and self.__local_file(file_id) is proof[2]
@@ -5852,6 +5988,7 @@ class ModelBuilder:
         partial.__unknown_local_path_pair_ids = set(unknown_local_path_pair_ids)
         partial.__local_root_paths = dict(self.__local_root_paths)
         partial.__local_staging_paths = dict(self.__local_staging_paths)
+        self.__stage_checkpoint_invalidations(partial)
         return partial.build_model(diagnostic_target_root_ids=diagnostic_target_root_ids)
 
     def __pair_delta_is_globally_safe(
@@ -6022,6 +6159,7 @@ class ModelBuilder:
         partial.__unknown_local_path_pair_ids = set(current_unknown_ids)
         partial.__local_root_paths = dict(self.__local_root_paths)
         partial.__local_staging_paths = dict(self.__local_staging_paths)
+        self.__stage_checkpoint_invalidations(partial)
         return _AuthoritativePairBuild(
             path_pair_id,
             dict(self.__local_files_by_pair.get(path_pair_id, {})),
@@ -6348,11 +6486,12 @@ class ModelBuilder:
                 return None
             try:
                 source = self.__transfer_state(status.total_transfer_state)
-                _, previous = self.__resolve_recent_live_transfer_snapshot_for_job(
-                    file_id, status.file_id, status.id, status.type,
+                _, previous = self.__resolve_transfer_checkpoint_snapshot(
+                    file_id, status.file_id, status.id, status.type, source.size_local,
                 )
                 current = self.__combine_split_root_transfer_state(
                     source, remote, local, previous, status.id, status.type,
+                    self.__fresh_checkpoint_bytes(file_id, remote, local),
                 )
                 current = self.__coalesce_retained_stopped_transfer_state(
                     file_id, status.file_id, remote, local, current, source,
@@ -6554,11 +6693,12 @@ class ModelBuilder:
             # this slice projects: no child/ancestor aggregation is inferred.
             try:
                 source = self.__transfer_state(status.total_transfer_state)
-                _, previous = self.__resolve_recent_live_transfer_snapshot_for_job(
-                    file_id, status.file_id, status.id, status.type,
+                _, previous = self.__resolve_transfer_checkpoint_snapshot(
+                    file_id, status.file_id, status.id, status.type, source.size_local,
                 )
                 current = self.__combine_split_root_transfer_state(
                     source, remote, local, previous, status.id, status.type,
+                    self.__fresh_checkpoint_bytes(file_id, remote, local),
                 )
                 current = self.__coalesce_retained_stopped_transfer_state(
                     file_id, status.file_id, remote, local, current, source,
@@ -6671,9 +6811,15 @@ class ModelBuilder:
         if not diagnostic_root_ids:
             diagnostic_root_ids.update(self.__lftp_touched_root_file_ids)
             diagnostic_root_ids.update(self.__active_touched_root_file_ids)
-            for _, affected in self.__pending_invalidation_tokens.values():
+            for reason, affected in self.__pending_invalidation_tokens.values():
                 if affected is not None:
-                    diagnostic_root_ids.update(affected)
+                    if reason == MODEL_BUILDER_INVALIDATION_LOCAL_FILES:
+                        for file_id in affected:
+                            path, pair_id = self.__completion_file_path(file_id)
+                            if path is not None:
+                                diagnostic_root_ids.add(self.__root_file_id(path.split("/")[0], pair_id))
+                    else:
+                        diagnostic_root_ids.update(affected)
         # Mirror the selector's global-safety condition: a legacy marker is
         # ambiguous only when it applies to a selected/touched root and that
         # name has non-unique source/status visibility.
@@ -6939,6 +7085,7 @@ class ModelBuilder:
         partial.__local_staging_paths = dict(self.__local_staging_paths)
         timed("global_copy", started_ns)
         started_ns = time.monotonic_ns() if timing is not None else 0
+        self.__stage_checkpoint_invalidations(partial)
         built_model = partial.build_model()
         timed("partial_build", started_ns)
         return _ActiveTransferRootBuild(
@@ -8285,8 +8432,9 @@ class ModelBuilder:
         raw_current_transfer_state = source_current_transfer_state
         if source_current_transfer_state is not None:
             if status is not None:
-                _, previous_snapshot = self.__resolve_recent_live_transfer_snapshot_for_job(
+                _, previous_snapshot = self.__resolve_transfer_checkpoint_snapshot(
                     file_id, status.file_id, status.id, status.type,
+                    source_current_transfer_state.size_local,
                 )
             else:
                 _, previous_snapshot = self.__resolve_recent_live_transfer_snapshot(
@@ -8299,6 +8447,7 @@ class ModelBuilder:
                 previous_snapshot,
                 status.id if status is not None else None,
                 status.type if status is not None else None,
+                self.__fresh_checkpoint_bytes(file_id, remote, local),
             )
             raw_current_transfer_state = self.__apply_persisted_display_progress_floor(
                 file_id, raw_current_transfer_state, source_current_transfer_state,
@@ -8602,14 +8751,15 @@ class ModelBuilder:
 
                 _child_raw_transfer_state = _child_current_transfer_state
                 if _child_current_transfer_state is not None and \
-                        type(_child_current_transfer_state.size_local) is int and \
                         not _ancestor_has_staging_collision and not _is_dir:
-                    checkpoint_bytes = ModelBuilder.__staged_remote_leaf_bytes(_remote_child, _local_child)
-                    if checkpoint_bytes > _child_current_transfer_state.size_local:
-                        _child_current_transfer_state = _TransferState(checkpoint_bytes,
-                            _child_current_transfer_state.size_remote,
-                            int(round(checkpoint_bytes * 100 / _remote_child.size)) if _remote_child.size > 0 else None,
-                            _child_current_transfer_state.speed, _child_current_transfer_state.eta)
+                    _child_current_transfer_state = self.__combine_split_root_transfer_state(
+                        _child_current_transfer_state, _remote_child, _local_child,
+                        self.__recent_live_transfer_snapshots.get(_child_file_id) or
+                        self.__retained_stopped_transfer_snapshots.get(_child_file_id),
+                        _child_live_status.id if _child_live_status is not None else None,
+                        _child_live_status.type if _child_live_status is not None else None,
+                        self.__fresh_checkpoint_bytes(_child_file_id, _remote_child, _local_child),
+                    )
                 # fill the rest
                 self.__fill_model_file(
                     _child_model_file,
@@ -8729,6 +8879,7 @@ class ModelBuilder:
                     raw_transfer_state,
                     lftp_job_id,
                     lftp_job_type,
+                    resolve_root_alias=not ancestor_file_ids,
                 )
             download_progress = ModelBuilder.__normalize_download_progress(transfer_state.percent_local)
             if download_progress is not None:

@@ -56,6 +56,21 @@ class _RealisticStatusPty:
 
 
 class TestLftpStatusDiagnostics(unittest.TestCase):
+    def setUp(self):
+        # Capture quotas and poll deduplication are process-wide in production,
+        # but each fixture must start with its own capture lifecycle.
+        capture_state = patch.multiple(
+            lftp_mod,
+            _PRIVATE_STATUS_FRAME_CAPTURE_REMAINING=6,
+            _PRIVATE_STATUS_FRAME_ANOMALY_PATHS={},
+            _PRIVATE_STATUS_FRAME_ANOMALY_ATTEMPTS=set(),
+            _PRIVATE_STATUS_FRAME_CAPTURE_ROLES=set(),
+            _PRIVATE_STATUS_FRAME_CAPTURE_PATHS={},
+            _PRIVATE_STATUS_FRAME_PRODUCER=None,
+        )
+        capture_state.start()
+        self.addCleanup(capture_state.stop)
+
     def test_mirror_terminal_breadcrumb_requires_complete_mirror_and_final_counts(self):
         trace = self._trace()
         poll = "lftp-poll:0123456789abcdef"
@@ -392,13 +407,43 @@ class TestLftpStatusDiagnostics(unittest.TestCase):
                 else:
                     self.assertEqual([], writes)
 
+    def test_capture_docker_lines_forwards_other_file_descriptors(self):
+        import select
+
+        read_fd, write_fd = os.pipe()
+        try:
+            def emit():
+                self.assertEqual(3, os.write(write_fd, b"ipc"))
+                self.assertEqual(11, os.write(2, b"diagnostic\n"))
+                return "result"
+
+            result, lines = self._capture_docker_lines(emit)
+
+            self.assertEqual("result", result)
+            self.assertEqual(["diagnostic\n"], lines)
+            # Check readiness after the helper restores select; a broken
+            # forwarding seam must fail rather than block on an empty pipe.
+            readable, _, _ = select.select([read_fd], [], [], 0)
+            self.assertEqual([read_fd], readable)
+            self.assertEqual(b"ipc", os.read(read_fd, 3))
+        finally:
+            os.close(write_fd)
+            os.close(read_fd)
+
     @staticmethod
     def _capture_docker_lines(call):
         writes = []
+        original_write = os.write
+
+        def capture_stderr(fd, data):
+            if fd != 2:
+                return original_write(fd, data)
+            writes.append((fd, data))
+            return len(data)
+
         with patch("lftp.lftp.sys.stderr", MagicMock(fileno=MagicMock(return_value=2))), \
                 patch("lftp.lftp.select.select", return_value=([], [2], [])), \
-                patch("lftp.lftp.os.write",
-                      side_effect=lambda fd, data: writes.append((fd, data)) or len(data)):
+                patch("lftp.lftp.os.write", side_effect=capture_stderr):
             result = call()
         return result, [data.decode("ascii") for _fd, data in writes]
 

@@ -1816,6 +1816,298 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_lftp_statuses([resumed])
         self.assertEqual(5, self.model_builder.build_model().get_file("active.bin").transferred_size)
 
+    def test_unrelated_source_changes_do_not_rearm_reset_checkpoint(self):
+        for change in ("sibling", "root_metadata", "leaf_metadata", "other_root", "other_pair"):
+            with self.subTest(change=change):
+                builder = ModelBuilder()
+                root_id = ModelFile.build_file_id("bundle", "pair-a")
+                remote = SystemFile("bundle", 200, True)
+                remote.path_pair_id = "pair-a"
+                remote.add_child(SystemFile("active.bin", 100, False))
+                remote.add_child(SystemFile("sibling.bin", 100, False))
+                builder.set_remote_files([remote])
+
+                def local_sources(updated):
+                    root = SystemFile("bundle", 90, True, is_staging=True,
+                        mtime_ns=2 if updated and change == "root_metadata" else 1)
+                    root.path_pair_id = "pair-a"
+                    active = SystemFile("active.bin", 80, False, is_staging=True,
+                        mtime_ns=2 if updated and change == "leaf_metadata" else 1)
+                    active.status_sidecar_ready = True
+                    root.add_child(active)
+                    sibling = SystemFile("sibling.bin",
+                        20 if updated and change == "sibling" else 10, False)
+                    root.add_child(sibling)
+                    other = SystemFile("other.bin", 2 if updated else 1, False)
+                    other.path_pair_id = "pair-b" if change == "other_pair" else "pair-a"
+                    return [root, other] if change in ("other_root", "other_pair") else [root]
+
+                def publish(raw):
+                    status = LftpJobStatus(7, LftpJobStatus.Type.MIRROR,
+                        LftpJobStatus.State.RUNNING, "bundle", "")
+                    status.path_pair_id = "pair-a"
+                    status.total_transfer_state = LftpJobStatus.TransferState(raw, 200, raw // 2, 1, 1)
+                    status.add_active_file_transfer_state("active.bin",
+                        LftpJobStatus.TransferState(raw, 100, raw, 1, 1))
+                    builder.set_lftp_statuses([status])
+                    return builder.build_model().get_file(root_id)
+
+                builder.set_local_files(local_sources(False))
+                self.assertEqual(80, publish(80).transferred_size)
+                self.assertEqual(0, publish(0).transferred_size)
+                builder.set_local_files(local_sources(True))
+                root = publish(0)
+                self.assertEqual(0, root.transferred_size)
+                active = next(child for child in root.iter_children() if child.name == "active.bin")
+                self.assertEqual(0, active.transferred_size)
+
+    def test_checkpoint_reset_ignores_proof_rebind_and_file_metadata_adoption(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                builder = ModelBuilder()
+                root_name = "bundle" if nested else "active.bin"
+                root_id = ModelFile.build_file_id(root_name, "pair-a")
+
+                def sources(mtime=1):
+                    remote = SystemFile("active.bin", 100, False)
+                    local = SystemFile("active.bin", 80, False, is_staging=True, mtime_ns=mtime)
+                    local.status_sidecar_ready = True
+                    if nested:
+                        remote_root = SystemFile(root_name, 100, True)
+                        remote_root.add_child(remote)
+                        local_root = SystemFile(root_name, 80, True, is_staging=True)
+                        local_root.add_child(local)
+                    else:
+                        remote_root, local_root = remote, local
+                    remote_root.path_pair_id = local_root.path_pair_id = "pair-a"
+                    return remote_root, local_root
+
+                remote, local = sources()
+                builder.set_remote_files([remote])
+                builder.adopt_local_root_scan_sources({root_id: (local, "scan", 1)})
+                builder.set_unknown_local_path_pair_ids({"pair-a"})
+
+                def publish(raw, generation):
+                    status = LftpJobStatus(7,
+                        LftpJobStatus.Type.MIRROR if nested else LftpJobStatus.Type.PGET,
+                        LftpJobStatus.State.RUNNING, root_name, "")
+                    status.path_pair_id = "pair-a"
+                    status.total_transfer_state = LftpJobStatus.TransferState(raw, 100, raw, 1, 1)
+                    if nested:
+                        status.add_active_file_transfer_state("active.bin",
+                            LftpJobStatus.TransferState(raw, 100, raw, 1, 1))
+                    builder.set_lftp_statuses([status])
+                    return builder.build_model(local_scan_session="scan", local_scan_generation=generation,
+                        reconciled_remote_path_pair_ids={"pair-a"}).get_file(root_id)
+
+                self.assertEqual(80, publish(80, 1).transferred_size)
+                self.assertEqual(0, publish(0, 1).transferred_size)
+                _, replacement = sources(1 if nested else 2)
+                builder.adopt_local_root_scan_sources({root_id: (replacement, "scan", 2)})
+                tokens = builder._ModelBuilder__pending_invalidation_tokens
+                if nested:
+                    self.assertTrue(any(reason == MODEL_BUILDER_INVALIDATION_LOCAL_FILES and
+                        affected == frozenset({root_id}) for reason, affected in tokens.values()))
+                else:
+                    self.assertNotIn(root_id, builder._ModelBuilder__local_root_scan_proofs)
+                self.assertEqual(0, publish(0, 2).transferred_size)
+
+    def test_changed_checkpoint_leaf_does_not_rearm_unchanged_sibling_coverage(self):
+        builder = ModelBuilder()
+        remote = SystemFile("bundle", 200, True)
+        for name in ("active.bin", "sibling.bin"):
+            remote.add_child(SystemFile(name, 100, False))
+        builder.set_remote_files([remote])
+
+        def local_sources(sibling_size):
+            root = SystemFile("bundle", 80 + sibling_size, True, is_staging=True)
+            for name, size in (("active.bin", 80), ("sibling.bin", sibling_size)):
+                leaf = SystemFile(name, size, False, is_staging=True)
+                leaf.status_sidecar_ready = True
+                root.add_child(leaf)
+            return root
+
+        def publish(raw):
+            status = LftpJobStatus(7, LftpJobStatus.Type.MIRROR,
+                LftpJobStatus.State.RUNNING, "bundle", "")
+            status.total_transfer_state = LftpJobStatus.TransferState(raw, 200, raw // 2, 1, 1)
+            status.add_active_file_transfer_state("active.bin",
+                LftpJobStatus.TransferState(raw, 100, raw, 1, 1))
+            builder.set_lftp_statuses([status])
+            return builder.build_model().get_file("bundle")
+
+        builder.set_local_files([local_sources(10)])
+        self.assertEqual(80, publish(80).transferred_size)
+        self.assertEqual(0, publish(0).transferred_size)
+        builder.set_local_files([local_sources(20)])
+        root = publish(0)
+        self.assertEqual(20, root.transferred_size)
+        active = next(child for child in root.iter_children() if child.name == "active.bin")
+        self.assertEqual(0, active.transferred_size)
+        for _ in range(2):
+            root = publish(0)
+            self.assertEqual(20, root.transferred_size)
+            active = next(child for child in root.iter_children() if child.name == "active.bin")
+            self.assertEqual(0, active.transferred_size)
+
+    def test_fresh_checkpoint_partial_builds_preserve_parent_evidence_lifetime(self):
+        for mode in ("active", "progressive", "pair"):
+            with self.subTest(mode=mode):
+                builder = ModelBuilder()
+                root_id = ModelFile.build_file_id("bundle", "pair-a")
+                remote = SystemFile("bundle", 100, True)
+                remote.path_pair_id = "pair-a"
+                remote.add_child(SystemFile("active.bin", 100, False))
+
+                def local(size):
+                    root = SystemFile("bundle", size, True, is_staging=True)
+                    root.path_pair_id = "pair-a"
+                    leaf = SystemFile("active.bin", size, False, is_staging=True)
+                    leaf.status_sidecar_ready = True
+                    root.add_child(leaf)
+                    return root
+
+                def status(raw):
+                    value = LftpJobStatus(7, LftpJobStatus.Type.MIRROR,
+                        LftpJobStatus.State.RUNNING, "bundle", "")
+                    value.path_pair_id = "pair-a"
+                    value.total_transfer_state = LftpJobStatus.TransferState(raw, 100, raw, 1, 1)
+                    value.add_active_file_transfer_state("active.bin",
+                        LftpJobStatus.TransferState(raw, 100, raw, 1, 1))
+                    return value
+
+                builder.set_remote_files([remote])
+                builder.set_local_files([local(80)])
+                builder.set_lftp_statuses([status(80)])
+                builder.build_model()
+                builder.set_lftp_statuses([status(0)])
+                self.assertEqual(0, builder.build_model().get_file(root_id).transferred_size)
+                fresh = local(40)
+                if mode == "active":
+                    builder.set_local_files([fresh])
+                parent_tokens = dict(builder._ModelBuilder__pending_invalidation_tokens)
+                if mode == "active":
+                    candidate = builder.build_active_transfer_roots({root_id}).model
+                elif mode == "progressive":
+                    candidate = builder.build_progressive_roots([fresh], [remote], set())
+                else:
+                    pair_build = builder.build_authoritative_pair_roots("pair-a", [fresh], [remote], set())
+                    self.assertIsNotNone(pair_build)
+                    candidate = pair_build.model
+                self.assertEqual(40, candidate.get_file(root_id).transferred_size)
+                self.assertEqual(parent_tokens, builder._ModelBuilder__pending_invalidation_tokens)
+                self.assertEqual(40 if mode == "active" else 0,
+                    builder.build_model().get_file(root_id).transferred_size)
+
+    def test_root_snapshot_lookup_does_not_promote_only_nested_child(self):
+        for pair_id in (None, "pair-a"):
+            with self.subTest(pair_id=pair_id):
+                builder = ModelBuilder()
+                root_id = ModelFile.build_file_id("bundle", pair_id)
+                child_id = ModelFile.build_file_id("bundle/active.bin", pair_id)
+                snapshot = _RecentLiveTransferSnapshot(root_id, 10, 10, 1, 1,
+                    7, "mirror", subset_size_local=10, subset_size_remote=100)
+                snapshots = builder._ModelBuilder__recent_live_transfer_snapshots
+                snapshots[child_id] = snapshot
+                self.assertEqual((None, None),
+                    builder._ModelBuilder__resolve_recent_live_transfer_snapshot_for_job(
+                        root_id, "bundle", 7, LftpJobStatus.Type.MIRROR))
+                self.assertEqual({child_id: snapshot}, snapshots)
+
+    def test_running_zero_bootstrap_survives_rebuilds_and_low_first_counter(self):
+        for nested in (False, True):
+            for clear_checkpoint in (False, True):
+                with self.subTest(nested=nested, clear_checkpoint=clear_checkpoint):
+                    builder = ModelBuilder()
+                    remote = SystemFile("active.bin", 100, False)
+                    local = SystemFile("active.bin", 10, False, is_staging=True)
+                    local.status_sidecar_ready = True
+                    if nested:
+                        remote_root = SystemFile("bundle", 100, True)
+                        remote_root.add_child(remote)
+                        local_root = SystemFile("bundle", 10, True, is_staging=True)
+                        local_root.add_child(local)
+                    else:
+                        remote_root, local_root = remote, local
+                    builder.set_remote_files([remote_root])
+                    builder.set_local_files([local_root])
+                    root_id = remote_root.name
+
+                    polls = 0
+
+                    def publish(raw):
+                        nonlocal polls
+                        polls += 1
+                        status = LftpJobStatus(7,
+                            LftpJobStatus.Type.MIRROR if nested else LftpJobStatus.Type.PGET,
+                            LftpJobStatus.State.RUNNING, root_id, "")
+                        status.total_transfer_state = LftpJobStatus.TransferState(raw, 100, raw, polls, 1)
+                        if nested:
+                            status.add_active_file_transfer_state("active.bin",
+                                LftpJobStatus.TransferState(raw, 100, raw, 1, 1))
+                        builder.set_lftp_statuses([status])
+                        if polls in (2, 3):
+                            overlays = builder.build_read_only_lftp_root_counter_overlays({root_id})
+                            self.assertIsNotNone(overlays)
+                            self.assertEqual(10, overlays[root_id].transferred_size)
+                            builder.record_read_only_lftp_root_counter_overlays(overlays)
+                        model = builder.build_model()
+                        self.assertEqual(raw, status.total_transfer_state.size_local)
+                        return model
+
+                    for _ in range(3):
+                        model = publish(0)
+                        self.assertEqual(10, model.get_file(root_id).transferred_size)
+                        self.assertEqual(10, (next(model.get_file(root_id).iter_children()) if nested else
+                            model.get_file(root_id)).transferred_size)
+                    if clear_checkpoint:
+                        fresh_local = SystemFile("active.bin", 0, False, is_staging=True)
+                        fresh_local.status_sidecar_ready = True
+                        if nested:
+                            fresh_root = SystemFile("bundle", 0, True, is_staging=True)
+                            fresh_root.add_child(fresh_local)
+                        else:
+                            fresh_root = fresh_local
+                        builder.set_local_files([fresh_root])
+                        model = publish(0)
+                        self.assertEqual(0, model.get_file(root_id).transferred_size)
+                        self.assertEqual(0, (next(model.get_file(root_id).iter_children()) if nested else
+                            model.get_file(root_id)).transferred_size)
+                    else:
+                        model = publish(5)
+                        self.assertEqual(10, model.get_file(root_id).transferred_size)
+                        self.assertEqual(10, (next(model.get_file(root_id).iter_children()) if nested else
+                            model.get_file(root_id)).transferred_size)
+                        model = publish(0)
+                        self.assertEqual(0, model.get_file(root_id).transferred_size)
+                        self.assertEqual(0, (next(model.get_file(root_id).iter_children()) if nested else
+                            model.get_file(root_id)).transferred_size)
+                        model = publish(5)
+                        self.assertEqual(5, model.get_file(root_id).transferred_size)
+                        self.assertEqual(5, (next(model.get_file(root_id).iter_children()) if nested else
+                            model.get_file(root_id)).transferred_size)
+
+    def test_mirror_child_raw_floor_stays_separate_from_root_across_lower_samples(self):
+        remote = SystemFile("bundle", 100, True)
+        remote.add_child(SystemFile("active.bin", 100, False))
+        self.model_builder.set_remote_files([remote])
+        for raw in (20, 10, 5):
+            status = LftpJobStatus(7, LftpJobStatus.Type.MIRROR,
+                LftpJobStatus.State.RUNNING, "bundle", "")
+            status.total_transfer_state = LftpJobStatus.TransferState(50, 100, 50, 1, 1)
+            status.add_active_file_transfer_state("active.bin",
+                LftpJobStatus.TransferState(raw, 100, raw, 1, 1))
+            self.model_builder.set_lftp_statuses([status])
+            full = self.model_builder.build_model()
+            self.assertEqual(50, full.get_file("bundle").transferred_size)
+            self.assertEqual(20, next(full.get_file("bundle").iter_children()).transferred_size)
+            partial = self.model_builder.build_active_transfer_roots({"bundle"})
+            self.assertEqual(full.get_file("bundle"), partial.model.get_file("bundle"))
+            snapshots = self.model_builder._ModelBuilder__recent_live_transfer_snapshots
+            self.assertEqual(50, snapshots["bundle"].subset_size_local)
+            self.assertEqual(20, snapshots["bundle/active.bin"].subset_size_local)
+            self.assertEqual(raw, dict(status.get_active_file_transfer_states())["active.bin"].size_local)
+
     def test_recent_pget_snapshot_promotion_does_not_recreate_stopped_floor(self):
         remote = SystemFile("active.bin", 100, False, mtime_ns=1_000_000_000)
         local = SystemFile("active.bin", 80, False, is_staging=True)

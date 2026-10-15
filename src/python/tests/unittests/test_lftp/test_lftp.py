@@ -628,6 +628,7 @@ class TestLftp(unittest.TestCase):
         finally:
             lftp_mod._PREPARSE_STDERR_REMAINING = original_remaining
 
+    @pytest.mark.timeout(30)  # Six real-PTY cases each exercise one-second response timeouts.
     def test_timed_out_pty_response_is_synchronized_before_next_status(self):
         import pexpect
         import sys
@@ -697,6 +698,7 @@ for command in sys.stdin:
                         backend.force_close()
                         trace.close()
 
+    @pytest.mark.timeout(30)  # Nine real-PTY cases retain their production timeout budgets.
     def test_late_predecessor_errors_reject_send_without_fresh_membership(self):
         import pexpect
         import sys

@@ -383,7 +383,7 @@ class TestModelUpdater(unittest.TestCase):
             )
         details = controller._record_completion_scan_join_breadcrumb.call_args.args[2]
         facts = details["p"]
-        self.assertEqual({"m", "so", "ao", "sp", "cp", "up", "tp", "tc"}, set(facts))
+        self.assertEqual({"m", "so", "ao", "sp", "cp", "up", "tp", "tc", "ro", "rf", "rs", "rc"}, set(facts))
         self.assertEqual("progressive", facts["m"])
         self.assertEqual(opaque_trace_correlation("system-root-object|{}".format(id(target))), facts["so"])
         self.assertEqual(opaque_trace_correlation("system-root-object|{}".format(id(source))), facts["ao"])
@@ -392,6 +392,10 @@ class TestModelUpdater(unittest.TestCase):
         self.assertTrue(facts["up"])
         self.assertTrue(facts["tp"])
         self.assertFalse(facts["tc"])
+        self.assertEqual("unknown", facts["ro"])
+        self.assertIsNone(facts["rf"])
+        self.assertIsNone(facts["rs"])
+        self.assertEqual("unknown", facts["rc"])
         serialized = json.dumps(details)
         for private in ("private-root", pair_id, "private-session"):
             self.assertNotIn(private, serialized)
@@ -11652,6 +11656,7 @@ class TestModelUpdater(unittest.TestCase):
         first_status = next(
             entry for entry in trace.snapshot()["entries"]
             if entry["message"] == "lftp_status_poll"
+            and entry["details"].get("schema") == "lftp_status_authority.v1"
         )
         first_correlation = first_status["details"]["poll_correlation"]
         self.assertEqual("fresh_healthy", first_status["details"]["source"])
@@ -11673,6 +11678,7 @@ class TestModelUpdater(unittest.TestCase):
         status_events = [
             entry for entry in trace.snapshot()["entries"]
             if entry["message"] == "lftp_status_poll"
+            and entry["details"].get("schema") == "lftp_status_authority.v1"
         ]
         self.assertEqual(2, len(status_events))
         no_op_correlation = status_events[-1]["details"]["poll_correlation"]
@@ -11691,6 +11697,7 @@ class TestModelUpdater(unittest.TestCase):
         status_events = [
             entry for entry in trace.snapshot()["entries"]
             if entry["message"] == "lftp_status_poll"
+            and entry["details"].get("schema") == "lftp_status_authority.v1"
         ]
         self.assertEqual(3, len(status_events))
         second_correlation = status_events[-1]["details"]["poll_correlation"]
@@ -11698,7 +11705,10 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual("fresh_healthy_empty", status_events[-1]["details"]["outcome"])
         self.assertEqual(0, status_events[-1]["details"]["filtered_status_count"])
 
-        linked = trace.snapshot(flow_id=second_correlation)["entries"]
+        # This test covers the legacy model authority envelope; the separate
+        # PTY snapshot witness is validated by its finalized consumer tests.
+        linked = [entry for entry in trace.snapshot(flow_id=second_correlation)["entries"]
+                  if entry["details"].get("schema") != "lftp.status_poll.v1"]
         linked_messages = {entry["message"] for entry in linked}
         expected_linked_messages = {
             "lftp_status_poll",
@@ -11773,6 +11783,7 @@ class TestModelUpdater(unittest.TestCase):
         cached_entries = cached_snapshot["entries"]
         cached_status = next(
             entry for entry in cached_entries if entry["message"] == "lftp_status_poll"
+            and entry["details"].get("schema") == "lftp_status_authority.v1"
         )
         self.assertEqual("cached_idle", cached_status["details"]["source"])
         self.assertNotIn("poll_correlation", cached_status["details"])
