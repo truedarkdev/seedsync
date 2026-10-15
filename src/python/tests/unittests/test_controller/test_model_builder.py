@@ -9416,6 +9416,85 @@ class TestModelBuilder(unittest.TestCase):
             self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots,
         )
 
+    def test_current_staged_checkpoint_is_alternative_live_coverage_and_resets(self):
+        from system.scanner import SystemScanner
+        with tempfile.TemporaryDirectory() as directory:
+            remote_path, local_path, stage_path = [os.path.join(directory, name)
+                for name in ("remote", "local", "stage")]
+            for root in (remote_path, local_path, stage_path):
+                os.makedirs(os.path.join(root, "bundle"))
+            Path(remote_path, "bundle", "partial.bin").write_bytes(b"p" * 40)
+            Path(remote_path, "bundle", "complete.bin").write_bytes(b"c" * 60)
+            Path(remote_path, "bundle", "missing.bin").write_bytes(b"m" * 20)
+            Path(stage_path, "bundle", "complete.bin").write_bytes(b"c" * 60)
+            partial = Path(stage_path, "bundle", "partial.bin.lftp")
+            partial.write_bytes(b"p" * 40)
+            sidecar = Path(str(partial) + ".lftp-pget-status")
+            sidecar.write_text("size=40\n0.pos=10\n", encoding="utf-8")
+            remote = SystemScanner(remote_path).scan_single("bundle")
+            def scan():
+                return LocalScanner(local_path, True, staging_path=stage_path).scan()[0]
+            def status(counter):
+                running = LftpJobStatus(9, LftpJobStatus.Type.MIRROR,
+                    LftpJobStatus.State.RUNNING, "bundle", "")
+                running.total_transfer_state = LftpJobStatus.TransferState(counter, remote.size, counter, 1, 0)
+                running.add_active_file_transfer_state("partial.bin",
+                    LftpJobStatus.TransferState(counter, 40, counter * 100 // 40, 1, 0))
+                return running
+            builder = ModelBuilder()
+            builder.set_remote_files([remote])
+            builder.set_local_files([scan()])
+            builder.set_lftp_statuses([status(0)])
+            root = builder.build_model().get_file("bundle")
+            self.assertEqual((ModelFile.State.DOWNLOADING, 10), (root.state, root.transferred_size))
+            for counter, expected in ((10, 10), (15, 15)):
+                builder.set_lftp_statuses([status(counter)])
+                overlay = builder.build_read_only_lftp_root_counter_overlays({"bundle"})
+                self.assertIsNotNone(overlay)
+                self.assertEqual(expected, overlay["bundle"].transferred_size)
+                self.assertEqual(expected, builder.build_model().get_file("bundle").transferred_size)
+            # A newer parsed zero resets current credit despite the old live snapshot.
+            sidecar.write_text("size=40\n0.pos=0\n", encoding="utf-8")
+            zero = scan()
+            zero_leaf = next(child for child in zero.children if child.name == "partial.bin")
+            self.assertTrue(zero_leaf.status_sidecar_ready)
+            self.assertEqual(0, zero_leaf.size)
+            builder.set_local_files([zero])
+            builder.set_lftp_statuses([status(0)])
+            self.assertEqual(0, builder.build_model().get_file("bundle").transferred_size)
+            sidecar.unlink()
+            absent = scan()
+            self.assertFalse(next(child for child in absent.children if child.name == "partial.bin").status_sidecar_ready)
+            builder.set_local_files([absent])
+            builder.set_lftp_statuses([status(0)])
+            self.assertEqual(0, builder.build_model().get_file("bundle").transferred_size)
+            for map_text in ("malformed", "size=40\n0.pos=10\n"):
+                sidecar.write_text(map_text, encoding="utf-8")
+                source = scan()
+                if map_text == "malformed":
+                    self.assertFalse(next(child for child in source.children if child.name == "partial.bin").status_sidecar_ready)
+                else:
+                    source.has_staging_collision = True
+                builder.set_local_files([source])
+                builder.set_lftp_statuses([status(0)])
+                self.assertEqual(0, builder.build_model().get_file("bundle").transferred_size)
+            # A full parsed map is coverage, never final placement or completion.
+            partial.write_bytes(b"p" * 10)
+            sidecar.write_text("size=40\n0.pos=40\n", encoding="utf-8")
+            source = scan()
+            self.assertEqual(10, partial.stat().st_size)
+            self.assertEqual(40, next(child for child in source.children if child.name == "partial.bin").size)
+            builder.set_local_files([source])
+            builder.set_lftp_statuses([status(0)])
+            root = builder.build_model().get_file("bundle")
+            leaf = next(child for child in root.iter_children() if child.name == "partial.bin")
+            self.assertEqual((40, ModelFile.State.DOWNLOADING), (root.transferred_size, root.state))
+            self.assertEqual(ModelFile.State.DOWNLOADING, leaf.state)
+            self.assertFalse(root.complete_local_coverage)
+            self.assertFalse(root.final_move_succeeded)
+            self.assertEqual(0, ModelBuilder._ModelBuilder__staged_remote_leaf_bytes(
+                remote.children[0], SystemFile(remote.children[0].name, 10, True, is_staging=True)))
+
     def test_mixed_directory_zero_reset_clears_stopped_floor_before_new_lifecycle(self):
         self.__set_mixed_directory_sources()
         self.__set_mixed_directory_active_transfer()

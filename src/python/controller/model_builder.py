@@ -2901,9 +2901,13 @@ class ModelBuilder:
         if not has_staging_descendant(local_file):
             return transfer_state
         final_bytes = ModelBuilder.__trusted_final_leaf_bytes(remote_file, local_file)
-        if final_bytes == 0:
+        checkpoint_bytes = ModelBuilder.__staged_remote_leaf_bytes(remote_file, local_file) \
+            if type(transfer_state.size_local) is int else 0
+        # Current parsed coverage and current LFTP counters cover the same
+        # staged bytes. Choose their coverage once, never retain an old total.
+        staged_bytes = max(transfer_state.size_local or 0, checkpoint_bytes)
+        if final_bytes == 0 and staged_bytes == (transfer_state.size_local or 0):
             return transfer_state
-        staged_bytes = transfer_state.size_local or 0
         size_local = final_bytes + staged_bytes
         if remote_file is not None:
             size_local = min(size_local, remote_file.size)
@@ -8596,6 +8600,16 @@ class ModelBuilder:
                     if _child_is_stopped and _status is not None:
                         _child_arbitration_source = "suppressed_stopped_live_status"
 
+                _child_raw_transfer_state = _child_current_transfer_state
+                if _child_current_transfer_state is not None and \
+                        type(_child_current_transfer_state.size_local) is int and \
+                        not _ancestor_has_staging_collision and not _is_dir:
+                    checkpoint_bytes = ModelBuilder.__staged_remote_leaf_bytes(_remote_child, _local_child)
+                    if checkpoint_bytes > _child_current_transfer_state.size_local:
+                        _child_current_transfer_state = _TransferState(checkpoint_bytes,
+                            _child_current_transfer_state.size_remote,
+                            int(round(checkpoint_bytes * 100 / _remote_child.size)) if _remote_child.size > 0 else None,
+                            _child_current_transfer_state.speed, _child_current_transfer_state.eta)
                 # fill the rest
                 self.__fill_model_file(
                     _child_model_file,
@@ -8606,6 +8620,7 @@ class ModelBuilder:
                     _child_current_transfer_state is not None,
                     _child_live_status.file_id if _child_live_status is not None else None,
                     live_transferred_file_ids,
+                    raw_transfer_state=_child_raw_transfer_state,
                     lftp_job_id=_child_live_status.id if _child_live_status is not None else None,
                     lftp_job_type=_child_live_status.type.value if _child_live_status is not None else None,
                     file_id=_child_file_id,
