@@ -8844,7 +8844,7 @@ class Controller:
                     for entry in entries:
                         if not entry.is_dir(follow_symlinks=False):
                             return False
-                        pending.append((entry.path, os.path.join(relative, entry.name)))
+                        pending.append((entry.path, os.path.relpath(entry.path, claim)))
             for candidate, relative in reversed(owned):
                 if cls.__retirement_identity(candidate) != directories[relative]:
                     return False

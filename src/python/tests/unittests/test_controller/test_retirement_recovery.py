@@ -775,3 +775,84 @@ class TestRetirementRecovery(unittest.TestCase):
             self.assertEqual(b"verified payload", (destination / "payload").read_bytes())
             self.assertEqual([], list(source.parent.glob(".seedsync-retire-*")))
             self.assertEqual([], list(Path(root).glob(".seedsync-retirement-*.json")))
+
+    def interrupt_nested_retirement(self, source, destination, depth):
+        source.mkdir()
+        nested = source.joinpath(*(["nested"] * depth))
+        nested.mkdir(parents=True)
+        (nested / "payload").write_bytes(b"verified nested payload")
+        def partial(claim):
+            claimed_nested = Path(claim).joinpath(*(["nested"] * depth))
+            (claimed_nested / "payload").rename(claimed_nested / ".busy")
+            raise OSError(errno.ENOTEMPTY, "nested retirement pending")
+        with patch.object(Controller, "_Controller__rename_no_replace",
+                          side_effect=OSError(errno.EXDEV, "forced strict copy")), \
+                patch.object(Controller, "_Controller__rename_owned_directory",
+                             side_effect=OSError(errno.EXDEV, "forced owned-directory copy")), \
+                patch("controller.controller.shutil.rmtree", side_effect=partial):
+            self.assertEqual(Controller.MoveFromStagingResult.FAILED,
+                             self.controller._Controller__move_from_staging("item"))
+        journal = next(Path(self.controller._Controller__context.config.file_path).parent.glob(
+            ".seedsync-retirement-*.json"))
+        record = json.loads(journal.read_text())
+        return journal, record, Path(record["claim"])
+
+    def test_nested_and_multidepth_retirement_restart_settles_after_delayed_residue_without_recopy(self):
+        for depth in (1, 3):
+            with self.subTest(depth=depth), tempfile.TemporaryDirectory() as root:
+                source, destination = self.configure(root)
+                journal, record, claim = self.interrupt_nested_retirement(source, destination, depth)
+                leaf = claim.joinpath(*(["nested"] * depth))
+                self.assertEqual("deleting", record["phase"])
+                self.assertEqual({".", *(os.path.join(*(["nested"] * level))
+                                         for level in range(1, depth + 1))}, set(record["directories"]))
+                self.assertEqual(b"verified nested payload",
+                                 destination.joinpath(*(["nested"] * depth), "payload").read_bytes())
+                self.setUp()
+                self.controller._Controller__staging_path = str(source.parent)
+                self.controller._Controller__legacy_local_path = str(destination.parent)
+                self.controller._Controller__context.config.file_path = str(Path(root, "settings.json"))
+                with patch.object(Controller, "_Controller__copy_to_publish_temporary",
+                                  side_effect=AssertionError("recovery recopied Final")), \
+                        patch("controller.controller.shutil.rmtree",
+                              side_effect=AssertionError("recovery recursively deleted residue")):
+                    self.assertEqual(Controller.MoveFromStagingResult.DEFERRED,
+                                     self.controller._Controller__move_from_staging("item"))
+                    self.assertEqual(b"verified nested payload", (leaf / ".busy").read_bytes())
+                    (leaf / ".busy").unlink()  # external holder releases its residue
+                    self.assertEqual(Controller.MoveFromStagingResult.COMPLETED,
+                                     self.controller._Controller__move_from_staging("item"))
+                    self.assertEqual(Controller.MoveFromStagingResult.COMPLETED,
+                                     self.controller._Controller__move_from_staging("item"))
+                self.assertFalse(claim.exists())
+                self.assertFalse(source.exists())
+                self.assertEqual("settled", json.loads(journal.read_text())["phase"])
+
+    def test_nested_recovery_retains_foreign_and_replaced_empty_directories(self):
+        for change in ("foreign", "replaced"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                source, destination = self.configure(root)
+                journal, record, claim = self.interrupt_nested_retirement(source, destination, 2)
+                leaf = claim / "nested" / "nested"
+                (leaf / ".busy").unlink()
+                if change == "foreign":
+                    protected = leaf / "foreign"
+                    protected.mkdir()
+                else:
+                    protected = source.parent / "preserved-empty-directory"
+                    leaf.rename(protected)
+                    leaf.mkdir()
+                    expected_identity = record["directories"][os.path.join("nested", "nested")]
+                    self.assertNotEqual(expected_identity, Controller._Controller__retirement_identity(str(leaf)))
+                with patch.object(Controller, "_Controller__copy_to_publish_temporary",
+                                  side_effect=AssertionError("recovery recopied Final")), \
+                        patch("controller.controller.shutil.rmtree",
+                              side_effect=AssertionError("recovery recursively deleted residue")):
+                    self.assertEqual(Controller.MoveFromStagingResult.DEFERRED,
+                                     self.controller._Controller__move_from_staging("item"))
+                self.assertTrue(claim.is_dir())
+                self.assertTrue(leaf.is_dir())
+                self.assertTrue(protected.is_dir())
+                self.assertEqual("deleting", json.loads(journal.read_text())["phase"])
+                self.assertEqual(b"verified nested payload",
+                                 (destination / "nested" / "nested" / "payload").read_bytes())
